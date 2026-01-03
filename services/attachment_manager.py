@@ -1,4 +1,4 @@
-﻿"""Attachment management utilities for BioAI Unified."""
+﻿"""Attachment management utilities for Gran Sabio LLM."""
 
 from __future__ import annotations
 

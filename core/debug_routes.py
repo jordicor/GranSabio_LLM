@@ -1,5 +1,5 @@
 """
-Debugger API routes for BioAI Unified.
+Debugger API routes for Gran Sabio LLM.
 
 Note: These endpoints are protected by require_internal_ip dependency,
 ensuring they remain internal-only even after the global IP middleware

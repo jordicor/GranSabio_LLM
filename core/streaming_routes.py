@@ -1,5 +1,5 @@
 """
-Streaming endpoints for BioAI Unified.
+Streaming endpoints for Gran Sabio LLM.
 """
 
 from __future__ import annotations

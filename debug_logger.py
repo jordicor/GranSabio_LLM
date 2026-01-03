@@ -1,5 +1,5 @@
 """
-Debug logger for BioAI Unified Engine.
+Debug logger for Gran Sabio LLM Engine.
 
 Persists full request/response timelines to SQLite so developers can inspect
 each session in chronological order via the /debugger interface.

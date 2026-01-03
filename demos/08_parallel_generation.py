@@ -37,7 +37,7 @@ from datetime import datetime
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from client import AsyncBioAIClient
+from client import AsyncGranSabioClient
 from demos.common import print_header, print_full_content, colorize, safe_print
 
 
@@ -74,7 +74,7 @@ CONTENT_PROMPTS = [
 class ParallelGenerationManager:
     """Manages multiple parallel generation requests."""
 
-    def __init__(self, client: AsyncBioAIClient, project_id: str):
+    def __init__(self, client: AsyncGranSabioClient, project_id: str):
         self.client = client
         self.project_id = project_id
         self.sessions: Dict[str, Dict[str, Any]] = {}
@@ -245,7 +245,7 @@ async def demo_parallel_generation():
     # Clamp count
     count = max(1, min(5, args.count))
 
-    async with AsyncBioAIClient() as client:
+    async with AsyncGranSabioClient() as client:
         info = await client.get_info()
         print(f"Connected to: {info['service']} v{info['version']}")
 

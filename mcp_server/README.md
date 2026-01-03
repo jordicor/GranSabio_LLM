@@ -1,17 +1,17 @@
-# BioAI Unified MCP Server
+# Gran Sabio LLM MCP Server
 
-Model Context Protocol (MCP) server that integrates BioAI Unified's multi-model QA capabilities with AI coding assistants.
+Model Context Protocol (MCP) server that integrates Gran Sabio LLM's multi-model QA capabilities with AI coding assistants.
 
 ## What is This?
 
-This MCP server allows AI coding tools like **Claude Code**, **Gemini CLI**, and **Codex CLI** to use BioAI Unified for:
+This MCP server allows AI coding tools like **Claude Code**, **Gemini CLI**, and **Codex CLI** to use Gran Sabio LLM for:
 
 - **Code Analysis**: Get multi-model consensus on code quality, security issues, and bugs
 - **Fix Validation**: Review proposed fixes before applying them
 - **Content Generation**: Generate code or documentation with built-in quality assurance
 - **Reasoning Control**: Configure thinking depth for complex analysis tasks
 
-Instead of trusting a single AI's analysis, BioAI Unified runs your code through multiple AI models and only approves results when they reach consensus.
+Instead of trusting a single AI's analysis, Gran Sabio LLM runs your code through multiple AI models and only approves results when they reach consensus.
 
 ## Quick Start
 
@@ -21,7 +21,7 @@ Instead of trusting a single AI's analysis, BioAI Unified runs your code through
 pip install -r mcp_server/requirements.txt
 ```
 
-### 2. Ensure BioAI Unified is Running
+### 2. Ensure Gran Sabio LLM is Running
 
 ```bash
 # In the project root
@@ -62,23 +62,23 @@ install_mcp.bat --uninstall    # Windows
 
 **Claude Code CLI:**
 ```bash
-# Replace /path/to/BioAI_Unified with your actual path
-claude mcp add bioai-unified -- python /path/to/BioAI_Unified/mcp_server/bioai_mcp_server.py
+# Replace /path/to/Gran_Sabio_LLM with your actual path
+claude mcp add gransabio-llm -- python /path/to/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py
 
 # Windows example:
-claude mcp add bioai-unified -- python C:\Projects\BioAI_Unified\mcp_server\bioai_mcp_server.py
+claude mcp add gransabio-llm -- python C:\Projects\Gran_Sabio_LLM\mcp_server\gransabio_mcp_server.py
 
 # Linux/macOS example:
-claude mcp add bioai-unified -- python /home/user/BioAI_Unified/mcp_server/bioai_mcp_server.py
+claude mcp add gransabio-llm -- python /home/user/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py
 ```
 
 **Gemini CLI** (`~/.gemini/settings.json`):
 ```json
 {
   "mcpServers": {
-    "bioai-unified": {
+    "gransabio-llm": {
       "command": "python",
-      "args": ["/path/to/BioAI_Unified/mcp_server/bioai_mcp_server.py"]
+      "args": ["/path/to/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py"]
     }
   }
 }
@@ -89,16 +89,16 @@ claude mcp add bioai-unified -- python /home/user/BioAI_Unified/mcp_server/bioai
 [features]
 rmcp_client = true
 
-[mcp_servers.bioai-unified]
+[mcp_servers.gransabio-llm]
 command = "python"
-args = ["/path/to/BioAI_Unified/mcp/bioai_mcp_server.py"]
+args = ["/path/to/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py"]
 ```
 
-> **Note**: Replace `/path/to/BioAI_Unified` with your actual installation path.
+> **Note**: Replace `/path/to/Gran_Sabio_LLM` with your actual installation path.
 
 ## Available Tools
 
-### `bioai_analyze_code`
+### `gransabio_analyze_code`
 
 Analyze code for bugs, security issues, performance problems, and best practices violations.
 
@@ -124,11 +124,11 @@ Returns:
 
 **Example usage in Claude Code:**
 ```
-> Analyze this code for security issues using BioAI with high reasoning
+> Analyze this code for security issues using Gran Sabio with high reasoning
 
-[Claude calls bioai_analyze_code with reasoning_effort: "high"]
+[Claude calls gransabio_analyze_code with reasoning_effort: "high"]
 
-BioAI Analysis Results:
+Gran Sabio Analysis Results:
 - Score: 7.5/10
 - Issues Found: 3
   - [CRITICAL] SQL Injection vulnerability at line 45
@@ -136,7 +136,7 @@ BioAI Analysis Results:
   - [MEDIUM] Missing input validation at line 30
 ```
 
-### `bioai_review_fix`
+### `gransabio_review_fix`
 
 Review a proposed code fix before applying it.
 
@@ -161,11 +161,11 @@ Returns:
 
 **Example usage:**
 ```
-> Before applying this fix, validate it with BioAI
+> Before applying this fix, validate it with Gran Sabio
 
-[Claude calls bioai_review_fix]
+[Claude calls gransabio_review_fix]
 
-BioAI Review:
+Gran Sabio Review:
 - Verdict: APPROVE
 - Score: 8.5/10
 - Solves Issue: Yes
@@ -173,7 +173,7 @@ BioAI Review:
 - Security Impact: Positive (fixes vulnerability)
 ```
 
-### `bioai_generate_with_qa`
+### `gransabio_generate_with_qa`
 
 Generate content with multi-model quality assurance.
 
@@ -198,15 +198,15 @@ Returns:
   - QA summary
 ```
 
-### `bioai_check_health`
+### `gransabio_check_health`
 
-Check if BioAI Unified API is available.
+Check if Gran Sabio LLM API is available.
 
-### `bioai_list_models`
+### `gransabio_list_models`
 
 List available AI models organized by provider.
 
-### `bioai_get_config`
+### `gransabio_get_config`
 
 Get current MCP server configuration including default models and reasoning settings.
 
@@ -218,27 +218,27 @@ All configuration is via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BIOAI_API_URL` | `http://localhost:8000` | BioAI Unified API URL |
-| `BIOAI_API_KEY` | (empty) | API key for authenticated access |
-| `BIOAI_TIMEOUT` | `300` | Request timeout in seconds |
-| `BIOAI_POLL_INTERVAL` | `2.0` | Polling interval for results |
+| `GRANSABIO_API_URL` | `http://localhost:8000` | Gran Sabio LLM API URL |
+| `GRANSABIO_API_KEY` | (empty) | API key for authenticated access |
+| `GRANSABIO_TIMEOUT` | `300` | Request timeout in seconds |
+| `GRANSABIO_POLL_INTERVAL` | `2.0` | Polling interval for results |
 
 ### Model Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BIOAI_GENERATOR_MODEL` | `gpt-5.2` | Default generator model |
-| `BIOAI_QA_MODELS` | `claude-opus-4-5-20251101,z-ai/glm-4.7,gemini-3-pro-preview` | Comma-separated QA models |
-| `BIOAI_GRAN_SABIO_MODEL` | `claude-opus-4-5-20251101` | Model for conflict resolution |
+| `GRANSABIO_GENERATOR_MODEL` | `gpt-5.2` | Default generator model |
+| `GRANSABIO_QA_MODELS` | `claude-opus-4-5-20251101,z-ai/glm-4.7,gemini-3-pro-preview` | Comma-separated QA models |
+| `GRANSABIO_ARBITER_MODEL` | `claude-opus-4-5-20251101` | Model for conflict resolution |
 
 ### Reasoning Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BIOAI_GENERATOR_REASONING` | `medium` | Default reasoning effort for generator (`none`, `low`, `medium`, `high`) |
-| `BIOAI_QA_REASONING` | `medium` | Default reasoning effort for QA models |
-| `BIOAI_GRAN_SABIO_REASONING` | `high` | Default reasoning effort for Gran Sabio |
-| `BIOAI_THINKING_BUDGET` | `0` | Default thinking budget for Claude models (0 = auto) |
+| `GRANSABIO_GENERATOR_REASONING` | `medium` | Default reasoning effort for generator (`none`, `low`, `medium`, `high`) |
+| `GRANSABIO_QA_REASONING` | `medium` | Default reasoning effort for QA models |
+| `GRANSABIO_ARBITER_REASONING` | `high` | Default reasoning effort for arbiter |
+| `GRANSABIO_THINKING_BUDGET` | `0` | Default thinking budget for Claude models (0 = auto) |
 
 ### Reasoning Effort Levels
 
@@ -251,24 +251,24 @@ All configuration is via environment variables:
 
 **Example with custom configuration:**
 ```bash
-BIOAI_API_URL=https://api.bioai.example.com \
-BIOAI_API_KEY=sk-xxx \
-BIOAI_GENERATOR_MODEL=gpt-5.2 \
-BIOAI_GENERATOR_REASONING=high \
-BIOAI_THINKING_BUDGET=8192 \
-python bioai_mcp_server.py
+GRANSABIO_API_URL=https://api.gransabio.example.com \
+GRANSABIO_API_KEY=sk-xxx \
+GRANSABIO_GENERATOR_MODEL=gpt-5.2 \
+GRANSABIO_GENERATOR_REASONING=high \
+GRANSABIO_THINKING_BUDGET=8192 \
+python gransabio_mcp_server.py
 ```
 
-## Using with Remote BioAI (SaaS)
+## Using with Remote Gran Sabio (SaaS)
 
-If you're using a hosted BioAI Unified instance (run from BioAI_Unified directory):
+If you're using a hosted Gran Sabio LLM instance (run from Gran_Sabio_LLM directory):
 
 ```bash
-claude mcp add bioai-unified \
-  --env BIOAI_API_URL=https://api.bioai.example.com \
-  --env BIOAI_API_KEY=your-api-key \
-  --env BIOAI_GENERATOR_REASONING=high \
-  -- python mcp_server/bioai_mcp_server.py
+claude mcp add gransabio-llm \
+  --env GRANSABIO_API_URL=https://api.gransabio.example.com \
+  --env GRANSABIO_API_KEY=your-api-key \
+  --env GRANSABIO_GENERATOR_REASONING=high \
+  -- python mcp_server/gransabio_mcp_server.py
 ```
 
 ## Per-Call Reasoning Override
@@ -277,7 +277,7 @@ The AI client can override reasoning settings per-call:
 
 ```json
 {
-  "tool": "bioai_analyze_code",
+  "tool": "gransabio_analyze_code",
   "arguments": {
     "code": "def vulnerable(): ...",
     "focus_areas": ["security"],
@@ -296,20 +296,20 @@ On Windows, use the `install_mcp.bat` script for automatic setup.
 For manual installation, use absolute paths:
 
 ```cmd
-claude mcp add bioai-unified -- python C:\path\to\BioAI_Unified\mcp_server\bioai_mcp_server.py
+claude mcp add gransabio-llm -- python C:\path\to\Gran_Sabio_LLM\mcp_server\gransabio_mcp_server.py
 ```
 
 If Python is not in your PATH, use the full Python path:
 
 ```cmd
-claude mcp add bioai-unified -- C:\Python311\python.exe C:\path\to\BioAI_Unified\mcp_server\bioai_mcp_server.py
+claude mcp add gransabio-llm -- C:\Python311\python.exe C:\path\to\Gran_Sabio_LLM\mcp_server\gransabio_mcp_server.py
 ```
 
 ## Troubleshooting
 
 ### "Connection refused" error
 
-Ensure BioAI Unified is running:
+Ensure Gran Sabio LLM is running:
 ```bash
 curl http://localhost:8000/
 ```
@@ -325,7 +325,7 @@ pip install mcp
 
 Increase the timeout for complex analyses:
 ```bash
-BIOAI_TIMEOUT=600 python bioai_mcp_server.py
+GRANSABIO_TIMEOUT=600 python gransabio_mcp_server.py
 ```
 
 ### Models not found
@@ -337,13 +337,13 @@ curl http://localhost:8000/models
 
 ### Check current configuration
 
-Use the `bioai_get_config` tool to see active settings.
+Use the `gransabio_get_config` tool to see active settings.
 
 ## How It Works
 
 ```
 +---------------------+     stdio      +---------------------+     HTTP      +---------------------+
-|  Claude Code        | -------------> |  MCP Server         | ------------> |  BioAI Unified      |
+|  Claude Code        | -------------> |  MCP Server         | ------------> |  Gran Sabio LLM     |
 |  Gemini CLI         |                |  (this script)      |               |  localhost:8000     |
 |  Codex CLI          | <------------- |                     | <------------ |  or remote URL      |
 +---------------------+                +---------------------+               +---------------------+
@@ -368,4 +368,4 @@ Use the `bioai_get_config` tool to see active settings.
 
 ## License
 
-Same license as BioAI Unified (MIT).
+Same license as Gran Sabio LLM (MIT).

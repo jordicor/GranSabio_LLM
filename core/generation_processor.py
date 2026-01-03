@@ -1,5 +1,5 @@
 """
-Core content-generation flow and helper utilities for BioAI Unified.
+Core content-generation flow and helper utilities for Gran Sabio LLM.
 """
 
 from __future__ import annotations

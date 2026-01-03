@@ -1,6 +1,6 @@
 """
-QA Evaluation Service Module for BioAI Unified Engine
-======================================================
+QA Evaluation Service Module for Gran Sabio LLM Engine
+=======================================================
 
 Handles content quality evaluation using AI models.
 Provides structured evaluation with scores, feedback, and edit suggestions.

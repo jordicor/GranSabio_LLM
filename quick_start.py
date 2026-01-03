@@ -1,6 +1,6 @@
 """
-Quick Start Script for BioAI Unified Engine
-==========================================
+Quick Start Script for Gran Sabio LLM Engine
+=============================================
 
 Fast setup and testing script to get the engine running quickly.
 """
@@ -153,7 +153,7 @@ async def test_basic_request():
 
 def main():
     """Main setup and test function"""
-    print("BioAI Unified Engine - Quick Start")
+    print("Gran Sabio LLM - Quick Start")
     print("=" * 50)
     
     # Check environment setup
@@ -195,7 +195,7 @@ def main():
     result = asyncio.run(test_basic_request())
     
     if result:
-        print("\nSUCCESS: BioAI Unified Engine is working correctly!")
+        print("\nSUCCESS: Gran Sabio LLM is working correctly!")
         print("\nNext steps:")
         print("   - Check the full documentation: http://localhost:8000/docs")
         print("   - Run comprehensive tests: python example_request.py")

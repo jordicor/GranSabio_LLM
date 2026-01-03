@@ -1,5 +1,5 @@
 """
-Modularized entrypoint for the BioAI Unified Engine.
+Modularized entrypoint for the Gran Sabio LLM Engine.
 This file wires the FastAPI application together by importing the core package,
 which initializes shared state and registers all routes.
 """
@@ -42,7 +42,7 @@ from word_count_utils import prepare_qa_layers_with_word_count
 if __name__ == "__main__":
     from file_logger import activate_file_logging
 
-    parser = argparse.ArgumentParser(description="BioAI Unified Engine (modularized)")
+    parser = argparse.ArgumentParser(description="Gran Sabio LLM Engine")
     parser.add_argument(
         "--file-logging",
         action="store_true",

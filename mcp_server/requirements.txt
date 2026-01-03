@@ -1,4 +1,4 @@
-# BioAI Unified MCP Server Dependencies
+# Gran Sabio LLM MCP Server Dependencies
 # Install with: pip install -r requirements.txt
 
 # MCP SDK - Model Context Protocol
@@ -8,5 +8,5 @@ mcp>=1.0.0
 httpx>=0.27.0
 
 # Note: These are the minimal dependencies for the MCP server.
-# The main BioAI Unified application has its own requirements.txt
+# The main Gran Sabio LLM application has its own requirements.txt
 # in the project root.

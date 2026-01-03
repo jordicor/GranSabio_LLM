@@ -153,7 +153,7 @@ def _command_delete(args: argparse.Namespace) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Maintenance tools for BioAI attachments")
+    parser = argparse.ArgumentParser(description="Maintenance tools for Gran Sabio LLM attachments")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     list_parser = subparsers.add_parser("list", help="List stored attachments for a user")

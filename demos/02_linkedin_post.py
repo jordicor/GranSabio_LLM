@@ -23,14 +23,14 @@ from pathlib import Path
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from client import AsyncBioAIClient
+from client import AsyncGranSabioClient
 from demos.common import run_demo, print_status, print_generation_result
 
 
 async def demo_linkedin_post():
     """Generate a LinkedIn post with QA validation."""
 
-    async with AsyncBioAIClient() as client:
+    async with AsyncGranSabioClient() as client:
         # Check API is available
         info = await client.get_info()
         print(f"Connected to: {info['service']} v{info['version']}")

@@ -19,7 +19,7 @@ from .security import require_internal_ip
 async def api_info():
     """API information endpoint"""
     return {
-        "service": "BioAI Unified Engine",
+        "service": "Gran Sabio LLM Engine",
         "version": "1.0.0",
         "status": "operational",
         "endpoints": {

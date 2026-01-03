@@ -1,6 +1,6 @@
 """
-Consensus Engine Module for BioAI Unified Engine
-===============================================
+Consensus Engine Module for Gran Sabio LLM Engine
+==================================================
 
 Calculates consensus from multiple AI evaluations and determines
 whether content meets quality standards across all layers.

@@ -35,7 +35,7 @@ from typing import Dict, Any
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from client import AsyncBioAIClient
+from client import AsyncGranSabioClient
 from demos.common import run_demo, print_header, print_json_content, colorize, safe_print
 
 
@@ -225,7 +225,7 @@ async def demo_json_structured_output():
 
     args, _ = parser.parse_known_args()
 
-    async with AsyncBioAIClient() as client:
+    async with AsyncGranSabioClient() as client:
         info = await client.get_info()
         print(f"Connected to: {info['service']} v{info['version']}")
 

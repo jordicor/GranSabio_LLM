@@ -1,5 +1,5 @@
 """
-Configuration for BioAI Unified Engine (fallback-free)
+Configuration for Gran Sabio LLM Engine (fallback-free)
 =====================================================
 
 Central configuration management for all AI models and API keys.
@@ -134,7 +134,7 @@ class AttachmentSettings(BaseModel):
         description="Seconds to cache recent URL downloads per user to avoid duplicates",
     )
     url_user_agent: str = Field(
-        default="BioAI-Unified-Attachments/1.0",
+        default="GranSabio-LLM-Attachments/1.0",
         description="User-Agent header used for remote attachment fetches",
     )
     retention_days: int = Field(
@@ -231,7 +231,7 @@ class DebuggerSettings(BaseModel):
 
 
 class Config(BaseModel):
-    """Configuration settings for the BioAI Unified Engine (no fallbacks)."""
+    """Configuration settings for the Gran Sabio LLM Engine (no fallbacks)."""
 
     model_config = {"populate_by_name": True}
 
@@ -376,7 +376,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         description="Model used for preflight feasibility checks."
     )
     PREFLIGHT_SYSTEM_PROMPT: str = Field(
-        default="""You are the preflight validator for the BioAI Unified editorial engine. Analyze the incoming request and QA contract before any generation. Detect contradictions, impossible requirements, or obvious failure risks. Output JSON only, strictly following the schema in the user message. No creative writing—feasibility analysis only.""",
+        default="""You are the preflight validator for the Gran Sabio LLM editorial engine. Analyze the incoming request and QA contract before any generation. Detect contradictions, impossible requirements, or obvious failure risks. Output JSON only, strictly following the schema in the user message. No creative writing—feasibility analysis only.""",
         description="System prompt used for preflight validation queries."
     )
 

@@ -1,6 +1,6 @@
 """
-Shared Utilities for BioAI Unified Demos
-=========================================
+Shared Utilities for Gran Sabio LLM Demos
+==========================================
 
 Helper functions for formatting and running demo scripts.
 """
@@ -330,7 +330,7 @@ async def run_demo(demo_func: Callable, title: str):
         print("[OK] Demo completed successfully")
     except aiohttp.ClientConnectorError:
         print()
-        print("[ERROR] Cannot connect to BioAI API")
+        print("[ERROR] Cannot connect to Gran Sabio API")
         print("        Make sure the server is running: python main.py")
         sys.exit(1)
     except Exception as e:

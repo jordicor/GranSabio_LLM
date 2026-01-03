@@ -1,6 +1,6 @@
 """
-Data Models for BioAI Unified Engine
-====================================
+Data Models for Gran Sabio LLM Engine
+======================================
 
 Pydantic models for request/response handling and internal data structures.
 """

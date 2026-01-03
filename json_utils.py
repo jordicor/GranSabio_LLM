@@ -1,8 +1,8 @@
 """
-Optimized JSON utilities using orjson for BioAI Unified Engine
-============================================================
+Optimized JSON utilities using orjson for Gran Sabio LLM Engine
+================================================================
 
-Provides a high-performance JSON interface using orjson while maintaining 
+Provides a high-performance JSON interface using orjson while maintaining
 compatibility with standard json library interface.
 
 orjson is 3.6x faster than standard json based on our benchmarks.

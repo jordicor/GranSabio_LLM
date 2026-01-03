@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 REM ===================================
-REM BioAI Unified MCP Server Installer
+REM Gran Sabio LLM MCP Server Installer
 REM Registers the MCP server with Claude Code using the correct absolute path.
 REM
 REM Usage:
@@ -13,8 +13,8 @@ REM ===================================
 set "SCRIPT_DIR=%~dp0"
 REM Remove trailing backslash
 set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
-set "MCP_SERVER_PATH=%SCRIPT_DIR%\mcp_server\bioai_mcp_server.py"
-set "MCP_NAME=bioai-unified"
+set "MCP_SERVER_PATH=%SCRIPT_DIR%\mcp_server\gransabio_mcp_server.py"
+set "MCP_NAME=gransabio-llm"
 
 REM Check for uninstall flag
 if "%~1"=="--uninstall" goto :uninstall
@@ -52,10 +52,10 @@ if "%PYTHON_CMD%"=="" (
 )
 
 echo ===================================
-echo BioAI Unified MCP Server Installer
+echo Gran Sabio LLM MCP Server Installer
 echo ===================================
 echo.
-echo This will register the BioAI Unified MCP server with Claude Code.
+echo This will register the Gran Sabio LLM MCP server with Claude Code.
 echo.
 echo Server path: %MCP_SERVER_PATH%
 echo Python: %PYTHON_CMD%
@@ -87,20 +87,20 @@ echo Installation complete!
 echo.
 echo The MCP server is now available in Claude Code.
 echo Available tools:
-echo   - bioai_analyze_code    : Analyze code for bugs and security issues
-echo   - bioai_review_fix      : Review proposed code fixes
-echo   - bioai_generate_with_qa: Generate content with multi-model QA
-echo   - bioai_check_health    : Check API connectivity
-echo   - bioai_list_models     : List available AI models
-echo   - bioai_get_config      : View current configuration
+echo   - gransabio_analyze_code    : Analyze code for bugs and security issues
+echo   - gransabio_review_fix      : Review proposed code fixes
+echo   - gransabio_generate_with_qa: Generate content with multi-model QA
+echo   - gransabio_check_health    : Check API connectivity
+echo   - gransabio_list_models     : List available AI models
+echo   - gransabio_get_config      : View current configuration
 echo.
-echo Make sure BioAI Unified API is running: python main.py
+echo Make sure Gran Sabio LLM API is running: python main.py
 echo.
 echo To uninstall: install_mcp.bat --uninstall
 goto :eof
 
 :uninstall
-echo Removing BioAI Unified MCP server...
+echo Removing Gran Sabio LLM MCP server...
 claude mcp remove %MCP_NAME% >nul 2>&1
 if errorlevel 1 (
     echo MCP server '%MCP_NAME%' was not registered or already removed.

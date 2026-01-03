@@ -1,5 +1,5 @@
 """
-Generation and streaming API routes for BioAI Unified.
+Generation and streaming API routes for Gran Sabio LLM.
 """
 
 from __future__ import annotations
@@ -117,9 +117,9 @@ async def allocate_project_id(request: Optional[ProjectInitRequest] = Body(defau
 
     if supplied_id:
         if _is_project_reserved(supplied_id):
-            logger.info("BIOAI_MAIN: Reusing existing project_id reservation: %s", supplied_id)
+            logger.info("GRANSABIO_MAIN: Reusing existing project_id reservation: %s", supplied_id)
         else:
-            logger.info("BIOAI_MAIN: Reserving client-supplied project_id: %s", supplied_id)
+            logger.info("GRANSABIO_MAIN: Reserving client-supplied project_id: %s", supplied_id)
             _reserve_project_id(supplied_id)
         return ProjectInitResponse(project_id=supplied_id)
 
@@ -132,7 +132,7 @@ async def allocate_project_id(request: Optional[ProjectInitRequest] = Body(defau
     if not project_id:
         raise HTTPException(status_code=500, detail="Unable to allocate a unique project identifier. Try again.")
 
-    logger.info("BIOAI_MAIN: Generated NEW project_id via /project/new: %s", project_id)
+    logger.info("GRANSABIO_MAIN: Generated NEW project_id via /project/new: %s", project_id)
     _reserve_project_id(project_id)
     return ProjectInitResponse(project_id=project_id)
 
@@ -159,7 +159,7 @@ async def start_project(project_id: str):
     status = "reactivated" if was_cancelled else "already_active"
 
     logger.info(
-        "BIOAI_MAIN: Project %s %s via /project/start",
+        "GRANSABIO_MAIN: Project %s %s via /project/start",
         project_id,
         "reactivated (was cancelled)" if was_cancelled else "confirmed active"
     )
@@ -194,7 +194,7 @@ async def stop_project(project_id: str):
     sessions_cancelled = _stop_project(project_id)
 
     logger.info(
-        "BIOAI_MAIN: Project %s cancelled via /project/stop - %d active sessions stopped",
+        "GRANSABIO_MAIN: Project %s cancelled via /project/stop - %d active sessions stopped",
         project_id,
         sessions_cancelled
     )
@@ -209,8 +209,8 @@ async def stop_project(project_id: str):
 @app.post("/generate", response_model=GenerationInitResponse)
 async def generate_content(request: ContentRequest):
     """
-    Generate content using the BioAI Unified Engine
-    
+    Generate content using the Gran Sabio LLM Engine
+
     This endpoint initiates content generation with multi-layer QA evaluation.
     Returns a session ID for tracking progress via the /status endpoint.
     """
@@ -299,12 +299,12 @@ async def generate_content(request: ContentRequest):
             if len(candidate) > 128:
                 raise HTTPException(status_code=400, detail="project_id must be 128 characters or fewer")
             project_id = candidate
-            logger.info(f"BIOAI_MAIN: Received EXISTING project_id in request: {project_id}")
+            logger.info(f"GRANSABIO_MAIN: Received EXISTING project_id in request: {project_id}")
 
             # Check if this project has been cancelled - reject new requests
             if _is_project_cancelled(project_id):
                 logger.warning(
-                    "BIOAI_MAIN: Rejecting request for CANCELLED project_id: %s "
+                    "GRANSABIO_MAIN: Rejecting request for CANCELLED project_id: %s "
                     "(client should call /project/start/%s first)",
                     project_id, project_id
                 )
@@ -323,9 +323,9 @@ async def generate_content(request: ContentRequest):
     if not project_id:
         # Unification: session_id = project_id when not explicitly provided
         project_id = session_id
-        logger.info(f"BIOAI_MAIN: Using session_id as project_id: {project_id}")
+        logger.info(f"GRANSABIO_MAIN: Using session_id as project_id: {project_id}")
     else:
-        logger.info(f"BIOAI_MAIN: Using explicit project_id: {project_id}")
+        logger.info(f"GRANSABIO_MAIN: Using explicit project_id: {project_id}")
 
     if project_id:
         _reserve_project_id(project_id)
@@ -549,7 +549,7 @@ async def generate_content(request: ContentRequest):
         "last_generated_content_word_count": 0,
     })
 
-    logger.info(f"BIOAI_MAIN: About to record session {session_id[:8]}... with project_id: {project_id if project_id else 'NULL'}")
+    logger.info(f"GRANSABIO_MAIN: About to record session {session_id[:8]}... with project_id: {project_id if project_id else 'NULL'}")
     asyncio.create_task(_debug_session_start(
         session_id,
         request_payload=request,

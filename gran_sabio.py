@@ -1,6 +1,6 @@
 """
-Gran Sabio Module for BioAI Unified Engine
-==========================================
+Gran Sabio Module for Gran Sabio LLM Engine
+============================================
 
 The final escalation system that resolves conflicts and makes ultimate
 decisions when the standard QA process cannot reach consensus.

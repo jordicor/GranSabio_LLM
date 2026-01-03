@@ -1,6 +1,6 @@
 """
-AI Service Module for BioAI Unified Engine
-==========================================
+AI Service Module for Gran Sabio LLM Engine
+============================================
 
 Handles communication with multiple AI providers (OpenAI, Anthropic, Google).
 Provides unified interface for content generation across different models.
@@ -235,8 +235,8 @@ class AIService:
                 timeout=180.0,  # Increased timeout for better stability
                 max_retries=3,
                 default_headers={
-                    "HTTP-Referer": "https://bioai-unified.local",
-                    "X-Title": "BioAI Unified Engine"
+                    "HTTP-Referer": "https://gransabio-llm.local",
+                    "X-Title": "Gran Sabio LLM Engine"
                 }
             )
             logger.info("OpenRouter client initialized for unified model access")

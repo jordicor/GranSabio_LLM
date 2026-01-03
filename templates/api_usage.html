@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BioAI Content Engine - API Usage Guide</title>
+    <title>Gran Sabio LLM - API Usage Guide</title>
     <link rel="stylesheet" href="/static/css/style.css">
     <link rel="stylesheet" href="/static/css/docs.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -14,7 +14,7 @@
         <!-- Sidebar Navigation -->
         <nav class="docs-sidebar">
             <div class="sidebar-header">
-                <h1 class="docs-logo">BioAI <span class="accent">Content Engine</span></h1>
+                <h1 class="docs-logo">Gran Sabio <span class="accent">LLM</span></h1>
                 <p class="docs-version">API Usage Guide</p>
             </div>
 
@@ -72,7 +72,7 @@
         <main class="docs-content">
             <!-- Introduction -->
             <section id="introduction" class="docs-section">
-                <h1 class="docs-heading">BioAI Content Engine</h1>
+                <h1 class="docs-heading">Gran Sabio LLM</h1>
                 <p class="docs-lead">
                     Professional content generation platform with enterprise-grade quality assurance.
                 </p>
@@ -114,7 +114,7 @@
             <!-- Quick Start -->
             <section id="quick-start" class="docs-section">
                 <h2 class="docs-subheading">Quick Start Guide</h2>
-                <p>Get started with BioAI Content Engine in three simple steps:</p>
+                <p>Get started with Gran Sabio LLM in three simple steps:</p>
 
                 <div class="steps-container">
                     <div class="step-card">
@@ -144,7 +144,7 @@
 import json
 
 # Step 1: Generate content
-response = requests.post('https://api.bioai.com/generate', json={
+response = requests.post('https://api.example.com/generate', json={
     "prompt": "Write a professional biography of Marie Curie",
     "content_type": "biography",
     "max_words": 1000,
@@ -154,11 +154,11 @@ response = requests.post('https://api.bioai.com/generate', json={
 session_id = response.json()['session_id']
 
 # Step 2: Check status
-status = requests.get(f'https://api.bioai.com/status/{session_id}')
+status = requests.get(f'https://api.example.com/status/{session_id}')
 print(f"Status: {status.json()['status']}")
 
 # Step 3: Get result (when completed)
-result = requests.get(f'https://api.bioai.com/result/{session_id}')
+result = requests.get(f'https://api.example.com/result/{session_id}')
 content = result.json()['content']</code></pre>
                 </div>
             </section>
@@ -544,7 +544,7 @@ eventSource.onmessage = (event) => {
                     <pre><code class="language-python"># Upload a reference document
 with open('research_notes.pdf', 'rb') as f:
     response = requests.post(
-        'https://api.bioai.com/attachments',
+        'https://api.example.com/attachments',
         files={'file': f},
         data={'username': 'your_username'}
     )
@@ -796,7 +796,7 @@ import time
 def generate_biography(subject_name, focus_areas):
     # Submit generation request
     response = requests.post(
-        'https://api.bioai.com/generate',
+        'https://api.example.com/generate',
         headers={'Authorization': f'Bearer {API_KEY}'},
         json={
             "prompt": f"Write a comprehensive biography of {subject_name}, "
@@ -826,7 +826,7 @@ def generate_biography(subject_name, focus_areas):
     # Poll for completion
     while True:
         status = requests.get(
-            f'https://api.bioai.com/status/{session_id}',
+            f'https://api.example.com/status/{session_id}',
             headers={'Authorization': f'Bearer {API_KEY}'}
         ).json()
 
@@ -839,7 +839,7 @@ def generate_biography(subject_name, focus_areas):
 
     # Get final result
     result = requests.get(
-        f'https://api.bioai.com/result/{session_id}',
+        f'https://api.example.com/result/{session_id}',
         headers={'Authorization': f'Bearer {API_KEY}'}
     ).json()
 
@@ -866,7 +866,7 @@ print(biography)</code></pre>
     );
 
     // Generate article with context
-    const response = await fetch('https://api.bioai.com/generate', {
+    const response = await fetch('https://api.example.com/generate', {
         method: 'POST',
         headers: {
             'Authorization': `Bearer ${API_KEY}`,
@@ -901,7 +901,7 @@ print(biography)</code></pre>
 
     // Stream progress (project_id = session_id when not explicitly provided)
     const eventSource = new EventSource(
-        `https://api.bioai.com/stream/project/${session_id}`
+        `https://api.example.com/stream/project/${session_id}`
     );
 
     return new Promise((resolve, reject) => {
@@ -911,7 +911,7 @@ print(biography)</code></pre>
 
             if (data.status === 'completed') {
                 eventSource.close();
-                fetch(`https://api.bioai.com/result/${session_id}`)
+                fetch(`https://api.example.com/result/${session_id}`)
                     .then(r => r.json())
                     .then(result => resolve(result.content));
             }
@@ -967,8 +967,8 @@ print(biography)</code></pre>
             <section class="docs-footer">
                 <div class="footer-content">
                     <h3>Need Help?</h3>
-                    <p>Contact our support team at <a href="mailto:support@bioai.com">support@bioai.com</a></p>
-                    <p>API Status: <a href="https://status.bioai.com">status.bioai.com</a></p>
+                    <p>Contact our support team at <a href="mailto:support@example.com">support@example.com</a></p>
+                    <p>API Status: <a href="https://status.example.com">status.example.com</a></p>
                 </div>
             </section>
         </main>

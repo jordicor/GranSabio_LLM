@@ -51,7 +51,7 @@ def fetch_ip_ranges(url: str) -> list[str]:
     try:
         req = urllib.request.Request(
             url,
-            headers={"User-Agent": "BioAI-Unified/1.0 (Cloudflare IP Updater)"}
+            headers={"User-Agent": "GranSabio-LLM/1.0 (Cloudflare IP Updater)"}
         )
         with urllib.request.urlopen(req, timeout=30) as response:
             content = response.read().decode("utf-8")

@@ -1,5 +1,5 @@
 """
-OpenRouter models management routes for BioAI Unified.
+OpenRouter models management routes for Gran Sabio LLM.
 Provides interface to browse, select, and sync OpenRouter models.
 """
 

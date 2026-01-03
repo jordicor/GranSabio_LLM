@@ -2,7 +2,7 @@
 Demo 01: Simple Article Generation (No QA)
 ==========================================
 
-This demo shows the most basic usage of BioAI Unified:
+This demo shows the most basic usage of Gran Sabio LLM:
 - Generate content with a simple prompt
 - No quality evaluation (QA bypass mode)
 - Fast response, single iteration
@@ -23,14 +23,14 @@ from pathlib import Path
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from client import AsyncBioAIClient
+from client import AsyncGranSabioClient
 from demos.common import run_demo, print_header, print_generation_result
 
 
 async def demo_simple_article():
     """Generate a simple article without QA validation."""
 
-    async with AsyncBioAIClient() as client:
+    async with AsyncGranSabioClient() as client:
         # Check API is available
         info = await client.get_info()
         print(f"Connected to: {info['service']} v{info['version']}")

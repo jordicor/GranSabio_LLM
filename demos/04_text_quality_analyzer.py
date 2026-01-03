@@ -33,7 +33,7 @@ from typing import Dict, Any, List
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from client import AsyncBioAIClient
+from client import AsyncGranSabioClient
 from demos.common import run_demo, print_header, print_section, colorize, safe_print
 
 
@@ -198,7 +198,7 @@ def analyze_ai_tics(top_words: List[Dict], repetition_data: Dict) -> Dict[str, A
     return findings
 
 
-async def analyze_text(client: AsyncBioAIClient, text: str, label: str = "Text"):
+async def analyze_text(client: AsyncGranSabioClient, text: str, label: str = "Text"):
     """Perform comprehensive text analysis."""
     print()
     print_header(f"Analyzing: {label}", "-")
@@ -356,7 +356,7 @@ async def demo_text_quality_analyzer():
 
     args, _ = parser.parse_known_args()
 
-    async with AsyncBioAIClient() as client:
+    async with AsyncGranSabioClient() as client:
         info = await client.get_info()
         print(f"Connected to: {info['service']} v{info['version']}")
 

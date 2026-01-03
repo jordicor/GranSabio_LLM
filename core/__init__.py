@@ -1,5 +1,5 @@
 """
-Core package exposing modularized components of the BioAI Unified Engine.
+Core package exposing modularized components of the Gran Sabio LLM Engine.
 Importing this package ensures all route modules are loaded so route
 definitions attach to the shared FastAPI application.
 """

@@ -12,7 +12,7 @@ Features:
 - Thread-safe file operations
 - Captures Python logging module output
 
-Author: BioAI Unified Team
+Author: Gran Sabio LLM Team
 """
 
 import sys

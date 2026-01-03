@@ -3,26 +3,26 @@
     "IMPORTANT: Copy this file to .mcp.json and replace the path below with your ABSOLUTE path.",
     "MCP servers require absolute paths - relative paths will NOT work.",
     "Recommended: Use install_mcp.bat (Windows) or install_mcp.sh (Linux/macOS) instead.",
-    "Windows example: C:/Projects/BioAI_Unified/mcp_server/bioai_mcp_server.py",
-    "Linux example: /home/user/BioAI_Unified/mcp_server/bioai_mcp_server.py"
+    "Windows example: C:/Projects/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py",
+    "Linux example: /home/user/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py"
   ],
   "mcpServers": {
-    "bioai-unified": {
+    "gransabio-llm": {
       "type": "stdio",
       "command": "python",
-      "args": ["/REPLACE/WITH/YOUR/ABSOLUTE/PATH/TO/BioAI_Unified/mcp_server/bioai_mcp_server.py"],
+      "args": ["/REPLACE/WITH/YOUR/ABSOLUTE/PATH/TO/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py"],
       "env": {
-        "BIOAI_API_URL": "${BIOAI_API_URL:-http://localhost:8000}",
-        "BIOAI_API_KEY": "${BIOAI_API_KEY:-}",
-        "BIOAI_GENERATOR_MODEL": "${BIOAI_GENERATOR_MODEL:-gpt-5.2}",
-        "BIOAI_QA_MODELS": "${BIOAI_QA_MODELS:-claude-opus-4-5-20251101,z-ai/glm-4.7,gemini-3-pro-preview}",
-        "BIOAI_GRAN_SABIO_MODEL": "${BIOAI_GRAN_SABIO_MODEL:-claude-opus-4-5-20251101}",
-        "BIOAI_GENERATOR_REASONING": "${BIOAI_GENERATOR_REASONING:-medium}",
-        "BIOAI_QA_REASONING": "${BIOAI_QA_REASONING:-medium}",
-        "BIOAI_GRAN_SABIO_REASONING": "${BIOAI_GRAN_SABIO_REASONING:-high}",
-        "BIOAI_THINKING_BUDGET": "${BIOAI_THINKING_BUDGET:-0}"
+        "GRANSABIO_API_URL": "${GRANSABIO_API_URL:-http://localhost:8000}",
+        "GRANSABIO_API_KEY": "${GRANSABIO_API_KEY:-}",
+        "GRANSABIO_GENERATOR_MODEL": "${GRANSABIO_GENERATOR_MODEL:-gpt-5.2}",
+        "GRANSABIO_QA_MODELS": "${GRANSABIO_QA_MODELS:-claude-opus-4-5-20251101,z-ai/glm-4.7,gemini-3-pro-preview}",
+        "GRANSABIO_ARBITER_MODEL": "${GRANSABIO_ARBITER_MODEL:-claude-opus-4-5-20251101}",
+        "GRANSABIO_GENERATOR_REASONING": "${GRANSABIO_GENERATOR_REASONING:-medium}",
+        "GRANSABIO_QA_REASONING": "${GRANSABIO_QA_REASONING:-medium}",
+        "GRANSABIO_ARBITER_REASONING": "${GRANSABIO_ARBITER_REASONING:-high}",
+        "GRANSABIO_THINKING_BUDGET": "${GRANSABIO_THINKING_BUDGET:-0}"
       },
-      "description": "BioAI Unified - Multi-model QA for code analysis and content generation with reasoning support"
+      "description": "Gran Sabio LLM - Multi-model QA for code analysis and content generation with reasoning support"
     }
   }
 }

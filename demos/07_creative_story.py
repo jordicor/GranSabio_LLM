@@ -36,7 +36,7 @@ from pathlib import Path
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from client import AsyncBioAIClient
+from client import AsyncGranSabioClient
 from demos.common import run_demo, print_header, print_status, print_generation_result
 
 
@@ -67,7 +67,7 @@ async def demo_creative_story():
     # Clamp word count
     target_words = max(600, min(1200, args.words))
 
-    async with AsyncBioAIClient() as client:
+    async with AsyncGranSabioClient() as client:
         info = await client.get_info()
         print(f"Connected to: {info['service']} v{info['version']}")
 

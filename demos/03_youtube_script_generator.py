@@ -46,7 +46,7 @@ from typing import Dict, Any, Optional
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from client import AsyncBioAIClient
+from client import AsyncGranSabioClient
 from demos.common import (
     run_demo,
     print_header,
@@ -180,7 +180,7 @@ THUMBNAIL_IDEAS_SCHEMA = {
 class YouTubeScriptPipeline:
     """Multi-phase YouTube script generation pipeline."""
 
-    def __init__(self, client: AsyncBioAIClient, project_id: str):
+    def __init__(self, client: AsyncGranSabioClient, project_id: str):
         self.client = client
         self.project_id = project_id
         self.results: Dict[str, Any] = {}
@@ -612,7 +612,7 @@ async def demo_youtube_script_generator():
     # Only parse known args to avoid issues with run_demo
     args, _ = parser.parse_known_args()
 
-    async with AsyncBioAIClient() as client:
+    async with AsyncGranSabioClient() as client:
         # Check API
         info = await client.get_info()
         print(f"Connected to: {info['service']} v{info['version']}")

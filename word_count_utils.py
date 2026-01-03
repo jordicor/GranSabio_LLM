@@ -1,6 +1,6 @@
 """
-Word Count Utilities for BioAI Unified Engine
-=============================================
+Word Count Utilities for Gran Sabio LLM Engine
+===============================================
 
 Utilities for word count validation and enforcement.
 """

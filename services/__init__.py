@@ -1,1 +1,1 @@
-"Service layer utilities for BioAI Unified."
+"Service layer utilities for Gran Sabio LLM."

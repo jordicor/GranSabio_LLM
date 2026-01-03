@@ -1,4 +1,4 @@
-# Common utilities for BioAI Unified demos
+# Common utilities for Gran Sabio LLM demos
 from .utils import (
     print_header,
     print_section,

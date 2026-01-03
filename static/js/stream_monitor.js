@@ -1,5 +1,5 @@
 // ============================================
-// BIOAI UNIFIED STREAM MONITOR
+// GRAN SABIO LLM STREAM MONITOR
 // Direct connection (no proxy needed)
 // ============================================
 
@@ -2002,7 +2002,7 @@ function showLiveActivityIndicator(iteration) {
 // ============================================
 
 document.addEventListener('DOMContentLoaded', function() {
-    log('BioAI Stream Monitor initialized', 'success');
+    log('Gran Sabio LLM Stream Monitor initialized', 'success');
     log(`Stream endpoint: ${STREAM_BASE}/stream/project/{id}`, 'info');
 
     // Initialize toggle switch listeners

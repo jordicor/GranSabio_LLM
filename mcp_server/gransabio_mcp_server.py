@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-BioAI Unified MCP Server
+Gran Sabio LLM MCP Server
 
-Model Context Protocol server that exposes BioAI Unified's code analysis
+Model Context Protocol server that exposes Gran Sabio LLM's code analysis
 and content generation capabilities to AI coding assistants like Claude Code,
 Gemini CLI, and Codex CLI.
 
-This server acts as a bridge between MCP-compatible clients and the BioAI
-Unified API, providing structured tools for code review, analysis, and
+This server acts as a bridge between MCP-compatible clients and the Gran Sabio
+LLM API, providing structured tools for code review, analysis, and
 AI-assisted content generation with multi-model QA.
 
 Usage:
     # Local development
-    python bioai_mcp_server.py
+    python gransabio_mcp_server.py
 
     # With Claude Code
-    claude mcp add bioai-unified -- python /path/to/bioai_mcp_server.py
+    claude mcp add gransabio-llm -- python /path/to/gransabio_mcp_server.py
 
-    # With custom BioAI URL
-    BIOAI_API_URL=https://api.example.com python bioai_mcp_server.py
+    # With custom Gran Sabio URL
+    GRANSABIO_API_URL=https://api.example.com python gransabio_mcp_server.py
 """
 
 import asyncio
@@ -47,29 +47,29 @@ except ImportError:
 # Configuration from environment
 # =============================================================================
 
-BIOAI_API_URL = os.getenv("BIOAI_API_URL", "http://localhost:8000")
-BIOAI_API_KEY = os.getenv("BIOAI_API_KEY", "")
-REQUEST_TIMEOUT = int(os.getenv("BIOAI_TIMEOUT", "300"))
-POLL_INTERVAL = float(os.getenv("BIOAI_POLL_INTERVAL", "2.0"))
+GRANSABIO_API_URL = os.getenv("GRANSABIO_API_URL", "http://localhost:8000")
+GRANSABIO_API_KEY = os.getenv("GRANSABIO_API_KEY", "")
+REQUEST_TIMEOUT = int(os.getenv("GRANSABIO_TIMEOUT", "300"))
+POLL_INTERVAL = float(os.getenv("GRANSABIO_POLL_INTERVAL", "2.0"))
 
 # Default models configuration
-DEFAULT_GENERATOR_MODEL = os.getenv("BIOAI_GENERATOR_MODEL", "gpt-5.2")
+DEFAULT_GENERATOR_MODEL = os.getenv("GRANSABIO_GENERATOR_MODEL", "gpt-5.2")
 DEFAULT_QA_MODELS = os.getenv(
-    "BIOAI_QA_MODELS",
+    "GRANSABIO_QA_MODELS",
     "claude-opus-4-5-20251101,z-ai/glm-4.7,gemini-3-pro-preview"
 ).split(",")
-DEFAULT_GRAN_SABIO_MODEL = os.getenv(
-    "BIOAI_GRAN_SABIO_MODEL",
+DEFAULT_ARBITER_MODEL = os.getenv(
+    "GRANSABIO_ARBITER_MODEL",
     "claude-opus-4-5-20251101"
 )
 
 # Reasoning configuration defaults
-DEFAULT_GENERATOR_REASONING = os.getenv("BIOAI_GENERATOR_REASONING", "medium")
-DEFAULT_QA_REASONING = os.getenv("BIOAI_QA_REASONING", "medium")
-DEFAULT_GRAN_SABIO_REASONING = os.getenv("BIOAI_GRAN_SABIO_REASONING", "high")
+DEFAULT_GENERATOR_REASONING = os.getenv("GRANSABIO_GENERATOR_REASONING", "medium")
+DEFAULT_QA_REASONING = os.getenv("GRANSABIO_QA_REASONING", "medium")
+DEFAULT_ARBITER_REASONING = os.getenv("GRANSABIO_ARBITER_REASONING", "high")
 
 # Thinking budget for Claude models (0 = auto/disabled)
-_thinking_budget_env = os.getenv("BIOAI_THINKING_BUDGET", "0")
+_thinking_budget_env = os.getenv("GRANSABIO_THINKING_BUDGET", "0")
 DEFAULT_THINKING_BUDGET = int(_thinking_budget_env) if _thinking_budget_env.isdigit() else 0
 
 
@@ -165,25 +165,25 @@ def _build_qa_config(args: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
-def _build_gran_sabio_config(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Build Gran Sabio configuration."""
-    # Gran Sabio doesn't support per-call reasoning config in the API yet,
+def _build_arbiter_config(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Build arbiter (Gran Sabio) configuration."""
+    # Arbiter doesn't support per-call reasoning config in the API yet,
     # but we prepare the model selection
     return {
-        "gran_sabio_model": args.get("gran_sabio_model", DEFAULT_GRAN_SABIO_MODEL),
+        "gran_sabio_model": args.get("gran_sabio_model", DEFAULT_ARBITER_MODEL),
         "gran_sabio_fallback": True
     }
 
 
 # Initialize MCP server
-server = Server("bioai-unified")
+server = Server("gransabio-llm")
 
 
 def _build_headers() -> dict[str, str]:
     """Build request headers with optional API key."""
     headers = {"Content-Type": "application/json"}
-    if BIOAI_API_KEY:
-        headers["Authorization"] = f"Bearer {BIOAI_API_KEY}"
+    if GRANSABIO_API_KEY:
+        headers["Authorization"] = f"Bearer {GRANSABIO_API_KEY}"
     return headers
 
 
@@ -194,7 +194,7 @@ async def _wait_for_result(
 ) -> dict[str, Any]:
     """Poll for generation result until completion or timeout."""
     start_time = time.time()
-    result_url = f"{BIOAI_API_URL}/result/{session_id}"
+    result_url = f"{GRANSABIO_API_URL}/result/{session_id}"
 
     while time.time() - start_time < timeout:
         try:
@@ -228,12 +228,12 @@ async def _wait_for_result(
     raise Exception(f"Timeout waiting for result after {timeout}s")
 
 
-async def _call_bioai(payload: dict[str, Any]) -> dict[str, Any]:
-    """Make a generation request to BioAI Unified and wait for result."""
+async def _call_gransabio(payload: dict[str, Any]) -> dict[str, Any]:
+    """Make a generation request to Gran Sabio LLM and wait for result."""
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         # Start generation
         response = await client.post(
-            f"{BIOAI_API_URL}/generate",
+            f"{GRANSABIO_API_URL}/generate",
             json=payload,
             headers=_build_headers()
         )
@@ -278,10 +278,10 @@ async def _call_bioai(payload: dict[str, Any]) -> dict[str, Any]:
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    """List available BioAI tools."""
+    """List available Gran Sabio LLM tools."""
     return [
         Tool(
-            name="bioai_analyze_code",
+            name="gransabio_analyze_code",
             description="""Analyze code for bugs, security issues, performance problems,
 and best practices violations. Uses multiple AI models for consensus-based review.
 
@@ -322,7 +322,7 @@ Use this BEFORE implementing fixes to understand the full scope of issues.""",
             }
         ),
         Tool(
-            name="bioai_review_fix",
+            name="gransabio_review_fix",
             description="""Review a proposed code fix before applying it.
 Validates that the fix:
 - Actually solves the problem
@@ -359,7 +359,7 @@ from multiple AI models.""",
             }
         ),
         Tool(
-            name="bioai_generate_with_qa",
+            name="gransabio_generate_with_qa",
             description="""Generate content with multi-model quality assurance.
 Useful for generating code, documentation, or any text that needs to meet
 quality standards.
@@ -419,8 +419,8 @@ Returns approved content only when it meets all quality criteria.""",
             }
         ),
         Tool(
-            name="bioai_check_health",
-            description="""Check if BioAI Unified API is available and responding.
+            name="gransabio_check_health",
+            description="""Check if Gran Sabio LLM API is available and responding.
 Use this to verify connectivity before making other requests.""",
             inputSchema={
                 "type": "object",
@@ -429,8 +429,8 @@ Use this to verify connectivity before making other requests.""",
             }
         ),
         Tool(
-            name="bioai_list_models",
-            description="""List available AI models in BioAI Unified.
+            name="gransabio_list_models",
+            description="""List available AI models in Gran Sabio LLM.
 Shows models organized by provider with their capabilities and pricing.""",
             inputSchema={
                 "type": "object",
@@ -445,7 +445,7 @@ Shows models organized by provider with their capabilities and pricing.""",
             }
         ),
         Tool(
-            name="bioai_get_config",
+            name="gransabio_get_config",
             description="""Get current MCP server configuration including default models
 and reasoning settings. Useful for debugging or understanding current setup.""",
             inputSchema={
@@ -462,17 +462,17 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Handle tool calls."""
 
     try:
-        if name == "bioai_analyze_code":
+        if name == "gransabio_analyze_code":
             result = await _handle_analyze_code(arguments)
-        elif name == "bioai_review_fix":
+        elif name == "gransabio_review_fix":
             result = await _handle_review_fix(arguments)
-        elif name == "bioai_generate_with_qa":
+        elif name == "gransabio_generate_with_qa":
             result = await _handle_generate_with_qa(arguments)
-        elif name == "bioai_check_health":
+        elif name == "gransabio_check_health":
             result = await _handle_check_health()
-        elif name == "bioai_list_models":
+        elif name == "gransabio_list_models":
             result = await _handle_list_models(arguments)
-        elif name == "bioai_get_config":
+        elif name == "gransabio_get_config":
             result = _handle_get_config()
         else:
             result = {"error": f"Unknown tool: {name}"}
@@ -483,7 +483,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         error_result = {
             "error": str(e),
             "tool": name,
-            "hint": "Ensure BioAI Unified is running at " + BIOAI_API_URL
+            "hint": "Ensure Gran Sabio LLM is running at " + GRANSABIO_API_URL
         }
         return [TextContent(type="text", text=json.dumps(error_result, indent=2))]
 
@@ -549,7 +549,7 @@ Provide a comprehensive analysis in JSON format with:
     # Build configuration from arguments
     generator_config = _build_generator_config(args)
     qa_config = _build_qa_config(args)
-    gran_sabio_config = _build_gran_sabio_config(args)
+    arbiter_config = _build_arbiter_config(args)
 
     payload = {
         "prompt": prompt,
@@ -557,7 +557,7 @@ Provide a comprehensive analysis in JSON format with:
         "json_output": True,
         **generator_config,
         **qa_config,
-        **gran_sabio_config,
+        **arbiter_config,
         "qa_layers": qa_layers,
         "min_global_score": 7.5,
         "max_iterations": 3,
@@ -565,7 +565,7 @@ Provide a comprehensive analysis in JSON format with:
         "show_query_costs": 2
     }
 
-    result = await _call_bioai(payload)
+    result = await _call_gransabio(payload)
 
     # Parse the content if successful
     if result.get("success") and result.get("content"):
@@ -640,7 +640,7 @@ Analyze and respond in JSON format:
     # Build configuration from arguments
     generator_config = _build_generator_config(args)
     qa_config = _build_qa_config(args)
-    gran_sabio_config = _build_gran_sabio_config(args)
+    arbiter_config = _build_arbiter_config(args)
 
     payload = {
         "prompt": prompt,
@@ -648,7 +648,7 @@ Analyze and respond in JSON format:
         "json_output": True,
         **generator_config,
         **qa_config,
-        **gran_sabio_config,
+        **arbiter_config,
         "qa_layers": qa_layers,
         "min_global_score": 7.5,
         "max_iterations": 2,
@@ -656,7 +656,7 @@ Analyze and respond in JSON format:
         "show_query_costs": 2
     }
 
-    result = await _call_bioai(payload)
+    result = await _call_gransabio(payload)
 
     # Parse the content if successful
     if result.get("success") and result.get("content"):
@@ -708,40 +708,40 @@ async def _handle_generate_with_qa(args: dict[str, Any]) -> dict[str, Any]:
     # Build configuration from arguments
     generator_config = _build_generator_config(args)
     qa_config = _build_qa_config(args)
-    gran_sabio_config = _build_gran_sabio_config(args)
+    arbiter_config = _build_arbiter_config(args)
 
     payload = {
         "prompt": prompt,
         "content_type": content_type,
         **generator_config,
         **qa_config,
-        **gran_sabio_config,
+        **arbiter_config,
         "qa_layers": qa_layers,
         "min_global_score": min_score,
         "max_iterations": max_iterations,
         "show_query_costs": 2
     }
 
-    return await _call_bioai(payload)
+    return await _call_gransabio(payload)
 
 
 async def _handle_check_health() -> dict[str, Any]:
-    """Check BioAI API health."""
+    """Check Gran Sabio LLM API health."""
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             response = await client.get(
-                f"{BIOAI_API_URL}/",
+                f"{GRANSABIO_API_URL}/",
                 headers=_build_headers()
             )
             return {
                 "status": "healthy" if response.status_code == 200 else "unhealthy",
-                "api_url": BIOAI_API_URL,
+                "api_url": GRANSABIO_API_URL,
                 "response_code": response.status_code
             }
         except Exception as e:
             return {
                 "status": "unreachable",
-                "api_url": BIOAI_API_URL,
+                "api_url": GRANSABIO_API_URL,
                 "error": str(e)
             }
 
@@ -753,7 +753,7 @@ async def _handle_list_models(args: dict[str, Any]) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=30) as client:
         try:
             response = await client.get(
-                f"{BIOAI_API_URL}/models",
+                f"{GRANSABIO_API_URL}/models",
                 headers=_build_headers()
             )
 
@@ -787,7 +787,7 @@ async def _handle_list_models(args: dict[str, Any]) -> dict[str, Any]:
                 ][:10]  # Limit to first 10 per provider
 
             return {
-                "api_url": BIOAI_API_URL,
+                "api_url": GRANSABIO_API_URL,
                 "models": summary,
                 "note": "Showing first 10 models per provider. Use the web UI for full list."
             }
@@ -799,16 +799,16 @@ async def _handle_list_models(args: dict[str, Any]) -> dict[str, Any]:
 def _handle_get_config() -> dict[str, Any]:
     """Return current MCP server configuration."""
     return {
-        "api_url": BIOAI_API_URL,
+        "api_url": GRANSABIO_API_URL,
         "models": {
             "generator": DEFAULT_GENERATOR_MODEL,
             "qa_models": DEFAULT_QA_MODELS,
-            "gran_sabio": DEFAULT_GRAN_SABIO_MODEL
+            "arbiter": DEFAULT_ARBITER_MODEL
         },
         "reasoning": {
             "generator_reasoning": DEFAULT_GENERATOR_REASONING,
             "qa_reasoning": DEFAULT_QA_REASONING,
-            "gran_sabio_reasoning": DEFAULT_GRAN_SABIO_REASONING,
+            "arbiter_reasoning": DEFAULT_ARBITER_REASONING,
             "thinking_budget": DEFAULT_THINKING_BUDGET if DEFAULT_THINKING_BUDGET >= 1024 else "auto"
         },
         "timeouts": {
@@ -824,18 +824,18 @@ def _handle_get_config() -> dict[str, Any]:
 
 async def main():
     """Run the MCP server."""
-    print("BioAI Unified MCP Server", file=sys.stderr)
-    print(f"API URL: {BIOAI_API_URL}", file=sys.stderr)
+    print("Gran Sabio LLM MCP Server", file=sys.stderr)
+    print(f"API URL: {GRANSABIO_API_URL}", file=sys.stderr)
     print("", file=sys.stderr)
     print("Models:", file=sys.stderr)
     print(f"  Generator: {DEFAULT_GENERATOR_MODEL}", file=sys.stderr)
     print(f"  QA: {', '.join(DEFAULT_QA_MODELS)}", file=sys.stderr)
-    print(f"  Gran Sabio: {DEFAULT_GRAN_SABIO_MODEL}", file=sys.stderr)
+    print(f"  Arbiter: {DEFAULT_ARBITER_MODEL}", file=sys.stderr)
     print("", file=sys.stderr)
     print("Reasoning Defaults:", file=sys.stderr)
     print(f"  Generator: {DEFAULT_GENERATOR_REASONING}", file=sys.stderr)
     print(f"  QA: {DEFAULT_QA_REASONING}", file=sys.stderr)
-    print(f"  Gran Sabio: {DEFAULT_GRAN_SABIO_REASONING}", file=sys.stderr)
+    print(f"  Arbiter: {DEFAULT_ARBITER_REASONING}", file=sys.stderr)
     if DEFAULT_THINKING_BUDGET >= 1024:
         print(f"  Thinking Budget: {DEFAULT_THINKING_BUDGET} tokens", file=sys.stderr)
     print("", file=sys.stderr)

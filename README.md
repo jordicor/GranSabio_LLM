@@ -1,8 +1,8 @@
-# BioAI Unified Engine
+# Gran Sabio LLM Engine
 
 ### Multi-Layer AI Quality Assurance for Content Generation
 
-**Your AI generates content but you can't trust it blindly?** Put BioAI Unified in the middle. Multiple AI models evaluate, score, and approve every piece of content before it reaches you.
+**Your AI generates content but you can't trust it blindly?** Put Gran Sabio LLM in the middle. Multiple AI models evaluate, score, and approve every piece of content before it reaches you.
 
 ---
 
@@ -28,7 +28,7 @@ Every developer using AI for content generation faces the same challenges:
 
 **Traditional solution:** Review everything manually or accept the risk.
 
-**BioAI Unified solution:** Let multiple AI models evaluate every output with configurable quality criteria, automatic retry on failure, and a "Great Sage" arbiter for final decisions.
+**Gran Sabio LLM solution:** Let multiple AI models evaluate every output with configurable quality criteria, automatic retry on failure, and a "Great Sage" arbiter for final decisions.
 
 ---
 
@@ -70,7 +70,7 @@ Your Request
 
 ## See It In Action
 
-> **Note:** BioAI Unified is fundamentally an **API-first tool** designed to integrate into your content generation pipelines. The web interface below is a development/demo UI to help visualize and test the API capabilities - not a production-ready application. Think of it as a reference implementation showing what's possible when you build on top of this API.
+> **Note:** Gran Sabio LLM is fundamentally an **API-first tool** designed to integrate into your content generation pipelines. The web interface below is a development/demo UI to help visualize and test the API capabilities - not a production-ready application. Think of it as a reference implementation showing what's possible when you build on top of this API.
 
 ### Web Interface (Demo)
 
@@ -218,7 +218,7 @@ Preflight Response:
 
 ### Word Count Enforcement
 
-AI models are notoriously bad at hitting word targets. BioAI Unified solves this:
+AI models are notoriously bad at hitting word targets. Gran Sabio LLM solves this:
 
 ```json
 {
@@ -363,8 +363,8 @@ Content is approved immediately. Perfect for testing, bulk generation, or conten
 ### 1. Clone and Install
 
 ```bash
-git clone https://github.com/jordicor/BioAI_Unified.git
-cd BioAI_Unified
+git clone https://github.com/jordicor/Gran_Sabio_LLM.git
+cd Gran_Sabio_LLM
 python quick_start.py
 ```
 
@@ -495,9 +495,9 @@ Group multiple sessions under a single project ID:
 A ready-to-use Python client is available for easy integration:
 
 ```python
-from bioai_client import BioAIClient
+from gransabio_client import GranSabioClient
 
-client = BioAIClient("http://localhost:8000")
+client = GranSabioClient("http://localhost:8000")
 
 # Simple generation
 result = client.generate(
@@ -520,17 +520,17 @@ for event in client.stream_generate(prompt="...", qa_layers=[...]):
 
 ## MCP Integration (Claude Code, Gemini CLI, Codex CLI)
 
-BioAI Unified includes a **Model Context Protocol (MCP) server** that integrates directly with AI coding assistants. Get multi-model code review and analysis without leaving your terminal.
+Gran Sabio LLM includes a **Model Context Protocol (MCP) server** that integrates directly with AI coding assistants. Get multi-model code review and analysis without leaving your terminal.
 
 ### What You Get
 
 | Tool | Description |
 |------|-------------|
-| `bioai_analyze_code` | Analyze code for bugs, security issues, and best practices |
-| `bioai_review_fix` | Validate a proposed fix before applying it |
-| `bioai_generate_with_qa` | Generate content with multi-model QA |
-| `bioai_check_health` | Verify BioAI API connectivity |
-| `bioai_list_models` | List available AI models |
+| `gransabio_analyze_code` | Analyze code for bugs, security issues, and best practices |
+| `gransabio_review_fix` | Validate a proposed fix before applying it |
+| `gransabio_generate_with_qa` | Generate content with multi-model QA |
+| `gransabio_check_health` | Verify Gran Sabio LLM API connectivity |
+| `gransabio_list_models` | List available AI models |
 
 ### Quick Setup
 
@@ -557,16 +557,16 @@ The scripts automatically detect paths and register the MCP server with Claude C
 
 ```bash
 # Use absolute paths - relative paths won't work!
-claude mcp add bioai-unified -- python /path/to/BioAI_Unified/mcp/bioai_mcp_server.py
+claude mcp add gransabio-llm -- python /path/to/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py
 ```
 
 **Gemini CLI** (`~/.gemini/settings.json`):
 ```json
 {
   "mcpServers": {
-    "bioai-unified": {
+    "gransabio-llm": {
       "command": "python",
-      "args": ["/path/to/BioAI_Unified/mcp/bioai_mcp_server.py"]
+      "args": ["/path/to/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py"]
     }
   }
 }
@@ -574,19 +574,19 @@ claude mcp add bioai-unified -- python /path/to/BioAI_Unified/mcp/bioai_mcp_serv
 
 **Codex CLI** (`~/.codex/config.toml`):
 ```toml
-[mcp_servers.bioai-unified]
+[mcp_servers.gransabio-llm]
 command = "python"
-args = ["/path/to/BioAI_Unified/mcp/bioai_mcp_server.py"]
+args = ["/path/to/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py"]
 ```
 
 ### Example Usage
 
 ```
-You: Analyze this code for security issues using BioAI
+You: Analyze this code for security issues using Gran Sabio
 
-Claude: [Calls bioai_analyze_code]
+Claude: [Calls gransabio_analyze_code]
 
-BioAI Analysis (Score: 8.2/10):
+Gran Sabio Analysis (Score: 8.2/10):
 - [CRITICAL] SQL injection at line 45
 - [HIGH] Hardcoded credentials at line 12
 - [MEDIUM] Missing input validation at line 30
@@ -597,12 +597,12 @@ Consensus: 3/3 models agree
 
 ### Remote/SaaS Configuration
 
-For hosted BioAI instances:
+For hosted Gran Sabio LLM instances:
 ```bash
-claude mcp add bioai-unified \
-  --env BIOAI_API_URL=https://api.bioai.example.com \
-  --env BIOAI_API_KEY=your-api-key \
-  -- python /path/to/bioai_mcp_server.py
+claude mcp add gransabio-llm \
+  --env GRANSABIO_API_URL=https://api.gransabio.example.com \
+  --env GRANSABIO_API_KEY=your-api-key \
+  -- python /path/to/gransabio_mcp_server.py
 ```
 
 See full documentation: **[mcp/README.md](mcp/README.md)**
@@ -611,7 +611,7 @@ See full documentation: **[mcp/README.md](mcp/README.md)**
 
 ## Self-Hosting (Bring Your Own API Keys)
 
-BioAI Unified is currently a **self-hosted solution**. You deploy it on your infrastructure and use your own API keys from each AI provider.
+Gran Sabio LLM is currently a **self-hosted solution**. You deploy it on your infrastructure and use your own API keys from each AI provider.
 
 ### What This Means
 
@@ -650,7 +650,7 @@ gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000
 
 ---
 
-## Coming Soon: BioAI Unified Cloud
+## Coming Soon: Gran Sabio LLM Cloud
 
 **Don't want to manage API keys and infrastructure?** A hosted version is in development.
 
@@ -705,13 +705,25 @@ Returns detailed token usage and costs:
 
 ---
 
-## Why "BioAI Unified"?
+## About the Name
 
-This project started as a quality assurance system for biography generation (hence "BioAI"). The goal was simple: ensure AI-generated biographies didn't contain hallucinations or factual errors.
+### From BioAI to Gran Sabio
 
-After multiple iterations and experiments, the best features from different approaches were **unified** into a single, powerful engine. The realization came quickly: this isn't just for biographies. Any content - articles, scripts, code, JSON data - can benefit from multi-model QA evaluation.
+This project was originally called **BioAI Unified** - "Bio" for biography (its first use case was validating AI-generated biographies) and "Unified" because it brought together multiple AI providers into a single, coherent QA system.
 
-What started as "how do I trust AI-generated biographies?" became "how do I trust ANY AI-generated content?"
+However, "BioAI" consistently caused confusion. People assumed this was a biomedical or bioinformatics tool, expecting features for DNA analysis or drug discovery. The name created friction before the tool could even be evaluated.
+
+### Why "Gran Sabio LLM"?
+
+The new name directly reflects what makes this engine unique:
+
+**"Gran Sabio"** (Spanish for "Great Sage") is not just a brand - it's a core architectural component. When multiple AI models disagree during quality evaluation, a premium reasoning model called the **Gran Sabio** (the wise arbiter) steps in to make the final decision. This concept of a "council of sages" deliberating on content quality is central to how the system works.
+
+**"LLM"** (Large Language Model) clarifies that this is AI infrastructure for text generation - not a fantasy game, not biomedicine, but a practical tool for orchestrating language models.
+
+The result: a name that immediately tells you what you're getting - an AI content pipeline with a wise, multi-model arbitration system at its heart.
+
+> *Previous name: BioAI Unified (2024). Rebranded to Gran Sabio LLM in January 2025.*
 
 ---
 

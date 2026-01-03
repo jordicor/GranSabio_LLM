@@ -1,5 +1,5 @@
 """
-Preflight validation utilities for the BioAI Unified Engine.
+Preflight validation utilities for the Gran Sabio LLM Engine.
 
 Runs a lightweight feasibility analysis before starting expensive
 content generation iterations.

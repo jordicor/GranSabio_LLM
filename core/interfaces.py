@@ -1,5 +1,5 @@
 """
-HTML interface routes for BioAI Unified.
+HTML interface routes for Gran Sabio LLM.
 """
 
 from typing import Optional

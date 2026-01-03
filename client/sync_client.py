@@ -1,11 +1,11 @@
 """
-Synchronous BioAI Unified Client
-================================
+Synchronous Gran Sabio LLM Client
+=================================
 
-Thread-safe synchronous client for the BioAI Unified Engine API.
+Thread-safe synchronous client for the Gran Sabio LLM Engine API.
 Suitable for scripts, CLI tools, and simple integrations.
 
-For async applications, use AsyncBioAIClient instead.
+For async applications, use AsyncGranSabioClient instead.
 """
 
 from __future__ import annotations
@@ -27,17 +27,17 @@ except ImportError:
     pass
 
 # Import shared exception from package
-from . import BioAIClientError
+from . import GranSabioClientError
 
 logger = logging.getLogger(__name__)
 
 
-class BioAIClient:
+class GranSabioClient:
     """
-    Synchronous client for BioAI Unified Engine.
+    Synchronous client for Gran Sabio LLM Engine.
 
     Usage:
-        client = BioAIClient()
+        client = GranSabioClient()
 
         # Simple generation (no QA)
         result = client.generate(
@@ -65,15 +65,15 @@ class BioAIClient:
         timeout: tuple = DEFAULT_TIMEOUT,
     ):
         """
-        Initialize the BioAI client.
+        Initialize the Gran Sabio client.
 
         Args:
-            base_url: API base URL (default: http://localhost:8000 or BIOAI_BASE_URL env)
-            api_key: Optional API key (default: BIOAI_API_KEY env)
+            base_url: API base URL (default: http://localhost:8000 or GRANSABIO_BASE_URL env)
+            api_key: Optional API key (default: GRANSABIO_API_KEY env)
             timeout: Request timeout tuple (connect_timeout, read_timeout)
         """
-        self.base_url = (base_url or os.getenv("BIOAI_BASE_URL", self.DEFAULT_BASE_URL)).rstrip("/")
-        self.api_key = api_key or os.getenv("BIOAI_API_KEY")
+        self.base_url = (base_url or os.getenv("GRANSABIO_BASE_URL", self.DEFAULT_BASE_URL)).rstrip("/")
+        self.api_key = api_key or os.getenv("GRANSABIO_API_KEY")
         self.timeout = timeout
 
     def _headers(self) -> Dict[str, str]:
@@ -99,16 +99,16 @@ class BioAIClient:
             response = requests.request(method, url, json=json_data, **kwargs)
             return response
         except requests_exceptions.ConnectionError as e:
-            raise BioAIClientError(
-                f"Cannot connect to BioAI API at {self.base_url}. "
+            raise GranSabioClientError(
+                f"Cannot connect to Gran Sabio API at {self.base_url}. "
                 "Ensure the server is running."
             ) from e
         except requests_exceptions.Timeout as e:
-            raise BioAIClientError(
+            raise GranSabioClientError(
                 f"Request to {endpoint} timed out after {self.timeout}s"
             ) from e
         except requests_exceptions.RequestException as e:
-            raise BioAIClientError(f"Request failed: {e}") from e
+            raise GranSabioClientError(f"Request failed: {e}") from e
 
     # =========================================================================
     # Health & Info
@@ -123,7 +123,7 @@ class BioAIClient:
         """
         response = self._request("GET", "/health")
         if response.status_code != 200:
-            raise BioAIClientError(
+            raise GranSabioClientError(
                 f"Health check failed: {response.status_code}",
                 status_code=response.status_code
             )
@@ -138,7 +138,7 @@ class BioAIClient:
         """
         response = self._request("GET", "/models")
         if response.status_code != 200:
-            raise BioAIClientError(
+            raise GranSabioClientError(
                 f"Failed to get models: {response.status_code}",
                 status_code=response.status_code
             )
@@ -149,7 +149,7 @@ class BioAIClient:
         try:
             health = self.health_check()
             return health.get("status") == "healthy"
-        except BioAIClientError:
+        except GranSabioClientError:
             return False
 
     def get_info(self) -> Dict[str, Any]:
@@ -160,7 +160,7 @@ class BioAIClient:
         """
         health = self.health_check()
         return {
-            "service": "BioAI Unified Engine",
+            "service": "Gran Sabio LLM Engine",
             "version": "1.0.0",
             "status": health.get("status", "unknown"),
             "active_sessions": health.get("active_sessions", 0),
@@ -185,7 +185,7 @@ class BioAIClient:
         response = self._request("POST", "/project/new", json_data=payload)
 
         if response.status_code not in (200, 201):
-            raise BioAIClientError(
+            raise GranSabioClientError(
                 f"Failed to reserve project: {response.text}",
                 status_code=response.status_code
             )
@@ -197,7 +197,7 @@ class BioAIClient:
         """Activate/reactivate a project."""
         response = self._request("POST", f"/project/start/{project_id}")
         if response.status_code not in (200, 201):
-            raise BioAIClientError(
+            raise GranSabioClientError(
                 f"Failed to start project: {response.text}",
                 status_code=response.status_code
             )
@@ -207,7 +207,7 @@ class BioAIClient:
         """Cancel a project and all its active sessions."""
         response = self._request("POST", f"/project/stop/{project_id}")
         if response.status_code not in (200, 202):
-            raise BioAIClientError(
+            raise GranSabioClientError(
                 f"Failed to stop project: {response.text}",
                 status_code=response.status_code
             )
@@ -333,7 +333,7 @@ class BioAIClient:
         response = self._request("POST", "/generate", json_data=payload)
 
         if response.status_code != 200:
-            raise BioAIClientError(
+            raise GranSabioClientError(
                 f"Generation request failed: {response.text}",
                 status_code=response.status_code,
                 details={"payload": payload}
@@ -344,14 +344,14 @@ class BioAIClient:
         # Handle preflight rejection
         if result.get("status") == "rejected":
             feedback = result.get("preflight_feedback", {})
-            raise BioAIClientError(
+            raise GranSabioClientError(
                 f"Request rejected by preflight: {feedback.get('user_feedback', 'Unknown reason')}",
                 details={"preflight_feedback": feedback}
             )
 
         session_id = result.get("session_id")
         if not session_id:
-            raise BioAIClientError("No session_id in response", details=result)
+            raise GranSabioClientError("No session_id in response", details=result)
 
         # Return immediately if not waiting
         if not wait_for_completion:
@@ -369,7 +369,7 @@ class BioAIClient:
         """Get current status of a generation session."""
         response = self._request("GET", f"/status/{session_id}")
         if response.status_code != 200:
-            raise BioAIClientError(
+            raise GranSabioClientError(
                 f"Failed to get status: {response.text}",
                 status_code=response.status_code
             )
@@ -384,7 +384,7 @@ class BioAIClient:
             return {"status": "in_progress", "session_id": session_id}
 
         if response.status_code != 200:
-            raise BioAIClientError(
+            raise GranSabioClientError(
                 f"Failed to get result: {response.text}",
                 status_code=response.status_code
             )
@@ -395,7 +395,7 @@ class BioAIClient:
         """Cancel an active generation session."""
         response = self._request("POST", f"/stop/{session_id}")
         if response.status_code not in (200, 202):
-            raise BioAIClientError(
+            raise GranSabioClientError(
                 f"Failed to stop session: {response.text}",
                 status_code=response.status_code
             )
@@ -425,7 +425,7 @@ class BioAIClient:
         while True:
             elapsed = time.time() - start_time
             if elapsed > max_wait:
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Timed out waiting for session {session_id} after {max_wait}s"
                 )
 
@@ -440,13 +440,13 @@ class BioAIClient:
                 return self.get_result(session_id)
 
             if current_status == "failed":
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Generation failed: {status.get('error', 'Unknown error')}",
                     details=status
                 )
 
             if current_status == "cancelled":
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     "Generation was cancelled",
                     details=status
                 )
@@ -491,7 +491,7 @@ class BioAIClient:
 
         response = self._request("POST", "/analysis/lexical-diversity", json_data=payload)
         if response.status_code != 200:
-            raise BioAIClientError(
+            raise GranSabioClientError(
                 f"Lexical diversity analysis failed: {response.text}",
                 status_code=response.status_code
             )
@@ -530,7 +530,7 @@ class BioAIClient:
 
         response = self._request("POST", "/analysis/repetition", json_data=payload)
         if response.status_code != 200:
-            raise BioAIClientError(
+            raise GranSabioClientError(
                 f"Repetition analysis failed: {response.text}",
                 status_code=response.status_code
             )
@@ -573,7 +573,7 @@ class BioAIClient:
         )
 
         if response.status_code != 200:
-            raise BioAIClientError(
+            raise GranSabioClientError(
                 f"Attachment upload failed: {response.text}",
                 status_code=response.status_code
             )
@@ -607,7 +607,7 @@ class BioAIClient:
 
         response = self._request("POST", "/attachments/base64", json_data=payload)
         if response.status_code != 200:
-            raise BioAIClientError(
+            raise GranSabioClientError(
                 f"Attachment upload failed: {response.text}",
                 status_code=response.status_code
             )
@@ -688,7 +688,11 @@ class BioAIClient:
         )
 
 
+# Backward compatibility alias
+BioAIClient = GranSabioClient
+
+
 # Module-level convenience function
-def create_client(base_url: Optional[str] = None, **kwargs) -> BioAIClient:
-    """Create a BioAI client instance."""
-    return BioAIClient(base_url=base_url, **kwargs)
+def create_client(base_url: Optional[str] = None, **kwargs) -> GranSabioClient:
+    """Create a Gran Sabio client instance."""
+    return GranSabioClient(base_url=base_url, **kwargs)

@@ -1,6 +1,6 @@
 """
-Feedback Memory System for BioAI Unified Engine
-===============================================
+Feedback Memory System for Gran Sabio LLM Engine
+=================================================
 
 Persistent memory system that tracks QA feedback across iterations,
 detects patterns using embeddings, and provides intelligent context

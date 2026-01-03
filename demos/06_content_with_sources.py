@@ -35,7 +35,7 @@ from typing import Dict, Any, Optional
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from client import AsyncBioAIClient
+from client import AsyncGranSabioClient
 from demos.common import run_demo, print_header, print_generation_result, colorize, safe_print
 
 
@@ -96,7 +96,7 @@ CITATIONS:
 
 
 async def upload_source_document(
-    client: AsyncBioAIClient,
+    client: AsyncGranSabioClient,
     content: str,
     filename: str,
     username: str
@@ -131,7 +131,7 @@ async def demo_content_with_sources():
 
     args, _ = parser.parse_known_args()
 
-    async with AsyncBioAIClient() as client:
+    async with AsyncGranSabioClient() as client:
         info = await client.get_info()
         print(f"Connected to: {info['service']} v{info['version']}")
 

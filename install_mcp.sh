@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# BioAI Unified MCP Server Installer
+# Gran Sabio LLM MCP Server Installer
 # Registers the MCP server with Claude Code using the correct absolute path.
 #
 # Usage:
@@ -12,8 +12,8 @@ set -e
 
 # Get the directory where this script is located (project root)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MCP_SERVER_PATH="$SCRIPT_DIR/mcp_server/bioai_mcp_server.py"
-MCP_NAME="bioai-unified"
+MCP_SERVER_PATH="$SCRIPT_DIR/mcp_server/gransabio_mcp_server.py"
+MCP_NAME="gransabio-llm"
 
 # Colors for output
 RED='\033[0;31m'
@@ -40,7 +40,7 @@ fi
 
 # Handle uninstall
 if [ "$1" = "--uninstall" ] || [ "$1" = "-u" ]; then
-    echo "Removing BioAI Unified MCP server..."
+    echo "Removing Gran Sabio LLM MCP server..."
     if claude mcp remove "$MCP_NAME" 2>/dev/null; then
         print_success "MCP server '$MCP_NAME' removed successfully."
     else
@@ -61,10 +61,10 @@ else
 fi
 
 echo "==================================="
-echo "BioAI Unified MCP Server Installer"
+echo "Gran Sabio LLM MCP Server Installer"
 echo "==================================="
 echo ""
-echo "This will register the BioAI Unified MCP server with Claude Code."
+echo "This will register the Gran Sabio LLM MCP server with Claude Code."
 echo ""
 echo "Server path: $MCP_SERVER_PATH"
 echo "Python: $PYTHON_CMD"
@@ -91,13 +91,13 @@ print_success "Installation complete!"
 echo ""
 echo "The MCP server is now available in Claude Code."
 echo "Available tools:"
-echo "  - bioai_analyze_code    : Analyze code for bugs and security issues"
-echo "  - bioai_review_fix      : Review proposed code fixes"
-echo "  - bioai_generate_with_qa: Generate content with multi-model QA"
-echo "  - bioai_check_health    : Check API connectivity"
-echo "  - bioai_list_models     : List available AI models"
-echo "  - bioai_get_config      : View current configuration"
+echo "  - gransabio_analyze_code    : Analyze code for bugs and security issues"
+echo "  - gransabio_review_fix      : Review proposed code fixes"
+echo "  - gransabio_generate_with_qa: Generate content with multi-model QA"
+echo "  - gransabio_check_health    : Check API connectivity"
+echo "  - gransabio_list_models     : List available AI models"
+echo "  - gransabio_get_config      : View current configuration"
 echo ""
-echo "Make sure BioAI Unified API is running: python main.py"
+echo "Make sure Gran Sabio LLM API is running: python main.py"
 echo ""
 echo "To uninstall: ./install_mcp.sh --uninstall"

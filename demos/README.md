@@ -1,6 +1,6 @@
-# BioAI Unified Engine - Demos
+# Gran Sabio LLM - Demos
 
-This folder contains demonstration scripts showcasing the capabilities of BioAI Unified Engine.
+This folder contains demonstration scripts showcasing the capabilities of Gran Sabio LLM.
 
 ## Quick Start
 
@@ -333,16 +333,16 @@ For production use, we provide a full-featured client library in the `client/` f
 
 ```python
 # Synchronous client (for scripts)
-from client import BioAIClient
+from client import GranSabioClient
 
-client = BioAIClient()
+client = GranSabioClient()
 result = client.generate_fast("Write a haiku")
 print(result["content"])
 
 # Asynchronous client (for web apps, demos)
-from client import AsyncBioAIClient
+from client import AsyncGranSabioClient
 
-async with AsyncBioAIClient() as client:
+async with AsyncGranSabioClient() as client:
     # Check API health
     info = await client.get_info()
 
@@ -365,7 +365,7 @@ See `client/README.md` for full documentation.
 ## Requirements
 
 - Python 3.9+
-- BioAI Unified API running on localhost:8000
+- Gran Sabio LLM API running on localhost:8000
 - Dependencies: `aiohttp` (installed with main requirements)
 
 Optional:
@@ -385,7 +385,7 @@ Optional:
 
 ## Troubleshooting
 
-**"Cannot connect to BioAI API"**
+**"Cannot connect to Gran Sabio API"**
 - Make sure the server is running: `python main.py`
 - Check the server is on port 8000
 

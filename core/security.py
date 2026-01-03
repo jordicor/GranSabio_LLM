@@ -1,5 +1,5 @@
 """
-Security utilities for BioAI Unified Engine.
+Security utilities for Gran Sabio LLM Engine.
 =============================================
 
 Provides IP-based access control for internal-only endpoints.

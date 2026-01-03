@@ -1,21 +1,21 @@
 """
-BioAI Unified Client
-====================
+Gran Sabio LLM Client
+=====================
 
-Python client library for the BioAI Unified Engine API.
+Python client library for the Gran Sabio LLM Engine API.
 
 Quick Start:
-    from client import BioAIClient
+    from client import GranSabioClient
 
     # Sync usage
-    client = BioAIClient()
+    client = GranSabioClient()
     result = client.generate("Write an article about AI")
     print(result["content"])
 
     # Async usage
-    from client import AsyncBioAIClient
+    from client import AsyncGranSabioClient
 
-    async with AsyncBioAIClient() as client:
+    async with AsyncGranSabioClient() as client:
         result = await client.generate("Write an article about AI")
         print(result["content"])
 
@@ -25,8 +25,8 @@ For more examples, see the demos/ folder.
 from typing import Dict, Optional
 
 
-class BioAIClientError(Exception):
-    """Exception raised for BioAI client errors."""
+class GranSabioClientError(Exception):
+    """Exception raised for Gran Sabio client errors."""
 
     def __init__(self, message: str, status_code: Optional[int] = None, details: Optional[Dict] = None):
         super().__init__(message)
@@ -34,10 +34,21 @@ class BioAIClientError(Exception):
         self.details = details or {}
 
 
-from .sync_client import BioAIClient
-from .async_client import AsyncBioAIClient
+# Backward compatibility alias
+BioAIClientError = GranSabioClientError
+
+from .sync_client import GranSabioClient
+from .async_client import AsyncGranSabioClient
+
+# Backward compatibility aliases
+BioAIClient = GranSabioClient
+AsyncBioAIClient = AsyncGranSabioClient
 
 __all__ = [
+    "GranSabioClient",
+    "AsyncGranSabioClient",
+    "GranSabioClientError",
+    # Backward compatibility
     "BioAIClient",
     "AsyncBioAIClient",
     "BioAIClientError",

@@ -1,8 +1,8 @@
 """
-Example requests for BioAI Unified Engine
-========================================
+Example requests for Gran Sabio LLM Engine
+==========================================
 
-This script demonstrates how to use the BioAI Unified API with different
+This script demonstrates how to use the Gran Sabio LLM API with different
 types of content generation requests.
 """
 
@@ -308,7 +308,7 @@ async def test_health_check():
 
 async def main():
     """Run all tests"""
-    print("🚀 BioAI Unified Engine - API Testing Suite")
+    print("Gran Sabio LLM - API Testing Suite")
     print("=" * 50)
     
     # Test API availability first

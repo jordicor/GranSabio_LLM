@@ -58,7 +58,7 @@ from typing import Dict, Any
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from client import AsyncBioAIClient
+from client import AsyncGranSabioClient
 from demos.common import run_demo, print_header, safe_print, print_json_content, colorize
 
 
@@ -398,7 +398,7 @@ async def demo_code_analyzer():
         code_to_analyze = SAMPLE_CODE_WITH_ISSUES
         source_desc = "Sample code with intentional issues"
 
-    async with AsyncBioAIClient() as client:
+    async with AsyncGranSabioClient() as client:
         info = await client.get_info()
         print(f"Connected to: {info['service']} v{info['version']}")
 

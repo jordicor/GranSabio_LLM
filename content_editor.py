@@ -1,6 +1,6 @@
 """
-Smart Content Editor for BioAI Unified
-=======================================
+Smart Content Editor for Gran Sabio LLM
+========================================
 
 This module implements the incremental editing system that:
 1. Analyzes QA feedback to identify specific text ranges

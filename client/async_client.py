@@ -1,11 +1,11 @@
 """
-Asynchronous BioAI Unified Client
-=================================
+Asynchronous Gran Sabio LLM Client
+==================================
 
-High-performance async client for the BioAI Unified Engine API.
+High-performance async client for the Gran Sabio LLM Engine API.
 Ideal for web applications, parallel generation, and async workflows.
 
-For synchronous usage, use BioAIClient instead.
+For synchronous usage, use GranSabioClient instead.
 """
 
 from __future__ import annotations
@@ -27,22 +27,22 @@ except ImportError:
     pass
 
 # Import shared exception from package
-from . import BioAIClientError
+from . import GranSabioClientError
 
 logger = logging.getLogger(__name__)
 
 
-class AsyncBioAIClient:
+class AsyncGranSabioClient:
     """
-    Asynchronous client for BioAI Unified Engine.
+    Asynchronous client for Gran Sabio LLM Engine.
 
     Usage:
-        async with AsyncBioAIClient() as client:
+        async with AsyncGranSabioClient() as client:
             result = await client.generate("Write a haiku")
             print(result["content"])
 
     Or without context manager:
-        client = AsyncBioAIClient()
+        client = AsyncGranSabioClient()
         await client.connect()
         try:
             result = await client.generate("Write a haiku")
@@ -62,15 +62,15 @@ class AsyncBioAIClient:
         timeout: Optional[aiohttp.ClientTimeout] = None,
     ):
         """
-        Initialize the async BioAI client.
+        Initialize the async Gran Sabio client.
 
         Args:
-            base_url: API base URL (default: http://localhost:8000 or BIOAI_BASE_URL env)
-            api_key: Optional API key (default: BIOAI_API_KEY env)
+            base_url: API base URL (default: http://localhost:8000 or GRANSABIO_BASE_URL env)
+            api_key: Optional API key (default: GRANSABIO_API_KEY env)
             timeout: Request timeout configuration
         """
-        self.base_url = (base_url or os.getenv("BIOAI_BASE_URL", self.DEFAULT_BASE_URL)).rstrip("/")
-        self.api_key = api_key or os.getenv("BIOAI_API_KEY")
+        self.base_url = (base_url or os.getenv("GRANSABIO_BASE_URL", self.DEFAULT_BASE_URL)).rstrip("/")
+        self.api_key = api_key or os.getenv("GRANSABIO_API_KEY")
         self.timeout = timeout or self.DEFAULT_TIMEOUT
         self._session: Optional[aiohttp.ClientSession] = None
         self._owns_session = True
@@ -87,7 +87,7 @@ class AsyncBioAIClient:
             await self._session.close()
             self._session = None
 
-    async def __aenter__(self) -> "AsyncBioAIClient":
+    async def __aenter__(self) -> "AsyncGranSabioClient":
         await self.connect()
         return self
 
@@ -99,7 +99,7 @@ class AsyncBioAIClient:
         """Get the active session, raising if not connected."""
         if self._session is None or self._session.closed:
             raise RuntimeError(
-                "Client not connected. Use 'async with AsyncBioAIClient()' or call connect()"
+                "Client not connected. Use 'async with AsyncGranSabioClient()' or call connect()"
             )
         return self._session
 
@@ -125,14 +125,14 @@ class AsyncBioAIClient:
             response = await self.session.request(method, url, json=json_data, **kwargs)
             return response
         except aiohttp.ClientConnectorError as e:
-            raise BioAIClientError(
-                f"Cannot connect to BioAI API at {self.base_url}. "
+            raise GranSabioClientError(
+                f"Cannot connect to Gran Sabio API at {self.base_url}. "
                 "Ensure the server is running."
             ) from e
         except asyncio.TimeoutError as e:
-            raise BioAIClientError(f"Request to {endpoint} timed out") from e
+            raise GranSabioClientError(f"Request to {endpoint} timed out") from e
         except aiohttp.ClientError as e:
-            raise BioAIClientError(f"Request failed: {e}") from e
+            raise GranSabioClientError(f"Request failed: {e}") from e
 
     # =========================================================================
     # Health & Info
@@ -147,7 +147,7 @@ class AsyncBioAIClient:
         """
         async with await self._request("GET", "/health") as response:
             if response.status != 200:
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Health check failed: {response.status}",
                     status_code=response.status
                 )
@@ -162,7 +162,7 @@ class AsyncBioAIClient:
         """
         async with await self._request("GET", "/models") as response:
             if response.status != 200:
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Failed to get models: {response.status}",
                     status_code=response.status
                 )
@@ -173,7 +173,7 @@ class AsyncBioAIClient:
         try:
             health = await self.health_check()
             return health.get("status") == "healthy"
-        except BioAIClientError:
+        except GranSabioClientError:
             return False
 
     async def get_info(self) -> Dict[str, Any]:
@@ -184,7 +184,7 @@ class AsyncBioAIClient:
         """
         health = await self.health_check()
         return {
-            "service": "BioAI Unified Engine",
+            "service": "Gran Sabio LLM Engine",
             "version": "1.0.0",
             "status": health.get("status", "unknown"),
             "active_sessions": health.get("active_sessions", 0),
@@ -209,7 +209,7 @@ class AsyncBioAIClient:
         async with await self._request("POST", "/project/new", json_data=payload) as response:
             if response.status not in (200, 201):
                 text = await response.text()
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Failed to reserve project: {text}",
                     status_code=response.status
                 )
@@ -221,7 +221,7 @@ class AsyncBioAIClient:
         async with await self._request("POST", f"/project/start/{project_id}") as response:
             if response.status not in (200, 201):
                 text = await response.text()
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Failed to start project: {text}",
                     status_code=response.status
                 )
@@ -232,7 +232,7 @@ class AsyncBioAIClient:
         async with await self._request("POST", f"/project/stop/{project_id}") as response:
             if response.status not in (200, 202):
                 text = await response.text()
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Failed to stop project: {text}",
                     status_code=response.status
                 )
@@ -358,7 +358,7 @@ class AsyncBioAIClient:
         async with await self._request("POST", "/generate", json_data=payload) as response:
             if response.status != 200:
                 text = await response.text()
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Generation request failed: {text}",
                     status_code=response.status,
                     details={"payload": payload}
@@ -369,14 +369,14 @@ class AsyncBioAIClient:
         # Handle preflight rejection
         if result.get("status") == "rejected":
             feedback = result.get("preflight_feedback", {})
-            raise BioAIClientError(
+            raise GranSabioClientError(
                 f"Request rejected by preflight: {feedback.get('user_feedback', 'Unknown reason')}",
                 details={"preflight_feedback": feedback}
             )
 
         session_id = result.get("session_id")
         if not session_id:
-            raise BioAIClientError("No session_id in response", details=result)
+            raise GranSabioClientError("No session_id in response", details=result)
 
         # Return immediately if not waiting
         if not wait_for_completion:
@@ -395,7 +395,7 @@ class AsyncBioAIClient:
         async with await self._request("GET", f"/status/{session_id}") as response:
             if response.status != 200:
                 text = await response.text()
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Failed to get status: {text}",
                     status_code=response.status
                 )
@@ -409,7 +409,7 @@ class AsyncBioAIClient:
 
             if response.status != 200:
                 text = await response.text()
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Failed to get result: {text}",
                     status_code=response.status
                 )
@@ -421,7 +421,7 @@ class AsyncBioAIClient:
         async with await self._request("POST", f"/stop/{session_id}") as response:
             if response.status not in (200, 202):
                 text = await response.text()
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Failed to stop session: {text}",
                     status_code=response.status
                 )
@@ -451,7 +451,7 @@ class AsyncBioAIClient:
         while True:
             elapsed = time.monotonic() - start_time
             if elapsed > max_wait:
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Timed out waiting for session {session_id} after {max_wait}s"
                 )
 
@@ -466,13 +466,13 @@ class AsyncBioAIClient:
                 return await self.get_result(session_id)
 
             if current_status == "failed":
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Generation failed: {status.get('error', 'Unknown error')}",
                     details=status
                 )
 
             if current_status == "cancelled":
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     "Generation was cancelled",
                     details=status
                 )
@@ -534,7 +534,7 @@ class AsyncBioAIClient:
         async with await self._request("POST", "/analysis/lexical-diversity", json_data=payload) as response:
             if response.status != 200:
                 text_response = await response.text()
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Lexical diversity analysis failed: {text_response}",
                     status_code=response.status
                 )
@@ -574,7 +574,7 @@ class AsyncBioAIClient:
         async with await self._request("POST", "/analysis/repetition", json_data=payload) as response:
             if response.status != 200:
                 text_response = await response.text()
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Repetition analysis failed: {text_response}",
                     status_code=response.status
                 )
@@ -623,7 +623,7 @@ class AsyncBioAIClient:
         ) as response:
             if response.status != 200:
                 text = await response.text()
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Attachment upload failed: {text}",
                     status_code=response.status
                 )
@@ -658,7 +658,7 @@ class AsyncBioAIClient:
         async with await self._request("POST", "/attachments/base64", json_data=payload) as response:
             if response.status != 200:
                 text = await response.text()
-                raise BioAIClientError(
+                raise GranSabioClientError(
                     f"Attachment upload failed: {text}",
                     status_code=response.status
                 )
@@ -759,9 +759,13 @@ class AsyncBioAIClient:
         return await asyncio.gather(*tasks, return_exceptions=True)
 
 
+# Backward compatibility alias
+AsyncBioAIClient = AsyncGranSabioClient
+
+
 # Module-level convenience function
-async def create_client(base_url: Optional[str] = None, **kwargs) -> AsyncBioAIClient:
-    """Create and connect an async BioAI client instance."""
-    client = AsyncBioAIClient(base_url=base_url, **kwargs)
+async def create_client(base_url: Optional[str] = None, **kwargs) -> AsyncGranSabioClient:
+    """Create and connect an async Gran Sabio client instance."""
+    client = AsyncGranSabioClient(base_url=base_url, **kwargs)
     await client.connect()
     return client

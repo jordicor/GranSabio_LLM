@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture Overview
 
-BioAI Unified Engine is a sophisticated content generation API that uses multiple AI providers (OpenAI, Anthropic, Google, xAI) with a multi-layer quality assurance system. The architecture follows a service-oriented pattern:
+Gran Sabio LLM Engine is a sophisticated content generation API that uses multiple AI providers (OpenAI, Anthropic, Google, xAI) with a multi-layer quality assurance system. The architecture follows a service-oriented pattern:
 
 - **Preflight Validator** (`preflight_validator.py`): Intelligent feasibility analysis before content generation starts
 - **AI Service Layer** (`ai_service.py`): Unified interface for multiple AI providers with model-specific parameter handling. Use `get_ai_service()` to reuse the shared connector instead of instantiating `AIService` directly.

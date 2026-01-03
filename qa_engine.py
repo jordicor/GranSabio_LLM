@@ -1,6 +1,6 @@
 """
-QA Engine Module for BioAI Unified Engine
-=========================================
+QA Engine Module for Gran Sabio LLM Engine
+==========================================
 
 Multi-layer quality assurance evaluation system that processes content
 through multiple evaluation criteria using different AI models.

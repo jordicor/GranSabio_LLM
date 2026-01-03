@@ -1,5 +1,5 @@
 """
-BioAI Unified Engine - Advanced Content Generation API
+Gran Sabio LLM Engine - Advanced Content Generation API
 =====================================================
 
 A sophisticated content generation engine that uses multiple AI models
@@ -13,7 +13,7 @@ Features:
 - Verbose progress tracking
 - Flexible content type support
 
-Author: BioAI Unified Team
+Author: Gran Sabio LLM Team
 Version: 1.0.0
 """
 
@@ -72,9 +72,9 @@ for _logger_name in _noisy_loggers:
 logger = logging.getLogger(__name__)
 
 TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
-FILE_LOGGING_ENV_VAR = "BIOAI_FILE_LOGGING"
-FORCE_VERBOSE_ENV_VAR = "BIOAI_FORCE_VERBOSE"
-FORCE_EXTRA_VERBOSE_ENV_VAR = "BIOAI_FORCE_EXTRA_VERBOSE"
+FILE_LOGGING_ENV_VAR = "GRANSABIO_FILE_LOGGING"
+FORCE_VERBOSE_ENV_VAR = "GRANSABIO_FORCE_VERBOSE"
+FORCE_EXTRA_VERBOSE_ENV_VAR = "GRANSABIO_FORCE_EXTRA_VERBOSE"
 
 if os.getenv(FILE_LOGGING_ENV_VAR, "").lower() in TRUTHY_ENV_VALUES:
     try:
@@ -128,7 +128,7 @@ from usage_tracking import (
 T = TypeVar("T")
 
 app = FastAPI(
-    title="BioAI Unified Engine",
+    title="Gran Sabio LLM Engine",
     description="Advanced Content Generation API with Multi-Layer QA",
     version="1.0.0",
     docs_url="/docs",
@@ -382,7 +382,7 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Clean up resources on shutdown"""
-    logger.info("Shutting down BioAI Unified Engine...")
+    logger.info("Shutting down Gran Sabio LLM Engine...")
 
     # Close the shared AI service instance connections
     try:

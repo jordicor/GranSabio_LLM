@@ -1,5 +1,5 @@
 """
-Usage tracking utilities for BioAI Unified Engine.
+Usage tracking utilities for Gran Sabio LLM Engine.
 
 Captures token usage and cost details for each AI call so that final responses
 can include per-phase breakdowns and aggregated totals.

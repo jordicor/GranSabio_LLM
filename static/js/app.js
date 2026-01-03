@@ -1,5 +1,5 @@
 /**
- * BioAI Unified Engine - Web Interface JavaScript
+ * Gran Sabio LLM - Web Interface JavaScript
  * Professional content generation interface with real-time progress tracking
  */
 
@@ -18,7 +18,7 @@ function escapeHtml(str) {
     return div.innerHTML;
 }
 
-class BioAIInterface {
+class GranSabioInterface {
     constructor() {
         this.currentSession = null;
         this.progressInterval = null;
@@ -723,7 +723,7 @@ class BioAIInterface {
             <div class="qa-layer" id="${layerId}">
                 <div class="qa-layer-header">
                     <span class="qa-layer-title">QA Layer ${this.qaLayerCount}</span>
-                    <button type="button" class="qa-layer-remove" onclick="bioai.removeQALayer('${layerId}')">
+                    <button type="button" class="qa-layer-remove" onclick="gransabio.removeQALayer('${layerId}')">
                         Remove
                     </button>
                 </div>
@@ -1704,7 +1704,7 @@ class BioAIInterface {
         const content = document.getElementById('generatedContent').textContent;
         const contentType = document.getElementById('contentType').value;
         const timestamp = new Date().toISOString().slice(0, -5).replace(/:/g, '-');
-        const filename = `bioai-${contentType}-${timestamp}.txt`;
+        const filename = `gransabio-${contentType}-${timestamp}.txt`;
         
         // Create download link
         const blob = new Blob([content], { type: 'text/plain' });
@@ -1811,8 +1811,8 @@ function removeQaModel(button) {
 }
 
 function addRecommendedModels(type) {
-    if (window.bioai && window.bioai.addRecommendedModels) {
-        window.bioai.addRecommendedModels(type);
+    if (window.gransabio && window.gransabio.addRecommendedModels) {
+        window.gransabio.addRecommendedModels(type);
     }
 }
 
@@ -1848,5 +1848,5 @@ function updateTokenEstimate() {
 
 // Initialize the interface when the DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
-    window.bioai = new BioAIInterface();
+    window.gransabio = new GranSabioInterface();
 });

@@ -1,5 +1,5 @@
 """
-Monitor API routes for BioAI Unified.
+Monitor API routes for Gran Sabio LLM.
 Provides endpoints for listing active projects and sessions.
 """
 

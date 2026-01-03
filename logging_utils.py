@@ -1,6 +1,6 @@
 """
-Enhanced Logging System for BioAI Unified Engine
-================================================
+Enhanced Logging System for Gran Sabio LLM Engine
+==================================================
 
 Provides visual, colored, structured logging with phase tracking.
 IMPORTANT: No emojis in console output (Windows encoding issues).

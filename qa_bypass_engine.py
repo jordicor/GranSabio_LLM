@@ -1,6 +1,6 @@
 """
-QA Bypass Engine for BioAI Unified Engine
-==========================================
+QA Bypass Engine for Gran Sabio LLM Engine
+===========================================
 
 Algorithmic bypass system for automatic deal-breaker detection,
 avoiding expensive AI model calls for predictable criteria violations.

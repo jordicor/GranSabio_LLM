@@ -1,10 +1,10 @@
-# BioAI Unified Client
+# Gran Sabio LLM Client
 
-Python client library for the BioAI Unified Engine API.
+Python client library for the Gran Sabio LLM Engine API.
 
 ## Installation
 
-The client is included in the BioAI Unified repository. No separate installation required.
+The client is included in the Gran Sabio LLM repository. No separate installation required.
 
 Dependencies:
 ```bash
@@ -16,10 +16,10 @@ pip install aiohttp requests
 ### Synchronous Client
 
 ```python
-from client import BioAIClient
+from client import GranSabioClient
 
 # Create client
-client = BioAIClient()
+client = GranSabioClient()
 
 # Quick generation (no QA)
 result = client.generate_fast("Write a haiku about coding")
@@ -47,10 +47,10 @@ print(result["content"])
 
 ```python
 import asyncio
-from client import AsyncBioAIClient
+from client import AsyncGranSabioClient
 
 async def main():
-    async with AsyncBioAIClient() as client:
+    async with AsyncGranSabioClient() as client:
         # Quick generation
         result = await client.generate_fast("Write a haiku")
         print(result["content"])
@@ -163,14 +163,14 @@ upload_id = result["upload_id"]
 ### Environment Variables
 
 ```bash
-BIOAI_BASE_URL=http://localhost:8000  # API URL
-BIOAI_API_KEY=your_api_key            # Optional API key
+GRANSABIO_BASE_URL=http://localhost:8000  # API URL
+GRANSABIO_API_KEY=your_api_key            # Optional API key
 ```
 
 ### Custom Configuration
 
 ```python
-client = BioAIClient(
+client = GranSabioClient(
     base_url="http://custom-host:8000",
     api_key="your_key",
     timeout=(30, 600)  # (connect, read) in seconds
@@ -180,13 +180,13 @@ client = BioAIClient(
 ## Error Handling
 
 ```python
-from client import BioAIClient, BioAIClientError
+from client import GranSabioClient, GranSabioClientError
 
-client = BioAIClient()
+client = GranSabioClient()
 
 try:
     result = client.generate(prompt="...")
-except BioAIClientError as e:
+except GranSabioClientError as e:
     print(f"Error: {e}")
     print(f"Status code: {e.status_code}")
     print(f"Details: {e.details}")
