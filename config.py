@@ -36,11 +36,20 @@ class AttachmentSettings(BaseModel):
             "text/markdown",
             "application/json",
             "application/pdf",
+            # Image types for vision support
+            "image/jpeg",
+            "image/png",
+            "image/gif",
+            "image/webp",
         ],
         description="MIME types permitted for attachments",
     )
     allowed_extensions: List[str] = Field(
-        default_factory=lambda: [".txt", ".md", ".json", ".pdf"],
+        default_factory=lambda: [
+            ".txt", ".md", ".json", ".pdf",
+            # Image extensions for vision support
+            ".jpg", ".jpeg", ".png", ".gif", ".webp",
+        ],
         description="File extensions permitted for attachments",
     )
     disallowed_mime_types: List[str] = Field(
@@ -230,6 +239,44 @@ class DebuggerSettings(BaseModel):
     )
 
 
+class ImageSettings(BaseModel):
+    """Vision/image processing configuration."""
+
+    max_images_per_request: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Maximum images allowed in a single generation request"
+    )
+    max_image_size_bytes: int = Field(
+        default=5 * 1024 * 1024,  # 5 MB (Claude limit, most restrictive)
+        description="Maximum size per image file in bytes"
+    )
+    max_dimension_pixels: int = Field(
+        default=8000,
+        ge=1,
+        description="Maximum width or height in pixels"
+    )
+    max_dimension_multi_image: int = Field(
+        default=2000,
+        ge=1,
+        description="Max dimension when >20 images in request (Claude requirement)"
+    )
+    default_detail_level: str = Field(
+        default="auto",
+        description="Default detail level for OpenAI: low, high, auto"
+    )
+    auto_resize: bool = Field(
+        default=True,
+        description="Automatically resize images exceeding limits"
+    )
+    optimal_max_edge: int = Field(
+        default=1568,
+        ge=1,
+        description="Optimal max edge size for best performance (Claude recommendation)"
+    )
+
+
 class Config(BaseModel):
     """Configuration settings for the Gran Sabio LLM Engine (no fallbacks)."""
 
@@ -246,6 +293,7 @@ class Config(BaseModel):
     ATTACHMENTS: AttachmentSettings = Field(default_factory=AttachmentSettings, description="Attachment ingestion settings")
     FEEDBACK_MEMORY: FeedbackMemorySettings = Field(default_factory=FeedbackMemorySettings, description="Feedback memory system settings")
     DEBUGGER: DebuggerSettings = Field(default_factory=DebuggerSettings, description="Debugger persistence settings")
+    IMAGE: ImageSettings = Field(default_factory=ImageSettings, description="Vision/image processing settings")
 
     # Model specifications loaded from external JSON file (mandatory)
     spec_catalog: Dict[str, Any] = Field(

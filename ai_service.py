@@ -16,6 +16,7 @@ from typing import Dict, Any, Optional, List, Tuple, Callable, TYPE_CHECKING, Ty
 
 if TYPE_CHECKING:
     from logging_utils import PhaseLogger
+    from models import ImageData
 import openai
 import anthropic
 try:
@@ -481,6 +482,202 @@ class AIService:
 
         _check(schema, "root")
 
+    # =========================================================================
+    # Vision/Image Support Methods
+    # =========================================================================
+
+    def _estimate_image_tokens_openai(
+        self,
+        width: int,
+        height: int,
+        detail: str = "auto"
+    ) -> int:
+        """
+        Estimate OpenAI/xAI image tokens based on dimensions and detail level.
+
+        Args:
+            width: Image width in pixels
+            height: Image height in pixels
+            detail: Detail level ('low', 'high', 'auto')
+
+        Returns:
+            Estimated token count for the image
+        """
+        if detail == "low":
+            return 85
+
+        # High/auto detail: calculate tiles
+        # Images are resized to fit in 2048x2048, then tiled at 512x512
+        if width == 0 or height == 0:
+            return 85  # Fallback for unknown dimensions
+
+        scale = min(2048 / max(width, height), 1.0)
+        scaled_w = int(width * scale)
+        scaled_h = int(height * scale)
+
+        # Shortest side scaled to 768
+        short_side = min(scaled_w, scaled_h)
+        if short_side == 0:
+            return 85
+        short_scale = 768 / short_side
+        final_w = int(scaled_w * short_scale)
+        final_h = int(scaled_h * short_scale)
+
+        # Count 512x512 tiles
+        tiles_w = (final_w + 511) // 512
+        tiles_h = (final_h + 511) // 512
+        tiles = tiles_w * tiles_h
+
+        return 170 * tiles + 85
+
+    def _estimate_image_tokens_claude(self, width: int, height: int) -> int:
+        """
+        Estimate Claude image tokens: (width * height) / 750
+
+        Args:
+            width: Image width in pixels
+            height: Image height in pixels
+
+        Returns:
+            Estimated token count for the image
+        """
+        if width == 0 or height == 0:
+            return 258  # Fallback for unknown dimensions
+        return (width * height) // 750
+
+    def _estimate_image_tokens_gemini(self, width: int, height: int) -> int:
+        """
+        Estimate Gemini image tokens.
+
+        Args:
+            width: Image width in pixels
+            height: Image height in pixels
+
+        Returns:
+            Estimated token count for the image
+        """
+        if width == 0 or height == 0:
+            return 258  # Fallback for unknown dimensions
+
+        if max(width, height) <= 384:
+            return 258
+
+        # Calculate 768x768 tiles
+        tiles_w = (width + 767) // 768
+        tiles_h = (height + 767) // 768
+        return 258 * tiles_w * tiles_h
+
+    def _build_openai_image_content(
+        self,
+        images: List["ImageData"],
+        use_responses_api: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        Build OpenAI/xAI image content parts for vision requests.
+
+        Args:
+            images: List of ImageData objects with base64 encoded images
+            use_responses_api: If True, use Responses API format (input_image),
+                              otherwise use Chat Completions format (image_url)
+
+        Returns:
+            List of content parts ready for the API
+        """
+        parts = []
+        for img in images:
+            detail = img.detail or "auto"
+            data_url = f"data:{img.mime_type};base64,{img.base64_data}"
+
+            if use_responses_api:
+                # Responses API format (O3-pro, GPT-5 Pro)
+                part = {
+                    "type": "input_image",
+                    "image_url": data_url,
+                }
+                if detail != "auto":
+                    part["detail"] = detail
+                parts.append(part)
+            else:
+                # Chat Completions API format (GPT-4o, GPT-5, O1/O3)
+                parts.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": data_url,
+                        "detail": detail
+                    }
+                })
+        return parts
+
+    def _build_claude_image_content(
+        self,
+        images: List["ImageData"]
+    ) -> List[Dict[str, Any]]:
+        """
+        Build Claude image content parts for vision requests.
+
+        Args:
+            images: List of ImageData objects with base64 encoded images
+
+        Returns:
+            List of content parts ready for Claude API
+        """
+        parts = []
+        for img in images:
+            parts.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img.mime_type,
+                    "data": img.base64_data
+                }
+            })
+        return parts
+
+    def _build_gemini_image_parts(self, images: List["ImageData"]) -> List:
+        """
+        Build Gemini image parts using SDK types.
+
+        Args:
+            images: List of ImageData objects with base64 encoded images
+
+        Returns:
+            List of Gemini Part objects ready for the API
+        """
+        import base64 as b64
+        from google.genai import types
+
+        parts = []
+        for img in images:
+            image_bytes = b64.b64decode(img.base64_data)
+            parts.append(
+                types.Part.from_bytes(data=image_bytes, mime_type=img.mime_type)
+            )
+        return parts
+
+    def _log_vision_request(
+        self,
+        images: List["ImageData"],
+        provider: str,
+        model_id: str
+    ) -> None:
+        """Log information about a vision request."""
+        total_tokens = 0
+        for img in images:
+            if img.width and img.height:
+                if provider in ("openai", "xai", "openrouter"):
+                    total_tokens += self._estimate_image_tokens_openai(
+                        img.width, img.height, img.detail or "auto"
+                    )
+                elif provider in ("claude", "anthropic"):
+                    total_tokens += self._estimate_image_tokens_claude(img.width, img.height)
+                elif provider in ("gemini", "google"):
+                    total_tokens += self._estimate_image_tokens_gemini(img.width, img.height)
+
+        logger.info(
+            f"Vision request: {len(images)} image(s) for {model_id} "
+            f"(estimated ~{total_tokens} tokens)"
+        )
+
     def _max_retry_attempts(self) -> int:
         try:
             return max(1, int(getattr(config, "MAX_RETRIES", 3)))
@@ -679,6 +876,7 @@ class AIService:
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
         phase_logger: Optional["PhaseLogger"] = None,
+        images: Optional[List["ImageData"]] = None,
     ) -> str:
         """
         Generate content using specified AI model
@@ -693,6 +891,7 @@ class AIService:
             thinking_budget_tokens: Budget tokens for thinking/reasoning
             content_type: Type of content being generated (affects system prompt selection)
             json_output: Whether to force JSON output format when supported
+            images: Optional list of ImageData objects for vision-enabled models
 
         Returns:
             Generated content as string
@@ -830,6 +1029,10 @@ class AIService:
         prompt = prompt + language_instruction + date_instruction
 
         async def _single_attempt() -> str:
+            # Log vision request if images provided
+            if images:
+                self._log_vision_request(images, provider, model_id)
+
             if provider == "openai":
                 content, usage_meta = await self._generate_openai(
                     prompt,
@@ -842,6 +1045,7 @@ class AIService:
                     request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=json_schema,
+                    images=images,
                 )
 
                 # Log full response if extra_verbose is enabled
@@ -877,6 +1081,7 @@ class AIService:
                     request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=json_schema,
+                    images=images,
                 )
 
                 # Log full response if extra_verbose is enabled
@@ -909,6 +1114,7 @@ class AIService:
                     system_prompt or "",
                     json_output=json_output,
                     json_schema=effective_json_schema,
+                    images=images,
                 )
 
                 # Log full response if extra_verbose is enabled
@@ -941,6 +1147,7 @@ class AIService:
                     system_prompt or "",
                     json_output=json_output,
                     json_schema=json_schema,
+                    images=images,
                 )
 
                 # Log full response if extra_verbose is enabled
@@ -973,6 +1180,7 @@ class AIService:
                     system_prompt or "",
                     json_output=json_output,
                     json_schema=json_schema,
+                    images=images,
                 )
 
                 # Log full response if extra_verbose is enabled
@@ -1054,8 +1262,9 @@ class AIService:
         request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
     ) -> Tuple[str, Any]:
-        """Generate content using OpenAI API with optional JSON Schema support"""
+        """Generate content using OpenAI API with optional JSON Schema and vision support"""
         if not self.openai_client:
             raise ValueError("OpenAI client not initialized")
 
@@ -1069,22 +1278,40 @@ class AIService:
         if json_output:
             effective_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
 
-        # Default messages (for non-o3/o1/Responses routes)
-        messages = [
-            {"role": "system", "content": effective_system_prompt},
-            {"role": "user", "content": effective_prompt}
-        ]
+        # Build messages with optional vision support
+        if images:
+            # Vision-enabled request: use content array format
+            image_parts = self._build_openai_image_content(images, use_responses_api=False)
+            image_parts.append({"type": "text", "text": effective_prompt})
+            messages = [
+                {"role": "system", "content": effective_system_prompt},
+                {"role": "user", "content": image_parts}
+            ]
+        else:
+            # Default text-only messages
+            messages = [
+                {"role": "system", "content": effective_system_prompt},
+                {"role": "user", "content": effective_prompt}
+            ]
 
         # --- RAZONAMIENTO o3-pro: Responses API ---
         if "o3-pro" in model_id.lower():
             if not hasattr(self, 'openai_sync_client') or not self.openai_sync_client:
                 raise ValueError("OpenAI sync client not initialized for O3-pro")
 
+            # Build input for Responses API (supports vision)
+            if images:
+                # Responses API format with images
+                input_content = self._build_openai_image_content(images, use_responses_api=True)
+                input_content.append({"type": "input_text", "text": effective_prompt})
+            else:
+                input_content = effective_prompt  # Plain string for text-only
+
             # IMPORTANT! In Responses API, use 'instructions' for the "system" prompt.
             create_params = {
                 "model": model_id,
-                "input": effective_prompt,                     # better as plain string
-                "instructions": effective_system_prompt,       # system/developer here
+                "input": input_content,
+                "instructions": effective_system_prompt,
                 "max_output_tokens": max_tokens
             }
             if reasoning_effort:
@@ -1161,10 +1388,18 @@ class AIService:
             if not hasattr(self, 'openai_sync_client') or not self.openai_sync_client:
                 raise ValueError("OpenAI sync client not initialized for GPT-5 Pro")
 
+            # Build input for Responses API (supports vision)
+            if images:
+                # Responses API format with images
+                input_content = self._build_openai_image_content(images, use_responses_api=True)
+                input_content.append({"type": "input_text", "text": effective_prompt})
+            else:
+                input_content = effective_prompt  # Plain string for text-only
+
             # GPT-5 Pro usa Responses API igual que o3-pro
             create_params = {
                 "model": model_id,
-                "input": effective_prompt,
+                "input": input_content,
                 "instructions": effective_system_prompt,
                 "max_output_tokens": max_tokens
             }
@@ -1363,6 +1598,7 @@ class AIService:
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
         phase_logger: Optional["PhaseLogger"] = None,
+        images: Optional[List["ImageData"]] = None,
     ):
         """
         Generate content with streaming support
@@ -1377,6 +1613,7 @@ class AIService:
             thinking_budget_tokens: Budget tokens for thinking/reasoning
             content_type: Type of content being generated (affects system prompt selection)
             json_output: Whether to force JSON output format (response_format: json_object)
+            images: Optional list of ImageData objects for vision-enabled models
 
         Yields:
             Generated content chunks as they are produced
@@ -1502,6 +1739,10 @@ class AIService:
         prompt = prompt + language_instruction + date_instruction
 
         async def _dispatch_stream():
+            # Log vision request if images provided
+            if images:
+                self._log_vision_request(images, provider, model_id)
+
             if provider == "openai":
                 async for chunk in self._stream_openai(
                     prompt,
@@ -1519,6 +1760,7 @@ class AIService:
                     provider=provider,
                     resolved_model_id=model_id,
                     usage_extra=extra_payload,
+                    images=images,
                 ):
                     yield chunk
             elif provider in {"anthropic", "claude"}:
@@ -1536,6 +1778,7 @@ class AIService:
                     provider=provider,
                     resolved_model_id=model_id,
                     usage_extra=extra_payload,
+                    images=images,
                 ):
                     yield chunk
             elif provider in {"google", "gemini"}:
@@ -1550,6 +1793,7 @@ class AIService:
                     usage_callback=usage_callback,
                     provider=provider,
                     usage_extra=extra_payload,
+                    images=images,
                 ):
                     yield chunk
             elif provider in {"xai", "grok"}:
@@ -1563,6 +1807,7 @@ class AIService:
                     json_schema=json_schema,
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
+                    images=images,
                 ):
                     yield chunk
             elif provider == "openrouter":
@@ -1576,6 +1821,7 @@ class AIService:
                     json_schema=json_schema,
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
+                    images=images,
                 ):
                     yield chunk
             elif provider == "ollama":
@@ -1647,8 +1893,9 @@ class AIService:
         request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
     ) -> Tuple[str, Any]:
-        """Generate content using Claude API with optional Structured Outputs support
+        """Generate content using Claude API with optional Structured Outputs and vision support
 
         Args:
             prompt: Generation prompt
@@ -1660,6 +1907,7 @@ class AIService:
             request_timeout: Request timeout
             json_output: Enable JSON output mode
             json_schema: Optional JSON schema for structured outputs (Claude Sonnet 4.5 / Opus 4.1 beta)
+            images: Optional list of ImageData objects for vision-enabled requests
         """
         if not self.anthropic_client:
             raise ValueError("Claude client not initialized")
@@ -1677,30 +1925,33 @@ class AIService:
         )
         use_structured_outputs = json_output and json_schema and supports_structured_outputs
 
+        # Helper to build user content with optional images
+        def _build_user_content(text_content: str) -> Any:
+            if images:
+                # Claude: images first, then text
+                content_parts = self._build_claude_image_content(images)
+                content_parts.append({"type": "text", "text": text_content})
+                return content_parts
+            return text_content
+
         if use_structured_outputs:
             # Use new Structured Outputs (beta) - no prefill, schema-guaranteed
-            messages = [{"role": "user", "content": prompt}]
+            messages = [{"role": "user", "content": _build_user_content(prompt)}]
             logger.info(f"Using Claude Structured Outputs (beta) with JSON Schema for {model_id}")
         elif json_output:
             # Fallback to prompt engineering approach
             if thinking_enabled:
-                messages = [
-                    {
-                        "role": "user",
-                        "content": f"{prompt}\n\nCRITICAL REQUIREMENT: You MUST respond with valid JSON only. Start your response with '{{' immediately. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text, explanation, or thinking output before or after the JSON object."
-                    }
-                ]
+                json_prompt = f"{prompt}\n\nCRITICAL REQUIREMENT: You MUST respond with valid JSON only. Start your response with '{{' immediately. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text, explanation, or thinking output before or after the JSON object."
+                messages = [{"role": "user", "content": _build_user_content(json_prompt)}]
             else:
+                json_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text before or after the JSON object."
                 messages = [
-                    {
-                        "role": "user",
-                        "content": f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text before or after the JSON object."
-                    },
+                    {"role": "user", "content": _build_user_content(json_prompt)},
                     {"role": "assistant", "content": "{"}
                 ]
             logger.info(f"Using Claude JSON mode (prompt engineering) for {model_id}")
         else:
-            messages = [{"role": "user", "content": prompt}]
+            messages = [{"role": "user", "content": _build_user_content(prompt)}]
 
         create_params = {
             "model": model_id,
@@ -1816,8 +2067,9 @@ class AIService:
         system_prompt: str,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
     ) -> Tuple[str, Any]:
-        """Generate content using Gemini API with optional JSON Schema support"""
+        """Generate content using Gemini API with optional JSON Schema and vision support"""
         if self.google_new_client:
             return await self._generate_gemini_new_sdk(
                 prompt,
@@ -1827,8 +2079,17 @@ class AIService:
                 system_prompt,
                 json_output=json_output,
                 json_schema=json_schema,
+                images=images,
             )
         elif self.genai_client:
+            # Legacy SDK: log warning if images provided (not fully supported)
+            if images:
+                logger.warning(
+                    "Vision not supported with legacy Gemini SDK. "
+                    "Images will be ignored for model %s. "
+                    "Consider upgrading to google-genai SDK.",
+                    model_id
+                )
             return await self._generate_gemini_legacy_sdk(
                 prompt,
                 model_id,
@@ -1850,8 +2111,9 @@ class AIService:
         system_prompt: str,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
     ) -> Tuple[str, Any]:
-        """Generate content using new Google GenAI SDK with optional JSON Schema support
+        """Generate content using new Google GenAI SDK with optional JSON Schema and vision support
 
         Args:
             prompt: Generation prompt
@@ -1861,6 +2123,7 @@ class AIService:
             system_prompt: System prompt
             json_output: Enable JSON output mode
             json_schema: Optional JSON schema for structured outputs (requires json_output=True)
+            images: Optional list of ImageData objects for vision-enabled requests
         """
         try:
             from google.genai import types
@@ -1872,15 +2135,17 @@ class AIService:
             if json_output:
                 final_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
 
+            # Build parts list (images first, then text)
+            parts = []
+            if images:
+                parts.extend(self._build_gemini_image_parts(images))
+
             if system_prompt:
-                contents.append({
-                    "role": "user",  # System messages handled as user in new SDK
-                    "parts": [{"text": f"System: {system_prompt}\n\nUser: {final_prompt}"}]
-                })
+                parts.append({"text": f"System: {system_prompt}\n\nUser: {final_prompt}"})
+                contents.append({"role": "user", "parts": parts})
             else:
-                contents.append({
-                    "parts": [{"text": final_prompt}]
-                })
+                parts.append({"text": final_prompt})
+                contents.append({"parts": parts})
 
             # Check if model supports thinking
             thinking_budget = self._get_thinking_budget_for_model(model_id)
@@ -2141,8 +2406,9 @@ class AIService:
         system_prompt: str,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
     ) -> Tuple[str, Any]:
-        """Generate content using xAI Grok API with optional structured outputs
+        """Generate content using xAI Grok API with optional structured outputs and vision
 
         Args:
             prompt: Generation prompt
@@ -2152,6 +2418,7 @@ class AIService:
             system_prompt: System prompt
             json_output: Enable JSON output mode
             json_schema: Optional JSON schema for structured outputs (requires json_output=True)
+            images: Optional list of ImageData objects for vision-enabled requests
         """
         if not self.xai_client:
             raise ValueError("xAI client not initialized")
@@ -2160,9 +2427,13 @@ class AIService:
         if json_output:
             effective_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
 
-        messages = [
-            {"role": "user", "content": effective_prompt}
-        ]
+        # Build user content with optional images (xAI uses OpenAI format)
+        if images:
+            image_parts = self._build_openai_image_content(images, use_responses_api=False)
+            image_parts.append({"type": "text", "text": effective_prompt})
+            messages = [{"role": "user", "content": image_parts}]
+        else:
+            messages = [{"role": "user", "content": effective_prompt}]
 
         if system_prompt:
             system_content = system_prompt
@@ -2210,8 +2481,9 @@ class AIService:
         system_prompt: str,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
     ) -> Tuple[str, Any]:
-        """Generate content using OpenRouter unified API with optional JSON Schema support"""
+        """Generate content using OpenRouter unified API with optional JSON Schema and vision support"""
         if not self.openrouter_client:
             raise ValueError("OpenRouter client not initialized")
 
@@ -2219,9 +2491,13 @@ class AIService:
         if json_output:
             effective_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
 
-        messages = [
-            {"role": "user", "content": effective_prompt}
-        ]
+        # Build user content with optional images (OpenRouter uses OpenAI format)
+        if images:
+            image_parts = self._build_openai_image_content(images, use_responses_api=False)
+            image_parts.append({"type": "text", "text": effective_prompt})
+            messages = [{"role": "user", "content": image_parts}]
+        else:
+            messages = [{"role": "user", "content": effective_prompt}]
 
         if system_prompt:
             system_content = system_prompt
@@ -2340,8 +2616,9 @@ class AIService:
         provider: str = "openai",
         resolved_model_id: Optional[str] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
     ):
-        """Stream OpenAI content generation with optional JSON Schema support"""
+        """Stream OpenAI content generation with optional JSON Schema and vision support"""
         if not self.openai_client:
             self._initialize_clients()
 
@@ -2357,10 +2634,19 @@ class AIService:
         if json_output:
             effective_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
 
-        messages = [
-            {"role": "system", "content": effective_system_prompt},
-            {"role": "user", "content": effective_prompt}
-        ]
+        # Build messages with optional vision support
+        if images:
+            image_parts = self._build_openai_image_content(images, use_responses_api=False)
+            image_parts.append({"type": "text", "text": effective_prompt})
+            messages = [
+                {"role": "system", "content": effective_system_prompt},
+                {"role": "user", "content": image_parts}
+            ]
+        else:
+            messages = [
+                {"role": "system", "content": effective_system_prompt},
+                {"role": "user", "content": effective_prompt}
+            ]
         
         # Log streaming start if extra_verbose is enabled
         if extra_verbose:
@@ -2383,6 +2669,7 @@ class AIService:
                     request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=json_schema,
+                    images=images,
                 )
                 yield content
                 self._emit_usage(
@@ -2408,6 +2695,7 @@ class AIService:
                     request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=json_schema,
+                    images=images,
                 )
                 yield content
                 self._emit_usage(
@@ -2422,7 +2710,14 @@ class AIService:
             # Handle O1/O3 models (excluding O3-pro)
             elif any(x in model_id.lower() for x in ["o1", "o3"]) and "o3-pro" not in model_id.lower():
                 # O1/O3 models: no system message, no temperature
-                messages = [{"role": "user", "content": f"{effective_system_prompt}\n\n{effective_prompt}"}]
+                # Combine system prompt and user prompt into single user message
+                combined_prompt = f"{effective_system_prompt}\n\n{effective_prompt}"
+                if images:
+                    image_parts = self._build_openai_image_content(images, use_responses_api=False)
+                    image_parts.append({"type": "text", "text": combined_prompt})
+                    messages = [{"role": "user", "content": image_parts}]
+                else:
+                    messages = [{"role": "user", "content": combined_prompt}]
 
                 create_params = _build_openai_params(model_id, messages, temperature, max_tokens, reasoning_effort)
                 create_params["stream"] = True  # Add streaming
@@ -2596,8 +2891,9 @@ class AIService:
         provider: str = "claude",
         resolved_model_id: Optional[str] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
     ):
-        """Stream Claude content generation with optional Structured Outputs support"""
+        """Stream Claude content generation with optional Structured Outputs and vision support"""
         if not self.anthropic_client:
             self._initialize_clients()
 
@@ -2617,26 +2913,35 @@ class AIService:
         )
         use_structured_outputs = json_output and json_schema and supports_structured_outputs
 
+        # Helper to build user content with optional images
+        def _build_user_content(text_content: str) -> Any:
+            if images:
+                # Claude: images first, then text
+                content_parts = self._build_claude_image_content(images)
+                content_parts.append({"type": "text", "text": text_content})
+                return content_parts
+            return text_content
+
         if use_structured_outputs:
             # Use new Structured Outputs (beta) - no prefill, schema-guaranteed
-            messages = [{"role": "user", "content": prompt}]
+            messages = [{"role": "user", "content": _build_user_content(prompt)}]
             logger.info(f"Using Claude Structured Outputs (beta, streaming) with JSON Schema for {model_id}")
         elif json_output:
             # Fallback to prompt engineering approach
             if thinking_enabled:
                 # Cannot prefill when thinking is enabled - use strong prompt instructions instead
-                messages = [
-                    {"role": "user", "content": f"{prompt}\n\nCRITICAL REQUIREMENT: You MUST respond with valid JSON only. Start your response with '{{' immediately. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text, explanation, or thinking output before or after the JSON object."}
-                ]
+                json_prompt = f"{prompt}\n\nCRITICAL REQUIREMENT: You MUST respond with valid JSON only. Start your response with '{{' immediately. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text, explanation, or thinking output before or after the JSON object."
+                messages = [{"role": "user", "content": _build_user_content(json_prompt)}]
             else:
                 # Standard prefill approach when thinking is not enabled
+                json_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text before or after the JSON object."
                 messages = [
-                    {"role": "user", "content": f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text before or after the JSON object."},
+                    {"role": "user", "content": _build_user_content(json_prompt)},
                     {"role": "assistant", "content": "{"}  # Prefill to force JSON start
                 ]
             logger.info(f"Using Claude JSON mode (streaming, prompt engineering) for {model_id}")
         else:
-            messages = [{"role": "user", "content": prompt}]
+            messages = [{"role": "user", "content": _build_user_content(prompt)}]
 
         try:
             stream_params = {
@@ -2765,8 +3070,9 @@ class AIService:
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         provider: str = "gemini",
         usage_extra: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
     ):
-        """Stream Gemini content generation with optional JSON Schema support"""
+        """Stream Gemini content generation with optional JSON Schema and vision support"""
         extra_payload = usage_extra or {}
         if self.google_new_client:
             async for chunk in self._stream_gemini_new_sdk(
@@ -2780,9 +3086,17 @@ class AIService:
                 usage_callback,
                 provider,
                 extra_payload,
+                images=images,
             ):
                 yield chunk
         elif self.genai_client:
+            # Legacy SDK: log warning if images provided (not fully supported)
+            if images:
+                logger.warning(
+                    "Vision streaming not supported with legacy Gemini SDK. "
+                    "Images will be ignored for model %s.",
+                    model_id
+                )
             async for chunk in self._stream_gemini_legacy_sdk(
                 prompt,
                 model_id,
@@ -2811,8 +3125,9 @@ class AIService:
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         provider: str = "gemini",
         usage_extra: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
     ):
-        """Stream content using new Google GenAI SDK with optional JSON Schema support"""
+        """Stream content using new Google GenAI SDK with optional JSON Schema and vision support"""
         extra_payload = usage_extra or {}
         try:
             from google.genai import types
@@ -2825,15 +3140,17 @@ class AIService:
             if json_output:
                 final_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
 
+            # Build parts list (images first, then text)
+            parts = []
+            if images:
+                parts.extend(self._build_gemini_image_parts(images))
+
             if system_prompt:
-                contents.append({
-                    "role": "user",  # System messages handled as user in new SDK
-                    "parts": [{"text": f"System: {system_prompt}\n\nUser: {final_prompt}"}]
-                })
+                parts.append({"text": f"System: {system_prompt}\n\nUser: {final_prompt}"})
+                contents.append({"role": "user", "parts": parts})
             else:
-                contents.append({
-                    "parts": [{"text": final_prompt}]
-                })
+                parts.append({"text": final_prompt})
+                contents.append({"parts": parts})
 
             # Check if model supports thinking
             thinking_budget = self._get_thinking_budget_for_model(model_id)
@@ -3033,8 +3350,9 @@ class AIService:
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
     ):
-        """Stream xAI content generation with optional structured outputs
+        """Stream xAI content generation with optional structured outputs and vision
 
         Args:
             prompt: Generation prompt
@@ -3046,6 +3364,7 @@ class AIService:
             json_schema: Optional JSON schema for structured outputs (requires json_output=True)
             usage_callback: Callback for usage tracking
             usage_extra: Extra usage tracking data
+            images: Optional list of ImageData objects for vision-enabled requests
         """
         if not self.xai_client:
             self._initialize_clients()
@@ -3056,7 +3375,13 @@ class AIService:
         if json_output:
             effective_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
 
-        messages = [{"role": "user", "content": effective_prompt}]
+        # Build user content with optional images (xAI uses OpenAI format)
+        if images:
+            image_parts = self._build_openai_image_content(images, use_responses_api=False)
+            image_parts.append({"type": "text", "text": effective_prompt})
+            messages = [{"role": "user", "content": image_parts}]
+        else:
+            messages = [{"role": "user", "content": effective_prompt}]
         if system_prompt:
             messages.insert(0, {"role": "system", "content": system_prompt})
 
@@ -3129,8 +3454,9 @@ class AIService:
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
     ):
-        """Stream OpenRouter content generation with optional JSON Schema support"""
+        """Stream OpenRouter content generation with optional JSON Schema and vision support"""
         if not self.openrouter_client:
             self._initialize_clients()
 
@@ -3140,7 +3466,13 @@ class AIService:
         if json_output:
             effective_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
 
-        messages = [{"role": "user", "content": effective_prompt}]
+        # Build user content with optional images (OpenRouter uses OpenAI format)
+        if images:
+            image_parts = self._build_openai_image_content(images, use_responses_api=False)
+            image_parts.append({"type": "text", "text": effective_prompt})
+            messages = [{"role": "user", "content": image_parts}]
+        else:
+            messages = [{"role": "user", "content": effective_prompt}]
         if system_prompt:
             messages.insert(0, {"role": "system", "content": system_prompt})
 

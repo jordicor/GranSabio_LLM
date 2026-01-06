@@ -25,6 +25,7 @@ load_dotenv()
 
 if TYPE_CHECKING:
     from logging_utils import PhaseLogger
+    from models import ImageData
 
 from ai_service import AIService, get_ai_service, AIRequestError
 from qa_evaluation_service import QAEvaluationService
@@ -203,6 +204,7 @@ class QAEngine:
         marker_mode: str = "phrase",
         marker_length: Optional[int] = None,
         word_map_formatted: Optional[str] = None,
+        input_images: Optional[List["ImageData"]] = None,
     ) -> QAEvaluation:
         """
         Evaluate content using a specific QA layer and AI model
@@ -211,6 +213,9 @@ class QAEngine:
             marker_mode: "phrase" for text markers, "word_index" for word map indices
             marker_length: Number of words for phrase markers (4-12)
             word_map_formatted: Formatted word map string for word_index mode
+            input_images: Optional list of ImageData for vision-enabled QA evaluation.
+                         Only passed if both the layer has include_input_images=True
+                         and the QA model supports vision.
         """
         from models import QAModelConfig
 
@@ -219,6 +224,37 @@ class QAEngine:
             model_config = QAModelConfig(model=model)
         else:
             model_config = model
+
+        # Determine if we should pass images to this evaluation
+        # Images are only passed if:
+        # 1. input_images is provided
+        # 2. The layer has include_input_images=True
+        # 3. The QA model supports vision
+        images_for_eval = None
+        if input_images and getattr(layer, 'include_input_images', False):
+            try:
+                model_info = config.get_model_info(model_config.model)
+                model_capabilities = model_info.get("capabilities", [])
+                model_supports_vision = "vision" in [
+                    c.lower() for c in model_capabilities if isinstance(c, str)
+                ]
+                if model_supports_vision:
+                    images_for_eval = input_images
+                    if extra_verbose:
+                        logger.info(
+                            f"[QA VISION] Passing {len(input_images)} images to {model_config.model} "
+                            f"for layer '{layer.name}'"
+                        )
+                else:
+                    logger.warning(
+                        f"[QA VISION] Layer '{layer.name}' has include_input_images=True but "
+                        f"model {model_config.model} doesn't support vision. Evaluating without images."
+                    )
+            except Exception as exc:
+                logger.warning(
+                    f"[QA VISION] Could not determine vision support for {model_config.model}: {exc}. "
+                    f"Evaluating without images."
+                )
 
         try:
             return await self.qa_evaluator.evaluate_content(
@@ -242,6 +278,7 @@ class QAEngine:
                 marker_mode=marker_mode,
                 marker_length=marker_length,
                 word_map_formatted=word_map_formatted,
+                input_images=images_for_eval,
             )
         except Exception as e:
             logger.error(f"QA evaluation failed for layer {layer.name} with model {model_config.model}: {str(e)}")
@@ -251,11 +288,16 @@ class QAEngine:
         self,
         content: str,
         layers: List[QALayer],
-        qa_models: List[str]
+        qa_models: List[str],
+        input_images: Optional[List["ImageData"]] = None,
     ) -> Dict[str, Dict[str, QAEvaluation]]:
         """
         Evaluate content through all QA layers with all specified models.
         (Non-progress variant)
+
+        Args:
+            input_images: Optional list of ImageData for vision-enabled QA.
+                         Passed to layers with include_input_images=True.
         """
         # Sort layers by order
         sorted_layers = sorted(layers, key=lambda x: x.order)
@@ -273,7 +315,10 @@ class QAEngine:
                 individual_timeout = calculate_qa_timeout_for_model(model)
                 task = asyncio.create_task(
                     asyncio.wait_for(
-                        self.evaluate_content(content, layer, model),
+                        self.evaluate_content(
+                            content, layer, model,
+                            input_images=input_images,
+                        ),
                         timeout=individual_timeout
                     ),
                     name=f"{layer.name}_{model}"
@@ -389,6 +434,7 @@ class QAEngine:
         marker_mode: str = "phrase",
         marker_length: Optional[int] = None,
         word_map_formatted: Optional[str] = None,
+        input_images: Optional[List["ImageData"]] = None,
     ) -> Dict[str, Dict[str, QAEvaluation]]:
         """
         Evaluate content through all QA layers with detailed progress tracking.
@@ -397,6 +443,8 @@ class QAEngine:
             marker_mode: "phrase" for text markers, "word_index" for word map indices
             marker_length: Number of words for phrase markers (4-12)
             word_map_formatted: Formatted word map string for word_index mode
+            input_images: Optional list of ImageData for vision-enabled QA.
+                         Passed to layers with include_input_images=True.
         """
         from models import QAModelConfig
 
@@ -525,6 +573,7 @@ class QAEngine:
                                 marker_mode=marker_mode,
                                 marker_length=marker_length,
                                 word_map_formatted=word_map_formatted,
+                                input_images=input_images,
                             ),
                             timeout=individual_timeout
                         )
@@ -923,6 +972,7 @@ class QAEngine:
         marker_mode: str = "phrase",
         marker_length: Optional[int] = None,
         word_map_formatted: Optional[str] = None,
+        input_images: Optional[List["ImageData"]] = None,
     ) -> Dict[str, Any]:
         """
         Comprehensive content evaluation with progress tracking
@@ -931,6 +981,8 @@ class QAEngine:
             marker_mode: "phrase" for text markers, "word_index" for word map indices
             marker_length: Number of words for phrase markers (4-12)
             word_map_formatted: Formatted word map string for word_index mode
+            input_images: Optional list of ImageData for vision-enabled QA.
+                         Passed to layers with include_input_images=True.
         """
         from models import QAModelConfig
 
@@ -956,6 +1008,7 @@ class QAEngine:
             marker_mode=marker_mode,
             marker_length=marker_length,
             word_map_formatted=word_map_formatted,
+            input_images=input_images,
         )
 
         if isinstance(qa_results, dict) and qa_results.get("summary", {}).get("force_iteration"):

@@ -72,6 +72,12 @@ class QALayer(BaseModel):
     concise_on_pass: bool = Field(default=True, description="If True, provide concise 'Passed' feedback when score >= min_score (saves tokens). If False, always provide detailed feedback.")
     order: int = Field(default=1, description="Evaluation order for this layer")
 
+    # Vision support for QA evaluation
+    include_input_images: bool = Field(
+        default=False,
+        description="When true and images are available, include input images in QA evaluation context. Useful for layers that validate image descriptions or visual accuracy."
+    )
+
     # Deprecated field for backward compatibility
     is_deal_breaker: bool = Field(default=False, description="DEPRECATED: Use deal_breaker_criteria instead")
 
@@ -535,6 +541,39 @@ class ContextDocumentRef(BaseModel):
     intended_usage: Optional[str] = Field(default="context", description="Usage hint stored alongside the attachment")
 
 
+class ImageRef(BaseModel):
+    """Reference to an image attachment for vision-enabled generation."""
+
+    upload_id: str = Field(..., min_length=8, description="Attachment upload_id containing the image")
+    username: str = Field(..., min_length=1, description="Owner of the attachment")
+    detail: Optional[str] = Field(
+        default=None,
+        description="Detail level for OpenAI: 'low', 'high', 'auto'. None = provider default"
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "upload_id": "abc123def456",
+                "username": "user1",
+                "detail": "auto"
+            }
+        }
+
+
+class ImageData(BaseModel):
+    """Resolved image data ready for API calls."""
+
+    base64_data: str = Field(..., description="Base64-encoded image content")
+    mime_type: str = Field(..., description="Image MIME type (e.g., image/jpeg, image/png)")
+    original_filename: str = Field(..., description="Original filename of the uploaded image")
+    size_bytes: int = Field(..., ge=0, description="File size in bytes")
+    width: Optional[int] = Field(default=None, ge=1, description="Image width in pixels")
+    height: Optional[int] = Field(default=None, ge=1, description="Image height in pixels")
+    estimated_tokens: Optional[int] = Field(default=None, ge=0, description="Estimated token cost for this image")
+    detail: Optional[str] = Field(default=None, description="Detail level applied for OpenAI")
+
+
 class ProjectInitRequest(BaseModel):
     """Optional payload used when allocating or reserving a project identifier."""
 
@@ -584,6 +623,16 @@ class ContentRequest(BaseModel):
     context_documents: Optional[List[ContextDocumentRef]] = Field(
         default=None,
         description="List of attachments to expose as contextual documents",
+    )
+
+    # Image inputs for vision-enabled generation
+    images: Optional[List[ImageRef]] = Field(
+        default=None,
+        description="List of image references for vision-enabled models (GPT-4o, Claude, Gemini)"
+    )
+    image_detail: Optional[str] = Field(
+        default=None,
+        description="Default detail level for all images: 'low', 'high', 'auto' (OpenAI-specific)"
     )
 
     # Generator configuration
@@ -650,6 +699,10 @@ class ContentRequest(BaseModel):
         description="Per-model QA configuration by model name. Example: {'gpt-5-mini': {'reasoning_effort': 'high', 'max_tokens': 12000}}"
     )
     qa_layers: List[QALayer] = Field(default=[], description="QA evaluation layers - use empty list [] to bypass QA evaluation")
+    qa_with_vision: bool = Field(
+        default=False,
+        description="Enable vision support in QA evaluation. When true, input images are passed to QA layers that have include_input_images=True. Only works when images are provided in the request."
+    )
     
     # Scoring configuration
     min_global_score: float = Field(default=8.0, ge=0.0, le=10.0, description="Minimum global average score")

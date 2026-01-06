@@ -13,3 +13,4 @@ requests>=2.32.0
 orjson>=3.10.0
 python-magic>=0.4.27
 httpx>=0.28.0
+Pillow>=10.0.0

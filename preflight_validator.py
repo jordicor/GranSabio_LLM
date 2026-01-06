@@ -30,8 +30,21 @@ logger = logging.getLogger(__name__)
 def _build_validation_payload(
     request: ContentRequest,
     context_documents: Optional[List[Dict[str, Any]]] = None,
+    image_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Collect the relevant pieces of the request for the validator."""
+    """Collect the relevant pieces of the request for the validator.
+
+    Args:
+        request: The content generation request.
+        context_documents: Optional list of context document summaries.
+        image_info: Optional dict with image metadata for vision-enabled requests:
+            - count: Number of images
+            - total_estimated_tokens: Sum of estimated tokens for all images
+            - filenames: List of original filenames
+            - total_size_bytes: Total size of all images
+            - generator_supports_vision: Whether the generator model supports vision
+            - detail_levels: List of detail levels used
+    """
     qa_layers: List[Dict[str, Any]] = []
     for layer in request.qa_layers:
         if hasattr(layer, "model_dump"):
@@ -99,6 +112,8 @@ def _build_validation_payload(
     if context_documents:
         payload["context_documents"] = context_documents
         payload["context_documents_total_bytes"] = sum(item.get("size_bytes", 0) for item in context_documents)
+    if image_info:
+        payload["images"] = image_info
     if word_count_info:
         payload["word_count"] = word_count_info
     if phrase_frequency_info:
@@ -147,6 +162,13 @@ def _build_validator_prompt(payload: Dict[str, Any]) -> str:
         "You MUST identify and recommend removing any QA layers that validate word count, length, brevity, size, word limits, "
         "character count, or any size-related criteria when algorithmic word count enforcement is active. "
         "IMPORTANT: After identifying redundant layers for removal, the request should PROCEED (not be rejected) as the conflict will be resolved by removing the redundant layers. "
+
+        "VISION/IMAGE VALIDATION: "
+        "If the request includes an 'images' block (images.count > 0): "
+        "1. Check 'generator_supports_vision' field. If FALSE, REJECT with code 'vision_not_supported' - the generator model cannot process images. "
+        "2. Check for contradictions: if QA layers require 'text-only' analysis or forbid visual references, but images are provided, flag as warning. "
+        "3. If prompt explicitly mentions analyzing/describing images but no images are provided, issue a warning (not rejection). "
+        "4. Vision-enabled requests are valid for all content types - images can provide context for biographies, articles, scripts, etc. "
 
         "If no blocking issue exists, respond with decision 'proceed'. "
         "Always return STRICT JSON matching the described schema. Do not include code fences or commentary."
@@ -333,11 +355,25 @@ async def run_preflight_validation(
     ai_service,
     request: ContentRequest,
     context_documents: Optional[List[Dict[str, Any]]] = None,
+    image_info: Optional[Dict[str, Any]] = None,
     stream_callback: Optional[callable] = None,
     usage_tracker: Optional[UsageTracker] = None,
     phase_logger: Optional["PhaseLogger"] = None,
 ) -> PreflightResult:
-    """Run the preflight validator and return a structured decision."""
+    """Run the preflight validator and return a structured decision.
+
+    Args:
+        ai_service: The AI service instance for generation.
+        request: The content generation request to validate.
+        context_documents: Optional list of context document summaries.
+        image_info: Optional dict with image metadata for vision-enabled requests.
+        stream_callback: Optional callback for streaming validation output.
+        usage_tracker: Optional usage tracker for cost tracking.
+        phase_logger: Optional phase logger for structured logging.
+
+    Returns:
+        PreflightResult with decision (proceed/reject) and validation feedback.
+    """
     if not getattr(config, "PREFLIGHT_VALIDATION_MODEL", None):
         heuristic_analysis = _analyze_word_count_conflicts(request)
         return PreflightResult(
@@ -350,7 +386,11 @@ async def run_preflight_validation(
             duplicate_word_count_layers_to_remove=heuristic_analysis["duplicate_layers_to_remove"],
         )
 
-    payload = _build_validation_payload(request, context_documents=context_documents)
+    payload = _build_validation_payload(
+        request,
+        context_documents=context_documents,
+        image_info=image_info,
+    )
     validator_prompt = _build_validator_prompt(payload)
 
     try:

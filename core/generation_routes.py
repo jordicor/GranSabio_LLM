@@ -20,6 +20,7 @@ from models import (
     ContentRequest,
     GenerationInitResponse,
     GenerationStatus,
+    ImageData,
     PreflightResult,
     ProjectInitRequest,
     ProjectInitResponse,
@@ -68,6 +69,7 @@ from .generation_processor import (
     _build_final_result,
     add_verbose_log,
     process_content_generation,
+    resolve_images_for_generation,
     ai_service,
 )
 
@@ -405,6 +407,108 @@ async def generate_content(request: ContentRequest):
             request.username,
         )
 
+    # Validate and resolve images for vision-enabled generation
+    resolved_images: List[ImageData] = []
+    if request.images:
+        if not request.username:
+            raise HTTPException(status_code=400, detail="username is required when providing images")
+
+        if not attachment_manager:
+            attachment_manager = get_attachment_manager()
+
+        max_images = config.IMAGE.max_images_per_request
+        if len(request.images) > max_images:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Maximum of {max_images} images allowed per request"
+            )
+
+        # Validate image references before starting generation
+        seen_image_ids = set()
+        for img_ref in request.images:
+            if img_ref.username != request.username:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Image does not belong to the requesting user"
+                )
+            if img_ref.upload_id in seen_image_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Duplicate image reference: {img_ref.upload_id}"
+                )
+            seen_image_ids.add(img_ref.upload_id)
+
+            # Validate image exists and is actually an image type
+            try:
+                resolved = attachment_manager.resolve_attachment(
+                    username=request.username,
+                    upload_id=img_ref.upload_id,
+                )
+                if not attachment_manager._is_image(resolved.record):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Attachment {img_ref.upload_id} is not an image "
+                               f"(type: {resolved.record.mime_type})"
+                    )
+            except AttachmentValidationError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except AttachmentNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except AttachmentError as exc:
+                logger.exception("Unexpected image resolution error", exc_info=exc)
+                raise HTTPException(status_code=500, detail="Unable to access image content") from exc
+
+        # Resolve all images to ImageData (fail-fast on any error)
+        try:
+            resolved_images = await resolve_images_for_generation(request, attachment_manager)
+            logger.info(
+                "Resolved %d images for vision-enabled generation, user %s",
+                len(resolved_images),
+                request.username,
+            )
+        except (AttachmentError, AttachmentNotFoundError, AttachmentValidationError) as exc:
+            raise HTTPException(status_code=400, detail=f"Image processing failed: {exc}") from exc
+
+    # Build image_info for preflight validation (vision-enabled requests)
+    preflight_image_info: Optional[Dict[str, Any]] = None
+    if resolved_images:
+        # Check if the generator model supports vision
+        try:
+            generator_model_info = config.get_model_info(request.generator_model)
+            generator_capabilities = generator_model_info.get("capabilities", [])
+            generator_supports_vision = "vision" in [
+                c.lower() for c in generator_capabilities if isinstance(c, str)
+            ]
+        except Exception:
+            # If we can't determine capabilities, assume vision is not supported
+            generator_supports_vision = False
+
+        # Validate vision support - reject early if model cannot process images
+        # This validation runs regardless of qa_layers (preflight might be skipped)
+        if not generator_supports_vision:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model '{request.generator_model}' does not support vision/images. "
+                    f"Request includes {len(resolved_images)} image(s). "
+                    "Please use a vision-capable model (e.g., gpt-4o, claude-sonnet-4, "
+                    "gemini-2.5-flash) or remove the images from the request."
+                )
+            )
+
+        preflight_image_info = {
+            "count": len(resolved_images),
+            "total_estimated_tokens": sum(
+                img.estimated_tokens or 0 for img in resolved_images
+            ),
+            "filenames": [img.original_filename for img in resolved_images],
+            "total_size_bytes": sum(img.size_bytes for img in resolved_images),
+            "generator_supports_vision": generator_supports_vision,
+            "detail_levels": list(set(
+                img.detail for img in resolved_images if img.detail
+            )) or ["auto"],
+        }
+
     reasoning_timeout_hint: Optional[int] = None
     try:
         validation_preview = config.validate_token_limits(
@@ -483,6 +587,7 @@ async def generate_content(request: ContentRequest):
                 ai_service,
                 request,
                 context_documents=preflight_context,
+                image_info=preflight_image_info,
                 stream_callback=preflight_stream_callback,
                 usage_tracker=usage_tracker,
                 phase_logger=preflight_phase_logger,
@@ -563,7 +668,13 @@ async def generate_content(request: ContentRequest):
     # No cleanup needed since we reuse the same session_id
 
     # Start generation process in background
-    asyncio.create_task(process_content_generation(session_id, request, resolved_attachments, attachment_manager))
+    asyncio.create_task(process_content_generation(
+        session_id,
+        request,
+        resolved_attachments,
+        attachment_manager,
+        resolved_images,
+    ))
 
     return GenerationInitResponse(
         status="initialized",

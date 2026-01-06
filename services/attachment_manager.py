@@ -528,6 +528,122 @@ class AttachmentManager:
 
         return data.decode("utf-8", errors="replace")
 
+    def get_image_dimensions(self, resolved: ResolvedAttachment) -> Optional[Tuple[int, int]]:
+        """
+        Get image dimensions (width, height) using PIL/Pillow.
+
+        Returns None if dimensions cannot be determined or attachment is not an image.
+        """
+        if not self._is_image(resolved.record):
+            return None
+
+        try:
+            from PIL import Image
+            with Image.open(resolved.binary_path) as img:
+                return img.size  # Returns (width, height)
+        except ImportError:
+            logger.warning("Pillow not installed, cannot get image dimensions")
+            return None
+        except Exception as exc:
+            logger.warning("Failed to get dimensions for %s: %s", resolved.binary_path, exc)
+            return None
+
+    def resize_image_if_needed(
+        self,
+        resolved: ResolvedAttachment,
+        max_edge: Optional[int] = None,
+        max_size_bytes: Optional[int] = None,
+    ) -> Tuple[bytes, str]:
+        """
+        Resize image if it exceeds limits. Returns (image_bytes, mime_type).
+
+        May convert format (e.g., HEIC -> JPEG) for broader API compatibility.
+        Uses config.IMAGE settings for defaults.
+        Respects config.IMAGE.auto_resize setting.
+
+        Raises:
+            AttachmentError: If Pillow is not installed.
+        """
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise AttachmentError(
+                "Pillow is required for image processing. Install with: pip install Pillow"
+            ) from exc
+        import io
+        from config import config
+
+        # Check if auto_resize is disabled
+        if not config.IMAGE.auto_resize:
+            # Auto-resize disabled: return original bytes with detected MIME type
+            # Still convert HEIC/HEIF to JPEG for API compatibility
+            mime_type = resolved.record.mime_type
+            if mime_type in ("image/heic", "image/heif"):
+                with Image.open(resolved.binary_path) as img:
+                    if img.mode in ("RGBA", "LA", "P"):
+                        img = img.convert("RGB")
+                    buffer = io.BytesIO()
+                    img.save(buffer, format="JPEG", quality=95)
+                    return buffer.getvalue(), "image/jpeg"
+            # Return original bytes for all other formats
+            with open(resolved.binary_path, "rb") as f:
+                return f.read(), mime_type
+
+        if max_edge is None:
+            max_edge = config.IMAGE.optimal_max_edge
+        if max_size_bytes is None:
+            max_size_bytes = config.IMAGE.max_image_size_bytes
+
+        with Image.open(resolved.binary_path) as img:
+            # Determine output format based on input MIME type
+            output_format = "JPEG"
+            mime_type = "image/jpeg"
+
+            if resolved.record.mime_type == "image/png":
+                output_format = "PNG"
+                mime_type = "image/png"
+            elif resolved.record.mime_type == "image/webp":
+                output_format = "WEBP"
+                mime_type = "image/webp"
+            elif resolved.record.mime_type == "image/gif":
+                # GIF: use first frame, convert to PNG for quality
+                output_format = "PNG"
+                mime_type = "image/png"
+            # HEIC/HEIF -> JPEG for broad API compatibility
+
+            # Check if resize is needed
+            width, height = img.size
+            needs_resize = max(width, height) > max_edge
+
+            if needs_resize:
+                ratio = max_edge / max(width, height)
+                new_size = (int(width * ratio), int(height * ratio))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+            # Prepare for save - JPEG doesn't support alpha channel
+            if output_format == "JPEG":
+                if img.mode in ("RGBA", "LA", "P"):
+                    img = img.convert("RGB")
+
+            # Save to buffer with initial quality
+            buffer = io.BytesIO()
+            save_kwargs: Dict[str, Any] = {"format": output_format}
+            if output_format in ("JPEG", "WEBP"):
+                save_kwargs["quality"] = 85
+
+            img.save(buffer, **save_kwargs)
+            image_bytes = buffer.getvalue()
+
+            # Reduce quality if still exceeds size limit (JPEG/WEBP only)
+            if len(image_bytes) > max_size_bytes and output_format in ("JPEG", "WEBP"):
+                for quality in [70, 55, 40, 25]:
+                    buffer = io.BytesIO()
+                    img.save(buffer, format=output_format, quality=quality)
+                    image_bytes = buffer.getvalue()
+                    if len(image_bytes) <= max_size_bytes:
+                        break
+
+            return image_bytes, mime_type
 
     def run_cleanup(
         self,
@@ -1155,6 +1271,12 @@ class AttachmentManager:
         extension = Path(record.stored_filename).suffix.lower()
         return extension in {".json", ".txt", ".md"}
 
+    def _is_image(self, record: AttachmentRecord) -> bool:
+        """Return True when the attachment is an image."""
+        if not record.mime_type:
+            return False
+        return record.mime_type.startswith("image/")
+
     def _validate_declared_size(self, *, actual: int, declared: Optional[int]) -> None:
         if declared is None:
             return
@@ -1189,17 +1311,23 @@ class AttachmentManager:
     def _heuristic_mime(self, sample: bytes) -> Optional[str]:
         if not sample:
             return None
-        header = sample[:8]
+        header = sample[:12]  # WEBP detection needs 12 bytes
         if header.startswith(b"%PDF-"):
             return "application/pdf"
         if header.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
             return "application/zip"
         if header.startswith(b"\x1f\x8b\x08"):
             return "application/gzip"
+        # Image types
         if header.startswith(b"\x89PNG"):
             return "image/png"
         if header.startswith(b"\xff\xd8"):
             return "image/jpeg"
+        if header.startswith(b"GIF87a") or header.startswith(b"GIF89a"):
+            return "image/gif"
+        if header[:4] == b"RIFF" and len(header) >= 12 and header[8:12] == b"WEBP":
+            return "image/webp"
+        # Text detection
         if self._looks_textual(sample):
             stripped = sample.lstrip()
             if stripped.startswith((b"{", b"[")):
