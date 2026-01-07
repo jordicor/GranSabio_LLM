@@ -27,6 +27,32 @@ from word_count_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _normalize_qa_models(qa_models: Any) -> List[str]:
+    """Convert QAModelConfig objects to model name strings for JSON serialization.
+
+    orjson cannot serialize Pydantic models directly, so we extract just the
+    model identifier when QAModelConfig objects are provided.
+
+    Args:
+        qa_models: List of model names (str) or QAModelConfig objects
+
+    Returns:
+        List of model name strings safe for JSON serialization
+    """
+    if not qa_models:
+        return []
+    result = []
+    for m in qa_models:
+        if isinstance(m, str):
+            result.append(m)
+        elif hasattr(m, 'model'):
+            # QAModelConfig - extract just the model name
+            result.append(m.model)
+        else:
+            result.append(str(m))
+    return result
+
+
 def _build_validation_payload(
     request: ContentRequest,
     context_documents: Optional[List[Dict[str, Any]]] = None,
@@ -97,7 +123,7 @@ def _build_validation_payload(
         "prompt": request.prompt,
         "content_type": request.content_type,
         "generator_model": request.generator_model,
-        "qa_models": request.qa_models,
+        "qa_models": _normalize_qa_models(request.qa_models),
         "qa_layers": qa_layers,
         "min_global_score": request.min_global_score,
         "max_iterations": request.max_iterations,

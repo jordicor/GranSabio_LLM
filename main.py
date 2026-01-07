@@ -95,7 +95,10 @@ if __name__ == "__main__":
     if is_wsl_or_linux():
         import subprocess
 
-        workers = os.cpu_count() or 4
+        # Default to 1 worker to avoid session state inconsistencies across processes.
+        # Multi-worker mode requires shared state backend (Redis) - not yet implemented.
+        # Override with APP_WORKERS env var if needed (at your own risk).
+        workers = int(os.environ.get("APP_WORKERS", "1"))
         cmd = [
             sys.executable,
             "-m",
