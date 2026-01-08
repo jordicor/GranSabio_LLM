@@ -79,7 +79,6 @@ backups/
 
 # Test outputs and development tests
 test_outputs/
-dev_tests/
 docs/
 *.test
 

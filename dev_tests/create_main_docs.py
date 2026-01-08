@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""Create main api_docs.html with SPA loader."""
+import os
+
+BASE_DIR = "S:/01.Coding/BioAI_Unified/templates"
+
+main_html = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Documentation - Gran Sabio LLM</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/docs.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+    <div class="docs-container">
+        <nav class="docs-sidebar">
+            <div class="sidebar-header">
+                <h1 class="docs-logo">Gran Sabio <span class="accent">LLM</span></h1>
+                <p class="docs-version">v2.2.0 (Connection Stability)</p>
+            </div>
+
+            <div class="nav-section">
+                <h3 class="nav-title">Getting Started</h3>
+                <ul class="nav-list">
+                    <li><a href="#overview" class="nav-link" data-section="getting-started">Overview</a></li>
+                    <li><a href="#authentication" class="nav-link" data-section="getting-started">Authentication</a></li>
+                    <li><a href="#base-url" class="nav-link" data-section="getting-started">Base URL</a></li>
+                </ul>
+            </div>
+
+            <div class="nav-section">
+                <h3 class="nav-title">Endpoints</h3>
+                <ul class="nav-list">
+                    <li><a href="#generate" class="nav-link" data-section="endpoints">POST /generate</a></li>
+                    <li><a href="#status" class="nav-link" data-section="endpoints">GET /status/{id}</a></li>
+                    <li><a href="#stream" class="nav-link" data-section="endpoints">GET /stream/{id}</a></li>
+                    <li><a href="#result" class="nav-link" data-section="endpoints">GET /result/{id}</a></li>
+                    <li><a href="#stop" class="nav-link" data-section="endpoints">POST /stop/{id}</a></li>
+                    <li><a href="#project-start" class="nav-link" data-section="endpoints">POST /project/start/{id}</a></li>
+                    <li><a href="#project-stop" class="nav-link" data-section="endpoints">POST /project/stop/{id}</a></li>
+                    <li><a href="#models" class="nav-link" data-section="endpoints">GET /models</a></li>
+                    <li><a href="#analytics" class="nav-link" data-section="endpoints">GET /analytics</a></li>
+                    <li><a href="#analytics-model" class="nav-link" data-section="endpoints">GET /analytics/model/{name}</a></li>
+                </ul>
+            </div>
+
+            <div class="nav-section">
+                <h3 class="nav-title">Analysis Tools</h3>
+                <ul class="nav-list">
+                    <li><a href="#analysis-lexical-diversity" class="nav-link" data-section="analysis">POST /analysis/lexical-diversity</a></li>
+                    <li><a href="#analysis-repetition" class="nav-link" data-section="analysis">POST /analysis/repetition</a></li>
+                    <li><a href="#analysis-health" class="nav-link" data-section="analysis">GET /analysis/health</a></li>
+                </ul>
+            </div>
+
+            <div class="nav-section">
+                <h3 class="nav-title">Advanced</h3>
+                <ul class="nav-list">
+                    <li><a href="#project-handshake" class="nav-link" data-section="advanced-misc">Project Grouping</a></li>
+                    <li><a href="#usage-cost-tracking" class="nav-link" data-section="advanced-misc">Usage & Cost Tracking</a></li>
+                    <li><a href="#preflight-validation" class="nav-link" data-section="advanced-misc">Preflight Validation</a></li>
+                    <li><a href="#context-source-text" class="nav-link" data-section="advanced-misc">Context & Source Text</a></li>
+                    <li><a href="#connection-stability" class="nav-link" data-section="advanced-misc">Connection Stability</a></li>
+                    <li><a href="#reasoning-models" class="nav-link" data-section="advanced-misc">Reasoning Models</a></li>
+                    <li><a href="#qa-layers" class="nav-link" data-section="advanced-qa">QA Layers</a></li>
+                    <li><a href="#qa-models-reasoning" class="nav-link" data-section="advanced-qa">QA Models Reasoning</a></li>
+                    <li><a href="#smart-editing" class="nav-link" data-section="advanced-qa">Smart Editing</a></li>
+                    <li><a href="#gran-sabio-escalation" class="nav-link" data-section="advanced-qa">Gran Sabio Escalation</a></li>
+                    <li><a href="#word-count-enforcement" class="nav-link" data-section="advanced-guards">Word Count Enforcement</a></li>
+                    <li><a href="#phrase-frequency-guard" class="nav-link" data-section="advanced-guards">Phrase Frequency Guard</a></li>
+                    <li><a href="#lexical-diversity-guard" class="nav-link" data-section="advanced-guards">Lexical Diversity Guard</a></li>
+                    <li><a href="#json-schema-structured-outputs" class="nav-link" data-section="advanced-json">JSON Schema Structured Outputs</a></li>
+                    <li><a href="#json-validation-comparison" class="nav-link" data-section="advanced-json">JSON Validation: Schema vs Expectations</a></li>
+                    <li><a href="#json-retry" class="nav-link" data-section="advanced-json">JSON Retry Mode</a></li>
+                    <li><a href="#error-handling" class="nav-link" data-section="reference">Error Handling</a></li>
+                    <li><a href="#examples" class="nav-link" data-section="reference">Examples</a></li>
+                </ul>
+            </div>
+        </nav>
+
+        <main class="docs-content" id="docs-main">
+            <div class="docs-loading">Loading documentation...</div>
+        </main>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+    <script src="/static/js/docs.js"></script>
+    <script>
+    (function() {
+        var docsMain = document.getElementById("docs-main");
+        var navLinks = document.querySelectorAll(".nav-link");
+        var sectionCache = {};
+        var currentSection = null;
+
+        var sections = {
+            "getting-started": "/templates/docs/getting-started.html",
+            "endpoints": "/templates/docs/endpoints.html",
+            "analysis": "/templates/docs/analysis.html",
+            "advanced-qa": "/templates/docs/advanced-qa.html",
+            "advanced-json": "/templates/docs/advanced-json.html",
+            "advanced-guards": "/templates/docs/advanced-guards.html",
+            "advanced-misc": "/templates/docs/advanced-misc.html",
+            "reference": "/templates/docs/reference.html"
+        };
+
+        function loadSection(sectionName) {
+            return new Promise(function(resolve) {
+                if (!sections[sectionName]) { resolve(null); return; }
+                if (sectionCache[sectionName]) { resolve(sectionCache[sectionName]); return; }
+                fetch(sections[sectionName])
+                    .then(function(response) {
+                        if (!response.ok) throw new Error("HTTP " + response.status);
+                        return response.text();
+                    })
+                    .then(function(html) {
+                        sectionCache[sectionName] = html;
+                        resolve(html);
+                    })
+                    .catch(function(error) {
+                        console.error("Failed to load section:", sectionName, error);
+                        resolve("<div class='docs-error'>Failed to load section: " + sectionName + "</div>");
+                    });
+            });
+        }
+
+        function displaySection(sectionName, targetId) {
+            if (currentSection === sectionName && !targetId) return Promise.resolve();
+            if (currentSection !== sectionName) {
+                docsMain.innerHTML = "<div class='docs-loading'>Loading...</div>";
+            }
+            return loadSection(sectionName).then(function(content) {
+                if (content) {
+                    docsMain.innerHTML = content;
+                    currentSection = sectionName;
+                    if (window.Prism) Prism.highlightAllUnder(docsMain);
+                    if (targetId) {
+                        var target = document.getElementById(targetId);
+                        if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+                    } else {
+                        docsMain.scrollTop = 0;
+                    }
+                }
+                navLinks.forEach(function(link) {
+                    link.classList.remove("active");
+                    if (link.dataset.section === sectionName) {
+                        var href = link.getAttribute("href");
+                        if (!targetId || href === "#" + targetId) link.classList.add("active");
+                    }
+                });
+            });
+        }
+
+        navLinks.forEach(function(link) {
+            link.addEventListener("click", function(e) {
+                e.preventDefault();
+                var section = link.dataset.section;
+                var targetId = link.getAttribute("href").substring(1);
+                history.pushState({ section: section, targetId: targetId }, "", link.getAttribute("href"));
+                displaySection(section, targetId);
+            });
+        });
+
+        window.addEventListener("popstate", function(e) {
+            if (e.state) displaySection(e.state.section, e.state.targetId);
+            else displaySection("getting-started", getHashTarget());
+        });
+
+        function getHashTarget() {
+            var hash = window.location.hash;
+            return hash ? hash.substring(1) : null;
+        }
+
+        function findSectionForTarget(targetId) {
+            for (var i = 0; i < navLinks.length; i++) {
+                if (navLinks[i].getAttribute("href") === "#" + targetId) return navLinks[i].dataset.section;
+            }
+            return "getting-started";
+        }
+
+        function init() {
+            var targetId = getHashTarget();
+            var section = targetId ? findSectionForTarget(targetId) : "getting-started";
+            displaySection(section, targetId);
+        }
+
+        document.addEventListener("click", function(e) {
+            if (e.target.classList.contains("copy-btn")) {
+                var codeBlock = e.target.closest(".code-example").querySelector("code");
+                if (codeBlock) {
+                    navigator.clipboard.writeText(codeBlock.textContent).then(function() {
+                        e.target.textContent = "Copied!";
+                        setTimeout(function() { e.target.textContent = "Copy"; }, 2000);
+                    });
+                }
+            }
+            if (e.target.classList.contains("tab-button")) {
+                var tabName = e.target.textContent.toLowerCase();
+                var tabContainer = e.target.closest(".example-tabs");
+                var parent = tabContainer.parentElement;
+                tabContainer.querySelectorAll(".tab-button").forEach(function(btn) { btn.classList.remove("active"); });
+                e.target.classList.add("active");
+                parent.querySelectorAll(".example-content").forEach(function(content) { content.classList.remove("active"); });
+                var targetExample = parent.querySelector("#" + tabName + "-example");
+                if (targetExample) targetExample.classList.add("active");
+            }
+        });
+
+        init();
+    })();
+    </script>
+</body>
+</html>'''
+
+main_path = os.path.join(BASE_DIR, "api_docs.html")
+with open(main_path, "w", encoding="utf-8") as f:
+    f.write(main_html)
+
+print(f"Created api_docs.html: {len(main_html) / 1024:.1f} KB")

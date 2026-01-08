@@ -290,6 +290,70 @@ Block specific phrases or patterns:
 
 ---
 
+### Vision/Image Support
+
+Process images alongside text for multimodal content generation:
+
+```json
+{
+  "prompt": "Describe these product images in detail",
+  "generator_model": "gpt-4o",
+  "username": "your_username",
+  "images": [
+    {"upload_id": "img_001", "username": "your_username", "detail": "high"},
+    {"upload_id": "img_002", "username": "your_username", "detail": "auto"}
+  ],
+  "image_detail": "auto",
+  "qa_layers": []
+}
+```
+
+**Supported vision models:**
+- **OpenAI:** GPT-4o, GPT-5, GPT-5 Pro, O1, O3, O3-Pro
+- **Anthropic:** Claude Sonnet 4, Claude Opus 4.5, Haiku 4
+- **Google:** Gemini 2.0 Flash, Gemini 2.5 Pro/Flash
+- **xAI:** Grok 2+ models
+
+**Detail levels (OpenAI-style):**
+| Level | Tokens | Use Case |
+|-------|--------|----------|
+| `low` | ~85 fixed | Quick classification, thumbnails |
+| `high` | Variable (tiles) | Detailed analysis, text extraction |
+| `auto` | Model decides | General use (default) |
+
+**QA with vision** - Let QA models see input images for accuracy validation:
+
+```json
+{
+  "prompt": "Describe this architectural diagram",
+  "generator_model": "claude-sonnet-4-20250514",
+  "images": [{"upload_id": "diagram", "username": "user1"}],
+  "qa_with_vision": true,
+  "qa_layers": [
+    {
+      "name": "Visual Accuracy",
+      "criteria": "Verify description matches the actual diagram elements",
+      "include_input_images": true,
+      "min_score": 8.5
+    },
+    {
+      "name": "Writing Quality",
+      "criteria": "Evaluate clarity and technical accuracy",
+      "include_input_images": false,
+      "min_score": 7.5
+    }
+  ]
+}
+```
+
+**Limits and auto-processing:**
+- Default: 20 images per request (configurable up to 100)
+- Auto-resize to optimal dimensions per provider
+- Automatic format conversion (HEIC/HEIF to JPEG)
+- Preflight validation rejects requests when model lacks vision capability
+
+---
+
 ### JSON Schema Structured Outputs
 
 **100% format guarantee** across all major providers:
@@ -637,6 +701,9 @@ Gran Sabio LLM is currently a **self-hosted solution**. You deploy it on your in
 - **API keys for at least one provider** (OpenAI, Anthropic, Google, xAI, or OpenRouter)
 - ~500MB disk space for dependencies
 - Recommended: 4GB RAM minimum
+- Pillow library (auto-installed, required for vision/image processing)
+
+**Quality assurance:** The codebase includes 950+ automated tests covering API endpoints, engines, client SDK, and integrations.
 
 ### Production Deployment
 
