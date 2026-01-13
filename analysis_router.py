@@ -25,6 +25,7 @@ from tools.lexical_diversity_utils import (
     analyze_text_lexical_diversity,
 )
 from tools.repetition_analyzer import AnalysisConfig, analyze_text
+from word_count_utils import extract_target_field
 
 logger = logging.getLogger(__name__)
 
@@ -395,6 +396,18 @@ async def analyze_lexical_diversity_endpoint(request: LexicalDiversityRequest) -
             # Remove None values
             thresholds_dict = {k: v for k, v in thresholds_dict.items() if v is not None}
 
+        # Extract target field if specified (standalone API handles extraction here)
+        text_to_analyze = request.text
+        if request.target_field:
+            text_to_analyze, was_extracted = extract_target_field(request.text, request.target_field)
+            if was_extracted:
+                logger.info(f"Extracted field '{request.target_field}' for lexical diversity analysis")
+            else:
+                logger.warning(
+                    f"Field '{request.target_field}' not found or JSON parse failed, "
+                    f"analyzing full content as fallback"
+                )
+
         # Build settings object
         settings = LexicalDiversitySettings(
             enabled=True,
@@ -413,7 +426,6 @@ async def analyze_lexical_diversity_endpoint(request: LexicalDiversityRequest) -
             thresholds_overrides=thresholds_dict,
             top_words_k=request.top_words,
             include_positions=request.include_positions,
-            target_field=request.target_field,
             decision_policy=LexicalDiversityDecisionPolicy(
                 require_majority=request.require_majority,
                 deal_breaker_on_red=request.deal_breaker_on_red,
@@ -434,7 +446,7 @@ async def analyze_lexical_diversity_endpoint(request: LexicalDiversityRequest) -
         )
 
         # Run analysis
-        result = analyze_text_lexical_diversity(request.text, settings)
+        result = analyze_text_lexical_diversity(text_to_analyze, settings)
 
         # Extract result
         analysis = result.analysis

@@ -32,7 +32,7 @@ DEFAULT_MAX_RECURSION_DEPTH = 3
 def try_extract_json_from_content(
     content: str,
     json_output: bool,
-    text_field_path: Optional[Union[str, List[str]]] = None,
+    target_field: Optional[Union[str, List[str]]] = None,
     max_recursion_depth: int = DEFAULT_MAX_RECURSION_DEPTH
 ) -> Tuple[Optional[Dict[str, Any]], str]:
     """
@@ -46,7 +46,7 @@ def try_extract_json_from_content(
     Args:
         content: Raw content from generator
         json_output: Whether JSON output was requested
-        text_field_path: Explicit path(s) to text field(s)
+        target_field: Explicit path(s) to text field(s)
         max_recursion_depth: Maximum depth for automatic field search
 
     Returns:
@@ -87,7 +87,7 @@ def try_extract_json_from_content(
             parsed=parsed,
             json_string=json_string,
             original_content=content,
-            text_field_path=text_field_path,
+            target_field=target_field,
             max_recursion_depth=max_recursion_depth
         )
 
@@ -133,7 +133,7 @@ def _build_json_context(
     parsed: Any,
     json_string: str,
     original_content: str,
-    text_field_path: Optional[Union[str, List[str]]],
+    target_field: Optional[Union[str, List[str]]],
     max_recursion_depth: int = DEFAULT_MAX_RECURSION_DEPTH
 ) -> Tuple[Optional[Dict[str, Any]], str]:
     """
@@ -142,7 +142,7 @@ def _build_json_context(
     Returns:
         (json_context, combined_text_for_processing)
     """
-    paths = _normalize_paths(text_field_path)
+    paths = _normalize_paths(target_field)
     extracted_texts: Dict[str, str] = {}
     discovered = False
 
@@ -153,7 +153,7 @@ def _build_json_context(
             if value is not None and isinstance(value, str):
                 extracted_texts[path] = value
             else:
-                logger.warning(f"text_field_path '{path}' not found or not a string")
+                logger.warning(f"target_field '{path}' not found or not a string")
     else:
         # Auto-detect: find largest string field
         candidates = _find_all_string_fields(parsed, max_depth=max_recursion_depth)
@@ -171,13 +171,13 @@ def _build_json_context(
             field_names = [c[0] for c in similar]
             logger.error(
                 f"Ambiguous text fields detected: {field_names}. "
-                f"Please specify text_field_path explicitly."
+                f"Please specify target_field explicitly."
             )
             # Return error context that will cause the request to fail
             return {
                 "error": "ambiguous_fields",
                 "candidates": field_names,
-                "message": f"Multiple text fields found: {field_names}. Specify text_field_path."
+                "message": f"Multiple text fields found: {field_names}. Specify target_field."
             }, original_content
 
         # Use the largest
@@ -193,12 +193,19 @@ def _build_json_context(
     # Combine texts for processing (order preserved)
     combined_text = "\n\n".join(extracted_texts.values())
 
+    # Fail fast if extracted text is empty (prevents silent failures downstream)
+    if not combined_text.strip():
+        raise ValueError(
+            f"Extracted text from target_field is empty. "
+            f"Fields checked: {list(extracted_texts.keys())}"
+        )
+
     json_context = {
         "original_json": parsed,
         "original_content": original_content,
         "json_string": json_string,
-        "text_field_paths": list(extracted_texts.keys()),
-        "text_field_discovered": discovered,
+        "target_field_paths": list(extracted_texts.keys()),
+        "target_field_discovered": discovered,
         "extracted_texts": extracted_texts,
         "combined_text": combined_text,
     }
@@ -351,11 +358,11 @@ def _parse_jmespath_for_set(path: str) -> List[Union[str, int]]:
 # Path Validation
 # =============================================================================
 
-def validate_text_field_path(
+def validate_target_field(
     path: Optional[Union[str, List[str]]]
 ) -> Tuple[bool, Optional[str]]:
     """
-    Validate path syntax before generation starts.
+    Validate target_field path syntax before generation starts.
 
     Returns:
         (is_valid, error_message)
@@ -396,42 +403,29 @@ def validate_text_field_path(
 def prepare_content_for_qa(
     content: str,
     json_context: Optional[Dict[str, Any]],
-    text_field_only: bool
+    target_field_only: bool
 ) -> str:
     """
-    Prepare content to send to QA evaluation.
+    Prepare content for AI QA evaluation.
+
+    Note: Algorithmic QA (bypass) receives extracted text separately via
+    content_for_bypass parameter in qa_engine. This function only handles
+    content for AI QA evaluators.
 
     Args:
         content: Original content (may be JSON)
         json_context: Context from extraction phase (None if not JSON)
-        text_field_only: If True, send only extracted text; if False, send full JSON with hint
+        target_field_only: If True, send only extracted text; if False, send full JSON
 
     Returns:
-        Content string ready for QA evaluation
+        Content string ready for AI QA evaluation
     """
-    if json_context is None:
+    if json_context is None or json_context.get("error"):
         return content
 
-    # Check for error context
-    if json_context.get("error"):
-        return content
-
-    if text_field_only:
-        # Send only the extracted text(s)
-        if len(json_context["extracted_texts"]) == 1:
-            return json_context["combined_text"]
-        else:
-            # Multiple fields: send as simple JSON with just those fields
-            texts_only = json_context["extracted_texts"]
-            return orjson.dumps(texts_only).decode('utf-8')
+    if target_field_only:
+        # AI QA receives only extracted text (saves tokens)
+        return json_context["combined_text"]
     else:
-        # Send full JSON with hint about primary fields
-        fields = json_context["text_field_paths"]
-        hint = f"""--- JSON CONTENT TO EVALUATE ---
-PRIMARY TEXT FIELD(S): {fields}
-Focus evaluation on these fields. Other fields provide context only.
-When generating edit_groups, target only content within the primary text field(s).
-
-{json_context['json_string']}
---- END JSON CONTENT ---"""
-        return hint
+        # AI QA receives complete JSON (no hint - simpler, consistent)
+        return content

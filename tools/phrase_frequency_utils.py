@@ -14,7 +14,6 @@ from tools.repetition_analyzer import (
     untokenize,
 )
 from tools.stopwords_utils import get_stopwords_for_language, resolve_language_hint
-from word_count_utils import extract_target_field
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +158,6 @@ class PhraseFrequencySettings:
     diag_cluster_max_span_tokens: int = 250
     diag_top_k: int = 50
     diag_digest_k: int = 20
-    target_field: Optional[str] = None
     rules: List[PhraseFrequencyRuleSpec] = field(default_factory=list)
 
 
@@ -261,19 +259,7 @@ def analyze_phrase_frequency(text: str, settings: PhraseFrequencySettings) -> Ph
     if not settings.enabled:
         return PhraseFrequencyResult(issues=[], analyzer_output={}, max_over_limit=0)
 
-    # Extract target field if specified (similar to word count and lexical diversity)
-    text_to_analyze = text
-    is_json_extraction = False
-    if settings.target_field:
-        text_to_analyze, is_json_extraction = extract_target_field(text, settings.target_field)
-        if is_json_extraction:
-            logger.info(f"Phrase frequency analyzing field '{settings.target_field}' from JSON")
-        else:
-            logger.warning(
-                f"Phrase frequency: field '{settings.target_field}' not found or JSON parse failed, "
-                f"analyzing full content as fallback"
-            )
-
+    text_to_analyze = text  # Content already preprocessed by caller
     analysis_cfg = _build_analysis_config(settings)
     analyzer_output = analyze_text(text_to_analyze, analysis_cfg)
     lookup = _collect_phrase_lookup(analyzer_output)

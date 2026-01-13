@@ -7,7 +7,7 @@ of JSON extraction, processing, and reconstruction in the smart-edit pipeline.
 Tests verify:
 - JSON extraction works correctly (pure JSON and markdown blocks)
 - Auto-detection of text fields
-- text_field_only flag behavior for QA
+- target_field_only flag behavior for QA
 - JSON reconstruction after smart-edit
 - Original bug is fixed (no text duplication)
 
@@ -84,31 +84,31 @@ class TestJsonExtractionIntegration:
     """Test JSON extraction in realistic scenarios."""
 
     def test_extract_pure_json_with_explicit_path(self, sample_json_content):
-        """Test extraction with explicit text_field_path."""
+        """Test extraction with explicit target_field."""
         json_context, text = try_extract_json_from_content(
             content=sample_json_content,
             json_output=True,
-            text_field_path="generated_text"
+            target_field="generated_text"
         )
 
         assert json_context is not None
         assert "error" not in json_context
         assert text == "El humo de los camiones. El asfalto hirviente bajo el sol de agosto. Los pregones de los vendedores ambulantes. Todo eso era mi infancia en la colonia Del Valle."
-        assert json_context["text_field_paths"] == ["generated_text"]
-        assert json_context["text_field_discovered"] is False
+        assert json_context["target_field_paths"] == ["generated_text"]
+        assert json_context["target_field_discovered"] is False
 
     def test_extract_pure_json_auto_detect(self, sample_json_content):
         """Test auto-detection of largest text field."""
         json_context, text = try_extract_json_from_content(
             content=sample_json_content,
             json_output=True,
-            text_field_path=None
+            target_field=None
         )
 
         assert json_context is not None
         # generated_text is much longer than observations.tone
-        assert "generated_text" in json_context["text_field_paths"]
-        assert json_context["text_field_discovered"] is True
+        assert "generated_text" in json_context["target_field_paths"]
+        assert json_context["target_field_discovered"] is True
         assert "El humo" in text
 
     def test_extract_markdown_json(self, sample_markdown_json):
@@ -116,7 +116,7 @@ class TestJsonExtractionIntegration:
         json_context, text = try_extract_json_from_content(
             content=sample_markdown_json,
             json_output=True,
-            text_field_path="generated_text"
+            target_field="generated_text"
         )
 
         assert json_context is not None
@@ -127,7 +127,7 @@ class TestJsonExtractionIntegration:
         json_context, text = try_extract_json_from_content(
             content=sample_json_with_multiple_fields,
             json_output=True,
-            text_field_path=None
+            target_field=None
         )
 
         # Should detect ambiguity
@@ -141,12 +141,12 @@ class TestJsonExtractionIntegration:
         json_context, text = try_extract_json_from_content(
             content=sample_json_with_multiple_fields,
             json_output=True,
-            text_field_path=["chapter_text", "author_notes"]
+            target_field=["chapter_text", "author_notes"]
         )
 
         assert json_context is not None
         assert "error" not in json_context
-        assert len(json_context["text_field_paths"]) == 2
+        assert len(json_context["target_field_paths"]) == 2
         assert "chapter_text" in json_context["extracted_texts"]
         assert "author_notes" in json_context["extracted_texts"]
         # Combined text should contain both
@@ -159,7 +159,7 @@ class TestJsonExtractionIntegration:
         json_context, text = try_extract_json_from_content(
             content=plain_text,
             json_output=False,
-            text_field_path=None
+            target_field=None
         )
 
         assert json_context is None
@@ -173,18 +173,18 @@ class TestJsonExtractionIntegration:
 class TestQaContentPreparation:
     """Test prepare_content_for_qa behavior."""
 
-    def test_text_field_only_true(self, sample_json_content):
-        """Test that text_field_only=True sends only extracted text."""
+    def test_target_field_only_true(self, sample_json_content):
+        """Test that target_field_only=True sends only extracted text."""
         json_context, _ = try_extract_json_from_content(
             content=sample_json_content,
             json_output=True,
-            text_field_path="generated_text"
+            target_field="generated_text"
         )
 
         qa_content = prepare_content_for_qa(
             content=sample_json_content,
             json_context=json_context,
-            text_field_only=True
+            target_field_only=True
         )
 
         # Should be just the text, no JSON structure
@@ -192,22 +192,23 @@ class TestQaContentPreparation:
         assert "El humo de los camiones" in qa_content
         assert "observations" not in qa_content
 
-    def test_text_field_only_false(self, sample_json_content):
-        """Test that text_field_only=False sends full JSON with hint."""
+    def test_target_field_only_false(self, sample_json_content):
+        """Test that target_field_only=False sends full JSON unchanged (no hint)."""
         json_context, _ = try_extract_json_from_content(
             content=sample_json_content,
             json_output=True,
-            text_field_path="generated_text"
+            target_field="generated_text"
         )
 
         qa_content = prepare_content_for_qa(
             content=sample_json_content,
             json_context=json_context,
-            text_field_only=False
+            target_field_only=False
         )
 
-        # Should contain hint and full JSON
-        assert "PRIMARY TEXT FIELD" in qa_content
+        # Phase 2 removed hint - now returns original JSON unchanged
+        assert qa_content == sample_json_content
+        assert "PRIMARY TEXT FIELD" not in qa_content
         assert "generated_text" in qa_content
         assert "observations" in qa_content
 
@@ -216,7 +217,7 @@ class TestQaContentPreparation:
         qa_content = prepare_content_for_qa(
             content=sample_json_content,
             json_context=None,
-            text_field_only=True
+            target_field_only=True
         )
 
         assert qa_content == sample_json_content
@@ -234,7 +235,7 @@ class TestJsonReconstruction:
         json_context, original_text = try_extract_json_from_content(
             content=sample_json_content,
             json_output=True,
-            text_field_path="generated_text"
+            target_field="generated_text"
         )
 
         edited_text = "EDITED: This is the new content after smart-edit."
@@ -254,7 +255,7 @@ class TestJsonReconstruction:
         json_context, _ = try_extract_json_from_content(
             content=sample_json_with_multiple_fields,
             json_output=True,
-            text_field_path=["chapter_text", "author_notes"]
+            target_field=["chapter_text", "author_notes"]
         )
 
         edited_texts = {
@@ -275,7 +276,7 @@ class TestJsonReconstruction:
         json_context, _ = try_extract_json_from_content(
             content=sample_json_content,
             json_output=True,
-            text_field_path="generated_text"
+            target_field="generated_text"
         )
 
         # Edit with special characters that might break JSON
@@ -317,7 +318,7 @@ class TestBugRegression:
         json_context, extracted_text = try_extract_json_from_content(
             content=sample_json_content,
             json_output=True,
-            text_field_path="generated_text"
+            target_field="generated_text"
         )
 
         # Markers that would be generated by QA for the inner text
@@ -358,7 +359,7 @@ class TestBugRegression:
         json_context, extracted_text = try_extract_json_from_content(
             content=sample_json_content,
             json_output=True,
-            text_field_path="generated_text"
+            target_field="generated_text"
         )
 
         assert json_context is not None
@@ -369,7 +370,7 @@ class TestBugRegression:
         edited_text = extracted_text.replace(original_phrase, replacement)
 
         # Step 3: Reconstruct JSON
-        edited_texts = {path: edited_text for path in json_context["text_field_paths"]}
+        edited_texts = {path: edited_text for path in json_context["target_field_paths"]}
         final_json = reconstruct_json(json_context, edited_texts)
 
         # Verify no duplication
@@ -402,7 +403,7 @@ class TestBugRegression:
         json_context, text = try_extract_json_from_content(
             content=json_content,
             json_output=True,
-            text_field_path="generated_text"
+            target_field="generated_text"
         )
 
         editor = SmartContentEditor(mock_ai_service)
@@ -454,7 +455,7 @@ class TestMarkdownCodeBlockIntegration:
         json_context, text = try_extract_json_from_content(
             content=markdown,
             json_output=True,
-            text_field_path="text"
+            target_field="text"
         )
 
         assert json_context is not None
@@ -468,7 +469,7 @@ class TestMarkdownCodeBlockIntegration:
         json_context, text = try_extract_json_from_content(
             content=markdown,
             json_output=True,
-            text_field_path="text"
+            target_field="text"
         )
 
         assert json_context is not None
@@ -482,7 +483,7 @@ class TestMarkdownCodeBlockIntegration:
         json_context, text = try_extract_json_from_content(
             content=markdown,
             json_output=True,
-            text_field_path="text"
+            target_field="text"
         )
 
         # Should not extract - has text before code block
@@ -498,7 +499,7 @@ class TestMarkdownCodeBlockIntegration:
         json_context, text = try_extract_json_from_content(
             content=markdown,
             json_output=True,
-            text_field_path="text"
+            target_field="text"
         )
 
         # Should not extract - multiple blocks
@@ -528,7 +529,7 @@ class TestEndToEndFlow:
         json_context, text_for_processing = try_extract_json_from_content(
             content=generator_output,
             json_output=True,
-            text_field_path="generated_text"
+            target_field="generated_text"
         )
 
         assert json_context is not None
@@ -570,8 +571,8 @@ class TestEndToEndFlow:
         # Metadata preserved
         assert parsed["metadata"]["genre"] == "horror"
 
-    def test_flow_with_text_field_only_true(self, mock_ai_service):
-        """Test flow when text_field_only=True for QA."""
+    def test_flow_with_target_field_only_true(self, mock_ai_service):
+        """Test flow when target_field_only=True for QA."""
         generator_output = orjson.dumps({
             "text": "Short story content here.",
             "author": "Test Author",
@@ -581,14 +582,14 @@ class TestEndToEndFlow:
         json_context, text = try_extract_json_from_content(
             content=generator_output,
             json_output=True,
-            text_field_path="text"
+            target_field="text"
         )
 
-        # Prepare content for QA with text_field_only=True
+        # Prepare content for QA with target_field_only=True
         qa_content = prepare_content_for_qa(
             content=generator_output,
             json_context=json_context,
-            text_field_only=True
+            target_field_only=True
         )
 
         # QA should only see the text, not the full JSON

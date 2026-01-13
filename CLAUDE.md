@@ -123,9 +123,9 @@ Model specifications are centralized in `model_specs.json` with provider-specifi
 **Gran Sabio Escalation**: When max iterations reached without approval, the system escalates to a premium model for final decision and potential content modification.
 
 **Smart Edit JSON Field Extraction**: When generating JSON output, smart-edit needs to work on the text content, not the JSON structure. The system automatically extracts text fields for editing:
-- **`text_field_path`**: Specify which JSON field(s) contain the primary text using jmespath notation (e.g., `"generated_text"`, `"data.content"`, or `["chapter", "notes"]` for multiple fields)
-- **`text_field_only`**: When `true`, QA receives only extracted text (saves tokens). When `false`, QA receives full JSON with hint about primary fields
-- **Auto-detection**: If `text_field_path` not specified, automatically finds the largest string field (errors if ambiguous)
+- **`target_field`**: Specify which JSON field(s) contain the primary text using jmespath notation (e.g., `"generated_text"`, `"data.content"`, or `["chapter", "notes"]` for multiple fields)
+- **`target_field_only`**: When `true`, AI QA receives only extracted text (saves tokens). When `false`, AI QA receives full JSON. Algorithmic guards always use extracted text when target_field is set.
+- **Auto-detection**: If `target_field` not specified, automatically finds the largest string field (errors if ambiguous)
 - **Markdown extraction**: Automatically extracts JSON from markdown ```json code blocks
 - **Reconstruction**: After smart-edit completes, the edited text is reconstructed back into the original JSON structure
 - See `json_field_utils.py` for implementation details

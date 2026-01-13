@@ -363,12 +363,8 @@ def check_word_count_compliance(content: str, min_words: Optional[int],
     if config_dict is None:
         raise ValueError("word_count_enforcement must be dict-like or a Pydantic model")
 
-    # Extract target field if specified
-    target_field = config_dict.get("target_field")
-    text_to_count, is_json_extraction = extract_target_field(content, target_field)
-
-    # Count words in the extracted text
-    word_count = count_words(text_to_count)
+    # Count words directly - content already pre-processed by generation_processor
+    word_count = count_words(content)
 
     # Calculate acceptable range
     abs_min, abs_max = calculate_word_count_range(min_words, max_words,
@@ -391,8 +387,6 @@ def check_word_count_compliance(content: str, min_words: Optional[int],
         "flexibility_percent": config_dict["flexibility_percent"],
         "direction": config_dict["direction"],
         "severity": config_dict["severity"],
-        "target_field": target_field,
-        "is_json_extraction": is_json_extraction
     }
 
 

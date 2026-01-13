@@ -554,6 +554,7 @@ class QAEngine:
         input_images: Optional[List["ImageData"]] = None,
         evidence_grounding_config: Optional[EvidenceGroundingConfig] = None,
         context_for_grounding: Optional[str] = None,
+        content_for_bypass: Optional[str] = None,
     ) -> Dict[str, Dict[str, QAEvaluation]]:
         """
         Evaluate content through all QA layers with detailed progress tracking.
@@ -567,6 +568,9 @@ class QAEngine:
             evidence_grounding_config: Optional evidence grounding configuration.
                          If enabled, grounding runs as a special layer with auto-order.
             context_for_grounding: Context string for grounding (prompt + attachments).
+            content_for_bypass: Optional text for algorithmic bypass evaluation.
+                         When provided, bypass engine uses this instead of `content`.
+                         Used when `content` is JSON but bypass needs extracted text.
         """
         from models import QAModelConfig
 
@@ -698,7 +702,9 @@ class QAEngine:
                 if progress_callback:
                     await progress_callback(f"🔄 Using algorithmic bypass for {layer.name}...")
 
-                bypass_results = self.bypass_engine.bypass_layer_evaluation(content, layer, qa_model_names, original_request)
+                # Use extracted text for bypass if available, otherwise use original content
+                bypass_content = content_for_bypass if content_for_bypass is not None else content
+                bypass_results = self.bypass_engine.bypass_layer_evaluation(bypass_content, layer, qa_model_names, original_request)
                 layer_results.update(bypass_results)
                 logger.info(f"Layer {layer.name} evaluated algorithmically with bypass engine")
 
@@ -1187,6 +1193,7 @@ class QAEngine:
         input_images: Optional[List["ImageData"]] = None,
         evidence_grounding_config: Optional[EvidenceGroundingConfig] = None,
         context_for_grounding: Optional[str] = None,
+        content_for_bypass: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Comprehensive content evaluation with progress tracking
@@ -1200,6 +1207,8 @@ class QAEngine:
             evidence_grounding_config: Optional evidence grounding configuration.
                          If enabled, grounding runs as a special layer with auto-order.
             context_for_grounding: Context string for grounding (prompt + attachments).
+            content_for_bypass: Optional text for algorithmic bypass evaluation.
+                         Propagated to evaluate_all_layers_with_progress.
         """
         from models import QAModelConfig
 
@@ -1228,6 +1237,7 @@ class QAEngine:
             input_images=input_images,
             evidence_grounding_config=evidence_grounding_config,
             context_for_grounding=context_for_grounding,
+            content_for_bypass=content_for_bypass,
         )
 
         if isinstance(qa_results, dict) and qa_results.get("summary", {}).get("force_iteration"):

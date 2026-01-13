@@ -137,7 +137,6 @@ class WordCountEnforcement(BaseModel):
     flexibility_percent: float = Field(default=15.0, ge=0.0, le=100.0, description="Allowed flexibility percentage (0-100)")
     direction: Literal["both", "more", "less"] = Field(default="both", description="Direction of flexibility: both (±), more (+), or less (-)")
     severity: Literal["important", "deal_breaker"] = Field(default="important", description="Severity level when word count is violated")
-    target_field: Optional[str] = Field(default=None, description="Specific JSON field to count words in (e.g., 'generated_text'). If None, counts all content.")
 
     class Config:
         json_schema_extra = {
@@ -145,8 +144,7 @@ class WordCountEnforcement(BaseModel):
                 "enabled": True,
                 "flexibility_percent": 15.0,
                 "direction": "both",
-                "severity": "deal_breaker",
-                "target_field": "generated_text"
+                "severity": "deal_breaker"
             }
         }
 
@@ -204,7 +202,6 @@ class PhraseFrequencyConfig(BaseModel):
     diag_cluster_max_span_tokens: Optional[int] = Field(default=None, ge=1, description="Maximum cluster span for diagnostics")
     diag_top_k: Optional[int] = Field(default=None, ge=0, description="Maximum diagnostics violations to include")
     diag_digest_k: Optional[int] = Field(default=None, ge=0, description="Maximum digest entries to include")
-    target_field: Optional[str] = Field(default=None, description="Specific JSON field to analyze (e.g., 'generated_text', 'data.content'). If None, analyzes full content.")
     rules: List[PhraseFrequencyRule] = Field(default_factory=list, description="Phrase repetition rules to evaluate")
 
     @field_validator("max_n")
@@ -289,7 +286,6 @@ class PhraseFrequencyConfig(BaseModel):
             diag_cluster_max_span_tokens=(self.diag_cluster_max_span_tokens if self.diag_cluster_max_span_tokens is not None else 250),
             diag_top_k=(self.diag_top_k if self.diag_top_k is not None else 50),
             diag_digest_k=(self.diag_digest_k if self.diag_digest_k is not None else 20),
-            target_field=self.target_field,
             rules=rules,
         )
         return settings
@@ -442,10 +438,6 @@ class LexicalDiversityConfig(BaseModel):
     filter_stop_words: bool = Field(default=True, description="Filter language stop words from top-word summaries when available")
     top_words_k: int = Field(default=50, ge=0, description="Top repeated words to expose in metadata")
     include_positions: bool = Field(default=False, description="Include token positions for top words")
-    target_field: Optional[str] = Field(
-        default=None,
-        description="Specific JSON field to analyze for lexical diversity (e.g., 'generated_text', 'data.content'). If None, analyzes all content."
-    )
     thresholds: Optional[LexicalDiversityThresholdsConfig] = Field(
         default=None, description="Threshold overrides for grading"
     )
@@ -499,7 +491,6 @@ class LexicalDiversityConfig(BaseModel):
             thresholds_overrides=thresholds_overrides,
             top_words_k=self.top_words_k,
             include_positions=self.include_positions,
-            target_field=self.target_field,
             decision_policy=decision_policy,
             score_policy=self.scoring.build_policy(),
             window_policy=self.windows.build_policy(),
@@ -809,22 +800,22 @@ class ContentRequest(BaseModel):
         default=False,
         description="When true, enforce JSON validation/payload handling while keeping the declared content_type.",
     )
-    text_field_path: Optional[Union[str, List[str]]] = Field(
+    target_field: Optional[Union[str, List[str]]] = Field(
         default=None,
+        validation_alias=AliasChoices("target_field", "text_field_path"),
         description=(
             "Path(s) to primary text field(s) in JSON output using jmespath notation. "
-            "Single string or list. Examples: 'generated_text', ['chapter', 'notes']. "
-            "If not specified with json_output=true, auto-detects largest string field. "
-            "Returns error if multiple ambiguous candidates found."
+            "Examples: 'generated_text', 'data.content', ['chapter', 'notes']. "
+            "Smart Edit and algorithmic QA guards operate on these fields automatically."
         )
     )
-    text_field_only: bool = Field(
+    target_field_only: bool = Field(
         default=False,
+        validation_alias=AliasChoices("target_field_only", "text_field_only"),
         description=(
-            "Controls what content is sent to QA/Consensus/GranSabio when processing JSON. "
-            "If true: Send only extracted text field(s) for evaluation (saves tokens). "
-            "If false: Send complete JSON with hint about primary fields. "
-            "In both cases, user receives complete JSON."
+            "If true: AI QA receives only extracted text. "
+            "If false: AI QA receives complete JSON. "
+            "Algorithmic QA always uses extracted text when target_field is set."
         )
     )
     username: Optional[str] = Field(default=None, description="User identifier required when referencing attachments")
@@ -1075,13 +1066,13 @@ class ContentRequest(BaseModel):
             )
         return v
 
-    @field_validator('text_field_path')
+    @field_validator('target_field')
     @classmethod
-    def validate_text_field_path_syntax(cls, v: Optional[Union[str, List[str]]]) -> Optional[Union[str, List[str]]]:
-        """Validate text_field_path syntax using json_field_utils validation."""
+    def validate_target_field_syntax(cls, v: Optional[Union[str, List[str]]]) -> Optional[Union[str, List[str]]]:
+        """Validate target_field syntax using json_field_utils validation."""
         if v is not None:
-            from json_field_utils import validate_text_field_path
-            is_valid, error = validate_text_field_path(v)
+            from json_field_utils import validate_target_field
+            is_valid, error = validate_target_field(v)
             if not is_valid:
                 raise ValueError(error)
         return v

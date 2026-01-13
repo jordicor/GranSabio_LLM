@@ -574,28 +574,7 @@ class TestCheckWordCountCompliance:
         assert "flexibility_percent" in result
         assert "direction" in result
         assert "severity" in result
-        assert "is_json_extraction" in result
-
-    def test_json_target_field_extraction(self):
-        """Given: JSON content with target_field, Then: Counts field words"""
-        config = {
-            "enabled": True,
-            "flexibility_percent": 10,
-            "direction": "both",
-            "severity": "important",
-            "target_field": "text"
-        }
-        # Create JSON with 500 words in "text" field
-        text_content = " ".join(["word"] * 500)
-        content = '{"text": "' + text_content + '", "meta": "ignored"}'
-        result = check_word_count_compliance(
-            content=content,
-            min_words=400,
-            max_words=600,
-            config=config
-        )
-        assert result["is_json_extraction"] is True
-        assert result["actual_count"] == 500
+        # Note: target_field and is_json_extraction removed - extraction now done in generation_processor
 
     def test_invalid_config_raises_error(self):
         """Given: Invalid config type, Then: Raises ValueError"""

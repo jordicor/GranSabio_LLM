@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from json_field_utils import (
     try_extract_json_from_content,
     reconstruct_json,
-    validate_text_field_path,
+    validate_target_field,
     prepare_content_for_qa,
     _extract_json_from_markdown,
     _find_all_string_fields,
@@ -33,103 +33,103 @@ from json_field_utils import (
 # Path Validation Tests
 # =============================================================================
 
-class TestValidateTextFieldPath:
-    """Tests for validate_text_field_path function."""
+class TestValidateTargetField:
+    """Tests for validate_target_field function."""
 
     def test_validate_path_none(self):
         """None path should be valid."""
-        is_valid, error = validate_text_field_path(None)
+        is_valid, error = validate_target_field(None)
         assert is_valid is True
         assert error is None
 
     def test_validate_path_simple(self):
         """Simple field name should be valid."""
-        is_valid, error = validate_text_field_path("field")
+        is_valid, error = validate_target_field("field")
         assert is_valid is True
         assert error is None
 
     def test_validate_path_nested(self):
         """Nested path should be valid."""
-        is_valid, error = validate_text_field_path("a.b.c")
+        is_valid, error = validate_target_field("a.b.c")
         assert is_valid is True
         assert error is None
 
     def test_validate_path_array(self):
         """Array index path should be valid."""
-        is_valid, error = validate_text_field_path("items[0].text")
+        is_valid, error = validate_target_field("items[0].text")
         assert is_valid is True
         assert error is None
 
     def test_validate_path_multiple_arrays(self):
         """Multiple array indices should be valid."""
-        is_valid, error = validate_text_field_path("data[0].items[1].value")
+        is_valid, error = validate_target_field("data[0].items[1].value")
         assert is_valid is True
         assert error is None
 
     def test_validate_path_list_of_paths(self):
         """List of valid paths should be valid."""
-        is_valid, error = validate_text_field_path(["field1", "nested.field2"])
+        is_valid, error = validate_target_field(["field1", "nested.field2"])
         assert is_valid is True
         assert error is None
 
     def test_validate_path_empty_string(self):
         """Empty string should be invalid."""
-        is_valid, error = validate_text_field_path("")
+        is_valid, error = validate_target_field("")
         assert is_valid is False
         assert "empty" in error.lower()
 
     def test_validate_path_whitespace_only(self):
         """Whitespace-only string should be invalid."""
-        is_valid, error = validate_text_field_path("   ")
+        is_valid, error = validate_target_field("   ")
         assert is_valid is False
         assert "empty" in error.lower()
 
     def test_validate_path_starts_with_dot(self):
         """Path starting with dot should be invalid."""
-        is_valid, error = validate_text_field_path(".field")
+        is_valid, error = validate_target_field(".field")
         assert is_valid is False
         assert "start" in error.lower() or "." in error
 
     def test_validate_path_ends_with_dot(self):
         """Path ending with dot should be invalid."""
-        is_valid, error = validate_text_field_path("field.")
+        is_valid, error = validate_target_field("field.")
         assert is_valid is False
         assert "end" in error.lower() or "." in error
 
     def test_validate_path_double_dots(self):
         """Path with double dots should be invalid."""
-        is_valid, error = validate_text_field_path("a..b")
+        is_valid, error = validate_target_field("a..b")
         assert is_valid is False
         assert ".." in error
 
     def test_validate_path_unmatched_bracket_open(self):
         """Path with unmatched opening bracket should be invalid."""
-        is_valid, error = validate_text_field_path("items[0")
+        is_valid, error = validate_target_field("items[0")
         assert is_valid is False
         assert "bracket" in error.lower()
 
     def test_validate_path_unmatched_bracket_close(self):
         """Path with unmatched closing bracket should be invalid."""
         # Path with [ but missing corresponding ]
-        is_valid, error = validate_text_field_path("items[0][1")
+        is_valid, error = validate_target_field("items[0][1")
         assert is_valid is False
         assert "bracket" in error.lower()
 
     def test_validate_path_non_numeric_index(self):
         """Path with non-numeric array index should be invalid."""
-        is_valid, error = validate_text_field_path("items[abc]")
+        is_valid, error = validate_target_field("items[abc]")
         assert is_valid is False
         assert "index" in error.lower()
 
     def test_validate_path_negative_index(self):
         """Path with negative array index should be invalid."""
-        is_valid, error = validate_text_field_path("items[-1]")
+        is_valid, error = validate_target_field("items[-1]")
         assert is_valid is False
         assert "index" in error.lower()
 
     def test_validate_path_list_with_invalid(self):
         """List containing invalid path should fail."""
-        is_valid, error = validate_text_field_path(["valid", "..invalid"])
+        is_valid, error = validate_target_field(["valid", "..invalid"])
         assert is_valid is False
         assert ".." in error
 
@@ -214,31 +214,31 @@ class TestTryExtractJsonFromContent:
         json_ctx, text = try_extract_json_from_content(
             '{"generated_text": "Hello world"}',
             json_output=True,
-            text_field_path="generated_text"
+            target_field="generated_text"
         )
         assert json_ctx is not None
         assert text == "Hello world"
-        assert json_ctx["text_field_paths"] == ["generated_text"]
-        assert json_ctx["text_field_discovered"] is False
+        assert json_ctx["target_field_paths"] == ["generated_text"]
+        assert json_ctx["target_field_discovered"] is False
 
     def test_extract_pure_json_auto_detect(self):
         """Pure JSON without path should auto-detect largest field."""
         json_ctx, text = try_extract_json_from_content(
             '{"short": "a", "long": "This is much longer text here"}',
             json_output=True,
-            text_field_path=None
+            target_field=None
         )
         assert json_ctx is not None
-        assert "long" in json_ctx["text_field_paths"]
+        assert "long" in json_ctx["target_field_paths"]
         assert text == "This is much longer text here"
-        assert json_ctx["text_field_discovered"] is True
+        assert json_ctx["target_field_discovered"] is True
 
     def test_extract_ambiguous_fields_error(self):
         """Ambiguous fields (similar length) should return error context."""
         json_ctx, text = try_extract_json_from_content(
             '{"text1": "Same length here", "text2": "Same length here"}',
             json_output=True,
-            text_field_path=None
+            target_field=None
         )
         assert json_ctx is not None
         assert json_ctx.get("error") == "ambiguous_fields"
@@ -251,7 +251,7 @@ class TestTryExtractJsonFromContent:
         json_ctx, text = try_extract_json_from_content(
             content,
             json_output=True,
-            text_field_path="content"
+            target_field="content"
         )
         assert json_ctx is not None
         assert text == "Extracted text"
@@ -262,7 +262,7 @@ class TestTryExtractJsonFromContent:
         json_ctx, text = try_extract_json_from_content(
             content,
             json_output=False,
-            text_field_path=None
+            target_field=None
         )
         assert json_ctx is None
         assert text == content
@@ -273,7 +273,7 @@ class TestTryExtractJsonFromContent:
         json_ctx, text = try_extract_json_from_content(
             content,
             json_output=True,
-            text_field_path=None
+            target_field=None
         )
         assert json_ctx is None
         assert text == content
@@ -283,7 +283,7 @@ class TestTryExtractJsonFromContent:
         json_ctx, text = try_extract_json_from_content(
             '{"response": {"content": "Nested text"}}',
             json_output=True,
-            text_field_path="response.content"
+            target_field="response.content"
         )
         assert json_ctx is not None
         assert text == "Nested text"
@@ -293,7 +293,7 @@ class TestTryExtractJsonFromContent:
         json_ctx, text = try_extract_json_from_content(
             '{"items": ["first", "second", "third"]}',
             json_output=True,
-            text_field_path="items[1]"
+            target_field="items[1]"
         )
         assert json_ctx is not None
         assert text == "second"
@@ -303,11 +303,11 @@ class TestTryExtractJsonFromContent:
         json_ctx, text = try_extract_json_from_content(
             '{"title": "Hello", "body": "World"}',
             json_output=True,
-            text_field_path=["title", "body"]
+            target_field=["title", "body"]
         )
         assert json_ctx is not None
-        assert "title" in json_ctx["text_field_paths"]
-        assert "body" in json_ctx["text_field_paths"]
+        assert "title" in json_ctx["target_field_paths"]
+        assert "body" in json_ctx["target_field_paths"]
         assert "Hello" in text
         assert "World" in text
 
@@ -316,7 +316,7 @@ class TestTryExtractJsonFromContent:
         json_ctx, text = try_extract_json_from_content(
             "",
             json_output=True,
-            text_field_path=None
+            target_field=None
         )
         assert json_ctx is None
         assert text == ""
@@ -326,7 +326,7 @@ class TestTryExtractJsonFromContent:
         json_ctx, text = try_extract_json_from_content(
             '{"other_field": "value"}',
             json_output=True,
-            text_field_path="nonexistent"
+            target_field="nonexistent"
         )
         # Should return None context because no text was extracted
         assert json_ctx is None
@@ -337,7 +337,7 @@ class TestTryExtractJsonFromContent:
         json_ctx, text = try_extract_json_from_content(
             original,
             json_output=True,
-            text_field_path="text"
+            target_field="text"
         )
         assert json_ctx is not None
         assert json_ctx["original_json"]["meta"]["count"] == 5
@@ -356,7 +356,7 @@ class TestReconstructJson:
         import orjson
         json_ctx = {
             "original_json": {"generated_text": "original", "meta": {}},
-            "text_field_paths": ["generated_text"],
+            "target_field_paths": ["generated_text"],
         }
         result = reconstruct_json(json_ctx, {"generated_text": "edited"})
         parsed = orjson.loads(result)
@@ -368,7 +368,7 @@ class TestReconstructJson:
         import orjson
         json_ctx = {
             "original_json": {"data": {"content": "original", "id": 123}},
-            "text_field_paths": ["data.content"],
+            "target_field_paths": ["data.content"],
         }
         result = reconstruct_json(json_ctx, {"data.content": "edited"})
         parsed = orjson.loads(result)
@@ -380,7 +380,7 @@ class TestReconstructJson:
         import orjson
         json_ctx = {
             "original_json": {"items": ["first", "second", "third"]},
-            "text_field_paths": ["items[1]"],
+            "target_field_paths": ["items[1]"],
         }
         result = reconstruct_json(json_ctx, {"items[1]": "modified"})
         parsed = orjson.loads(result)
@@ -393,7 +393,7 @@ class TestReconstructJson:
         import orjson
         json_ctx = {
             "original_json": {"title": "old title", "body": "old body"},
-            "text_field_paths": ["title", "body"],
+            "target_field_paths": ["title", "body"],
         }
         result = reconstruct_json(
             json_ctx,
@@ -407,7 +407,7 @@ class TestReconstructJson:
         """Reconstruction should not modify original json_context."""
         json_ctx = {
             "original_json": {"text": "original"},
-            "text_field_paths": ["text"],
+            "target_field_paths": ["text"],
         }
         reconstruct_json(json_ctx, {"text": "edited"})
         assert json_ctx["original_json"]["text"] == "original"
@@ -427,7 +427,7 @@ class TestReconstructJson:
                     "status": "ok"
                 }
             },
-            "text_field_paths": ["response.data.items[0].text"],
+            "target_field_paths": ["response.data.items[0].text"],
         }
         result = reconstruct_json(
             json_ctx,
@@ -449,47 +449,48 @@ class TestPrepareContentForQa:
     def test_prepare_no_json_context(self):
         """Without JSON context, original content should be returned."""
         content = "Plain text content"
-        result = prepare_content_for_qa(content, None, text_field_only=True)
+        result = prepare_content_for_qa(content, None, target_field_only=True)
         assert result == content
 
-    def test_prepare_text_field_only_single(self):
-        """text_field_only=True with single field should return just text."""
+    def test_prepare_target_field_only_single(self):
+        """target_field_only=True with single field should return just text."""
         json_ctx = {
             "extracted_texts": {"text": "The extracted text"},
             "combined_text": "The extracted text",
-            "text_field_paths": ["text"],
+            "target_field_paths": ["text"],
             "json_string": '{"text": "The extracted text"}'
         }
-        result = prepare_content_for_qa("ignored", json_ctx, text_field_only=True)
+        result = prepare_content_for_qa("ignored", json_ctx, target_field_only=True)
         assert result == "The extracted text"
 
-    def test_prepare_text_field_only_multiple(self):
-        """text_field_only=True with multiple fields should return JSON of texts."""
-        import orjson
+    def test_prepare_target_field_only_multiple(self):
+        """target_field_only=True with multiple fields should return combined text."""
         json_ctx = {
             "extracted_texts": {"title": "Title", "body": "Body"},
             "combined_text": "Title\n\nBody",
-            "text_field_paths": ["title", "body"],
+            "target_field_paths": ["title", "body"],
             "json_string": '{"title": "Title", "body": "Body"}'
         }
-        result = prepare_content_for_qa("ignored", json_ctx, text_field_only=True)
-        parsed = orjson.loads(result)
-        assert parsed["title"] == "Title"
-        assert parsed["body"] == "Body"
+        result = prepare_content_for_qa("ignored", json_ctx, target_field_only=True)
+        # Returns combined_text directly (plain text, not JSON)
+        assert result == "Title\n\nBody"
+        assert "Title" in result
+        assert "Body" in result
 
-    def test_prepare_full_json_with_hint(self):
-        """text_field_only=False should return full JSON with hint."""
+    def test_prepare_full_json_no_hint(self):
+        """target_field_only=False should return original content unchanged (no hint)."""
+        original_content = '{"text": "Content", "meta": {}}'
         json_ctx = {
             "extracted_texts": {"text": "Content"},
             "combined_text": "Content",
-            "text_field_paths": ["text"],
-            "json_string": '{"text": "Content", "meta": {}}'
+            "target_field_paths": ["text"],
+            "json_string": original_content
         }
-        result = prepare_content_for_qa("ignored", json_ctx, text_field_only=False)
-        assert "JSON CONTENT TO EVALUATE" in result
-        assert "PRIMARY TEXT FIELD" in result
-        assert "['text']" in result
-        assert '{"text": "Content", "meta": {}}' in result
+        result = prepare_content_for_qa(original_content, json_ctx, target_field_only=False)
+        # Phase 2 removed the hint - now returns original content unchanged
+        assert result == original_content
+        assert "JSON CONTENT TO EVALUATE" not in result
+        assert "PRIMARY TEXT FIELD" not in result
 
     def test_prepare_error_context(self):
         """Error context should return original content."""
@@ -497,7 +498,7 @@ class TestPrepareContentForQa:
             "error": "ambiguous_fields",
             "candidates": ["field1", "field2"]
         }
-        result = prepare_content_for_qa("original", json_ctx, text_field_only=True)
+        result = prepare_content_for_qa("original", json_ctx, target_field_only=True)
         assert result == "original"
 
 
@@ -611,7 +612,7 @@ class TestIntegration:
         json_ctx, text = try_extract_json_from_content(
             original,
             json_output=True,
-            text_field_path="generated_text"
+            target_field="generated_text"
         )
         assert text == "Original content here"
 
@@ -640,7 +641,7 @@ class TestIntegration:
         json_ctx, text = try_extract_json_from_content(
             original,
             json_output=True,
-            text_field_path="text"
+            target_field="text"
         )
         assert text == "Content"
 
@@ -662,7 +663,7 @@ class TestIntegration:
         json_ctx, text = try_extract_json_from_content(
             original,
             json_output=True,
-            text_field_path=["chapter", "notes"]
+            target_field=["chapter", "notes"]
         )
         assert "Chapter text" in text
         assert "Author notes" in text
@@ -678,6 +679,108 @@ class TestIntegration:
         assert parsed["chapter"] == "Edited chapter"
         assert parsed["notes"] == "Edited notes"
         assert parsed["page"] == 1
+
+
+# =============================================================================
+# Target Field Bypass Integration Tests
+# =============================================================================
+
+class TestTargetFieldBypassIntegration:
+    """
+    Tests for target_field behavior in QA bypass scenarios.
+
+    These tests verify the fix for the original bug where QA bypass
+    received content with JSON hints that caused parsing failures.
+    """
+
+    def test_bypass_receives_extracted_text(self):
+        """
+        QA bypass receives extracted text when target_field is set.
+
+        Verifies that algorithmic guards receive clean extracted text
+        (not JSON with hints) when target_field is configured.
+        """
+        content = '{"generated_text": "This is the story content.", "meta": {}}'
+        json_ctx, text = try_extract_json_from_content(
+            content,
+            json_output=True,
+            target_field="generated_text"
+        )
+
+        # The bypass should receive the extracted text directly
+        assert json_ctx is not None
+        bypass_content = json_ctx["combined_text"]
+
+        # Bypass content should be plain text, not JSON
+        assert bypass_content == "This is the story content."
+        assert not bypass_content.startswith("{")
+        assert "meta" not in bypass_content
+
+    def test_ia_receives_full_json_when_target_field_only_false(self):
+        """
+        QA IAs receive full JSON when target_field_only=False.
+
+        Verifies that AI evaluators get the complete JSON structure
+        (without the old hint) when target_field_only is False.
+        """
+        content = '{"text": "Story here", "metadata": {"author": "Test"}}'
+        json_ctx, _ = try_extract_json_from_content(
+            content,
+            json_output=True,
+            target_field="text"
+        )
+
+        # Prepare for IA QA with target_field_only=False
+        qa_content = prepare_content_for_qa(content, json_ctx, target_field_only=False)
+
+        # Should receive the original JSON, NOT with hint prefix
+        # (Phase 2 removed the hint from prepare_content_for_qa)
+        assert qa_content == content
+        assert "JSON CONTENT TO EVALUATE" not in qa_content
+
+    def test_raw_json_without_target_field_no_crash(self):
+        """
+        Raw JSON without target_field specified doesn't cause errors.
+
+        Verifies backward compatibility: when target_field is not set,
+        the system should handle JSON content gracefully.
+        """
+        content = '{"data": "some value", "count": 5}'
+
+        # No target_field specified - should auto-detect or return None
+        json_ctx, text = try_extract_json_from_content(
+            content,
+            json_output=True,
+            target_field=None
+        )
+
+        # Should either extract successfully or return None context
+        # but should NOT crash
+        if json_ctx is not None:
+            assert "combined_text" in json_ctx
+        else:
+            # If no extraction, text should be original content
+            assert text == content
+
+    def test_empty_extracted_field_raises_error(self):
+        """
+        Empty extracted field raises ValueError (fail fast).
+
+        Verifies that when target_field points to an empty string,
+        the system fails fast with a clear error message.
+        """
+        content = '{"generated_text": "", "meta": {}}'
+
+        # Should raise ValueError because extracted text is empty
+        with pytest.raises(ValueError) as exc_info:
+            try_extract_json_from_content(
+                content,
+                json_output=True,
+                target_field="generated_text"
+            )
+
+        assert "empty" in str(exc_info.value).lower()
+        assert "generated_text" in str(exc_info.value)
 
 
 # =============================================================================

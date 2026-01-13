@@ -180,8 +180,6 @@ class QABypassEngine:
         target_max = compliance_result['target_max']
         score = compliance_result['score']  # Gradual score from 0 to 10
         severity = compliance_result['severity']
-        target_field = compliance_result.get('target_field')
-        is_json_extraction = compliance_result.get('is_json_extraction', False)
 
         # Determine deal_breaker status:
         # A score of 0 means the content is outside the absolute range.
@@ -259,21 +257,11 @@ class QABypassEngine:
         if deal_breaker and detail:
             deal_breaker_reason = detail
 
-        # Build feedback with target_field info if applicable
-        target_field_info = ""
-        if target_field and is_json_extraction:
-            target_field_info = f"Counting field: '{target_field}' (JSON extraction)\n"
-        elif target_field and not is_json_extraction:
-            target_field_info = f"Counting field: '{target_field}' (fallback to full content - JSON parsing failed)\n"
-        else:
-            target_field_info = "Counting scope: Full content\n"
-
         # Use first evaluator name for algorithmic evaluation
         evaluator_name = self.evaluator_names[0]
 
         feedback = (
             f"[ALGORITHMIC EVALUATION BY {evaluator_name}]\n\n"
-            f"{target_field_info}"
             f"Word count analysis: {actual_count} words\n"
             f"Target range: {target_min or 'N/A'}-{target_max or 'N/A'} words\n"
             f"Flexibility range: {required_min}-{required_max} words\n"
@@ -479,17 +467,6 @@ class QABypassEngine:
             f"{metric.upper()}={grade}" for metric, grade in sorted(grades.items())
         ) if grades else "no grades available"
 
-        # Extract target_field info from metadata
-        target_field = meta.get("target_field")
-        is_json_extraction = meta.get("is_json_extraction", False)
-
-        target_field_info = ""
-        if target_field and is_json_extraction:
-            target_field_info = f"Analysis scope: field '{target_field}' (JSON extraction)"
-        elif target_field and not is_json_extraction:
-            target_field_info = f"Analysis scope: field '{target_field}' (fallback to full content - JSON parsing failed)"
-        else:
-            target_field_info = "Analysis scope: Full content"
         language_hint = (
             meta.get("language_hint")
             or settings.language
@@ -500,7 +477,6 @@ class QABypassEngine:
 
         feedback_lines = [
             "[ALGORITHMIC EVALUATION BY LexiGuard]",
-            target_field_info,
             f"Language hint: {language_hint} (stop-word filter: {'on' if stop_words_filtered else 'off'})",
             f"Decision: {decision_label} (score {result.score:.1f}/10)",
             f"Grading summary: {grades_summary}",

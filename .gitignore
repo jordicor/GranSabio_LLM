@@ -79,7 +79,7 @@ backups/
 
 # Test outputs and development tests
 test_outputs/
-docs/
+/docs/
 *.test
 
 # Database files

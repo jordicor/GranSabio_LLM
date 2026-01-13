@@ -11,7 +11,6 @@ from tools.lexical_diversity import (
     Thresholds,
     analyze_lexical_diversity,
 )
-from word_count_utils import extract_target_field
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +148,6 @@ class LexicalDiversitySettings:
     thresholds_overrides: Dict[str, float] = field(default_factory=dict)
     top_words_k: int = 50
     include_positions: bool = False
-    target_field: Optional[str] = None
     decision_policy: LexicalDiversityDecisionPolicy = field(
         default_factory=LexicalDiversityDecisionPolicy
     )
@@ -220,20 +218,8 @@ def analyze_text_lexical_diversity(
             decision_label="GREEN",
         )
 
-    # Extract target field if specified (similar to word count enforcement)
-    text_to_analyze = text
-    is_json_extraction = False
-    if settings.target_field:
-        text_to_analyze, is_json_extraction = extract_target_field(text, settings.target_field)
-        if is_json_extraction:
-            logger.info(f"Lexical diversity analyzing field '{settings.target_field}' from JSON")
-        else:
-            logger.warning(
-                f"Lexical diversity: field '{settings.target_field}' not found or JSON parse failed, "
-                f"analyzing full content as fallback"
-            )
-
     lex_config = settings.build_lexdiv_config()
+    text_to_analyze = text  # Content already preprocessed by caller
     base_result = analyze_lexical_diversity(text_to_analyze, lex_config)
 
     metrics = base_result.get("metrics", {})
@@ -266,13 +252,6 @@ def analyze_text_lexical_diversity(
     deal_breaker = settings.decision_policy.should_trigger_deal_breaker(
         decision_label, adjusted_grades
     )
-
-    # Add target_field info to metadata
-    if settings.target_field:
-        if "meta" not in base_result:
-            base_result["meta"] = {}
-        base_result["meta"]["target_field"] = settings.target_field
-        base_result["meta"]["is_json_extraction"] = is_json_extraction
 
     return LexicalDiversityResult(
         analysis=base_result,

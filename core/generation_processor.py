@@ -33,6 +33,7 @@ from tools.ai_json_cleanroom import validate_ai_json, ValidationResult
 from usage_tracking import UsageTracker, inject_costs_into_json_payload, merge_costs_into_json_string
 from word_count_utils import build_word_count_instructions, count_words, prepare_qa_layers_with_word_count
 from json_field_utils import try_extract_json_from_content, prepare_content_for_qa, reconstruct_json
+import json_utils as json
 
 from . import app_state
 from .app_state import (
@@ -1020,13 +1021,13 @@ async def _generate_smart_edits(
             # For single field, map the path to the edited content
             # For multiple fields, this assumes all fields share the same edited content
             # (future enhancement: track edits per field)
-            edited_texts = {path: final_content for path in json_context["text_field_paths"]}
+            edited_texts = {path: final_content for path in json_context["target_field_paths"]}
             final_content = reconstruct_json(json_context, edited_texts)
             # Update parsed content in session for _get_final_content()
             try:
-                session["json_parsed_content"] = orjson.loads(final_content)
+                session["json_parsed_content"] = json.loads(final_content)
                 logger.info(f"[SMART_EDIT] JSON reconstructed after editing")
-            except orjson.JSONDecodeError as json_err:
+            except json.JSONDecodeError as json_err:
                 logger.error(f"[SMART_EDIT] Failed to parse reconstructed JSON: {json_err}")
                 # Keep final_content as the reconstructed string anyway
 
@@ -1051,12 +1052,12 @@ async def _generate_smart_edits(
         # Reconstruct JSON with original content if we have json_context (Phase 5)
         json_context = smart_edit_data.get("json_context")
         if json_context and not json_context.get("error"):
-            edited_texts = {path: base_content for path in json_context["text_field_paths"]}
+            edited_texts = {path: base_content for path in json_context["target_field_paths"]}
             reconstructed = reconstruct_json(json_context, edited_texts)
             try:
-                session["json_parsed_content"] = orjson.loads(reconstructed)
+                session["json_parsed_content"] = json.loads(reconstructed)
                 logger.info(f"[SMART_EDIT] JSON reconstructed with original content after error")
-            except orjson.JSONDecodeError:
+            except json.JSONDecodeError:
                 pass  # Keep original base_content
             return reconstructed
 
@@ -1912,7 +1913,7 @@ ITERATION CONTEXT:
             json_context, text_for_processing = try_extract_json_from_content(
                 content=content,
                 json_output=getattr(request, 'json_output', False),
-                text_field_path=getattr(request, 'text_field_path', None),
+                target_field=getattr(request, 'target_field', None),
                 max_recursion_depth=config.MAX_JSON_RECURSION_DEPTH
             )
 
@@ -1930,8 +1931,8 @@ ITERATION CONTEXT:
             if json_context:
                 logger.info(
                     f"Session {session_id}: JSON extracted. "
-                    f"Fields: {json_context['text_field_paths']}, "
-                    f"Discovered: {json_context['text_field_discovered']}, "
+                    f"Fields: {json_context['target_field_paths']}, "
+                    f"Discovered: {json_context['target_field_discovered']}, "
                     f"Text length: {len(text_for_processing)} chars"
                 )
 
@@ -1995,17 +1996,21 @@ ITERATION CONTEXT:
 
             while qa_retry_count <= config.MAX_QA_TIMEOUT_RETRIES and not qa_evaluation_success:
                 try:
-                    # Prepare content for QA based on text_field_only flag
-                    # If JSON was extracted, this controls whether QA sees only text or full JSON with hints
+                    # Prepare content for QA based on target_field_only flag
+                    # If JSON was extracted, this controls whether QA sees only text or full JSON
                     qa_content = prepare_content_for_qa(
                         content,
                         json_context,
-                        getattr(request, 'text_field_only', False)
+                        getattr(request, 'target_field_only', False)
                     )
+
+                    # Prepare bypass content - algorithmic QA always uses extracted text
+                    bypass_content = text_for_processing if json_context else None
 
                     qa_comprehensive_result = await asyncio.wait_for(
                         qa_engine.evaluate_content_comprehensive(
                             content=qa_content,
+                            content_for_bypass=bypass_content,
                             layers=qa_layers_to_use,
                             qa_models=normalized_qa_models,
                             progress_callback=qa_progress_callback,
@@ -2907,22 +2912,26 @@ ITERATION CONTEXT:
                     gs_json_context, gs_text_for_processing = try_extract_json_from_content(
                         content=gran_sabio_content,
                         json_output=getattr(request, 'json_output', False),
-                        text_field_path=getattr(request, 'text_field_path', None),
+                        target_field=getattr(request, 'target_field', None),
                         max_recursion_depth=config.MAX_JSON_RECURSION_DEPTH
                     )
 
-                    # Prepare Gran Sabio content for QA based on text_field_only flag
+                    # Prepare Gran Sabio content for QA based on target_field_only flag
                     gs_qa_content = prepare_content_for_qa(
                         gran_sabio_content,
                         gs_json_context,
-                        getattr(request, 'text_field_only', False)
+                        getattr(request, 'target_field_only', False)
                     )
+
+                    # Prepare bypass content for Gran Sabio - algorithmic QA always uses extracted text
+                    gs_bypass_content = gs_text_for_processing if gs_json_context else None
 
                     while qa_retry_count_gs <= config.MAX_QA_TIMEOUT_RETRIES and not qa_evaluation_success_gs:
                         try:
                             qa_comprehensive_result = await asyncio.wait_for(
                                 qa_engine.evaluate_content_comprehensive(
                                     content=gs_qa_content,
+                                    content_for_bypass=gs_bypass_content,
                                     layers=qa_layers_to_use,
                                     qa_models=normalized_qa_models_gs,
                                     progress_callback=qa_progress_callback,
