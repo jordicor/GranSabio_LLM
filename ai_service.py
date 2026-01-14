@@ -1055,11 +1055,12 @@ class AIService:
             else:
                 system_prompt = config.GENERATOR_SYSTEM_PROMPT
 
-        # Add language instruction and current date to all prompts
+        # Add language instruction and current date to system prompt (not user message)
+        # This avoids prompt contamination where models confuse system instructions with user content
         current_date = datetime.now().strftime("%Y/%m/%d")
         language_instruction = "\n\nIMPORTANT: Always respond in the same language as the user's request, regardless of the language used in these instructions."
         date_instruction = f"\n\nCurrent date: {current_date}"
-        prompt = prompt + language_instruction + date_instruction
+        system_prompt = system_prompt + language_instruction + date_instruction
 
         async def _single_attempt() -> str:
             # Log vision request if images provided
@@ -1306,10 +1307,13 @@ class AIService:
         if request_timeout and request_timeout > 0:
             request_kwargs["timeout"] = request_timeout
 
-        # Add JSON instruction to prompt if needed
-        effective_prompt = prompt
+        # Add JSON instruction to system prompt (not user message) to avoid prompt contamination
         if json_output:
-            effective_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+            json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+            effective_system_prompt = f"{effective_system_prompt}\n\n{json_instructions}"
+
+        # User prompt stays clean without system instructions
+        effective_prompt = prompt
 
         # Build messages with optional vision support
         if images:
@@ -1918,11 +1922,12 @@ class AIService:
             else:
                 system_prompt = config.GENERATOR_SYSTEM_PROMPT
 
-        # Add language instruction and current date to all prompts
+        # Add language instruction and current date to system prompt (not user message)
+        # This avoids prompt contamination where models confuse system instructions with user content
         current_date = datetime.now().strftime("%Y/%m/%d")
         language_instruction = "\n\nIMPORTANT: Always respond in the same language as the user's request, regardless of the language used in these instructions."
         date_instruction = f"\n\nCurrent date: {current_date}"
-        prompt = prompt + language_instruction + date_instruction
+        system_prompt = system_prompt + language_instruction + date_instruction
 
         async def _dispatch_stream():
             # Log vision request if images provided
@@ -2126,14 +2131,15 @@ class AIService:
             messages = [{"role": "user", "content": _build_user_content(prompt)}]
             logger.info(f"Using Claude Structured Outputs (beta) with JSON Schema for {model_id}")
         elif json_output:
-            # Fallback to prompt engineering approach
+            # JSON mode without structured outputs - instructions go in system prompt only
+            # User message stays clean to avoid prompt contamination
             if thinking_enabled:
-                json_prompt = f"{prompt}\n\nCRITICAL REQUIREMENT: You MUST respond with valid JSON only. Start your response with '{{' immediately. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text, explanation, or thinking output before or after the JSON object."
-                messages = [{"role": "user", "content": _build_user_content(json_prompt)}]
+                # With thinking: no prefill, just clean user prompt
+                messages = [{"role": "user", "content": _build_user_content(prompt)}]
             else:
-                json_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text before or after the JSON object."
+                # Without thinking: use prefill to force JSON start
                 messages = [
-                    {"role": "user", "content": _build_user_content(json_prompt)},
+                    {"role": "user", "content": _build_user_content(prompt)},
                     {"role": "assistant", "content": "{"}
                 ]
             logger.info(f"Using Claude JSON mode (prompt engineering) for {model_id}")
@@ -2147,12 +2153,19 @@ class AIService:
             "messages": messages
         }
 
-        # Only add system prompt if it exists and is not empty
-        if system_prompt and system_prompt.strip():
-            if json_output and not use_structured_outputs:
-                create_params["system"] = f"{system_prompt}\n\nYou must respond with valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\"). No additional text or explanation."
+        # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
+        effective_system = system_prompt.strip() if system_prompt else ""
+        if json_output and not use_structured_outputs:
+            if thinking_enabled:
+                json_instructions = "CRITICAL REQUIREMENT: You MUST respond with valid JSON only. Start your response with '{' immediately. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text, explanation, or thinking output before or after the JSON object."
             else:
-                create_params["system"] = system_prompt
+                json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\"). No additional text or explanation."
+            if effective_system:
+                effective_system = f"{effective_system}\n\n{json_instructions}"
+            else:
+                effective_system = json_instructions
+        if effective_system:
+            create_params["system"] = effective_system
 
         # Add thinking mode for Claude models that support it (Claude 3.7, Claude 4 Sonnet, Claude 4 Opus)
         # Structured outputs + thinking is supported; Claude ignores thinking tokens for tool calls
@@ -2315,33 +2328,33 @@ class AIService:
         try:
             from google.genai import types
 
-            # Build contents using correct SDK format
-            contents = []
-
-            final_prompt = prompt
+            # Build system instruction (separate from user content to avoid prompt contamination)
+            effective_system = system_prompt or ""
             if json_output:
-                final_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+                json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+                if effective_system:
+                    effective_system = f"{effective_system}\n\n{json_instructions}"
+                else:
+                    effective_system = json_instructions
 
-            # Build parts list (images first, then text)
+            # Build contents with user message only (system goes in config)
+            contents = []
             parts = []
             if images:
                 parts.extend(self._build_gemini_image_parts(images))
-
-            if system_prompt:
-                parts.append({"text": f"System: {system_prompt}\n\nUser: {final_prompt}"})
-                contents.append({"role": "user", "parts": parts})
-            else:
-                parts.append({"text": final_prompt})
-                contents.append({"parts": parts})
+            parts.append({"text": prompt})
+            contents.append({"role": "user", "parts": parts})
 
             # Check if model supports thinking
             thinking_budget = self._get_thinking_budget_for_model(model_id)
 
-            # Configure generation
+            # Configure generation with system_instruction in config (not concatenated in user message)
             config_params = {
                 "temperature": temperature,
                 "max_output_tokens": max_tokens
             }
+            if effective_system:
+                config_params["system_instruction"] = effective_system
 
             # Configure JSON output format
             if json_output:
@@ -2409,18 +2422,22 @@ class AIService:
             json_output: Enable JSON output mode
             json_schema: Optional JSON schema for structured outputs (requires json_output=True)
         """
-        system_instruction = system_prompt
-        if json_output and system_prompt:
-            system_instruction = f"{system_prompt}\n\nYou must respond with valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\"). No additional text or explanation."
+        # Build system instruction with JSON instructions if needed (avoids prompt contamination in user message)
+        system_instruction = system_prompt or ""
+        if json_output:
+            json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+            if system_instruction:
+                system_instruction = f"{system_instruction}\n\n{json_instructions}"
+            else:
+                system_instruction = json_instructions
 
         model = self.genai_client.GenerativeModel(
             model_name=model_id,
-            system_instruction=system_instruction
+            system_instruction=system_instruction if system_instruction else None
         )
 
+        # User prompt stays clean - JSON instructions go in system_instruction only
         final_prompt = prompt
-        if json_output:
-            final_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
 
         config_kwargs = {
             "temperature": temperature,
@@ -2610,23 +2627,26 @@ class AIService:
         if not self.xai_client:
             raise ValueError("xAI client not initialized")
 
-        effective_prompt = prompt
+        # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
+        effective_system = system_prompt or ""
         if json_output:
-            effective_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+            json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+            if effective_system:
+                effective_system = f"{effective_system}\n\n{json_instructions}"
+            else:
+                effective_system = json_instructions
 
-        # Build user content with optional images (xAI uses OpenAI format)
+        # Build user content with optional images (xAI uses OpenAI format) - keep user prompt clean
         if images:
             image_parts = self._build_openai_image_content(images, use_responses_api=False)
-            image_parts.append({"type": "text", "text": effective_prompt})
+            image_parts.append({"type": "text", "text": prompt})
             messages = [{"role": "user", "content": image_parts}]
         else:
-            messages = [{"role": "user", "content": effective_prompt}]
+            messages = [{"role": "user", "content": prompt}]
 
-        if system_prompt:
-            system_content = system_prompt
-            if json_output:
-                system_content = f"{system_prompt}\n\nYou must respond with valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\"). No additional text or explanation."
-            messages.insert(0, {"role": "system", "content": system_content})
+        # Always include system message (with or without JSON instructions)
+        if effective_system:
+            messages.insert(0, {"role": "system", "content": effective_system})
 
         request_params = {
             "model": model_id,
@@ -2674,23 +2694,26 @@ class AIService:
         if not self.openrouter_client:
             raise ValueError("OpenRouter client not initialized")
 
-        effective_prompt = prompt
+        # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
+        effective_system = system_prompt or ""
         if json_output:
-            effective_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+            json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+            if effective_system:
+                effective_system = f"{effective_system}\n\n{json_instructions}"
+            else:
+                effective_system = json_instructions
 
-        # Build user content with optional images (OpenRouter uses OpenAI format)
+        # Build user content with optional images (OpenRouter uses OpenAI format) - keep user prompt clean
         if images:
             image_parts = self._build_openai_image_content(images, use_responses_api=False)
-            image_parts.append({"type": "text", "text": effective_prompt})
+            image_parts.append({"type": "text", "text": prompt})
             messages = [{"role": "user", "content": image_parts}]
         else:
-            messages = [{"role": "user", "content": effective_prompt}]
+            messages = [{"role": "user", "content": prompt}]
 
-        if system_prompt:
-            system_content = system_prompt
-            if json_output:
-                system_content = f"{system_prompt}\n\nYou must respond with valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\"). No additional text or explanation."
-            messages.insert(0, {"role": "system", "content": system_content})
+        # Always include system message (with or without JSON instructions)
+        if effective_system:
+            messages.insert(0, {"role": "system", "content": effective_system})
 
         request_params = {
             "model": model_id,  # Format: "provider/model-name" (e.g., "meta-llama/llama-3.3-70b-instruct")
@@ -2816,15 +2839,15 @@ class AIService:
         if request_timeout and request_timeout > 0:
             request_kwargs["timeout"] = request_timeout
 
-        # Add JSON instruction to prompt if needed
-        effective_prompt = prompt
+        # Add JSON instruction to system prompt (not user message) to avoid prompt contamination
         if json_output:
-            effective_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+            json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+            effective_system_prompt = f"{effective_system_prompt}\n\n{json_instructions}"
 
-        # Build messages with optional vision support
+        # Build messages with optional vision support - user prompt stays clean
         if images:
             image_parts = self._build_openai_image_content(images, use_responses_api=False)
-            image_parts.append({"type": "text", "text": effective_prompt})
+            image_parts.append({"type": "text", "text": prompt})
             messages = [
                 {"role": "system", "content": effective_system_prompt},
                 {"role": "user", "content": image_parts}
@@ -2832,7 +2855,7 @@ class AIService:
         else:
             messages = [
                 {"role": "system", "content": effective_system_prompt},
-                {"role": "user", "content": effective_prompt}
+                {"role": "user", "content": prompt}
             ]
         
         # Log streaming start if extra_verbose is enabled
@@ -3114,16 +3137,15 @@ class AIService:
             messages = [{"role": "user", "content": _build_user_content(prompt)}]
             logger.info(f"Using Claude Structured Outputs (beta, streaming) with JSON Schema for {model_id}")
         elif json_output:
-            # Fallback to prompt engineering approach
+            # JSON mode without structured outputs - instructions go in system prompt only
+            # User message stays clean to avoid prompt contamination
             if thinking_enabled:
-                # Cannot prefill when thinking is enabled - use strong prompt instructions instead
-                json_prompt = f"{prompt}\n\nCRITICAL REQUIREMENT: You MUST respond with valid JSON only. Start your response with '{{' immediately. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text, explanation, or thinking output before or after the JSON object."
-                messages = [{"role": "user", "content": _build_user_content(json_prompt)}]
+                # With thinking: no prefill, just clean user prompt
+                messages = [{"role": "user", "content": _build_user_content(prompt)}]
             else:
-                # Standard prefill approach when thinking is not enabled
-                json_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text before or after the JSON object."
+                # Without thinking: use prefill to force JSON start
                 messages = [
-                    {"role": "user", "content": _build_user_content(json_prompt)},
+                    {"role": "user", "content": _build_user_content(prompt)},
                     {"role": "assistant", "content": "{"}  # Prefill to force JSON start
                 ]
             logger.info(f"Using Claude JSON mode (streaming, prompt engineering) for {model_id}")
@@ -3138,13 +3160,19 @@ class AIService:
                 "messages": messages
             }
 
-            # Only add system prompt if it exists and is not empty
-            if system_prompt and system_prompt.strip():
-                if json_output and not use_structured_outputs:
-                    # Add JSON instruction to system prompt (only for prompt engineering approach)
-                    stream_params["system"] = f"{system_prompt}\n\nYou must respond with valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. No additional text or explanation."
+            # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
+            effective_system = system_prompt.strip() if system_prompt else ""
+            if json_output and not use_structured_outputs:
+                if thinking_enabled:
+                    json_instructions = "CRITICAL REQUIREMENT: You MUST respond with valid JSON only. Start your response with '{' immediately. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text, explanation, or thinking output before or after the JSON object."
                 else:
-                    stream_params["system"] = system_prompt
+                    json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\"). No additional text or explanation."
+                if effective_system:
+                    effective_system = f"{effective_system}\n\n{json_instructions}"
+                else:
+                    effective_system = json_instructions
+            if effective_system:
+                stream_params["system"] = effective_system
 
             # Add thinking mode for Claude models that support it (structured outputs compatible)
             self._inject_claude_thinking_params(stream_params, model_id, thinking_budget_tokens, log_context="Streaming: ")
@@ -3319,34 +3347,33 @@ class AIService:
         try:
             from google.genai import types
 
-            # Build contents using correct SDK format
-            contents = []
-
-            # Add JSON instruction to prompt if needed
-            final_prompt = prompt
+            # Build system instruction (separate from user content to avoid prompt contamination)
+            effective_system = system_prompt or ""
             if json_output:
-                final_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+                json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+                if effective_system:
+                    effective_system = f"{effective_system}\n\n{json_instructions}"
+                else:
+                    effective_system = json_instructions
 
-            # Build parts list (images first, then text)
+            # Build contents with user message only (system goes in config)
+            contents = []
             parts = []
             if images:
                 parts.extend(self._build_gemini_image_parts(images))
-
-            if system_prompt:
-                parts.append({"text": f"System: {system_prompt}\n\nUser: {final_prompt}"})
-                contents.append({"role": "user", "parts": parts})
-            else:
-                parts.append({"text": final_prompt})
-                contents.append({"parts": parts})
+            parts.append({"text": prompt})
+            contents.append({"role": "user", "parts": parts})
 
             # Check if model supports thinking
             thinking_budget = self._get_thinking_budget_for_model(model_id)
 
-            # Configure generation
+            # Configure generation with system_instruction in config (not concatenated in user message)
             config_params = {
                 "temperature": temperature,
                 "max_output_tokens": max_tokens
             }
+            if effective_system:
+                config_params["system_instruction"] = effective_system
 
             # Configure JSON output format
             if json_output:
@@ -3468,12 +3495,14 @@ class AIService:
         """Stream content using legacy Google GenerativeAI SDK with optional JSON Schema support"""
         extra_payload = usage_extra or {}
         try:
-            # Add JSON instruction if needed
-            final_prompt = prompt
+            # Build system instruction with JSON instructions if needed (avoids prompt contamination in user message)
+            system_instruction = system_prompt or ""
             if json_output:
-                final_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
-
-            full_prompt = f"{system_prompt}\n\n{final_prompt}" if system_prompt else final_prompt
+                json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+                if system_instruction:
+                    system_instruction = f"{system_instruction}\n\n{json_instructions}"
+                else:
+                    system_instruction = json_instructions
 
             # Configure model
             config_params = {
@@ -3493,8 +3522,14 @@ class AIService:
 
             generation_config = self.genai_client.types.GenerationConfig(**config_params)
 
-            model = self.genai_client.GenerativeModel(model_id, generation_config=generation_config)
-            response = await model.generate_content_async(full_prompt, stream=True)
+            # Use system_instruction parameter for proper separation
+            model = self.genai_client.GenerativeModel(
+                model_id,
+                generation_config=generation_config,
+                system_instruction=system_instruction if system_instruction else None
+            )
+            # User prompt stays clean
+            response = await model.generate_content_async(prompt, stream=True)
 
             usage_metadata = None
             async for chunk in response:
@@ -3557,20 +3592,27 @@ class AIService:
             self._initialize_clients()
 
         extra_payload = usage_extra or {}
-        # Add JSON instruction to prompt if needed
-        effective_prompt = prompt
-        if json_output:
-            effective_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
 
-        # Build user content with optional images (xAI uses OpenAI format)
+        # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
+        effective_system = system_prompt or ""
+        if json_output:
+            json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+            if effective_system:
+                effective_system = f"{effective_system}\n\n{json_instructions}"
+            else:
+                effective_system = json_instructions
+
+        # Build user content with optional images (xAI uses OpenAI format) - keep user prompt clean
         if images:
             image_parts = self._build_openai_image_content(images, use_responses_api=False)
-            image_parts.append({"type": "text", "text": effective_prompt})
+            image_parts.append({"type": "text", "text": prompt})
             messages = [{"role": "user", "content": image_parts}]
         else:
-            messages = [{"role": "user", "content": effective_prompt}]
-        if system_prompt:
-            messages.insert(0, {"role": "system", "content": system_prompt})
+            messages = [{"role": "user", "content": prompt}]
+
+        # Always include system message (with or without JSON instructions)
+        if effective_system:
+            messages.insert(0, {"role": "system", "content": effective_system})
 
         try:
             create_params = {
@@ -3648,20 +3690,27 @@ class AIService:
             self._initialize_clients()
 
         extra_payload = usage_extra or {}
-        # Add JSON instruction to prompt if needed
-        effective_prompt = prompt
-        if json_output:
-            effective_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
 
-        # Build user content with optional images (OpenRouter uses OpenAI format)
+        # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
+        effective_system = system_prompt or ""
+        if json_output:
+            json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+            if effective_system:
+                effective_system = f"{effective_system}\n\n{json_instructions}"
+            else:
+                effective_system = json_instructions
+
+        # Build user content with optional images (OpenRouter uses OpenAI format) - keep user prompt clean
         if images:
             image_parts = self._build_openai_image_content(images, use_responses_api=False)
-            image_parts.append({"type": "text", "text": effective_prompt})
+            image_parts.append({"type": "text", "text": prompt})
             messages = [{"role": "user", "content": image_parts}]
         else:
-            messages = [{"role": "user", "content": effective_prompt}]
-        if system_prompt:
-            messages.insert(0, {"role": "system", "content": system_prompt})
+            messages = [{"role": "user", "content": prompt}]
+
+        # Always include system message (with or without JSON instructions)
+        if effective_system:
+            messages.insert(0, {"role": "system", "content": effective_system})
 
         try:
             create_params = {
@@ -3745,19 +3794,23 @@ class AIService:
         if not self.ollama_client:
             raise ValueError("Ollama client not initialized. Set OLLAMA_HOST in your environment.")
 
-        effective_prompt = prompt
+        # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
+        effective_system = system_prompt or ""
         if json_output:
-            effective_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+            json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+            if effective_system:
+                effective_system = f"{effective_system}\n\n{json_instructions}"
+            else:
+                effective_system = json_instructions
 
+        # User prompt stays clean
         messages = [
-            {"role": "user", "content": effective_prompt}
+            {"role": "user", "content": prompt}
         ]
 
-        if system_prompt:
-            system_content = system_prompt
-            if json_output:
-                system_content = f"{system_prompt}\n\nYou must respond with valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\"). No additional text or explanation."
-            messages.insert(0, {"role": "system", "content": system_content})
+        # Always include system message (with or without JSON instructions)
+        if effective_system:
+            messages.insert(0, {"role": "system", "content": effective_system})
 
         request_params = {
             "model": model_id,
@@ -3810,14 +3863,22 @@ class AIService:
             self._initialize_clients()
 
         extra_payload = usage_extra or {}
-        # Add JSON instruction to prompt if needed
-        effective_prompt = prompt
-        if json_output:
-            effective_prompt = f"{prompt}\n\nIMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
 
-        messages = [{"role": "user", "content": effective_prompt}]
-        if system_prompt:
-            messages.insert(0, {"role": "system", "content": system_prompt})
+        # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
+        effective_system = system_prompt or ""
+        if json_output:
+            json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+            if effective_system:
+                effective_system = f"{effective_system}\n\n{json_instructions}"
+            else:
+                effective_system = json_instructions
+
+        # User prompt stays clean
+        messages = [{"role": "user", "content": prompt}]
+
+        # Always include system message (with or without JSON instructions)
+        if effective_system:
+            messages.insert(0, {"role": "system", "content": effective_system})
 
         try:
             create_params = {
