@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Edit Playground - Gran Sabio LLM</title>
+    <link rel="stylesheet" href="/static/css/smart_edit.css">
+</head>
+<body class="light-mode">
+    <!-- Header -->
+    <header class="header">
+        <div class="header-left">
+            <span class="logo-icon">&#9899;</span>
+            <h1>Smart Edit Playground</h1>
+        </div>
+        <div class="header-right">
+            <button id="theme-toggle" class="icon-btn" title="Toggle dark mode">
+                <span class="theme-icon">&#9789;</span>
+            </button>
+            <a href="/api-docs" class="icon-btn" title="API Documentation">
+                <span>&#128214;</span>
+            </a>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="main-content">
+        <!-- Left Panel: Source Text -->
+        <section class="panel source-panel">
+            <div class="panel-header">
+                <h2>
+                    <span class="panel-icon">&#128221;</span>
+                    Source Text
+                </h2>
+                <div class="panel-actions">
+                    <select id="sample-select" class="sample-dropdown">
+                        <option value="">Load Example...</option>
+                    </select>
+                </div>
+            </div>
+            <div class="panel-body">
+                <textarea
+                    id="source-text"
+                    class="source-textarea"
+                    placeholder="Enter or paste your text here..."
+                    maxlength="50000"
+                ></textarea>
+                <div class="char-counter">
+                    <span id="char-count">0</span> / 50,000 chars
+                </div>
+            </div>
+        </section>
+
+        <!-- Middle Panel: Actions -->
+        <section class="panel actions-panel">
+            <div class="panel-header">
+                <h2>
+                    <span class="panel-icon">&#9881;</span>
+                    Actions
+                </h2>
+            </div>
+            <div class="panel-body">
+                <!-- Analyze Section -->
+                <div class="analyze-section">
+                    <button id="generate-actions-btn" class="btn btn-primary btn-large">
+                        <span class="btn-icon">&#127922;</span>
+                        Generate Actions
+                    </button>
+                    <div class="analyze-options">
+                        <label>
+                            Model:
+                            <select id="analysis-model">
+                                <option value="gpt-4o-mini">gpt-4o-mini</option>
+                                <option value="gpt-4o">gpt-4o</option>
+                                <option value="claude-3-5-haiku-latest">claude-3.5-haiku</option>
+                            </select>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Run All Button -->
+                <div class="run-all-section" id="run-all-section" style="display: none;">
+                    <button id="run-all-btn" class="btn btn-success btn-run-all">
+                        <span class="btn-icon">&#9654;&#9654;</span>
+                        <span class="btn-text">RUN ALL</span>
+                        <span class="btn-meta" id="run-all-meta"></span>
+                    </button>
+                </div>
+
+                <!-- Actions Queue -->
+                <div class="actions-queue" id="actions-queue">
+                    <div class="empty-state">
+                        <p>No actions yet.</p>
+                        <p class="hint">Enter text and click "Generate Actions" to analyze.</p>
+                    </div>
+                </div>
+
+                <!-- Stats -->
+                <div class="stats-bar" id="stats-bar" style="display: none;">
+                    <span class="stat">
+                        <span class="stat-icon">&#9889;</span>
+                        <span id="stat-direct">0</span> Direct
+                    </span>
+                    <span class="stat">
+                        <span class="stat-icon">&#129302;</span>
+                        <span id="stat-ai">0</span> AI
+                    </span>
+                    <span class="stat">
+                        <span class="stat-icon">&#128202;</span>
+                        <span id="stat-chars">0</span> chars
+                    </span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Right Panel: Preview -->
+        <section class="panel preview-panel">
+            <div class="panel-header">
+                <h2>
+                    <span class="panel-icon">&#10024;</span>
+                    Live Preview
+                </h2>
+                <div class="panel-actions">
+                    <div class="view-mode-toggle">
+                        <button class="view-btn active" data-view="live">Live</button>
+                        <button class="view-btn" data-view="diff">Diff</button>
+                        <button class="view-btn" data-view="side">Side by Side</button>
+                    </div>
+                    <button id="copy-result-btn" class="icon-btn" title="Copy result">
+                        <span>&#128203;</span>
+                    </button>
+                </div>
+            </div>
+            <div class="panel-body">
+                <!-- Live Preview -->
+                <div id="preview-live" class="preview-content preview-active">
+                    <div class="preview-text" id="preview-text">
+                        <span class="placeholder">Preview will appear here...</span>
+                    </div>
+                </div>
+
+                <!-- Diff View -->
+                <div id="preview-diff" class="preview-content">
+                    <pre class="diff-output" id="diff-output"></pre>
+                </div>
+
+                <!-- Side by Side View -->
+                <div id="preview-side" class="preview-content">
+                    <div class="side-by-side">
+                        <div class="side-panel">
+                            <h3>Original</h3>
+                            <div class="side-text" id="side-original"></div>
+                        </div>
+                        <div class="side-panel">
+                            <h3>Edited</h3>
+                            <div class="side-text" id="side-edited"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Settings Panel (Collapsible) -->
+    <aside class="settings-panel" id="settings-panel">
+        <button class="settings-toggle" id="settings-toggle">
+            <span>&#9881;</span> Settings
+        </button>
+        <div class="settings-content" id="settings-content">
+            <div class="setting-item">
+                <label>Animation Speed</label>
+                <input type="range" id="animation-speed" min="0.5" max="2" step="0.1" value="1">
+                <span id="speed-value">1x</span>
+            </div>
+            <div class="setting-item">
+                <label>
+                    <input type="checkbox" id="auto-scroll" checked>
+                    Auto-scroll to current action
+                </label>
+            </div>
+            <div class="setting-item">
+                <label>
+                    <input type="checkbox" id="highlight-changes" checked>
+                    Highlight changes in preview
+                </label>
+            </div>
+            <div class="setting-item">
+                <label>
+                    <input type="checkbox" id="pause-between">
+                    Pause between actions (500ms)
+                </label>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loading-overlay">
+        <div class="loading-spinner"></div>
+        <p class="loading-text" id="loading-text">Analyzing text...</p>
+    </div>
+
+    <!-- Toast Notifications -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <!-- Confetti library for celebration effects -->
+    <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
+    <script src="/static/js/smart_edit.js"></script>
+</body>
+</html>

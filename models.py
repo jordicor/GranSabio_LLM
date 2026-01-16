@@ -12,7 +12,7 @@ from enum import Enum
 from datetime import datetime
 
 from config import get_default_models, config
-from edit_models import TextEditRange
+from smart_edit import TextEditRange
 
 
 class GenerationStatus(str, Enum):
@@ -58,6 +58,15 @@ def _default_gran_sabio_model() -> str:
     default_model = defaults.get("gran_sabio")
     if not default_model:
         raise RuntimeError("Gran Sabio default model is not configured in model_specs.json under 'default_models.gran_sabio'.")
+    return default_model
+
+
+def _default_arbiter_model() -> str:
+    """Return configured default model for Arbiter from configuration."""
+    defaults = get_default_models()
+    default_model = defaults.get("arbiter")
+    if not default_model:
+        raise RuntimeError("Arbiter default model is not configured in model_specs.json under 'default_models.arbiter'.")
     return default_model
 
 
@@ -940,6 +949,14 @@ class ContentRequest(BaseModel):
         )
     )
 
+    # Smart Edit Per-Layer Configuration
+    max_edit_rounds_per_layer: int = Field(
+        default_factory=lambda: config.MAX_EDIT_ROUNDS_PER_LAYER,
+        ge=1,
+        le=20,
+        description="Maximum rounds of smart-edit per QA layer. Each layer is evaluated and edited iteratively before moving to the next."
+    )
+
     # Gran Sabio configuration
     gran_sabio_model: str = Field(default_factory=_default_gran_sabio_model, description="Model for Gran Sabio escalation")
     gran_sabio_fallback: bool = Field(default=False, description="Allow Gran Sabio to regenerate content when iterations are exhausted")
@@ -954,6 +971,12 @@ class ContentRequest(BaseModel):
         default=-1,
         ge=-1,
         description="Max Gran Sabio escalations per entire session. Use -1 for unlimited (testing/debug)."
+    )
+
+    # Arbiter configuration (per-layer conflict resolution)
+    arbiter_model: str = Field(
+        default_factory=_default_arbiter_model,
+        description="Model for Arbiter conflict resolution between QA evaluators"
     )
 
     # Word count enforcement configuration
@@ -1143,6 +1166,7 @@ class ContentRequest(BaseModel):
                 "min_global_score": 8.0,
                 "max_iterations": 5,
                 "gran_sabio_model": _default_gran_sabio_model(),
+                "arbiter_model": _default_arbiter_model(),
                 "word_count_enforcement": {
                     "enabled": True,
                     "flexibility_percent": 15,

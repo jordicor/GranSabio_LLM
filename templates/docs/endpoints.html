@@ -1,0 +1,1650 @@
+<section id="generate" class="docs-section">
+                <h2 class="docs-subheading">Generate Content</h2>
+                <div class="endpoint-header">
+                    <span class="http-method post">POST</span>
+                    <span class="endpoint-path">/generate</span>
+                </div>
+                
+                <p>Initiates content generation with multi-layer QA evaluation. Returns a session ID for tracking progress.</p>
+                
+                <h3 class="docs-minor-heading">Request Body</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">prompt</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Content generation prompt (minimum 10 characters)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">request_name</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Optional descriptive name for this request (max 128 chars). Returned in all responses and streaming events for easy client-side identification (e.g., "LinkedIn Article", "School Essay")</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">content_type</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Type of content: biography, script, novel, article, essay, technical, creative</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">json_output</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Set to true to request JSON-formatted output (with guard validation) while keeping the declared content_type</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">json_retry_without_iteration</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">When true, JSON validation errors trigger retries that do NOT consume main iterations (default: false). Controlled by MAX_JSON_RETRY_ATTEMPTS env var (default: 2 retries)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">json_schema</div>
+                        <div class="param-type">object</div>
+                        <div class="param-desc">Optional JSON Schema for structured outputs with 100% format guarantee (requires json_output=true). Supported by Grok, Gemini, Claude 4.5/Opus 4.1, GPT-4o, GPT-5, O1/O3, Mistral. See <a href="#json-schema-structured-outputs">JSON Schema Structured Outputs</a> for details.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">json_expectations</div>
+                        <div class="param-type">array</div>
+                        <div class="param-desc">Optional path-based validation rules for specific JSON fields (requires json_output=true). Validates only specified fields without defining complete structure. See <a href="#json-validation-comparison">JSON Validation: Schema vs Expectations</a> for comparison and usage.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">text_field_path</div>
+                        <div class="param-type">string | array</div>
+                        <div class="param-desc">Path(s) to primary text field(s) in JSON output using jmespath notation. Can be a single string or array for multiple fields. Examples: <code>"generated_text"</code>, <code>"data.content"</code>, <code>["chapter", "notes"]</code>. When specified, Smart Edit and QA focus on these fields while preserving other JSON structure. If not specified with json_output=true, auto-detects the largest string field (errors if ambiguous). See <a href="#smart-editing">Smart Editing</a> for details.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">text_field_only</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Controls what QA/Consensus/GranSabio receives when processing JSON. If <code>true</code>: Send only extracted text field(s) for evaluation (saves tokens). If <code>false</code>: Send complete JSON with hint about primary fields. In both cases, the user always receives the complete JSON with all fields preserved. (default: false)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">project_id</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Optional project identifier (≤128 chars) to group related sessions. Reuse the value returned from a previous negotiation.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">request_project_id</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">When true (alias: <code>get_project_id</code>), instructs the API to allocate a project_id if one is not provided.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">generator_model</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">AI model for generation (default: gpt-4o)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">temperature</div>
+                        <div class="param-type">float</div>
+                        <div class="param-desc">Generation temperature 0.0-2.0 (default: 0.7)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">max_tokens</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Maximum tokens for generation (default: 4000, ignored if max_tokens_percentage is specified)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">max_tokens_percentage</div>
+                        <div class="param-type">float</div>
+                        <div class="param-desc">Use X% of model's maximum available tokens (1-100). Takes precedence over max_tokens. With safety margin of 95%</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">min_words</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Minimum words for generation (optional)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">max_words</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Maximum words for generation (takes precedence over max_tokens)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">language</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Language hint for generation and QA modules (ISO 639-1 or locale code, e.g., 'es', 'en-US'). Automatically propagates to lexical diversity and phrase frequency analysis for proper stop-word filtering.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">reasoning_effort</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Reasoning effort level for GPT-5 models: "none", "low", "medium", "high" (optional)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">thinking_budget_tokens</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Budget tokens for thinking/reasoning (minimum 1024, for Claude 3.7/4 models)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">source_text</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Original source text for QA validation (e.g., interview text, reference material for biographical analysis). See <a href="#context-source-text">Context & Source Text</a> section for details.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">username</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">User identifier required when referencing attachments via context_documents</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">context_documents</div>
+                        <div class="param-type">array</div>
+                        <div class="param-desc">List of attachments to expose as contextual documents. Each item requires upload_id, username, and optional intended_usage. See <a href="#context-source-text">Context & Source Text</a> section.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">images</div>
+                        <div class="param-type">array</div>
+                        <div class="param-desc">List of image references for vision-enabled generation. Each item requires upload_id and username. Supported by GPT-4o, GPT-5, Claude, Gemini, and Grok models. See <a href="#vision-support">Vision Support</a> section.</div>
+                    </div>
+                    <div class="param-row nested">
+                        <div class="param-name">upload_id</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Attachment upload_id containing the image (from /attachments endpoint)</div>
+                    </div>
+                    <div class="param-row nested">
+                        <div class="param-name">username</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Owner of the attachment (must match request username)</div>
+                    </div>
+                    <div class="param-row nested">
+                        <div class="param-name">detail</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Detail level for OpenAI: "low" (85 tokens), "high" (variable), "auto" (default). Ignored by other providers.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">image_detail</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Default detail level for all images: "low", "high", "auto". Applied when individual image doesn't specify detail.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">qa_with_vision</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Enable vision in QA evaluation (default: false). When true, QA layers with include_input_images=true receive input images for evaluation.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">cumulative_text</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Previously generated chapters for cumulative repetition analysis (e.g., chapters 1-4 when generating chapter 5)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">cumulative_word_count</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Total word count of cumulative_text for ratio-based repetition analysis</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">word_count_enforcement</div>
+                        <div class="param-type">object</div>
+                        <div class="param-desc">Word count enforcement configuration (optional). Requires min_words and/or max_words to be set.</div>
+                    </div>
+                    <div class="param-row nested">
+                        <div class="param-name">enabled</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Enable strict word count validation</div>
+                    </div>
+                    <div class="param-row nested">
+                        <div class="param-name">flexibility_percent</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Allowed deviation percentage (0-100). Required when enabled=true.</div>
+                    </div>
+                    <div class="param-row nested">
+                        <div class="param-name">direction</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Flexibility direction: "both" (more or less), "more" (exceed only), "less" (under only)</div>
+                    </div>
+                    <div class="param-row nested">
+                        <div class="param-name">severity</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Enforcement severity: "important" (lower score), "deal_breaker" (hard fail)</div>
+                    </div>
+                    <div class="param-row nested">
+                        <div class="param-name">target_field</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Optional JSON field to count words in (e.g., "generated_text", "data.content"). If omitted, counts all content. Supports dot notation for nested fields.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">qa_models</div>
+                        <div class="param-type">array</div>
+                        <div class="param-desc">List of AI models for QA evaluation (strings for simple config, or QAModelConfig objects for advanced config with reasoning/thinking support)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">qa_global_config</div>
+                        <div class="param-type">object</div>
+                        <div class="param-desc">Global configuration applied to all QA models (max_tokens, reasoning_effort, thinking_budget_tokens, temperature)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">qa_models_config</div>
+                        <div class="param-type">object</div>
+                        <div class="param-desc">Per-model QA configuration by model name. Example: {"gpt-5-mini": {"reasoning_effort": "high", "max_tokens": 12000}}</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name required">qa_layers</div>
+                        <div class="param-type">array</div>
+                        <div class="param-desc">QA evaluation layers configuration. Use empty array [] to bypass QA and preflight validation completely for rapid generation.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">min_global_score</div>
+                        <div class="param-type">float</div>
+                        <div class="param-desc">Minimum global average score 0.0-10.0 (default: 8.0)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">max_iterations</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Maximum generation iterations (default: 5)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">max_edit_rounds_per_layer</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Maximum smart-edit rounds per QA layer before moving to the next layer (default: 5)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">gran_sabio_model</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Model for Gran Sabio escalation (default: claude-opus-4-1-20250805)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">gran_sabio_fallback</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Allow Gran Sabio to regenerate content when iterations exhausted (default: false)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">gran_sabio_call_limit_per_iteration</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Max Gran Sabio escalations per iteration. Use -1 for unlimited testing mode (default: 3)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">gran_sabio_call_limit_per_session</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Max Gran Sabio escalations per entire session. Use -1 for unlimited testing mode (default: 15)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">verbose</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Enable verbose progress tracking (default: true)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">show_query_costs</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Enable token usage and cost reporting: 0=disabled (default), 1=summary mode (phase aggregates), 2=detailed mode (per-iteration breakdown)</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Example Request</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "prompt": "Write a 2000-word biography about Marie Curie, focusing on her scientific discoveries and impact on modern science.",
+  "request_name": "Marie Curie Biography",
+  "content_type": "biography",
+  "json_output": true,
+  "json_retry_without_iteration": true,
+  "generator_model": "claude-sonnet-4-20250514",
+  "temperature": 0.7,
+  "min_words": 800,
+  "max_words": 1200,
+  "reasoning_effort": "medium",
+  "thinking_budget_tokens": 4000,
+  "word_count_enforcement": {
+    "enabled": true,
+    "flexibility_percent": 15,
+    "direction": "both",
+    "severity": "deal_breaker",
+    "target_field": "biography"
+  },
+  "qa_models": ["gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash"],
+  "qa_models_config": {
+    "gpt-4o": {
+      "max_tokens": 10000,
+      "temperature": 0.25
+    },
+    "claude-sonnet-4-20250514": {
+      "thinking_budget_tokens": 5000,
+      "max_tokens": 12000
+    }
+  },
+  "qa_layers": [
+    {
+      "name": "Factual Accuracy",
+      "description": "Historical accuracy and fact verification",
+      "criteria": "Verify all dates, events, and biographical details are accurate.",
+      "min_score": 8.5,
+      "is_mandatory": true,
+      "deal_breaker_criteria": "invents facts or presents false information as true",
+      "concise_on_pass": true,
+      "order": 1
+    },
+    {
+      "name": "Literary Quality",
+      "description": "Writing style and narrative quality",
+      "criteria": "Evaluate prose quality, narrative flow, and engaging writing style.",
+      "min_score": 7.5,
+      "is_mandatory": false,
+      "deal_breaker_criteria": null,
+      "concise_on_pass": true,
+      "order": 2
+    }
+  ],
+  "min_global_score": 8.0,
+  "max_iterations": 2,
+  "max_edit_rounds_per_layer": 5,
+  "gran_sabio_model": "claude-opus-4-1-20250805",
+  "gran_sabio_fallback": true,
+  "gran_sabio_call_limit_per_iteration": 3,
+  "gran_sabio_call_limit_per_session": 15,
+  "verbose": true,
+  "show_query_costs": 1
+}</code></pre>
+                <p class="docs-note">Set <code>json_output</code> to <code>true</code> when you need structured JSON responses (for example, <code>{"generated_text": ..., "observations": ...}</code>) while keeping the editorial tone and quality configuration associated with the selected <code>content_type</code>.</p>
+                <p class="docs-note"><strong>JSON Retry Mode:</strong> When <code>json_retry_without_iteration</code> is <code>true</code>, JSON validation errors trigger automatic retries that do NOT consume your main iteration count. This is useful for complex JSON structures where syntax errors might occur, allowing the system to self-correct structural issues without exhausting your generation attempts. The number of retries is controlled by the <code>MAX_JSON_RETRY_ATTEMPTS</code> environment variable (default: 2 retries per iteration).</p>
+                </div>
+
+                <h3 class="docs-minor-heading">Response</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "project_id": "24c4bb76d6f44050a6e9846f04ce2a52",
+  "request_name": "Marie Curie Biography",
+  "status": "initialized",
+  "recommended_timeout_seconds": 3600,
+  "preflight_feedback": {
+    "decision": "proceed",
+    "user_feedback": "Request looks good, generation will proceed",
+    "issues": []
+  }
+}</code></pre>
+                </div>
+
+                <div class="callout callout-info">
+                    <h4>Project Negotiation (Optional)</h4>
+                    <p>Include <code>"request_project_id": true</code> to ask the API for a reusable project identifier. The same value is returned in the response and will be echoed in subsequent status/result payloads. Supply your own <code>project_id</code> field when you already manage the identifier on the client side.</p>
+                </div>
+
+                <div class="alert info">
+                    <strong>⏱️ Timeout Recommendation:</strong> The <code>recommended_timeout_seconds</code> field now factors in the model’s reasoning timeout <em>and</em> your requested iteration/QA budget. Expect higher values for large biographies (multiple iterations, many QA layers, or Gran Sabio fallback). Use this number as the minimum client-side timeout to avoid premature cancellations.
+                </div>
+
+                <h3 class="docs-minor-heading">Preflight Validation</h3>
+                <p>The API now includes intelligent preflight validation that analyzes request feasibility before starting content generation. This prevents resource waste on impossible or contradictory requests.</p>
+
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">decision</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Preflight outcome: "proceed", "reject", or "manual_review"</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">user_feedback</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Human-readable explanation of the preflight analysis</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">issues</div>
+                        <div class="param-type">array</div>
+                        <div class="param-desc">List of issues detected during preflight validation</div>
+                    </div>
+                </div>
+
+                <h4 class="docs-minor-heading">Preflight Rejection Example</h4>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "preflight_rejected",
+  "preflight_feedback": {
+    "decision": "reject",
+    "user_feedback": "The request asks for a fictional story about vampires, but includes a QA layer requiring historical accuracy verification. Fiction cannot be historically accurate.",
+    "issues": [
+      {
+        "code": "fiction_accuracy_conflict",
+        "severity": "critical",
+        "message": "Historical accuracy validation cannot be applied to fictional content",
+        "blockers": true,
+        "related_requirements": ["Historical Accuracy"]
+      }
+    ]
+  }
+}</code></pre>
+                </div>
+            </section>
+
+            <!-- QA Bypass Section -->
+            <section id="qa-bypass" class="docs-section">
+                <h2 class="docs-subheading">🚀 QA Bypass Mode</h2>
+                <p>For rapid content generation without quality evaluation, you can completely bypass both QA evaluation and preflight validation by sending an empty <code>qa_layers</code> array.</p>
+
+                <h3 class="docs-minor-heading">Bypass Example</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "prompt": "Write a short science fiction story about AI",
+  "content_type": "story",
+  "generator_model": "gpt-4o",
+  "temperature": 0.8,
+  "max_tokens": 1000,
+  "qa_layers": [],  // Empty array = Complete bypass
+  "max_iterations": 1,
+  "verbose": true
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Bypass Behavior</h3>
+                <ul class="feature-list">
+                    <li><strong>Instant Approval:</strong> Content is approved immediately after generation</li>
+                    <li><strong>No QA Evaluation:</strong> Skips all quality assessment layers</li>
+                    <li><strong>No Preflight:</strong> Skips contradiction detection</li>
+                    <li><strong>Perfect Score:</strong> Returns 10.0 score by default</li>
+                    <li><strong>Single Iteration:</strong> No retry loops, accepts first result</li>
+                </ul>
+
+                <h3 class="docs-minor-heading">Bypass Response</h3>
+                <div class="code-example">
+                    <pre><code class="language-json">{
+  "status": "completed",
+  "content": "...",
+  "qa_result": {
+    "approved": true,
+    "global_score": 10.0,
+    "bypassed": true
+  }
+}</code></pre>
+                </div>
+
+                <h2 class="docs-section-title">Maximum Token Percentage Example</h2>
+                <div class="docs-subsection">
+                    <p>Use <code>max_tokens_percentage</code> to dynamically allocate tokens based on the model's maximum capacity.</p>
+                </div>
+
+                <h3 class="docs-minor-heading">Example: Using 80% of Model's Maximum</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "prompt": "Write an extensive technical article about quantum computing",
+  "content_type": "article",
+  "generator_model": "gpt-5",
+  "temperature": 0.7,
+  "max_tokens_percentage": 80,  // Use 80% of model's max (with 95% safety margin)
+  "qa_layers": [
+    {
+      "name": "Technical Accuracy",
+      "criteria": "Verify technical correctness and depth",
+      "min_score": 8.0
+    }
+  ],
+  "verbose": true
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Token Percentage Behavior</h3>
+                <ul class="feature-list">
+                    <li><strong>Dynamic Allocation:</strong> Automatically calculates tokens based on model's maximum output capacity</li>
+                    <li><strong>Safety Margin:</strong> Applies 95% safety margin to prevent token limit errors</li>
+                    <li><strong>Model-Aware:</strong> Adjusts to each model's specific limits (e.g., GPT-5: 32,000 tokens, Claude Opus 4: 32,000 tokens)</li>
+                    <li><strong>Takes Precedence:</strong> When specified, overrides the <code>max_tokens</code> field</li>
+                    <li><strong>Range:</strong> Accepts values from 1.0 to 100.0 (percentage)</li>
+                </ul>
+
+                <h3 class="docs-minor-heading">Model Token Limits Reference</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">Model</div>
+                        <div class="param-type">Max Output</div>
+                        <div class="param-desc">95% Safe Limit</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">GPT-5</div>
+                        <div class="param-type">32,000</div>
+                        <div class="param-desc">30,400 tokens</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">GPT-4o</div>
+                        <div class="param-type">16,384</div>
+                        <div class="param-desc">15,565 tokens</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">Claude Opus 4</div>
+                        <div class="param-type">32,000</div>
+                        <div class="param-desc">30,400 tokens</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">Claude Sonnet 4.5</div>
+                        <div class="param-type">64,000</div>
+                        <div class="param-desc">60,800 tokens</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">Grok-4</div>
+                        <div class="param-type">128,000</div>
+                        <div class="param-desc">121,600 tokens</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Use Cases for Token Percentage</h3>
+                <ul class="feature-list">
+                    <li><strong>Maximum Output:</strong> Use <code>max_tokens_percentage: 100</code> to get the maximum possible output from any model</li>
+                    <li><strong>Conservative Generation:</strong> Use <code>max_tokens_percentage: 50</code> for moderate-length content</li>
+                    <li><strong>Model-Agnostic Code:</strong> Write requests that work optimally across different models without hardcoding token limits</li>
+                    <li><strong>Cost Optimization:</strong> Use lower percentages (20-40%) for drafts or summaries to reduce costs</li>
+                </ul>
+
+                <h3 class="docs-minor-heading">Example Response</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "initialized",
+  "preflight_feedback": {
+    "decision": "proceed",
+    "user_feedback": "QA evaluation disabled - proceeding without preflight validation"
+  }
+}</code></pre>
+                </div>
+
+                <div class="callout callout-info">
+                    <h4>When to Use QA Bypass</h4>
+                    <p><strong>✅ Ideal for:</strong> Prototyping, content drafts, mass generation, testing</p>
+                    <p><strong>❌ Avoid for:</strong> Production content, factual accuracy requirements, editorial standards</p>
+                </div>
+            </section>
+
+            <!-- Status Endpoint -->
+            <section id="status" class="docs-section">
+                <h2 class="docs-subheading">Check Generation Status</h2>
+                <div class="endpoint-header">
+                    <span class="http-method get">GET</span>
+                    <span class="endpoint-path">/status/{session_id}</span>
+                </div>
+                
+                <p>Get the current status of a content generation session.</p>
+                <p class="docs-note">When project grouping is in use, the payload includes the <code>project_id</code> that owns the session.</p>
+                
+                <h3 class="docs-minor-heading">Path Parameters</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">session_id</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Session identifier returned from /generate</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Example Response</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "project_id": "24c4bb76d6f44050a6e9846f04ce2a52",
+  "request_name": "Marie Curie Biography",
+  "status": "qa_evaluation",
+  "current_iteration": 2,
+  "max_iterations": 5,
+  "verbose_log": [
+    "[14:32:15] Starting content generation...",
+    "[14:32:16] Iteration 2/5",
+    "[14:32:17] Querying gpt-4o..."
+  ],
+  "created_at": "2024-12-29T14:32:14.123456",
+  "gran_sabio_escalations": {
+    "total_count": 2,
+    "escalations": [
+      {
+        "escalation_id": "550e8400_escalation_0",
+        "iteration": 1,
+        "layer": "Factual Accuracy",
+        "trigger_type": "minority_deal_breaker",
+        "model": "gpt-5-mini",
+        "decision": "false_positive",
+        "was_real": false,
+        "duration_seconds": 12.5
+      },
+      {
+        "escalation_id": "550e8400_escalation_1",
+        "iteration": 2,
+        "layer": "Literary Quality",
+        "trigger_type": "50_50_tie",
+        "model": "claude-sonnet-4",
+        "decision": "real",
+        "was_real": true,
+        "duration_seconds": 15.2
+      }
+    ]
+  }
+}</code></pre>
+                </div>
+
+                <div class="alert info">
+                    <strong>New in v2.0:</strong> The response now includes <code>gran_sabio_escalations</code> with complete tracking of all escalations that occurred during this session.
+                </div>
+            </section>
+
+            <!-- Stream Endpoint -->
+            <section id="stream" class="docs-section">
+                <h2 class="docs-subheading">Stream Real-time Progress</h2>
+                <div class="endpoint-header">
+                    <span class="http-method get">GET</span>
+                    <span class="endpoint-path">/stream/{session_id}</span>
+                </div>
+
+                <p>Stream real-time progress updates for a generation session using Server-Sent Events (SSE).</p>
+                <p class="docs-note">Each progress message mirrors the session metadata, including <code>project_id</code> when the session belongs to a negotiated project.</p>
+
+                <h3 class="docs-minor-heading">Path Parameters</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">session_id</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Session identifier returned from /generate</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Connection Stability</h3>
+                <div class="alert info">
+                    <strong>🔌 Keep-Alive Heartbeats:</strong> The stream automatically sends SSE comment heartbeats (<code>: ping</code>) every 15 seconds to maintain the connection during long-running operations. These are invisible to EventSource clients and require no special handling. This prevents proxy/browser timeouts during AI thinking periods.
+                </div>
+
+                <h3 class="docs-minor-heading">Thinking Status Messages</h3>
+                <p>When using reasoning models (O1, O3, GPT-5, Claude thinking), the <code>verbose_log</code> will include thinking status updates:</p>
+                <ul class="feature-list">
+                    <li><strong>Initial:</strong> "🧠 [model] is preparing to think deeply (this may take several minutes)..."</li>
+                    <li><strong>During thinking:</strong> "🧠 Still thinking... (Xs elapsed)" - sent every 10 seconds</li>
+                    <li><strong>Complete:</strong> "💡 [model] finished thinking after Xs, now generating content..."</li>
+                </ul>
+
+                <h3 class="docs-minor-heading">Example Usage (JavaScript)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JavaScript</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-javascript">const eventSource = new EventSource(`/stream/${sessionId}`);
+
+eventSource.onmessage = function(event) {
+  const update = JSON.parse(event.data);
+  console.log('Status:', update.status);
+  console.log('Iteration:', update.current_iteration);
+  console.log('Project:', update.project_id || '—');
+
+  // Display thinking status messages
+  if (update.verbose_log && update.verbose_log.length > 0) {
+    update.verbose_log.forEach(log => {
+      if (log.includes('thinking')) {
+        console.log('AI Status:', log);
+      }
+    });
+  }
+
+  if (update.status === 'completed' || update.status === 'failed') {
+    eventSource.close();
+  }
+};
+
+// Note: SSE heartbeat comments (: ping) are automatically handled by EventSource</code></pre>
+                </div>
+            </section>
+
+            <!-- Unified Project Stream -->
+            <section id="stream-project-unified" class="docs-section">
+                <h2 class="docs-subheading">Unified Project Stream (SSE)</h2>
+                <div class="endpoint-header">
+                    <span class="http-method get">GET</span>
+                    <span class="endpoint-path">/stream/project/{project_id}</span>
+                </div>
+
+                <p>Stream real-time events for <strong>all sessions</strong> under a project using Server-Sent Events (SSE). Select which phases to receive via the <code>phases</code> query parameter.</p>
+
+                <div class="alert info">
+                    <strong>Live-Only Streaming:</strong> This endpoint does NOT replay historical data. It only emits events generated <em>after</em> the client connects. If you need to recover past content, your client application should persist events as they arrive.
+                </div>
+
+                <h3 class="docs-minor-heading">Path Parameters</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">project_id</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">The project identifier (max 128 chars)</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Query Parameters</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">phases</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">CSV of phases to subscribe. Default: "all"</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Available Phases</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">preflight</div>
+                        <div class="param-type">phase</div>
+                        <div class="param-desc">Preflight validation chunks</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">generation</div>
+                        <div class="param-type">phase</div>
+                        <div class="param-desc">Content generation chunks</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">qa</div>
+                        <div class="param-type">phase</div>
+                        <div class="param-desc">QA evaluation chunks</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">consensus</div>
+                        <div class="param-type">phase</div>
+                        <div class="param-desc">Consensus calculation updates</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">gransabio / gran_sabio</div>
+                        <div class="param-type">phase</div>
+                        <div class="param-desc">Gran Sabio review/regeneration chunks</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">status</div>
+                        <div class="param-type">phase</div>
+                        <div class="param-desc">Aggregated status updates with initial snapshot</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">all</div>
+                        <div class="param-type">phase</div>
+                        <div class="param-desc">All phases (default)</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">URL Examples</h3>
+                <div class="code-example">
+                    <pre><code class="language-bash"># All phases (default)
+/stream/project/abc123
+
+# Only generation and QA chunks
+/stream/project/abc123?phases=generation,qa
+
+# Status updates only (control panel)
+/stream/project/abc123?phases=status
+
+# Content phases without status
+/stream/project/abc123?phases=preflight,generation,qa,consensus,gransabio</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Event Types</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">connected</div>
+                        <div class="param-type">event</div>
+                        <div class="param-desc">Initial connection confirmation with subscribed_phases list (always sent first)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">status_snapshot</div>
+                        <div class="param-type">event</div>
+                        <div class="param-desc">Current project state snapshot (only if "status" phase requested)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">chunk</div>
+                        <div class="param-type">event</div>
+                        <div class="param-desc">Content chunk from any subscribed content phase</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">status_change</div>
+                        <div class="param-type">event</div>
+                        <div class="param-desc">Session state changed (status, phase, iteration, QA progress)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">session_end</div>
+                        <div class="param-type">event</div>
+                        <div class="param-desc">A session within the project completed or failed</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">stream_end</div>
+                        <div class="param-type">event</div>
+                        <div class="param-desc">Stream closing (project ended or cancelled). Always includes "reason"</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Key Behaviors</h3>
+                <ul class="feature-list">
+                    <li><strong>All events include "phase" field:</strong> Easy client-side filtering by origin</li>
+                    <li><strong>Heartbeat every 15 seconds:</strong> SSE comment <code>: heartbeat</code> keeps connection alive</li>
+                    <li><strong>Immediate close on cancel:</strong> No queue draining - stops immediately</li>
+                    <li><strong>Guaranteed close event:</strong> Client always receives <code>stream_end</code> with reason</li>
+                </ul>
+
+                <h3 class="docs-minor-heading">Event Format Examples</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">// Connected event (always first)
+{
+  "type": "connected",
+  "project_id": "abc123",
+  "subscribed_phases": ["generation", "qa", "status"],
+  "timestamp": 1732968000000
+}
+
+// Status snapshot (only if "status" phase requested)
+{
+  "type": "status_snapshot",
+  "phase": "status",
+  "project": {
+    "project_id": "abc123",
+    "status": "running",
+    "sessions": [...],
+    "summary": {"total": 2, "active": 1, "completed": 1}
+  },
+  "timestamp": 1732968000001
+}
+
+// Content chunk
+{
+  "type": "chunk",
+  "phase": "generation",
+  "session_id": "sess-xyz",
+  "content": "The generated text...",
+  "timestamp": 1732968005000
+}
+
+// Status change
+{
+  "type": "status_change",
+  "phase": "status",
+  "trigger_session": "sess-xyz",
+  "project": {...},
+  "timestamp": 1732968010000
+}
+
+// Stream end
+{
+  "type": "stream_end",
+  "phase": "status",
+  "reason": "project_ended",
+  "timestamp": 1732968020000
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Example Usage (JavaScript)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JavaScript</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-javascript">const projectId = 'my-biography-project';
+
+// Subscribe to generation, QA, and status phases
+const eventSource = new EventSource(
+  `/stream/project/${projectId}?phases=generation,qa,status`
+);
+
+eventSource.onmessage = function(event) {
+  const data = JSON.parse(event.data);
+
+  // All events have "phase" field for easy filtering
+  switch (data.phase) {
+    case 'generation':
+      appendToEditor(data.session_id, data.content);
+      break;
+
+    case 'qa':
+      updateQAPanel(data.session_id, data.content);
+      break;
+
+    case 'status':
+      if (data.type === 'status_snapshot') {
+        initializeDashboard(data.project);
+      } else if (data.type === 'status_change') {
+        updateDashboard(data.project);
+      } else if (data.type === 'stream_end') {
+        console.log('Stream ended:', data.reason);
+        eventSource.close();
+      }
+      break;
+  }
+};
+
+eventSource.onerror = function(error) {
+  console.error('Stream error:', error);
+  eventSource.close();
+};</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Error Responses</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">400</div>
+                        <div class="param-type">error</div>
+                        <div class="param-desc">Invalid project_id or invalid phase names</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">503</div>
+                        <div class="param-type">error</div>
+                        <div class="param-desc">Unable to subscribe to any requested phase (service temporarily unavailable)</div>
+                    </div>
+                </div>
+
+                <div class="alert warning">
+                    <strong>Multiple Sessions:</strong> When multiple sessions run under the same project, events from all of them arrive on the same stream. Use the <code>session_id</code> field to route each event to the appropriate UI component.
+                </div>
+            </section>
+
+            <!-- Result Endpoint -->
+            <section id="result" class="docs-section">
+                <h2 class="docs-subheading">Get Final Result</h2>
+                <div class="endpoint-header">
+                    <span class="http-method get">GET</span>
+                    <span class="endpoint-path">/result/{session_id}</span>
+                </div>
+                
+                <p>Get the final result of a completed generation session.</p>
+                <p class="docs-note">The response mirrors the original request metadata, including <code>project_id</code> when the session is part of a grouped project.</p>
+                
+                <h3 class="docs-minor-heading">Path Parameters</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">session_id</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Session identifier returned from /generate</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Example Response</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "project_id": "24c4bb76d6f44050a6e9846f04ce2a52",
+  "request_name": "Marie Curie Biography",
+  "content": "Marie Curie (1867-1934) was a Polish-French physicist and chemist...",
+  "final_iteration": 3,
+  "final_score": 8.7,
+  "qa_summary": {
+    "average_score": 8.7,
+    "layer_averages": {
+      "Factual Accuracy": 9.2,
+      "Literary Quality": 8.1
+    },
+    "approved": true
+  },
+  "generated_at": "2024-12-29T14:35:22.789012",
+  "costs": {
+    "mode": "summary",
+    "currency": "USD",
+    "grand_totals": {
+      "input_tokens": 2847,
+      "output_tokens": 1523,
+      "total_tokens": 4370,
+      "cost": 0.012456
+    },
+    "phases": {
+      "preflight": {
+        "input_tokens": 234,
+        "output_tokens": 89,
+        "cost": 0.000123
+      },
+      "generation": {
+        "input_tokens": 1456,
+        "output_tokens": 987,
+        "cost": 0.008234
+      },
+      "qa": {
+        "input_tokens": 987,
+        "output_tokens": 345,
+        "cost": 0.003456
+      },
+      "gran_sabio": {
+        "input_tokens": 170,
+        "output_tokens": 102,
+        "cost": 0.000643
+      }
+    }
+  }
+}</code></pre>
+                </div>
+            </section>
+
+            <!-- Stop Session Endpoint -->
+            <section id="stop" class="docs-section">
+                <h2 class="docs-subheading">Stop Generation Session</h2>
+                <div class="endpoint-header">
+                    <span class="http-method post">POST</span>
+                    <span class="endpoint-path">/stop/{session_id}</span>
+                </div>
+                
+                <p>Cancel an active content generation session immediately. This stops the generation process and marks the session as cancelled.</p>
+
+                <h3 class="docs-minor-heading">Path Parameters</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">session_id</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">The unique session identifier returned from the /generate endpoint</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Example Request</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">cURL</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X POST "https://your-api.com/stop/550e8400-e29b-41d4-a716-446655440000" \
+  -H "Content-Type: application/json"</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Success Response</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <span class="status-code success">200 OK</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "message": "Session stopped successfully",
+  "stopped": true,
+  "status": "cancelled"
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Error Responses</h3>
+                
+                <div class="error-section">
+                    <h4 class="error-title">Session Not Found</h4>
+                    <div class="code-example">
+                        <div class="code-header">
+                            <span class="code-lang">JSON</span>
+                            <span class="status-code error">404 Not Found</span>
+                            <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        </div>
+                        <pre><code class="language-json">{
+  "detail": "Session not found"
+}</code></pre>
+                    </div>
+                </div>
+
+                <div class="error-section">
+                    <h4 class="error-title">Session Already Completed</h4>
+                    <div class="code-example">
+                        <div class="code-header">
+                            <span class="code-lang">JSON</span>
+                            <span class="status-code success">200 OK</span>
+                            <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        </div>
+                        <pre><code class="language-json">{
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "message": "Session already finished with status: completed",
+  "stopped": false
+}</code></pre>
+                    </div>
+                </div>
+
+                <div class="important-notes">
+                    <h4 class="notes-title">Important Notes</h4>
+                    <ul class="notes-list">
+                        <li>Only active sessions (generating, qa_evaluation, gran_sabio_review) can be cancelled</li>
+                        <li>Cancelled sessions can still be retrieved using GET /result/{session_id}</li>
+                        <li>The cancellation is immediate and cannot be undone</li>
+                        <li>Partial content generated before cancellation is preserved in the result</li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- Project Start Endpoint -->
+            <section id="project-start" class="docs-section">
+                <h2 class="docs-subheading">Start/Reactivate Project</h2>
+                <div class="endpoint-header">
+                    <span class="http-method post">POST</span>
+                    <span class="endpoint-path">/project/start/{project_id}</span>
+                </div>
+
+                <p>Activate or reactivate a project to accept new generation requests. Use this endpoint after stopping a project to resume operations.</p>
+
+                <h3 class="docs-minor-heading">Path Parameters</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">project_id</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">The project identifier used to group related sessions</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Example Request</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">cURL</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X POST "https://your-api.com/project/start/my-project-123" \
+  -H "Content-Type: application/json"</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Success Response</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <span class="status-code success">200 OK</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "project_id": "my-project-123",
+  "status": "active",
+  "was_cancelled": true,
+  "message": "Project reactivated successfully"
+}</code></pre>
+                </div>
+
+                <div class="important-notes">
+                    <h4 class="notes-title">Important Notes</h4>
+                    <ul class="notes-list">
+                        <li>If the project was previously cancelled, <code>was_cancelled</code> returns <code>true</code></li>
+                        <li>If the project was already active, <code>was_cancelled</code> returns <code>false</code></li>
+                        <li>Call this endpoint before resuming generation after a project stop</li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- Project Stop Endpoint -->
+            <section id="project-stop" class="docs-section">
+                <h2 class="docs-subheading">Stop Project</h2>
+                <div class="endpoint-header">
+                    <span class="http-method post">POST</span>
+                    <span class="endpoint-path">/project/stop/{project_id}</span>
+                </div>
+
+                <p>Cancel all active sessions belonging to a project and reject any new generation requests until the project is reactivated. This is useful for implementing a "Stop All" functionality in client applications.</p>
+
+                <h3 class="docs-minor-heading">Path Parameters</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">project_id</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">The project identifier used to group related sessions</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Example Request</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">cURL</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X POST "https://your-api.com/project/stop/my-project-123" \
+  -H "Content-Type: application/json"</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Success Response</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <span class="status-code success">200 OK</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "project_id": "my-project-123",
+  "status": "cancelled",
+  "sessions_cancelled": 3,
+  "message": "Project cancelled; 3 active sessions stopped"
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Blocked Request Response</h3>
+                <p>After stopping a project, any new <code>/generate</code> requests with that project_id will be rejected:</p>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <span class="status-code error">403 Forbidden</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "detail": "Project 'my-project-123' has been cancelled. Call POST /project/start/my-project-123 to reactivate it."
+}</code></pre>
+                </div>
+
+                <div class="important-notes">
+                    <h4 class="notes-title">Important Notes</h4>
+                    <ul class="notes-list">
+                        <li>All active sessions belonging to the project are immediately cancelled</li>
+                        <li>New generation requests with this project_id are rejected with HTTP 403</li>
+                        <li>Use <code>POST /project/start/{project_id}</code> to reactivate the project</li>
+                        <li>This endpoint is idempotent - calling it multiple times is safe</li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- Project Status Endpoint -->
+            <section id="project-status" class="docs-section">
+                <h2 class="docs-subheading">Project Status (Control Panel)</h2>
+                <div class="endpoint-header">
+                    <span class="http-method get">GET</span>
+                    <span class="endpoint-path">/status/project/{project_id}</span>
+                </div>
+
+                <p>Get the current status of all sessions belonging to a project. This endpoint is designed for building "control panel" UIs that display the real-time state of all generation activities within a project.</p>
+
+                <h3 class="docs-minor-heading">Path Parameters</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">project_id</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">The project identifier (max 128 chars)</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Response Structure</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">project_id</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">The project identifier</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">status</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Overall project status: "idle", "running", "completed", "failed", "cancelled"</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">sessions</div>
+                        <div class="param-type">array</div>
+                        <div class="param-desc">List of session status objects (see below)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">summary</div>
+                        <div class="param-type">object</div>
+                        <div class="param-desc">Aggregate counts: total_sessions, active_sessions, completed_sessions</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Session Object Structure</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">session_id</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Unique session identifier</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">request_name</div>
+                        <div class="param-type">string | null</div>
+                        <div class="param-desc">Descriptive name for this request when provided</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">status</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Session status: initializing, generating, qa_evaluation, consensus, completed, failed, cancelled</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">phase</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Current processing phase</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">iteration</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Current iteration number</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">max_iterations</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Maximum allowed iterations</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">started_at</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">ISO timestamp when session started</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">generation</div>
+                        <div class="param-type">object</div>
+                        <div class="param-desc">Generation info: model, content_length, word_count</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">qa</div>
+                        <div class="param-type">object</div>
+                        <div class="param-desc">QA tracking: models[], layers[], current_model, current_layer, progress{completed, total}</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">consensus</div>
+                        <div class="param-type">object</div>
+                        <div class="param-desc">Consensus info: last_score, min_required, approved</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">gran_sabio</div>
+                        <div class="param-type">object</div>
+                        <div class="param-desc">Gran Sabio info: active, model, escalation_count</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Example Response</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "project_id": "my-biography-project",
+  "status": "running",
+  "sessions": [
+    {
+      "session_id": "550e8400-e29b-41d4-a716-446655440000",
+      "request_name": "Marie Curie Biography",
+      "status": "qa_evaluation",
+      "phase": "qa_evaluation",
+      "iteration": 2,
+      "max_iterations": 5,
+      "started_at": "2025-11-30T14:32:14.123456",
+      "generation": {
+        "model": "gpt-4o",
+        "content_length": 4523,
+        "word_count": 856
+      },
+      "qa": {
+        "models": ["gpt-4o-mini", "claude-sonnet-4-20250514"],
+        "layers": ["Factual Accuracy", "Literary Quality"],
+        "current_model": "claude-sonnet-4-20250514",
+        "current_layer": "Literary Quality",
+        "progress": {
+          "completed": 3,
+          "total": 4
+        }
+      },
+      "consensus": {
+        "last_score": 7.8,
+        "min_required": 8.0,
+        "approved": false
+      },
+      "gran_sabio": {
+        "active": false,
+        "model": "claude-opus-4-1-20250805",
+        "escalation_count": 1
+      }
+    }
+  ],
+  "summary": {
+    "total_sessions": 1,
+    "active_sessions": 1,
+    "completed_sessions": 0
+  }
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Use Cases</h3>
+                <ul class="feature-list">
+                    <li><strong>Control Panel UI:</strong> Display real-time status of all sessions in a project dashboard</li>
+                    <li><strong>Progress Monitoring:</strong> Track QA evaluation progress with current model/layer info</li>
+                    <li><strong>Resource Management:</strong> Monitor active vs completed sessions across a project</li>
+                    <li><strong>Debugging:</strong> Identify stuck or failed sessions within a project</li>
+                </ul>
+
+                <h3 class="docs-minor-heading">Combining with Unified Stream</h3>
+                <p>For a complete control panel experience, use the unified stream endpoint instead of polling:</p>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JavaScript</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-javascript">const projectId = 'my-biography-project';
+
+// Single connection for status + generation chunks
+const eventSource = new EventSource(
+  `/stream/project/${projectId}?phases=generation,status`
+);
+
+eventSource.onmessage = function(event) {
+  const data = JSON.parse(event.data);
+
+  switch (data.phase) {
+    case 'status':
+      if (data.type === 'status_snapshot' || data.type === 'status_change') {
+        updateDashboard(data.project);
+      } else if (data.type === 'stream_end') {
+        eventSource.close();
+      }
+      break;
+
+    case 'generation':
+      appendToEditor(data.session_id, data.content);
+      break;
+  }
+};</code></pre>
+                </div>
+
+                <div class="alert info">
+                    <strong>Polling vs Streaming:</strong> Use this endpoint for periodic status snapshots (dashboard refresh). For real-time updates, use the unified stream endpoint: <code>/stream/project/{id}?phases=status</code> (status only) or <code>/stream/project/{id}</code> (all phases).
+                </div>
+            </section>
+
+
+            <!-- Models Endpoint -->
+            <section id="models" class="docs-section">
+                <h2 class="docs-subheading">Available Models</h2>
+                <div class="endpoint-header">
+                    <span class="http-method get">GET</span>
+                    <span class="endpoint-path">/models</span>
+                </div>
+
+                <p>Get list of available AI models with their specifications and capabilities.</p>
+
+                <h3 class="docs-minor-heading">Example Response</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "openai": [
+    {
+      "key": "gpt-5",
+      "name": "GPT-5",
+      "description": "Latest flagship model with reasoning capabilities",
+      "output_tokens": 128000,
+      "reasoning_effort": ["none", "low", "medium", "high"],
+      "pricing": "Premium"
+    },
+    {
+      "key": "o1",
+      "name": "o1",
+      "description": "Reasoning model with function calling support",
+      "output_tokens": 65536,
+      "reasoning_effort": ["low", "medium", "high"],
+      "pricing": "Premium"
+    },
+    {
+      "key": "o3",
+      "name": "o3",
+      "description": "Advanced reasoning model for complex problems",
+      "output_tokens": 100000,
+      "reasoning_effort": ["low", "medium", "high"],
+      "pricing": "Ultra-Premium"
+    },
+    {
+      "key": "o3-mini",
+      "name": "o3 Mini",
+      "description": "Efficient reasoning model with configurable effort",
+      "output_tokens": 100000,
+      "reasoning_effort": ["low", "medium", "high"],
+      "pricing": "Standard"
+    },
+    {
+      "key": "o3-pro",
+      "name": "o3 Pro",
+      "description": "Most intelligent OpenAI model with maximum reliability",
+      "output_tokens": 100000,
+      "reasoning_effort": ["low", "medium", "high"],
+      "pricing": "Ultra-Premium"
+    },
+    {
+      "key": "gpt-4o",
+      "name": "GPT-4o",
+      "description": "Advanced multimodal model",
+      "output_tokens": 16384,
+      "pricing": "Premium"
+    }
+  ],
+  "anthropic": [
+    {
+      "key": "claude-sonnet-4-20250514",
+      "name": "Claude Sonnet 4",
+      "description": "Latest generation Sonnet with thinking capabilities",
+      "output_tokens": 128000,
+      "thinking_budget": {"min": 1024, "max": 16384, "default": 6000},
+      "pricing": "Standard"
+    },
+    {
+      "key": "claude-opus-4-1-20250805",
+      "name": "Claude Opus 4.1",
+      "description": "Most advanced Claude model with enhanced reasoning",
+      "output_tokens": 128000,
+      "thinking_budget": {"min": 1024, "max": 16384, "default": 8000},
+      "pricing": "Premium"
+    },
+    {
+      "key": "claude-3-7-sonnet-20250219",
+      "name": "Claude 3.7 Sonnet",
+      "description": "Hybrid reasoning model with thinking mode",
+      "output_tokens": 8192,
+      "thinking_budget": {"min": 1024, "max": 16384, "default": 4000},
+      "pricing": "Standard"
+    }
+  ]
+}</code></pre>
+                </div>
+            </section>
+
+            <!-- Analytics Section -->
+            <section id="analytics" class="docs-section">
+                <h2 class="docs-subheading">Analytics Dashboard</h2>
+                <div class="endpoint-header">
+                    <span class="http-method get">GET</span>
+                    <span class="endpoint-path">/analytics</span>
+                </div>
+
+                <p>Get comprehensive deal-breaker tracking analytics including escalation statistics and model reliability metrics.</p>
+
+                <div class="alert info">
+                    <strong>New in v2.0:</strong> Track Gran Sabio escalations and identify which QA models have high false positive rates.
+                </div>
+
+                <h3 class="docs-minor-heading">Example Response</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "total_escalations": 47,
+  "total_real_deal_breakers": 32,
+  "total_false_positives": 15,
+  "overall_false_positive_rate": 0.32,
+  "model_statistics": {
+    "gpt-5-mini": {
+      "total_raised": 12,
+      "confirmed_real": 3,
+      "confirmed_false_positive": 9,
+      "false_positive_rate": 0.75,
+      "precision": 0.25,
+      "reliability_badge": "LOW",
+      "last_updated": "2025-10-06T05:20:30"
+    },
+    "claude-sonnet-4-20250514": {
+      "total_raised": 20,
+      "confirmed_real": 18,
+      "confirmed_false_positive": 2,
+      "false_positive_rate": 0.10,
+      "precision": 0.90,
+      "reliability_badge": "HIGH",
+      "last_updated": "2025-10-06T05:22:15"
+    }
+  },
+  "high_reliability_models": ["claude-sonnet-4-20250514"],
+  "low_reliability_models": ["gpt-5-mini"]
+}</code></pre>
+                </div>
+
+                <div class="info-box">
+                    <h4>Reliability Badges</h4>
+                    <ul>
+                        <li><strong>HIGH:</strong> Precision >= 80% (highly reliable)</li>
+                        <li><strong>MEDIUM:</strong> Precision 50-79% (moderately reliable)</li>
+                        <li><strong>LOW:</strong> Precision < 50% (many false positives)</li>
+                        <li><strong>UNKNOWN:</strong> Less than 5 samples (insufficient data)</li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- Analytics Model Section -->
+            <section id="analytics-model" class="docs-section">
+                <h2 class="docs-subheading">Model Analytics</h2>
+                <div class="endpoint-header">
+                    <span class="http-method get">GET</span>
+                    <span class="endpoint-path">/analytics/model/{model_name}</span>
+                </div>
+
+                <p>Get detailed reliability statistics for a specific QA model.</p>
+
+                <h3 class="docs-minor-heading">Path Parameters</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">model_name</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">The name of the QA model (e.g., "gpt-5-mini", "claude-sonnet-4-20250514")</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Example Request</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">cURL</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl "http://localhost:8000/analytics/model/gpt-5-mini"</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Success Response (200 OK)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "model_name": "gpt-5-mini",
+  "total_deal_breakers_raised": 12,
+  "confirmed_real": 3,
+  "confirmed_false_positive": 9,
+  "false_positive_rate": 0.75,
+  "precision": 0.25,
+  "reliability_badge": "LOW",
+  "first_seen": "2025-10-06T05:18:00.123456",
+  "last_updated": "2025-10-06T05:20:30.456789"
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Error Response (404 Not Found)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "detail": "No statistics found for model: unknown-model"
+}</code></pre>
+                </div>
+
+                <div class="alert warning">
+                    <strong>Note:</strong> Statistics are only available for models that have triggered at least one deal-breaker escalation. Models without escalations will return 404.
+                </div>
+            </section>
+
+            <!-- Analysis Tools: Lexical Diversity Section -->

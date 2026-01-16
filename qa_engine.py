@@ -17,7 +17,7 @@ Changes (2025-11-06):
 import asyncio
 import logging
 from collections import defaultdict
-from typing import List, Dict, Any, Optional, Callable, Awaitable, TYPE_CHECKING
+from typing import List, Dict, Any, Optional, Callable, Awaitable, Tuple, TYPE_CHECKING
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -207,13 +207,14 @@ class QAEngine:
         marker_length: Optional[int] = None,
         word_map_formatted: Optional[str] = None,
         input_images: Optional[List["ImageData"]] = None,
+        edit_history: Optional[str] = None,
     ) -> QAEvaluation:
         """
         Evaluate content using a specific QA layer and AI model
 
         Args:
             marker_mode: "phrase" for text markers, "word_index" for word map indices
-            marker_length: Number of words for phrase markers (4-12)
+            marker_length: Number of words for phrase markers (4-64)
             word_map_formatted: Formatted word map string for word_index mode
             input_images: Optional list of ImageData for vision-enabled QA evaluation.
                          Only passed if both the layer has include_input_images=True
@@ -281,6 +282,7 @@ class QAEngine:
                 marker_length=marker_length,
                 word_map_formatted=word_map_formatted,
                 input_images=images_for_eval,
+                edit_history=edit_history,
             )
         except Exception as e:
             logger.error(f"QA evaluation failed for layer {layer.name} with model {model_config.model}: {str(e)}")
@@ -561,7 +563,7 @@ class QAEngine:
 
         Args:
             marker_mode: "phrase" for text markers, "word_index" for word map indices
-            marker_length: Number of words for phrase markers (4-12)
+            marker_length: Number of words for phrase markers (4-64)
             word_map_formatted: Formatted word map string for word_index mode
             input_images: Optional list of ImageData for vision-enabled QA.
                          Passed to layers with include_input_images=True.
@@ -679,265 +681,38 @@ class QAEngine:
 
                 continue  # Move to next item in execution plan
 
-            # Handle semantic QA layer (existing logic)
+            # Handle semantic QA layer - delegate to extracted function
             layer = plan_item["layer"]
-            await _abort_if_cancelled(f"🛑 Cancelled before evaluating layer {layer.name}.")
 
-            # Log layer evaluation start with phase_logger
-            if phase_logger:
-                phase_logger.info(f"Evaluating layer: {layer.name}")
-                if phase_logger.extra_verbose and layer.criteria:
-                    phase_logger.info(f"Criteria: {layer.criteria[:200]}...")
+            # Evaluate layer using extracted function
+            layer_results, majority_deal_breaker = await self._evaluate_single_semantic_layer(
+                content=content,
+                layer=layer,
+                qa_models=qa_models,
+                qa_model_names=qa_model_names,
+                progress_callback=progress_callback,
+                original_request=original_request,
+                stream_callback=stream_callback,
+                session_id=session_id,
+                cancel_callback=cancel_callback,
+                usage_tracker=usage_tracker,
+                iteration=iteration,
+                phase_logger=phase_logger,
+                marker_mode=marker_mode,
+                marker_length=marker_length,
+                word_map_formatted=word_map_formatted,
+                input_images=input_images,
+                content_for_bypass=content_for_bypass,
+            )
 
-            if progress_callback:
-                await progress_callback(f"📊 Evaluating layer: {layer.name}")
-
-            layer_results: Dict[str, QAEvaluation] = {}
-            
-            # Algorithmic bypass (unchanged)
-            if self.bypass_engine.should_bypass_qa_layer(
-                layer, original_request,
-                extra_verbose=getattr(original_request, 'extra_verbose', False) if original_request else False
-            ):
-                if progress_callback:
-                    await progress_callback(f"🔄 Using algorithmic bypass for {layer.name}...")
-
-                # Use extracted text for bypass if available, otherwise use original content
-                bypass_content = content_for_bypass if content_for_bypass is not None else content
-                bypass_results = self.bypass_engine.bypass_layer_evaluation(bypass_content, layer, qa_model_names, original_request)
-                layer_results.update(bypass_results)
-                logger.info(f"Layer {layer.name} evaluated algorithmically with bypass engine")
-
-                first_evaluation = next(iter(bypass_results.values()))
-                if first_evaluation.deal_breaker:
-                    logger.warning(f"Algorithmic deal-breaker detected in {layer.name}. Stopping to iterate.")
-                    if progress_callback:
-                        await progress_callback(f"🛑 Algorithmic deal-breaker in {layer.name}. Stopping to iterate.")
-                    results[layer.name] = layer_results
-                    consensus_info = {
-                        "immediate_stop": True,
-                        "deal_breaker_count": len(qa_model_names),
-                        "total_evaluated": len(qa_model_names),
-                        "total_models": len(qa_model_names),
-                        "deal_breaker_details": [{
-                            "model": f"Algorithmic ({model})",
-                            "reason": first_evaluation.deal_breaker_reason
-                        } for model in qa_model_names],
-                        "majority_threshold": len(qa_model_names) / 2
-                    }
-                    return self._create_iteration_stop_result(results, consensus_info)
-
-                if progress_callback:
-                    for model in qa_models:
-                        model_name = get_model_name(model)
-                        evaluation = layer_results[model_name]
-                        if evaluation.score is not None:
-                            await progress_callback(f"✅ {evaluation.model}: {evaluation.score:.1f}/10")
-                        else:
-                            await progress_callback(
-                                f"⚠️ {evaluation.model}: invalid JSON response. Evaluation skipped for this model."
-                            )
-                await _abort_if_cancelled(f"🛑 Cancelled after bypass evaluation of layer {layer.name}.")
-                
-            else:
-                # Normal AI-based evaluation
-                for model in qa_models:
-                    model_name = get_model_name(model)
-                    await _abort_if_cancelled(f"🛑 Cancelled before querying {model_name} for layer {layer.name}.")
-
-                    if phase_logger:
-                        phase_logger.info(f"Querying model: {model_name}")
-
-                    if progress_callback:
-                        await progress_callback(f"🧠 Querying {model_name} for {layer.name}...")
-
-                    if isinstance(model, QAModelConfig):
-                        individual_timeout = calculate_qa_timeout_for_model(
-                            model.model, model.reasoning_effort, model.thinking_budget_tokens
-                        )
-                    else:
-                        individual_timeout = calculate_qa_timeout_for_model(model)
-
-                    usage_callback_fn = None
-                    if usage_tracker:
-                        usage_callback_fn = usage_tracker.create_callback(
-                            phase="qa",
-                            role="evaluation",
-                            iteration=iteration,
-                            layer=layer.name,
-                            metadata={"qa_model": model_name, "session_id": session_id},
-                        )
-
-                    # Determine if we should request edit info based on smart_editing_mode
-                    smart_editing_mode = getattr(original_request, 'smart_editing_mode', 'auto') if original_request else 'auto'
-                    content_type = getattr(original_request, 'content_type', 'other') if original_request else 'other'
-                    request_edit_info = self._should_request_edit_info(
-                        mode=smart_editing_mode,
-                        content_type=content_type
-                    )
-
-                    try:
-                        evaluation = await asyncio.wait_for(
-                            self.evaluate_content(
-                                content,
-                                layer,
-                                model,
-                                original_request,
-                                extra_verbose=getattr(original_request, 'extra_verbose', False) if original_request else False,
-                                stream_callback=stream_callback,
-                                usage_callback=usage_callback_fn,
-                                request_edit_info=request_edit_info,
-                                phase_logger=phase_logger,
-                                marker_mode=marker_mode,
-                                marker_length=marker_length,
-                                word_map_formatted=word_map_formatted,
-                                input_images=input_images,
-                            ),
-                            timeout=individual_timeout
-                        )
-
-                        layer_results[model_name] = evaluation
-                        self._reset_model_failure(session_id, model_name)
-
-                        score_text = f"{evaluation.score:.2f}" if evaluation.score is not None else "N/A"
-                        logger.info(f"Layer {layer.name} - Model {model_name}: Score {score_text}")
-
-                        # Log QA result with phase_logger
-                        if phase_logger:
-                            phase_logger.log_qa_result(
-                                model=model_name,
-                                score=evaluation.score if evaluation.score is not None else 0.0,
-                                is_deal_breaker=evaluation.deal_breaker,
-                                feedback=evaluation.feedback
-                            )
-
-                        if progress_callback:
-                            if evaluation.score is not None:
-                                await progress_callback(f"✅ {model_name}: {evaluation.score:.1f}/10")
-                            else:
-                                await progress_callback(f"⚠️ {model_name}: invalid JSON response. Evaluation skipped for this model.")
-
-                        if evaluation.deal_breaker:
-                            logger.warning(f"Deal-breaker detected in {layer.name} by {model_name}: {evaluation.deal_breaker_reason}")
-                            if progress_callback:
-                                await progress_callback(f"⛔ Deal-breaker detected in {layer.name} by {model_name}")
-                        
-                        deal_breaker_consensus = self._check_deal_breaker_consensus(layer_results, qa_model_names)
-                        if deal_breaker_consensus["immediate_stop"]:
-                            logger.warning(f"Majority deal-breaker consensus reached for layer {layer.name}. Stopping evaluations to force iteration.")
-                            if progress_callback:
-                                await progress_callback(f"🛑 Majority deal-breaker consensus in {layer.name}. Stopping to iterate.")
-                            results[layer.name] = layer_results
-                            return self._create_iteration_stop_result(results, deal_breaker_consensus)
-                    
-                    except ValueError as parse_error:
-                        if len(qa_model_names) > 1:
-                            logger.warning(
-                                "QA model %s returned invalid JSON for layer %s. Skipping this evaluation.",
-                                model_name, layer.name
-                            )
-                            placeholder = QAEvaluation(
-                                model=model_name,
-                                layer=layer.name,
-                                score=None,
-                                feedback=str(parse_error),
-                                deal_breaker=False,
-                                deal_breaker_reason=None,
-                                passes_score=False,
-                                reason=str(parse_error),
-                                metadata={"parse_error": "invalid_json"}
-                            )
-                            layer_results[model_name] = placeholder
-
-                            if progress_callback:
-                                await progress_callback(f"⚠️ {model_name}: invalid JSON response. Skipping this QA response.")
-                        else:
-                            raise ValueError(
-                                f"QA model {model_name} returned invalid JSON response for layer {layer.name}"
-                            ) from parse_error
-                    except AIRequestError as api_err:
-                        logger.error(
-                            "QA model %s failed due to provider error in layer %s: %s",
-                            model_name,
-                            layer.name,
-                            api_err,
-                        )
-
-                        if len(qa_model_names) == 1:
-                            raise QAModelUnavailableError(
-                                f"QA model {model_name} unavailable for layer {layer.name}: {api_err}"
-                            ) from api_err
-
-                        failure_count = self._increment_model_failure(session_id, model_name)
-                        placeholder = QAEvaluation(
-                            model=model_name,
-                            layer=layer.name,
-                            score=None,
-                            feedback=str(api_err),
-                            deal_breaker=False,
-                            deal_breaker_reason=None,
-                            passes_score=False,
-                            reason=str(api_err),
-                            metadata={
-                                "error_type": "api_failure",
-                                "attempts": getattr(api_err, "attempts", None),
-                                "provider": getattr(api_err, "provider", None),
-                                "failure_count": failure_count,
-                            }
-                        )
-                        layer_results[model_name] = placeholder
-
-                        if phase_logger:
-                            phase_logger.info(
-                                f"Model {model_name} skipped due to provider error (failure {failure_count})."
-                            )
-                        if progress_callback:
-                            await progress_callback(
-                                f"⚠️ {model_name}: API error tras {getattr(api_err, 'attempts', 0)} intentos. Saltando (fallo {failure_count})."
-                            )
-
-                        if failure_count >= self._qa_failure_threshold():
-                            raise QAModelUnavailableError(
-                                f"QA model {model_name} failed {failure_count} times in this session"
-                            ) from api_err
-                    except asyncio.TimeoutError:
-                        logger.error(f"Timeout for {layer.name} with {model_name}")
-                        if progress_callback:
-                            await progress_callback(f"⏰ Timeout in {layer.name} with {model_name}")
-                        layer_results[model_name] = QAEvaluation(
-                            model=model_name,
-                            layer=layer.name,
-                            score=0.0,
-                            feedback=f"Timeout during evaluation with {model_name}",
-                            deal_breaker=True,
-                            deal_breaker_reason="Timeout during evaluation",
-                            passes_score=False,
-                            reason="Timeout during evaluation",
-                            identified_issues=None
-                        )
-                    except Exception as e:
-                        logger.error(f"Evaluation failed for {layer.name} with {model_name}: {str(e)}")
-                        if progress_callback:
-                            await progress_callback(f"❌ Error in {layer.name} with {model_name}: {str(e)[:50]}")
-                        layer_results[model_name] = QAEvaluation(
-                            model=model_name,
-                            layer=layer.name,
-                            score=0.0,
-                            feedback=f"Error during evaluation: {str(e)}",
-                            deal_breaker=True,
-                            deal_breaker_reason="Technical error during evaluation",
-                            passes_score=False,
-                            reason="Technical error during evaluation",
-                            identified_issues=None
-                        )
-
-                    await _abort_if_cancelled(
-                        f"🛑 Cancelled after receiving evaluation from {model_name} for layer {layer.name}."
-                    )
+            # If majority deal-breaker detected, stop immediately
+            if majority_deal_breaker:
+                results[layer.name] = layer_results
+                return self._create_iteration_stop_result(results, majority_deal_breaker)
 
             results[layer.name] = layer_results
 
-            # ===== Minority deal-breakers & Gran Sabio logic (unchanged except logging text) =====
+            # ===== Minority deal-breakers & Gran Sabio logic =====
             deal_breakers = [eval for eval in layer_results.values() if eval.deal_breaker]
 
             if deal_breakers:
@@ -1200,7 +975,7 @@ class QAEngine:
 
         Args:
             marker_mode: "phrase" for text markers, "word_index" for word map indices
-            marker_length: Number of words for phrase markers (4-12)
+            marker_length: Number of words for phrase markers (4-64)
             word_map_formatted: Formatted word map string for word_index mode
             input_images: Optional list of ImageData for vision-enabled QA.
                          Passed to layers with include_input_images=True.
@@ -1522,7 +1297,325 @@ class QAEngine:
                 "total_evaluations": total_evals
             }
         }
-    
+
+    async def _evaluate_single_semantic_layer(
+        self,
+        content: str,
+        layer: QALayer,
+        qa_models: List[Any],
+        qa_model_names: List[str],
+        progress_callback: Optional[Callable] = None,
+        original_request: Optional[Any] = None,
+        stream_callback: Optional[Callable] = None,
+        session_id: Optional[str] = None,
+        cancel_callback: Optional[Callable[[], Awaitable[bool]]] = None,
+        usage_tracker: Optional[UsageTracker] = None,
+        iteration: Optional[int] = None,
+        phase_logger: Optional["PhaseLogger"] = None,
+        marker_mode: str = "phrase",
+        marker_length: Optional[int] = None,
+        word_map_formatted: Optional[str] = None,
+        input_images: Optional[List["ImageData"]] = None,
+        content_for_bypass: Optional[str] = None,
+        edit_history: Optional[str] = None,
+    ) -> Tuple[Dict[str, QAEvaluation], Optional[Dict[str, Any]]]:
+        """
+        Evaluate a single semantic QA layer.
+
+        This is the core evaluation logic extracted for reuse in per-layer smart-edit flow.
+        Does NOT include Gran Sabio escalation - that is handled by the caller.
+
+        Args:
+            content: The content to evaluate
+            layer: The QA layer configuration
+            qa_models: List of QA models (strings or QAModelConfig)
+            qa_model_names: Pre-extracted model names
+            progress_callback: Optional callback for progress updates
+            original_request: The original content request
+            stream_callback: Optional callback for streaming
+            session_id: Session identifier
+            cancel_callback: Optional async callback to check for cancellation
+            usage_tracker: Optional usage tracker
+            iteration: Current iteration number
+            phase_logger: Optional phase logger
+            marker_mode: "phrase" or "word_index"
+            marker_length: Number of words for phrase markers
+            word_map_formatted: Formatted word map for word_index mode
+            input_images: Optional images for vision-enabled QA
+            content_for_bypass: Optional extracted text for bypass evaluation
+
+        Returns:
+            Tuple of:
+            - layer_results: Dict mapping model names to QAEvaluation objects
+            - majority_deal_breaker_info: If majority deal-breaker detected, dict with consensus info; else None
+        """
+        from models import QAModelConfig
+
+        def get_model_name(model: Any) -> str:
+            return model.model if isinstance(model, QAModelConfig) else model
+
+        async def _abort_if_cancelled(message: str) -> None:
+            if cancel_callback and await cancel_callback():
+                if progress_callback:
+                    await progress_callback(message)
+                raise QAProcessCancelled()
+
+        extra_verbose = getattr(original_request, 'extra_verbose', False) if original_request else False
+
+        await _abort_if_cancelled(f"Cancelled before evaluating layer {layer.name}.")
+
+        # Log layer evaluation start
+        if phase_logger:
+            phase_logger.info(f"Evaluating layer: {layer.name}")
+            if phase_logger.extra_verbose and layer.criteria:
+                phase_logger.info(f"Criteria: {layer.criteria[:200]}...")
+
+        if progress_callback:
+            await progress_callback(f"Evaluating layer: {layer.name}")
+
+        layer_results: Dict[str, QAEvaluation] = {}
+
+        # Algorithmic bypass check
+        if self.bypass_engine.should_bypass_qa_layer(
+            layer, original_request,
+            extra_verbose=extra_verbose
+        ):
+            if progress_callback:
+                await progress_callback(f"Using algorithmic bypass for {layer.name}...")
+
+            bypass_content = content_for_bypass if content_for_bypass is not None else content
+            bypass_results = self.bypass_engine.bypass_layer_evaluation(
+                bypass_content, layer, qa_model_names, original_request
+            )
+            layer_results.update(bypass_results)
+            logger.info(f"Layer {layer.name} evaluated algorithmically with bypass engine")
+
+            first_evaluation = next(iter(bypass_results.values()))
+            if first_evaluation.deal_breaker:
+                logger.warning(f"Algorithmic deal-breaker detected in {layer.name}.")
+                if progress_callback:
+                    await progress_callback(f"Algorithmic deal-breaker in {layer.name}.")
+                # Return with deal-breaker info (all models agree since it's algorithmic)
+                consensus_info = {
+                    "immediate_stop": True,
+                    "deal_breaker_count": len(qa_model_names),
+                    "total_evaluated": len(qa_model_names),
+                    "total_models": len(qa_model_names),
+                    "deal_breaker_details": [{
+                        "model": f"Algorithmic ({model})",
+                        "reason": first_evaluation.deal_breaker_reason
+                    } for model in qa_model_names],
+                    "majority_threshold": len(qa_model_names) / 2
+                }
+                return layer_results, consensus_info
+
+            if progress_callback:
+                for model in qa_models:
+                    model_name = get_model_name(model)
+                    evaluation = layer_results[model_name]
+                    if evaluation.score is not None:
+                        await progress_callback(f"{evaluation.model}: {evaluation.score:.1f}/10")
+                    else:
+                        await progress_callback(f"{evaluation.model}: invalid JSON response. Skipped.")
+
+            await _abort_if_cancelled(f"Cancelled after bypass evaluation of layer {layer.name}.")
+
+        else:
+            # Normal AI-based evaluation
+            for model in qa_models:
+                model_name = get_model_name(model)
+                await _abort_if_cancelled(f"Cancelled before querying {model_name} for layer {layer.name}.")
+
+                if phase_logger:
+                    phase_logger.info(f"Querying model: {model_name}")
+
+                if progress_callback:
+                    await progress_callback(f"Querying {model_name} for {layer.name}...")
+
+                if isinstance(model, QAModelConfig):
+                    individual_timeout = calculate_qa_timeout_for_model(
+                        model.model, model.reasoning_effort, model.thinking_budget_tokens
+                    )
+                else:
+                    individual_timeout = calculate_qa_timeout_for_model(model)
+
+                usage_callback_fn = None
+                if usage_tracker:
+                    usage_callback_fn = usage_tracker.create_callback(
+                        phase="qa",
+                        role="evaluation",
+                        iteration=iteration,
+                        layer=layer.name,
+                        metadata={"qa_model": model_name, "session_id": session_id},
+                    )
+
+                # Determine if we should request edit info
+                smart_editing_mode = getattr(original_request, 'smart_editing_mode', 'auto') if original_request else 'auto'
+                content_type = getattr(original_request, 'content_type', 'other') if original_request else 'other'
+                request_edit_info = self._should_request_edit_info(
+                    mode=smart_editing_mode,
+                    content_type=content_type
+                )
+
+                try:
+                    evaluation = await asyncio.wait_for(
+                        self.evaluate_content(
+                            content,
+                            layer,
+                            model,
+                            original_request,
+                            extra_verbose=extra_verbose,
+                            stream_callback=stream_callback,
+                            usage_callback=usage_callback_fn,
+                            request_edit_info=request_edit_info,
+                            phase_logger=phase_logger,
+                            marker_mode=marker_mode,
+                            marker_length=marker_length,
+                            word_map_formatted=word_map_formatted,
+                            input_images=input_images,
+                            edit_history=edit_history,
+                        ),
+                        timeout=individual_timeout
+                    )
+
+                    layer_results[model_name] = evaluation
+                    self._reset_model_failure(session_id, model_name)
+
+                    score_text = f"{evaluation.score:.2f}" if evaluation.score is not None else "N/A"
+                    logger.info(f"Layer {layer.name} - Model {model_name}: Score {score_text}")
+
+                    if phase_logger:
+                        phase_logger.log_qa_result(
+                            model=model_name,
+                            score=evaluation.score if evaluation.score is not None else 0.0,
+                            is_deal_breaker=evaluation.deal_breaker,
+                            feedback=evaluation.feedback
+                        )
+
+                    if progress_callback:
+                        if evaluation.score is not None:
+                            await progress_callback(f"{model_name}: {evaluation.score:.1f}/10")
+                        else:
+                            await progress_callback(f"{model_name}: invalid JSON response. Skipped.")
+
+                    if evaluation.deal_breaker:
+                        logger.warning(f"Deal-breaker detected in {layer.name} by {model_name}: {evaluation.deal_breaker_reason}")
+                        if progress_callback:
+                            await progress_callback(f"Deal-breaker detected in {layer.name} by {model_name}")
+
+                    # Check for majority deal-breaker consensus
+                    deal_breaker_consensus = self._check_deal_breaker_consensus(layer_results, qa_model_names)
+                    if deal_breaker_consensus["immediate_stop"]:
+                        logger.warning(f"Majority deal-breaker consensus reached for layer {layer.name}.")
+                        if progress_callback:
+                            await progress_callback(f"Majority deal-breaker consensus in {layer.name}.")
+                        return layer_results, deal_breaker_consensus
+
+                except ValueError as parse_error:
+                    if len(qa_model_names) > 1:
+                        logger.warning(
+                            "QA model %s returned invalid JSON for layer %s. Skipping.",
+                            model_name, layer.name
+                        )
+                        placeholder = QAEvaluation(
+                            model=model_name,
+                            layer=layer.name,
+                            score=None,
+                            feedback=str(parse_error),
+                            deal_breaker=False,
+                            deal_breaker_reason=None,
+                            passes_score=False,
+                            reason=str(parse_error),
+                            metadata={"parse_error": "invalid_json"}
+                        )
+                        layer_results[model_name] = placeholder
+
+                        if progress_callback:
+                            await progress_callback(f"{model_name}: invalid JSON response. Skipping.")
+                    else:
+                        raise ValueError(
+                            f"QA model {model_name} returned invalid JSON response for layer {layer.name}"
+                        ) from parse_error
+
+                except AIRequestError as api_err:
+                    logger.error(
+                        "QA model %s failed due to provider error in layer %s: %s",
+                        model_name, layer.name, api_err,
+                    )
+
+                    if len(qa_model_names) == 1:
+                        raise QAModelUnavailableError(
+                            f"QA model {model_name} unavailable for layer {layer.name}: {api_err}"
+                        ) from api_err
+
+                    failure_count = self._increment_model_failure(session_id, model_name)
+                    placeholder = QAEvaluation(
+                        model=model_name,
+                        layer=layer.name,
+                        score=None,
+                        feedback=str(api_err),
+                        deal_breaker=False,
+                        deal_breaker_reason=None,
+                        passes_score=False,
+                        reason=str(api_err),
+                        metadata={
+                            "error_type": "api_failure",
+                            "attempts": getattr(api_err, "attempts", None),
+                            "provider": getattr(api_err, "provider", None),
+                            "failure_count": failure_count,
+                        }
+                    )
+                    layer_results[model_name] = placeholder
+
+                    if phase_logger:
+                        phase_logger.info(f"Model {model_name} skipped due to provider error (failure {failure_count}).")
+                    if progress_callback:
+                        await progress_callback(
+                            f"{model_name}: API error after {getattr(api_err, 'attempts', 0)} attempts. Skipping (failure {failure_count})."
+                        )
+
+                    if failure_count >= self._qa_failure_threshold():
+                        raise QAModelUnavailableError(
+                            f"QA model {model_name} failed {failure_count} times in this session"
+                        ) from api_err
+
+                except asyncio.TimeoutError:
+                    logger.error(f"Timeout for {layer.name} with {model_name}")
+                    if progress_callback:
+                        await progress_callback(f"Timeout in {layer.name} with {model_name}")
+                    layer_results[model_name] = QAEvaluation(
+                        model=model_name,
+                        layer=layer.name,
+                        score=0.0,
+                        feedback=f"Timeout during evaluation with {model_name}",
+                        deal_breaker=True,
+                        deal_breaker_reason="Timeout during evaluation",
+                        passes_score=False,
+                        reason="Timeout during evaluation",
+                        identified_issues=None
+                    )
+
+                except Exception as e:
+                    logger.error(f"Evaluation failed for {layer.name} with {model_name}: {str(e)}")
+                    if progress_callback:
+                        await progress_callback(f"Error in {layer.name} with {model_name}: {str(e)[:50]}")
+                    layer_results[model_name] = QAEvaluation(
+                        model=model_name,
+                        layer=layer.name,
+                        score=0.0,
+                        feedback=f"Error during evaluation: {str(e)}",
+                        deal_breaker=True,
+                        deal_breaker_reason="Technical error during evaluation",
+                        passes_score=False,
+                        reason="Technical error during evaluation",
+                        identified_issues=None
+                    )
+
+                await _abort_if_cancelled(f"Cancelled after evaluation from {model_name} for layer {layer.name}.")
+
+        # No majority deal-breaker - return results without early stop
+        return layer_results, None
+
     def _create_iteration_stop_result(self, partial_results: Dict[str, Any], consensus_info: Dict[str, Any]) -> Dict[str, Any]:
         """Create result structure for stopping QA to force iteration due to majority deal-breakers"""
         

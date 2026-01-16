@@ -1,0 +1,879 @@
+<section id="project-handshake" class="docs-section">
+                <h2 class="docs-subheading">Project Grouping (Optional)</h2>
+                <p>Use the lightweight project handshake when you want to associate multiple sessions with a single workflow (for example, a multi-chapter biography generator or batched QA experiments).</p>
+
+                <div class="feature-grid">
+                    <div class="feature-card">
+                        <h4>Reserve Upfront</h4>
+                        <p>Call <code>POST /project/new</code> to reserve an identifier without starting any AI workflows. Leave the body empty for a generated UUID or pass your own <code>project_id</code> for validation.</p>
+                    </div>
+                    <div class="feature-card">
+                        <h4>Allocate Inline</h4>
+                        <p>Send <code>"request_project_id": true</code> (alias <code>get_project_id</code>) with <code>/generate</code> when you prefer a single call. The API mints and returns the identifier in the response.</p>
+                    </div>
+                    <div class="feature-card">
+                        <h4>Reuse Your Own</h4>
+                        <p>Provide <code>project_id</code> directly when your integration already manages identifiers. The API validates length (≤128 characters) and echoes it back.</p>
+                    </div>
+                    <div class="feature-card">
+                        <h4>Debugger Filtering</h4>
+                        <p>Browse related sessions via <code>/debugger/project/&lt;project_id&gt;</code> or use the built-in project filter in the debugger UI.</p>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Negotiation Example</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">HTTP</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+<pre><code class="language-json">POST /project/new
+{}</code></pre>
+                </div>
+
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+<pre><code class="language-json">{
+  "project_id": "24c4bb76d6f44050a6e9846f04ce2a52"
+}</code></pre>
+                </div>
+
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">HTTP</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+<pre><code class="language-json">POST /generate
+{
+  "prompt": "Write Chapter 2 covering early career breakthroughs.",
+  "content_type": "biography",
+  "project_id": "24c4bb76d6f44050a6e9846f04ce2a52"
+}</code></pre>
+                </div>
+
+                <div class="callout callout-info">
+                    <h4>Where project_id appears</h4>
+                    <p>The identifier is echoed in <code>/generate</code>, <code>/status</code>, <code>/stream</code>, and <code>/result</code> responses. Debugger timelines also tag each session with the same value, enabling <em>per-project</em> history views.</p>
+                    <p class="docs-note">Prefer single-call allocation? Include <code>"request_project_id": true</code> in <code>/generate</code> and skip the upfront reservation.</p>
+                </div>
+            </section>
+
+            <!-- Usage & Cost Tracking Section -->
+            <section id="usage-cost-tracking" class="docs-section">
+                <h2 class="docs-subheading">Usage & Cost Tracking</h2>
+                <p>The BioAI Unified Engine provides comprehensive token usage and cost tracking across all AI operations. Track tokens and costs for generation, QA evaluation, preflight validation, and Gran Sabio escalations.</p>
+
+                <h3 class="docs-minor-heading">Tracking Modes</h3>
+                <p>Control cost reporting detail level using the <code>show_query_costs</code> parameter in your generation request:</p>
+
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">0 - Disabled</div>
+                        <div class="param-type">default</div>
+                        <div class="param-desc">No cost information is returned (fastest, minimal overhead)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">1 - Summary</div>
+                        <div class="param-type">recommended</div>
+                        <div class="param-desc">Aggregated totals per phase (generation, qa, preflight, gran_sabio). Good balance of detail and performance.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">2 - Detailed</div>
+                        <div class="param-type">verbose</div>
+                        <div class="param-desc">Complete per-iteration breakdown with individual QA evaluations. Use for debugging and optimization.</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Summary Mode Response (show_query_costs=1)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "content": "Generated content here...",
+  "final_score": 8.5,
+  "costs": {
+    "mode": "summary",
+    "currency": "USD",
+    "grand_totals": {
+      "input_tokens": 2847,
+      "output_tokens": 1523,
+      "total_tokens": 4370,
+      "cost": 0.012456
+    },
+    "phases": {
+      "preflight": {
+        "input_tokens": 234,
+        "output_tokens": 89,
+        "cost": 0.000123
+      },
+      "generation": {
+        "input_tokens": 1456,
+        "output_tokens": 987,
+        "cost": 0.008234
+      },
+      "qa": {
+        "input_tokens": 987,
+        "output_tokens": 345,
+        "cost": 0.003456
+      },
+      "gran_sabio": {
+        "input_tokens": 170,
+        "output_tokens": 102,
+        "cost": 0.000643
+      }
+    }
+  }
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Detailed Mode Response (show_query_costs=2)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "content": "Generated content here...",
+  "final_score": 8.5,
+  "costs": {
+    "mode": "detailed",
+    "currency": "USD",
+    "grand_totals": {
+      "input_tokens": 4370,
+      "output_tokens": 2156,
+      "total_tokens": 6526,
+      "cost": 0.018765
+    },
+    "iterations": [
+      {
+        "iteration": 1,
+        "generation_totals": {
+          "input_tokens": 728,
+          "output_tokens": 456,
+          "cost": 0.003456
+        },
+        "qa_details": [
+          {
+            "layer": "Factual Accuracy",
+            "model": "gpt-4o",
+            "totals": {
+              "input_tokens": 567,
+              "output_tokens": 123,
+              "cost": 0.002345
+            }
+          },
+          {
+            "layer": "Literary Quality",
+            "model": "claude-sonnet-4-20250514",
+            "totals": {
+              "input_tokens": 563,
+              "output_tokens": 98,
+              "cost": 0.004567
+            }
+          }
+        ]
+      }
+    ],
+    "preflight": {
+      "input_tokens": 234,
+      "output_tokens": 89,
+      "cost": 0.000123
+    },
+    "gran_sabio": {
+      "input_tokens": 456,
+      "output_tokens": 234,
+      "cost": 0.005678
+    }
+  }
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Cost Calculation</h3>
+                <p>Costs are calculated automatically using provider-specific pricing from <code>model_specs.json</code>:</p>
+                <ul class="docs-list">
+                    <li><strong>Input Tokens:</strong> Charged per million tokens based on model tier</li>
+                    <li><strong>Output Tokens:</strong> Typically higher rate than input (varies by model)</li>
+                    <li><strong>Reasoning Tokens:</strong> For O3/O4/Claude thinking modes, billed as output tokens</li>
+                    <li><strong>Multi-Provider:</strong> Costs normalized to USD across OpenAI, Anthropic, Google, and xAI</li>
+                </ul>
+
+                <h3 class="docs-minor-heading">JSON Output Integration</h3>
+                <p>When using <code>json_output=true</code>, cost information is automatically injected into the JSON response under the <code>query_costs</code> key:</p>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "generated_field_1": "value",
+  "generated_field_2": "value",
+  "query_costs": {
+    "mode": "summary",
+    "grand_totals": {
+      "total_tokens": 1234,
+      "cost": 0.005678
+    }
+  }
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Text Output Integration</h3>
+                <p>For text-based content types, cost information can be embedded at the end using special tags:</p>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">Text</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code>Generated text content here...
+
+[[QUERY_COSTS mode="summary" currency="USD" total_tokens="1234" grand_cost="0.005678" input_tokens="789" output_tokens="445"]]</code></pre>
+                </div>
+
+                <div class="alert info">
+                    <strong>Performance Impact:</strong> Cost tracking adds minimal overhead. Summary mode (1) is recommended for production. Detailed mode (2) provides full visibility for optimization but increases response payload size.
+                </div>
+            </section>
+
+            <!-- Preflight Validation Section -->
+            <section id="preflight-validation" class="docs-section">
+                <h2 class="docs-subheading">Preflight Validation System</h2>
+                <p>The BioAI Unified Engine includes an intelligent preflight validation system that analyzes request feasibility before starting content generation. This prevents resource waste on impossible or contradictory requests.</p>
+
+                <h3 class="docs-minor-heading">How It Works</h3>
+                <ol class="docs-list">
+                    <li><strong>Intelligent Analysis:</strong> Uses GPT-4o to evaluate coherence between prompt and QA layers</li>
+                    <li><strong>Contradiction Detection:</strong> Identifies incompatibilities (e.g., requesting fiction with historical accuracy validation)</li>
+                    <li><strong>Specific Feedback:</strong> Provides constructive suggestions for improving the request</li>
+                    <li><strong>Automatic Decision:</strong> Determines whether to proceed, reject, or require manual review</li>
+                </ol>
+
+                <h3 class="docs-minor-heading">Validation Types</h3>
+                <ul class="docs-list">
+                    <li><strong>Prompt-QA Compatibility:</strong> Verifies that QA layers are applicable to the requested content</li>
+                    <li><strong>Internal Coherence:</strong> Detects contradictions within the prompt or criteria</li>
+                    <li><strong>Technical Feasibility:</strong> Evaluates whether the request is technically achievable</li>
+                    <li><strong>Resource Optimization:</strong> Prevents costly iterations on impossible cases</li>
+                </ul>
+
+                <h3 class="docs-minor-heading">Decision Outcomes</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">proceed</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Request is feasible, generation will start normally</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">reject</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Request contains critical contradictions, generation is blocked</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">manual_review</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Request requires human review due to complexity or ambiguity</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Issue Severity Levels</h3>
+                <ul class="docs-list">
+                    <li><strong>critical:</strong> Fundamental contradictions that prevent successful generation</li>
+                    <li><strong>warning:</strong> Potential issues that might affect quality but don't block generation</li>
+                    <li><strong>info:</strong> Informational notes about the request or suggestions for improvement</li>
+                </ul>
+
+                <div class="alert info">
+                    <strong>Note:</strong> Preflight validation runs automatically on every /generate request and is included in the response. No additional configuration is required.
+                </div>
+            </section>
+
+            <!-- Context & Source Text Section -->
+            <section id="context-source-text" class="docs-section">
+                <h2 class="docs-subheading">Context & Source Text</h2>
+                <p>La API ofrece varias formas de proporcionar texto fuente o contexto para guiar la generación de contenido. Puedes enviar texto directamente, subir archivos, o proporcionar URLs para descarga automática.</p>
+
+                <h3 class="docs-minor-heading">Métodos Disponibles</h3>
+
+                <div class="feature-card">
+                    <h4>1. Texto Directo (<code>source_text</code>)</h4>
+                    <p><strong>Uso:</strong> Para textos cortos o medianos que puedes incluir directamente en el JSON del request.</p>
+                    <p><strong>Cuándo usar:</strong> Entrevistas, transcripciones, notas, textos de referencia de hasta varios miles de palabras.</p>
+                    <div class="code-example">
+                        <pre><code class="language-json">{
+  "prompt": "Escribe una biografía basada en esta entrevista",
+  "source_text": "Entrevista con Juan Pérez...",
+  "content_type": "biography"
+}</code></pre>
+                    </div>
+                    <p class="docs-note"><strong>Ventaja:</strong> Más simple, todo en un solo request. Ideal para textos pequeños.</p>
+                </div>
+
+                <div class="feature-card">
+                    <h4>2. Sistema de Attachments (Archivos)</h4>
+                    <p><strong>Uso:</strong> Para documentos grandes, PDFs, múltiples archivos, o cuando necesitas reutilizar el mismo documento en varias generaciones.</p>
+                    <p><strong>Proceso:</strong></p>
+                    <ol class="docs-list">
+                        <li>Sube el archivo con <code>POST /attachments</code> (multipart/form-data)</li>
+                        <li>Recibes un <code>upload_id</code></li>
+                        <li>Referencia el archivo en <code>context_documents</code> del request de generación</li>
+                    </ol>
+                    <div class="code-example">
+                        <pre><code class="language-json">{
+  "prompt": "Analiza este documento y genera un resumen",
+  "username": "tu_usuario",
+  "context_documents": [
+    {
+      "upload_id": "abc123-def456-ghi789",
+      "username": "tu_usuario",
+      "intended_usage": "context"
+    }
+  ],
+  "content_type": "article"
+}</code></pre>
+                    </div>
+                    <p class="docs-note"><strong>Ventaja:</strong> Soporta archivos grandes, PDFs, y reutilización. Los archivos se mantienen durante el período de retención configurado.</p>
+                </div>
+
+                <div class="feature-card">
+                    <h4>3. Descarga desde URL (<code>/attachments/url</code>)</h4>
+                    <p><strong>Uso:</strong> Cuando tu contenido fuente está alojado en una URL pública (requiere HTTPS).</p>
+                    <p><strong>Proceso:</strong></p>
+                    <ol class="docs-list">
+                        <li>Llama a <code>POST /attachments/url</code> con la URL del documento</li>
+                        <li>El sistema descarga y valida el archivo automáticamente</li>
+                        <li>Recibes un <code>upload_id</code> que puedes referenciar igual que en el método anterior</li>
+                    </ol>
+                    <p class="docs-note"><strong>Ventaja:</strong> No necesitas descargar y subir archivos manualmente. Incluye caché para URLs ya descargadas.</p>
+                </div>
+
+                <div class="feature-card">
+                    <h4>4. Texto Acumulativo (<code>cumulative_text</code>)</h4>
+                    <p><strong>Uso:</strong> Para análisis de repeticiones cuando generas contenido por capítulos o secciones.</p>
+                    <p><strong>Cuándo usar:</strong> Si estás generando un libro por capítulos y quieres evitar repeticiones entre capítulos anteriores y el nuevo.</p>
+                    <div class="code-example">
+                        <pre><code class="language-json">{
+  "prompt": "Escribe el capítulo 5 continuando la historia",
+  "cumulative_text": "Capítulo 1... Capítulo 2... Capítulo 3... Capítulo 4...",
+  "cumulative_word_count": 12450,
+  "phrase_frequency": {
+    "enabled": true,
+    "rules": [...]
+  }
+}</code></pre>
+                    </div>
+                    <p class="docs-note"><strong>Ventaja:</strong> Permite análisis de repeticiones considerando todo el contenido previo, no solo el capítulo actual.</p>
+                </div>
+
+                <h3 class="docs-minor-heading">Endpoints de Attachments</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">POST /attachments</div>
+                        <div class="param-type">multipart/form-data</div>
+                        <div class="param-desc">Sube un archivo físico desde tu sistema</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">POST /attachments/base64</div>
+                        <div class="param-type">JSON</div>
+                        <div class="param-desc">Sube contenido codificado en base64</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">POST /attachments/url</div>
+                        <div class="param-type">JSON</div>
+                        <div class="param-desc">Descarga y almacena un archivo desde una URL (HTTPS requerido)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">GET /attachments/{upload_id}</div>
+                        <div class="param-type">-</div>
+                        <div class="param-desc">Obtiene metadatos de un attachment previamente subido</div>
+                    </div>
+                </div>
+
+                <div class="alert info">
+                    <strong>Consejo:</strong> Usa <code>source_text</code> para textos simples (< 5000 palabras). Usa el sistema de attachments para documentos complejos, archivos grandes, o cuando necesites reutilizar el mismo contexto en múltiples generaciones.
+                </div>
+
+                <div class="alert warning">
+                    <strong>Seguridad:</strong> Las URLs para descarga requieren HTTPS. El sistema valida tipos MIME, tamaños, y aplica límites configurables. Los attachments se asocian a un <code>username</code> y respetan períodos de retención configurados.
+                </div>
+            </section>
+
+            <!-- Vision Support Section -->
+            <section id="vision-support" class="docs-section">
+                <h2 class="docs-subheading">Vision Support (Image Input)</h2>
+                <p>The BioAI Unified Engine supports vision-enabled generation, allowing AI models to analyze and describe images as part of the content generation process.</p>
+
+                <h3 class="docs-minor-heading">Supported Models</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">OpenAI</div>
+                        <div class="param-type">GPT-4o, GPT-5, GPT-5 Pro, O1, O3</div>
+                        <div class="param-desc">Full vision support with configurable detail levels</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">Anthropic</div>
+                        <div class="param-type">Claude Sonnet 4.5, Opus 4.1, all 3.x models</div>
+                        <div class="param-desc">Base64 image encoding with automatic token estimation</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">Google</div>
+                        <div class="param-type">Gemini 2.0 Flash, Gemini 2.5 Pro</div>
+                        <div class="param-desc">Native inline image support</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">xAI</div>
+                        <div class="param-type">Grok 2+</div>
+                        <div class="param-desc">OpenAI-compatible vision format</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Workflow</h3>
+                <ol class="docs-list">
+                    <li><strong>Upload Image:</strong> Use <code>POST /attachments</code> to upload your image (JPEG, PNG, GIF, WEBP supported)</li>
+                    <li><strong>Get upload_id:</strong> The response includes an <code>upload_id</code> to reference the image</li>
+                    <li><strong>Reference in Request:</strong> Add the image to the <code>images</code> array in your <code>/generate</code> request</li>
+                    <li><strong>Generate:</strong> The vision-enabled model analyzes the image(s) and generates content</li>
+                </ol>
+
+                <h3 class="docs-minor-heading">Basic Example</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "prompt": "Describe this image in detail, including colors, objects, and composition.",
+  "generator_model": "gpt-4o",
+  "username": "my_user",
+  "images": [
+    {
+      "upload_id": "abc123-def456-ghi789",
+      "username": "my_user",
+      "detail": "high"
+    }
+  ],
+  "qa_layers": []
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Multi-Image with JSON Output</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "prompt": "Analyze these product photos. Return JSON with a description array.",
+  "generator_model": "claude-sonnet-4-20250514",
+  "username": "product_team",
+  "json_output": true,
+  "images": [
+    {"upload_id": "img001", "username": "product_team"},
+    {"upload_id": "img002", "username": "product_team"},
+    {"upload_id": "img003", "username": "product_team"}
+  ],
+  "qa_layers": []
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Detail Levels (OpenAI)</h3>
+                <p>OpenAI models support different detail levels that affect token usage and analysis quality:</p>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">low</div>
+                        <div class="param-type">85 tokens</div>
+                        <div class="param-desc">Fixed cost, fast processing. Good for simple images or when speed matters.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">high</div>
+                        <div class="param-type">170 * tiles + 85</div>
+                        <div class="param-desc">Higher fidelity analysis with tiling. Better for detailed images.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">auto</div>
+                        <div class="param-type">varies</div>
+                        <div class="param-desc">Model decides based on image size and content (default).</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">QA with Vision</h3>
+                <p>You can enable vision support in QA evaluation for layers that need to verify image-text accuracy:</p>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "prompt": "Describe the architecture in this photo",
+  "generator_model": "gpt-4o",
+  "username": "architect",
+  "images": [{"upload_id": "building_photo", "username": "architect"}],
+  "qa_with_vision": true,
+  "qa_models": ["gpt-4o"],
+  "qa_layers": [
+    {
+      "name": "Visual Accuracy",
+      "description": "Verify description matches image",
+      "criteria": "All architectural elements mentioned must be visible",
+      "min_score": 8.0,
+      "include_input_images": true
+    },
+    {
+      "name": "Writing Quality",
+      "criteria": "Evaluate prose quality",
+      "min_score": 7.5,
+      "include_input_images": false
+    }
+  ],
+  "gran_sabio_model": "gpt-4o"
+}</code></pre>
+                </div>
+                <p class="docs-note"><strong>Note:</strong> Set <code>qa_with_vision: true</code> globally, then control per-layer with <code>include_input_images</code>. Layers with <code>include_input_images: false</code> evaluate text only (saves tokens).</p>
+
+                <h3 class="docs-minor-heading">Image Limits</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">Max images per request</div>
+                        <div class="param-type">20</div>
+                        <div class="param-desc">Configurable via config.IMAGE.max_images_per_request</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">Max file size</div>
+                        <div class="param-type">5 MB</div>
+                        <div class="param-desc">Per image. Larger images are automatically resized.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">Supported formats</div>
+                        <div class="param-type">JPEG, PNG, GIF, WEBP</div>
+                        <div class="param-desc">HEIC/HEIF converted to JPEG automatically</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">Auto-resize threshold</div>
+                        <div class="param-type">1568px</div>
+                        <div class="param-desc">Images larger than this are resized for optimal performance</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Preflight Validation</h3>
+                <p>The preflight validator automatically checks vision compatibility:</p>
+                <ul class="docs-list">
+                    <li><strong>REJECT:</strong> When images are provided but the generator model doesn't support vision</li>
+                    <li><strong>WARNING:</strong> When prompt mentions image analysis but no images are provided</li>
+                    <li><strong>WARNING:</strong> When QA layers expect images (<code>include_input_images: true</code>) but none provided</li>
+                </ul>
+
+                <div class="alert info">
+                    <strong>Token Estimation:</strong> The system automatically estimates token costs for images based on provider-specific calculations. This helps with budget planning and is included in verbose logs.
+                </div>
+
+                <div class="alert warning">
+                    <strong>Cost Consideration:</strong> Vision increases token usage significantly. Use <code>detail: "low"</code> for cost-sensitive applications. Enable <code>qa_with_vision</code> only for layers that truly need image context.
+                </div>
+            </section>
+
+            <!-- Connection Stability Section -->
+            <section id="connection-stability" class="docs-section">
+                <h2 class="docs-subheading">Connection Stability & Long-Running Operations</h2>
+                <p>The BioAI Unified Engine implements automatic connection keep-alive mechanisms to handle long-running AI operations, especially for reasoning models that can take several minutes to think before responding.</p>
+
+                <h3 class="docs-minor-heading">Heartbeat Mechanisms</h3>
+
+                <h4 class="docs-minor-heading">SSE Heartbeats (Server-Sent Events)</h4>
+                <p>The <code>/stream</code> endpoint automatically sends SSE comment heartbeats to keep connections alive:</p>
+                <ul class="docs-list">
+                    <li><strong>Format:</strong> <code>: ping\n\n</code> (SSE comment syntax)</li>
+                    <li><strong>Interval:</strong> Every 15 seconds during idle periods</li>
+                    <li><strong>Visibility:</strong> Invisible to EventSource clients (automatically filtered)</li>
+                    <li><strong>Purpose:</strong> Prevents proxy/browser timeouts during AI thinking periods</li>
+                    <li><strong>Client Action:</strong> No special handling required (EventSource handles automatically)</li>
+                </ul>
+
+                <h4 class="docs-minor-heading">JSON Heartbeats (Text Streaming Endpoints)</h4>
+                <p>Other streaming endpoints (<code>/stream-content</code>, <code>/stream-generation</code>, etc.) send JSON heartbeat messages:</p>
+                <ul class="docs-list">
+                    <li><strong>Format:</strong> <code>{"type":"heartbeat","timestamp":1234567890}\n</code></li>
+                    <li><strong>Interval:</strong> Every 15 seconds during idle periods</li>
+                    <li><strong>Visibility:</strong> These messages appear in the stream</li>
+                    <li><strong>Client Action:</strong> Filter or ignore messages with <code>type: "heartbeat"</code></li>
+                </ul>
+
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JavaScript</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-javascript">// Example: Filtering heartbeats from text/plain streams
+fetch(`/stream-content/${sessionId}`)
+  .then(response => response.body.getReader())
+  .then(reader => {
+    const decoder = new TextDecoder();
+
+    function processStream() {
+      reader.read().then(({done, value}) => {
+        if (done) return;
+
+        const text = decoder.decode(value);
+        const lines = text.split('\n');
+
+        lines.forEach(line => {
+          if (line.trim()) {
+            try {
+              const msg = JSON.parse(line);
+
+              // Ignore heartbeats
+              if (msg.type === 'heartbeat') {
+                console.log('Heartbeat received, connection alive');
+                return;
+              }
+
+              // Process other messages
+              console.log('Data:', msg);
+            } catch (e) {
+              // Not JSON, treat as content
+              console.log('Content:', line);
+            }
+          }
+        });
+
+        processStream();
+      });
+    }
+
+    processStream();
+  });</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Timeout Recommendations</h3>
+                <p>The <code>/generate</code> response includes <code>recommended_timeout_seconds</code>, computed as <strong>per-iteration budget × max_iterations</strong> plus QA/Gran Sabio padding. The table below shows the baseline per-iteration budgets; multiply them by your iteration count to estimate the total.</p>
+
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">Standard Models</div>
+                        <div class="param-type">120s</div>
+                        <div class="param-desc">GPT-4, Claude Sonnet, Gemini (non-reasoning)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">None Reasoning</div>
+                        <div class="param-type">1200s (20min)</div>
+                        <div class="param-desc">reasoning_effort: "none"</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">Low Reasoning</div>
+                        <div class="param-type">1800s (30min)</div>
+                        <div class="param-desc">reasoning_effort: "low"</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">Medium Reasoning</div>
+                        <div class="param-type">3600s (60min)</div>
+                        <div class="param-desc">reasoning_effort: "medium" (default for reasoning models)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">High Reasoning</div>
+                        <div class="param-type">7200s (120min)</div>
+                        <div class="param-desc">reasoning_effort: "high" or "ultra-high"</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Thinking Status Messages</h3>
+                <p>When using reasoning models, the API provides real-time thinking status updates in <code>verbose_log</code>:</p>
+
+                <ul class="docs-list">
+                    <li><strong>Preparation:</strong> "🧠 [model] is preparing to think deeply (this may take several minutes)..."</li>
+                    <li><strong>Progress:</strong> "🧠 Still thinking... (42s elapsed)" - sent every 10 seconds</li>
+                    <li><strong>Completion:</strong> "💡 [model] finished thinking after 42s, now generating content..."</li>
+                </ul>
+
+                <p>These messages help you understand AI progress during silent periods and set user expectations appropriately.</p>
+
+                <div class="alert warning">
+                    <strong>⚠️ Proxy Configuration:</strong> If using nginx or other reverse proxies, increase timeout settings:
+                    <ul>
+                        <li><code>proxy_read_timeout 180s;</code> (or higher for reasoning models)</li>
+                        <li><code>proxy_send_timeout 180s;</code></li>
+                        <li><code>proxy_connect_timeout 60s;</code></li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- Reasoning Models Section -->
+            <section id="reasoning-models" class="docs-section">
+                <h2 class="docs-subheading">Reasoning Models & Thinking Tokens</h2>
+                <p>The BioAI Unified Engine supports advanced reasoning models that can "think" before generating responses, providing higher quality content for complex tasks.</p>
+                
+                <h3 class="docs-minor-heading">OpenAI Reasoning Models</h3>
+                <p>For OpenAI reasoning models (GPT-5, O1, O3, O3-mini, O3-pro), control the level of reasoning with the <code>reasoning_effort</code> parameter:</p>
+                
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">minimal</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Fast responses with minimal reasoning - best for simple tasks (GPT-5 only)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">low</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Basic reasoning for moderately complex tasks</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">medium</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Balanced reasoning (recommended for most tasks, default)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">high</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Deep reasoning for complex problems and analysis</div>
+                    </div>
+                </div>
+                
+                <div class="docs-info-box">
+                    <p><strong>Model-specific support:</strong></p>
+                    <ul>
+                        <li><strong>GPT-5:</strong> Supports all levels (none, low, medium, high)</li>
+                        <li><strong>O1:</strong> Supports low, medium, high (with function calling & structured outputs)</li>
+                        <li><strong>O1-mini:</strong> Does NOT support reasoning_effort parameter</li>
+                        <li><strong>O3 & O3-mini:</strong> Supports low, medium, high</li>
+                        <li><strong>O3-pro:</strong> Most intelligent model with maximum reliability</li>
+                        <li><strong>Performance:</strong> With "high" effort, O3-mini can outperform O1</li>
+                    </ul>
+                </div>
+
+                <h4 class="docs-minor-heading">GPT-5 Example</h4>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "generator_model": "gpt-5",
+  "reasoning_effort": "high",
+  "prompt": "Analyze the economic implications of artificial intelligence on global markets...",
+  "temperature": 0.7,
+  "max_tokens": 4000
+}</code></pre>
+                </div>
+
+                <h4 class="docs-minor-heading">O1 Example</h4>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "generator_model": "o1",
+  "reasoning_effort": "medium",
+  "prompt": "Analyze this complex reasoning problem with function calling support...",
+  "max_tokens": 3000
+}</code></pre>
+                </div>
+
+                <h4 class="docs-minor-heading">O3-pro Example</h4>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "generator_model": "o3-pro",
+  "reasoning_effort": "high",
+  "prompt": "Solve this extremely complex problem requiring maximum reliability...",
+  "max_tokens": 4000
+}</code></pre>
+                </div>
+
+                <h4 class="docs-minor-heading">O3-mini Example</h4>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "generator_model": "o3-mini",
+  "reasoning_effort": "medium",
+  "prompt": "Solve this complex mathematical problem step by step: ...",
+  "max_tokens": 3000
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Claude Thinking Mode</h3>
+                <p>For Claude 3.7/4 models, allocate specific tokens for internal reasoning with <code>thinking_budget_tokens</code>:</p>
+                
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">Minimum</div>
+                        <div class="param-type">1,024 tokens</div>
+                        <div class="param-desc">Required minimum for thinking mode</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">Recommended</div>
+                        <div class="param-type">4,000-8,000 tokens</div>
+                        <div class="param-desc">Good balance of quality and performance</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">Maximum</div>
+                        <div class="param-type">16,000+ tokens</div>
+                        <div class="param-desc">Deep analysis for complex tasks</div>
+                    </div>
+                </div>
+
+                <h4 class="docs-minor-heading">Claude Example</h4>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "generator_model": "claude-sonnet-4-20250514",
+  "thinking_budget_tokens": 8000,
+  "prompt": "Write a comprehensive analysis of renewable energy technologies...",
+  "temperature": 0.6,
+  "max_tokens": 5000
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Gran Sabio Advanced Reasoning</h3>
+                <p>The Gran Sabio system automatically uses high-reasoning models by default:</p>
+                
+                <ul class="docs-list">
+                    <li><strong>Critical Analysis:</strong> GPT-5 with <code>reasoning_effort="high"</code> for deal-breaker reviews, conflicts, and final decisions</li>
+                    <li><strong>Content Generation:</strong> Claude 4 Opus with <code>thinking_budget_tokens=16384</code> for final content regeneration</li>
+                    <li><strong>Automatic Selection:</strong> No configuration needed - optimal models chosen based on task type</li>
+                </ul>
+
+                <h3 class="docs-minor-heading">Available Reasoning Models</h3>
+                <div class="template-grid">
+                    <div class="template-card">
+                        <h4>🧠 GPT-5</h4>
+                        <ul>
+                            <li>Parameter: reasoning_effort</li>
+                            <li>Best for: Critical analysis, decision making</li>
+                            <li>Response time: Variable (higher effort = slower)</li>
+                        </ul>
+                    </div>
+                    <div class="template-card">
+                        <h4>💭 Claude 4 Sonnet/Opus</h4>
+                        <ul>
+                            <li>Parameter: thinking_budget_tokens</li>
+                            <li>Best for: Creative content, detailed writing</li>
+                            <li>Max context: 200K tokens</li>
+                        </ul>
+                    </div>
+                    <div class="template-card">
+                        <h4>🎯 Claude 3.7 Sonnet</h4>
+                        <ul>
+                            <li>Parameter: thinking_budget_tokens</li>
+                            <li>Hybrid: Standard + reasoning mode</li>
+                            <li>Flexible thinking allocation</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="alert info">
+                    <strong>Performance Note:</strong> Reasoning models take longer to respond but provide significantly higher quality results for complex tasks. Thinking tokens are billed as output tokens.
+                </div>
+            </section>
+
+            <!-- QA Layers Section -->

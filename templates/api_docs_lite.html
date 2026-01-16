@@ -208,9 +208,9 @@
       <div class="param-desc">Maximum generation iterations (default: 5).</div>
     </div>
     <div class="param-row">
-      <div class="param-name">max_consecutive_smart_edits</div>
+      <div class="param-name">max_edit_rounds_per_layer</div>
       <div class="param-type">integer</div>
-      <div class="param-desc">Maximum incremental edit passes before forcing a full regeneration (default: 10).</div>
+      <div class="param-desc">Maximum smart-edit rounds per QA layer before moving to the next layer (default: 5).</div>
     </div>
     <div class="param-row">
       <div class="param-name">gran_sabio_model</div>
@@ -866,8 +866,8 @@
 
 <section id="smart-editing" class="docs-section">
   <h2 class="docs-subheading">Smart Editing Workflow</h2>
-  <p>Smart Content Editor applies targeted paragraph edits instead of regenerating the entire document when QA detects localized issues.</p>
-  <p>Controlled by max_consecutive_smart_edits; edited drafts still pass through full QA each iteration.</p>
+  <p>Smart Content Editor applies targeted paragraph edits instead of regenerating the entire document. Each QA layer is processed sequentially with edits applied immediately.</p>
+  <p>Controlled by max_edit_rounds_per_layer (default: 5); each layer can iterate up to this limit before passing content to the next layer.</p>
   <p><strong>JSON Support:</strong> When generating JSON-wrapped content, use target_field to specify which field(s) contain the primary text. Smart Edit extracts text from these fields, applies edits, and reconstructs the JSON. Use target_field_only=true to send only text to AI QA (saves tokens). Algorithmic guards always use extracted text when target_field is set.</p>
 </section>
 

@@ -237,19 +237,29 @@ def _check_minority_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
 
     all_deal_breakers = []
     total_evaluations = 0
+    total_models = len(qa_models) if qa_models else 0
 
     for layer_name, model_results in qa_results.items():
         layer_total = len(model_results)
-        layer_has_deal_breaker = False
+        if layer_total == 0:
+            continue
 
+        layer_db_details = []
         for model, evaluation in model_results.items():
-            if evaluation.deal_breaker:
-                layer_has_deal_breaker = True
-                all_deal_breakers.append(
+            if getattr(evaluation, "deal_breaker", False):
+                layer_db_details.append(
                     {"layer": layer_name, "model": model, "reason": evaluation.deal_breaker_reason}
                 )
 
-        if layer_has_deal_breaker:
+        if not layer_db_details:
+            continue
+
+        db_count = len(layer_db_details)
+        is_tie = layer_total % 2 == 0 and db_count * 2 == layer_total
+        is_minority = db_count < (layer_total / 2)
+
+        if is_tie or is_minority:
+            all_deal_breakers.extend(layer_db_details)
             total_evaluations += layer_total
 
     has_minority = len(all_deal_breakers) > 0
@@ -258,6 +268,7 @@ def _check_minority_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
         "has_minority_deal_breakers": has_minority,
         "deal_breaker_count": len(all_deal_breakers),
         "total_evaluations": total_evaluations,
+        "total_models": total_models,
         "details": all_deal_breakers,
         "summary": f"{len(all_deal_breakers)} deal-breakers from {total_evaluations} evaluations",
     }

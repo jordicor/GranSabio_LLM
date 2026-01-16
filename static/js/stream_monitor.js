@@ -52,6 +52,12 @@ const viewState = {
 // Maximum visible tabs before overflow (including Overview tab)
 const MAX_VISIBLE_TABS = 6;
 
+// QA Filter state - for filtering QA panel by layer/model
+const qaFilterState = {
+    layer: null,   // null = show all, string = filter by this layer
+    model: null    // null = show all, string = filter by this model
+};
+
 // ============================================
 // PHASE TOGGLE MANAGEMENT
 // ============================================
@@ -360,6 +366,9 @@ function clearAllContent() {
 
     // Hide status dashboard until data arrives
     hideDashboard();
+
+    // Reset QA filters
+    resetQAFilters();
 }
 
 // ============================================
@@ -449,6 +458,12 @@ function initializeIteration(request, iteration) {
                 consensus: { chunks: 0, bytes: 0 },
                 gransabio: { chunks: 0, bytes: 0 }
             },
+            // QA filter structures - indexed content for filtering
+            qaByLayer: {},       // { "Layer Name": "accumulated content..." }
+            qaByModel: {},       // { "model-name": "accumulated content..." }
+            qaByLayerModel: {},  // { "Layer Name": { "model-name": "content..." } }
+            qaLayers: [],        // List of unique layer names seen
+            qaModels: [],        // List of unique model names seen
             score: null,
             approved: false,
             status: 'in_progress',  // 'in_progress' | 'rejected' | 'approved'
@@ -802,6 +817,9 @@ function selectRequest(sessionId) {
     viewState.selectedRequestId = sessionId;
     viewState.autoFollow = false;  // User manually selected, disable auto-follow
 
+    // Reset QA filters when switching requests
+    resetQAFilters();
+
     // Ensure the selected tab is visible in the view window
     ensureTabVisible(sessionId);
 
@@ -825,8 +843,7 @@ function selectRequest(sessionId) {
     // Render dashboard filtered to only this session
     renderProjectStatus(lastProjectData, sessionId);
 
-    const request = requestsData.requests[sessionId];
-    log(`Switched to request: ${request?.requestName || sessionId}`, 'info');
+    log(`Switched to request: ${requestsData.requests[sessionId]?.requestName || sessionId}`, 'info');
 }
 
 function closeRequest(sessionId) {
@@ -1086,6 +1103,9 @@ function renderProjectStatus(projectData, filterSessionId = undefined) {
         const card = renderSessionCard(session);
         sessionsContainer.appendChild(card);
     });
+
+    // Bind click listeners to QA filter pills
+    bindQAFilterListeners();
 }
 
 function renderSessionCard(session) {
@@ -1187,28 +1207,34 @@ function renderQASection(session) {
 
     // Models row
     if (models.length > 0) {
-        html += '<div style="margin-bottom: 8px;"><span class="info-item-label" style="font-size: 9px;">Models:</span></div>';
+        html += '<div style="margin-bottom: 8px;"><span class="info-item-label" style="font-size: 9px;">Models: <span style="color: var(--gray); font-style: italic;">(click to filter)</span></span></div>';
         html += '<div class="model-pills">';
         models.forEach(model => {
             const isActive = model === currentModel;
             const isCompleted = models.indexOf(model) < models.indexOf(currentModel);
+            const isFilterSelected = qaFilterState.model === model;
             let stateClass = isActive ? 'active' : (isCompleted ? 'completed' : '');
+            if (isFilterSelected) stateClass += ' filter-selected';
             let icon = isActive ? '*' : (isCompleted ? '+' : 'o');
-            html += `<span class="model-pill ${stateClass}"><span class="status-icon">${icon}</span>${model}</span>`;
+            const escaped = escapeHtmlAttr(model);
+            html += `<span class="model-pill ${stateClass}" data-filter-type="model" data-filter-value="${escaped}"><span class="status-icon">${icon}</span>${escapeHtml(model)}</span>`;
         });
         html += '</div>';
     }
 
     // Layers row
     if (layers.length > 0) {
-        html += '<div style="margin: 8px 0;"><span class="info-item-label" style="font-size: 9px;">Layers:</span></div>';
+        html += '<div style="margin: 8px 0;"><span class="info-item-label" style="font-size: 9px;">Layers: <span style="color: var(--gray); font-style: italic;">(click to filter)</span></span></div>';
         html += '<div class="layer-pills">';
         layers.forEach(layer => {
             const isActive = layer === currentLayer;
             const isCompleted = layers.indexOf(layer) < layers.indexOf(currentLayer);
+            const isFilterSelected = qaFilterState.layer === layer;
             let stateClass = isActive ? 'active' : (isCompleted ? 'completed' : '');
+            if (isFilterSelected) stateClass += ' filter-selected';
             let icon = isActive ? '*' : (isCompleted ? '+' : 'o');
-            html += `<span class="layer-pill ${stateClass}"><span class="status-icon">${icon}</span>${layer}</span>`;
+            const escaped = escapeHtmlAttr(layer);
+            html += `<span class="layer-pill ${stateClass}" data-filter-type="layer" data-filter-value="${escaped}"><span class="status-icon">${icon}</span>${escapeHtml(layer)}</span>`;
         });
         html += '</div>';
     }
@@ -1452,6 +1478,117 @@ function disconnect() {
     setConnectionStatus('disconnected', 'OFFLINE');
     PHASES.forEach(phase => setBadge(phase, 'idle'));
     updateUrl(null);
+    resetQAFilters();
+}
+
+// ============================================
+// QA FILTER MANAGEMENT
+// ============================================
+
+/**
+ * Bind click listeners to QA filter pills in the dashboard.
+ * Call this after renderProjectStatus() to make pills interactive.
+ */
+function bindQAFilterListeners() {
+    const dashboard = document.getElementById('statusDashboard');
+    if (!dashboard) return;
+
+    // Find all model and layer pills with filter data attributes
+    dashboard.querySelectorAll('.model-pill[data-filter-type], .layer-pill[data-filter-type]').forEach(pill => {
+        pill.onclick = (e) => {
+            e.stopPropagation();
+            handleQAFilterClick(pill);
+        };
+    });
+}
+
+/**
+ * Handle click on a QA filter pill in the dashboard
+ * @param {HTMLElement} pill - The clicked pill element
+ */
+function handleQAFilterClick(pill) {
+    const filterType = pill.dataset.filterType;
+    const filterValue = pill.dataset.filterValue;
+
+    // Toggle: if already selected, deselect
+    if (filterType === 'layer') {
+        qaFilterState.layer = (qaFilterState.layer === filterValue) ? null : filterValue;
+    } else if (filterType === 'model') {
+        qaFilterState.model = (qaFilterState.model === filterValue) ? null : filterValue;
+    }
+
+    // Re-render dashboard to update pill styles, then re-bind listeners
+    if (lastProjectData) {
+        renderProjectStatus(lastProjectData, viewState.selectedRequestId);
+    }
+
+    // Re-render QA content with filter applied
+    const request = requestsData.requests[viewState.selectedRequestId];
+    if (request) {
+        renderFilteredQAContent(request);
+    }
+}
+
+/**
+ * Render QA content based on current filter state
+ * @param {Object} request - The request object
+ */
+function renderFilteredQAContent(request) {
+    const contentEl = document.getElementById('content-qa');
+    if (!contentEl) return;
+
+    const iter = request?.iterations?.[request.viewingIteration];
+    if (!iter) {
+        contentEl.textContent = '';
+        return;
+    }
+
+    let content = '';
+
+    if (qaFilterState.layer && qaFilterState.model) {
+        // Filter by both layer AND model
+        content = iter.qaByLayerModel?.[qaFilterState.layer]?.[qaFilterState.model] || '';
+    } else if (qaFilterState.layer) {
+        // Filter by layer only
+        content = iter.qaByLayer?.[qaFilterState.layer] || '';
+    } else if (qaFilterState.model) {
+        // Filter by model only
+        content = iter.qaByModel?.[qaFilterState.model] || '';
+    } else {
+        // No filter - show all
+        content = iter.content?.qa || '';
+    }
+
+    contentEl.textContent = content;
+    contentEl.scrollTop = contentEl.scrollHeight;
+}
+
+/**
+ * Reset QA filters to default (show all)
+ */
+function resetQAFilters() {
+    qaFilterState.layer = null;
+    qaFilterState.model = null;
+}
+
+/**
+ * Escape HTML for safe display
+ * @param {string} text - Text to escape
+ * @returns {string} Escaped text
+ */
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+/**
+ * Escape text for use in HTML attributes
+ * @param {string} text - Text to escape
+ * @returns {string} Escaped text safe for attributes
+ */
+function escapeHtmlAttr(text) {
+    return text.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 // ============================================
@@ -1539,6 +1676,35 @@ function handleChunk(data) {
             iterData.stats[phase].chunks++;
             iterData.stats[phase].bytes += content.length;
         }
+
+        // Index QA content by layer and model for filtering
+        if (phase === 'qa' && data.qa_layer && data.qa_model) {
+            const layer = data.qa_layer;
+            const model = data.qa_model;
+
+            // Register layer if new
+            if (!iterData.qaLayers.includes(layer)) {
+                iterData.qaLayers.push(layer);
+            }
+
+            // Register model if new
+            if (!iterData.qaModels.includes(model)) {
+                iterData.qaModels.push(model);
+            }
+
+            // Accumulate by layer
+            iterData.qaByLayer[layer] = (iterData.qaByLayer[layer] || '') + content;
+
+            // Accumulate by model
+            iterData.qaByModel[model] = (iterData.qaByModel[model] || '') + content;
+
+            // Accumulate by layer+model
+            if (!iterData.qaByLayerModel[layer]) {
+                iterData.qaByLayerModel[layer] = {};
+            }
+            iterData.qaByLayerModel[layer][model] =
+                (iterData.qaByLayerModel[layer][model] || '') + content;
+        }
     }
 
     // In Overview mode: don't display in panels, but show generic activity
@@ -1554,7 +1720,13 @@ function handleChunk(data) {
     if (request && request.sessionId === viewState.selectedRequestId) {
         // Only show content if viewing the current iteration
         if (request.viewingIteration === request.currentIteration) {
-            appendContent(phase, content);
+            if (phase === 'qa' && (qaFilterState.layer || qaFilterState.model)) {
+                // QA with filter active - re-render filtered content
+                renderFilteredQAContent(request);
+            } else {
+                // Normal append behavior
+                appendContent(phase, content);
+            }
         } else {
             // Viewing history - show activity indicator that live data is coming
             showLiveActivityIndicator(request.currentIteration);

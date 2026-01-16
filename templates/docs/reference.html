@@ -1,0 +1,357 @@
+<section id="error-handling" class="docs-section">
+                <h2 class="docs-subheading">Error Handling</h2>
+                
+                <h3 class="docs-minor-heading">HTTP Status Codes</h3>
+                <div class="status-table">
+                    <div class="status-row">
+                        <div class="status-code success">200</div>
+                        <div class="status-desc">Request successful</div>
+                    </div>
+                    <div class="status-row">
+                        <div class="status-code error">400</div>
+                        <div class="status-desc">Bad request - invalid parameters</div>
+                    </div>
+                    <div class="status-row">
+                        <div class="status-code error">404</div>
+                        <div class="status-desc">Session not found</div>
+                    </div>
+                    <div class="status-row">
+                        <div class="status-code error">500</div>
+                        <div class="status-desc">Internal server error</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Error Response Format</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "detail": "Session not found"
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">JSON Validation Error Handling</h3>
+                <p class="docs-text">When using <code>json_output=true</code>, the system validates generated JSON using JSON Guard. By default, validation errors consume iterations. However, you can enable smart retry behavior:</p>
+
+                <div class="feature-highlight">
+                    <h4>JSON Retry Without Iteration</h4>
+                    <p class="docs-text">Set <code>json_retry_without_iteration: true</code> to enable automatic JSON error recovery:</p>
+                    <ul class="docs-list">
+                        <li><strong>Automatic Retries:</strong> When JSON validation fails, the system regenerates content automatically</li>
+                        <li><strong>Iteration Preservation:</strong> These retries do NOT consume your main iteration count</li>
+                        <li><strong>Configurable Attempts:</strong> Controlled by <code>MAX_JSON_RETRY_ATTEMPTS</code> environment variable (default: 2)</li>
+                        <li><strong>Context Preservation:</strong> Each retry includes the previous error context to help fix the issue</li>
+                        <li><strong>Tracking:</strong> All retry attempts are recorded in <code>json_guard_history</code> with a <code>retry</code> field</li>
+                    </ul>
+                </div>
+
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">// Example: JSON Retry Mode enabled
+{
+  "prompt": "Generate a JSON object with user profile data",
+  "content_type": "json",
+  "json_output": true,
+  "json_retry_without_iteration": true,
+  "generator_model": "gpt-4o-mini",
+  "max_iterations": 3,
+  "qa_layers": []
+}
+
+// Result includes retry history
+{
+  "content": "{\"name\": \"John\", \"age\": 30}",
+  "final_iteration": 1,
+  "json_guard_history": [
+    {
+      "iteration": 1,
+      "retry": 0,  // First attempt failed
+      "result": {
+        "json_valid": false,
+        "errors": [{"message": "Missing closing brace"}]
+      }
+    },
+    {
+      "iteration": 1,
+      "retry": 1,  // Second attempt succeeded
+      "result": {
+        "json_valid": true,
+        "data": {"name": "John", "age": 30}
+      }
+    }
+  ]
+}</code></pre>
+                </div>
+
+                <p class="docs-note"><strong>Traditional Mode:</strong> When <code>json_retry_without_iteration</code> is <code>false</code> (default), each JSON validation failure consumes one iteration from <code>max_iterations</code>.</p>
+            </section>
+
+            <!-- Examples Section -->
+            <section id="examples" class="docs-section">
+                <h2 class="docs-subheading">Complete Examples</h2>
+                
+                <div class="example-tabs">
+                    <button class="tab-button active" onclick="showExample('python')">Python</button>
+                    <button class="tab-button" onclick="showExample('javascript')">JavaScript</button>
+                    <button class="tab-button" onclick="showExample('curl')">cURL</button>
+                </div>
+
+                <div id="python-example" class="example-content active">
+                    <h3 class="docs-minor-heading">Python Example</h3>
+                    <div class="code-example">
+                        <div class="code-header">
+                            <span class="code-lang">Python</span>
+                            <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        </div>
+                        <pre><code class="language-python">import requests
+import json
+import time
+
+# Configuration
+API_BASE = "http://localhost:8000"
+
+def generate_content():
+    # Step 1: Start generation
+    payload = {
+        "prompt": "Write a 1500-word article about artificial intelligence and ethics.",
+        "content_type": "article",
+        "generator_model": "claude-sonnet-4-20250514",
+        "temperature": 0.7,
+        "thinking_budget_tokens": 6000,
+        "min_words": 600,
+        "max_words": 1000,
+        "qa_models": ["gpt-4o", "claude-sonnet-4-20250514"],
+        "qa_layers": [
+            {
+                "name": "Accuracy",
+                "description": "Factual accuracy",
+                "criteria": "Check for factual errors and contradictions",
+                "min_score": 8.0,
+                "is_mandatory": true,
+                "deal_breaker_criteria": "invents facts or contradicts known information",
+                "concise_on_pass": true,
+                "order": 1
+            }
+        ],
+        "min_global_score": 8.0,
+        "max_iterations": 3,
+        "verbose": True
+    }
+    
+    response = requests.post(f"{API_BASE}/generate", json=payload)
+    session_data = response.json()
+    session_id = session_data["session_id"]
+    
+    print(f"Session started: {session_id}")
+    
+    # Step 2: Monitor progress
+    while True:
+        status_response = requests.get(f"{API_BASE}/status/{session_id}")
+        status = status_response.json()
+        
+        print(f"Status: {status['status']}, Iteration: {status['current_iteration']}")
+        
+        if status["status"] in ["completed", "failed"]:
+            break
+            
+        time.sleep(2)
+    
+    # Step 3: Get final result
+    if status["status"] == "completed":
+        result_response = requests.get(f"{API_BASE}/result/{session_id}")
+        result = result_response.json()
+        
+        print(f"Content generated successfully!")
+        print(f"Final score: {result['final_score']}")
+        print(f"Content: {result['content'][:100]}...")
+        
+        return result
+    else:
+        print("Generation failed")
+        return None
+
+# Run the example
+if __name__ == "__main__":
+    generate_content()</code></pre>
+                    </div>
+                </div>
+
+                <div id="javascript-example" class="example-content">
+                    <h3 class="docs-minor-heading">JavaScript Example</h3>
+                    <div class="code-example">
+                        <div class="code-header">
+                            <span class="code-lang">JavaScript</span>
+                            <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        </div>
+                        <pre><code class="language-javascript">const API_BASE = 'http://localhost:8000';
+
+async function generateContent() {
+  // Step 1: Start generation
+  const payload = {
+    prompt: "Write a 1000-word biography about Leonardo da Vinci.",
+    content_type: "biography",
+    generator_model: "gpt-5",
+    reasoning_effort: "medium",
+    temperature: 0.7,
+    min_words: 400,
+    max_words: 800,
+    qa_models: ["gpt-4o", "claude-sonnet-4-20250514"],
+    qa_layers: [
+      {
+        name: "Factual Accuracy",
+        description: "Historical accuracy verification",
+        criteria: "Verify all historical facts and dates",
+        min_score: 8.5,
+        is_mandatory: true,
+        deal_breaker_criteria: "contains factual errors or anachronisms",
+        concise_on_pass: true,
+        order: 1
+      }
+    ],
+    min_global_score: 8.0,
+    max_iterations: 3,
+    verbose: true
+  };
+
+  const response = await fetch(`${API_BASE}/generate`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const sessionData = await response.json();
+  const sessionId = sessionData.session_id;
+  
+  console.log(`Session started: ${sessionId}`);
+
+  // Step 2: Stream progress updates
+  const eventSource = new EventSource(`${API_BASE}/stream/${sessionId}`);
+  
+  eventSource.onmessage = async function(event) {
+    const update = JSON.parse(event.data);
+    console.log(`Status: ${update.status}, Iteration: ${update.current_iteration}`);
+    
+    if (update.status === 'completed') {
+      eventSource.close();
+      
+      // Step 3: Get final result
+      const resultResponse = await fetch(`${API_BASE}/result/${sessionId}`);
+      const result = await resultResponse.json();
+      
+      console.log('Content generated successfully!');
+      console.log(`Final score: ${result.final_score}`);
+      console.log(`Content: ${result.content.substring(0, 100)}...`);
+    } else if (update.status === 'failed') {
+      eventSource.close();
+      console.log('Generation failed');
+    }
+  };
+}
+
+// Run the example
+generateContent();</code></pre>
+                    </div>
+                </div>
+
+                <div id="curl-example" class="example-content">
+                    <h3 class="docs-minor-heading">cURL Example</h3>
+                    <div class="code-example">
+                        <div class="code-header">
+                            <span class="code-lang">Bash</span>
+                            <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                        </div>
+                        <pre><code class="language-bash"># Step 1: Start generation
+curl -X POST "http://localhost:8000/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Write an 800-word essay about the future of artificial intelligence.",
+    "content_type": "essay",
+    "generator_model": "gpt-4o",
+    "temperature": 0.7,
+    "min_words": 300,
+    "max_words": 600,
+    "qa_models": ["gpt-4o", "claude-sonnet-4-20250514"],
+    "qa_layers": [
+      {
+        "name": "Technical Accuracy",
+        "description": "Technical accuracy of AI concepts",
+        "criteria": "Verify technical AI concepts are correctly explained",
+        "min_score": 8.0,
+        "is_mandatory": true,
+        "deal_breaker_criteria": "contains technical errors or misrepresents AI concepts",
+        "concise_on_pass": true,
+        "order": 1
+      }
+    ],
+    "min_global_score": 8.0,
+    "max_iterations": 3,
+    "gran_sabio_call_limit_per_iteration": 3,
+    "gran_sabio_call_limit_per_session": 15,
+    "verbose": true
+  }'
+
+# Step 2: Check status (replace SESSION_ID with actual session ID)
+curl "http://localhost:8000/status/SESSION_ID"
+
+# Step 3: Check analytics
+curl "http://localhost:8000/analytics"
+
+# Step 4: Get final result
+curl "http://localhost:8000/result/SESSION_ID"</code></pre>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Generation Statuses -->
+            <section id="generation-statuses" class="docs-section">
+                <h2 class="docs-subheading">Generation Statuses</h2>
+                <p>Understanding the different stages of content generation:</p>
+                
+                <div class="status-flow">
+                    <div class="status-step">
+                        <div class="status-icon initializing">🚀</div>
+                        <div class="status-info">
+                            <h4>initializing</h4>
+                            <p>Session created, preparing for generation</p>
+                        </div>
+                    </div>
+                    <div class="status-arrow">→</div>
+                    <div class="status-step">
+                        <div class="status-icon generating">🤖</div>
+                        <div class="status-info">
+                            <h4>generating</h4>
+                            <p>AI model is creating content</p>
+                        </div>
+                    </div>
+                    <div class="status-arrow">→</div>
+                    <div class="status-step">
+                        <div class="status-icon qa-evaluation">🔍</div>
+                        <div class="status-info">
+                            <h4>qa_evaluation</h4>
+                            <p>Multiple models evaluating quality</p>
+                        </div>
+                    </div>
+                    <div class="status-arrow">→</div>
+                    <div class="status-step">
+                        <div class="status-icon completed">✅</div>
+                        <div class="status-info">
+                            <h4>completed</h4>
+                            <p>Content approved and ready</p>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="status-note">
+                    <h4>🧙‍♂️ Gran Sabio Escalation (v2.0)</h4>
+                    <p><strong>Immediate Escalation:</strong> When minority (< 50%) or tie (50%) deal-breakers are detected, Gran Sabio reviews immediately before continuing with remaining QA layers.</p>
+                    <p><strong>Final Review:</strong> If content doesn't meet quality standards after max iterations, the system escalates to Gran Sabio for final review and potential modifications.</p>
+                    <p><strong>Limits:</strong> Configurable per-iteration and per-session limits (default: 3/iteration, 15/session) prevent excessive costs. Use -1 for unlimited during testing.</p>
+                </div>
+            </section>

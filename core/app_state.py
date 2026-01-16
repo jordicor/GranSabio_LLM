@@ -153,6 +153,10 @@ app.mount("/templates/docs", StaticFiles(directory="templates/docs"), name="docs
 app.include_router(attachments_router)
 app.include_router(analysis_router)
 
+# Smart Edit routes
+from smart_edit.router import router as smart_edit_router
+app.include_router(smart_edit_router, prefix="/smart-edit")
+
 # Monitor routes
 from .monitor_routes import router as monitor_router
 app.include_router(monitor_router)
@@ -653,6 +657,9 @@ def _build_project_phase_event(
     retry_in_seconds: Optional[float] = None,
     is_api_error: Optional[bool] = None,
     provider: Optional[str] = None,
+    # QA-specific fields for filtering
+    qa_layer: Optional[str] = None,
+    qa_model: Optional[str] = None,
 ) -> str:
     """Create a JSON event string for project/phase streams."""
     obj: Dict[str, Any] = {
@@ -681,6 +688,11 @@ def _build_project_phase_event(
         obj["is_api_error"] = is_api_error
     if provider is not None:
         obj["provider"] = provider
+    # QA filter fields
+    if qa_layer is not None:
+        obj["qa_layer"] = qa_layer
+    if qa_model is not None:
+        obj["qa_model"] = qa_model
     return json.dumps(obj, ensure_ascii=True)
 
 
@@ -701,6 +713,9 @@ async def publish_project_phase_chunk(
     retry_in_seconds: Optional[float] = None,
     is_api_error: Optional[bool] = None,
     provider: Optional[str] = None,
+    # QA-specific fields for filtering
+    qa_layer: Optional[str] = None,
+    qa_model: Optional[str] = None,
 ) -> None:
     """
     Broadcast a live event to all subscribers of a project/phase stream.
@@ -740,6 +755,8 @@ async def publish_project_phase_chunk(
         retry_in_seconds=retry_in_seconds,
         is_api_error=is_api_error,
         provider=provider,
+        qa_layer=qa_layer,
+        qa_model=qa_model,
     )
 
     for q in targets:

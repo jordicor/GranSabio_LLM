@@ -335,6 +335,16 @@ class RepetitionAnalyzerRequest(BaseModel):
         description="Output verbosity: 'full' includes all phrases, 'compact' is minimal"
     )
 
+    # Stopword filtering
+    language: Optional[str] = Field(
+        default=None,
+        description="ISO language hint (e.g., 'es', 'en') for stop-word filtering"
+    )
+    filter_stop_words: bool = Field(
+        default=False,
+        description="Remove stop words from summaries (requires language hint)"
+    )
+
 
 class RepetitionAnalyzerResponse(BaseModel):
     """Response model for repetition analyzer"""
@@ -557,6 +567,9 @@ async def analyze_repetition_endpoint(request: RepetitionAnalyzerRequest) -> Rep
             pos_candidates_top_k=request.pos_candidates_top_k,
             paragraph_break_min_blank_lines=request.paragraph_break_min_blank_lines,
             block_break_min_blank_lines=request.block_break_min_blank_lines,
+            # Stopword filtering
+            language=request.language,
+            filter_stop_words=request.filter_stop_words,
         )
 
         # Run analysis

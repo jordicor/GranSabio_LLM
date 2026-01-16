@@ -6933,7 +6933,8 @@
     "premium_generator": "claude-sonnet-4-5",
     "standard_generator": "gpt-5.1",
     "fast_qa": "claude-haiku-4-5",
-    "reasoning": "o3-mini"
+    "reasoning": "o3-mini",
+    "arbiter": "gpt-5-mini"
   },
   "token_validation": {
     "default_max_input": 100000,

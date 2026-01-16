@@ -10,14 +10,15 @@ Gran Sabio LLM Engine is a sophisticated content generation API that uses multip
 - **AI Service Layer** (`ai_service.py`): Unified interface for multiple AI providers with model-specific parameter handling. Use `get_ai_service()` to reuse the shared connector instead of instantiating `AIService` directly.
 - **QA Engine** (`qa_engine.py`): Multi-layer evaluation system with configurable criteria and deal-breaker detection
 - **QA Bypass Engine** (`qa_bypass_engine.py`): Alternative QA system for specific use cases
-- **Consensus Engine** (`consensus_engine.py`): Calculates consensus scores across multiple evaluator models
+- **Arbiter** (`arbiter.py`): Per-layer intelligent conflict resolver for smart-edit operations. Detects and resolves conflicts between edits proposed by different QA evaluators, maintains edit history per layer, and verifies edit alignment with original request intent.
+- **Consensus Engine** (`consensus_engine.py`): Calculates consensus scores across multiple evaluator models for final approval/rejection decision
 - **Gran Sabio Engine** (`gran_sabio.py`): Final escalation system for conflict resolution and content modification
 - **Attachment System** (`attachments_router.py`): Handle file uploads and context ingestion with security controls
 - **Session Management**: UUID-based async session tracking with real-time streaming
 - **Text Analysis** (`text_analysis.py`): Word counting and content analysis utilities
 - **JSON Optimization** (`json_utils.py`): Fast JSON processing using orjson (3.6x faster than standard json)
 
-The generation workflow: Client request → **Preflight validation** → Content generation → Multi-layer QA evaluation → Consensus calculation → Approval/retry → Gran Sabio escalation (if needed).
+The generation workflow: Client request → **Preflight validation** → Content generation → Multi-layer QA evaluation → **Arbiter** (edit conflict resolution per layer) → Smart-edit application → Consensus calculation → Approval/retry → Gran Sabio escalation (if needed).
 
 ## Development Commands
 
@@ -84,9 +85,10 @@ SESSION_CLEANUP_INTERVAL=900  # Session cleanup interval in seconds
 ATTACHMENTS_RETENTION_DAYS=32850  # Override attachment retention period
 
 # Smart Edit Configuration (optional)
-MAX_PARAGRAPHS_PER_INCREMENTAL_RUN=12  # Max paragraphs edited per smart edit iteration
-DEFAULT_MAX_CONSECUTIVE_SMART_EDITS=10  # Max consecutive smart edits before full regeneration
+MAX_PARAGRAPHS_PER_INCREMENTAL_RUN=12  # Max paragraphs edited per smart edit round
+MAX_EDIT_ROUNDS_PER_LAYER=5  # Max smart-edit rounds per QA layer before moving to next layer
 MAX_JSON_RECURSION_DEPTH=3  # Max depth for automatic JSON text field discovery
+SMART_EDIT_MAX_PHRASE_LENGTH=64  # Max words to check for unique n-grams (default 64, avoids word_map fallback)
 
 # Evidence Grounding Configuration (ECONOMY mode - optimized for cost)
 EVIDENCE_GROUNDING_EXTRACTION_MODEL=gpt-5-nano   # Cheap ($0.05/$0.40/M), no logprobs needed
@@ -121,6 +123,14 @@ Model specifications are centralized in `model_specs.json` with provider-specifi
 **Attachment Maintenance**: AttachmentManager.run_cleanup() valida firmas/sha, reconstruye uploads/index.json, respeta config.ATTACHMENTS.retention_days (override con ATTACHMENTS_RETENTION_DAYS) y dispone de CLI (python tools/attachments_cli.py cleanup|list|delete) para operaciones manuales (dry-run por defecto).
 
 **Gran Sabio Escalation**: When max iterations reached without approval, the system escalates to a premium model for final decision and potential content modification.
+
+**Arbiter System**: Per-layer intelligent arbitration for smart-edit operations:
+- **Conflict Detection**: Detects incompatible edits (DELETE vs REPLACE on same fragment, EXPAND vs CONDENSE on same paragraph, severity mismatches, semantic redundancy, edit cycles)
+- **Distribution Classification**: Classifies how edits are distributed among QA models (CONSENSUS, MAJORITY, MINORITY, CONFLICT, TIE, SINGLE_QA)
+- **Model Escalation**: Uses economic model (gpt-4o-mini) for normal cases; escalates to GranSabio model for difficult cases (MINORITY, CONFLICT, TIE)
+- **AI Verification**: ALWAYS calls AI to verify edit alignment with original request - can reject poorly-reasoned edits even without conflicts
+- **Edit History**: Maintains per-layer history of applied/discarded edits, injected into QA prompts in subsequent rounds to prevent re-proposing discarded edits
+- **Configuration**: `ARBITER_MODEL`, `ARBITER_MAX_TOKENS`, `ARBITER_TEMPERATURE`, `EDIT_HISTORY_MAX_ROUNDS`, `EDIT_HISTORY_MAX_CHARS`
 
 **Smart Edit JSON Field Extraction**: When generating JSON output, smart-edit needs to work on the text content, not the JSON structure. The system automatically extracts text fields for editing:
 - **`target_field`**: Specify which JSON field(s) contain the primary text using jmespath notation (e.g., `"generated_text"`, `"data.content"`, or `["chapter", "notes"]` for multiple fields)

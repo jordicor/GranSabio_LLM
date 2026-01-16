@@ -603,8 +603,11 @@ async def generate_content(request: ContentRequest):
             preflight_feedback=preflight_result
         )
 
-    # Extract QA layer names for status tracking
-    qa_layer_names = [layer.name for layer in request.qa_layers] if request.qa_layers else []
+    # Extract QA layer names for status tracking (respect processing order)
+    if request.qa_layers:
+        qa_layer_names = [layer.name for layer in sorted(request.qa_layers, key=lambda x: getattr(x, "order", 0))]
+    else:
+        qa_layer_names = []
 
     # Initialize session with preflight content
     await register_session(session_id, {

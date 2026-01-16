@@ -253,6 +253,59 @@ def _compose_style_feedback_block(previous_iteration: Optional[Dict[str, Any]]) 
     return "\n".join(lines)
 
 
+def _extract_deal_breaker_details(qa_results: Dict[str, Dict[str, Any]]) -> str:
+    """
+    Extract detailed information from QA evaluations that marked deal-breakers.
+
+    Returns a formatted string with comprehensive deal-breaker information
+    for use in iteration feedback prompts.
+    """
+    deal_breaker_entries: List[str] = []
+
+    for layer_name, model_results in qa_results.items():
+        for model_name, evaluation in model_results.items():
+            # Only process evaluations that flagged deal-breaker
+            if not _safe_get_evaluation_attr(evaluation, "deal_breaker"):
+                continue
+
+            # Extract all available information
+            score = _safe_get_evaluation_attr(evaluation, "score")
+            deal_breaker_reason = _safe_get_evaluation_attr(evaluation, "deal_breaker_reason")
+            feedback = _safe_get_evaluation_attr(evaluation, "feedback")
+            reason = _safe_get_evaluation_attr(evaluation, "reason")  # Backward compat field
+
+            # Build entry header
+            entry_lines = [f"[{layer_name}] Evaluator: {model_name}"]
+
+            if score is not None:
+                entry_lines.append(f"  Score: {score}/10")
+
+            # Determine the best explanation available
+            # Priority: deal_breaker_reason > reason > feedback (if not "Passed")
+            primary_explanation = (
+                deal_breaker_reason
+                or reason
+                or (feedback if feedback and feedback.lower() != "passed" else None)
+            )
+
+            if primary_explanation:
+                entry_lines.append(f"  Critical Issue: {primary_explanation}")
+            else:
+                entry_lines.append("  Critical Issue: Deal-breaker detected (no specific reason provided)")
+
+            # If we have both deal_breaker_reason AND different feedback, include both
+            if deal_breaker_reason and feedback and feedback.lower() != "passed":
+                if deal_breaker_reason.strip() != feedback.strip():
+                    entry_lines.append(f"  Additional feedback: {feedback}")
+
+            deal_breaker_entries.append("\n".join(entry_lines))
+
+    if not deal_breaker_entries:
+        return ""
+
+    return "\n\n".join(deal_breaker_entries)
+
+
 def create_user_friendly_reason(
     qa_summary: Dict[str, Any],
     qa_results: Dict[str, Any],

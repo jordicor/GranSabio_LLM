@@ -345,13 +345,27 @@ Return STRICTLY VALID JSON in this exact format:
     {
       "paragraph_start": "<first 3-5 words of paragraph>",
       "paragraph_end": "<last 3-5 words of paragraph>",
+      "operation_type": "<delete|replace|rephrase>",
       "instruction": "<what to fix at paragraph level>",
       "severity": "<minor|major|critical>",
-      "exact_fragment": "<optional: specific problematic text>",
-      "suggested_text": "<optional: suggested replacement>"
+      "exact_fragment": "<REQUIRED for delete/replace: the exact text to modify>",
+      "suggested_text": "<REQUIRED for replace: the replacement text>"
     }
   ]
 }
+
+OPERATION_TYPE RULES (choose the most efficient operation):
+- "delete": Remove text entirely. Use for redundant words, filler phrases, duplicates.
+  REQUIRES: exact_fragment (the exact text to delete, copy verbatim from content)
+  Example: To remove "very" from "very very good", set exact_fragment="very " (include trailing space)
+- "replace": Swap text with specific replacement. Use for typos, wrong words, specific corrections.
+  REQUIRES: exact_fragment AND suggested_text
+  Example: To change "1985" to "1987", set exact_fragment="1985", suggested_text="1987"
+- "rephrase": Rewrite while preserving meaning. Use when the issue requires creative rewording.
+  Does NOT require exact_fragment (AI will decide how to rephrase)
+
+PREFER "delete" or "replace" when the fix is simple and deterministic.
+Use "rephrase" only when creative rewording is needed.
 
 Score scale:
 - 1-3: Very poor; critical issues
@@ -361,10 +375,15 @@ Score scale:
 
 IMPORTANT:
 - 'editable' = true only for narrative text (articles, biographies, stories)
-- 'editable' = false for code, formulas, structured data
+- 'editable' = false for code, formulas, structured data, or when deal_breaker=true
 - 'edit_strategy' = "incremental" when few specific fixes needed
-- 'edit_strategy' = "regenerate" when structural problems exist
+- 'edit_strategy' = "regenerate" when widespread problems exist (but NOT a deal-breaker)
 - 'edit_groups' required only when edit_strategy="incremental"
+
+DEAL-BREAKER vs EDITS (CRITICAL):
+- If deal_breaker=true: set editable=false, edit_strategy=null, edit_groups=[]
+- Deal-breakers require FULL REGENERATION - edit fields become irrelevant
+- If a problem CAN be fixed with specific edits, it is NOT a deal-breaker
 
 Be rigorous and fair according to professional editorial standards.""")
 
@@ -503,9 +522,9 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         description="Maximum number of paragraphs that can be edited in a single smart edit iteration"
     )
     DEFAULT_MAX_CONSECUTIVE_SMART_EDITS: int = Field(
-        default=10,
+        default=50,
         ge=1,
-        le=50,
+        le=100,
         description="Default maximum number of consecutive smart edit iterations before forcing full regeneration"
     )
 
@@ -517,9 +536,9 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         description="Minimum phrase length (words) for paragraph markers in smart edit"
     )
     SMART_EDIT_MAX_PHRASE_LENGTH: int = Field(
-        default=12,
+        default=64,
         ge=6,
-        le=20,
+        le=80,
         description="Maximum phrase length (words) before falling back to word_index mode"
     )
     SMART_EDIT_DEFAULT_PHRASE_LENGTH: int = Field(
@@ -529,12 +548,46 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         description="Default phrase length when pre-scan is not used"
     )
 
+    # Smart Edit Per-Layer Configuration
+    MAX_EDIT_ROUNDS_PER_LAYER: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Maximum rounds of smart-edit per QA layer before continuing to next layer"
+    )
+
     # JSON Field Extraction Configuration
     MAX_JSON_RECURSION_DEPTH: int = Field(
         default=3,
         ge=1,
         le=10,
         description="Maximum depth for recursive JSON field search in smart-edit extraction"
+    )
+
+    # Arbiter Configuration (per-layer conflict resolution)
+    ARBITER_MAX_TOKENS: int = Field(
+        default=8000,
+        ge=500,
+        le=16000,
+        description="Maximum tokens for Arbiter AI responses"
+    )
+    ARBITER_TEMPERATURE: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Temperature for Arbiter AI (lower = more deterministic)"
+    )
+    EDIT_HISTORY_MAX_ROUNDS: int = Field(
+        default=-1,
+        ge=-1,
+        le=50,
+        description="Maximum rounds of edit history to include in prompts. Use -1 to match MAX_EDIT_ROUNDS_PER_LAYER."
+    )
+    EDIT_HISTORY_MAX_CHARS: int = Field(
+        default=10000,
+        ge=500,
+        le=50000,
+        description="Maximum characters for edit history in prompts"
     )
 
     # Session management
@@ -742,7 +795,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             os.getenv("MAX_PARAGRAPHS_PER_INCREMENTAL_RUN", "12")
         )
         self.DEFAULT_MAX_CONSECUTIVE_SMART_EDITS = int(
-            os.getenv("DEFAULT_MAX_CONSECUTIVE_SMART_EDITS", "10")
+            os.getenv("DEFAULT_MAX_CONSECUTIVE_SMART_EDITS", "50")
         )
 
         # Smart Edit Marker Configuration
@@ -750,16 +803,32 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             os.getenv("SMART_EDIT_MIN_PHRASE_LENGTH", "4")
         )
         self.SMART_EDIT_MAX_PHRASE_LENGTH = int(
-            os.getenv("SMART_EDIT_MAX_PHRASE_LENGTH", "12")
+            os.getenv("SMART_EDIT_MAX_PHRASE_LENGTH", "64")
         )
         self.SMART_EDIT_DEFAULT_PHRASE_LENGTH = int(
             os.getenv("SMART_EDIT_DEFAULT_PHRASE_LENGTH", "5")
+        )
+
+        # Smart Edit Per-Layer Configuration
+        self.MAX_EDIT_ROUNDS_PER_LAYER = int(
+            os.getenv("MAX_EDIT_ROUNDS_PER_LAYER", "5")
         )
 
         # JSON Field Extraction
         self.MAX_JSON_RECURSION_DEPTH = int(
             os.getenv("MAX_JSON_RECURSION_DEPTH", "3")
         )
+
+        # Arbiter Configuration
+        self.ARBITER_MAX_TOKENS = int(os.getenv("ARBITER_MAX_TOKENS", "8000"))
+        self.ARBITER_TEMPERATURE = float(os.getenv("ARBITER_TEMPERATURE", "0.3"))
+        # EDIT_HISTORY_MAX_ROUNDS: -1 means "use MAX_EDIT_ROUNDS_PER_LAYER"
+        _history_rounds_env = os.getenv("EDIT_HISTORY_MAX_ROUNDS", "-1")
+        _history_rounds = int(_history_rounds_env)
+        self.EDIT_HISTORY_MAX_ROUNDS = (
+            _history_rounds if _history_rounds > 0 else self.MAX_EDIT_ROUNDS_PER_LAYER
+        )
+        self.EDIT_HISTORY_MAX_CHARS = int(os.getenv("EDIT_HISTORY_MAX_CHARS", "10000"))
 
         # Model Reliability
         self.MODEL_RELIABILITY_MIN_SAMPLES = int(

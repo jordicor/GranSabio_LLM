@@ -81,3 +81,56 @@ OUTPUT REQUIREMENTS - MANDATORY:
 
 BEGIN YOUR CORRECTED JSON OUTPUT NOW:
 """
+
+
+def build_deal_breaker_awareness_prompt(qa_layers: list) -> str:
+    """
+    Build a prompt section that informs the generator about deal-breaker criteria
+    from QA layers, so it can avoid violations proactively.
+
+    Args:
+        qa_layers: List of QALayer objects, each may have deal_breaker_criteria
+
+    Returns:
+        Formatted prompt section, or empty string if no deal-breakers defined
+    """
+    # Extract non-empty deal_breaker_criteria from all layers
+    deal_breakers = []
+    for layer in qa_layers:
+        criteria = getattr(layer, 'deal_breaker_criteria', None)
+        if criteria and criteria.strip():
+            deal_breakers.append({
+                "layer": getattr(layer, 'name', 'Unknown'),
+                "criteria": criteria.strip()
+            })
+
+    if not deal_breakers:
+        return ""
+
+    # Build formatted list
+    criteria_list = "\n".join(
+        f"  - [{db['layer']}] {db['criteria']}"
+        for db in deal_breakers
+    )
+
+    return f"""
+================================================================================
+CONTENT RESTRICTIONS - CRITICAL REQUIREMENTS
+================================================================================
+
+The following restrictions are defined by the user as non-negotiable for this content.
+Violating any of these will cause automatic rejection and require full regeneration:
+
+{criteria_list}
+
+WHY THIS MATTERS:
+- These criteria reflect what the user considers unacceptable in the final content
+- Content failing these checks cannot be approved, regardless of other qualities
+- Avoiding these issues on the first attempt saves resources and produces better results
+
+Take a moment to review these restrictions before writing.
+If uncertain about any point, err on the side of caution.
+
+Note: Compliance with these restrictions is tracked to optimize model selection for future tasks.
+================================================================================
+"""

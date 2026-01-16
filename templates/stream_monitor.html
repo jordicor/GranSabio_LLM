@@ -861,6 +861,12 @@
             display: flex;
             align-items: center;
             gap: 4px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .model-pill:hover, .layer-pill:hover {
+            border-color: var(--green-dim);
         }
 
         .model-pill.completed, .layer-pill.completed {
@@ -871,6 +877,13 @@
         .model-pill.active, .layer-pill.active {
             border-color: var(--amber);
             color: var(--amber);
+        }
+
+        /* Filter selected state - overrides other states */
+        .model-pill.filter-selected, .layer-pill.filter-selected {
+            background: var(--green);
+            border-color: var(--green);
+            color: var(--bg-dark);
         }
 
         .model-pill .status-icon, .layer-pill .status-icon {

@@ -1,0 +1,683 @@
+<section id="json-schema-structured-outputs" class="docs-section">
+                <h2 class="docs-subheading">JSON Schema Structured Outputs</h2>
+                <p class="docs-lead">
+                    Guarantee 100% format compliance with native JSON Schema support across all major AI providers.
+                </p>
+
+                <h3 class="docs-minor-heading">Overview</h3>
+                <p class="docs-text">
+                    JSON Schema Structured Outputs use native AI provider capabilities to enforce exact JSON format compliance during generation.
+                    Unlike prompt-based approaches, structured outputs use constrained decoding to guarantee that responses match your schema exactly,
+                    eliminating parsing errors and retry loops.
+                </p>
+
+                <div class="feature-highlight">
+                    <h4>Key Benefits</h4>
+                    <ul class="docs-list">
+                        <li><strong>100% Reliability:</strong> Model responses guaranteed to match your schema</li>
+                        <li><strong>Zero Parsing Errors:</strong> No need for client-side validation or error handling</li>
+                        <li><strong>Cost Reduction:</strong> Eliminates retry loops for format validation</li>
+                        <li><strong>Developer Experience:</strong> Works seamlessly with Pydantic, Zod, and other schema tools</li>
+                        <li><strong>Backward Compatible:</strong> Opt-in feature, existing code works without changes</li>
+                    </ul>
+                </div>
+
+                <h3 class="docs-minor-heading">Dual Operation Modes</h3>
+                <div class="docs-comparison">
+                    <div class="comparison-column">
+                        <h4>Without json_schema (Flexible JSON)</h4>
+                        <pre><code class="language-json">{
+  "json_output": true
+  // No json_schema specified
+}</code></pre>
+                        <ul class="docs-list">
+                            <li>Returns valid JSON</li>
+                            <li>Structure decided by AI</li>
+                            <li>Backward compatible</li>
+                            <li>Good for creative responses</li>
+                        </ul>
+                    </div>
+                    <div class="comparison-column">
+                        <h4>With json_schema (Structured Outputs)</h4>
+                        <pre><code class="language-json">{
+  "json_output": true,
+  "json_schema": { "type": "object", ... }
+}</code></pre>
+                        <ul class="docs-list">
+                            <li>Returns valid JSON</li>
+                            <li>Structure exactly matches schema</li>
+                            <li>100% format guarantee</li>
+                            <li>Perfect for integrations</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Supported Models</h3>
+                <table class="docs-table">
+                    <thead>
+                        <tr>
+                            <th>Provider</th>
+                            <th>Models</th>
+                            <th>Support Level</th>
+                            <th>Implementation</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Grok (xAI)</strong></td>
+                            <td>Grok 2-1212 and later</td>
+                            <td><span class="badge badge-success">Full Support</span></td>
+                            <td>response_format with json_schema</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Gemini</strong></td>
+                            <td>All active models</td>
+                            <td><span class="badge badge-success">Full Support</span></td>
+                            <td>response_schema (Nov 2025)</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Claude</strong></td>
+                            <td>Sonnet 4.5, Opus 4.1</td>
+                            <td><span class="badge badge-warning">Beta</span></td>
+                            <td>output_format + beta header</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Claude</strong></td>
+                            <td>3.x models</td>
+                            <td><span class="badge badge-info">Fallback</span></td>
+                            <td>Prompt engineering</td>
+                        </tr>
+                        <tr>
+                            <td><strong>OpenAI</strong></td>
+                            <td>GPT-4o (Aug 2024+)</td>
+                            <td><span class="badge badge-success">Full Support</span></td>
+                            <td>100% reliability guarantee</td>
+                        </tr>
+                        <tr>
+                            <td><strong>OpenAI</strong></td>
+                            <td>GPT-5, O1/O3</td>
+                            <td><span class="badge badge-success">Full Support</span></td>
+                            <td>Chat Completions API</td>
+                        </tr>
+                        <tr>
+                            <td><strong>OpenAI</strong></td>
+                            <td>O3-Pro, GPT-5 Pro</td>
+                            <td><span class="badge badge-success">Full Support</span></td>
+                            <td>Responses API</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Mistral</strong></td>
+                            <td>3.2 series</td>
+                            <td><span class="badge badge-success">Full Support</span></td>
+                            <td>Via OpenRouter</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h3 class="docs-minor-heading">Example 1: Flexible JSON (Backward Compatible)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "prompt": "Generate a biography of Marie Curie",
+  "generator_model": "grok-4-0709",
+  "json_output": true,
+  "qa_layers": []
+}</code></pre>
+                    <p class="docs-note">Returns valid JSON with any structure. Model decides the format.</p>
+                </div>
+
+                <h3 class="docs-minor-heading">Example 2: Strict Schema Enforcement</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "prompt": "Generate a biography of Marie Curie with structured data",
+  "generator_model": "gemini-2.5-pro",
+  "json_output": true,
+  "json_schema": {
+    "type": "object",
+    "properties": {
+      "full_name": {"type": "string"},
+      "birth_year": {"type": "integer"},
+      "death_year": {"type": "integer"},
+      "biography": {"type": "string"},
+      "achievements": {
+        "type": "array",
+        "items": {"type": "string"}
+      },
+      "awards": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string"},
+            "year": {"type": "integer"}
+          },
+          "required": ["name", "year"]
+        }
+      }
+    },
+    "required": ["full_name", "biography"],
+    "additionalProperties": false
+  },
+  "qa_layers": []
+}</code></pre>
+                    <p class="docs-note">Returns JSON guaranteed to match the schema exactly. Perfect for data extraction and structured information.</p>
+                </div>
+
+                <h3 class="docs-minor-heading">Example 3: Claude with Thinking + JSON (No Schema)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "prompt": "Analyze this complex problem and provide deep insights in JSON format",
+  "generator_model": "claude-sonnet-4-5",
+  "json_output": true,
+  "thinking_budget_tokens": 10000,
+  "qa_layers": []
+}</code></pre>
+                    <p class="docs-note">Uses Claude's thinking mode for deep reasoning, returns flexible JSON format (schema not enforced).</p>
+                </div>
+
+                <h3 class="docs-minor-heading">Example 4: Claude Structured Outputs (Thinking Supported)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "prompt": "Extract key information from this document",
+  "generator_model": "claude-sonnet-4-5",
+  "json_output": true,
+  "json_schema": {
+    "type": "object",
+    "properties": {
+      "summary": {"type": "string"},
+      "key_points": {
+        "type": "array",
+        "items": {"type": "string"}
+      },
+      "confidence": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+      }
+    },
+    "required": ["summary", "key_points"],
+    "additionalProperties": false
+  },
+  "qa_layers": []
+}</code></pre>
+                    <p class="docs-note">Uses Claude Structured Outputs beta (Nov 2025). Thinking mode can be enabled with <code>thinking_budget_tokens</code>; schema enforcement applies to the final JSON, not the thinking blocks.</p>
+                </div>
+
+                <div class="docs-warning-box">
+                    <h4>⚠️ Important Notes</h4>
+                    <ul class="docs-list">
+                        <li><strong>Claude Thinking Compatibility:</strong> Thinking can be combined with json_schema on Sonnet 4.5/Opus 4.1; avoid forcing specific tools with <code>tool_choice</code> when thinking is enabled.</li>
+                        <li><strong>Claude 3.x Models:</strong> Automatically fall back to prompt engineering (no native structured outputs)</li>
+                        <li><strong>Model Version Requirements:</strong> GPT-4o requires snapshot gpt-4o-2024-08-06 or later for json_schema support</li>
+                        <li><strong>OpenRouter Models:</strong> Schema support depends on the underlying provider (Mistral and OpenAI confirmed)</li>
+                    </ul>
+                </div>
+
+                <h3 class="docs-minor-heading">Provider-Specific Implementation</h3>
+                <div class="docs-info-box">
+                    <p><strong>Technical Details:</strong></p>
+                    <ul class="docs-list">
+                        <li><strong>Grok/xAI:</strong> Uses <code>response_format: {type: "json_schema", json_schema: {...}}</code></li>
+                        <li><strong>Gemini:</strong> Uses <code>response_schema</code> parameter in GenerateContentConfig</li>
+                        <li><strong>Claude 4.x:</strong> Uses <code>output_format</code> with header <code>anthropic-beta: structured-outputs-2025-11-13</code></li>
+                        <li><strong>OpenAI Chat Completions:</strong> Uses <code>response_format: {type: "json_schema", json_schema: {...}}</code></li>
+                        <li><strong>OpenAI Responses API (O3-Pro, GPT-5 Pro):</strong> Uses <code>text.format</code> parameter</li>
+                        <li><strong>OpenRouter/Mistral:</strong> Uses <code>response_format: {type: "json_schema", json_schema: {...}}</code></li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- JSON Validation Comparison Section -->
+            <section id="json-validation-comparison" class="docs-section">
+                <h2 class="docs-subheading">JSON Validation: Schema vs Expectations</h2>
+                <p class="docs-lead">
+                    Understand the differences between <code>json_schema</code> and <code>json_expectations</code> to choose the right validation approach for your use case.
+                </p>
+
+                <h3 class="docs-minor-heading">Two Complementary Approaches</h3>
+                <p class="docs-text">
+                    The API provides two distinct methods for JSON validation, each serving different purposes. You can use them independently or combine them for maximum control.
+                </p>
+
+                <div class="docs-comparison">
+                    <div class="comparison-column">
+                        <h4><code>json_schema</code></h4>
+                        <h5>Complete Structure Validation</h5>
+                        <ul class="docs-list">
+                            <li><strong>Sent to AI model</strong> to guide generation</li>
+                            <li><strong>Enforces exact format</strong> (100% guarantee)</li>
+                            <li><strong>Validates complete structure</strong> after generation</li>
+                            <li><strong>Standard JSON Schema</strong> format</li>
+                            <li><strong>Constrained decoding</strong> eliminates errors</li>
+                        </ul>
+                        <div class="docs-note">
+                            <strong>Best for:</strong> Integrations, APIs, guaranteed format compliance
+                        </div>
+                    </div>
+                    <div class="comparison-column">
+                        <h4><code>json_expectations</code></h4>
+                        <h5>Selective Field Validation</h5>
+                        <ul class="docs-list">
+                            <li><strong>NOT sent to AI</strong> (validation only)</li>
+                            <li><strong>Validates specific paths</strong> you care about</li>
+                            <li><strong>Ignores additional fields</strong> not mentioned</li>
+                            <li><strong>Lightweight rules</strong> per field</li>
+                            <li><strong>Flexible structure</strong> allows AI creativity</li>
+                        </ul>
+                        <div class="docs-note">
+                            <strong>Best for:</strong> Dynamic content, critical fields, flexible structures
+                        </div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Comparison Table</h3>
+                <table class="docs-table">
+                    <thead>
+                        <tr>
+                            <th>Aspect</th>
+                            <th><code>json_schema</code></th>
+                            <th><code>json_expectations</code></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Scope</strong></td>
+                            <td>Complete structure</td>
+                            <td>Specific fields only</td>
+                        </tr>
+                        <tr>
+                            <td><strong>AI Generation</strong></td>
+                            <td><span class="badge badge-success">Guides model output</span></td>
+                            <td><span class="badge badge-info">Validation only</span></td>
+                        </tr>
+                        <tr>
+                            <td><strong>Validation</strong></td>
+                            <td>Full structure</td>
+                            <td>Selected paths</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Complexity</strong></td>
+                            <td>High (JSON Schema)</td>
+                            <td>Low (simple rules)</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Flexibility</strong></td>
+                            <td>Strict (exact match)</td>
+                            <td>Flexible (ignores extras)</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Format Guarantee</strong></td>
+                            <td><span class="badge badge-success">100% with supported models</span></td>
+                            <td><span class="badge badge-warning">No generation guarantee</span></td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h3 class="docs-minor-heading">Example 1: Using json_schema (Strict Structure)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "prompt": "Extract contact information from this business card",
+  "generator_model": "gpt-4o",
+  "json_output": true,
+  "json_schema": {
+    "type": "object",
+    "properties": {
+      "nombre": {"type": "string"},
+      "edad": {"type": "integer"},
+      "email": {"type": "string"}
+    },
+    "required": ["nombre", "edad"],
+    "additionalProperties": false
+  },
+  "qa_layers": []
+}</code></pre>
+                    <p class="docs-note">
+                        <strong>Result:</strong> JSON will have EXACTLY these 3 fields, no more, no less. Perfect for integrations that expect exact structure.
+                    </p>
+                </div>
+
+                <h3 class="docs-minor-heading">Example 2: Using json_expectations (Flexible Structure)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "prompt": "Analyze this biography and extract relevant information in JSON format",
+  "generator_model": "gpt-4o",
+  "json_output": true,
+  "json_expectations": [
+    {
+      "path": "$.nombre",
+      "required": true,
+      "type": "string",
+      "min_length": 3
+    },
+    {
+      "path": "$.edad",
+      "required": true,
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 120
+    },
+    {
+      "path": "$.email",
+      "required": false,
+      "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\\\.[a-z]{2,}$"
+    }
+  ],
+  "qa_layers": []
+}</code></pre>
+                    <p class="docs-note">
+                        <strong>Result:</strong> JSON will have AT LEAST <code>nombre</code> and <code>edad</code> fields with specified constraints.
+                        AI can add any additional fields it considers relevant (achievements, dates, locations, etc.). Only specified fields are validated.
+                    </p>
+                </div>
+
+                <h3 class="docs-minor-heading">Available Validation Rules (json_expectations)</h3>
+                <div class="param-table">
+                    <div class="param-row">
+                        <div class="param-name required">path</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">JSONPath to the field (e.g., <code>$.user.email</code>, <code>$.items[*].id</code>)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">required</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Whether the field must exist (default: true)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">type</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Expected data type: <code>"string"</code>, <code>"integer"</code>, <code>"number"</code>, <code>"boolean"</code>, <code>"array"</code>, <code>"object"</code></div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">equals</div>
+                        <div class="param-type">any</div>
+                        <div class="param-desc">Exact value match</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">in</div>
+                        <div class="param-type">array</div>
+                        <div class="param-desc">Value must be in this array (enum validation)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">pattern</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Regex pattern for string validation</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">min_length / max_length</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">String or array length constraints</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">min_items / max_items</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Array size constraints</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">minimum / maximum</div>
+                        <div class="param-type">number</div>
+                        <div class="param-desc">Numeric range constraints</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">allow_empty</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Allow empty strings or arrays</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Example 3: Combining Both (Maximum Control)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "prompt": "Analyze this content and extract structured information",
+  "generator_model": "gemini-2.5-pro",
+  "json_output": true,
+  "json_schema": {
+    "type": "object",
+    "properties": {
+      "tipo_contenido": {"type": "string"},
+      "metadatos": {"type": "object"}
+    },
+    "required": ["tipo_contenido"],
+    "additionalProperties": true
+  },
+  "json_expectations": [
+    {
+      "path": "$.tipo_contenido",
+      "required": true,
+      "in": ["biografia", "novela", "articulo", "ensayo"]
+    },
+    {
+      "path": "$.metadatos",
+      "required": true,
+      "type": "object"
+    }
+  ],
+  "qa_layers": []
+}</code></pre>
+                    <p class="docs-note">
+                        <strong>How it works:</strong>
+                    </p>
+                    <ul class="docs-list">
+                        <li><code>json_schema</code> ensures minimum required structure with <code>additionalProperties: true</code> allowing AI to add extra fields</li>
+                        <li><code>json_expectations</code> adds extra validation rules (enum constraint for <code>tipo_contenido</code>)</li>
+                        <li>AI can add any additional fields beyond the minimum structure</li>
+                        <li>Perfect for dynamic content where structure varies by content type</li>
+                    </ul>
+                </div>
+
+                <h3 class="docs-minor-heading">When to Use Each Approach</h3>
+                <div class="feature-highlight">
+                    <h4>Use <code>json_schema</code> when:</h4>
+                    <ul class="docs-list">
+                        <li>You need 100% format guarantee for integrations</li>
+                        <li>Working with APIs that expect exact structure</li>
+                        <li>Want to eliminate all parsing errors</li>
+                        <li>Need to define the complete data model upfront</li>
+                        <li>Structure is fixed and well-defined</li>
+                    </ul>
+                </div>
+
+                <div class="feature-highlight">
+                    <h4>Use <code>json_expectations</code> when:</h4>
+                    <ul class="docs-list">
+                        <li>You need flexibility in the output structure</li>
+                        <li>Only care about validating specific critical fields</li>
+                        <li>Want AI to decide additional fields dynamically</li>
+                        <li>Structure varies based on content type (biography vs novel vs article)</li>
+                        <li>Need simple validation without full schema complexity</li>
+                    </ul>
+                </div>
+
+                <div class="feature-highlight">
+                    <h4>Use both together when:</h4>
+                    <ul class="docs-list">
+                        <li>Need minimum structure guarantee with flexibility for extras</li>
+                        <li>Want to enforce base schema but allow AI creativity</li>
+                        <li>Require additional validation rules beyond basic schema constraints</li>
+                        <li>Combining strict requirements with dynamic content</li>
+                    </ul>
+                </div>
+
+                <div class="docs-warning-box">
+                    <h4>⚠️ Important Notes</h4>
+                    <ul class="docs-list">
+                        <li><strong>Both require json_output=true:</strong> JSON validation only works when JSON output mode is enabled</li>
+                        <li><strong>Schema influences generation:</strong> Only <code>json_schema</code> is sent to the AI model to guide output format</li>
+                        <li><strong>Expectations are post-validation:</strong> <code>json_expectations</code> only validates after generation, doesn't guide the model</li>
+                        <li><strong>Combine for flexibility:</strong> Use <code>json_schema</code> with <code>additionalProperties: true</code> to allow AI-decided extra fields</li>
+                        <li><strong>Model support:</strong> <code>json_schema</code> native support varies by provider (see <a href="#json-schema-structured-outputs">Structured Outputs</a> section)</li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- JSON Retry Mode Section -->
+            <section id="json-retry" class="docs-section">
+                <h2 class="docs-subheading">JSON Retry Mode</h2>
+                <p class="docs-lead">
+                    Automatic JSON error recovery without consuming your main iteration count.
+                </p>
+
+                <h3 class="docs-minor-heading">Overview</h3>
+                <p class="docs-text">
+                    When generating JSON output, structural syntax errors (missing brackets, commas, quotes) can occur.
+                    By default, each JSON validation failure consumes one iteration. JSON Retry Mode allows the system
+                    to automatically retry and fix these structural issues without exhausting your iteration budget.
+                </p>
+
+                <div class="feature-highlight">
+                    <h4>How It Works</h4>
+                    <ol class="docs-list">
+                        <li>Generator produces content and JSON Guard validates it</li>
+                        <li>If validation fails and retry mode is enabled:
+                            <ul>
+                                <li>System extracts the error details (missing bracket, invalid syntax, etc.)</li>
+                                <li>Regenerates content with error context included in the prompt</li>
+                                <li>This retry does NOT consume a main iteration</li>
+                                <li>Process repeats up to <code>MAX_JSON_RETRY_ATTEMPTS</code> times (default: 2)</li>
+                            </ul>
+                        </li>
+                        <li>If all retries exhausted, then the next main iteration is consumed</li>
+                        <li>All attempts are tracked in <code>json_guard_history</code></li>
+                    </ol>
+                </div>
+
+                <h3 class="docs-minor-heading">Configuration</h3>
+                <div class="param-table">
+                    <div class="param-row">
+                        <div class="param-name">json_retry_without_iteration</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Enable JSON retry mode (default: false)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">MAX_JSON_RETRY_ATTEMPTS</div>
+                        <div class="param-type">env var</div>
+                        <div class="param-desc">Maximum retry attempts per iteration (default: 2)</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Example Usage</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "prompt": "Generate a complex nested JSON structure with user data, settings, and preferences",
+  "content_type": "json",
+  "json_output": true,
+  "json_retry_without_iteration": true,
+  "generator_model": "gpt-4o-mini",
+  "max_iterations": 3,
+  "qa_layers": [],
+  "verbose": true
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Response with Retry History</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "content": "{\"user\": {\"name\": \"Alice\", \"age\": 28}}",
+  "final_iteration": 1,
+  "final_score": 10.0,
+  "approved": true,
+  "json_guard_history": [
+    {
+      "iteration": 1,
+      "retry": 0,
+      "result": {
+        "json_valid": false,
+        "errors": [
+          {"message": "Unexpected end of JSON input"}
+        ],
+        "info": {"source": "raw", "parse_backend": "orjson"}
+      }
+    },
+    {
+      "iteration": 1,
+      "retry": 1,
+      "result": {
+        "json_valid": false,
+        "errors": [
+          {"message": "Expecting ',' delimiter"}
+        ]
+      }
+    },
+    {
+      "iteration": 1,
+      "retry": 2,
+      "result": {
+        "json_valid": true,
+        "data": {
+          "user": {
+            "name": "Alice",
+            "age": 28
+          }
+        }
+      }
+    }
+  ],
+  "json_guard_failures": 2,
+  "generated_at": "2025-10-30T21:00:00.000000"
+}</code></pre>
+                </div>
+
+                <div class="alert alert-info">
+                    <strong>Performance Note:</strong> In the example above, the system made 3 attempts total
+                    (initial + 2 retries) but only consumed iteration 1. Without retry mode, this would have
+                    consumed 3 iterations.
+                </div>
+
+                <h3 class="docs-minor-heading">Benefits</h3>
+                <ul class="docs-list">
+                    <li><strong>Iteration Efficiency:</strong> Use your iterations for content quality, not JSON syntax fixes</li>
+                    <li><strong>Higher Success Rate:</strong> Complex JSON structures have more chances to succeed</li>
+                    <li><strong>Cost Effective:</strong> Fewer failed generations due to simple syntax errors</li>
+                    <li><strong>Full Transparency:</strong> Complete history of all attempts in the response</li>
+                    <li><strong>Configurable:</strong> Control retry count via environment variable</li>
+                </ul>
+
+                <h3 class="docs-minor-heading">When to Use</h3>
+                <ul class="docs-list">
+                    <li>Generating complex nested JSON structures</li>
+                    <li>Working with models that occasionally produce syntax errors</li>
+                    <li>When you have strict iteration limits and need maximum reliability</li>
+                    <li>Production environments where JSON must be valid</li>
+                </ul>
+
+                <div class="alert alert-warning">
+                    <strong>Note:</strong> Traditional mode (retry disabled) is still the default for backward compatibility.
+                    Enable retry mode explicitly with <code>json_retry_without_iteration: true</code> when needed.
+                </div>
+            </section>
+
+            <!-- Error Handling Section -->

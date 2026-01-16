@@ -2,9 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 Repetition Analyzer (exact n-gram repetition analytics with distances, clustering, diagnostics)
-Version: 2.3.2
+Version: 2.3.3
 Author: ChatGPT (GPT-5 Pro)
 License: MIT
+
+What's new in 2.3.3
+-------------------
+- Feature: Added stopword filtering support via 'language' and 'filter_stop_words' config options.
+  When enabled, stopwords are excluded from summaries (top_by_count, top_by_ratio).
+  For n=1, pure stopwords are filtered. For n>1, phrases starting or ending with stopwords are filtered.
+- New meta fields: language_hint, stop_words_filtered, stop_words_count.
 
 What's new in 2.3.2
 -------------------
@@ -40,6 +47,8 @@ from collections import Counter, defaultdict
 import hashlib
 
 from multiprocessing import get_context
+
+from tools.stopwords_utils import get_stopwords_for_language, resolve_language_hint
 
 # Optional psutil for physical core detection (best effort)
 try:
@@ -722,6 +731,10 @@ class AnalysisConfig:
     paragraph_break_min_blank_lines: int = 1  # 1 => \n\n separates paragraphs
     block_break_min_blank_lines: int = 2      # 2 => >=2 blank lines ~ "chapter/block"
 
+    # Stopword filtering
+    language: Optional[str] = None         # ISO language hint for stop-word filtering (e.g., 'es', 'en')
+    filter_stop_words: bool = False        # Filter stop words from summaries
+
 # -----------------------------
 # Normalization & validation
 # -----------------------------
@@ -1014,6 +1027,20 @@ def analyze_text(text: str, cfg: AnalysisConfig) -> Dict[str, Any]:
     # Punctuation filtering
     counts_by_n = filter_counts_by_punct_policy(counts_by_n, cfg.punct_policy)
 
+    # Stopword filtering (for summaries)
+    canonical_language = resolve_language_hint(cfg.language)
+    stop_words = get_stopwords_for_language(cfg.language, cfg.filter_stop_words)
+    stop_words_applied = bool(stop_words)
+
+    def is_stopword_phrase(tup: Tuple[str, ...]) -> bool:
+        """Return True if the phrase is entirely stopwords (for n=1) or starts/ends with stopword."""
+        if not stop_words:
+            return False
+        if len(tup) == 1:
+            return tup[0] in stop_words
+        # For n>1, filter if first or last token is a stopword
+        return tup[0] in stop_words or tup[-1] in stop_words
+
     checksum_md5 = compute_md5_for_counts(counts_by_n)
 
     # Build summaries (according to summary_mode)
@@ -1025,6 +1052,9 @@ def analyze_text(text: str, cfg: AnalysisConfig) -> Dict[str, Any]:
 
     for n, d in counts_by_n.items():
         items = list(d.items())
+        # Apply stopword filtering if enabled
+        if stop_words_applied:
+            items = [(k, v) for k, v in items if not is_stopword_phrase(k)]
 
         if include_counts:
             ranked_counts = sorted(items, key=lambda kv: (-kv[1], phrase_tuple_to_text(kv[0])))
@@ -1347,7 +1377,7 @@ def analyze_text(text: str, cfg: AnalysisConfig) -> Dict[str, Any]:
 
     # Compose output
     result_full: Dict[str, Any] = {
-        "version": "2.3.2",
+        "version": "2.3.3",
         "meta": {
             "total_tokens": total_tokens,
             "total_chars": total_chars,
@@ -1363,6 +1393,9 @@ def analyze_text(text: str, cfg: AnalysisConfig) -> Dict[str, Any]:
             "workers_used": workers_used,
             "core_policy": cfg.core_policy,
             "punct_policy": cfg.punct_policy,
+            "language_hint": canonical_language or cfg.language,
+            "stop_words_filtered": cfg.filter_stop_words and stop_words_applied,
+            "stop_words_count": len(stop_words) if stop_words_applied else 0,
             "checksum_md5": checksum_md5,
             "config_warnings": cfg_warnings,
         },
