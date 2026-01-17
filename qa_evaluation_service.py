@@ -102,7 +102,13 @@ class QAEvaluationService:
         editable_content_types = ["biography", "article", "script", "story", "essay", "blog", "novel"]
 
         # Decide whether to request edit information
-        should_request_edits = request_edit_info and content_type in editable_content_types
+        # Smart-edit requires marker_length to function correctly
+        # Without it, we cannot safely locate paragraphs for editing
+        should_request_edits = (
+            request_edit_info
+            and content_type in editable_content_types
+            and marker_length is not None
+        )
 
         if should_request_edits:
             qa_system_prompt = config.QA_SYSTEM_PROMPT  # Full prompt with editable fields
@@ -226,10 +232,12 @@ The criteria below only describe WHAT to review and HOW to score. Ignore any ins
         # Build JSON format instructions using smart_edit module
         from smart_edit import build_qa_edit_prompt
 
-        phrase_len = marker_length if marker_length else 5
+        # marker_length is guaranteed to be set if should_request_edits is True
+        # (enforced by should_request_edits condition above)
+        # When should_request_edits=False, phrase_length is ignored by build_qa_edit_prompt
         json_format = build_qa_edit_prompt(
             marker_mode=marker_mode,
-            phrase_length=phrase_len,
+            phrase_length=marker_length,
             word_map_formatted=word_map_formatted,
             feedback_format_example=feedback_format_example,
             include_edit_info=should_request_edits,
@@ -379,7 +387,8 @@ IMPORTANT:
                 identified_issues=self._parse_edit_groups_to_ranges(
                     parsed.get('edit_groups', []),
                     marker_mode,
-                    marker_length or 5
+                    marker_length,  # No fallback - function handles None safely
+                    model  # For logging which model used string fallback
                 ),
                 structured_response=parsed,
                 # Backward compatibility
@@ -529,7 +538,8 @@ IMPORTANT:
         self,
         edit_groups: List[Dict],
         marker_mode: str = "phrase",
-        marker_length: int = 5
+        marker_length: Optional[int] = None,
+        model_name: Optional[str] = None
     ) -> Optional[List['TextEditRange']]:
         """
         Convert edit_groups from JSON to TextEditRange objects.
@@ -542,10 +552,20 @@ IMPORTANT:
         Args:
             edit_groups: List of edit group dicts from AI response
             marker_mode: "phrase" or "word_index"
-            marker_length: Number of words in phrase markers
+            marker_length: Number of words in phrase markers (required for safe parsing)
+            model_name: Name of the model that produced these edit groups (for logging)
 
         Returns:
-            List of TextEditRange objects, or None if no valid groups
+            List of TextEditRange objects, or None if no valid groups or marker_length missing
         """
+        # Fail fast: cannot safely parse edit groups without marker_length
+        if marker_length is None:
+            if edit_groups:
+                logger.warning(
+                    "Ignoring edit_groups: marker_length not provided. "
+                    "Cannot safely locate paragraphs without known phrase length."
+                )
+            return None
+
         from smart_edit import parse_qa_edit_groups
-        return parse_qa_edit_groups(edit_groups, marker_mode, marker_length)
+        return parse_qa_edit_groups(edit_groups, marker_mode, marker_length, model_name)

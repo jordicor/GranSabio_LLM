@@ -972,7 +972,8 @@ def _group_edits_by_paragraph(
 def _locate_edit_segment(
     text: str,
     edit: "TextEditRange",
-    word_map: Optional[List[Dict[str, Any]]] = None
+    word_map: Optional[List[Dict[str, Any]]] = None,
+    phrase_length: Optional[int] = None
 ) -> Optional[tuple]:
     """
     Locate a text segment based on TextEditRange.
@@ -981,6 +982,7 @@ def _locate_edit_segment(
         text: Full content text
         edit: TextEditRange with markers or indices
         word_map: Word map for word_index mode
+        phrase_length: Number of words in phrase markers (required for phrase mode)
 
     Returns:
         Tuple of (start_pos, end_pos) or None
@@ -997,11 +999,16 @@ def _locate_edit_segment(
             logger.warning("Word index mode requested but no word_map provided")
             return None
     else:
-        # Phrase marker mode
+        # Phrase marker mode - requires phrase_length for safe operation
+        if phrase_length is None:
+            logger.warning("Phrase mode requested but no phrase_length provided")
+            return None
+
         return locate_by_markers(
             text,
             edit.paragraph_start or "",
-            edit.paragraph_end or ""
+            edit.paragraph_end or "",
+            expected_phrase_length=phrase_length
         )
 
 
@@ -1750,10 +1757,11 @@ async def _process_single_layer_with_edits(
         # Validate edit markers
         marker_config = session.get('marker_config', {})
         word_map = marker_config.get('word_map')
+        phrase_length = marker_config.get('phrase_length')
 
         valid_edits = []
         for edit in edits_to_apply:
-            span = _locate_edit_segment(content, edit, word_map)
+            span = _locate_edit_segment(content, edit, word_map, phrase_length)
             if span:
                 valid_edits.append(edit)
             else:
@@ -2196,9 +2204,10 @@ async def _generate_smart_edits(
         logger.info(f"[CONTENT PREVIEW - BEFORE EDIT]\n{content[:500]}{'...' if len(content) > 500 else ''}")
         logger.info("")
 
-        # Get word_map from marker config (if using word_index mode)
+        # Get marker config for paragraph location
         marker_config = session.get('marker_config', {})
         word_map = marker_config.get('word_map')
+        phrase_length = marker_config.get('phrase_length')
 
         # Determine marker mode from first edit range
         marker_mode = "phrase"
@@ -2228,7 +2237,7 @@ async def _generate_smart_edits(
         sorted_paragraphs = []
         for paragraph_key, paragraph_edits in edits_by_paragraph.items():
             first_edit = paragraph_edits[0]
-            span = _locate_edit_segment(content, first_edit, word_map)
+            span = _locate_edit_segment(content, first_edit, word_map, phrase_length)
             if span:
                 start_pos, _ = span
                 sorted_paragraphs.append((start_pos, paragraph_key, paragraph_edits))
@@ -2252,7 +2261,7 @@ async def _generate_smart_edits(
         # Apply edits with fail-fast behavior
         for span_start_original, paragraph_key, paragraph_edits in sorted_paragraphs:
             first_edit = paragraph_edits[0]
-            span = _locate_edit_segment(edited_content, first_edit, word_map)
+            span = _locate_edit_segment(edited_content, first_edit, word_map, phrase_length)
 
             if not span:
                 # Fail-fast: if we can't find a paragraph, raise error

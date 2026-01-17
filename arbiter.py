@@ -13,7 +13,7 @@ The actual Arbiter class implementation will be added in Phase 2.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, TYPE_CHECKING
+from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 from enum import Enum
 from pydantic import BaseModel, Field
 
@@ -33,6 +33,8 @@ class ConflictType(str, Enum):
     SEVERITY_MISMATCH = "severity_mismatch"          # critical vs minor
     SEMANTIC_REDUNDANCY = "semantic_redundancy"      # Same intent, different words
     CYCLE_DETECTED = "cycle_detected"                # Previously discarded edit
+    STALE_FRAGMENT = "stale_fragment"                # exact_fragment no longer in content
+    ALREADY_APPLIED = "already_applied"              # suggested_text already matches content
 
 
 class ArbiterDecision(str, Enum):
@@ -600,6 +602,91 @@ class Arbiter:
             groups[key].append(pe)
         return groups
 
+    def _filter_stale_edits(
+        self,
+        proposed_edits: List[ProposedEdit],
+        current_content: str
+    ) -> Tuple[List[ProposedEdit], List[Dict[str, Any]]]:
+        """
+        Filter out stale edits that are no longer applicable to current content.
+
+        An edit is stale if:
+        - STALE_FRAGMENT: exact_fragment no longer exists in content (was already modified)
+        - ALREADY_APPLIED: suggested_text already matches content at the target location
+
+        This prevents wasted AI calls and potential corruption from applying edits
+        that reference outdated content state.
+
+        Args:
+            proposed_edits: List of proposed edits to filter
+            current_content: Current content after previous edits
+
+        Returns:
+            Tuple of (valid_edits, discarded_edits_info)
+        """
+        valid_edits = []
+        discarded_info = []
+
+        for pe in proposed_edits:
+            edit = pe.edit
+
+            # Get exact_fragment and suggested_text from edit
+            exact_fragment = getattr(edit, 'exact_fragment', None) or ""
+            suggested_text = getattr(edit, 'new_content', None)
+
+            # Skip edits without exact_fragment (can't verify staleness)
+            if not exact_fragment:
+                valid_edits.append(pe)
+                continue
+
+            # Check 1: Does exact_fragment still exist in content?
+            if exact_fragment not in current_content:
+                self._logger.info(
+                    f"Stale edit detected (STALE_FRAGMENT): '{exact_fragment[:40]}...' "
+                    f"no longer in content [model: {pe.source_model}]"
+                )
+                discarded_info.append({
+                    "edit_type": edit.edit_type.value if hasattr(edit, 'edit_type') else "unknown",
+                    "source_model": pe.source_model,
+                    "reason": f"STALE_FRAGMENT: exact_fragment no longer exists in content",
+                    "paragraph_key": pe.paragraph_key[:80],
+                    "conflict_type": ConflictType.STALE_FRAGMENT.value
+                })
+                continue
+
+            # Check 2: Is suggested_text already in place? (for REPLACE operations)
+            if suggested_text is not None:
+                # Find where exact_fragment is and check if surrounding context
+                # already has the suggested_text
+                fragment_pos = current_content.find(exact_fragment)
+                if fragment_pos != -1:
+                    # Check if suggested_text is already at this position
+                    # (meaning the edit was already applied or content matches)
+                    if exact_fragment == suggested_text:
+                        self._logger.info(
+                            f"Stale edit detected (ALREADY_APPLIED): suggested_text equals "
+                            f"exact_fragment [model: {pe.source_model}]"
+                        )
+                        discarded_info.append({
+                            "edit_type": edit.edit_type.value if hasattr(edit, 'edit_type') else "unknown",
+                            "source_model": pe.source_model,
+                            "reason": f"ALREADY_APPLIED: suggested_text equals exact_fragment (noop)",
+                            "paragraph_key": pe.paragraph_key[:80],
+                            "conflict_type": ConflictType.ALREADY_APPLIED.value
+                        })
+                        continue
+
+            # Edit is valid
+            valid_edits.append(pe)
+
+        if discarded_info:
+            self._logger.info(
+                f"Filtered {len(discarded_info)} stale edit(s), "
+                f"{len(valid_edits)} valid edit(s) remaining"
+            )
+
+        return valid_edits, discarded_info
+
     def _detect_opposite_operations(
         self,
         edits: List[ProposedEdit],
@@ -851,11 +938,27 @@ class Arbiter:
             elif hasattr(pe.edit, 'edit_instruction') and pe.edit.edit_instruction:
                 desc = pe.edit.edit_instruction[:100]
 
-            lines.append(
+            # Get exact_fragment and suggested_text for verification
+            exact_fragment = getattr(pe.edit, 'exact_fragment', None) or ""
+            suggested_text = getattr(pe.edit, 'new_content', None)
+
+            # Build edit info with fragment details
+            edit_info = (
                 f"[{i}] {op.upper()} (severity={sev}) by {pe.source_model}\n"
                 f"    Paragraph: {pe.paragraph_key[:60]}...\n"
                 f"    Description: {desc}"
             )
+
+            # Add fragment details if available (truncate for prompt size)
+            if exact_fragment:
+                fragment_preview = exact_fragment[:80] + ("..." if len(exact_fragment) > 80 else "")
+                edit_info += f"\n    Find: \"{fragment_preview}\""
+
+            if suggested_text is not None:
+                suggested_preview = suggested_text[:80] + ("..." if len(suggested_text) > 80 else "")
+                edit_info += f"\n    Replace with: \"{suggested_preview}\""
+
+            lines.append(edit_info)
 
         return "\n\n".join(lines)
 
@@ -973,7 +1076,7 @@ class Arbiter:
                 system_prompt=ARBITER_SYSTEM_PROMPT,
                 max_tokens=config.ARBITER_MAX_TOKENS,
                 temperature=config.ARBITER_TEMPERATURE,
-                response_format={"type": "json_object"}
+                json_output=True
             )
 
             # Parse JSON response
@@ -981,12 +1084,7 @@ class Arbiter:
 
         except Exception as e:
             self._logger.error(f"Arbiter AI call failed: {e}")
-            # Return empty response - will fall back to algorithmic resolution
-            return {
-                "reasoning": f"AI resolution failed: {str(e)}",
-                "decisions": [],
-                "conflicts_resolved": []
-            }
+            raise RuntimeError(f"Arbiter AI call failed: {e}") from e
 
     def _parse_ai_response_json(self, response: str) -> Dict[str, Any]:
         """
@@ -1084,76 +1182,6 @@ class Arbiter:
 
         return decisions
 
-    def _resolve_algorithmically(
-        self,
-        proposed_edits: List[ProposedEdit],
-        conflicts: List[ConflictInfo]
-    ) -> List[ArbiterEditDecision]:
-        """
-        Resolve conflicts without AI using algorithmic rules.
-
-        This is used when AI is not needed (no conflicts) or as fallback.
-
-        Rules:
-        1. Higher severity wins
-        2. DELETE wins over MODIFY (safer to remove than change incorrectly)
-        3. First proposer wins for redundancy
-
-        Args:
-            proposed_edits: All proposed edits
-            conflicts: Detected conflicts
-
-        Returns:
-            List of ArbiterEditDecision objects
-        """
-        decisions: List[ArbiterEditDecision] = []
-        processed_paragraphs: Dict[str, ArbiterEditDecision] = {}
-
-        # Build conflict map
-        conflicted_paragraphs: set = set()
-        for conflict in conflicts:
-            conflicted_paragraphs.add(conflict.paragraph_key)
-
-        # Sort edits by severity (higher first) and confidence
-        severity_order = {"critical": 3, "major": 2, "minor": 1}
-        sorted_edits = sorted(
-            proposed_edits,
-            key=lambda pe: (
-                severity_order.get(
-                    pe.edit.issue_severity.value if hasattr(pe.edit, 'issue_severity') else "minor",
-                    1
-                ),
-                getattr(pe.edit, 'confidence', 1.0)
-            ),
-            reverse=True
-        )
-
-        for pe in sorted_edits:
-            key = pe.paragraph_key
-
-            if key in processed_paragraphs:
-                # Already processed - this is a conflicting edit
-                decisions.append(ArbiterEditDecision(
-                    edit=pe.edit,
-                    decision=ArbiterDecision.DISCARD,
-                    reason=f"Conflict with higher-priority edit from {processed_paragraphs[key].source_model}",
-                    source_model=pe.source_model,
-                    conflict_resolved=None
-                ))
-            else:
-                # First edit for this paragraph - apply it
-                decision = ArbiterEditDecision(
-                    edit=pe.edit,
-                    decision=ArbiterDecision.APPLY,
-                    reason="Highest priority edit for this paragraph",
-                    source_model=pe.source_model,
-                    conflict_resolved=None
-                )
-                decisions.append(decision)
-                processed_paragraphs[key] = decision
-
-        return decisions
-
     # =========================================================================
     # MAIN ARBITRATION METHOD
     # =========================================================================
@@ -1196,6 +1224,24 @@ class Arbiter:
                 model_used=""
             )
 
+        # Filter stale edits (exact_fragment missing or suggested_text already applied)
+        proposed_edits, stale_discarded = self._filter_stale_edits(
+            proposed_edits, context.current_content
+        )
+
+        # If all edits were stale, nothing left to do
+        if not proposed_edits:
+            return ArbiterResult(
+                edits_to_apply=[],
+                edits_discarded=stale_discarded,
+                conflicts_found=0,
+                conflicts_resolved=0,
+                arbiter_reasoning="All proposed edits were stale (fragments no longer in content)",
+                distribution=EditDistribution.CONSENSUS.value,
+                escalated_to_gran_sabio=False,
+                model_used=""
+            )
+
         # Detect conflicts
         conflicts = self._detect_conflicts(proposed_edits, context.layer_history)
         num_conflicts = len(conflicts)
@@ -1215,25 +1261,25 @@ class Arbiter:
             f"distribution={distribution.value}, model={selected_model}, escalated={escalated}"
         )
 
-        # ALWAYS call AI to verify edits (no passthrough)
+        # ALWAYS call AI to verify edits (no passthrough, no fallback)
         self._logger.info(f"Verifying {len(proposed_edits)} edit(s) with AI ({selected_model})...")
         ai_response = await self._resolve_with_ai(context, conflicts, distribution, selected_model)
 
-        if ai_response.get("decisions"):
-            # Parse AI response
-            decisions = self._parse_arbiter_response(
-                ai_response, proposed_edits, conflicts
-            )
-            reasoning = ai_response.get("reasoning", "AI-verified edits")
-        else:
-            # AI failed - fall back to algorithmic
-            self._logger.warning("AI verification failed, using algorithmic fallback")
-            decisions = self._resolve_algorithmically(proposed_edits, conflicts)
-            reasoning = "Algorithmic resolution (AI fallback)"
+        if not ai_response.get("decisions"):
+            # AI returned no decisions - fail fast to avoid corrupting text with unresolved conflicts
+            error_msg = ai_response.get("reasoning", "AI returned no decisions")
+            self._logger.error(f"Arbiter AI verification failed: {error_msg}")
+            raise RuntimeError(f"Arbiter cannot resolve edits: {error_msg}")
+
+        # Parse AI response
+        decisions = self._parse_arbiter_response(
+            ai_response, proposed_edits, conflicts
+        )
+        reasoning = ai_response.get("reasoning", "AI-verified edits")
 
         # Build result
         edits_to_apply = [d.edit for d in decisions if d.decision == ArbiterDecision.APPLY]
-        edits_discarded = [
+        ai_discarded = [
             {
                 "edit_type": d.edit.edit_type.value if hasattr(d.edit, 'edit_type') else "unknown",
                 "source_model": d.source_model,
@@ -1242,6 +1288,8 @@ class Arbiter:
             }
             for d in decisions if d.decision != ArbiterDecision.APPLY
         ]
+        # Combine stale edits (filtered early) with AI-discarded edits
+        edits_discarded = stale_discarded + ai_discarded
 
         # Build round record for history
         round_record = {

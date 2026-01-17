@@ -63,8 +63,8 @@ RESPONSE FORMAT - RETURN VALID JSON ONLY:
   "edit_strategy": <"incremental"|"regenerate"|null>,
   "edit_groups": [
     {{
-      "paragraph_start": {{"1": "<word1>", "2": "<word2>", "3": "<word3>", ...}},
-      "paragraph_end": {{"1": "<word1>", "2": "<word2>", "3": "<word3>", ...}},
+      "paragraph_start": {{"1": "<word1>", "2": "<word2>", ..., "{phrase_length}": "<word{phrase_length}>"}},
+      "paragraph_end": {{"1": "<word1>", "2": "<word2>", ..., "{phrase_length}": "<word{phrase_length}>"}},
       "operation_type": "<delete|replace|rephrase|add_before|add_after>",
       "instruction": "<what to fix>",
       "severity": "<minor|major|critical>",
@@ -74,17 +74,35 @@ RESPONSE FORMAT - RETURN VALID JSON ONLY:
   ]
 }}
 
-PHRASE FORMAT (CRITICAL - copy tokens exactly as they appear):
-- A "token" is ANY whitespace-separated sequence including attached punctuation and formatting.
-- paragraph_start: Object with the FIRST {phrase_length} tokens of the paragraph.
-  Each KEY is the position ("1", "2", ...) and VALUE is the token.
-- paragraph_end: Object with the LAST {phrase_length} tokens of the paragraph.
-  Each KEY is the position ("1", "2", ...) and VALUE is the token.
-- Copy each token CHARACTER-FOR-CHARACTER exactly as it appears, including:
-  - Attached punctuation: "word." "word," "word?" "word:" "(word)"
-  - Markdown formatting: "**bold**" "*italic*" "~~text~~"
-  - Special markers: "{{{{placeholder}}}}" "[link]"
-- If a paragraph has fewer than {phrase_length} tokens, use ALL tokens for both (numbered 1 to N)
+⚠️ NUMBERED WORD COUNTING - STRICT REQUIREMENT (NON-COMPLIANCE = REJECTED RESPONSE):
+
+paragraph_start and paragraph_end MUST be JSON objects with EXACTLY {phrase_length} numbered string keys.
+
+WHY THIS IS MANDATORY:
+- The system uses these anchors for find-and-replace; texts often contain repeated phrases
+- Only a FULL {phrase_length}-word sequence is unique enough to locate the correct paragraph
+- Fewer words = ambiguous match = text replaced in WRONG location = corrupted document
+- LLMs consistently lose count when listing >5 words in sequence
+- Numbering each key ("1", "2", "3"...) forces word-by-word counting and serves as self-verification
+
+FORMAT:
+paragraph_start: {{"1": "first", "2": "second", "3": "third", ..., "{phrase_length}": "Nth"}}
+paragraph_end: {{"1": "first", "2": "second", "3": "third", ..., "{phrase_length}": "Nth"}}
+
+- Count explicitly from "1" to "{phrase_length}" — no skipping, no grouping multiple words
+- A "token" = any whitespace-separated unit, INCLUDING attached punctuation/formatting
+- Copy CHARACTER-FOR-CHARACTER: "word." "**bold**" "(text)" "word," are each ONE token
+
+EXAMPLE (phrase_length={phrase_length}):
+If paragraph starts with: "**Chapter 1.** The adventure begins here today"
+✓ CORRECT: {{"1": "**Chapter", "2": "1.**", "3": "The", "4": "adventure", "5": "begins", "6": "here", "7": "today"}}
+✗ REJECTED: {{"1": "**Chapter 1.** The"}} — grouped words, missing numbered keys
+✗ REJECTED: "**Chapter 1.** The adventure" — string instead of object, no numbering
+✗ REJECTED: {{"1": "Chapter", "2": "1", "3": "The"}} — only 3 words when {phrase_length} required
+
+If paragraph has fewer than {phrase_length} tokens, use ALL available tokens (numbered 1 to N).
+
+⚠️ Responses failing this format are automatically discarded. Count as you write: 1, 2, 3... up to {phrase_length}.
 
 OPERATION TYPES:
 - "delete": Remove the exact_fragment entirely (no AI needed if exact_fragment provided)
@@ -92,13 +110,6 @@ OPERATION TYPES:
 - "rephrase": AI rewrites the paragraph maintaining meaning
 - "add_before": AI adds content before the fragment
 - "add_after": AI adds content after the fragment
-
-EXAMPLE for {phrase_length} tokens:
-If first {phrase_length} tokens are: "**Chapter 1.** The adventure"
-paragraph_start: {{"1": "**Chapter", "2": "1.**", "3": "The", "4": "adventure"}}  (for phrase_length=4)
-
-If last {phrase_length} tokens are: "the story continues. --End"
-paragraph_end: {{"1": "the", "2": "story", "3": "continues.", "4": "--End"}}  (for phrase_length=4)
 
 DEAL-BREAKER vs EDITS (CRITICAL):
 - If deal_breaker=true: set editable=false, edit_strategy=null, edit_groups=[]
@@ -355,6 +366,7 @@ def parse_qa_edit_groups(
     edit_groups: List[Dict[str, Any]],
     marker_mode: str = "phrase",
     marker_length: int = 5,
+    model_name: Optional[str] = None,
 ) -> Optional[List[TextEditRange]]:
     """
     Convert edit_groups from QA AI response to TextEditRange objects.
@@ -369,6 +381,7 @@ def parse_qa_edit_groups(
         edit_groups: List of edit group dicts from AI response
         marker_mode: "phrase" or "word_index"
         marker_length: Number of words in phrase markers (for phrase mode)
+        model_name: Name of the model that produced these edit groups (for logging)
 
     Returns:
         List of TextEditRange objects, or None if no valid groups
@@ -455,10 +468,10 @@ def parse_qa_edit_groups(
 
                 # Extract phrases using the counted phrase parser
                 paragraph_start = extract_phrase_from_response(
-                    raw_start, marker_length, "paragraph_start"
+                    raw_start, marker_length, "paragraph_start", model_name
                 )
                 paragraph_end = extract_phrase_from_response(
-                    raw_end, marker_length, "paragraph_end"
+                    raw_end, marker_length, "paragraph_end", model_name
                 )
 
                 # Skip if we couldn't parse the phrases

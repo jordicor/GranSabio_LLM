@@ -202,10 +202,11 @@ def validate_counted_phrase_format(
 def extract_phrase_from_response(
     data: Any,
     expected_count: int,
-    field_name: str = "phrase"
+    field_name: str = "phrase",
+    model_name: Optional[str] = None
 ) -> Optional[str]:
     """
-    Extract phrase from AI response in counted format.
+    Extract phrase from AI response in counted format, with string fallback.
 
     The counted format forces AIs to write the position number first,
     then the word, significantly reducing word-counting errors.
@@ -213,24 +214,48 @@ def extract_phrase_from_response(
 
     Format: {"1": "word1", "2": "word2", "3": "word3", ...}
 
+    Some models (e.g., GPT-5.2) may ignore instructions and return plain
+    strings instead. As a fallback, if a string has >= expected_count words,
+    we accept it directly.
+
     Args:
-        data: The phrase dict from AI response
+        data: The phrase dict from AI response (or string as fallback)
         expected_count: Expected number of words
         field_name: Field name for logging purposes
+        model_name: Name of the model that produced this response (for logging)
 
     Returns:
         Extracted phrase string, or None if invalid
     """
-    if not isinstance(data, dict):
-        logger.warning(f"{field_name}: expected dict, got {type(data).__name__}")
+    # Primary path: dict with counted format
+    if isinstance(data, dict):
+        phrase = parse_counted_phrase(data, expected_count)
+        if phrase:
+            logger.debug(f"Parsed {field_name}: {len(phrase.split())} words")
+            return phrase
+        logger.debug(f"Failed to parse {field_name} from counted format")
         return None
 
-    phrase = parse_counted_phrase(data, expected_count)
-    if phrase:
-        logger.debug(f"Parsed {field_name}: {len(phrase.split())} words")
-        return phrase
+    # Fallback: some models return plain strings instead of counted dicts
+    if isinstance(data, str) and data.strip():
+        words = data.split()
+        word_count = len(words)
+        model_info = f" [model: {model_name}]" if model_name else ""
+        if word_count >= expected_count:
+            logger.info(
+                f"{field_name}: fallback from string accepted "
+                f"({word_count} words >= {expected_count} expected){model_info}"
+            )
+            return data.strip()
+        else:
+            logger.warning(
+                f"{field_name}: string fallback rejected - "
+                f"only {word_count} words, need >= {expected_count}{model_info}"
+            )
+            return None
 
-    logger.debug(f"Failed to parse {field_name} from counted format")
+    # Neither dict nor valid string
+    logger.warning(f"{field_name}: expected dict, got {type(data).__name__}")
     return None
 
 
@@ -482,14 +507,17 @@ def locate_by_markers(
         end = {"1": "lazy", "2": "dog."}
         locate_by_markers(text, start, end, expected_phrase_length=3)  # Returns (0, 44)
     """
-    # Extract phrase strings from counted format
-    phrase_len = expected_phrase_length or 64  # Default max for validation
+    # Fail fast: expected_phrase_length is required for safe marker validation
+    if expected_phrase_length is None:
+        logger.warning("locate_by_markers called without expected_phrase_length")
+        return None
 
+    # Extract phrase strings from counted format
     start_phrase = extract_phrase_from_response(
-        paragraph_start, phrase_len, "paragraph_start"
+        paragraph_start, expected_phrase_length, "paragraph_start"
     )
     end_phrase = extract_phrase_from_response(
-        paragraph_end, phrase_len, "paragraph_end"
+        paragraph_end, expected_phrase_length, "paragraph_end"
     )
 
     if not start_phrase or not end_phrase:

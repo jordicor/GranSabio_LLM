@@ -523,6 +523,12 @@ class SmartTextEditor:
             replacements_made += 1
             offset += len(new) - len(old_text)
 
+            # POSITION mode: single replacement at fixed location, exit immediately
+            # Without this, the loop would run infinitely because locate() always
+            # returns the same valid position for POSITION mode targets
+            if isinstance(target, TextTarget) and target.mode == TargetMode.POSITION:
+                break
+
             # For exact matches with occurrence=1, we're done after one
             if (
                 isinstance(target, TextTarget)
