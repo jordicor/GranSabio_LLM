@@ -702,7 +702,7 @@ async def get_status(session_id: str):
         "status": session["status"].value,
         "current_iteration": session["current_iteration"],
         "max_iterations": session["max_iterations"],
-        "verbose_log": session["verbose_log"][-10:],  # Last 10 entries
+        "verbose_log": session["verbose_log"][-100:],  # Last 100 entries
         "created_at": session["created_at"].isoformat(),
         "gran_sabio_escalations": {
             "total_count": len(escalations),

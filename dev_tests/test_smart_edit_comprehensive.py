@@ -541,9 +541,10 @@ def test_smart_edit_direct_operations_preserve_other_text():
 def test_smart_edit_locate_simple_phrase():
     """Test basic phrase location."""
     text = "The quick brown fox jumps over the lazy dog."
+    # Need at least 3 words for expected_phrase_length=3
     start_dict = {"1": "The", "2": "quick", "3": "brown"}
-    end_dict = {"1": "lazy", "2": "dog."}
-    result = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=5)
+    end_dict = {"1": "the", "2": "lazy", "3": "dog."}
+    result = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=3)
 
     if result is None:
         return False, "Failed to locate phrase"
@@ -556,10 +557,11 @@ def test_smart_edit_locate_simple_phrase():
 
 def test_smart_edit_locate_partial_phrase():
     """Test locating a partial segment."""
-    text = "First paragraph here. Second paragraph follows. Third paragraph ends."
-    start_dict = {"1": "Second", "2": "paragraph"}
-    end_dict = {"1": "paragraph", "2": "follows."}
-    result = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=5)
+    text = "First paragraph here. Second paragraph follows nicely. Third paragraph ends."
+    # Need at least 3 words
+    start_dict = {"1": "Second", "2": "paragraph", "3": "follows"}
+    end_dict = {"1": "paragraph", "2": "follows", "3": "nicely."}
+    result = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=3)
 
     if result is None:
         return False, "Failed to locate phrase"
@@ -572,10 +574,11 @@ def test_smart_edit_locate_partial_phrase():
 
 def test_smart_edit_locate_case_insensitive():
     """Test case-insensitive phrase location."""
-    text = "THE QUICK BROWN FOX."
-    start_dict = {"1": "the", "2": "quick"}
-    end_dict = {"1": "brown", "2": "fox."}
-    result = locate_by_markers(text, start_dict, end_dict, case_sensitive=False, expected_phrase_length=5)
+    text = "THE QUICK BROWN FOX JUMPS."
+    # Need at least 3 words
+    start_dict = {"1": "the", "2": "quick", "3": "brown"}
+    end_dict = {"1": "brown", "2": "fox", "3": "jumps."}
+    result = locate_by_markers(text, start_dict, end_dict, case_sensitive=False, expected_phrase_length=3)
 
     if result is None:
         return False, "Failed to locate phrase (case insensitive)"
@@ -584,10 +587,11 @@ def test_smart_edit_locate_case_insensitive():
 
 def test_smart_edit_locate_with_punctuation():
     """Test phrase location with punctuation."""
-    text = '"Hello," said John. "How are you?"'
-    start_dict = {"1": '"Hello,"', "2": "said"}
-    end_dict = {"1": "are", "2": 'you?"'}
-    result = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=5)
+    text = '"Hello," said John politely. "How are you today?"'
+    # Need at least 3 words
+    start_dict = {"1": '"Hello,"', "2": "said", "3": "John"}
+    end_dict = {"1": "are", "2": "you", "3": 'today?"'}
+    result = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=3)
 
     if result is None:
         return False, "Failed to locate phrase with punctuation"
@@ -608,11 +612,11 @@ def test_smart_edit_locate_with_counted_format():
     """Test phrase location with counted phrase format."""
     text = "The quick brown fox jumps over the lazy dog."
 
-    # New format: position as key, word as value
+    # New format: position as key, word as value (need at least 3 words)
     start_dict = {"1": "The", "2": "quick", "3": "brown"}
-    end_dict = {"1": "lazy", "2": "dog."}
+    end_dict = {"1": "the", "2": "lazy", "3": "dog."}
 
-    result = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=5)
+    result = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=3)
 
     if result is None:
         return False, "Failed to locate with counted format"
@@ -621,11 +625,11 @@ def test_smart_edit_locate_with_counted_format():
 
 def test_smart_edit_locate_with_duplicate_words():
     """Test phrase location with duplicate words (the main reason for the new format)."""
-    text = "the cat saw the dog and the cat ran away"
+    text = "the cat saw the dog and the cat ran away fast"
 
     # New format allows duplicate words (values can repeat)
     start_dict = {"1": "the", "2": "cat", "3": "saw", "4": "the", "5": "dog"}
-    end_dict = {"1": "the", "2": "cat", "3": "ran"}
+    end_dict = {"1": "the", "2": "cat", "3": "ran", "4": "away", "5": "fast"}
 
     result = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=5)
 
@@ -636,10 +640,10 @@ def test_smart_edit_locate_with_duplicate_words():
 
 def test_smart_edit_locate_in_markdown():
     """Test phrase location in markdown text."""
-    # New format: position as key, word as value
+    # New format: position as key, word as value (need at least 3 words)
     start_dict = {"1": "#", "2": "The", "3": "Art"}
-    end_dict = {"1": "best", "2": "practices."}
-    result = locate_by_markers(TEXT_MARKDOWN, start_dict, end_dict, expected_phrase_length=5)
+    end_dict = {"1": "prevent", "2": "than", "3": "to"}  # From "Bugs are easier to prevent than to fix"
+    result = locate_by_markers(TEXT_MARKDOWN, start_dict, end_dict, expected_phrase_length=3)
 
     if result is None:
         return False, "Failed to locate in markdown"
@@ -652,10 +656,10 @@ def test_smart_edit_locate_in_markdown():
 
 def test_smart_edit_locate_in_html():
     """Test phrase location in HTML text."""
-    # New format: position as key, word as value
+    # New format: position as key, word as value (need at least 3 words)
     start_dict = {"1": "<h1>Welcome", "2": "to", "3": "Our"}
-    end_dict = {"1": "555-1234.</p>"}
-    result = locate_by_markers(TEXT_HTML, start_dict, end_dict, expected_phrase_length=5)
+    end_dict = {"1": "or", "2": "call", "3": "555-1234.</p>"}
+    result = locate_by_markers(TEXT_HTML, start_dict, end_dict, expected_phrase_length=3)
 
     if result is None:
         return False, "Failed to locate in HTML"
@@ -664,11 +668,12 @@ def test_smart_edit_locate_in_html():
 
 def test_smart_edit_locate_in_repetitive_text():
     """Test phrase location in text with repetitive patterns."""
-    # New format: position as key, word as value
+    # New format: position as key, word as value (need at least 3 words)
+    # Use unique enough phrase from first paragraph
     start_dict = {"1": "The", "2": "cat", "3": "sat"}
-    end_dict = {"1": "purred", "2": "loudly."}
+    end_dict = {"1": "cat", "2": "purred", "3": "loudly."}
     # This should find the first occurrence
-    result = locate_by_markers(TEXT_REPETITIVE, start_dict, end_dict, expected_phrase_length=5)
+    result = locate_by_markers(TEXT_REPETITIVE, start_dict, end_dict, expected_phrase_length=3)
 
     if result is None:
         return False, "Failed to locate in repetitive text"
@@ -946,13 +951,14 @@ def test_smart_edit_normalize_for_matching():
 def test_smart_edit_locate_after_normalization():
     """Test that location works after normalization."""
     # Text with typographic characters
-    text = '\u201CHello,\u201D she said \u2014 \u201Chow are you?\u201D'
+    text = '\u201CHello,\u201D she said \u2014 \u201Chow are you today?\u201D'
     normalized = normalize_source_text(text)
 
     # Search with straight quotes (as AI would return in new format)
-    start_dict = {"1": '"Hello,"', "2": "she"}
-    end_dict = {"1": "are", "2": 'you?"'}
-    result = locate_by_markers(normalized, start_dict, end_dict, expected_phrase_length=5)
+    # Need at least 3 words
+    start_dict = {"1": '"Hello,"', "2": "she", "3": "said"}
+    end_dict = {"1": "are", "2": "you", "3": 'today?"'}
+    result = locate_by_markers(normalized, start_dict, end_dict, expected_phrase_length=3)
 
     if result is None:
         return False, "Failed to locate after normalization"
@@ -974,22 +980,22 @@ def test_smart_edit_counted_phrase_valid():
 
 
 def test_smart_edit_counted_phrase_shorter():
-    """Test counted phrase with fewer words than expected."""
+    """Test counted phrase with fewer words than expected - should be REJECTED."""
     data = {"1": "Hello", "2": "world"}
     result = parse_counted_phrase(data, 5)  # Expecting 5 but got 2
 
-    if result != "Hello world":
-        return False, f"Should accept shorter phrase: {result}"
+    if result is not None:
+        return False, f"Should reject shorter phrase, got: {result}"
     return True
 
 
-def test_smart_edit_counted_phrase_too_many():
-    """Test counted phrase with too many words."""
+def test_smart_edit_counted_phrase_extra():
+    """Test counted phrase with more words than expected - should truncate."""
     data = {"1": "A", "2": "B", "3": "C", "4": "D", "5": "E", "6": "F"}
-    result = parse_counted_phrase(data, 5)  # Expecting max 5
+    result = parse_counted_phrase(data, 5)  # Expecting 5, got 6 - should truncate
 
-    if result is not None:
-        return False, "Should reject phrase with too many words"
+    if result != "A B C D E":
+        return False, f"Should truncate to first 5 words, got: {result}"
     return True
 
 
@@ -1035,15 +1041,28 @@ def test_smart_edit_counted_phrase_with_duplicates():
 
 def test_smart_edit_validate_counted_format():
     """Test detailed validation of counted format."""
-    data = {"1": "A", "2": "B", "3": "C"}
+    # 5 words when expecting 5 - should be valid
+    data = {"1": "A", "2": "B", "3": "C", "4": "D", "5": "E"}
     is_valid, phrase, msg = validate_counted_phrase_format(data, 5)
 
     if not is_valid:
         return False, f"Should be valid: {msg}"
-    if phrase != "A B C":
+    if phrase != "A B C D E":
         return False, f"Wrong phrase: {phrase}"
     if msg != "valid_counted_format":
         return False, f"Wrong message: {msg}"
+    return True
+
+
+def test_smart_edit_validate_counted_format_too_few():
+    """Test that fewer words than expected is rejected."""
+    data = {"1": "A", "2": "B", "3": "C"}  # Only 3, expecting 5
+    is_valid, phrase, msg = validate_counted_phrase_format(data, 5)
+
+    if is_valid:
+        return False, "Should reject too few words"
+    if "too few" not in msg.lower():
+        return False, f"Wrong error message: {msg}"
     return True
 
 
@@ -1060,20 +1079,39 @@ def test_smart_edit_validate_string_rejected():
 
 def test_smart_edit_extract_phrase_counted():
     """Test phrase extraction from counted format (new format: position as key)."""
-    data = {"1": "One", "2": "two", "3": "three"}
+    data = {"1": "One", "2": "two", "3": "three", "4": "four", "5": "five"}
     result = extract_phrase_from_response(data, 5, "test")
 
-    if result != "One two three":
+    if result != "One two three four five":
         return False, f"Wrong result: {result}"
     return True
 
 
-def test_smart_edit_extract_phrase_string_rejected():
-    """Test that string format is rejected."""
+def test_smart_edit_extract_phrase_counted_too_few():
+    """Test that dict with too few words is rejected."""
+    data = {"1": "One", "2": "two", "3": "three"}  # Only 3, need 5
+    result = extract_phrase_from_response(data, 5, "test")
+
+    if result is not None:
+        return False, f"Should reject too few words, got: {result}"
+    return True
+
+
+def test_smart_edit_extract_phrase_string_enough():
+    """Test that string format with enough words is accepted (fallback)."""
+    result = extract_phrase_from_response("One two three four five", 5, "test")
+
+    if result != "One two three four five":
+        return False, f"String fallback should work with enough words, got: {result}"
+    return True
+
+
+def test_smart_edit_extract_phrase_string_too_few():
+    """Test that string format with too few words is rejected."""
     result = extract_phrase_from_response("One two three", 5, "test")
 
     if result is not None:
-        return False, "String format should be rejected"
+        return False, "String with too few words should be rejected"
     return True
 
 
@@ -1157,9 +1195,10 @@ def test_smart_edit_with_technical():
 def test_smart_edit_long_paragraph_locate():
     """Test phrase location in very long paragraph."""
     # Should still find phrases even in very long text
+    # Need at least 3 words - text ends with "touch the face of infinity."
     start_dict = {"1": "In", "2": "the", "3": "vast"}
-    end_dict = {"1": "of", "2": "infinity."}
-    result = locate_by_markers(TEXT_LONG_PARAGRAPH, start_dict, end_dict, expected_phrase_length=5)
+    end_dict = {"1": "face", "2": "of", "3": "infinity."}
+    result = locate_by_markers(TEXT_LONG_PARAGRAPH, start_dict, end_dict, expected_phrase_length=3)
 
     if result is None:
         return False, "Failed to locate in long paragraph"
@@ -1268,11 +1307,12 @@ def test_smart_edit_unicode_normalization():
 
 def test_smart_edit_overlapping_markers():
     """Test phrase location with overlapping start/end markers."""
-    text = "The quick brown fox."
-    # Start and end markers overlap
+    text = "The quick brown fox jumps."
+    # Start and end markers overlap (quick brown / brown fox)
+    # Need at least 2 words with expected_phrase_length=2
     start_dict = {"1": "quick", "2": "brown"}
-    end_dict = {"1": "brown", "2": "fox."}
-    result = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=5)
+    end_dict = {"1": "brown", "2": "fox"}
+    result = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=2)
 
     if result is None:
         return False, "Should handle overlapping markers"
@@ -1281,12 +1321,13 @@ def test_smart_edit_overlapping_markers():
 
 def test_smart_edit_identical_markers():
     """Test phrase location with identical start/end markers."""
-    text = "Hello world Hello world"
+    text = "Hello world today Hello world today"
+    # Need at least 2 words
     start_dict = {"1": "Hello", "2": "world"}
     end_dict = {"1": "Hello", "2": "world"}
-    result = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=5)
+    result = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=2)
 
-    # Should find something (first occurrence)
+    # Should find something (first occurrence to second occurrence)
     if result is None:
         return False, "Should find with identical markers"
     return True
@@ -1294,12 +1335,12 @@ def test_smart_edit_identical_markers():
 
 def test_smart_edit_markers_at_boundaries():
     """Test phrase location at text boundaries."""
-    text = "Start middle end"
+    text = "Start word middle word end"
 
-    # Marker at very start
-    start_dict = {"1": "Start"}
-    end_dict = {"1": "end"}
-    result = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=5)
+    # Marker at very start, need at least 2 words
+    start_dict = {"1": "Start", "2": "word"}
+    end_dict = {"1": "word", "2": "end"}
+    result = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=2)
     if result is None:
         return False, "Should find markers at boundaries"
 
@@ -1567,9 +1608,15 @@ async def test_smart_edit_full_workflow_ai():
 
     # Locate a segment using proper start/end markers (new format: position as key)
     # "One autumn evening" starts a paragraph and "dying light of day." ends it
-    start_dict = {"1": "One", "2": "autumn", "3": "evening"}
-    end_dict = {"1": "of", "2": "day."}
-    span = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=phrase_length)
+    # Build dicts with at least phrase_length words
+    start_words = ["One", "autumn", "evening,", "a", "young", "rabbit", "named"]
+    end_words = ["the", "dying", "light", "of", "day."]
+
+    # Ensure we have enough words
+    start_dict = {str(i+1): w for i, w in enumerate(start_words[:max(phrase_length, 4)])}
+    end_dict = {str(i+1): w for i, w in enumerate(end_words[:max(phrase_length, 4)])}
+
+    span = locate_by_markers(text, start_dict, end_dict, expected_phrase_length=min(phrase_length, len(start_dict)))
     if span is None:
         return False, "Failed to locate segment"
 
@@ -1683,15 +1730,18 @@ def run_counted_phrase_tests():
     tests = [
         ("test_smart_edit_counted_phrase_valid", test_smart_edit_counted_phrase_valid),
         ("test_smart_edit_counted_phrase_shorter", test_smart_edit_counted_phrase_shorter),
-        ("test_smart_edit_counted_phrase_too_many", test_smart_edit_counted_phrase_too_many),
+        ("test_smart_edit_counted_phrase_extra", test_smart_edit_counted_phrase_extra),
         ("test_smart_edit_counted_phrase_non_consecutive", test_smart_edit_counted_phrase_non_consecutive),
         ("test_smart_edit_counted_phrase_wrong_start", test_smart_edit_counted_phrase_wrong_start),
         ("test_smart_edit_counted_phrase_non_integer", test_smart_edit_counted_phrase_non_integer),
         ("test_smart_edit_counted_phrase_with_duplicates", test_smart_edit_counted_phrase_with_duplicates),
         ("test_smart_edit_validate_counted_format", test_smart_edit_validate_counted_format),
+        ("test_smart_edit_validate_counted_format_too_few", test_smart_edit_validate_counted_format_too_few),
         ("test_smart_edit_validate_string_rejected", test_smart_edit_validate_string_rejected),
         ("test_smart_edit_extract_phrase_counted", test_smart_edit_extract_phrase_counted),
-        ("test_smart_edit_extract_phrase_string_rejected", test_smart_edit_extract_phrase_string_rejected),
+        ("test_smart_edit_extract_phrase_counted_too_few", test_smart_edit_extract_phrase_counted_too_few),
+        ("test_smart_edit_extract_phrase_string_enough", test_smart_edit_extract_phrase_string_enough),
+        ("test_smart_edit_extract_phrase_string_too_few", test_smart_edit_extract_phrase_string_too_few),
         ("test_smart_edit_extract_phrase_none", test_smart_edit_extract_phrase_none),
     ]
 

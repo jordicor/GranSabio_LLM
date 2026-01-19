@@ -420,7 +420,8 @@ class Arbiter:
     def __init__(
         self,
         ai_service: Any,
-        model: Optional[str] = None
+        model: Optional[str] = None,
+        stream_callback: Optional[callable] = None
     ):
         """
         Initialize Arbiter.
@@ -428,9 +429,12 @@ class Arbiter:
         Args:
             ai_service: AI service instance for making API calls
             model: Model to use for conflict resolution (default from config)
+            stream_callback: Optional callback for streaming AI responses.
+                             Signature: async def callback(chunk: str, model: str, operation: str)
         """
         self.ai_service = ai_service
         self._model = model
+        self.stream_callback = stream_callback
         self._logger = __import__('logging').getLogger(__name__)
 
     @property
@@ -1055,6 +1059,7 @@ class Arbiter:
         Call AI to analyze and decide on proposed edits.
 
         ALWAYS called - verifies alignment with original request even without conflicts.
+        Supports streaming when stream_callback is provided.
 
         Args:
             context: Full arbitration context
@@ -1070,17 +1075,44 @@ class Arbiter:
         prompt = self._build_arbiter_prompt(context, conflicts, distribution)
 
         try:
-            response = await self.ai_service.generate_content(
-                prompt=prompt,
-                model=selected_model,
-                system_prompt=ARBITER_SYSTEM_PROMPT,
-                max_tokens=config.ARBITER_MAX_TOKENS,
-                temperature=config.ARBITER_TEMPERATURE,
-                json_output=True
-            )
+            response_content = ""
 
-            # Parse JSON response
-            return self._parse_ai_response_json(response)
+            if self.stream_callback:
+                # Streaming mode - emit chunks in real-time
+                async for chunk in self.ai_service.generate_content_stream(
+                    prompt=prompt,
+                    model=selected_model,
+                    system_prompt=ARBITER_SYSTEM_PROMPT,
+                    max_tokens=config.ARBITER_MAX_TOKENS,
+                    temperature=config.ARBITER_TEMPERATURE,
+                    json_output=True
+                ):
+                    # Handle StreamChunk (Claude thinking) vs plain string
+                    if hasattr(chunk, 'text'):
+                        chunk_text = chunk.text
+                        is_thinking = getattr(chunk, 'is_thinking', False)
+                    else:
+                        chunk_text = chunk
+                        is_thinking = False
+
+                    if chunk_text:
+                        # Only accumulate non-thinking for JSON parsing
+                        if not is_thinking:
+                            response_content += chunk_text
+                        # Stream all (including thinking) for live monitoring
+                        await self.stream_callback(chunk_text, selected_model, "arbitration")
+            else:
+                # Non-streaming mode
+                response_content = await self.ai_service.generate_content(
+                    prompt=prompt,
+                    model=selected_model,
+                    system_prompt=ARBITER_SYSTEM_PROMPT,
+                    max_tokens=config.ARBITER_MAX_TOKENS,
+                    temperature=config.ARBITER_TEMPERATURE,
+                    json_output=True
+                )
+
+            return self._parse_ai_response_json(response_content)
 
         except Exception as e:
             self._logger.error(f"Arbiter AI call failed: {e}")

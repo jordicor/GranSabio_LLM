@@ -102,12 +102,13 @@ class QAEvaluationService:
         editable_content_types = ["biography", "article", "script", "story", "essay", "blog", "novel"]
 
         # Decide whether to request edit information
-        # Smart-edit requires marker_length to function correctly
-        # Without it, we cannot safely locate paragraphs for editing
+        # Smart-edit works in two modes:
+        # - phrase mode: requires marker_length (n-gram length for unique identification)
+        # - word_index mode: requires word_map_formatted (fallback for repetitive content)
         should_request_edits = (
             request_edit_info
             and content_type in editable_content_types
-            and marker_length is not None
+            and (marker_length is not None or (marker_mode == "word_index" and word_map_formatted))
         )
 
         if should_request_edits:
@@ -348,6 +349,22 @@ IMPORTANT:
 
                 # Combine all chunks for parsing
                 response = "".join(response_chunks)
+            else:
+                # Non-streaming: call generate_content directly
+                response = await self.ai_service.generate_content(
+                    prompt=evaluation_prompt,
+                    model=model,
+                    temperature=eval_temperature,
+                    max_tokens=max_tokens,
+                    system_prompt=qa_system_prompt,
+                    extra_verbose=extra_verbose,
+                    content_type=content_type,
+                    reasoning_effort=reasoning_effort,
+                    thinking_budget_tokens=thinking_budget_tokens,
+                    usage_callback=usage_callback,
+                    phase_logger=phase_logger,
+                    images=input_images,
+                )
 
             # Log full QA response if extra_verbose is enabled
             if phase_logger:

@@ -5,9 +5,12 @@
 
 // Direct connection - no proxy needed
 const STREAM_BASE = '';
-const PHASES = ['generation', 'qa', 'preflight', 'consensus', 'gransabio', 'status', 'everything'];
+// UI panels (note: 'analysis' combines preflight+consensus, 'smartedit' is placeholder)
+const PHASES = ['generation', 'qa', 'arbiter', 'smartedit', 'analysis', 'gransabio', 'status', 'everything'];
 // Phases that can be hard-switched (excluded from subscription)
-const HARD_SWITCHABLE_PHASES = ['generation', 'qa', 'preflight', 'consensus', 'gransabio', 'status'];
+// 'analysis' controls both 'preflight' and 'consensus' server-side subscriptions
+// 'smartedit' maps to 'smart_edit' on the server side
+const HARD_SWITCHABLE_PHASES = ['generation', 'qa', 'arbiter', 'smartedit', 'analysis', 'gransabio', 'status'];
 
 // State
 let eventSource = null;
@@ -57,6 +60,10 @@ const qaFilterState = {
     layer: null,   // null = show all, string = filter by this layer
     model: null    // null = show all, string = filter by this model
 };
+
+// Analysis Filter state - for filtering Analysis panel (preflight/consensus)
+// null = show both, 'preflight' = only preflight, 'consensus' = only consensus
+let analysisFilterState = null;
 
 // ============================================
 // PHASE TOGGLE MANAGEMENT
@@ -120,8 +127,22 @@ function updatePanelVisual(phase, state) {
 }
 
 function getActivePhases() {
-    // Return phases that are NOT in 'hard' state
-    return HARD_SWITCHABLE_PHASES.filter(phase => panelStates[phase] !== 'hard');
+    // Return server-side phases that are NOT in 'hard' state
+    // Note: 'analysis' UI panel maps to 'preflight' and 'consensus' server phases
+    const serverPhases = [];
+
+    HARD_SWITCHABLE_PHASES.forEach(phase => {
+        if (panelStates[phase] !== 'hard') {
+            if (phase === 'analysis') {
+                // 'analysis' panel controls both preflight and consensus subscriptions
+                serverPhases.push('preflight', 'consensus');
+            } else {
+                serverPhases.push(phase);
+            }
+        }
+    });
+
+    return serverPhases;
 }
 
 function reconnectWithActivePhases() {
@@ -142,7 +163,9 @@ function reconnectWithActivePhases() {
     }
 
     // Reconnect with only active phases
-    const phasesParam = activePhases.join(',');
+    // Use 'all' when all UI phases are active (none hard-muted)
+    const allPhasesActive = HARD_SWITCHABLE_PHASES.every(phase => panelStates[phase] !== 'hard');
+    const phasesParam = allPhasesActive ? 'all' : activePhases.join(',');
     const streamUrl = `${STREAM_BASE}/stream/project/${currentProjectId}?phases=${phasesParam}`;
 
     log(`Reconnecting with phases: ${phasesParam}`, 'info');
@@ -369,6 +392,9 @@ function clearAllContent() {
 
     // Reset QA filters
     resetQAFilters();
+
+    // Reset Analysis filter
+    resetAnalysisFilter();
 }
 
 // ============================================
@@ -448,6 +474,7 @@ function initializeIteration(request, iteration) {
                 preflight: '',
                 generation: '',
                 qa: '',
+                arbiter: '',
                 consensus: '',
                 gransabio: ''
             },
@@ -455,6 +482,7 @@ function initializeIteration(request, iteration) {
                 preflight: { chunks: 0, bytes: 0 },
                 generation: { chunks: 0, bytes: 0 },
                 qa: { chunks: 0, bytes: 0 },
+                arbiter: { chunks: 0, bytes: 0 },
                 consensus: { chunks: 0, bytes: 0 },
                 gransabio: { chunks: 0, bytes: 0 }
             },
@@ -892,7 +920,8 @@ function loadRequestContent(sessionId) {
 
     if (!iterData) {
         // No data for this iteration - clear panels
-        ['preflight', 'generation', 'qa', 'consensus', 'gransabio'].forEach(phase => {
+        // Note: preflight and consensus are combined into 'analysis' panel
+        ['generation', 'qa', 'gransabio', 'analysis'].forEach(phase => {
             const contentEl = document.getElementById(`content-${phase}`);
             if (contentEl) contentEl.textContent = '';
 
@@ -904,8 +933,9 @@ function loadRequestContent(sessionId) {
         return;
     }
 
-    // Load content into each phase panel (except status and everything)
-    ['preflight', 'generation', 'qa', 'consensus', 'gransabio'].forEach(phase => {
+    // Load content into each phase panel (except status, everything, and analysis)
+    // Note: preflight and consensus data still stored separately but displayed in combined 'analysis' panel
+    ['generation', 'qa', 'gransabio'].forEach(phase => {
         const contentEl = document.getElementById(`content-${phase}`);
         if (contentEl) {
             contentEl.textContent = iterData.content[phase] || '';
@@ -919,6 +949,17 @@ function loadRequestContent(sessionId) {
         if (chunksEl) chunksEl.textContent = phaseStats.chunks;
         if (bytesEl) bytesEl.textContent = phaseStats.bytes;
     });
+
+    // Render combined Analysis panel (preflight + consensus)
+    renderFilteredAnalysisContent(request);
+
+    // Update stats for analysis panel (sum of preflight + consensus)
+    const preflightStats = iterData.stats.preflight || { chunks: 0, bytes: 0 };
+    const consensusStats = iterData.stats.consensus || { chunks: 0, bytes: 0 };
+    const analysisChunksEl = document.getElementById('chunks-analysis');
+    const analysisBytesEl = document.getElementById('bytes-analysis');
+    if (analysisChunksEl) analysisChunksEl.textContent = preflightStats.chunks + consensusStats.chunks;
+    if (analysisBytesEl) analysisBytesEl.textContent = preflightStats.bytes + consensusStats.bytes;
 
     // Update history mode visual indicators
     updateHistoryModeIndicators(request);
@@ -1438,7 +1479,9 @@ function connect() {
     currentProjectId = inputValue;
 
     const activePhases = getActivePhases();
-    const phasesParam = activePhases.length === HARD_SWITCHABLE_PHASES.length ? 'all' : activePhases.join(',');
+    // Check if all UI phases are active (none hard-muted) to use 'all' param
+    const allPhasesActive = HARD_SWITCHABLE_PHASES.every(phase => panelStates[phase] !== 'hard');
+    const phasesParam = allPhasesActive ? 'all' : activePhases.join(',');
     const streamUrl = `${STREAM_BASE}/stream/project/${currentProjectId}?phases=${phasesParam}`;
 
     log(`Connecting to project stream: ${streamUrl}`, 'info');
@@ -1571,6 +1614,91 @@ function resetQAFilters() {
     qaFilterState.model = null;
 }
 
+// ============================================
+// ANALYSIS FILTER (PREFLIGHT/CONSENSUS)
+// ============================================
+
+/**
+ * Render Analysis content based on current filter state
+ * Combines preflight and consensus content with optional filtering
+ * @param {Object} request - The request object
+ */
+function renderFilteredAnalysisContent(request) {
+    const contentEl = document.getElementById('content-analysis');
+    if (!contentEl) return;
+
+    const iter = request?.iterations?.[request.viewingIteration];
+    if (!iter) {
+        contentEl.textContent = '';
+        return;
+    }
+
+    let content = '';
+
+    if (analysisFilterState === 'preflight') {
+        // Only preflight
+        content = iter.content?.preflight || '';
+    } else if (analysisFilterState === 'consensus') {
+        // Only consensus
+        content = iter.content?.consensus || '';
+    } else {
+        // Both (default) - with separator when both have content
+        const preflight = iter.content?.preflight || '';
+        const consensus = iter.content?.consensus || '';
+
+        if (preflight && consensus) {
+            content = preflight + '\n\n--- CONSENSUS ---\n\n' + consensus;
+        } else {
+            content = preflight || consensus;
+        }
+    }
+
+    contentEl.textContent = content;
+    contentEl.scrollTop = contentEl.scrollHeight;
+}
+
+/**
+ * Handle click on an analysis filter pill
+ * @param {HTMLElement} pill - The clicked pill element
+ */
+function handleAnalysisFilterClick(pill) {
+    const filterValue = pill.dataset.filter;
+
+    // Toggle: if already selected, deselect (show both)
+    analysisFilterState = (analysisFilterState === filterValue) ? null : filterValue;
+
+    // Update pill visual state
+    document.querySelectorAll('.analysis-pill').forEach(p => {
+        p.classList.toggle('active', p.dataset.filter === analysisFilterState);
+    });
+
+    // Re-render content with filter applied
+    const request = requestsData.requests[viewState.selectedRequestId];
+    if (request) {
+        renderFilteredAnalysisContent(request);
+    }
+}
+
+/**
+ * Bind click listeners to analysis filter pills
+ */
+function bindAnalysisFilterListeners() {
+    document.querySelectorAll('.analysis-pill').forEach(pill => {
+        pill.onclick = (e) => {
+            e.stopPropagation();
+            handleAnalysisFilterClick(pill);
+        };
+    });
+}
+
+/**
+ * Reset Analysis filter to default (show both)
+ */
+function resetAnalysisFilter() {
+    analysisFilterState = null;
+    document.querySelectorAll('.analysis-pill').forEach(p => p.classList.remove('active'));
+}
+
 /**
  * Escape HTML for safe display
  * @param {string} text - Text to escape
@@ -1636,6 +1764,18 @@ function handleMessage(rawData) {
                 log(`Stream ended: ${data.reason}`, 'warn');
                 appendContent('status', `[STREAM_END] Reason: ${data.reason}\n`);
                 setConnectionStatus('disconnected', 'STREAM ENDED');
+                break;
+
+            case 'edit_start':
+                handleSmartEditStart(data);
+                break;
+
+            case 'edit_complete':
+                handleSmartEditComplete(data);
+                break;
+
+            case 'edit_error':
+                handleSmartEditError(data);
                 break;
 
             default:
@@ -1707,11 +1847,15 @@ function handleChunk(data) {
         }
     }
 
+    // Determine which panel to show activity for
+    // preflight and consensus are combined into 'analysis' panel
+    const displayPhase = (phase === 'preflight' || phase === 'consensus') ? 'analysis' : phase;
+
     // In Overview mode: don't display in panels, but show generic activity
     if (isOverviewMode()) {
         if (request) {
             // Show activity indicator (generic receiving badge)
-            showReceiving(phase);
+            showReceiving(displayPhase);
         }
         return;
     }
@@ -1723,6 +1867,23 @@ function handleChunk(data) {
             if (phase === 'qa' && (qaFilterState.layer || qaFilterState.model)) {
                 // QA with filter active - re-render filtered content
                 renderFilteredQAContent(request);
+            } else if (phase === 'preflight' || phase === 'consensus') {
+                // Preflight/Consensus - render to combined Analysis panel with filter
+                if (analysisFilterState === null || analysisFilterState === phase) {
+                    renderFilteredAnalysisContent(request);
+                }
+                // Update stats for analysis panel
+                const iterData = request.iterations[request.currentIteration];
+                if (iterData) {
+                    const preflightStats = iterData.stats.preflight || { chunks: 0, bytes: 0 };
+                    const consensusStats = iterData.stats.consensus || { chunks: 0, bytes: 0 };
+                    const analysisChunksEl = document.getElementById('chunks-analysis');
+                    const analysisBytesEl = document.getElementById('bytes-analysis');
+                    if (analysisChunksEl) analysisChunksEl.textContent = preflightStats.chunks + consensusStats.chunks;
+                    if (analysisBytesEl) analysisBytesEl.textContent = preflightStats.bytes + consensusStats.bytes;
+                }
+                // Flash the analysis badge
+                showReceiving('analysis');
             } else {
                 // Normal append behavior
                 appendContent(phase, content);
@@ -1733,7 +1894,18 @@ function handleChunk(data) {
         }
     } else if (!request) {
         // No session_id in data - still show (legacy behavior)
-        appendContent(phase, content);
+        if (phase === 'preflight' || phase === 'consensus') {
+            // For legacy mode, append to analysis panel with separator
+            const analysisEl = document.getElementById('content-analysis');
+            if (analysisEl) {
+                if (analysisFilterState === null || analysisFilterState === phase) {
+                    analysisEl.textContent += content;
+                    analysisEl.scrollTop = analysisEl.scrollHeight;
+                }
+            }
+        } else {
+            appendContent(phase, content);
+        }
     }
 
     // Note: 'everything' panel receives all content via handleMessage
@@ -2108,7 +2280,8 @@ function updateIterationNavButtons(request) {
 function updateHistoryModeIndicators(request) {
     const isHistoryMode = request.viewingIteration !== request.currentIteration;
 
-    ['preflight', 'generation', 'qa', 'consensus', 'gransabio'].forEach(phase => {
+    // Note: 'analysis' panel combines preflight+consensus, 'smartedit' is placeholder for future
+    ['generation', 'qa', 'analysis', 'gransabio'].forEach(phase => {
         const panel = document.querySelector(`.stream-panel[data-phase="${phase}"]`);
         if (!panel) return;
 
@@ -2181,6 +2354,10 @@ document.addEventListener('DOMContentLoaded', function() {
     initToggleListeners();
     log('Phase toggle switches ready', 'info');
 
+    // Initialize analysis filter pill listeners
+    bindAnalysisFilterListeners();
+    log('Analysis filter pills ready', 'info');
+
     // Initialize tabs navigation buttons
     const tabsNavLeft = document.getElementById('tabsNavLeft');
     const tabsNavRight = document.getElementById('tabsNavRight');
@@ -2221,6 +2398,276 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     });
 });
+
+// ============================================
+// SMART EDIT VISUALIZATION
+// ============================================
+
+// Smart edit state for animations
+const smartEditState = {
+    totalEdits: 0,
+    currentParagraph: null,
+    totalParagraphs: null,
+    charDelta: 0,
+    animationSpeed: 1.0,  // Multiplier for animation timing
+};
+
+/**
+ * Handle smart edit start event - show paragraph with fragment highlighted
+ */
+function handleSmartEditStart(data) {
+    const editData = data.edit_data;
+    if (!editData) return;
+
+    // Update state
+    smartEditState.currentParagraph = editData.paragraph_index;
+    smartEditState.totalParagraphs = editData.total_paragraphs;
+
+    // Update stats display
+    updateSmartEditStats();
+
+    // Show receiving indicator
+    showReceiving('smartedit');
+    const badge = document.getElementById('badge-smartedit');
+    if (badge) {
+        badge.textContent = 'editing...';
+        badge.classList.add('badge-editing');
+    }
+
+    // Get the panel content area
+    const panel = document.getElementById('content-smartedit');
+    if (!panel) return;
+
+    // Build the content with highlighted fragment
+    const textBefore = editData.text_before || '';
+    const fragment = editData.fragment;
+    const fragPos = editData.fragment_position;
+
+    let html = '';
+
+    // Add operation header
+    html += '<div class="smartedit-op-header">';
+    html += `<span class="smartedit-op-type ai">EDIT</span>`;
+    html += `<span class="smartedit-op-desc">${escapeHtml(editData.description || 'Processing...')}</span>`;
+    html += `<span class="smartedit-op-progress">${editData.paragraph_index}/${editData.total_paragraphs}</span>`;
+    html += '</div>';
+
+    // Build paragraph with highlighted fragment
+    if (fragment && fragPos) {
+        const before = textBefore.substring(0, fragPos.start);
+        const highlighted = textBefore.substring(fragPos.start, fragPos.end);
+        const after = textBefore.substring(fragPos.end);
+
+        html += '<div class="smartedit-text">';
+        html += escapeHtml(before);
+        html += `<span class="edit-target ai-processing"><span class="ai-content">${escapeHtml(highlighted)}</span><div class="ai-progress-bar"><div class="ai-progress-fill"></div></div></span>`;
+        html += escapeHtml(after);
+        html += '</div>';
+    } else {
+        // No specific fragment - highlight entire paragraph
+        html += '<div class="smartedit-text">';
+        html += `<span class="edit-target ai-processing"><span class="ai-content">${escapeHtml(textBefore)}</span><div class="ai-progress-bar"><div class="ai-progress-fill"></div></div></span>`;
+        html += '</div>';
+    }
+
+    panel.innerHTML = html;
+
+    log(`Smart Edit: Starting paragraph ${editData.paragraph_index}/${editData.total_paragraphs}`, 'info');
+}
+
+/**
+ * Handle smart edit complete event - animate transition and show result
+ */
+function handleSmartEditComplete(data) {
+    const editData = data.edit_data;
+    if (!editData) return;
+
+    // Update state
+    smartEditState.totalEdits++;
+    smartEditState.charDelta += editData.char_delta || 0;
+
+    // Update stats display
+    updateSmartEditStats();
+
+    // Get the panel content area
+    const panel = document.getElementById('content-smartedit');
+    if (!panel) return;
+
+    const badge = document.getElementById('badge-smartedit');
+
+    // Determine operation type for animation
+    const opType = (editData.operation_type || 'replace').toLowerCase();
+    const isAI = editData.ai_assisted;
+
+    // Get the current processing element
+    const processingEl = panel.querySelector('.ai-processing');
+
+    if (processingEl) {
+        // Animate the transition
+        animateSmartEditComplete(processingEl, editData, opType, isAI, () => {
+            // After animation, show final result
+            showSmartEditResult(panel, editData);
+
+            // Update badge
+            if (badge) {
+                badge.textContent = 'done';
+                badge.classList.remove('badge-editing');
+                badge.classList.add('badge-success');
+                setTimeout(() => {
+                    badge.classList.remove('badge-success');
+                    badge.textContent = 'idle';
+                }, 2000);
+            }
+        });
+    } else {
+        // No animation element, just show result
+        showSmartEditResult(panel, editData);
+    }
+
+    log(`Smart Edit: Completed paragraph ${editData.paragraph_index}/${editData.total_paragraphs} (${editData.char_delta > 0 ? '+' : ''}${editData.char_delta} chars)`, 'success');
+}
+
+/**
+ * Handle smart edit error event
+ */
+function handleSmartEditError(data) {
+    const editData = data.edit_data;
+    if (!editData) return;
+
+    const panel = document.getElementById('content-smartedit');
+    const badge = document.getElementById('badge-smartedit');
+
+    if (badge) {
+        badge.textContent = 'error';
+        badge.classList.remove('badge-editing');
+        badge.classList.add('badge-error');
+    }
+
+    if (panel) {
+        let html = '<div class="smartedit-op-header" style="background: rgba(239, 68, 68, 0.2);">';
+        html += '<span class="smartedit-op-type" style="background: rgba(239, 68, 68, 0.3); color: #ef4444;">ERROR</span>';
+        html += `<span class="smartedit-op-desc" style="color: #ef4444;">${escapeHtml(editData.error || 'Unknown error')}</span>`;
+        html += '</div>';
+
+        if (editData.text_before) {
+            html += `<div class="smartedit-text" style="opacity: 0.5;">${escapeHtml(editData.text_before)}</div>`;
+        }
+
+        panel.innerHTML = html;
+    }
+
+    log(`Smart Edit: Error on paragraph ${editData.paragraph_index} - ${editData.error}`, 'error');
+}
+
+/**
+ * Animate the completion of a smart edit operation
+ */
+function animateSmartEditComplete(element, editData, opType, isAI, onComplete) {
+    const speed = smartEditState.animationSpeed;
+    const getTime = (ms) => ms / speed;
+
+    // Remove processing animation
+    element.classList.remove('ai-processing');
+
+    // Add completion class
+    element.classList.add('ai-complete');
+
+    // Remove progress bar
+    const progressBar = element.querySelector('.ai-progress-bar');
+    if (progressBar) {
+        progressBar.remove();
+    }
+
+    // Get the content span
+    const contentSpan = element.querySelector('.ai-content');
+
+    if (contentSpan && editData.text_after) {
+        // Blur effect
+        contentSpan.classList.add('ai-blur');
+
+        setTimeout(() => {
+            // Replace content
+            contentSpan.textContent = editData.text_after;
+            contentSpan.classList.remove('ai-blur');
+
+            // Success glow
+            setTimeout(() => {
+                if (onComplete) onComplete();
+            }, getTime(500));
+        }, getTime(300));
+    } else {
+        setTimeout(() => {
+            if (onComplete) onComplete();
+        }, getTime(500));
+    }
+}
+
+/**
+ * Show the final result of smart edit in the panel
+ */
+function showSmartEditResult(panel, editData) {
+    let html = '';
+
+    // Header showing completion
+    html += '<div class="smartedit-op-header" style="background: rgba(16, 185, 129, 0.1);">';
+    html += `<span class="smartedit-op-type" style="background: rgba(16, 185, 129, 0.2); color: #10b981;">${editData.ai_assisted ? 'AI' : 'DIRECT'}</span>`;
+    html += `<span class="smartedit-op-desc" style="color: #10b981;">Edit applied successfully</span>`;
+    html += `<span class="smartedit-op-progress">${editData.paragraph_index}/${editData.total_paragraphs}</span>`;
+    html += '</div>';
+
+    // Result text with success styling
+    html += '<div class="smartedit-result">';
+    html += '<div class="smartedit-result-label">Result:</div>';
+    html += `<div class="smartedit-text">${escapeHtml(editData.text_after || '')}</div>`;
+    html += '</div>';
+
+    // Stats
+    const charDelta = editData.char_delta || 0;
+    const wordDelta = editData.word_delta || 0;
+    html += '<div class="smartedit-stats" style="margin-top: 0.5rem; font-size: 0.75rem; color: var(--text-muted, #64748b);">';
+    html += `<span>Chars: ${charDelta > 0 ? '+' : ''}${charDelta}</span>`;
+    html += `<span style="margin-left: 1rem;">Words: ${wordDelta > 0 ? '+' : ''}${wordDelta}</span>`;
+    html += '</div>';
+
+    panel.innerHTML = html;
+}
+
+/**
+ * Update smart edit stats display
+ */
+function updateSmartEditStats() {
+    const editsEl = document.getElementById('edits-smartedit');
+    const paragraphEl = document.getElementById('paragraph-smartedit');
+    const deltaEl = document.getElementById('delta-smartedit');
+
+    if (editsEl) {
+        editsEl.textContent = smartEditState.totalEdits;
+    }
+
+    if (paragraphEl) {
+        if (smartEditState.currentParagraph && smartEditState.totalParagraphs) {
+            paragraphEl.textContent = `${smartEditState.currentParagraph}/${smartEditState.totalParagraphs}`;
+        } else {
+            paragraphEl.textContent = '-/-';
+        }
+    }
+
+    if (deltaEl) {
+        const delta = smartEditState.charDelta;
+        deltaEl.textContent = delta > 0 ? `+${delta}` : delta.toString();
+        deltaEl.style.color = delta > 0 ? '#10b981' : (delta < 0 ? '#ef4444' : 'inherit');
+    }
+}
+
+/**
+ * Escape HTML for safe display
+ */
+function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
 
 // Cleanup on page unload
 window.addEventListener('beforeunload', function() {

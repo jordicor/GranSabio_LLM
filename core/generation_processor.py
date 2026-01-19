@@ -938,6 +938,12 @@ def _get_paragraph_key(edit_range: "TextEditRange") -> str:
     Generate a unique key for a paragraph based on TextEditRange.
 
     Used for grouping edits by paragraph and deduplication.
+
+    When an edit uses direct mode (can_use_direct=True with exact_fragment but
+    invalid phrase markers), each edit gets its own unique key to prevent
+    incorrect grouping. This avoids the bug where multiple edits with different
+    exact_fragments get grouped together, causing the span to be calculated
+    from only the first edit's fragment.
     """
     marker_mode = getattr(edit_range, 'marker_mode', 'phrase')
 
@@ -945,8 +951,19 @@ def _get_paragraph_key(edit_range: "TextEditRange") -> str:
         start_idx = getattr(edit_range, 'start_word_index', 0)
         end_idx = getattr(edit_range, 'end_word_index', 0)
         return f"word_index:{start_idx}:{end_idx}"
-    else:
-        return f"{edit_range.paragraph_start}||{edit_range.paragraph_end}"
+
+    # Check if this edit uses direct mode with exact_fragment (invalid markers)
+    can_use_direct = getattr(edit_range, 'can_use_direct', False)
+    exact_fragment = getattr(edit_range, 'exact_fragment', '') or ''
+    paragraph_start = getattr(edit_range, 'paragraph_start', '') or ''
+    paragraph_end = getattr(edit_range, 'paragraph_end', '') or ''
+
+    if can_use_direct and exact_fragment and (not paragraph_start or not paragraph_end):
+        # Each direct edit gets its own "paragraph" to prevent incorrect grouping
+        # Use hash of exact_fragment to create unique key
+        return f"direct:{hash(exact_fragment)}"
+
+    return f"{paragraph_start}||{paragraph_end}"
 
 
 def _group_edits_by_paragraph(
@@ -998,18 +1015,42 @@ def _locate_edit_segment(
         else:
             logger.warning("Word index mode requested but no word_map provided")
             return None
-    else:
-        # Phrase marker mode - requires phrase_length for safe operation
-        if phrase_length is None:
-            logger.warning("Phrase mode requested but no phrase_length provided")
-            return None
 
-        return locate_by_markers(
-            text,
-            edit.paragraph_start or "",
-            edit.paragraph_end or "",
-            expected_phrase_length=phrase_length
-        )
+    # Check if we can use exact_fragment directly (markers empty but exact_fragment valid)
+    paragraph_start = getattr(edit, 'paragraph_start', '') or ''
+    paragraph_end = getattr(edit, 'paragraph_end', '') or ''
+    can_use_direct = getattr(edit, 'can_use_direct', False)
+    exact_fragment = getattr(edit, 'exact_fragment', '') or ''
+
+    if can_use_direct and exact_fragment and (not paragraph_start or not paragraph_end):
+        # Direct mode: locate using exact_fragment instead of markers
+        pos = text.find(exact_fragment)
+        if pos != -1:
+            logger.debug(
+                f"Located edit via exact_fragment ({len(exact_fragment)} chars) at position {pos}"
+            )
+            return (pos, pos + len(exact_fragment))
+        # Try case-insensitive as fallback
+        pos_lower = text.lower().find(exact_fragment.lower())
+        if pos_lower != -1:
+            logger.debug(
+                f"Located edit via exact_fragment (case-insensitive) at position {pos_lower}"
+            )
+            return (pos_lower, pos_lower + len(exact_fragment))
+        logger.warning(f"exact_fragment not found in text: '{exact_fragment[:50]}...'")
+        return None
+
+    # Phrase marker mode - requires phrase_length for safe operation
+    if phrase_length is None:
+        logger.warning("Phrase mode requested but no phrase_length provided")
+        return None
+
+    return locate_by_markers(
+        text,
+        paragraph_start,
+        paragraph_end,
+        expected_phrase_length=phrase_length
+    )
 
 
 def _build_combined_instruction(
@@ -1617,6 +1658,8 @@ async def _process_single_layer_with_edits(
             logger.info(
                 "Gran Sabio determined deal-breaker in layer '%s' as false positive. Continuing.", layer_name
             )
+            if progress_callback:
+                await progress_callback(f"Gran Sabio: FALSE POSITIVE in {layer_name}. Continuing.")
             # Restore status and exit phase - Gran Sabio review complete
             if phase_logger:
                 phase_logger._exit_phase(Phase.GRAN_SABIO)
@@ -1640,6 +1683,10 @@ async def _process_single_layer_with_edits(
                         prev_score,
                         eval.score,
                     )
+                    if progress_callback:
+                        await progress_callback(
+                            f"Gran Sabio override: {eval.model} score {prev_score} -> {gs_result.final_score}"
+                        )
 
             gs_modified_content = getattr(gs_result, "final_content", None)
             gs_modifications_made = getattr(gs_result, "modifications_made", False)
@@ -1891,11 +1938,26 @@ async def _process_all_layers_with_edits(
     total_layers = len(sorted_layers)
     logger.info(f"Starting per-layer smart-edit flow with {total_layers} layers")
 
+    # Create Arbiter stream callback for real-time monitoring
+    async def arbiter_stream_callback(chunk: str, model: str, operation: str):
+        """Capture Arbiter AI responses for real-time streaming."""
+        await add_to_session_field(session_id, "arbiter_content", chunk)
+        project_id = session.get("project_id")
+        if project_id and chunk:
+            await publish_project_phase_chunk(
+                project_id,
+                "arbiter",
+                chunk,
+                session_id=session_id,
+                request_name=session.get("request_name"),
+            )
+
     # Create Arbiter for intelligent conflict resolution between QA evaluators
     from arbiter import Arbiter
     arbiter = Arbiter(
         ai_service=ai_service,
-        model=getattr(request, 'arbiter_model', None)
+        model=getattr(request, 'arbiter_model', None),
+        stream_callback=arbiter_stream_callback,
     )
     logger.info(f"Arbiter initialized with model: {arbiter.model}")
 
@@ -2278,10 +2340,49 @@ async def _generate_smart_edits(
             span_start, span_end = span
             paragraph_text = edited_content[span_start:span_end]
 
+            # Determine paragraph index for streaming
+            paragraph_index = len(edit_metadata['edits_applied']) + 1
+            total_paragraphs = len(sorted_paragraphs)
+
+            # Get first edit info for event metadata
+            first_edit = paragraph_edits[0]
+            edit_severity = getattr(first_edit, 'issue_severity', None)
+            edit_description = getattr(first_edit, 'issue_description', '') or ''
+            exact_fragment = getattr(first_edit, 'exact_fragment', None)
+
+            # Calculate fragment position within paragraph if available
+            fragment_position = None
+            if exact_fragment and exact_fragment in paragraph_text:
+                frag_start = paragraph_text.find(exact_fragment)
+                frag_end = frag_start + len(exact_fragment)
+                fragment_position = {"start": frag_start, "end": frag_end}
+
+            # Emit edit_start event for monitor
+            project_id = session.get("project_id")
+            if project_id:
+                await publish_project_phase_chunk(
+                    project_id,
+                    "smart_edit",
+                    content=None,
+                    session_id=session_id,
+                    event="edit_start",
+                    edit_data={
+                        "paragraph_index": paragraph_index,
+                        "total_paragraphs": total_paragraphs,
+                        "operation_type": "pending",  # Will be updated after determining direct/ai
+                        "text_before": paragraph_text,
+                        "fragment": exact_fragment,
+                        "fragment_position": fragment_position,
+                        "severity": edit_severity.value if edit_severity else "minor",
+                        "description": edit_description[:200],  # Truncate for efficiency
+                        "issues_count": len(paragraph_edits),
+                    }
+                )
+
             # Log the original paragraph before editing
             logger.info("")
             logger.info("=" * 80)
-            logger.info(f"[SMART_EDIT] Editing paragraph #{len(edit_metadata['edits_applied']) + 1} of {len(sorted_paragraphs)}")
+            logger.info(f"[SMART_EDIT] Editing paragraph #{paragraph_index} of {total_paragraphs}")
             logger.info(f"[SMART_EDIT] Issues to fix: {len(paragraph_edits)}")
             for idx, edit in enumerate(paragraph_edits, 1):
                 desc = getattr(edit, 'issue_description', '') or ''
@@ -2374,9 +2475,67 @@ async def _generate_smart_edits(
                     "original_length": len(paragraph_text.split()),
                     "edited_length": len(edited_paragraph.split())
                 })
+
+                # Emit edit_complete event for monitor
+                if project_id:
+                    # Determine operation type based on path taken
+                    op_type = "direct" if direct_op else "ai_assisted"
+                    if direct_op:
+                        op_type = direct_op.get("edit_type", "replace")
+                        if hasattr(op_type, 'value'):
+                            op_type = op_type.value
+
+                    # Calculate new fragment if there was a specific fragment replaced
+                    new_fragment = None
+                    if exact_fragment and fragment_position:
+                        # Try to find what replaced the fragment
+                        frag_start = fragment_position["start"]
+                        # The new fragment length might differ, use word-based heuristic
+                        # or just provide the edited paragraph for the animation
+                        new_fragment = edited_paragraph
+
+                    await publish_project_phase_chunk(
+                        project_id,
+                        "smart_edit",
+                        content=None,
+                        session_id=session_id,
+                        event="edit_complete",
+                        edit_data={
+                            "paragraph_index": paragraph_index,
+                            "total_paragraphs": total_paragraphs,
+                            "operation_type": op_type,
+                            "ai_assisted": not direct_op,
+                            "success": True,
+                            "text_before": paragraph_text,
+                            "text_after": edited_paragraph,
+                            "fragment": exact_fragment,
+                            "new_fragment": new_fragment,
+                            "fragment_position": fragment_position,
+                            "char_delta": len(edited_paragraph) - len(paragraph_text),
+                            "word_delta": len(edited_paragraph.split()) - len(paragraph_text.split()),
+                        }
+                    )
             else:
                 # Fail-fast: propagate error immediately
                 error_msg = "; ".join(result.errors) if result.errors else "Unknown error"
+
+                # Emit edit_error event for monitor
+                if project_id:
+                    await publish_project_phase_chunk(
+                        project_id,
+                        "smart_edit",
+                        content=None,
+                        session_id=session_id,
+                        event="edit_error",
+                        edit_data={
+                            "paragraph_index": paragraph_index,
+                            "total_paragraphs": total_paragraphs,
+                            "success": False,
+                            "error": error_msg[:200],
+                            "text_before": paragraph_text,
+                        }
+                    )
+
                 raise SmartEditError(f"Edit operation failed for '{paragraph_key}': {error_msg}")
 
         final_content = edited_content

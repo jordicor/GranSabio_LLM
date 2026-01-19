@@ -20,9 +20,9 @@ logger = logging.getLogger(__name__)
 # Note: core.app_state imports are done lazily in methods to avoid
 # circular import (core/__init__.py imports streaming_routes which imports us)
 
-VALID_CONTENT_PHASES = {"preflight", "generation", "qa", "consensus", "gran_sabio"}
+VALID_CONTENT_PHASES = {"preflight", "generation", "qa", "arbiter", "smart_edit", "consensus", "gran_sabio"}
 VALID_PHASES = VALID_CONTENT_PHASES | {"status"}
-PHASE_ALIASES = {"gransabio": "gran_sabio"}
+PHASE_ALIASES = {"gransabio": "gran_sabio", "smartedit": "smart_edit"}
 HEARTBEAT_INTERVAL = 15
 
 

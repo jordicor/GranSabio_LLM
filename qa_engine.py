@@ -872,6 +872,10 @@ class QAEngine:
                                 logger.info(
                                     f"Gran Sabio determined deal-breaker in {layer.name} as FALSE POSITIVE. Continuing evaluation."
                                 )
+                                if progress_callback:
+                                    await progress_callback(
+                                        f"Gran Sabio: FALSE POSITIVE in {layer.name}. Continuing."
+                                    )
 
                                 for eval in deal_breakers:
                                     original_reason = eval.deal_breaker_reason or eval.reason or ""
@@ -887,6 +891,10 @@ class QAEngine:
                                         eval.score = gs_result.final_score
                                         eval.passes_score = (gs_result.final_score >= getattr(layer, "min_score", 0.0))
                                         logger.debug("Gran Sabio override updated %s score from %s to %s", eval.model, prev_score, eval.score)
+                                        if progress_callback:
+                                            await progress_callback(
+                                                f"Gran Sabio override: {eval.model} score {prev_score} -> {gs_result.final_score}"
+                                            )
 
                                 # Check if Gran Sabio provided modified content
                                 gs_modified_content = getattr(gs_result, "final_content", None)

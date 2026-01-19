@@ -141,6 +141,7 @@ class AIService:
         self.xai_client = None
         self.openrouter_client = None
         self.ollama_client = None
+        self.fake_client = None
         
         # Configure optimized HTTP connector for better performance
         self.http_connector = aiohttp.TCPConnector(
@@ -262,6 +263,24 @@ class AIService:
             logger.info(f"Ollama client initialized at {ollama_base_url}")
         else:
             logger.info("Ollama not configured (OLLAMA_HOST not set)")
+
+        # Initialize Fake AI client (for testing with controlled responses)
+        if config.FAKE_AI_HOST:
+            fake_base_url = config.FAKE_AI_HOST.rstrip("/")
+            if not fake_base_url.startswith(("http://", "https://")):
+                fake_base_url = f"http://{fake_base_url}"
+            if not fake_base_url.endswith("/v1"):
+                fake_base_url = f"{fake_base_url}/v1"
+            self.fake_client = openai.AsyncOpenAI(
+                api_key="fake",  # Dummy key, Fake AI doesn't require authentication
+                base_url=fake_base_url,
+                timeout=30.0,
+                max_retries=1
+            )
+            logger.info(f"Fake AI client initialized at {fake_base_url}")
+        else:
+            self.fake_client = None
+            logger.debug("Fake AI not configured (FAKE_AI_HOST not set)")
 
     @staticmethod
     def _strip_additional_properties(schema: Dict[str, Any]) -> Dict[str, Any]:
@@ -1270,6 +1289,38 @@ class AIService:
 
                 self._emit_usage(usage_callback, model_id, provider, usage_meta, extra_payload)
                 return content
+            elif provider == "fake":
+                content, usage_meta = await self._generate_fake(
+                    prompt,
+                    model_id,
+                    temperature,
+                    adjusted_max_tokens,
+                    system_prompt or "",
+                    json_output=json_output,
+                    json_schema=json_schema,
+                )
+
+                # Log full response if extra_verbose is enabled
+                if phase_logger:
+                    phase_logger.log_response(
+                        model=model_id,
+                        response=content,
+                        metadata={
+                            "input_tokens": usage_meta.get("input_tokens"),
+                            "output_tokens": usage_meta.get("output_tokens"),
+                            "provider": provider,
+                        }
+                    )
+                elif extra_verbose:
+                    separator = "=" * 80
+                    logger.info(f"\n{separator}")
+                    logger.info(f"[EXTRA_VERBOSE] FAKE AI RESPONSE from {model_id}")
+                    logger.info(f"{separator}")
+                    logger.info(content)
+                    logger.info(f"{separator}\n")
+
+                self._emit_usage(usage_callback, model_id, provider, usage_meta, extra_payload)
+                return content
             else:
                 raise ValueError(f"Unsupported model provider: {provider}")
 
@@ -2017,6 +2068,19 @@ class AIService:
                     yield chunk
             elif provider == "ollama":
                 async for chunk in self._stream_ollama(
+                    prompt,
+                    model_id,
+                    temperature,
+                    adjusted_max_tokens,
+                    system_prompt,
+                    json_output=json_output,
+                    json_schema=json_schema,
+                    usage_callback=usage_callback,
+                    usage_extra=extra_payload,
+                ):
+                    yield chunk
+            elif provider == "fake":
+                async for chunk in self._stream_fake(
                     prompt,
                     model_id,
                     temperature,
@@ -3926,6 +3990,122 @@ class AIService:
             )
         except Exception as e:
             logger.error(f"Ollama streaming error: {e}")
+            raise
+
+    async def _generate_fake(
+        self,
+        prompt: str,
+        model_id: str,
+        temperature: float,
+        max_tokens: int,
+        system_prompt: str,
+        json_output: bool = False,
+        json_schema: Optional[Dict[str, Any]] = None,
+    ) -> tuple:
+        """Generate content using Fake AI server (for testing).
+
+        Args:
+            prompt: Generation prompt
+            model_id: Fake model identifier (e.g., 'Generator-Dumb', 'QA-Dumb')
+            temperature: Generation temperature (ignored)
+            max_tokens: Maximum tokens (ignored)
+            system_prompt: System prompt (ignored)
+            json_output: Enable JSON output mode (ignored)
+            json_schema: Optional JSON schema (ignored)
+        """
+        if not self.fake_client:
+            raise ValueError("Fake AI client not initialized. Set FAKE_AI_HOST in your environment.")
+
+        messages = [{"role": "user", "content": prompt}]
+        if system_prompt:
+            messages.insert(0, {"role": "system", "content": system_prompt})
+
+        logger.info(f"[FakeAI] Generating with model: {model_id}")
+
+        response = await self.fake_client.chat.completions.create(
+            model=model_id,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+        content = response.choices[0].message.content
+        usage = {
+            "input_tokens": getattr(response.usage, "prompt_tokens", 0) if response.usage else 0,
+            "output_tokens": getattr(response.usage, "completion_tokens", 0) if response.usage else 0,
+        }
+
+        logger.info(f"[FakeAI] Response from {model_id}: {len(content)} chars")
+        return content, usage
+
+    async def _stream_fake(
+        self,
+        prompt: str,
+        model_id: str,
+        temperature: float,
+        max_tokens: int,
+        system_prompt: Optional[str],
+        json_output: bool = False,
+        json_schema: Optional[Dict[str, Any]] = None,
+        usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        usage_extra: Optional[Dict[str, Any]] = None,
+    ):
+        """Stream content generation using Fake AI server (for testing).
+
+        Args:
+            prompt: Generation prompt
+            model_id: Fake model identifier
+            temperature: Generation temperature (ignored)
+            max_tokens: Maximum tokens (ignored)
+            system_prompt: System prompt (ignored)
+            json_output: Enable JSON output mode (ignored)
+            json_schema: Optional JSON schema (ignored)
+            usage_callback: Callback for usage tracking
+            usage_extra: Extra usage tracking data
+        """
+        if not self.fake_client:
+            raise ValueError("Fake AI client not initialized. Set FAKE_AI_HOST in your environment.")
+
+        extra_payload = usage_extra or {}
+
+        messages = [{"role": "user", "content": prompt}]
+        if system_prompt:
+            messages.insert(0, {"role": "system", "content": system_prompt})
+
+        logger.info(f"[FakeAI] Streaming with model: {model_id}")
+
+        try:
+            stream = await self.fake_client.chat.completions.create(
+                model=model_id,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+
+            usage_obj = None
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+                # Capture usage from streaming response if available
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage_obj = chunk.usage
+
+            # Try to get usage from stream object
+            if hasattr(stream, "response") and hasattr(stream.response, "usage"):
+                usage_obj = getattr(stream.response, "usage", usage_obj)
+            elif hasattr(stream, "usage") and stream.usage:
+                usage_obj = stream.usage
+
+            self._emit_usage(
+                usage_callback,
+                model_id,
+                "fake",
+                usage_obj,
+                extra_payload,
+            )
+        except Exception as e:
+            logger.error(f"Fake AI streaming error: {e}")
             raise
 
     async def get_embeddings(self, texts: List[str], model: str = None) -> List[List[float]]:

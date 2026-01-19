@@ -440,6 +440,40 @@
             100% { transform: scale(1); }
         }
 
+        /* Smart edit specific badge states */
+        .stream-badge.badge-editing {
+            background: rgba(139, 92, 246, 0.3);
+            border-color: #8b5cf6;
+            color: #a78bfa;
+            animation: editing-pulse 1.5s ease-in-out infinite;
+        }
+
+        @keyframes editing-pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+
+        .stream-badge.badge-success {
+            background: rgba(16, 185, 129, 0.3);
+            border-color: #10b981;
+            color: #10b981;
+        }
+
+        .stream-badge.badge-error {
+            background: rgba(239, 68, 68, 0.3);
+            border-color: #ef4444;
+            color: #ef4444;
+        }
+
+        /* Smart edit text container */
+        .smartedit-text {
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
         .stream-content {
             height: 300px;
             overflow-y: auto;
@@ -456,6 +490,10 @@
             content: '> Awaiting data...';
             color: var(--gray);
             font-style: italic;
+        }
+
+        .stream-content.smartedit-preview:empty::before {
+            content: '> Awaiting smart-edit events...';
         }
 
         .stream-stats {
@@ -893,6 +931,37 @@
         .layer-pill .score {
             color: var(--cyan);
             margin-left: 3px;
+        }
+
+        /* Analysis Filter Pills (Preflight/Consensus toggle in header) */
+        .analysis-filter-pills {
+            display: flex;
+            gap: 4px;
+            margin-right: 8px;
+        }
+
+        .analysis-pill {
+            font-size: 8px;
+            padding: 2px 6px;
+            border-radius: 8px;
+            background: var(--bg-panel);
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            cursor: pointer;
+            transition: all 0.15s ease;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .analysis-pill:hover {
+            border-color: var(--green-dim);
+            color: var(--text);
+        }
+
+        .analysis-pill.active {
+            background: var(--green);
+            border-color: var(--green);
+            color: var(--bg-dark);
         }
 
         /* Consensus Gauge */
@@ -1701,6 +1770,7 @@
             margin-right: 5px;
         }
     </style>
+    <link rel="stylesheet" href="/static/css/edit_animations.css">
 </head>
 <body>
     <!-- Header -->
@@ -1852,39 +1922,62 @@
                 </div>
             </div>
 
-            <!-- Preflight -->
-            <div class="stream-panel" data-phase="preflight">
+            <!-- Arbiter -->
+            <div class="stream-panel" data-phase="arbiter">
                 <div class="stream-header">
-                    <span class="stream-title">Preflight</span>
-                    <div class="phase-toggle" data-phase="preflight">
+                    <span class="stream-title">Arbiter</span>
+                    <div class="phase-toggle" data-phase="arbiter">
                         <span class="toggle-segment on active" data-state="on" title="Active - Receiving chunks normally">&#9673;</span>
                         <span class="toggle-segment soft" data-state="soft" title="Soft mute - Ignoring chunks locally (still subscribed)">&#9684;</span>
                         <span class="toggle-segment hard" data-state="hard" title="Hard mute - Will reconnect excluding this phase">&#9675;</span>
                     </div>
-                    <span class="stream-badge" id="badge-preflight">idle</span>
+                    <span class="stream-badge" id="badge-arbiter">idle</span>
                 </div>
-                <div class="stream-content" id="content-preflight"></div>
+                <div class="stream-content" id="content-arbiter"></div>
                 <div class="stream-stats">
-                    <div class="stat-item"><span class="stat-label">Chunks:</span><span class="stat-value" id="chunks-preflight">0</span></div>
-                    <div class="stat-item"><span class="stat-label">Bytes:</span><span class="stat-value" id="bytes-preflight">0</span></div>
+                    <div class="stat-item"><span class="stat-label">Chunks:</span><span class="stat-value" id="chunks-arbiter">0</span></div>
+                    <div class="stat-item"><span class="stat-label">Bytes:</span><span class="stat-value" id="bytes-arbiter">0</span></div>
                 </div>
             </div>
 
-            <!-- Consensus -->
-            <div class="stream-panel" data-phase="consensus">
+            <!-- Smart Edit - Live edit visualization -->
+            <div class="stream-panel" data-phase="smartedit">
                 <div class="stream-header">
-                    <span class="stream-title">Consensus</span>
-                    <div class="phase-toggle" data-phase="consensus">
+                    <span class="stream-title">Smart Edit</span>
+                    <div class="phase-toggle" data-phase="smartedit">
+                        <span class="toggle-segment on active" data-state="on" title="Active - Receiving edit events">&#9673;</span>
+                        <span class="toggle-segment soft" data-state="soft" title="Soft mute - Ignoring locally">&#9684;</span>
+                        <span class="toggle-segment hard" data-state="hard" title="Hard mute - Will reconnect excluding">&#9675;</span>
+                    </div>
+                    <span class="stream-badge" id="badge-smartedit">idle</span>
+                </div>
+                <div class="stream-content smartedit-preview" id="content-smartedit"></div>
+                <div class="stream-stats">
+                    <div class="stat-item"><span class="stat-label">Edits:</span><span class="stat-value" id="edits-smartedit">0</span></div>
+                    <div class="stat-item"><span class="stat-label">Para:</span><span class="stat-value" id="paragraph-smartedit">-/-</span></div>
+                    <div class="stat-item"><span class="stat-label">Delta:</span><span class="stat-value" id="delta-smartedit">0</span></div>
+                </div>
+            </div>
+
+            <!-- Analysis (combined Preflight + Consensus with filter pills) -->
+            <div class="stream-panel" data-phase="analysis">
+                <div class="stream-header">
+                    <span class="stream-title">Analysis</span>
+                    <div class="analysis-filter-pills">
+                        <span class="analysis-pill" data-filter="preflight" title="Show only preflight analysis">Preflight</span>
+                        <span class="analysis-pill" data-filter="consensus" title="Show only consensus scoring">Consensus</span>
+                    </div>
+                    <div class="phase-toggle" data-phase="analysis">
                         <span class="toggle-segment on active" data-state="on" title="Active - Receiving chunks normally">&#9673;</span>
                         <span class="toggle-segment soft" data-state="soft" title="Soft mute - Ignoring chunks locally (still subscribed)">&#9684;</span>
                         <span class="toggle-segment hard" data-state="hard" title="Hard mute - Will reconnect excluding this phase">&#9675;</span>
                     </div>
-                    <span class="stream-badge" id="badge-consensus">idle</span>
+                    <span class="stream-badge" id="badge-analysis">idle</span>
                 </div>
-                <div class="stream-content" id="content-consensus"></div>
+                <div class="stream-content" id="content-analysis"></div>
                 <div class="stream-stats">
-                    <div class="stat-item"><span class="stat-label">Chunks:</span><span class="stat-value" id="chunks-consensus">0</span></div>
-                    <div class="stat-item"><span class="stat-label">Bytes:</span><span class="stat-value" id="bytes-consensus">0</span></div>
+                    <div class="stat-item"><span class="stat-label">Chunks:</span><span class="stat-value" id="chunks-analysis">0</span></div>
+                    <div class="stat-item"><span class="stat-label">Bytes:</span><span class="stat-value" id="bytes-analysis">0</span></div>
                 </div>
             </div>
 

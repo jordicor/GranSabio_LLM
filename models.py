@@ -927,7 +927,7 @@ class ContentRequest(BaseModel):
     min_global_score: float = Field(default=8.0, ge=0.0, le=10.0, description="Minimum global average score")
     
     # Iteration configuration
-    max_iterations: int = Field(default=5, gt=0, le=50, description="Maximum generation iterations")
+    max_iterations: int = Field(default=5, gt=0, le=999, description="Maximum generation iterations")
     json_retry_without_iteration: bool = Field(
         default=False,
         description="When true, JSON validation errors do not consume iterations (retries are handled separately)"
@@ -935,7 +935,7 @@ class ContentRequest(BaseModel):
     max_consecutive_smart_edits: int = Field(
         default_factory=lambda: config.DEFAULT_MAX_CONSECUTIVE_SMART_EDITS,
         ge=1,
-        le=50,
+        le=999,
         description="Maximum consecutive smart edit passes before forcing full regeneration (configurable via DEFAULT_MAX_CONSECUTIVE_SMART_EDITS in .env)"
     )
 

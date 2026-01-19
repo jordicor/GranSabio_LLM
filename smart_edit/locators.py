@@ -117,22 +117,29 @@ def parse_counted_phrase(data: Any, expected_count: int) -> Optional[str]:
 
     Args:
         data: The phrase object from AI response (dict with position: word)
-        expected_count: Expected number of words (N)
+        expected_count: Expected number of words (N) - minimum required for uniqueness
 
     Returns:
         The phrase as a joined string (words separated by spaces), or None if invalid.
         Returns None if:
         - data is not a dict or is empty
-        - number of words exceeds expected_count
+        - number of words is less than expected_count (not enough for unique matching)
         - keys are not consecutive integers "1".."N"
+        - any value is empty or whitespace-only
+
+        If more words than expected_count are provided, truncates to first N words.
     """
     if not isinstance(data, dict) or not data:
         return None
 
-    # Must have at most expected_count words (can be fewer for short spans)
     word_count = len(data)
-    if word_count > expected_count:
-        logger.debug(f"Counted phrase has {word_count} words, expected at most {expected_count}")
+
+    # Must have at least expected_count words for unique matching
+    if word_count < expected_count:
+        logger.debug(
+            f"Counted phrase has {word_count} words, need at least {expected_count} "
+            f"for unique matching"
+        )
         return None
 
     # Keys must be consecutive integers "1".."word_count"
@@ -150,6 +157,21 @@ def parse_counted_phrase(data: Any, expected_count: int) -> Optional[str]:
     sorted_items = sorted(data.items(), key=lambda x: int(x[0]))
     words = [str(item[1]) for item in sorted_items]
 
+    # Reject if any word is empty or whitespace-only
+    for i, word in enumerate(words):
+        if not word.strip():
+            logger.debug(
+                f"Counted phrase has empty/whitespace value at position {i + 1}"
+            )
+            return None
+
+    # Truncate to expected_count if more words provided (extras are ignored)
+    if word_count > expected_count:
+        logger.debug(
+            f"Counted phrase has {word_count} words, truncating to {expected_count}"
+        )
+        words = words[:expected_count]
+
     # Join with spaces to form the phrase
     return " ".join(words)
 
@@ -165,7 +187,7 @@ def validate_counted_phrase_format(
 
     Args:
         data: The phrase object from AI response (must be dict)
-        expected_count: Expected number of words
+        expected_count: Expected number of words (minimum required)
 
     Returns:
         Tuple of (is_valid, parsed_phrase, error_message)
@@ -180,8 +202,8 @@ def validate_counted_phrase_format(
         return False, None, "Empty phrase dict"
 
     word_count = len(data)
-    if word_count > expected_count:
-        return False, None, f"Too many words: {word_count} > {expected_count}"
+    if word_count < expected_count:
+        return False, None, f"Too few words: {word_count} < {expected_count} required"
 
     try:
         keys = sorted(int(k) for k in data.keys())
@@ -192,10 +214,20 @@ def validate_counted_phrase_format(
     if keys != expected_keys:
         return False, None, f"Keys {keys} not consecutive 1..{word_count}"
 
-    # Valid - extract phrase (values are words, sorted by key)
+    # Extract words sorted by key
     sorted_items = sorted(data.items(), key=lambda x: int(x[0]))
-    phrase = " ".join(str(item[1]) for item in sorted_items)
+    words = [str(item[1]) for item in sorted_items]
 
+    # Check for empty/whitespace values
+    for i, word in enumerate(words):
+        if not word.strip():
+            return False, None, f"Empty/whitespace value at position {i + 1}"
+
+    # Truncate to expected_count if more words provided
+    if word_count > expected_count:
+        words = words[:expected_count]
+
+    phrase = " ".join(words)
     return True, phrase, "valid_counted_format"
 
 
@@ -216,16 +248,16 @@ def extract_phrase_from_response(
 
     Some models (e.g., GPT-5.2) may ignore instructions and return plain
     strings instead. As a fallback, if a string has >= expected_count words,
-    we accept it directly.
+    we accept it (truncated to expected_count).
 
     Args:
         data: The phrase dict from AI response (or string as fallback)
-        expected_count: Expected number of words
+        expected_count: Expected number of words (minimum required)
         field_name: Field name for logging purposes
         model_name: Name of the model that produced this response (for logging)
 
     Returns:
-        Extracted phrase string, or None if invalid
+        Extracted phrase string (exactly expected_count words), or None if invalid
     """
     # Primary path: dict with counted format
     if isinstance(data, dict):
@@ -241,18 +273,35 @@ def extract_phrase_from_response(
         words = data.split()
         word_count = len(words)
         model_info = f" [model: {model_name}]" if model_name else ""
-        if word_count >= expected_count:
-            logger.info(
-                f"{field_name}: fallback from string accepted "
-                f"({word_count} words >= {expected_count} expected){model_info}"
-            )
-            return data.strip()
-        else:
+
+        if word_count < expected_count:
             logger.warning(
                 f"{field_name}: string fallback rejected - "
                 f"only {word_count} words, need >= {expected_count}{model_info}"
             )
             return None
+
+        # Check for empty words (consecutive spaces would cause this)
+        if any(not w.strip() for w in words[:expected_count]):
+            logger.warning(
+                f"{field_name}: string fallback rejected - "
+                f"contains empty tokens{model_info}"
+            )
+            return None
+
+        # Truncate to expected_count words if more provided
+        if word_count > expected_count:
+            logger.info(
+                f"{field_name}: string fallback accepted and truncated "
+                f"({word_count} -> {expected_count} words){model_info}"
+            )
+            return " ".join(words[:expected_count])
+
+        logger.info(
+            f"{field_name}: string fallback accepted "
+            f"({word_count} words){model_info}"
+        )
+        return data.strip()
 
     # Neither dict nor valid string
     logger.warning(f"{field_name}: expected dict, got {type(data).__name__}")

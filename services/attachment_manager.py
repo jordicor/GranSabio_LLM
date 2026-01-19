@@ -29,11 +29,10 @@ import json_utils as json
 from config import AttachmentSettings
 
 
-# Temporarily disabled to fix segfault
-# try:
-#     import magic  # type: ignore
-# except ImportError:  # pragma: no cover - optional dependency
-magic = None  # type: ignore[var-annotated]
+try:
+    import magic  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    magic = None  # type: ignore[var-annotated]
 
 logger = logging.getLogger(__name__)
 

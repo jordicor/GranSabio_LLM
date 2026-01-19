@@ -541,7 +541,7 @@ def _stop_project(project_id: str) -> int:
     cancelled_project_ids.add(project_id)
 
     # Broadcast project_end to all phases and close their streams
-    phases = ["preflight", "generation", "qa", "consensus", "gran_sabio"]
+    phases = ["preflight", "generation", "qa", "smart_edit", "consensus", "gran_sabio"]
     for phase in phases:
         # Fire-and-forget; if no loop running, just skip
         try:
@@ -660,6 +660,8 @@ def _build_project_phase_event(
     # QA-specific fields for filtering
     qa_layer: Optional[str] = None,
     qa_model: Optional[str] = None,
+    # Smart-edit specific fields
+    edit_data: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Create a JSON event string for project/phase streams."""
     obj: Dict[str, Any] = {
@@ -693,6 +695,9 @@ def _build_project_phase_event(
         obj["qa_layer"] = qa_layer
     if qa_model is not None:
         obj["qa_model"] = qa_model
+    # Smart-edit data
+    if edit_data is not None:
+        obj["edit_data"] = edit_data
     return json.dumps(obj, ensure_ascii=True)
 
 
@@ -716,6 +721,8 @@ async def publish_project_phase_chunk(
     # QA-specific fields for filtering
     qa_layer: Optional[str] = None,
     qa_model: Optional[str] = None,
+    # Smart-edit specific fields
+    edit_data: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Broadcast a live event to all subscribers of a project/phase stream.
@@ -757,6 +764,7 @@ async def publish_project_phase_chunk(
         provider=provider,
         qa_layer=qa_layer,
         qa_model=qa_model,
+        edit_data=edit_data,
     )
 
     for q in targets:
@@ -777,7 +785,7 @@ async def publish_project_session_end(
     """Publish a session_end event to all phases for a project."""
     if not project_id:
         return
-    phases = ["preflight", "generation", "qa", "consensus", "gran_sabio"]
+    phases = ["preflight", "generation", "qa", "smart_edit", "consensus", "gran_sabio"]
     for phase in phases:
         await publish_project_phase_chunk(
             project_id,

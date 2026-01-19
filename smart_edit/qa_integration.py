@@ -68,15 +68,15 @@ RESPONSE FORMAT - RETURN VALID JSON ONLY:
       "operation_type": "<delete|replace|rephrase|add_before|add_after>",
       "instruction": "<what to fix>",
       "severity": "<minor|major|critical>",
-      "exact_fragment": "<optional: problematic text for direct ops>",
-      "suggested_text": "<optional: replacement text for direct ops>"
+      "exact_fragment": "<VERBATIM copy of text to delete/replace, min {phrase_length} words>",
+      "suggested_text": "<replacement text for replace ops, ignored for delete>"
     }}
   ]
 }}
 
 ⚠️ NUMBERED WORD COUNTING - STRICT REQUIREMENT (NON-COMPLIANCE = REJECTED RESPONSE):
 
-paragraph_start and paragraph_end MUST be JSON objects with EXACTLY {phrase_length} numbered string keys.
+paragraph_start and paragraph_end MUST be JSON objects with AT LEAST {phrase_length} numbered string keys.
 
 WHY THIS IS MANDATORY:
 - The system uses these anchors for find-and-replace; texts often contain repeated phrases
@@ -89,20 +89,23 @@ FORMAT:
 paragraph_start: {{"1": "first", "2": "second", "3": "third", ..., "{phrase_length}": "Nth"}}
 paragraph_end: {{"1": "first", "2": "second", "3": "third", ..., "{phrase_length}": "Nth"}}
 
-- Count explicitly from "1" to "{phrase_length}" — no skipping, no grouping multiple words
+RULES:
+- Provide AT LEAST {phrase_length} words (extra words beyond {phrase_length} are ignored but not rejected)
+- Count explicitly from "1" to N — no skipping, no grouping multiple words
 - A "token" = any whitespace-separated unit, INCLUDING attached punctuation/formatting
 - Copy CHARACTER-FOR-CHARACTER: "word." "**bold**" "(text)" "word," are each ONE token
+- NEVER use empty strings "" as values — every key must have actual text
 
 EXAMPLE (phrase_length={phrase_length}):
 If paragraph starts with: "**Chapter 1.** The adventure begins here today"
 ✓ CORRECT: {{"1": "**Chapter", "2": "1.**", "3": "The", "4": "adventure", "5": "begins", "6": "here", "7": "today"}}
+✓ ALSO OK: providing more than {phrase_length} words (extras are simply ignored)
 ✗ REJECTED: {{"1": "**Chapter 1.** The"}} — grouped words, missing numbered keys
 ✗ REJECTED: "**Chapter 1.** The adventure" — string instead of object, no numbering
 ✗ REJECTED: {{"1": "Chapter", "2": "1", "3": "The"}} — only 3 words when {phrase_length} required
+✗ REJECTED: {{"1": "word", "2": "", "3": "other"}} — empty string value at position 2
 
-If paragraph has fewer than {phrase_length} tokens, use ALL available tokens (numbered 1 to N).
-
-⚠️ Responses failing this format are automatically discarded. Count as you write: 1, 2, 3... up to {phrase_length}.
+⚠️ Responses failing this format are automatically discarded. Count as you write: 1, 2, 3... up to {phrase_length} (or more).
 
 OPERATION TYPES:
 - "delete": Remove the exact_fragment entirely (no AI needed if exact_fragment provided)
@@ -110,6 +113,19 @@ OPERATION TYPES:
 - "rephrase": AI rewrites the paragraph maintaining meaning
 - "add_before": AI adds content before the fragment
 - "add_after": AI adds content after the fragment
+
+DIRECT OPERATIONS (delete/replace) - CRITICAL:
+exact_fragment and suggested_text perform LITERAL find-and-replace operations:
+- The system executes: text.replace(exact_fragment, suggested_text) for replace
+- The system executes: text.remove(exact_fragment) for delete
+- exact_fragment MUST be a VERBATIM copy from the content (character-for-character)
+- If exact_fragment has extra or missing words vs the actual text:
+  * Replace: leaves orphan words or removes unintended content
+  * Delete: removes wrong amount of text, corrupting the document
+- exact_fragment MUST have AT LEAST {phrase_length} words to guarantee uniqueness
+- Always COPY exact_fragment directly from the content, never paraphrase or summarize
+- For delete: only exact_fragment is required (suggested_text is ignored)
+- For replace: both exact_fragment AND suggested_text are required
 
 DEAL-BREAKER vs EDITS (CRITICAL):
 - If deal_breaker=true: set editable=false, edit_strategy=null, edit_groups=[]
@@ -136,7 +152,7 @@ GENERAL RULES:
 - Use edit_strategy="regenerate" when problems are widespread (but NOT a deal-breaker)
 - Provide edit_groups only when edit_strategy="incremental"
 - Each edit group should target one paragraph with clear fix instructions
-- For direct operations (delete/replace), provide exact_fragment and suggested_text
+- For direct operations: delete needs exact_fragment; replace needs both exact_fragment and suggested_text
 '''
 
 # Template for word index mode (uses start_word_index/end_word_index)
@@ -158,8 +174,8 @@ RESPONSE FORMAT - RETURN VALID JSON ONLY:
       "operation_type": "<delete|replace|rephrase|add_before|add_after>",
       "instruction": "<what to fix>",
       "severity": "<minor|major|critical>",
-      "exact_fragment": "<optional: problematic text for direct ops>",
-      "suggested_text": "<optional: replacement text for direct ops>"
+      "exact_fragment": "<VERBATIM copy of text to delete/replace, min {phrase_length} words>",
+      "suggested_text": "<replacement text for replace ops, ignored for delete>"
     }}
   ]
 }}
@@ -177,6 +193,19 @@ OPERATION TYPES:
 - "rephrase": AI rewrites the paragraph maintaining meaning
 - "add_before": AI adds content before the fragment
 - "add_after": AI adds content after the fragment
+
+DIRECT OPERATIONS (delete/replace) - CRITICAL:
+exact_fragment and suggested_text perform LITERAL find-and-replace operations:
+- The system executes: text.replace(exact_fragment, suggested_text) for replace
+- The system executes: text.remove(exact_fragment) for delete
+- exact_fragment MUST be a VERBATIM copy from the content (character-for-character)
+- If exact_fragment has extra or missing words vs the actual text:
+  * Replace: leaves orphan words or removes unintended content
+  * Delete: removes wrong amount of text, corrupting the document
+- exact_fragment MUST have AT LEAST {phrase_length} words to guarantee uniqueness
+- Always COPY exact_fragment directly from the content, never paraphrase or summarize
+- For delete: only exact_fragment is required (suggested_text is ignored)
+- For replace: both exact_fragment AND suggested_text are required
 
 DEAL-BREAKER vs EDITS (CRITICAL):
 - If deal_breaker=true: set editable=false, edit_strategy=null, edit_groups=[]
@@ -203,7 +232,7 @@ GENERAL RULES:
 - Use edit_strategy="regenerate" when problems are widespread (but NOT a deal-breaker)
 - Provide edit_groups only when edit_strategy="incremental"
 - Each edit group should target one paragraph with clear fix instructions
-- For direct operations (delete/replace), provide exact_fragment and suggested_text
+- For direct operations: delete needs exact_fragment; replace needs both exact_fragment and suggested_text
 '''
 
 # Simple format without edit info (for non-editable content)
@@ -474,14 +503,26 @@ def parse_qa_edit_groups(
                     raw_end, marker_length, "paragraph_end", model_name
                 )
 
-                # Skip if we couldn't parse the phrases
+                # Skip if we couldn't parse the phrases (unless exact_fragment is sufficient)
                 if not paragraph_start or not paragraph_end:
-                    logger.warning(
-                        f"Failed to parse phrase markers from edit group. "
-                        f"Raw start type: {type(raw_start).__name__}, "
-                        f"Raw end type: {type(raw_end).__name__}"
-                    )
-                    continue
+                    # Check if exact_fragment has enough words to guarantee uniqueness
+                    exact_word_count = len(exact_fragment.split()) if exact_fragment else 0
+                    if can_use_direct and exact_word_count >= marker_length:
+                        logger.debug(
+                            f"Markers invalid but exact_fragment has {exact_word_count} words "
+                            f">= {marker_length}, using direct mode"
+                        )
+                        # Proceed with empty markers - exact_fragment will be used directly
+                        paragraph_start = ""
+                        paragraph_end = ""
+                    else:
+                        logger.warning(
+                            f"Failed to parse phrase markers and exact_fragment insufficient "
+                            f"({exact_word_count} words, need {marker_length}). "
+                            f"Raw start type: {type(raw_start).__name__}, "
+                            f"Raw end type: {type(raw_end).__name__}"
+                        )
+                        continue
 
                 ranges.append(TextEditRange(
                     marker_mode="phrase",
