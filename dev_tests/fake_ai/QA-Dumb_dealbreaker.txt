@@ -1,0 +1,7 @@
+{
+  "score": 3.0,
+  "feedback": "Se detectaron problemas criticos en el contenido.",
+  "deal_breaker": true,
+  "deal_breaker_reason": "Contenido no cumple requisitos minimos de calidad",
+  "proposed_edits": []
+}

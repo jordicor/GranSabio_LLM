@@ -1,0 +1,20 @@
+{
+  "score": 6.5,
+  "feedback": "El contenido necesita mejoras puntuales para cumplir los requisitos.",
+  "deal_breaker": false,
+  "deal_breaker_reason": null,
+  "proposed_edits": [
+    {
+      "type": "REPLACE",
+      "original": "texto original a reemplazar",
+      "replacement": "texto mejorado con las correcciones necesarias",
+      "reason": "Mejora la claridad y precision del contenido"
+    },
+    {
+      "type": "DELETE",
+      "original": "contenido redundante que debe eliminarse",
+      "replacement": "",
+      "reason": "Elimina redundancia innecesaria"
+    }
+  ]
+}

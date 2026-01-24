@@ -1,0 +1,7 @@
+{
+  "score": 3.0,
+  "feedback": "DEAL-BREAKER DETECTADO por QA-Dumb: Se encontraron problemas criticos que requieren revision por GranSabio.",
+  "deal_breaker": true,
+  "deal_breaker_reason": "El contenido presenta deficiencias criticas que deben ser revisadas por un evaluador superior.",
+  "proposed_edits": []
+}

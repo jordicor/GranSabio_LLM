@@ -1,0 +1,88 @@
+{
+  "score": 6.5,
+  "feedback": "The biography contains several style issues, redundant phrases, and areas needing improvement. Multiple paragraphs use weak language, unnecessary filler words, and repetitive structures that reduce the overall quality.",
+  "deal_breaker": false,
+  "deal_breaker_reason": null,
+  "editable": true,
+  "edit_strategy": "incremental",
+  "edit_groups": [
+    {
+      "paragraph_start": {"1": "Marie", "2": "Curie", "3": "was", "4": "born", "5": "as"},
+      "paragraph_end": {"1": "in", "2": "academics", "3": "and", "4": "science."},
+      "operation_type": "rephrase",
+      "instruction": "The phrase 'very much' is weak. Rephrase to be more impactful and professional.",
+      "severity": "minor"
+    },
+    {
+      "paragraph_start": {"1": "Growing", "2": "up", "3": "under", "4": "Russian", "5": "occupation"},
+      "paragraph_end": {"1": "her", "2": "class", "3": "in", "4": "1883."},
+      "operation_type": "rephrase",
+      "instruction": "Replace 'very difficult' with more specific and evocative language describing the challenges.",
+      "severity": "minor"
+    },
+    {
+      "paragraph_start": {"1": "In", "2": "1891,", "3": "Marie", "4": "finally", "5": "moved"},
+      "paragraph_end": {"1": "her", "2": "class", "3": "again."},
+      "operation_type": "replace",
+      "instruction": "Remove redundant phrase 'absolutely remarkable and inspiring to everyone'",
+      "exact_fragment": "absolutely remarkable and inspiring to everyone",
+      "suggested_text": "extraordinary",
+      "severity": "major"
+    },
+    {
+      "paragraph_start": {"1": "Marie", "2": "met", "3": "Pierre", "4": "Curie", "5": "in"},
+      "paragraph_end": {"1": "used", "2": "today", "3": "universally."},
+      "operation_type": "delete",
+      "instruction": "Remove redundant word 'universally' as 'still used today' already implies widespread use",
+      "exact_fragment": " universally",
+      "suggested_text": "",
+      "severity": "minor"
+    },
+    {
+      "paragraph_start": {"1": "Their", "2": "groundbreaking", "3": "research", "4": "with", "5": "pitchblende"},
+      "paragraph_end": {"1": "not", "2": "understood", "3": "then."},
+      "operation_type": "rephrase",
+      "instruction": "The phrase 'amazing discoveries that changed science forever' is hyperbolic. Tone down while keeping impact.",
+      "severity": "major"
+    },
+    {
+      "paragraph_start": {"1": "In", "2": "1903,", "3": "Marie", "4": "became", "5": "the"},
+      "paragraph_end": {"1": "era", "2": "of", "3": "science."},
+      "operation_type": "replace",
+      "instruction": "Replace 'absolutely unprecedented' with clearer language",
+      "exact_fragment": "absolutely unprecedented",
+      "suggested_text": "groundbreaking",
+      "severity": "minor"
+    },
+    {
+      "paragraph_start": {"1": "Tragedy", "2": "struck", "3": "the", "4": "Curie", "5": "family"},
+      "paragraph_end": {"1": "first", "2": "female", "3": "professor", "4": "there."},
+      "operation_type": "rephrase",
+      "instruction": "The phrase 'terrible loss' followed by 'important scientific work' has awkward flow. Improve transitions.",
+      "severity": "minor"
+    },
+    {
+      "paragraph_start": {"1": "In", "2": "1911,", "3": "Marie", "4": "won", "5": "her"},
+      "paragraph_end": {"1": "repeated", "2": "by", "3": "anyone."},
+      "operation_type": "replace",
+      "instruction": "Remove redundant phrase 'truly remarkable achievement that has never been'",
+      "exact_fragment": "a truly remarkable achievement that has never been repeated by anyone",
+      "suggested_text": "an unparalleled accomplishment",
+      "severity": "major"
+    },
+    {
+      "paragraph_start": {"1": "During", "2": "World", "3": "War", "4": "One,", "5": "Marie"},
+      "paragraph_end": {"1": "for", "2": "medical", "3": "purposes."},
+      "operation_type": "rephrase",
+      "instruction": "Multiple uses of 'help' and 'wounded soldiers' create repetition. Vary the vocabulary.",
+      "severity": "minor"
+    },
+    {
+      "paragraph_start": {"1": "Marie", "2": "Curie", "3": "died", "4": "on", "5": "July"},
+      "paragraph_end": {"1": "obstacle", "2": "in", "3": "life."},
+      "operation_type": "rephrase",
+      "instruction": "The final sentence 'determination and intelligence can overcome any obstacle in life' is cliche. Create a more memorable closing.",
+      "severity": "major"
+    }
+  ]
+}

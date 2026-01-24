@@ -1,0 +1,7 @@
+{
+  "score": 2.5,
+  "feedback": "DEAL-BREAKER DETECTADO: Faltan secciones criticas del contenido que son esenciales para la completitud del texto.",
+  "deal_breaker": true,
+  "deal_breaker_reason": "El contenido omite informacion crucial sobre los logros cientificos y el impacto historico del sujeto.",
+  "proposed_edits": []
+}

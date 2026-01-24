@@ -1,0 +1,9 @@
+{
+  "score": 8.5,
+  "feedback": "Passed",
+  "deal_breaker": false,
+  "deal_breaker_reason": null,
+  "editable": false,
+  "edit_strategy": null,
+  "edit_groups": []
+}

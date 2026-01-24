@@ -52,6 +52,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "function_calling"
         ],
         "verified_at": "2025-10-24T21:14:05+00:00",
@@ -70,6 +71,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "function_calling"
         ],
         "verified_at": "2025-10-24T21:14:05+00:00",
@@ -88,6 +90,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "reasoning",
           "function_calling"
         ],
@@ -121,6 +124,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "reasoning",
           "function_calling"
         ],
@@ -155,6 +159,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "reasoning",
           "function_calling"
         ],
@@ -190,6 +195,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "reasoning",
           "function_calling"
         ],
@@ -226,6 +232,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "reasoning",
           "function_calling"
         ],
@@ -374,6 +381,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "reasoning",
           "function_calling"
         ],
@@ -407,6 +415,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "reasoning"
         ],
         "special_features": [
@@ -474,6 +483,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "reasoning"
         ],
         "special_features": [
@@ -537,6 +547,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "reasoning",
           "advanced_analysis"
         ],
@@ -570,6 +581,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "reasoning",
           "function_calling"
         ],
@@ -626,6 +638,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "analysis",
           "reasoning",
           "coding"
@@ -656,6 +669,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "analysis",
           "reasoning",
           "coding"
@@ -723,6 +737,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "analysis",
           "coding"
         ],
@@ -752,6 +767,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "analysis",
           "coding",
           "agentic_tasks",
@@ -1192,6 +1208,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "reasoning",
           "tool_use",
           "real_time_search"
@@ -1218,6 +1235,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "tool_use",
           "real_time_search"
         ],
@@ -1245,6 +1263,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "reasoning",
           "tool_use",
           "real_time_search",
@@ -1277,6 +1296,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "tool_use",
           "real_time_search",
           "function_calling"
@@ -6916,6 +6936,76 @@
         ],
         "verified_at": "2025-11-28T00:00:00+00:00",
         "source": "local/ollama"
+      }
+    },
+    "fake": {
+      "Generator-Dumb": {
+        "model_id": "Generator-Dumb",
+        "name": "Generator Dumb",
+        "description": "Fake model for testing content generation",
+        "input_tokens": 128000,
+        "output_tokens": 16384,
+        "context_window": 128000,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text"
+        ],
+        "verified_at": "2025-01-17T00:00:00+00:00",
+        "source": "local_testing"
+      },
+      "QA-Dumb": {
+        "model_id": "QA-Dumb",
+        "name": "QA Dumb",
+        "description": "Fake model for testing QA evaluation",
+        "input_tokens": 128000,
+        "output_tokens": 16384,
+        "context_window": 128000,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text"
+        ],
+        "verified_at": "2025-01-17T00:00:00+00:00",
+        "source": "local_testing"
+      },
+      "GranSabio-Dumb": {
+        "model_id": "GranSabio-Dumb",
+        "name": "GranSabio Dumb",
+        "description": "Fake model for testing GranSabio escalation",
+        "input_tokens": 128000,
+        "output_tokens": 16384,
+        "context_window": 128000,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text"
+        ],
+        "verified_at": "2025-01-17T00:00:00+00:00",
+        "source": "local_testing"
+      },
+      "Arbiter-Dumb": {
+        "model_id": "Arbiter-Dumb",
+        "name": "Arbiter Dumb",
+        "description": "Fake model for testing Arbiter conflict resolution",
+        "input_tokens": 128000,
+        "output_tokens": 16384,
+        "context_window": 128000,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text"
+        ],
+        "verified_at": "2025-01-17T00:00:00+00:00",
+        "source": "local_testing"
       }
     }
   },

@@ -100,6 +100,7 @@ cache/
 !CLAUDE.md
 !requirements.txt
 !core/trusted_proxies.txt
+!dev_tests/fake_ai/*.txt
 
 # Specific files to exclude
 pgbench_test.ps1

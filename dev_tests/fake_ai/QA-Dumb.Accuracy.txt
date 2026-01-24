@@ -1,0 +1,7 @@
+{
+  "score": 3.0,
+  "feedback": "DEAL-BREAKER DETECTADO: Se encontraron errores factuales graves en el contenido que requieren revision inmediata.",
+  "deal_breaker": true,
+  "deal_breaker_reason": "El contenido contiene fechas incorrectas y afirmaciones no verificables que comprometen la precision historica.",
+  "proposed_edits": []
+}

@@ -1,0 +1,16 @@
+{
+  "decisions": [
+    {"edit_index": 0, "decision": "apply", "reason": "Edit aligns with original request intent"},
+    {"edit_index": 1, "decision": "apply", "reason": "Edit aligns with original request intent"},
+    {"edit_index": 2, "decision": "apply", "reason": "Edit aligns with original request intent"},
+    {"edit_index": 3, "decision": "apply", "reason": "Edit aligns with original request intent"},
+    {"edit_index": 4, "decision": "apply", "reason": "Edit aligns with original request intent"},
+    {"edit_index": 5, "decision": "apply", "reason": "Edit aligns with original request intent"},
+    {"edit_index": 6, "decision": "apply", "reason": "Edit aligns with original request intent"},
+    {"edit_index": 7, "decision": "apply", "reason": "Edit aligns with original request intent"},
+    {"edit_index": 8, "decision": "apply", "reason": "Edit aligns with original request intent"},
+    {"edit_index": 9, "decision": "apply", "reason": "Edit aligns with original request intent"}
+  ],
+  "reasoning": "Arbiter-Dumb approved all proposed edits. No conflicts detected.",
+  "conflicts_resolved": []
+}
