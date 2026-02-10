@@ -97,14 +97,8 @@ async def list_active_connections():
     if lock is None:
         _process_sessions(list(active_sessions.items()))
     else:
-        import asyncio
-        # We need to handle the async lock properly
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # We're in an async context, use the lock properly
-            # But since this function is async, we can just await
-            pass
-        _process_sessions(list(active_sessions.items()))
+        async with lock:
+            _process_sessions(list(active_sessions.items()))
 
     # Also include reserved projects that might be idle (no active sessions yet)
     for pid in reserved_project_ids:

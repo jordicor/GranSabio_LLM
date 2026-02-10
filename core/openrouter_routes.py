@@ -179,7 +179,7 @@ async def get_openrouter_models():
         )
     except Exception as e:
         logger.exception("Error fetching OpenRouter models")
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return JSONResponse(content={"error": "Internal error fetching OpenRouter models"}, status_code=500)
 
 
 @app.post("/api/openrouter/sync")
@@ -270,4 +270,4 @@ async def sync_openrouter_models(request: Request):
 
     except Exception as e:
         logger.exception("Error syncing OpenRouter models")
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return JSONResponse(content={"error": "Internal error syncing OpenRouter models"}, status_code=500)

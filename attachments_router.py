@@ -65,6 +65,14 @@ class SimpleRateLimiter:
             )
         bucket.append(now)
 
+    async def purge_stale_keys(self) -> int:
+        """Remove empty buckets from the events dict. Returns count of purged keys."""
+        async with self._lock:
+            stale = [k for k, v in self._events.items() if not v]
+            for k in stale:
+                del self._events[k]
+            return len(stale)
+
     async def check(self, key: str) -> None:
         """Legacy single-key check for backwards compatibility."""
         if self.limit <= 0:
@@ -82,6 +90,11 @@ class SimpleRateLimiter:
         """
         now = monotonic()
         async with self._lock:
+            # Lazy purge: remove stale empty buckets periodically
+            if len(self._events) > 500:
+                stale = [k for k, v in self._events.items() if not v]
+                for k in stale:
+                    del self._events[k]
             # Check IP limit first (stricter, non-evadable)
             await self._check_single(f"ip:{ip_key}", self.ip_limit, self.ip_window_seconds, now)
             # Check user limit second (prevents username exhaustion)

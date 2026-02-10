@@ -1482,17 +1482,6 @@ def get_model_parameter_requirements(model_name: str) -> Dict[str, Any]:
             "default_temperature": None  # Temperature not supported at all
         }
 
-    # O1 and O3 reasoning models (require max_completion_tokens AND temperature=1)
-    if any(x in model_lower for x in ["o1", "o3"]):
-        return {
-            "max_tokens_param": "max_completion_tokens",
-            "supports_temperature": False,  # Must be 1, but unsupported parameter
-            "forced_temperature": 1.0,  # When supported, must be 1
-            "supports_reasoning_effort": True,
-            "supports_thinking_budget": False,
-            "default_temperature": 1.0
-        }
-
     # Legacy models (GPT-4, etc. - use max_tokens)
     return {
         "max_tokens_param": "max_tokens",

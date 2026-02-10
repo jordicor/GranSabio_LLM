@@ -1564,39 +1564,6 @@ class AIService:
 
             return content or "", getattr(response, "usage", None)
 
-        # --- O1/O3 (no pro) por Chat Completions ---
-        elif any(x in model_id.lower() for x in ["o1", "o3"]) and "o3-pro" not in model_id.lower():
-            # O1/O3: sin system, sin temperature (se ignora)
-            messages = [{"role": "user", "content": f"{effective_system_prompt}\n\n{effective_prompt}"}]
-            create_params = _build_openai_params(model_id, messages, temperature, max_tokens, reasoning_effort)
-
-            # Configure JSON output format
-            if json_output:
-                if json_schema:
-                    # Use JSON Schema for structured outputs
-                    create_params["response_format"] = {
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "structured_output",
-                            "strict": True,
-                            "schema": json_schema
-                        }
-                    }
-                    logger.info(f"Using O1/O3 JSON Schema structured outputs for {model_id}")
-                else:
-                    # Use basic JSON mode (flexible structure)
-                    create_params["response_format"] = {"type": "json_object"}
-                    logger.info(f"Using O1/O3 JSON mode (flexible) for {model_id}")
-
-            if extra_verbose:
-                logger.info(f"[EXTRA_VERBOSE] O1/O3 non-streaming parameters: {create_params}")
-
-            response = await self.openai_client.chat.completions.create(
-                **create_params,
-                **request_kwargs,
-            )
-            return response.choices[0].message.content, getattr(response, "usage", None)
-
         # --- GPT-5 por Chat Completions ---
         elif "gpt-5" in model_id.lower():
             create_params = _build_openai_params(model_id, messages, temperature, max_tokens, reasoning_effort)
@@ -1689,7 +1656,6 @@ class AIService:
 
         IMPORTANT: Only OpenAI models that support logprobs can be used:
         - Supported: gpt-4o, gpt-4o-mini, gpt-5-nano, gpt-5-mini, gpt-5, gpt-4.1
-        - NOT supported: o1, o1-mini, o3, o3-mini (reasoning models)
         - NOT supported: Claude models, Gemini models
 
         Args:
@@ -1726,21 +1692,13 @@ class AIService:
             )
 
         # Check for reasoning models that don't support logprobs
-        reasoning_markers = ["o1", "o3"]
         model_lower = model_id.lower()
-        is_reasoning_model = any(
-            marker in model_lower and f"gpt-{marker}" not in model_lower
-            for marker in reasoning_markers
-        )
         # xAI reasoning models (grok-*-reasoning) don't support logprobs
         # But non-reasoning models (grok-*-non-reasoning) DO support logprobs
         if provider == "xai" and "reasoning" in model_lower and "non-reasoning" not in model_lower:
-            is_reasoning_model = True
-
-        if is_reasoning_model:
             raise ValueError(
                 f"Model {model_id} is a reasoning model that does not support logprobs. "
-                f"Use gpt-4o-mini or grok-*-non-reasoning models for evidence grounding."
+                f"Use grok-*-non-reasoning models for evidence grounding."
             )
 
         # Clamp top_logprobs to API limits
@@ -2981,48 +2939,6 @@ class AIService:
                 )
                 return
 
-            # Handle O1/O3 models (excluding O3-pro)
-            elif any(x in model_id.lower() for x in ["o1", "o3"]) and "o3-pro" not in model_id.lower():
-                # O1/O3 models: no system message, no temperature
-                # Combine system prompt and user prompt into single user message
-                combined_prompt = f"{effective_system_prompt}\n\n{effective_prompt}"
-                if images:
-                    image_parts = self._build_openai_image_content(images, use_responses_api=False)
-                    image_parts.append({"type": "text", "text": combined_prompt})
-                    messages = [{"role": "user", "content": image_parts}]
-                else:
-                    messages = [{"role": "user", "content": combined_prompt}]
-
-                create_params = _build_openai_params(model_id, messages, temperature, max_tokens, reasoning_effort)
-                create_params["stream"] = True  # Add streaming
-                create_params.setdefault("stream_options", {})["include_usage"] = True
-
-                # Configure JSON output format
-                if json_output:
-                    if json_schema:
-                        # Use JSON Schema for structured outputs
-                        create_params["response_format"] = {
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": "structured_output",
-                                "strict": True,
-                                "schema": json_schema
-                            }
-                        }
-                        logger.info(f"Using O1/O3 JSON Schema structured outputs (streaming) for {model_id}")
-                    else:
-                        # Use basic JSON mode (flexible structure)
-                        create_params["response_format"] = {"type": "json_object"}
-                        logger.info(f"Using O1/O3 JSON mode (streaming, flexible) for {model_id}")
-
-                if extra_verbose:
-                    logger.info(f"[EXTRA_VERBOSE] O1/O3 streaming parameters: {create_params}")
-
-                stream = await self.openai_client.chat.completions.create(
-                    **create_params,
-                    **request_kwargs,
-                )
-
             elif "gpt-5" in model_id.lower():
                 # GPT-5 models: use max_completion_tokens, NO temperature parameter
                 create_params = {
@@ -3604,18 +3520,6 @@ class AIService:
         except Exception as e:
             logger.error(f"Legacy Gemini SDK streaming error: {e}")
             raise
-            # Fallback to regular generation
-            content, usage_meta = await self._generate_gemini_legacy_sdk(
-                prompt,
-                model_id,
-                temperature,
-                max_tokens,
-                system_prompt,
-                json_output=json_output,
-                json_schema=json_schema,
-            )
-            yield content
-            usage_metadata = usage_meta
 
         self._emit_usage(
             usage_callback,
