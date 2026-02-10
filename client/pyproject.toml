@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "gransabio-client"
+version = "1.1.0"
+description = "Client SDK for GranSabio LLM engine - sync and async Python clients"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "requests>=2.31",
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+orjson = ["orjson>=3.9"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["client*"]
