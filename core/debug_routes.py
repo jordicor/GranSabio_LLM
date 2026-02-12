@@ -50,20 +50,16 @@ async def list_debugger_sessions(
         offset=offset,
         project_id=normalized_project_id,
     )
-    # Extract request_name from request_json for each session
+    # request_name is now denormalized in the sessions table
     enriched_sessions = []
     for session in sessions:
-        request_data = _parse_debug_json(session.get("request_json"))
-        request_name = None
-        if isinstance(request_data, dict):
-            request_name = request_data.get("request_name")
         enriched_sessions.append({
             "session_id": session["session_id"],
             "created_at": session["created_at"],
             "updated_at": session["updated_at"],
             "status": session["status"],
             "project_id": session["project_id"],
-            "request_name": request_name,
+            "request_name": session.get("request_name"),
         })
     return {"sessions": enriched_sessions, "project_id": normalized_project_id}
 

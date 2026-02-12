@@ -7,7 +7,8 @@ each session in chronological order via the /debugger interface.
 
 import asyncio
 import logging
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,6 +17,10 @@ import aiosqlite
 import json_utils as json
 
 logger = logging.getLogger(__name__)
+
+# Piggyback cleanup configuration
+CLEANUP_INTERVAL_SECONDS = 3600  # 1 hour between opportunistic cleanups
+CLEANUP_RETENTION_DAYS = 7       # Delete sessions older than 7 days
 
 
 class DebugLogger:
@@ -28,6 +33,8 @@ class DebugLogger:
         self._init_lock = asyncio.Lock()
         self._event_lock = asyncio.Lock()
         self._event_counters: Dict[str, int] = {}
+        self._last_cleanup_ts: float = 0.0
+        self._cleanup_running: bool = False
 
     async def initialize(self) -> None:
         """Open SQLite connection and create schema if needed."""
@@ -66,6 +73,7 @@ class DebugLogger:
                 updated_at TEXT DEFAULT (datetime('now')),
                 status TEXT,
                 request_json TEXT,
+                request_name TEXT,
                 preflight_json TEXT,
                 final_json TEXT,
                 usage_json TEXT,
@@ -89,21 +97,28 @@ class DebugLogger:
 
             CREATE INDEX IF NOT EXISTS idx_sessions_updated
                 ON sessions(updated_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_sessions_created
+                ON sessions(created_at);
             """
         )
         await self._ensure_project_id_column()
 
     async def _ensure_project_id_column(self) -> None:
-        """Ensure the sessions table contains the project_id column and related index."""
+        """Ensure the sessions table contains project_id and request_name columns."""
         if self._pool is None:
             return
 
         async with self._pool.execute("PRAGMA table_info(sessions)") as cursor:
             columns = await cursor.fetchall()
 
-        has_project_id = any(col[1] == "project_id" for col in columns)
-        if not has_project_id:
+        col_names = {col[1] for col in columns}
+
+        if "project_id" not in col_names:
             await self._pool.execute("ALTER TABLE sessions ADD COLUMN project_id TEXT")
+
+        if "request_name" not in col_names:
+            await self._pool.execute("ALTER TABLE sessions ADD COLUMN request_name TEXT")
 
         await self._pool.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id)"
@@ -117,6 +132,23 @@ class DebugLogger:
         except Exception:
             logger.exception("Failed to serialize payload for debug logger")
             return "{}"
+
+    async def _maybe_piggyback_cleanup(self):
+        """Run cleanup opportunistically if enough time has passed."""
+        now = time.monotonic()
+        if self._cleanup_running or (now - self._last_cleanup_ts) < CLEANUP_INTERVAL_SECONDS:
+            return
+        self._cleanup_running = True
+        self._last_cleanup_ts = now
+        try:
+            result = await self.cleanup_old_sessions(retention_days=CLEANUP_RETENTION_DAYS)
+            deleted = result.get("deleted_sessions", 0)
+            if deleted > 0:
+                logger.info("Piggyback cleanup: removed %d old debug sessions", deleted)
+        except Exception:
+            logger.exception("Piggyback cleanup failed")
+        finally:
+            self._cleanup_running = False
 
     async def record_session_start(
         self,
@@ -134,30 +166,38 @@ class DebugLogger:
         # DEBUG: Log project_id being stored
         logger.info(f"DEBUG_LOGGER: Recording session {session_id[:8]}... with project_id: {project_id if project_id else 'NULL'}")
 
+        # Extract request_name for denormalized column
+        req_name = None
+        if isinstance(request_payload, dict):
+            req_name = request_payload.get("request_name")
+        elif hasattr(request_payload, "request_name"):
+            req_name = request_payload.request_name
+
         await self._pool.execute(
             """
-            INSERT OR REPLACE INTO sessions
-            (session_id, created_at, updated_at, status, request_json, preflight_json, project_id)
+            INSERT INTO sessions
+            (session_id, created_at, updated_at, status, request_json, request_name, preflight_json, project_id)
             VALUES
-            (
-                ?, COALESCE(
-                    (SELECT created_at FROM sessions WHERE session_id = ?),
-                    datetime('now')
-                ),
-                datetime('now'), ?, ?, ?, COALESCE(?, (SELECT project_id FROM sessions WHERE session_id = ?))
-            )
+            (?, datetime('now'), datetime('now'), ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                updated_at = datetime('now'),
+                status = excluded.status,
+                request_json = excluded.request_json,
+                request_name = excluded.request_name,
+                preflight_json = excluded.preflight_json,
+                project_id = COALESCE(excluded.project_id, sessions.project_id)
             """,
             (
                 session_id,
-                session_id,
                 status,
                 self._serialize(request_payload),
+                req_name,
                 self._serialize(preflight_payload) if preflight_payload is not None else None,
                 project_id,
-                session_id,
             ),
         )
         await self._pool.commit()
+        asyncio.create_task(self._maybe_piggyback_cleanup())
 
     async def update_session_status(
         self,
@@ -227,6 +267,7 @@ class DebugLogger:
             ),
         )
         await self._pool.commit()
+        asyncio.create_task(self._maybe_piggyback_cleanup())
 
     async def _next_event_order(self, session_id: str) -> int:
         """Compute the next chronological order value for the session."""
@@ -268,10 +309,10 @@ class DebugLogger:
             params.append(project_id)
 
         query = f"""
-            SELECT session_id, created_at, updated_at, status, project_id, request_json
+            SELECT session_id, created_at, updated_at, status, project_id, request_name
             FROM sessions
             {where_clause}
-            ORDER BY datetime(updated_at) DESC
+            ORDER BY updated_at DESC
             LIMIT ? OFFSET ?
         """
 
@@ -287,7 +328,7 @@ class DebugLogger:
                 "updated_at": row[2],
                 "status": row[3],
                 "project_id": row[4],
-                "request_json": row[5],
+                "request_name": row[5],
             }
             for row in rows
         ]
@@ -382,10 +423,13 @@ class DebugLogger:
             return {"status": "disabled", "deleted_sessions": 0, "deleted_events": 0}
 
         try:
+            # Compute cutoff once in Python (ISO-8601 sorts correctly as text)
+            cutoff_str = (datetime.utcnow() - timedelta(days=retention_days)).strftime('%Y-%m-%d %H:%M:%S')
+
             # Count before deletion for stats
             async with self._pool.execute(
-                "SELECT COUNT(*) FROM sessions WHERE datetime(created_at) < datetime('now', ?)",
-                (f"-{retention_days} days",)
+                "SELECT COUNT(*) FROM sessions WHERE created_at < ?",
+                (cutoff_str,)
             ) as cursor:
                 row = await cursor.fetchone()
                 sessions_to_delete = row[0] if row else 0
@@ -394,9 +438,9 @@ class DebugLogger:
                 """SELECT COUNT(*) FROM session_events
                    WHERE session_id IN (
                        SELECT session_id FROM sessions
-                       WHERE datetime(created_at) < datetime('now', ?)
+                       WHERE created_at < ?
                    )""",
-                (f"-{retention_days} days",)
+                (cutoff_str,)
             ) as cursor:
                 row = await cursor.fetchone()
                 events_to_delete = row[0] if row else 0
@@ -414,15 +458,15 @@ class DebugLogger:
                 """DELETE FROM session_events
                    WHERE session_id IN (
                        SELECT session_id FROM sessions
-                       WHERE datetime(created_at) < datetime('now', ?)
+                       WHERE created_at < ?
                    )""",
-                (f"-{retention_days} days",)
+                (cutoff_str,)
             )
 
             # Delete old sessions
             await self._pool.execute(
-                "DELETE FROM sessions WHERE datetime(created_at) < datetime('now', ?)",
-                (f"-{retention_days} days",)
+                "DELETE FROM sessions WHERE created_at < ?",
+                (cutoff_str,)
             )
 
             await self._pool.commit()

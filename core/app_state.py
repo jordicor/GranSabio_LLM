@@ -379,6 +379,9 @@ async def startup_event():
     try:
         await initialize_feedback_system()
         logger.info("Feedback memory system initialized successfully")
+        # Run cleanup for feedback memory on startup
+        feedback_mgr = get_feedback_manager()
+        await feedback_mgr.cleanup_old_data()
     except Exception as e:
         logger.error(f"Failed to initialize feedback memory system: {e}")
         # Don't fail startup, system can work without feedback memory

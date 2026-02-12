@@ -658,14 +658,17 @@ async def generate_content(request: ContentRequest):
     })
 
     logger.info(f"GRANSABIO_MAIN: About to record session {session_id[:8]}... with project_id: {project_id if project_id else 'NULL'}")
-    asyncio.create_task(_debug_session_start(
-        session_id,
-        request_payload=request,
-        preflight_payload=preflight_result,
-        project_id=project_id,
-        attachments=resolved_attachments,
-        preflight_context=[entry.get("text", "") if isinstance(entry, dict) else entry for entry in preflight_context],
-    ))
+    try:
+        await _debug_session_start(
+            session_id,
+            request_payload=request,
+            preflight_payload=preflight_result,
+            project_id=project_id,
+            attachments=resolved_attachments,
+            preflight_context=[entry.get("text", "") if isinstance(entry, dict) else entry for entry in preflight_context],
+        )
+    except Exception as e:
+        logger.error(f"GRANSABIO_MAIN: _debug_session_start failed for {session_id[:8]}..., continuing anyway: {e}")
 
     # Note: temp_session is automatically overwritten by register_session above
     # No cleanup needed since we reuse the same session_id

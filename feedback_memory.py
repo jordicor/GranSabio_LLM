@@ -34,6 +34,11 @@ from config import config
 
 logger = logging.getLogger(__name__)
 
+# Piggyback cleanup configuration
+FB_CLEANUP_INTERVAL_SECONDS = 3600  # 1 hour between opportunistic cleanups
+FB_CLEANUP_RETENTION_DAYS = 30      # Delete sessions older than 30 days
+FB_CLEANUP_ARCHIVE_DAYS = 14        # Archive sessions older than 14 days
+
 
 # ---------- Configuration ----------
 
@@ -93,11 +98,13 @@ class FeedbackDatabase:
         self.db_path = db_path
         self._lock = threading.Lock()
         self._pool = None
+        self._last_cleanup_ts: float = 0.0
+        self._cleanup_running: bool = False
 
     async def initialize(self):
         """Initialize database and create schema"""
         self._pool = await aiosqlite.connect(self.db_path)
-        await self._pool.execute("PRAGMA journal_mode=DELETE")
+        await self._pool.execute("PRAGMA journal_mode=WAL")
         await self._pool.execute("PRAGMA synchronous=NORMAL")
         await self._pool.execute("PRAGMA foreign_keys=ON")
         await self._create_schema()
@@ -173,6 +180,12 @@ class FeedbackDatabase:
                 ON feedback_categories(session_id, occurrences DESC);
             CREATE INDEX IF NOT EXISTS idx_categories_concept
                 ON feedback_categories(session_id, concept_id);
+
+            CREATE INDEX IF NOT EXISTS idx_normative_rules_lookup
+                ON normative_rules(session_id, active, creation_date DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_session_hash_success
+                ON session_metadata(request_hash, final_success);
         """)
 
     async def close(self):
@@ -190,6 +203,7 @@ class FeedbackDatabase:
             VALUES (?, ?, ?, 'active')
         """, (session_id, request_hash, json.dumps(metadata or {})))
         await self._pool.commit()
+        asyncio.create_task(self._maybe_piggyback_cleanup())
 
     async def get_session(self, session_id: str) -> Optional[Dict]:
         """Get session metadata"""
@@ -227,6 +241,7 @@ class FeedbackDatabase:
                 WHERE session_id = ?
             """, (status, session_id))
         await self._pool.commit()
+        asyncio.create_task(self._maybe_piggyback_cleanup())
 
     async def find_similar_sessions(self, request_hash: str, limit: int = 5) -> List[str]:
         """Find sessions with similar request hash"""
@@ -263,6 +278,7 @@ class FeedbackDatabase:
         """, (iteration_num + 1, session_id))
 
         await self._pool.commit()
+        asyncio.create_task(self._maybe_piggyback_cleanup())
 
     async def get_recent_iterations(self, session_id: str, limit: int = 10) -> List[Dict]:
         """Get recent iterations for a session"""
@@ -292,8 +308,14 @@ class FeedbackDatabase:
     async def upsert_category(self, session_id: str, concept_id: str,
                              canonical_label: str, category_type: str,
                              severity: str, evidence: List[str],
-                             actions: List[str], embedding: List[float]):
-        """Insert or update feedback category"""
+                             actions: List[str], embedding: List[float],
+                             total_iterations: Optional[int] = None):
+        """Insert or update feedback category.
+
+        Args:
+            total_iterations: Pre-fetched iteration count. When provided,
+                skips the per-call SELECT on session_metadata (batch optimization).
+        """
         # Check if exists
         async with self._pool.execute("""
             SELECT occurrences, evidence_json, actions_json
@@ -302,7 +324,8 @@ class FeedbackDatabase:
         """, (session_id, concept_id)) as cursor:
             existing = await cursor.fetchone()
 
-        current_iteration = await self._get_current_iteration(session_id)
+        # Use pre-fetched value when available, otherwise fetch individually
+        current_iteration = total_iterations if total_iterations is not None else await self._get_current_iteration(session_id)
 
         if existing:
             # Update existing
@@ -337,8 +360,6 @@ class FeedbackDatabase:
             """, (session_id, concept_id, canonical_label, category_type,
                   severity, json.dumps(evidence), json.dumps(actions),
                   json.dumps(embedding), current_iteration, current_iteration))
-
-        await self._pool.commit()
 
     async def get_categories(self, session_id: str, min_occurrences: int = 1) -> List[Dict]:
         """Get feedback categories for session"""
@@ -385,6 +406,7 @@ class FeedbackDatabase:
             VALUES (?, ?, ?)
         """, (session_id, '\n'.join(rules), json.dumps(source_patterns)))
         await self._pool.commit()
+        asyncio.create_task(self._maybe_piggyback_cleanup())
 
     async def get_active_rules(self, session_id: str) -> List[str]:
         """Get active normative rules for session"""
@@ -401,6 +423,24 @@ class FeedbackDatabase:
             return []
 
     # Cleanup
+
+    async def _maybe_piggyback_cleanup(self):
+        """Run cleanup opportunistically if enough time has passed."""
+        now = time.monotonic()
+        if self._cleanup_running or (now - self._last_cleanup_ts) < FB_CLEANUP_INTERVAL_SECONDS:
+            return
+        self._cleanup_running = True
+        self._last_cleanup_ts = now
+        try:
+            await self.cleanup_old_sessions(
+                retention_days=FB_CLEANUP_RETENTION_DAYS,
+                archive_days=FB_CLEANUP_ARCHIVE_DAYS,
+            )
+            logger.info("Piggyback cleanup: feedback memory cleanup completed")
+        except Exception:
+            logger.exception("Feedback piggyback cleanup failed")
+        finally:
+            self._cleanup_running = False
 
     async def cleanup_old_sessions(self, retention_days: int, archive_days: int):
         """Clean up old sessions based on retention policy"""
@@ -426,6 +466,14 @@ class FeedbackDatabase:
 
         await self._pool.execute("""
             DELETE FROM feedback_categories
+            WHERE session_id IN (
+                SELECT session_id FROM session_metadata
+                WHERE last_activity < ?
+            )
+        """, (cutoff_delete,))
+
+        await self._pool.execute("""
+            DELETE FROM normative_rules
             WHERE session_id IN (
                 SELECT session_id FROM session_metadata
                 WHERE last_activity < ?
@@ -736,6 +784,9 @@ class FeedbackMemoryManager:
         # Get existing categories for similarity comparison
         existing_categories = await self.db.get_categories(session_id)
 
+        # Cache total_iterations once before the loop to avoid N redundant SELECTs
+        total_iterations = await self.db._get_current_iteration(session_id)
+
         # Process each issue
         for idx, issue in enumerate(issues):
             canonical_label = issue.get('canonical_label', 'unspecified')
@@ -764,11 +815,16 @@ class FeedbackMemoryManager:
                     concept_id = best_match['concept_id']
                     canonical_label = best_match['canonical_label']  # Keep original label
 
-            # Update or insert category
+            # Update or insert category (no per-issue commit, batched below)
             await self.db.upsert_category(
                 session_id, concept_id, canonical_label,
-                category_type, severity, evidence, actions, embedding
+                category_type, severity, evidence, actions, embedding,
+                total_iterations=total_iterations
             )
+
+        # Single commit after all issues have been processed
+        await self.db._pool.commit()
+        asyncio.create_task(self.db._maybe_piggyback_cleanup())
 
     async def build_iteration_prompt(self, session_id: str) -> str:
         """Build the iteration feedback prompt with temporal decay"""
