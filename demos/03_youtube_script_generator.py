@@ -385,7 +385,7 @@ Recap and call to action...
             lexical_diversity=lexical_diversity,
             min_global_score=7.5,
             max_iterations=4,
-            gran_sabio_model="claude-opus-4-5-20251101",
+            gran_sabio_model="claude-opus-4-6",
             project_id=self.project_id,
             request_name="Phase 2: Script Generation",
             verbose=True,

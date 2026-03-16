@@ -99,7 +99,7 @@ The post should:
         print("Starting generation with QA...")
         print(f"  Target: 150-250 words")
         print(f"  QA Layers: {len(qa_layers)}")
-        print(f"  QA Models: gemini-3-flash-preview, claude-sonnet-4-5")
+        print(f"  QA Models: gemini-3-flash-preview, claude-sonnet-4-6")
 
         result = await client.generate(
             prompt=prompt,
@@ -110,11 +110,11 @@ The post should:
             min_words=150,
             max_words=250,
             word_count_enforcement=word_count_enforcement,
-            qa_models=["gemini-3-flash-preview", "claude-sonnet-4-5"],
+            qa_models=["gemini-3-flash-preview", "claude-sonnet-4-6"],
             qa_layers=qa_layers,
             min_global_score=7.5,
             max_iterations=3,
-            gran_sabio_model="claude-opus-4-5-20251101",
+            gran_sabio_model="claude-opus-4-6",
             verbose=True,
             request_name="LinkedIn Post Demo",
             wait_for_completion=False  # Return immediately with session_id

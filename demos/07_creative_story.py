@@ -198,7 +198,7 @@ Write the story directly, no preamble or explanation needed.
         result = await client.generate(
             prompt=prompt,
             content_type="creative",
-            generator_model="claude-opus-4-5-20251101",
+            generator_model="claude-opus-4-6",
             temperature=0.85,  # Higher for creativity
             max_tokens=3000,
             min_words=int(target_words * 0.8),

@@ -145,7 +145,7 @@ MODEL_CONFIGS = {
         "supports_thinking": False
     },
     "claude-opus": {
-        "generator_model": "claude-opus-4-5-20251101",
+        "generator_model": "claude-opus-4-6",
         "thinking_budget_tokens": 32768,  # Max thinking budget
         "supports_thinking": True
     },
@@ -166,7 +166,7 @@ MODEL_CONFIGS = {
     },
     # Other reasoning models
     "claude-sonnet": {
-        "generator_model": "claude-sonnet-4-5",
+        "generator_model": "claude-sonnet-4-6",
         "thinking_budget_tokens": 16384,
         "supports_thinking": True
     },
@@ -267,7 +267,7 @@ async def demo_reasoning_models():
             "qa_layers": qa_layers,
             "min_global_score": 7.5,
             "max_iterations": 2,
-            "gran_sabio_model": "claude-opus-4-5-20251101",
+            "gran_sabio_model": "claude-opus-4-6",
             "verbose": True,
             "request_name": f"Reasoning: {problem['name']}"
         }

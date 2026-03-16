@@ -276,7 +276,7 @@ class GranSabioClient:
         qa_layers: Optional[List[Dict[str, Any]]] = None,
         min_global_score: float = 8.0,
         max_iterations: int = 3,
-        gran_sabio_model: str = "claude-opus-4-5-20251101",
+        gran_sabio_model: str = "claude-opus-4-6",
         gran_sabio_fallback: bool = True,
         verbose: bool = True,
         project_id: Optional[str] = None,
@@ -517,7 +517,7 @@ class GranSabioClient:
         qa_layers: Optional[List[Dict[str, Any]]] = None,
         min_global_score: float = 8.0,
         max_iterations: int = 3,
-        gran_sabio_model: str = "claude-opus-4-5-20251101",
+        gran_sabio_model: str = "claude-opus-4-6",
         gran_sabio_fallback: bool = True,
         verbose: bool = True,
         project_id: Optional[str] = None,
@@ -962,7 +962,7 @@ class GranSabioClient:
         model is not found in the catalog.
 
         Args:
-            model: The model identifier (e.g. "gpt-4o", "claude-opus-4-5-20251101").
+            model: The model identifier (e.g. "gpt-4o", "claude-opus-4-6").
 
         Returns:
             The maximum output token limit for the model.

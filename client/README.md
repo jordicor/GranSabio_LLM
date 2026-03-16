@@ -83,7 +83,7 @@ result = client.generate(
     max_iterations=3,
 
     # Escalation
-    gran_sabio_model="claude-opus-4-5-20251101",
+    gran_sabio_model="claude-opus-4-6",
     gran_sabio_fallback=True,
 
     # Optional

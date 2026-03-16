@@ -82,7 +82,7 @@
         "name": "GPT-5",
         "description": "OpenAI's latest flagship model with reasoning capabilities",
         "input_tokens": 272000,
-        "output_tokens": 32000,
+        "output_tokens": 128000,
         "context_window": 400000,
         "pricing": {
           "input_per_million": 1.25,
@@ -318,17 +318,12 @@
         "reasoning_effort": {
           "supported": true,
           "levels": [
-            "none",
-            "minimal",
-            "low",
-            "medium",
-            "high",
-            "xhigh"
+            "medium"
           ],
-          "default": "minimal"
+          "default": "medium"
         },
-        "notes": "Speed-optimized variant. Best for daily tasks, writing, translation, and quick information retrieval. Knowledge cutoff: August 31, 2025.",
-        "verified_at": "2025-12-11T00:00:00+00:00",
+        "notes": "Speed-optimized variant. Best for daily tasks, writing, translation, and quick information retrieval. Only supports reasoning_effort='medium'. Knowledge cutoff: August 31, 2025.",
+        "verified_at": "2026-03-13T00:00:00+00:00",
         "source": "https://openai.com/index/introducing-gpt-5-2/"
       },
       "gpt-5.2-pro": {
@@ -670,6 +665,42 @@
         "verified_at": "2025-10-24T21:14:05+00:00",
         "source": "https://www.anthropic.com/claude/sonnet"
       },
+      "claude-sonnet-4-6": {
+        "model_id": "claude-sonnet-4-6",
+        "name": "Claude Sonnet 4.6",
+        "description": "Latest-gen balanced model with adaptive thinking, 64K output, and 1M context beta",
+        "input_tokens": 200000,
+        "output_tokens": 64000,
+        "context_window": 200000,
+        "pricing": {
+          "input_per_million": 3.0,
+          "output_per_million": 15.0
+        },
+        "capabilities": [
+          "text",
+          "vision",
+          "analysis",
+          "coding",
+          "agentic_tasks",
+          "computer_use"
+        ],
+        "special_features": [
+          "thinking_mode",
+          "adaptive_thinking",
+          "extended_thinking",
+          "best_coding",
+          "complex_agents"
+        ],
+        "thinking_budget": {
+          "supported": true,
+          "min_tokens": 1024,
+          "max_tokens": 64000,
+          "default_tokens": 8192
+        },
+        "notes": "Same pricing as Sonnet 4.5 with adaptive thinking mode. 1M context window available in beta with header context-1m-2025-08-07.",
+        "verified_at": "2026-02-24T00:00:00+00:00",
+        "source": "https://docs.anthropic.com/en/docs/about-claude/models"
+      },
       "claude-haiku-4-5": {
         "model_id": "claude-haiku-4-5",
         "name": "Claude Haiku 4.5",
@@ -707,10 +738,10 @@
       "claude-opus-4-6": {
         "model_id": "claude-opus-4-6",
         "name": "Claude Opus 4.6",
-        "description": "Most capable Anthropic model with adaptive thinking and 128K output",
-        "input_tokens": 200000,
+        "description": "Most capable Anthropic model with adaptive thinking, 1M context, and 128K output",
+        "input_tokens": 1000000,
         "output_tokens": 128000,
-        "context_window": 200000,
+        "context_window": 1000000,
         "pricing": {
           "input_per_million": 5.0,
           "output_per_million": 25.0
@@ -896,6 +927,48 @@
         "verified_at": "2025-11-18T00:00:00+00:00",
         "source": "https://blog.google/products/gemini/gemini-3/"
       },
+      "gemini-3.1-pro-preview": {
+        "model_id": "gemini-3.1-pro-preview",
+        "name": "Gemini 3.1 Pro",
+        "description": "Google's most advanced AI model, successor to Gemini 3 Pro with improved reasoning and multimodal capabilities",
+        "input_tokens": 1000000,
+        "output_tokens": 64000,
+        "context_window": 1000000,
+        "pricing": {
+          "input_per_million": 2.0,
+          "output_per_million": 12.0
+        },
+        "capabilities": [
+          "text",
+          "vision",
+          "audio",
+          "video",
+          "pdf",
+          "multimodal",
+          "reasoning",
+          "thinking",
+          "code",
+          "math",
+          "stem"
+        ],
+        "special_features": [
+          "sparse_moe",
+          "multimodal_understanding",
+          "long_context_analysis",
+          "native_multimodal",
+          "thinking_mode"
+        ],
+        "thinking_budget": {
+          "supported": true,
+          "parameter_name": "thinking_budget",
+          "min_tokens": 1024,
+          "max_tokens": 65536,
+          "default_tokens": 32768
+        },
+        "notes": "Latest Gemini Pro model (Feb 2026 preview). Improved reasoning over Gemini 3 Pro. Same pricing as Gemini 3 Pro.",
+        "verified_at": "2026-02-24T00:00:00+00:00",
+        "source": "https://ai.google.dev/gemini-api/docs/models"
+      },
       "gemini-3-flash-preview": {
         "model_id": "gemini-3-flash-preview",
         "name": "Gemini 3 Flash",
@@ -979,6 +1052,7 @@
         },
         "capabilities": [
           "text",
+          "vision",
           "function_calling",
           "tool_use",
           "real_time_search"
@@ -1220,24 +1294,6 @@
         "verified_at": "2025-12-24T22:05:31.808867+00:00",
         "source": "https://openrouter.ai/models/aion-labs/aion-rp-llama-3.1-8b"
       },
-      "alfredpros/codellama-7b-instruct-solidity": {
-        "model_id": "alfredpros/codellama-7b-instruct-solidity",
-        "name": "AlfredPros: CodeLLaMa 7B Instruct Solidity",
-        "description": "A finetuned 7 billion parameters Code LLaMA - Instruct model to generate Solidity smart contract using 4-bit QLoRA finetuning provided by PEFT library.",
-        "input_tokens": 4096,
-        "output_tokens": 4096,
-        "context_window": 4096,
-        "pricing": {
-          "input_per_million": 0.8,
-          "output_per_million": 1.2
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.808867+00:00",
-        "source": "https://openrouter.ai/models/alfredpros/codellama-7b-instruct-solidity"
-      },
       "alibaba/tongyi-deepresearch-30b-a3b": {
         "model_id": "alibaba/tongyi-deepresearch-30b-a3b",
         "name": "Tongyi DeepResearch 30B A3B",
@@ -1291,24 +1347,6 @@
         "provider": "openrouter",
         "verified_at": "2025-12-24T22:05:31.809867+00:00",
         "source": "https://openrouter.ai/models/allenai/olmo-2-0325-32b-instruct"
-      },
-      "alpindale/goliath-120b": {
-        "model_id": "alpindale/goliath-120b",
-        "name": "Goliath 120B",
-        "description": "A large LLM created by combining two fine-tuned Llama 70B models into one 120B model. Combines Xwin and Euryale.\n\nCredits to\n- [@chargoddard](https://huggingface.co/chargoddard) for developing the framework used to merge the model - [mergekit](https://github.com/cg123/mergekit).\n- [@Undi95](https://huggingface.co/Undi95) for helping with the merge ratios.\n\n#merge",
-        "input_tokens": 6144,
-        "output_tokens": 1024,
-        "context_window": 6144,
-        "pricing": {
-          "input_per_million": 6.0,
-          "output_per_million": 8.0
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/alpindale/goliath-120b"
       },
       "amazon/nova-lite-v1": {
         "model_id": "amazon/nova-lite-v1",
@@ -2097,24 +2135,6 @@
         "verified_at": "2025-12-24T22:05:31.809867+00:00",
         "source": "https://openrouter.ai/models/deepseek/deepseek-r1-distill-qwen-32b"
       },
-      "eleutherai/llemma_7b": {
-        "model_id": "eleutherai/llemma_7b",
-        "name": "EleutherAI: Llemma 7b",
-        "description": "Llemma 7B is a language model for mathematics. It was initialized with Code Llama 7B weights, and trained on the Proof-Pile-2 for 200B tokens. Llemma models are particularly strong at chain-of-thought mathematical reasoning and using computational tools for mathematics, such as Python and formal theorem provers.",
-        "input_tokens": 4096,
-        "output_tokens": 4096,
-        "context_window": 4096,
-        "pricing": {
-          "input_per_million": 0.8,
-          "output_per_million": 1.2
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/eleutherai/llemma_7b"
-      },
       "google/gemini-2.0-flash-001": {
         "model_id": "google/gemini-2.0-flash-001",
         "name": "Google: Gemini 2.0 Flash",
@@ -2343,42 +2363,6 @@
         "verified_at": "2025-12-24T22:05:31.809867+00:00",
         "source": "https://openrouter.ai/models/google/gemini-2.5-pro-preview"
       },
-      "google/gemma-2-27b-it": {
-        "model_id": "google/gemma-2-27b-it",
-        "name": "Google: Gemma 2 27B",
-        "description": "Gemma 2 27B by Google is an open model built from the same research and technology used to create the [Gemini models](/models?q=gemini).\n\nGemma models are well-suited for a variety of text generation tasks, including question answering, summarization, and reasoning.\n\nSee the [launch announcement](https://blog.google/technology/developers/google-gemma-2/) for more details. Usage of Gemma is subject to Google's [Gemma Terms of Use](https://ai.google.dev/gemma/terms).",
-        "input_tokens": 8192,
-        "output_tokens": 2048,
-        "context_window": 8192,
-        "pricing": {
-          "input_per_million": 0.65,
-          "output_per_million": 0.65
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/google/gemma-2-27b-it"
-      },
-      "google/gemma-2-9b-it": {
-        "model_id": "google/gemma-2-9b-it",
-        "name": "Google: Gemma 2 9B",
-        "description": "Gemma 2 9B by Google is an advanced, open-source language model that sets a new standard for efficiency and performance in its size class.\n\nDesigned for a wide variety of tasks, it empowers developers and researchers to build innovative applications, while maintaining accessibility, safety, and cost-effectiveness.\n\nSee the [launch announcement](https://blog.google/technology/developers/google-gemma-2/) for more details. Usage of Gemma is subject to Google's [Gemma Terms of Use](https://ai.google.dev/gemma/terms).",
-        "input_tokens": 8192,
-        "output_tokens": 2048,
-        "context_window": 8192,
-        "pricing": {
-          "input_per_million": 0.03,
-          "output_per_million": 0.09
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/google/gemma-2-9b-it"
-      },
       "google/gemma-3-12b-it": {
         "model_id": "google/gemma-3-12b-it",
         "name": "Google: Gemma 3 12B",
@@ -2547,24 +2531,6 @@
         "verified_at": "2025-12-24T22:05:31.809867+00:00",
         "source": "https://openrouter.ai/models/google/gemma-3n-e4b-it:free"
       },
-      "gryphe/mythomax-l2-13b": {
-        "model_id": "gryphe/mythomax-l2-13b",
-        "name": "MythoMax 13B",
-        "description": "One of the highest performing and most popular fine-tunes of Llama 2 13B, with rich descriptions and roleplay. #merge",
-        "input_tokens": 4096,
-        "output_tokens": 1024,
-        "context_window": 4096,
-        "pricing": {
-          "input_per_million": 0.06,
-          "output_per_million": 0.06
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/gryphe/mythomax-l2-13b"
-      },
       "ibm-granite/granite-4.0-h-micro": {
         "model_id": "ibm-granite/granite-4.0-h-micro",
         "name": "IBM: Granite 4.0 Micro",
@@ -2709,24 +2675,6 @@
         "verified_at": "2025-12-24T22:05:31.809867+00:00",
         "source": "https://openrouter.ai/models/liquid/lfm2-8b-a1b"
       },
-      "mancer/weaver": {
-        "model_id": "mancer/weaver",
-        "name": "Mancer: Weaver (alpha)",
-        "description": "An attempt to recreate Claude-style verbosity, but don't expect the same level of coherence or memory. Meant for use in roleplay/narrative situations.",
-        "input_tokens": 8000,
-        "output_tokens": 2000,
-        "context_window": 8000,
-        "pricing": {
-          "input_per_million": 0.75,
-          "output_per_million": 1.0
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/mancer/weaver"
-      },
       "meituan/longcat-flash-chat": {
         "model_id": "meituan/longcat-flash-chat",
         "name": "Meituan: LongCat Flash Chat",
@@ -2762,42 +2710,6 @@
         "provider": "openrouter",
         "verified_at": "2025-12-24T22:05:31.809867+00:00",
         "source": "https://openrouter.ai/models/meta-llama/llama-guard-3-8b"
-      },
-      "meta-llama/llama-3-70b-instruct": {
-        "model_id": "meta-llama/llama-3-70b-instruct",
-        "name": "Meta: Llama 3 70B Instruct",
-        "description": "Meta's latest class of model (Llama 3) launched with a variety of sizes & flavors. This 70B instruct-tuned version was optimized for high quality dialogue usecases.\n\nIt has demonstrated strong performance compared to leading closed-source models in human evaluations.\n\nTo read more about the model release, [click here](https://ai.meta.com/blog/meta-llama-3/). Usage of this model is subject to [Meta's Acceptable Use Policy](https://llama.meta.com/llama3/use-policy/).",
-        "input_tokens": 8192,
-        "output_tokens": 16384,
-        "context_window": 8192,
-        "pricing": {
-          "input_per_million": 0.3,
-          "output_per_million": 0.4
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/meta-llama/llama-3-70b-instruct"
-      },
-      "meta-llama/llama-3-8b-instruct": {
-        "model_id": "meta-llama/llama-3-8b-instruct",
-        "name": "Meta: Llama 3 8B Instruct",
-        "description": "Meta's latest class of model (Llama 3) launched with a variety of sizes & flavors. This 8B instruct-tuned version was optimized for high quality dialogue usecases.\n\nIt has demonstrated strong performance compared to leading closed-source models in human evaluations.\n\nTo read more about the model release, [click here](https://ai.meta.com/blog/meta-llama-3/). Usage of this model is subject to [Meta's Acceptable Use Policy](https://llama.meta.com/llama3/use-policy/).",
-        "input_tokens": 8192,
-        "output_tokens": 16384,
-        "context_window": 8192,
-        "pricing": {
-          "input_per_million": 0.03,
-          "output_per_million": 0.06
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/meta-llama/llama-3-8b-instruct"
       },
       "meta-llama/llama-3.1-405b": {
         "model_id": "meta-llama/llama-3.1-405b",
@@ -3056,24 +2968,6 @@
         "verified_at": "2025-12-24T22:05:31.809867+00:00",
         "source": "https://openrouter.ai/models/meta-llama/llama-guard-4-12b"
       },
-      "meta-llama/llama-guard-2-8b": {
-        "model_id": "meta-llama/llama-guard-2-8b",
-        "name": "Meta: LlamaGuard 2 8B",
-        "description": "This safeguard model has 8B parameters and is based on the Llama 3 family. Just like is predecessor, [LlamaGuard 1](https://huggingface.co/meta-llama/LlamaGuard-7b), it can do both prompt and response classification.\n\nLlamaGuard 2 acts as a normal LLM would, generating text that indicates whether the given input/output is safe/unsafe. If deemed unsafe, it will also share the content categories violated.\n\nFor best results, please use raw prompt input or the `/completions` endpoint, instead of the chat API.\n\nIt has demonstrated strong performance compared to leading closed-source models in human evaluations.\n\nTo read more about the model release, [click here](https://ai.meta.com/blog/meta-llama-3/). Usage of this model is subject to [Meta's Acceptable Use Policy](https://llama.meta.com/llama3/use-policy/).",
-        "input_tokens": 8192,
-        "output_tokens": 2048,
-        "context_window": 8192,
-        "pricing": {
-          "input_per_million": 0.2,
-          "output_per_million": 0.2
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/meta-llama/llama-guard-2-8b"
-      },
       "microsoft/phi-4": {
         "model_id": "microsoft/phi-4",
         "name": "Microsoft: Phi 4",
@@ -3128,78 +3022,6 @@
         "provider": "openrouter",
         "verified_at": "2025-12-24T22:05:31.809867+00:00",
         "source": "https://openrouter.ai/models/microsoft/phi-4-reasoning-plus"
-      },
-      "microsoft/phi-3-medium-128k-instruct": {
-        "model_id": "microsoft/phi-3-medium-128k-instruct",
-        "name": "Microsoft: Phi-3 Medium 128K Instruct",
-        "description": "Phi-3 128K Medium is a powerful 14-billion parameter model designed for advanced language understanding, reasoning, and instruction following. Optimized through supervised fine-tuning and preference adjustments, it excels in tasks involving common sense, mathematics, logical reasoning, and code processing.\n\nAt time of release, Phi-3 Medium demonstrated state-of-the-art performance among lightweight models. In the MMLU-Pro eval, the model even comes close to a Llama3 70B level of performance.\n\nFor 4k context length, try [Phi-3 Medium 4K](/models/microsoft/phi-3-medium-4k-instruct).",
-        "input_tokens": 128000,
-        "output_tokens": 32000,
-        "context_window": 128000,
-        "pricing": {
-          "input_per_million": 1.0,
-          "output_per_million": 1.0
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/microsoft/phi-3-medium-128k-instruct"
-      },
-      "microsoft/phi-3-mini-128k-instruct": {
-        "model_id": "microsoft/phi-3-mini-128k-instruct",
-        "name": "Microsoft: Phi-3 Mini 128K Instruct",
-        "description": "Phi-3 Mini is a powerful 3.8B parameter model designed for advanced language understanding, reasoning, and instruction following. Optimized through supervised fine-tuning and preference adjustments, it excels in tasks involving common sense, mathematics, logical reasoning, and code processing.\n\nAt time of release, Phi-3 Medium demonstrated state-of-the-art performance among lightweight models. This model is static, trained on an offline dataset with an October 2023 cutoff date.",
-        "input_tokens": 128000,
-        "output_tokens": 32000,
-        "context_window": 128000,
-        "pricing": {
-          "input_per_million": 0.1,
-          "output_per_million": 0.1
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/microsoft/phi-3-mini-128k-instruct"
-      },
-      "microsoft/phi-3.5-mini-128k-instruct": {
-        "model_id": "microsoft/phi-3.5-mini-128k-instruct",
-        "name": "Microsoft: Phi-3.5 Mini 128K Instruct",
-        "description": "Phi-3.5 models are lightweight, state-of-the-art open models. These models were trained with Phi-3 datasets that include both synthetic data and the filtered, publicly available websites data, with a focus on high quality and reasoning-dense properties. Phi-3.5 Mini uses 3.8B parameters, and is a dense decoder-only transformer model using the same tokenizer as [Phi-3 Mini](/models/microsoft/phi-3-mini-128k-instruct).\n\nThe models underwent a rigorous enhancement process, incorporating both supervised fine-tuning, proximal policy optimization, and direct preference optimization to ensure precise instruction adherence and robust safety measures. When assessed against benchmarks that test common sense, language understanding, math, code, long context and logical reasoning, Phi-3.5 models showcased robust and state-of-the-art performance among models with less than 13 billion parameters.",
-        "input_tokens": 128000,
-        "output_tokens": 32000,
-        "context_window": 128000,
-        "pricing": {
-          "input_per_million": 0.1,
-          "output_per_million": 0.1
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/microsoft/phi-3.5-mini-128k-instruct"
-      },
-      "microsoft/wizardlm-2-8x22b": {
-        "model_id": "microsoft/wizardlm-2-8x22b",
-        "name": "WizardLM-2 8x22B",
-        "description": "WizardLM-2 8x22B is Microsoft AI's most advanced Wizard model. It demonstrates highly competitive performance compared to leading proprietary models, and it consistently outperforms all existing state-of-the-art opensource models.\n\nIt is an instruct finetune of [Mixtral 8x22B](/models/mistralai/mixtral-8x22b).\n\nTo read more about the model release, [click here](https://wizardlm.github.io/WizardLM2/).\n\n#moe",
-        "input_tokens": 65536,
-        "output_tokens": 16384,
-        "context_window": 65536,
-        "pricing": {
-          "input_per_million": 0.48,
-          "output_per_million": 0.48
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/microsoft/wizardlm-2-8x22b"
       },
       "minimax/minimax-m1": {
         "model_id": "minimax/minimax-m1",
@@ -3292,24 +3114,6 @@
         "verified_at": "2025-12-24T22:05:31.809867+00:00",
         "source": "https://openrouter.ai/models/mistralai/mistral-large"
       },
-      "mistralai/mistral-large-2407": {
-        "model_id": "mistralai/mistral-large-2407",
-        "name": "Mistral Large 2407",
-        "description": "This is Mistral AI's flagship model, Mistral Large 2 (version mistral-large-2407). It's a proprietary weights-available model and excels at reasoning, code, JSON, chat, and more. Read the launch announcement [here](https://mistral.ai/news/mistral-large-2407/).\n\nIt supports dozens of languages including French, German, Spanish, Italian, Portuguese, Arabic, Hindi, Russian, Chinese, Japanese, and Korean, along with 80+ coding languages including Python, Java, C, C++, JavaScript, and Bash. Its long context window allows precise information recall from large documents.\n",
-        "input_tokens": 131072,
-        "output_tokens": 32768,
-        "context_window": 131072,
-        "pricing": {
-          "input_per_million": 2.0,
-          "output_per_million": 6.0
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/mistralai/mistral-large-2407"
-      },
       "mistralai/mistral-large-2411": {
         "model_id": "mistralai/mistral-large-2411",
         "name": "Mistral Large 2411",
@@ -3327,24 +3131,6 @@
         "provider": "openrouter",
         "verified_at": "2025-12-24T22:05:31.809867+00:00",
         "source": "https://openrouter.ai/models/mistralai/mistral-large-2411"
-      },
-      "mistralai/mistral-tiny": {
-        "model_id": "mistralai/mistral-tiny",
-        "name": "Mistral Tiny",
-        "description": "Note: This model is being deprecated. Recommended replacement is the newer [Ministral 8B](/mistral/ministral-8b)\n\nThis model is currently powered by Mistral-7B-v0.2, and incorporates a \"better\" fine-tuning than [Mistral 7B](/models/mistralai/mistral-7b-instruct-v0.1), inspired by community work. It's best used for large batch processing tasks where cost is a significant factor but reasoning capabilities are not crucial.",
-        "input_tokens": 32768,
-        "output_tokens": 8192,
-        "context_window": 32768,
-        "pricing": {
-          "input_per_million": 0.25,
-          "output_per_million": 0.25
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/mistralai/mistral-tiny"
       },
       "mistralai/codestral-2508": {
         "model_id": "mistralai/codestral-2508",
@@ -3454,24 +3240,6 @@
         "verified_at": "2025-12-24T22:05:31.809867+00:00",
         "source": "https://openrouter.ai/models/mistralai/ministral-8b"
       },
-      "mistralai/mistral-7b-instruct": {
-        "model_id": "mistralai/mistral-7b-instruct",
-        "name": "Mistral: Mistral 7B Instruct",
-        "description": "A high-performing, industry-standard 7.3B parameter model, with optimizations for speed and context length.\n\n*Mistral 7B Instruct has multiple version variants, and this is intended to be the latest version.*",
-        "input_tokens": 32768,
-        "output_tokens": 16384,
-        "context_window": 32768,
-        "pricing": {
-          "input_per_million": 0.028,
-          "output_per_million": 0.054
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/mistralai/mistral-7b-instruct"
-      },
       "mistralai/mistral-7b-instruct:free": {
         "model_id": "mistralai/mistral-7b-instruct:free",
         "name": "Mistral: Mistral 7B Instruct (free)",
@@ -3489,60 +3257,6 @@
         "provider": "openrouter",
         "verified_at": "2025-12-24T22:05:31.809867+00:00",
         "source": "https://openrouter.ai/models/mistralai/mistral-7b-instruct:free"
-      },
-      "mistralai/mistral-7b-instruct-v0.1": {
-        "model_id": "mistralai/mistral-7b-instruct-v0.1",
-        "name": "Mistral: Mistral 7B Instruct v0.1",
-        "description": "A 7.3B parameter model that outperforms Llama 2 13B on all benchmarks, with optimizations for speed and context length.",
-        "input_tokens": 2824,
-        "output_tokens": 706,
-        "context_window": 2824,
-        "pricing": {
-          "input_per_million": 0.11,
-          "output_per_million": 0.19
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/mistralai/mistral-7b-instruct-v0.1"
-      },
-      "mistralai/mistral-7b-instruct-v0.2": {
-        "model_id": "mistralai/mistral-7b-instruct-v0.2",
-        "name": "Mistral: Mistral 7B Instruct v0.2",
-        "description": "A high-performing, industry-standard 7.3B parameter model, with optimizations for speed and context length.\n\nAn improved version of [Mistral 7B Instruct](/modelsmistralai/mistral-7b-instruct-v0.1), with the following changes:\n\n- 32k context window (vs 8k context in v0.1)\n- Rope-theta = 1e6\n- No Sliding-Window Attention",
-        "input_tokens": 32768,
-        "output_tokens": 8192,
-        "context_window": 32768,
-        "pricing": {
-          "input_per_million": 0.2,
-          "output_per_million": 0.2
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/mistralai/mistral-7b-instruct-v0.2"
-      },
-      "mistralai/mistral-7b-instruct-v0.3": {
-        "model_id": "mistralai/mistral-7b-instruct-v0.3",
-        "name": "Mistral: Mistral 7B Instruct v0.3",
-        "description": "A high-performing, industry-standard 7.3B parameter model, with optimizations for speed and context length.\n\nAn improved version of [Mistral 7B Instruct v0.2](/models/mistralai/mistral-7b-instruct-v0.2), with the following changes:\n\n- Extended vocabulary to 32768\n- Supports v3 Tokenizer\n- Supports function calling\n\nNOTE: Support for function calling depends on the provider.",
-        "input_tokens": 32768,
-        "output_tokens": 4096,
-        "context_window": 32768,
-        "pricing": {
-          "input_per_million": 0.2,
-          "output_per_million": 0.2
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/mistralai/mistral-7b-instruct-v0.3"
       },
       "mistralai/mistral-medium-3": {
         "model_id": "mistralai/mistral-medium-3",
@@ -3947,24 +3661,6 @@
         "verified_at": "2025-12-24T22:05:31.809867+00:00",
         "source": "https://openrouter.ai/models/neversleep/llama-3.1-lumimaid-8b"
       },
-      "neversleep/noromaid-20b": {
-        "model_id": "neversleep/noromaid-20b",
-        "name": "Noromaid 20B",
-        "description": "A collab between IkariDev and Undi. This merge is suitable for RP, ERP, and general knowledge.\n\n#merge #uncensored",
-        "input_tokens": 4096,
-        "output_tokens": 1024,
-        "context_window": 4096,
-        "pricing": {
-          "input_per_million": 1.0,
-          "output_per_million": 1.75
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/neversleep/noromaid-20b"
-      },
       "nousresearch/deephermes-3-mistral-24b-preview": {
         "model_id": "nousresearch/deephermes-3-mistral-24b-preview",
         "name": "Nous: DeepHermes 3 Mistral 24B Preview",
@@ -4072,24 +3768,6 @@
         "provider": "openrouter",
         "verified_at": "2025-12-24T22:05:31.809867+00:00",
         "source": "https://openrouter.ai/models/nousresearch/hermes-4-70b"
-      },
-      "nousresearch/hermes-2-pro-llama-3-8b": {
-        "model_id": "nousresearch/hermes-2-pro-llama-3-8b",
-        "name": "NousResearch: Hermes 2 Pro - Llama-3 8B",
-        "description": "Hermes 2 Pro is an upgraded, retrained version of Nous Hermes 2, consisting of an updated and cleaned version of the OpenHermes 2.5 Dataset, as well as a newly introduced Function Calling and JSON Mode dataset developed in-house.",
-        "input_tokens": 8192,
-        "output_tokens": 2048,
-        "context_window": 8192,
-        "pricing": {
-          "input_per_million": 0.025,
-          "output_per_million": 0.08
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/nousresearch/hermes-2-pro-llama-3-8b"
       },
       "nvidia/llama-3.1-nemotron-70b-instruct": {
         "model_id": "nvidia/llama-3.1-nemotron-70b-instruct",
@@ -4256,169 +3934,6 @@
         "provider": "openrouter",
         "verified_at": "2025-12-24T22:05:31.809867+00:00",
         "source": "https://openrouter.ai/models/openai/codex-mini"
-      },
-      "openai/gpt-3.5-turbo": {
-        "model_id": "openai/gpt-3.5-turbo",
-        "name": "OpenAI: GPT-3.5 Turbo",
-        "description": "GPT-3.5 Turbo is OpenAI's fastest model. It can understand and generate natural language or code, and is optimized for chat and traditional completion tasks.\n\nTraining data up to Sep 2021.",
-        "input_tokens": 16385,
-        "output_tokens": 4096,
-        "context_window": 16385,
-        "pricing": {
-          "input_per_million": 0.5,
-          "output_per_million": 1.5
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/openai/gpt-3.5-turbo"
-      },
-      "openai/gpt-3.5-turbo-0613": {
-        "model_id": "openai/gpt-3.5-turbo-0613",
-        "name": "OpenAI: GPT-3.5 Turbo (older v0613)",
-        "description": "GPT-3.5 Turbo is OpenAI's fastest model. It can understand and generate natural language or code, and is optimized for chat and traditional completion tasks.\n\nTraining data up to Sep 2021.",
-        "input_tokens": 4095,
-        "output_tokens": 4096,
-        "context_window": 4095,
-        "pricing": {
-          "input_per_million": 1.0,
-          "output_per_million": 2.0
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/openai/gpt-3.5-turbo-0613"
-      },
-      "openai/gpt-3.5-turbo-16k": {
-        "model_id": "openai/gpt-3.5-turbo-16k",
-        "name": "OpenAI: GPT-3.5 Turbo 16k",
-        "description": "This model offers four times the context length of gpt-3.5-turbo, allowing it to support approximately 20 pages of text in a single request at a higher cost. Training data: up to Sep 2021.",
-        "input_tokens": 16385,
-        "output_tokens": 4096,
-        "context_window": 16385,
-        "pricing": {
-          "input_per_million": 3.0,
-          "output_per_million": 4.0
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/openai/gpt-3.5-turbo-16k"
-      },
-      "openai/gpt-3.5-turbo-instruct": {
-        "model_id": "openai/gpt-3.5-turbo-instruct",
-        "name": "OpenAI: GPT-3.5 Turbo Instruct",
-        "description": "This model is a variant of GPT-3.5 Turbo tuned for instructional prompts and omitting chat-related optimizations. Training data: up to Sep 2021.",
-        "input_tokens": 4095,
-        "output_tokens": 4096,
-        "context_window": 4095,
-        "pricing": {
-          "input_per_million": 1.5,
-          "output_per_million": 2.0
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/openai/gpt-3.5-turbo-instruct"
-      },
-      "openai/gpt-4": {
-        "model_id": "openai/gpt-4",
-        "name": "OpenAI: GPT-4",
-        "description": "OpenAI's flagship model, GPT-4 is a large-scale multimodal language model capable of solving difficult problems with greater accuracy than previous models due to its broader general knowledge and advanced reasoning capabilities. Training data: up to Sep 2021.",
-        "input_tokens": 8191,
-        "output_tokens": 4096,
-        "context_window": 8191,
-        "pricing": {
-          "input_per_million": 30.0,
-          "output_per_million": 60.0
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/openai/gpt-4"
-      },
-      "openai/gpt-4-0314": {
-        "model_id": "openai/gpt-4-0314",
-        "name": "OpenAI: GPT-4 (older v0314)",
-        "description": "GPT-4-0314 is the first version of GPT-4 released, with a context length of 8,192 tokens, and was supported until June 14. Training data: up to Sep 2021.",
-        "input_tokens": 8191,
-        "output_tokens": 4096,
-        "context_window": 8191,
-        "pricing": {
-          "input_per_million": 30.0,
-          "output_per_million": 60.0
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/openai/gpt-4-0314"
-      },
-      "openai/gpt-4-turbo": {
-        "model_id": "openai/gpt-4-turbo",
-        "name": "OpenAI: GPT-4 Turbo",
-        "description": "The latest GPT-4 Turbo model with vision capabilities. Vision requests can now use JSON mode and function calling.\n\nTraining data: up to December 2023.",
-        "input_tokens": 128000,
-        "output_tokens": 4096,
-        "context_window": 128000,
-        "pricing": {
-          "input_per_million": 10.0,
-          "output_per_million": 30.0
-        },
-        "capabilities": [
-          "text",
-          "vision"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/openai/gpt-4-turbo"
-      },
-      "openai/gpt-4-1106-preview": {
-        "model_id": "openai/gpt-4-1106-preview",
-        "name": "OpenAI: GPT-4 Turbo (older v1106)",
-        "description": "The latest GPT-4 Turbo model with vision capabilities. Vision requests can now use JSON mode and function calling.\n\nTraining data: up to April 2023.",
-        "input_tokens": 128000,
-        "output_tokens": 4096,
-        "context_window": 128000,
-        "pricing": {
-          "input_per_million": 10.0,
-          "output_per_million": 30.0
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/openai/gpt-4-1106-preview"
-      },
-      "openai/gpt-4-turbo-preview": {
-        "model_id": "openai/gpt-4-turbo-preview",
-        "name": "OpenAI: GPT-4 Turbo Preview",
-        "description": "The preview GPT-4 model with improved instruction following, JSON mode, reproducible outputs, parallel function calling, and more. Training data: up to Dec 2023.\n\n**Note:** heavily rate limited by OpenAI while in preview.",
-        "input_tokens": 128000,
-        "output_tokens": 4096,
-        "context_window": 128000,
-        "pricing": {
-          "input_per_million": 10.0,
-          "output_per_million": 30.0
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/openai/gpt-4-turbo-preview"
       },
       "openai/gpt-4.1": {
         "model_id": "openai/gpt-4.1",
@@ -4923,44 +4438,6 @@
         "provider": "openrouter",
         "verified_at": "2025-12-24T22:05:31.809867+00:00",
         "source": "https://openrouter.ai/models/openai/gpt-oss-safeguard-20b"
-      },
-      "openai/o1": {
-        "model_id": "openai/o1",
-        "name": "OpenAI: o1",
-        "description": "The latest and strongest model family from OpenAI, o1 is designed to spend more time thinking before responding. The o1 model series is trained with large-scale reinforcement learning to reason using chain of thought. \n\nThe o1 models are optimized for math, science, programming, and other STEM-related tasks. They consistently exhibit PhD-level accuracy on benchmarks in physics, chemistry, and biology. Learn more in the [launch announcement](https://openai.com/o1).\n",
-        "input_tokens": 200000,
-        "output_tokens": 100000,
-        "context_window": 200000,
-        "pricing": {
-          "input_per_million": 15.0,
-          "output_per_million": 60.0
-        },
-        "capabilities": [
-          "text",
-          "vision"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/openai/o1"
-      },
-      "openai/o1-pro": {
-        "model_id": "openai/o1-pro",
-        "name": "OpenAI: o1-pro",
-        "description": "The o1 series of models are trained with reinforcement learning to think before they answer and perform complex reasoning. The o1-pro model uses more compute to think harder and provide consistently better answers.",
-        "input_tokens": 200000,
-        "output_tokens": 100000,
-        "context_window": 200000,
-        "pricing": {
-          "input_per_million": 150.0,
-          "output_per_million": 600.0
-        },
-        "capabilities": [
-          "text",
-          "vision"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.809867+00:00",
-        "source": "https://openrouter.ai/models/openai/o1-pro"
       },
       "openai/o3": {
         "model_id": "openai/o3",
@@ -6028,24 +5505,6 @@
         "verified_at": "2025-12-24T22:05:31.810874+00:00",
         "source": "https://openrouter.ai/models/relace/relace-apply-3"
       },
-      "sao10k/l3-lunaris-8b": {
-        "model_id": "sao10k/l3-lunaris-8b",
-        "name": "Sao10K: Llama 3 8B Lunaris",
-        "description": "Lunaris 8B is a versatile generalist and roleplaying model based on Llama 3. It's a strategic merge of multiple models, designed to balance creativity with improved logic and general knowledge.\n\nCreated by [Sao10k](https://huggingface.co/Sao10k), this model aims to offer an improved experience over Stheno v3.2, with enhanced creativity and logical reasoning.\n\nFor best results, use with Llama 3 Instruct context template, temperature 1.4, and min_p 0.1.",
-        "input_tokens": 8192,
-        "output_tokens": 2048,
-        "context_window": 8192,
-        "pricing": {
-          "input_per_million": 0.04,
-          "output_per_million": 0.05
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.810874+00:00",
-        "source": "https://openrouter.ai/models/sao10k/l3-lunaris-8b"
-      },
       "sao10k/l3-euryale-70b": {
         "model_id": "sao10k/l3-euryale-70b",
         "name": "Sao10k: Llama 3 Euryale 70B v2.1",
@@ -6335,24 +5794,6 @@
         "provider": "openrouter",
         "verified_at": "2025-12-24T22:05:31.810874+00:00",
         "source": "https://openrouter.ai/models/tngtech/deepseek-r1t2-chimera:free"
-      },
-      "undi95/remm-slerp-l2-13b": {
-        "model_id": "undi95/remm-slerp-l2-13b",
-        "name": "ReMM SLERP 13B",
-        "description": "A recreation trial of the original MythoMax-L2-B13 but with updated models. #merge",
-        "input_tokens": 6144,
-        "output_tokens": 1536,
-        "context_window": 6144,
-        "pricing": {
-          "input_per_million": 0.45,
-          "output_per_million": 0.65
-        },
-        "capabilities": [
-          "text"
-        ],
-        "provider": "openrouter",
-        "verified_at": "2025-12-24T22:05:31.810874+00:00",
-        "source": "https://openrouter.ai/models/undi95/remm-slerp-l2-13b"
       },
       "x-ai/grok-3": {
         "model_id": "x-ai/grok-3",
@@ -6826,17 +6267,16 @@
     }
   },
   "aliases": {
-    "claude-opus": "claude-opus-4-5-20251101",
-    "claude-sonnet": "claude-sonnet-4-5",
+    "claude-opus": "claude-opus-4-6",
+    "claude-sonnet": "claude-sonnet-4-6",
     "claude-haiku": "claude-haiku-4-5",
-    "gpt-4o-latest": "gpt-4.1-2025-04-14",
-    "gemini-pro": "gemini-3-pro-preview",
+    "gemini-pro": "gemini-3.1-pro-preview",
     "gemini-flash": "gemini-2.5-flash"
   },
   "default_models": {
-    "gran_sabio": "claude-opus-4-5-20251101",
-    "gran_sabio_fallback": "claude-opus-4-5-20251101",
-    "premium_generator": "claude-sonnet-4-5",
+    "gran_sabio": "claude-opus-4-6",
+    "gran_sabio_fallback": "claude-opus-4-6",
+    "premium_generator": "claude-sonnet-4-6",
     "standard_generator": "gpt-5.1",
     "fast_qa": "claude-haiku-4-5",
     "reasoning": "gpt-5-mini",

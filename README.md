@@ -175,11 +175,11 @@ When evaluators disagree or max iterations are reached, the "Great Sage" steps i
 - **Analyzes the conflict:** Was it a real issue or false positive?
 - **Can modify content:** Fixes minor issues without full regeneration
 - **Tracks model reliability:** Learns which models produce more false positives
-- **Flexible model choice:** Use GPT-5.2-Pro for maximum accuracy or Claude Opus 4.5 for deep reasoning
+- **Flexible model choice:** Use GPT-5.2-Pro for maximum accuracy or Claude Opus 4.6 for deep reasoning
 
 ```json
 {
-  "gran_sabio_model": "claude-opus-4-5-20251101",
+  "gran_sabio_model": "claude-opus-4-6",
   "gran_sabio_call_limit_per_session": 15
 }
 ```

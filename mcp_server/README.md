@@ -228,8 +228,8 @@ All configuration is via environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GRANSABIO_GENERATOR_MODEL` | `gpt-5.2` | Default generator model |
-| `GRANSABIO_QA_MODELS` | `claude-opus-4-5-20251101,z-ai/glm-4.7,gemini-3-pro-preview` | Comma-separated QA models |
-| `GRANSABIO_ARBITER_MODEL` | `claude-opus-4-5-20251101` | Model for conflict resolution |
+| `GRANSABIO_QA_MODELS` | `claude-opus-4-6,z-ai/glm-4.7,gemini-3-pro-preview` | Comma-separated QA models |
+| `GRANSABIO_ARBITER_MODEL` | `claude-opus-4-6` | Model for conflict resolution |
 
 ### Reasoning Configuration
 

@@ -59,11 +59,11 @@ POLL_INTERVAL = float(os.getenv("GRANSABIO_POLL_INTERVAL", "2.0"))
 DEFAULT_GENERATOR_MODEL = os.getenv("GRANSABIO_GENERATOR_MODEL", "gpt-5.2")
 DEFAULT_QA_MODELS = os.getenv(
     "GRANSABIO_QA_MODELS",
-    "claude-opus-4-5-20251101,z-ai/glm-4.7,gemini-3-pro-preview"
+    "claude-opus-4-6,z-ai/glm-4.7,gemini-3-pro-preview"
 ).split(",")
 DEFAULT_ARBITER_MODEL = os.getenv(
     "GRANSABIO_ARBITER_MODEL",
-    "claude-opus-4-5-20251101"
+    "claude-opus-4-6"
 )
 
 # Reasoning configuration defaults
@@ -84,7 +84,7 @@ DEFAULT_THINKING_BUDGET = int(_thinking_budget_env) if _thinking_budget_env.isdi
 REASONING_PARAMS_SCHEMA = {
     "generator_model": {
         "type": "string",
-        "description": "Override the generator model (e.g., gpt-5.2, claude-opus-4-5-20251101)"
+        "description": "Override the generator model (e.g., gpt-5.2, claude-opus-4-6)"
     },
     "qa_models": {
         "type": "array",

@@ -1495,8 +1495,8 @@ class GranSabioInterface {
             select.appendChild(standardGroup);
         }
         
-        // Set default to Claude Opus 4.5 (best for final decisions)
-        select.value = 'claude-opus-4-5-20251101';
+        // Set default to Claude Opus 4.6 (best for final decisions)
+        select.value = 'claude-opus-4-6';
     }
 
     loadDefaultQAModels() {

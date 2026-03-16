@@ -423,7 +423,7 @@ async def demo_code_analyzer():
         print(f"Lines: {len(code_to_analyze.splitlines())}")
         print(f"Generator: {args.model}")
         print(f"QA Models: grok-4-1-fast-non-reasoning, gemini-3-flash-preview")
-        print(f"Gran Sabio: claude-opus-4-5-20251101")
+        print(f"Gran Sabio: claude-opus-4-6")
         print("-" * 60)
 
         # Show code preview
@@ -482,7 +482,7 @@ async def demo_code_analyzer():
             max_iterations=3,
 
             # Gran Sabio for escalation
-            gran_sabio_model="claude-opus-4-5-20251101",
+            gran_sabio_model="claude-opus-4-6",
 
             # Metadata
             verbose=True,

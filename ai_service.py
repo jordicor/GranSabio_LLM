@@ -2128,13 +2128,15 @@ class AIService:
 
         thinking_enabled = thinking_budget_tokens is not None and thinking_budget_tokens > 0
 
-        # Check if model supports Structured Outputs (Sonnet 4.5, Opus 4.1+, Haiku 4.5 - beta Nov 2025)
+        # Check if model supports Structured Outputs (Sonnet 4.5+, Opus 4.1+, Haiku 4.5 - beta Nov 2025)
         # Note: Sonnet 4.0 (claude-sonnet-4-20250514) does NOT support structured outputs
         model_lower = model_id.lower()
         supports_structured_outputs = (
             "sonnet-4-5" in model_lower or "sonnet-4.5" in model_lower or  # Sonnet 4.5
+            "sonnet-4-6" in model_lower or "sonnet-4.6" in model_lower or  # Sonnet 4.6
             "opus-4-1" in model_lower or "opus-4.1" in model_lower or      # Opus 4.1
             "opus-4-5" in model_lower or "opus-4.5" in model_lower or      # Opus 4.5
+            "opus-4-6" in model_lower or "opus-4.6" in model_lower or      # Opus 4.6
             "haiku-4-5" in model_lower or "haiku-4.5" in model_lower       # Haiku 4.5
         )
         use_structured_outputs = json_output and json_schema and supports_structured_outputs
@@ -2148,25 +2150,11 @@ class AIService:
                 return content_parts
             return text_content
 
+        messages = [{"role": "user", "content": _build_user_content(prompt)}]
         if use_structured_outputs:
-            # Use new Structured Outputs (beta) - no prefill, schema-guaranteed
-            messages = [{"role": "user", "content": _build_user_content(prompt)}]
             logger.info(f"Using Claude Structured Outputs (beta) with JSON Schema for {model_id}")
         elif json_output:
-            # JSON mode without structured outputs - instructions go in system prompt only
-            # User message stays clean to avoid prompt contamination
-            if thinking_enabled:
-                # With thinking: no prefill, just clean user prompt
-                messages = [{"role": "user", "content": _build_user_content(prompt)}]
-            else:
-                # Without thinking: use prefill to force JSON start
-                messages = [
-                    {"role": "user", "content": _build_user_content(prompt)},
-                    {"role": "assistant", "content": "{"}
-                ]
             logger.info(f"Using Claude JSON mode (prompt engineering) for {model_id}")
-        else:
-            messages = [{"role": "user", "content": _build_user_content(prompt)}]
 
         create_params = {
             "model": model_id,
@@ -2178,10 +2166,7 @@ class AIService:
         # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
         effective_system = system_prompt.strip() if system_prompt else ""
         if json_output and not use_structured_outputs:
-            if thinking_enabled:
-                json_instructions = "CRITICAL REQUIREMENT: You MUST respond with valid JSON only. Start your response with '{' immediately. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text, explanation, or thinking output before or after the JSON object."
-            else:
-                json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\"). No additional text or explanation."
+            json_instructions = "CRITICAL REQUIREMENT: You MUST respond with valid JSON only. Start your response with '{' immediately. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text, explanation, or commentary before or after the JSON object."
             if effective_system:
                 effective_system = f"{effective_system}\n\n{json_instructions}"
             else:
@@ -2776,7 +2761,7 @@ class AIService:
         try:
             if self.openai_client:
                 await self.openai_client.chat.completions.create(
-                    model="gpt-3.5-turbo",
+                    model="gpt-4o-mini",
                     messages=[{"role": "user", "content": "Hello"}],
                     max_tokens=5
                 )
@@ -2791,7 +2776,7 @@ class AIService:
         try:
             if self.anthropic_client:
                 await self.anthropic_client.messages.create(
-                    model="claude-3-5-haiku-20241022",
+                    model="claude-haiku-4-5",
                     max_tokens=5,
                     messages=[{"role": "user", "content": "Hello"}]
                 )
@@ -2805,7 +2790,7 @@ class AIService:
         # Test Gemini
         try:
             if self.genai_client:
-                model = self.genai_client.GenerativeModel('gemini-1.5-flash')
+                model = self.genai_client.GenerativeModel('gemini-2.0-flash')
                 await model.generate_content_async("Hello")
                 health_status["gemini"] = True
             else:
@@ -3092,13 +3077,15 @@ class AIService:
         # Check if thinking mode is enabled
         thinking_enabled = thinking_budget_tokens is not None and thinking_budget_tokens > 0
 
-        # Check if model supports Structured Outputs (Sonnet 4.5, Opus 4.1+, Haiku 4.5 - beta Nov 2025)
+        # Check if model supports Structured Outputs (Sonnet 4.5+, Opus 4.1+, Haiku 4.5 - beta Nov 2025)
         # Note: Sonnet 4.0 (claude-sonnet-4-20250514) does NOT support structured outputs
         model_lower = model_id.lower()
         supports_structured_outputs = (
             "sonnet-4-5" in model_lower or "sonnet-4.5" in model_lower or  # Sonnet 4.5
+            "sonnet-4-6" in model_lower or "sonnet-4.6" in model_lower or  # Sonnet 4.6
             "opus-4-1" in model_lower or "opus-4.1" in model_lower or      # Opus 4.1
             "opus-4-5" in model_lower or "opus-4.5" in model_lower or      # Opus 4.5
+            "opus-4-6" in model_lower or "opus-4.6" in model_lower or      # Opus 4.6
             "haiku-4-5" in model_lower or "haiku-4.5" in model_lower       # Haiku 4.5
         )
         use_structured_outputs = json_output and json_schema and supports_structured_outputs
@@ -3112,25 +3099,11 @@ class AIService:
                 return content_parts
             return text_content
 
+        messages = [{"role": "user", "content": _build_user_content(prompt)}]
         if use_structured_outputs:
-            # Use new Structured Outputs (beta) - no prefill, schema-guaranteed
-            messages = [{"role": "user", "content": _build_user_content(prompt)}]
             logger.info(f"Using Claude Structured Outputs (beta, streaming) with JSON Schema for {model_id}")
         elif json_output:
-            # JSON mode without structured outputs - instructions go in system prompt only
-            # User message stays clean to avoid prompt contamination
-            if thinking_enabled:
-                # With thinking: no prefill, just clean user prompt
-                messages = [{"role": "user", "content": _build_user_content(prompt)}]
-            else:
-                # Without thinking: use prefill to force JSON start
-                messages = [
-                    {"role": "user", "content": _build_user_content(prompt)},
-                    {"role": "assistant", "content": "{"}  # Prefill to force JSON start
-                ]
             logger.info(f"Using Claude JSON mode (streaming, prompt engineering) for {model_id}")
-        else:
-            messages = [{"role": "user", "content": _build_user_content(prompt)}]
 
         try:
             stream_params = {
@@ -3143,10 +3116,7 @@ class AIService:
             # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
             effective_system = system_prompt.strip() if system_prompt else ""
             if json_output and not use_structured_outputs:
-                if thinking_enabled:
-                    json_instructions = "CRITICAL REQUIREMENT: You MUST respond with valid JSON only. Start your response with '{' immediately. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text, explanation, or thinking output before or after the JSON object."
-                else:
-                    json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\"). No additional text or explanation."
+                json_instructions = "CRITICAL REQUIREMENT: You MUST respond with valid JSON only. Start your response with '{' immediately. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text, explanation, or commentary before or after the JSON object."
                 if effective_system:
                     effective_system = f"{effective_system}\n\n{json_instructions}"
                 else:
@@ -3165,10 +3135,6 @@ class AIService:
                 stream_params["output_format"] = pydantic_model
                 # Add required betas parameter for structured outputs
                 stream_params["betas"] = ["structured-outputs-2025-11-13"]
-
-            # If using JSON prefill (only when thinking is disabled AND not using structured outputs), yield the opening brace first
-            first_chunk = True
-            use_json_prefill = json_output and not thinking_enabled and not use_structured_outputs
 
             # Use beta API when using structured outputs, regular API otherwise
             stream_context = (
@@ -3209,17 +3175,9 @@ class AIService:
                             if thinking_text:
                                 yield StreamChunk(thinking_text, is_thinking=True)
                         elif hasattr(event.delta, 'text') and event.delta.text:
-                            # For JSON mode with prefill (thinking disabled), include the opening brace
-                            if use_json_prefill and first_chunk:
-                                yield StreamChunk("{", is_thinking=False)
-                                first_chunk = False
                             # Regular text delta
                             yield StreamChunk(event.delta.text, is_thinking=False)
                         elif delta_type == 'text_delta' and hasattr(event.delta, 'text'):
-                            # For JSON mode with prefill (thinking disabled), include the opening brace
-                            if use_json_prefill and first_chunk:
-                                yield StreamChunk("{", is_thinking=False)
-                                first_chunk = False
                             # Explicit text delta type
                             yield StreamChunk(event.delta.text, is_thinking=False)
 

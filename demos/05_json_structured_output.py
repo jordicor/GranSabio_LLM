@@ -219,7 +219,7 @@ async def demo_json_structured_output():
     parser = argparse.ArgumentParser(description="JSON Structured Output Demo")
     parser.add_argument("--text", help="Custom text to extract from")
     parser.add_argument("--model", default="gpt-5.2",
-                        choices=["gpt-5.2", "gpt-5-mini", "claude-sonnet-4-5",
+                        choices=["gpt-5.2", "gpt-5-mini", "claude-sonnet-4-6",
                                  "gemini-3-flash-preview", "grok-4-1-fast-non-reasoning",
                                  "z-ai/glm-4.6", "deepseek/deepseek-v3.2-exp", "qwen/qwen3-max"],
                         help="Model to use for extraction")

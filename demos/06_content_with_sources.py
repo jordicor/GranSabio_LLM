@@ -222,7 +222,7 @@ Do not add claims or statistics that are not in the research.
         result = await client.generate(
             prompt=prompt,
             content_type="article",
-            generator_model="claude-sonnet-4-5",
+            generator_model="claude-sonnet-4-6",
             temperature=0.6,
             max_tokens=2000,
             min_words=400,
@@ -237,7 +237,7 @@ Do not add claims or statistics that are not in the research.
             qa_layers=qa_layers,
             min_global_score=7.5,
             max_iterations=3,
-            gran_sabio_model="claude-opus-4-5-20251101",
+            gran_sabio_model="claude-opus-4-6",
             verbose=True,
             username=args.username,
             context_documents=[
