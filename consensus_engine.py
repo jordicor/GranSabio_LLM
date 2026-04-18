@@ -14,12 +14,15 @@ from datetime import datetime
 from ai_service import AIService, get_ai_service
 from models import QALayer, QAEvaluation, ConsensusResult
 from config import config
+from model_aliasing import ModelAliasRegistry, PromptPart, get_evaluator_alias
 
 if TYPE_CHECKING:
     from logging_utils import PhaseLogger
 
 
 logger = logging.getLogger(__name__)
+
+CONSENSUS_EXCLUDED_LAYER_NAMES = {"Evidence Grounding"}
 
 
 class ConsensusEngine:
@@ -68,22 +71,26 @@ class ConsensusEngine:
         per_model_averages = self._calculate_model_averages(qa_results)
         
         # Calculate overall average
-        all_scores = []
-        for layer_results in qa_results.values():
-            for evaluation in layer_results.values():
-                if evaluation.score is not None:
-                    all_scores.append(evaluation.score)
+        all_scores = [
+            evaluation.score
+            for _, _, evaluation in self._iter_consensus_scored_evaluations(qa_results)
+        ]
         
         average_score = sum(all_scores) / len(all_scores) if all_scores else 0.0
         
         # Collect deal-breakers and aggregate feedback for iteration guidance
         deal_breakers: List[str] = []
+        alias_registry = getattr(original_request, "_model_alias_registry", None) if original_request else None
         for layer_name, layer_results in qa_results.items():
             for model, evaluation in layer_results.items():
                 if bool(self._safe_get_evaluation_attr(evaluation, "deal_breaker", False)):
                     reason = self._safe_get_evaluation_attr(evaluation, "deal_breaker_reason") or \
                         self._safe_get_evaluation_attr(evaluation, "reason") or "Deal-breaker detected"
-                    deal_breakers.append(f"{layer_name} ({model}): {reason}")
+                    evaluator_name = get_evaluator_alias(
+                        evaluation,
+                        fallback=alias_registry.alias_for_identity(model, fallback=model) if alias_registry else model,
+                    )
+                    deal_breakers.append(f"{layer_name} ({evaluator_name}): {reason}")
 
         # Log consensus calculation info if phase_logger available
         if phase_logger:
@@ -98,7 +105,11 @@ class ConsensusEngine:
             content, qa_results, layers, layer_averages, average_score, deal_breakers, phase_logger
         )
 
-        feedback_by_layer, actionable_feedback = self._collect_feedback_details(qa_results, layer_averages)
+        feedback_by_layer, actionable_feedback = self._collect_feedback_details(
+            qa_results,
+            layer_averages,
+            alias_registry=alias_registry,
+        )
 
         return ConsensusResult(
             average_score=average_score,
@@ -116,12 +127,10 @@ class ConsensusEngine:
         model_scores = {}
         
         # Collect scores by model
-        for layer_results in qa_results.values():
-            for model, evaluation in layer_results.items():
-                if evaluation.score is not None:
-                    if model not in model_scores:
-                        model_scores[model] = []
-                    model_scores[model].append(evaluation.score)
+        for _, model, evaluation in self._iter_consensus_scored_evaluations(qa_results):
+            if model not in model_scores:
+                model_scores[model] = []
+            model_scores[model].append(evaluation.score)
         
         # Calculate averages
         model_averages = {}
@@ -129,6 +138,19 @@ class ConsensusEngine:
             model_averages[model] = sum(scores) / len(scores) if scores else 0.0
 
         return model_averages
+
+    def _iter_consensus_scored_evaluations(
+        self,
+        qa_results: Dict[str, Dict[str, QAEvaluation]],
+    ):
+        """Yield scored evaluations that should influence consensus-wide aggregates."""
+        for layer_name, layer_results in qa_results.items():
+            if layer_name in CONSENSUS_EXCLUDED_LAYER_NAMES:
+                continue
+
+            for model, evaluation in layer_results.items():
+                if evaluation.score is not None:
+                    yield layer_name, model, evaluation
     
     async def _determine_approval(
         self,
@@ -183,7 +205,8 @@ class ConsensusEngine:
     def _collect_feedback_details(
         self,
         qa_results: Dict[str, Dict[str, QAEvaluation]],
-        layer_averages: Dict[str, float]
+        layer_averages: Dict[str, float],
+        alias_registry: Optional[ModelAliasRegistry] = None,
     ) -> Tuple[List[Dict[str, Any]], List[str]]:
         """Aggregate per-layer feedback and actionable notes for iteration guidance."""
 
@@ -200,6 +223,10 @@ class ConsensusEngine:
             }
 
             for model_name, evaluation in model_results.items():
+                evaluator_name = get_evaluator_alias(
+                    evaluation,
+                    fallback=alias_registry.alias_for_identity(model_name, fallback=model_name) if alias_registry else model_name,
+                )
                 score = self._safe_get_evaluation_attr(evaluation, "score", 0.0)
                 feedback_text = (self._safe_get_evaluation_attr(evaluation, "feedback", "") or "").strip()
                 deal_breaker = bool(self._safe_get_evaluation_attr(evaluation, "deal_breaker", False))
@@ -208,6 +235,7 @@ class ConsensusEngine:
 
                 model_entry = {
                     "model": model_name,
+                    "evaluator": evaluator_name,
                     "score": score,
                     "deal_breaker": deal_breaker,
                     "feedback": feedback_text
@@ -215,13 +243,13 @@ class ConsensusEngine:
 
                 if deal_breaker_reason:
                     model_entry["deal_breaker_reason"] = deal_breaker_reason
-                    layer_entry["deal_breakers"].append(f"{model_name}: {deal_breaker_reason}")
+                    layer_entry["deal_breakers"].append(f"{evaluator_name}: {deal_breaker_reason}")
 
                 layer_entry["model_feedback"].append(model_entry)
 
                 actionable_text = deal_breaker_reason or feedback_text
                 if actionable_text:
-                    formatted = f"{layer_name} ({model_name}): {actionable_text}"
+                    formatted = f"{layer_name} ({evaluator_name}): {actionable_text}"
                     if formatted not in seen_actionable:
                         actionable_feedback.append(formatted)
                         seen_actionable.add(formatted)
@@ -245,7 +273,8 @@ class ConsensusEngine:
         content: str,
         qa_results: Dict[str, Dict[str, QAEvaluation]],
         layers: List[QALayer],
-        consensus_model: str = "gpt-4o"
+        consensus_model: str = "gpt-4o",
+        alias_registry: Optional[ModelAliasRegistry] = None,
     ) -> Dict[str, Any]:
         """
         Perform advanced consensus analysis using AI to interpret disagreements
@@ -260,7 +289,12 @@ class ConsensusEngine:
             Advanced consensus analysis results
         """
         # Prepare analysis prompt
-        analysis_prompt = self._build_consensus_analysis_prompt(content, qa_results, layers)
+        analysis_prompt = self._build_consensus_analysis_prompt(
+            content,
+            qa_results,
+            layers,
+            alias_registry=alias_registry,
+        )
         
         try:
             # Get AI consensus analysis
@@ -269,7 +303,15 @@ class ConsensusEngine:
                 model=consensus_model,
                 temperature=0.3,
                 max_tokens=2000,
-                system_prompt=config.CONSENSUS_SYSTEM_PROMPT
+                system_prompt=config.CONSENSUS_SYSTEM_PROMPT,
+                model_alias_registry=alias_registry,
+                prompt_safety_parts=[
+                    PromptPart(
+                        text=self._build_consensus_guard_summary(qa_results, alias_registry),
+                        source="system_generated",
+                        label="consensus.evaluation_summary",
+                    )
+                ] if alias_registry else None,
             )
             
             # Parse and structure the analysis
@@ -300,7 +342,8 @@ class ConsensusEngine:
         self,
         content: str,
         qa_results: Dict[str, Dict[str, QAEvaluation]],
-        layers: List[QALayer]
+        layers: List[QALayer],
+        alias_registry: Optional[ModelAliasRegistry] = None,
     ) -> str:
         """Build prompt for AI consensus analysis"""
         
@@ -315,8 +358,12 @@ class ConsensusEngine:
                 layer_summary += f"Minimum required score: {layer.min_score}\n"
                 
                 for model, evaluation in layer_results.items():
+                    evaluator_name = get_evaluator_alias(
+                        evaluation,
+                        fallback=alias_registry.alias_for_identity(model, fallback=model) if alias_registry else model,
+                    )
                     score_display = f"{evaluation.score}/10" if evaluation.score is not None else "Score unavailable"
-                    layer_summary += f"\n{model}: {score_display}\n"
+                    layer_summary += f"\n{evaluator_name}: {score_display}\n"
                     layer_summary += f"Feedback: {evaluation.feedback}\n"
                     if evaluation.deal_breaker:
                         layer_summary += f"⚠️ DEAL-BREAKER: {evaluation.reason}\n"
@@ -347,6 +394,23 @@ RESPONSE FORMAT:
 """
         
         return prompt
+
+    def _build_consensus_guard_summary(
+        self,
+        qa_results: Dict[str, Dict[str, QAEvaluation]],
+        alias_registry: Optional[ModelAliasRegistry],
+    ) -> str:
+        lines: List[str] = []
+        for layer_name, layer_results in qa_results.items():
+            lines.append(f"Layer: {layer_name}")
+            for model, evaluation in layer_results.items():
+                evaluator_name = get_evaluator_alias(
+                    evaluation,
+                    fallback=alias_registry.alias_for_identity(model, fallback=model) if alias_registry else model,
+                )
+                score = getattr(evaluation, "score", None)
+                lines.append(f"{evaluator_name}: {score}")
+        return "\n".join(lines)
     
     def _parse_consensus_analysis(self, analysis: str) -> Dict[str, Any]:
         """Parse structured information from AI consensus analysis"""

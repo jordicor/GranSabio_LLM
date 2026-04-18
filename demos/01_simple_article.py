@@ -60,11 +60,11 @@ Include:
         result = await client.generate(
             prompt=prompt,
             content_type="article",
-            generator_model="gpt-5-mini",  # Fast, cost-effective model
+            generator_model="gpt-5.4",  # Fast, cost-effective model
             temperature=0.7,
             max_tokens=1500,
             qa_layers=[],  # Empty list = bypass QA completely
-            qa_models=["gpt-5-mini"],  # Required but not used when qa_layers=[]
+            qa_models=["gpt-5.4"],  # Required but not used when qa_layers=[]
             max_iterations=1,
             verbose=True,
             request_name="Simple Article Demo",

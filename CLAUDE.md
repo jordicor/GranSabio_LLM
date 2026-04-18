@@ -117,6 +117,16 @@ Model specifications are centralized in `model_specs.json` with provider-specifi
 - Real-time progress streaming via Server-Sent Events
 - Status management through enum states
 
+**Debugger Storage**: The debugger SQLite DB (`debugger_history.db`) lives **outside** the repository, under local app/state storage. This is where to look when inspecting Gran Sabio sessions, QA timelines, or debugging live runs.
+
+- **Windows**: `%LOCALAPPDATA%\GranSabio_LLM\debugger\debugger_history.db`
+  - Typically resolves to `C:\Users\<user>\AppData\Local\GranSabio_LLM\debugger\debugger_history.db`
+- **Unix**: `$XDG_STATE_HOME/gransabio/debugger/debugger_history.db`
+  - Fallback: `~/.local/state/gransabio/debugger/debugger_history.db`
+- **Override**: Set the `DEBUGGER_DB_PATH` env var only when an explicit custom location is required.
+
+The first startup on each machine auto-migrates any legacy DB from the project root via `migrate_debugger_db_if_needed()` in `debug_logger.py`. No `debugger_history.db` should ever appear at the repo root again — if one does, it is stale and should be deleted. Path resolution logic lives in `debug_logger.py:resolve_debugger_db_path`.
+
 **Preflight Validation**: Before starting content generation, the system analyzes request feasibility using GPT-4o to detect contradictions, incompatibilities, and impossible scenarios. This prevents wasted resources on requests that cannot succeed (e.g., asking for fiction with historical accuracy validation).
 
 **Attachment Ingestion**: `/attachments`, `/attachments/base64`, and `/attachments/url` persist metadata through `AttachmentManager`. URL uploads require HTTPS, respect configurable redirect limits, enforce MIME checks, and cache successful downloads per usuario/URL via `AttachmentRecord.original_url`. Tune size limits, allowed schemes, host allow/block lists, timeouts, and cache TTL under `config.ATTACHMENTS`.
@@ -135,6 +145,8 @@ Model specifications are centralized in `model_specs.json` with provider-specifi
 **Smart Edit JSON Field Extraction**: When generating JSON output, smart-edit needs to work on the text content, not the JSON structure. The system automatically extracts text fields for editing:
 - **`target_field`**: Specify which JSON field(s) contain the primary text using jmespath notation (e.g., `"generated_text"`, `"data.content"`, or `["chapter", "notes"]` for multiple fields)
 - **`target_field_only`**: When `true`, AI QA receives only extracted text (saves tokens). When `false`, AI QA receives full JSON. Algorithmic guards always use extracted text when target_field is set.
+- **`smart_edit_locator_mode`**: Defaults to `ids`, using stable paragraph/sentence IDs (`p1`, `p1s2`) for smart-edit targeting. Set to `legacy` to keep phrase markers plus automatic word-index fallback.
+- **`generation_tools_mode`**: Controls generator-side deterministic validation tools (`auto`, `always`, `never`). `auto` enables the tool loop for supported providers (`OpenAI`, `Claude`, `Gemini`, `xAI`, `OpenRouter`) when measurable constraints such as word count, phrase frequency, lexical diversity, cumulative repetition, or JSON field extraction are active.
 - **Auto-detection**: If `target_field` not specified, automatically finds the largest string field (errors if ambiguous)
 - **Markdown extraction**: Automatically extracts JSON from markdown ```json code blocks
 - **Reconstruction**: After smart-edit completes, the edited text is reconstructed back into the original JSON structure
@@ -146,6 +158,15 @@ Model specifications are centralized in `model_specs.json` with provider-specifi
 - Alternative models: `grok-4-1-fast-non-reasoning` for speed (2.5x faster extraction, supports logprobs with top_logprobs=8 max)
 - Benchmark script: `python dev_tests/test_grounding_model_comparison.py --save`
 
+**Generator Tool Loop** (`ai_service.py`): When the request has measurable constraints (word count, phrase frequency, lexical diversity, JSON schema, cumulative repetition) and the provider supports tool calling, the generator runs inside a validation tool loop instead of a single-shot call. The loop exposes one combined `validate_draft(text)` tool that returns approved/hard_failed/score/issues/metrics for every measurable check at once.
+- **Activation**: `generation_tools_mode` request field (`auto`/`always`/`never`), default `auto`. `auto` enables when supported providers are used and any measurable validator is active (see `_should_use_generation_tools` in `core/generation_processor.py`).
+- **Supported providers**: `openai`, `claude`/`anthropic`, `gemini`/`google`, `xai`, `openrouter`.
+- **Excluded**: OpenAI Responses API models (`o3-pro`, `gpt-5-pro`) — different tool-call contract.
+- **Rounds budget**: `max(2, min(5, max_iterations))` external rounds per generation (`core/generation_processor.py:744`).
+- **Tool call budget**: `max(4, max_rounds * 2)` total calls before a force-finalize turn is injected (`ai_service.py:_get_tool_loop_call_budget`).
+- **Long Text**: uses its own per-section budget `LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION` (env override supported).
+- **Design rationale**: a single combined `validate_draft` tool outperforms multiple specialized mechanical tools for medium/long drafts. This rule applies to deterministic (Python-cost) validators; AI-cost validators that require another model call are a separate architectural decision.
+
 **JSON Schema Structured Outputs**: The system supports native JSON Schema structured outputs across all major AI providers (implemented Nov 2025). Key behaviors:
 - **Grok (xAI)**: Uses `response_format` with `json_schema` type for all Grok 2-1212+ models
 - **Gemini**: Uses `response_schema` parameter in both new and legacy SDKs (all active models supported)
@@ -156,6 +177,43 @@ Model specifications are centralized in `model_specs.json` with provider-specifi
 - **OpenRouter/Mistral**: Uses `response_format` with `json_schema` type for compatible models
 - **Dual operation**: When `json_schema` is provided, models use native structured outputs; when omitted, uses flexible JSON mode (backward compatible)
 - **Validation**: `json_schema` is used both for model-side generation guarantees AND client-side validation via `validate_ai_json()`
+- **QA evaluations**: QA uses dedicated simple/editable schemas in `qa_response_schemas.py`; parse failures must raise `QAResponseParseError` so multi-model QA can skip only the invalid evaluator instead of manufacturing deal-breakers.
+
+## Language-Agnostic Intelligence (MANDATORY)
+
+**Do NOT use regex, keyword lists, or hardcoded string patterns for semantic
+tasks.** This is a hard rule with no exceptions.
+
+Semantic tasks include: temporal expression detection, intent classification,
+entity extraction, topic detection, need/signal classification, query
+understanding, content categorization — anything where the input is natural
+language and the output requires understanding meaning.
+
+**Why:** Keyword lists only work for one language, break on paraphrases, and
+silently miss edge cases. LLMs have billions of parameters trained on every
+language and every phrasing variant — they ARE the evolved, complete keyword
+dictionary. Rebuilding a fraction of that with regex is anachronistic and
+creates silent bugs that only show up in production on inputs nobody tested.
+
+**What to use instead:** LLM calls (provider-agnostic). For latency-sensitive
+paths, use small/fast models or structured output with constrained schemas.
+For truly zero-latency needs, use pre-computed LLM results stored in the
+database, not runtime regex.
+
+**Acceptable uses of regex:** Parsing structured/mechanical formats ONLY —
+SQL sanitization, UUID validation, FTS query syntax cleanup, log parsing,
+config file parsing. If the input is machine-generated with a known grammar,
+regex is fine. If the input is human language, use an LLM.
+
+Mechanical IR cleanup for retrieval is allowed when it does not perform
+semantic interpretation (tokenization, FTS-safe sanitization, duplicate-token
+collapse, operator stripping). What is forbidden is hardcoded semantic
+understanding tied to specific words, languages, or benchmark phrasing.
+
+**When reviewing or modifying existing code:** If you encounter regex or
+keyword lists used for semantic understanding, flag it as tech debt to be
+replaced with an LLM call. Do not extend or "improve" keyword lists — that
+deepens the problem.
 
 ## Important Development Considerations
 
@@ -243,3 +301,15 @@ The web interface at `/` provides a complete UI for testing all functionality wi
 - All JSON operations use orjson via `json_utils.py` (3.6x faster than standard json)
 - AI service connection pooling reduces latency for repeated requests
 - Session cleanup background task prevents memory leaks
+
+### GitHub Sync
+
+When asked to sync to GitHub ("sincroniza github", "sync github",
+"actualiza github"), read and follow `SYNC_GITHUB.md` step by step.
+
+NOTE: "guarda en git", "commit", "guarda los cambios" etc. mean a normal
+git commit in the dev repo — NOT the GitHub sync. Only trigger the sync
+workflow when "github" is explicitly mentioned.
+
+The sync tool lives in `tools/sync_github/` (scan.py, apply.py, config.py,
+tests/test_transforms.py) and is itself excluded from the public mirror.

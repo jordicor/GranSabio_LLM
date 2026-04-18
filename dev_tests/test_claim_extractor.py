@@ -336,8 +336,10 @@ class TestClaimExtractor:
         """
         mock_ai_service.generate_content.return_value = '{"claims": []}'
 
-        with patch("evidence_grounding.claim_extractor.config") as mock_config:
-            mock_config.EVIDENCE_GROUNDING_MODEL = "gpt-5-nano"
+        with patch(
+            "evidence_grounding.claim_extractor.config.EVIDENCE_GROUNDING_EXTRACTION_MODEL",
+            "gpt-5-nano",
+        ):
             await extractor.extract_claims(
                 content="Content",
                 context="Context",

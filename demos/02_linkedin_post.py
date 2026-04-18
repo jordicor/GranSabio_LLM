@@ -104,7 +104,7 @@ The post should:
         result = await client.generate(
             prompt=prompt,
             content_type="article",
-            generator_model="gpt-5.2",
+            generator_model="gpt-5.4",
             temperature=0.75,
             max_tokens=1000,
             min_words=150,
@@ -114,7 +114,7 @@ The post should:
             qa_layers=qa_layers,
             min_global_score=7.5,
             max_iterations=3,
-            gran_sabio_model="claude-opus-4-6",
+            gran_sabio_model="claude-opus-4-7",
             verbose=True,
             request_name="LinkedIn Post Demo",
             wait_for_completion=False  # Return immediately with session_id

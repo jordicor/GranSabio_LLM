@@ -86,11 +86,11 @@ class ParallelGenerationManager:
             result = await self.client.generate(
                 prompt=prompt,
                 content_type=content_type,
-                generator_model="gpt-5-mini",  # Fast model for demos
+                generator_model="gpt-5.4",  # Fast model for demos
                 temperature=0.7,
                 max_tokens=500,
                 qa_layers=[],  # No QA for speed
-                qa_models=["gpt-5-mini"],
+                qa_models=["gpt-5.4"],
                 max_iterations=1,
                 verbose=True,
                 project_id=self.project_id,

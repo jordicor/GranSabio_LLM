@@ -36,6 +36,8 @@ from qa_engine import (
     calculate_qa_timeout_for_model,
     calculate_comprehensive_qa_timeout,
 )
+from qa_evaluation_service import QAResponseParseError
+from config import EDITABLE_CONTENT_TYPES
 from models import QALayer, QAEvaluation, QAModelConfig
 
 
@@ -58,6 +60,7 @@ def mock_bypass_engine():
     bypass = MagicMock()
     bypass.should_bypass_qa_layer = Mock(return_value=False)
     bypass.bypass_layer_evaluation = Mock(return_value={})
+    bypass.should_skip_incremental_repair = Mock(return_value=False)
     return bypass
 
 
@@ -459,9 +462,7 @@ class TestShouldRequestEditInfo:
         When: _should_request_edit_info() is called
         Then: Returns True for all editable types
         """
-        editable_types = ["biography", "article", "script", "story", "essay", "blog", "novel"]
-
-        for content_type in editable_types:
+        for content_type in EDITABLE_CONTENT_TYPES:
             result = qa_engine._should_request_edit_info(mode="auto", content_type=content_type)
             assert result is True, f"Expected True for {content_type}"
 
@@ -1109,6 +1110,63 @@ class TestEvaluateAllLayersWithProgress:
         assert "Test Quality" in results
 
     @pytest.mark.asyncio
+    async def test_falls_back_to_ai_when_bypass_returns_no_results(
+        self, qa_engine, sample_qa_layer, sample_qa_evaluation
+    ):
+        """
+        Given: Bypass engine says a layer is bypassable but returns no evaluations
+        When: evaluate_all_layers_with_progress() is called
+        Then: Falls back to normal AI evaluation instead of crashing
+        """
+        qa_engine.bypass_engine.should_bypass_qa_layer = Mock(return_value=True)
+        qa_engine.bypass_engine.bypass_layer_evaluation = Mock(return_value={})
+        qa_engine.qa_evaluator.evaluate_content = AsyncMock(return_value=sample_qa_evaluation)
+
+        with patch('qa_engine.calculate_qa_timeout_for_model', return_value=60):
+            results = await qa_engine.evaluate_all_layers_with_progress(
+                content="Test content",
+                layers=[sample_qa_layer],
+                qa_models=["gpt-4o"]
+            )
+
+        qa_engine.bypass_engine.should_bypass_qa_layer.assert_called_once()
+        qa_engine.bypass_engine.bypass_layer_evaluation.assert_called_once()
+        qa_engine.qa_evaluator.evaluate_content.assert_awaited_once()
+        assert "Test Quality" in results
+
+    @pytest.mark.asyncio
+    async def test_marks_bypass_content_as_prepared_when_provided(
+        self, qa_engine, sample_qa_layer, sample_qa_evaluation
+    ):
+        """
+        Given: Pre-extracted text passed via content_for_bypass
+        When: _evaluate_single_semantic_layer() uses the bypass engine
+        Then: The bypass engine is told the content is already prepared
+        """
+        qa_engine.bypass_engine.should_bypass_qa_layer = Mock(return_value=True)
+        qa_engine.bypass_engine.bypass_layer_evaluation = Mock(return_value={
+            "gpt-4o": sample_qa_evaluation
+        })
+        request = Mock()
+
+        await qa_engine._evaluate_single_semantic_layer(
+            content="ignored raw content",
+            layer=sample_qa_layer,
+            qa_models=["gpt-4o"],
+            qa_model_names=["gpt-4o"],
+            original_request=request,
+            content_for_bypass="prepared extracted text",
+        )
+
+        qa_engine.bypass_engine.bypass_layer_evaluation.assert_called_once_with(
+            "prepared extracted text",
+            sample_qa_layer,
+            ["gpt-4o"],
+            request,
+            content_already_prepared=True,
+        )
+
+    @pytest.mark.asyncio
     async def test_handles_cancellation(self, qa_engine, sample_qa_layer, sample_qa_evaluation):
         """
         Given: Cancel callback returns True
@@ -1132,7 +1190,7 @@ class TestEvaluateAllLayersWithProgress:
         """
         Given: Evaluation times out
         When: evaluate_all_layers_with_progress() is called
-        Then: Creates deal-breaker evaluation with timeout reason
+        Then: Fails fast because a single-model QA quorum is impossible
         """
         async def slow_evaluation(*args, **kwargs):
             await asyncio.sleep(10)
@@ -1140,33 +1198,7 @@ class TestEvaluateAllLayersWithProgress:
         qa_engine.qa_evaluator.evaluate_content = AsyncMock(side_effect=slow_evaluation)
 
         with patch('qa_engine.calculate_qa_timeout_for_model', return_value=0.01):
-            results = await qa_engine.evaluate_all_layers_with_progress(
-                content="Test content",
-                layers=[sample_qa_layer],
-                qa_models=["gpt-4o"]
-            )
-
-        # With single model timeout causes majority deal-breaker (1/1)
-        # Result is wrapped in iteration stop structure
-        qa_results = results.get("qa_results", results)
-        assert "Test Quality" in qa_results
-        evaluation = qa_results["Test Quality"]["gpt-4o"]
-        assert evaluation.deal_breaker is True
-        assert "Timeout" in evaluation.feedback
-
-    @pytest.mark.asyncio
-    async def test_handles_value_error_single_model(self, qa_engine, sample_qa_layer):
-        """
-        Given: Single model returns invalid JSON
-        When: evaluate_all_layers_with_progress() is called
-        Then: Raises ValueError
-        """
-        qa_engine.qa_evaluator.evaluate_content = AsyncMock(
-            side_effect=ValueError("Invalid JSON response")
-        )
-
-        with patch('qa_engine.calculate_qa_timeout_for_model', return_value=60):
-            with pytest.raises(ValueError, match="invalid JSON"):
+            with pytest.raises(QAModelUnavailableError, match="quorum impossible"):
                 await qa_engine.evaluate_all_layers_with_progress(
                     content="Test content",
                     layers=[sample_qa_layer],
@@ -1174,7 +1206,26 @@ class TestEvaluateAllLayersWithProgress:
                 )
 
     @pytest.mark.asyncio
-    async def test_handles_value_error_multiple_models(
+    async def test_handles_parse_error_single_model(self, qa_engine, sample_qa_layer):
+        """
+        Given: Single model returns invalid JSON
+        When: evaluate_all_layers_with_progress() is called
+        Then: Raises QAResponseParseError
+        """
+        qa_engine.qa_evaluator.evaluate_content = AsyncMock(
+            side_effect=QAResponseParseError("Invalid JSON response")
+        )
+
+        with patch('qa_engine.calculate_qa_timeout_for_model', return_value=60):
+            with pytest.raises(QAResponseParseError, match="invalid JSON"):
+                await qa_engine.evaluate_all_layers_with_progress(
+                    content="Test content",
+                    layers=[sample_qa_layer],
+                    qa_models=["gpt-4o"]
+                )
+
+    @pytest.mark.asyncio
+    async def test_handles_parse_error_multiple_models(
         self, qa_engine, sample_qa_layer, sample_qa_evaluation
     ):
         """
@@ -1187,7 +1238,7 @@ class TestEvaluateAllLayersWithProgress:
         async def mock_evaluate(*args, **kwargs):
             call_count[0] += 1
             if call_count[0] == 1:
-                raise ValueError("Invalid JSON")
+                raise QAResponseParseError("Invalid JSON")
             return sample_qa_evaluation
 
         qa_engine.qa_evaluator.evaluate_content = AsyncMock(side_effect=mock_evaluate)
@@ -1196,13 +1247,14 @@ class TestEvaluateAllLayersWithProgress:
             results = await qa_engine.evaluate_all_layers_with_progress(
                 content="Test content",
                 layers=[sample_qa_layer],
-                qa_models=["gpt-4o", "claude-sonnet-4"]
+                qa_models=["gpt-4o", "claude-sonnet-4", "gemini-pro"]
             )
 
         # First model should have placeholder, second should succeed
         assert "Test Quality" in results
         assert results["Test Quality"]["gpt-4o"].score is None
         assert results["Test Quality"]["claude-sonnet-4"].score == 8.5
+        assert results["Test Quality"]["gemini-pro"].score == 8.5
 
     @pytest.mark.asyncio
     async def test_majority_deal_breaker_stops_early(

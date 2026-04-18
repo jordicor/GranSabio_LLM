@@ -1,0 +1,306 @@
+{
+  "test_date": "2026-01-09T20:58:42.058447",
+  "model": "gemini-3-pro-preview",
+  "runs_per_scenario": 3,
+  "total_pass": 0,
+  "total_fail": 33,
+  "results": [
+    {
+      "scenario": "Short+Simple+2k",
+      "run": 1,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 6.926776,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Short+Simple+2k",
+      "run": 2,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 7.45623,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Short+Simple+2k",
+      "run": 3,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 5.862591,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Short+Medium+2k",
+      "run": 1,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 8.585911,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Short+Medium+2k",
+      "run": 2,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 7.960877,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Short+Medium+2k",
+      "run": 3,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 7.457701,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Short+Complex+2k",
+      "run": 1,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 15.687127,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Short+Complex+2k",
+      "run": 2,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 11.330943,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Short+Complex+2k",
+      "run": 3,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 7.112752,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Medium+Simple+4k",
+      "run": 1,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 9.099925,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Medium+Simple+4k",
+      "run": 2,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 8.915468,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Medium+Simple+4k",
+      "run": 3,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 14.463083,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Medium+Medium+4k",
+      "run": 1,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 13.145822,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Medium+Medium+4k",
+      "run": 2,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 10.88821,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Medium+Medium+4k",
+      "run": 3,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 10.612969,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Medium+Complex+4k",
+      "run": 1,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 11.620883,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Medium+Complex+4k",
+      "run": 2,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 16.790316,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Medium+Complex+4k",
+      "run": 3,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 15.781294,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Long+Simple+8k",
+      "run": 1,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 47.956271,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Long+Simple+8k",
+      "run": 2,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 48.310502,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Long+Simple+8k",
+      "run": 3,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 41.829793,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Long+Medium+8k",
+      "run": 1,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 37.666295,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Long+Medium+8k",
+      "run": 2,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 33.727554,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Long+Medium+8k",
+      "run": 3,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 56.132252,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Long+Complex+8k",
+      "run": 1,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 54.680377,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Long+Complex+8k",
+      "run": 2,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 43.598465,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Long+Complex+8k",
+      "run": 3,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 62.507557,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Short+Medium+40k",
+      "run": 1,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 7.880313,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Short+Medium+40k",
+      "run": 2,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 8.500684,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Short+Medium+40k",
+      "run": 3,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 8.086599,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Long+Medium+40k",
+      "run": 1,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 55.315188,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Long+Medium+40k",
+      "run": 2,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 28.78288,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    },
+    {
+      "scenario": "Long+Medium+40k",
+      "run": 3,
+      "success": false,
+      "word_count": 0,
+      "elapsed": 26.953113,
+      "error": "too many values to unpack (expected 2)",
+      "content_preview": null
+    }
+  ]
+}

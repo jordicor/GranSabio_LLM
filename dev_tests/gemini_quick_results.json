@@ -1,0 +1,26 @@
+{
+  "test_date": "2026-01-09T21:13:22.355630",
+  "model": "gemini-3-pro-preview",
+  "results": {
+    "auto_thinking": {
+      "success": true,
+      "word_count": 36,
+      "elapsed": 14.645283
+    },
+    "explicit_thinking": {
+      "success": true,
+      "word_count": 35,
+      "elapsed": 7.283216
+    },
+    "flexible_auto": {
+      "success": true,
+      "word_count": 25,
+      "elapsed": 8.559091
+    },
+    "no_json": {
+      "success": true,
+      "word_count": 34,
+      "elapsed": 5.090567
+    }
+  }
+}

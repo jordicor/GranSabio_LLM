@@ -25,6 +25,7 @@ class GranSabioInterface {
         this.qaLayerCount = 0;
         this.currentScreen = 'configuration';
         this.eventSource = null;
+        this.modelDefaults = {};
         
         this.init();
     }
@@ -376,7 +377,7 @@ class GranSabioInterface {
     }
 
     isFinalStatus(statusValue) {
-        return ['completed', 'failed', 'cancelled'].includes(statusValue);
+        return ['completed', 'rejected', 'failed', 'cancelled'].includes(statusValue);
     }
 
     normalizeStatus(status) {
@@ -449,7 +450,8 @@ class GranSabioInterface {
         this.setLoadingState(false);
 
         // Update status text
-        const statusText = update.status === 'failed' ? 'Failed' :
+        const statusText = update.status === 'rejected' ? 'Rejected' :
+                          update.status === 'failed' ? 'Failed' :
                           update.status === 'cancelled' ? 'Cancelled' : 'Completed';
         this.updateProcessingStatus(statusText, 'Loading results...');
 
@@ -468,7 +470,7 @@ class GranSabioInterface {
             badge.className = 'result-status-badge cancelled';
             if (iconSpan) iconSpan.textContent = '[X]';
             if (textSpan) textSpan.textContent = 'Cancelled';
-        } else if (status === 'failed' || !isApproved) {
+        } else if (status === 'rejected' || status === 'failed' || !isApproved) {
             badge.className = 'result-status-badge rejected';
             if (iconSpan) iconSpan.textContent = '[!]';
             if (textSpan) textSpan.textContent = 'Rejected';
@@ -1047,7 +1049,7 @@ class GranSabioInterface {
 
             this.updateProgressUI(status);
 
-            if (status.status === 'completed' || status.status === 'failed' || status.status === 'cancelled') {
+            if (status.status === 'completed' || status.status === 'rejected' || status.status === 'failed' || status.status === 'cancelled') {
                 this.stopProgressTracking();
                 this.setLoadingState(false);
 
@@ -1098,6 +1100,7 @@ class GranSabioInterface {
             'qa_evaluation': 'QA Evaluation',
             'gran_sabio_review': 'Gran Sabio Review',
             'completed': 'Completed',
+            'rejected': 'Rejected',
             'failed': 'Failed',
             'cancelled': 'Cancelled'
         };
@@ -1111,6 +1114,7 @@ class GranSabioInterface {
             'qa_evaluation': 70,
             'gran_sabio_review': 90,
             'completed': 100,
+            'rejected': 100,
             'failed': 100
         };
         
@@ -1150,7 +1154,7 @@ class GranSabioInterface {
         this.addNewVerboseLogs(update.verbose_log);
         
         // Check if complete
-        if (update.status === 'completed' || update.status === 'failed' || update.status === 'cancelled') {
+        if (update.status === 'completed' || update.status === 'rejected' || update.status === 'failed' || update.status === 'cancelled') {
             this.stopProgressTracking();
             this.setLoadingState(false);  // Reset UI state
             
@@ -1352,6 +1356,7 @@ class GranSabioInterface {
             
             this.qaModels = data.qa_models;
             this.qaRecommendations = data.recommendations;
+            this.modelDefaults = data.defaults || {};
             
             this.populateQAModelSelect();
             this.populateGeneratorModelSelect();
@@ -1446,8 +1451,12 @@ class GranSabioInterface {
             select.appendChild(experimentalGroup);
         }
         
-        // Set default selection to Gemini 3 Flash
-        select.value = 'gemini-3-flash-preview';
+        const preferredGenerator = this.modelDefaults.generator;
+        if (preferredGenerator && Array.from(select.querySelectorAll('option')).some(option => option.value === preferredGenerator)) {
+            select.value = preferredGenerator;
+        } else if (select.querySelector('option')) {
+            select.value = select.querySelector('option').value;
+        }
         
         // Initialize reasoning controls for the default model
         this.updateReasoningControls(select.value);
@@ -1495,17 +1504,22 @@ class GranSabioInterface {
             select.appendChild(standardGroup);
         }
         
-        // Set default to Claude Opus 4.6 (best for final decisions)
-        select.value = 'claude-opus-4-6';
+        const preferredGranSabio = this.modelDefaults.gran_sabio;
+        if (preferredGranSabio && Array.from(select.querySelectorAll('option')).some(option => option.value === preferredGranSabio)) {
+            select.value = preferredGranSabio;
+        } else if (select.querySelector('option')) {
+            select.value = select.querySelector('option').value;
+        }
     }
 
     loadDefaultQAModels() {
-        // Add some recommended QA models by default
-        const defaultModels = [
+        const configuredDefaults = Array.isArray(this.modelDefaults.qa) ? this.modelDefaults.qa : [];
+        const recommendedDefaults = [
             'claude-sonnet-4-20250514',
             'gpt-4o',
             'gemini-3-flash-preview'
         ];
+        const defaultModels = configuredDefaults.length > 0 ? configuredDefaults : recommendedDefaults;
 
         defaultModels.forEach(modelKey => {
             const modelData = this.qaModels.find(m => m.key === modelKey);

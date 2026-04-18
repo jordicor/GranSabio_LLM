@@ -15,6 +15,7 @@ import asyncio
 import aiohttp
 from unittest.mock import AsyncMock, Mock, MagicMock, patch
 from typing import Dict, Any
+from types import SimpleNamespace
 
 # Import the module under test
 from ai_service import AIService, AIRequestError
@@ -1177,3 +1178,806 @@ class TestExecuteWithRetries:
                 model_id="gpt-4o",
                 action="test"
             )
+
+
+class TestGenerationToolLoop:
+    """Tests for generator tool-loop behavior across providers."""
+
+    @pytest.mark.asyncio
+    async def test_tool_loop_exhaustion_without_validated_text_raises_after_forced_final_turn(
+        self, ai_service_instance, mock_config
+    ):
+        """
+        Given: The tool loop keeps asking for validation but never produces an approved draft
+        When: generate_content_with_validation_tools() exhausts its rounds and the forced final turn also fails
+        Then: It raises ValueError so callers can fall back to standard generation
+        """
+
+        async def passthrough(operation, **kwargs):
+            return await operation()
+
+        message = SimpleNamespace(
+            content="",
+            tool_calls=[
+                SimpleNamespace(
+                    id="call-1",
+                    function=SimpleNamespace(
+                        name="validate_draft",
+                        arguments='{"text":"draft that still fails"}',
+                    ),
+                )
+            ],
+        )
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=message)],
+            usage=None,
+        )
+        final_message = SimpleNamespace(content="still invalid final answer", tool_calls=[])
+        final_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=final_message)],
+            usage=None,
+        )
+
+        ai_service_instance.openai_client = Mock()
+        ai_service_instance.openai_client.chat = Mock()
+        ai_service_instance.openai_client.chat.completions = Mock()
+        ai_service_instance.openai_client.chat.completions.create = AsyncMock(
+            side_effect=[response, response, final_response]
+        )
+        ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "model_info": {"provider": "openai", "model_id": "gpt-4o"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+
+        with pytest.raises(ValueError, match="Tool loop exhausted without producing a validated draft"):
+            await ai_service_instance.generate_content_with_validation_tools(
+                prompt="Write something long.",
+                model="gpt-4o",
+                validation_callback=lambda _: {
+                    "approved": False,
+                    "score": 0.0,
+                    "feedback": "Still invalid.",
+                    "word_count": 0,
+                    "hard_failed": False,
+                },
+                max_rounds=2,
+            )
+
+    @pytest.mark.asyncio
+    async def test_openai_tool_loop_forces_final_turn_when_tool_call_budget_is_exceeded(
+        self, ai_service_instance, mock_config
+    ):
+        """
+        Given: An OpenAI-compatible model tries to emit more tool calls than the runtime budget allows
+        When: The runtime refuses additional tool calls
+        Then: It requests one final no-tools answer and accepts it if valid
+        """
+
+        async def passthrough(operation, **kwargs):
+            return await operation()
+
+        tool_calls = [
+            SimpleNamespace(
+                id=f"call-{idx}",
+                function=SimpleNamespace(
+                    name="validate_draft",
+                    arguments='{"text":"draft that still fails"}',
+                ),
+            )
+            for idx in range(5)
+        ]
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="", tool_calls=tool_calls))],
+            usage=None,
+        )
+        final_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="valid final answer", tool_calls=[]))],
+            usage=None,
+        )
+
+        ai_service_instance.openai_client = Mock()
+        ai_service_instance.openai_client.chat = Mock()
+        ai_service_instance.openai_client.chat.completions = Mock()
+        ai_service_instance.openai_client.chat.completions.create = AsyncMock(
+            side_effect=[response, final_response]
+        )
+        ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "model_info": {"provider": "openai", "model_id": "gpt-4o"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+
+        def validation_callback(candidate: str):
+            return {
+                "approved": candidate == "valid final answer",
+                "score": 10.0 if candidate == "valid final answer" else 0.0,
+                "feedback": "Still invalid." if candidate != "valid final answer" else "Looks good.",
+                "word_count": len(candidate.split()),
+                "hard_failed": False,
+            }
+
+        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+            prompt="Write something long.",
+            model="gpt-4o",
+            validation_callback=validation_callback,
+            max_rounds=2,
+        )
+
+        assert content == "valid final answer"
+        assert metadata["accepted"] == "forced_final_turn"
+        assert ai_service_instance.openai_client.chat.completions.create.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_openai_tool_loop_overflow_prefers_validate_draft_tool(
+        self, ai_service_instance, mock_config
+    ):
+        """
+        Given: An OpenAI-compatible model emits audit_accent before validate_draft at budget overflow
+        When: The runtime validates the overflow argument
+        Then: It validates the validate_draft text, not the audit_accent text
+        """
+
+        async def passthrough(operation, **kwargs):
+            return await operation()
+
+        tool_calls = [
+            SimpleNamespace(
+                id="call-audit",
+                function=SimpleNamespace(
+                    name="audit_accent",
+                    arguments='{"text":"accent only draft"}',
+                ),
+            ),
+            SimpleNamespace(
+                id="call-validate",
+                function=SimpleNamespace(
+                    name="validate_draft",
+                    arguments='{"text":"valid overflow draft"}',
+                ),
+            ),
+            *[
+                SimpleNamespace(
+                    id=f"call-extra-{idx}",
+                    function=SimpleNamespace(
+                        name="validate_draft",
+                        arguments='{"text":"extra draft"}',
+                    ),
+                )
+                for idx in range(3)
+            ],
+        ]
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="", tool_calls=tool_calls))],
+            usage=None,
+        )
+
+        ai_service_instance.openai_client = Mock()
+        ai_service_instance.openai_client.chat = Mock()
+        ai_service_instance.openai_client.chat.completions = Mock()
+        ai_service_instance.openai_client.chat.completions.create = AsyncMock(return_value=response)
+        ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
+        ai_service_instance.audit_accent = AsyncMock(
+            return_value={"approved": True, "score": 10.0, "findings": [], "verdict_summary": ""}
+        )
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "model_info": {"provider": "openai", "model_id": "gpt-4o"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+        seen_candidates = []
+
+        def validation_callback(candidate: str):
+            seen_candidates.append(candidate)
+            return {
+                "approved": candidate == "valid overflow draft",
+                "score": 10.0 if candidate == "valid overflow draft" else 0.0,
+                "feedback": "Still invalid." if candidate != "valid overflow draft" else "Looks good.",
+                "word_count": len(candidate.split()),
+                "hard_failed": False,
+            }
+
+        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+            prompt="Write something long.",
+            model="gpt-4o",
+            validation_callback=validation_callback,
+            max_rounds=2,
+            accent_guard=SimpleNamespace(
+                mode="inline",
+                criteria=None,
+                min_score=None,
+                max_inline_calls=1,
+                on_error="fail_closed",
+            ),
+        )
+
+        assert content == "valid overflow draft"
+        assert metadata["accepted"] == "validated_tool_argument"
+        assert seen_candidates == ["valid overflow draft"]
+
+    @pytest.mark.asyncio
+    async def test_openai_tool_loop_raises_clear_error_when_validation_callback_fails(
+        self, ai_service_instance, mock_config
+    ):
+        """
+        Given: The local validation callback crashes
+        When: The tool loop tries to validate a candidate
+        Then: A clear ValueError is raised instead of leaking the raw exception
+        """
+
+        async def passthrough(operation, **kwargs):
+            return await operation()
+
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="",
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="call-1",
+                                function=SimpleNamespace(
+                                    name="validate_draft",
+                                    arguments='{"text":"candidate"}',
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=None,
+        )
+
+        ai_service_instance.openai_client = Mock()
+        ai_service_instance.openai_client.chat = Mock()
+        ai_service_instance.openai_client.chat.completions = Mock()
+        ai_service_instance.openai_client.chat.completions.create = AsyncMock(return_value=response)
+        ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "model_info": {"provider": "openai", "model_id": "gpt-4o"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+
+        def failing_callback(_: str):
+            raise RuntimeError("validator boom")
+
+        with pytest.raises(ValueError, match="Validation callback failed during openai_tool_loop"):
+            await ai_service_instance.generate_content_with_validation_tools(
+                prompt="Write something long.",
+                model="gpt-4o",
+                validation_callback=failing_callback,
+                max_rounds=2,
+            )
+
+    @pytest.mark.asyncio
+    async def test_openai_tool_loop_emits_budget_warning_before_exhaustion(
+        self, ai_service_instance, mock_config
+    ):
+        """
+        Given: A turn that would consume most of the tool-call budget
+        When: The tool loop processes the turn
+        Then: Metadata trace includes an early budget warning
+        """
+
+        async def passthrough(operation, **kwargs):
+            return await operation()
+
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="",
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="call-1",
+                                function=SimpleNamespace(
+                                    name="validate_draft",
+                                    arguments='{"text":"draft one"}',
+                                ),
+                            ),
+                            SimpleNamespace(
+                                id="call-2",
+                                function=SimpleNamespace(
+                                    name="validate_draft",
+                                    arguments='{"text":"draft two"}',
+                                ),
+                            ),
+                            SimpleNamespace(
+                                id="call-3",
+                                function=SimpleNamespace(
+                                    name="validate_draft",
+                                    arguments='{"text":"draft three"}',
+                                ),
+                            ),
+                        ],
+                    )
+                )
+            ],
+            usage=None,
+        )
+
+        ai_service_instance.openai_client = Mock()
+        ai_service_instance.openai_client.chat = Mock()
+        ai_service_instance.openai_client.chat.completions = Mock()
+        ai_service_instance.openai_client.chat.completions.create = AsyncMock(return_value=response)
+        ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "model_info": {"provider": "openai", "model_id": "gpt-4o"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+
+        def validation_callback(candidate: str):
+            return {
+                "approved": candidate == "draft three",
+                "score": 10.0 if candidate == "draft three" else 0.0,
+                "feedback": "Needs work.",
+                "word_count": len(candidate.split()),
+                "hard_failed": False,
+            }
+
+        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+            prompt="Write something long.",
+            model="gpt-4o",
+            validation_callback=validation_callback,
+            max_rounds=2,
+        )
+
+        assert content == "draft three"
+        assert any(event.get("event") == "tool_call_budget_warning" for event in metadata["trace"])
+
+    @pytest.mark.asyncio
+    async def test_openrouter_tool_loop_uses_openrouter_client(
+        self, ai_service_instance, mock_config
+    ):
+        """
+        Given: An OpenRouter model using the validation tool loop
+        When: The model calls validate_draft with an approved draft
+        Then: The OpenRouter client is used and the validated draft is returned
+        """
+
+        async def passthrough(operation, **kwargs):
+            return await operation()
+
+        message = SimpleNamespace(
+            content="",
+            tool_calls=[
+                SimpleNamespace(
+                    id="call-1",
+                    function=SimpleNamespace(
+                        name="validate_draft",
+                        arguments='{"text":"validated via openrouter"}',
+                    ),
+                )
+            ],
+        )
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=message)],
+            usage=None,
+        )
+
+        ai_service_instance.openrouter_client = Mock()
+        ai_service_instance.openrouter_client.chat = Mock()
+        ai_service_instance.openrouter_client.chat.completions = Mock()
+        ai_service_instance.openrouter_client.chat.completions.create = AsyncMock(return_value=response)
+        ai_service_instance.openai_client = Mock()
+        ai_service_instance.openai_client.chat = Mock()
+        ai_service_instance.openai_client.chat.completions = Mock()
+        ai_service_instance.openai_client.chat.completions.create = AsyncMock()
+        ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "model_info": {"provider": "openrouter", "model_id": "openrouter/meta-llama-3.3"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+
+        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+            prompt="Write something long.",
+            model="or-meta",
+            validation_callback=lambda _: {
+                "approved": True,
+                "score": 10.0,
+                "feedback": "Looks good.",
+                "word_count": 3,
+                "hard_failed": False,
+            },
+            max_rounds=2,
+        )
+
+        assert content == "validated via openrouter"
+        assert metadata["mode"] == "openrouter_tool_loop"
+        ai_service_instance.openrouter_client.chat.completions.create.assert_awaited_once()
+        ai_service_instance.openai_client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_claude_tool_loop_handles_tool_use_blocks(
+        self, ai_service_instance, mock_config
+    ):
+        """
+        Given: A Claude model returning a tool_use block
+        When: The tool payload is approved locally
+        Then: The validated draft is returned without falling back
+        """
+
+        async def passthrough(operation, **kwargs):
+            return await operation()
+
+        response = SimpleNamespace(
+            content=[
+                SimpleNamespace(
+                    type="tool_use",
+                    id="toolu_1",
+                    name="validate_draft",
+                    input={"text": "validated via claude"},
+                )
+            ],
+            usage=None,
+        )
+
+        ai_service_instance.anthropic_client = Mock()
+        ai_service_instance.anthropic_client.messages = Mock()
+        ai_service_instance.anthropic_client.messages.create = AsyncMock(return_value=response)
+        ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "model_info": {"provider": "claude", "model_id": "claude-sonnet-4-5"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+
+        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+            prompt="Write something long.",
+            model="claude-sonnet-4-5",
+            validation_callback=lambda _: {
+                "approved": True,
+                "score": 10.0,
+                "feedback": "Looks good.",
+                "word_count": 3,
+                "hard_failed": False,
+            },
+            max_rounds=2,
+        )
+
+        assert content == "validated via claude"
+        assert metadata["mode"] == "claude_tool_loop"
+        ai_service_instance.anthropic_client.messages.create.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_claude_tool_loop_forces_final_turn_after_exhaustion(
+        self, ai_service_instance, mock_config
+    ):
+        """
+        Given: Claude keeps using validate_draft without producing an approved draft
+        When: The configured rounds are exhausted
+        Then: The runtime requests one last no-tools answer and accepts it if valid
+        """
+
+        async def passthrough(operation, **kwargs):
+            return await operation()
+
+        tool_response = SimpleNamespace(
+            content=[
+                SimpleNamespace(
+                    type="tool_use",
+                    id="toolu_1",
+                    name="validate_draft",
+                    input={"text": "draft that still fails"},
+                )
+            ],
+            usage=None,
+        )
+        final_response = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="valid claude final answer")],
+            usage=None,
+        )
+
+        ai_service_instance.anthropic_client = Mock()
+        ai_service_instance.anthropic_client.messages = Mock()
+        ai_service_instance.anthropic_client.messages.create = AsyncMock(
+            side_effect=[tool_response, tool_response, final_response]
+        )
+        ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "model_info": {"provider": "claude", "model_id": "claude-sonnet-4-5"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+
+        def validation_callback(candidate: str):
+            return {
+                "approved": candidate == "valid claude final answer",
+                "score": 10.0 if candidate == "valid claude final answer" else 0.0,
+                "feedback": "Still invalid." if candidate != "valid claude final answer" else "Looks good.",
+                "word_count": len(candidate.split()),
+                "hard_failed": False,
+            }
+
+        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+            prompt="Write something long.",
+            model="claude-sonnet-4-5",
+            validation_callback=validation_callback,
+            max_rounds=2,
+        )
+
+        assert content == "valid claude final answer"
+        assert metadata["accepted"] == "forced_final_turn"
+        assert ai_service_instance.anthropic_client.messages.create.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_claude_tool_loop_overflow_prefers_validate_draft_tool(
+        self, ai_service_instance, mock_config
+    ):
+        """
+        Given: Claude emits audit_accent before validate_draft at budget overflow
+        When: The runtime validates the overflow argument
+        Then: It validates the validate_draft text, not the audit_accent text
+        """
+
+        async def passthrough(operation, **kwargs):
+            return await operation()
+
+        response = SimpleNamespace(
+            content=[
+                SimpleNamespace(
+                    type="tool_use",
+                    id="toolu_audit",
+                    name="audit_accent",
+                    input={"text": "accent only draft"},
+                ),
+                SimpleNamespace(
+                    type="tool_use",
+                    id="toolu_validate",
+                    name="validate_draft",
+                    input={"text": "valid claude overflow draft"},
+                ),
+                *[
+                    SimpleNamespace(
+                        type="tool_use",
+                        id=f"toolu_extra_{idx}",
+                        name="validate_draft",
+                        input={"text": "extra draft"},
+                    )
+                    for idx in range(3)
+                ],
+            ],
+            usage=None,
+        )
+
+        ai_service_instance.anthropic_client = Mock()
+        ai_service_instance.anthropic_client.messages = Mock()
+        ai_service_instance.anthropic_client.messages.create = AsyncMock(return_value=response)
+        ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
+        ai_service_instance.audit_accent = AsyncMock(
+            return_value={"approved": True, "score": 10.0, "findings": [], "verdict_summary": ""}
+        )
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "model_info": {"provider": "claude", "model_id": "claude-sonnet-4-5"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+        seen_candidates = []
+
+        def validation_callback(candidate: str):
+            seen_candidates.append(candidate)
+            return {
+                "approved": candidate == "valid claude overflow draft",
+                "score": 10.0 if candidate == "valid claude overflow draft" else 0.0,
+                "feedback": "Still invalid." if candidate != "valid claude overflow draft" else "Looks good.",
+                "word_count": len(candidate.split()),
+                "hard_failed": False,
+            }
+
+        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+            prompt="Write something long.",
+            model="claude-sonnet-4-5",
+            validation_callback=validation_callback,
+            max_rounds=2,
+            accent_guard=SimpleNamespace(
+                mode="inline",
+                criteria=None,
+                min_score=None,
+                max_inline_calls=1,
+                on_error="fail_closed",
+            ),
+        )
+
+        assert content == "valid claude overflow draft"
+        assert metadata["accepted"] == "validated_tool_argument"
+        assert seen_candidates == ["valid claude overflow draft"]
+
+    @pytest.mark.asyncio
+    async def test_gemini_tool_loop_handles_function_calls(
+        self, ai_service_instance, mock_config
+    ):
+        """
+        Given: A Gemini model returning a function call
+        When: The local validator approves the proposed draft
+        Then: The validated draft is returned through the Gemini tool loop
+        """
+
+        async def passthrough(operation, **kwargs):
+            return await operation()
+
+        response = SimpleNamespace(
+            candidates=[
+                SimpleNamespace(
+                    content=SimpleNamespace(
+                        parts=[
+                            SimpleNamespace(
+                                function_call=SimpleNamespace(
+                                    name="validate_draft",
+                                    args={"text": "validated via gemini"},
+                                )
+                            )
+                        ]
+                    )
+                )
+            ],
+            usage_metadata=None,
+        )
+
+        ai_service_instance.google_new_client = Mock()
+        ai_service_instance.google_new_client.aio = Mock()
+        ai_service_instance.google_new_client.aio.models = Mock()
+        ai_service_instance.google_new_client.aio.models.generate_content = AsyncMock(return_value=response)
+        ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "model_info": {"provider": "gemini", "model_id": "gemini-2.5-flash"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+
+        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+            prompt="Write something long.",
+            model="gemini-2.5-flash",
+            validation_callback=lambda _: {
+                "approved": True,
+                "score": 10.0,
+                "feedback": "Looks good.",
+                "word_count": 3,
+                "hard_failed": False,
+            },
+            max_rounds=2,
+        )
+
+        assert content == "validated via gemini"
+        assert metadata["mode"] == "gemini_tool_loop"
+        ai_service_instance.google_new_client.aio.models.generate_content.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_gemini_tool_loop_avoids_structured_output_config_when_json_requested(
+        self, ai_service_instance, mock_config
+    ):
+        """
+        Given: Gemini tool-loop with JSON output requested
+        When: Function calling is enabled
+        Then: The request avoids response_mime_type/response_schema because Gemini rejects that combination
+        """
+
+        async def passthrough(operation, **kwargs):
+            return await operation()
+
+        captured_config = {}
+
+        async def fake_generate_content(*args, **kwargs):
+            captured_config["config"] = kwargs["config"]
+            return SimpleNamespace(
+                candidates=[
+                    SimpleNamespace(
+                        content=SimpleNamespace(
+                            parts=[
+                                SimpleNamespace(
+                                    function_call=SimpleNamespace(
+                                        name="validate_draft",
+                                        args={"text": "validated via gemini"},
+                                    )
+                                )
+                            ]
+                        )
+                    )
+                ],
+                usage_metadata=None,
+            )
+
+        ai_service_instance.google_new_client = Mock()
+        ai_service_instance.google_new_client.aio = Mock()
+        ai_service_instance.google_new_client.aio.models = Mock()
+        ai_service_instance.google_new_client.aio.models.generate_content = AsyncMock(
+            side_effect=fake_generate_content
+        )
+        ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "model_info": {"provider": "gemini", "model_id": "gemini-2.5-flash"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "content": {
+                    "type": "string",
+                }
+            },
+            "required": ["content"],
+        }
+
+        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+            prompt="Write something structured.",
+            model="gemini-2.5-flash",
+            validation_callback=lambda _: {
+                "approved": True,
+                "score": 10.0,
+                "feedback": "Looks good.",
+                "word_count": 3,
+                "hard_failed": False,
+            },
+            json_output=True,
+            json_schema=schema,
+            max_rounds=2,
+        )
+
+        config = captured_config["config"]
+        assert content == "validated via gemini"
+        assert metadata["mode"] == "gemini_tool_loop"
+        assert getattr(config, "response_mime_type", None) is None
+        assert getattr(config, "response_json_schema", None) is None
+        assert getattr(config, "response_schema", None) is None

@@ -291,6 +291,7 @@ class BudgetScorer:
         spans: List[EvidenceSpan],
         model: str,
         target_confidence: float = 0.95,
+        budget_gap_threshold: Optional[float] = None,
         top_logprobs: int = 10,
         placeholder: str = "[EVIDENCE REMOVED]",
         extra_verbose: bool = False,
@@ -303,6 +304,7 @@ class BudgetScorer:
             spans: Full list of evidence spans
             model: Model for logprob verification (must support logprobs)
             target_confidence: Expected reliability (0.5-0.99)
+            budget_gap_threshold: Threshold for flagging under-grounded claims
             top_logprobs: Number of top logprobs to request (1-20)
             placeholder: Text for scrubbed spans
             extra_verbose: Enable detailed logging
@@ -354,8 +356,15 @@ class BudgetScorer:
         )
 
         # 6. Determine if flagged
-        # Default threshold from config if not specified
-        threshold = config.EVIDENCE_GROUNDING_BUDGET_GAP_THRESHOLD if hasattr(config, 'EVIDENCE_GROUNDING_BUDGET_GAP_THRESHOLD') else 0.5
+        threshold = (
+            budget_gap_threshold
+            if budget_gap_threshold is not None
+            else (
+                config.EVIDENCE_GROUNDING_BUDGET_GAP_THRESHOLD
+                if hasattr(config, 'EVIDENCE_GROUNDING_BUDGET_GAP_THRESHOLD')
+                else 0.5
+            )
+        )
         flagged = budget_gap > threshold
 
         confidence_delta = posterior_yes - prior_yes
@@ -426,6 +435,7 @@ class BudgetScorer:
                     spans=spans,
                     model=model,
                     target_confidence=config_obj.target_confidence,
+                    budget_gap_threshold=config_obj.budget_gap_threshold,
                     top_logprobs=config_obj.top_logprobs,
                     placeholder=config_obj.placeholder_text,
                     extra_verbose=extra_verbose,

@@ -1,0 +1,39 @@
+{
+  "test_date": "2026-01-09T14:06:23.420152",
+  "model": "gemini-3-pro-preview",
+  "thinking_budget": 32768,
+  "max_tokens": 40768,
+  "prompt_length": 5689,
+  "results": [
+    {
+      "scenario": "ORIGINAL: JSON Schema + Thinking 32768 + MaxTokens 40768",
+      "content": "{\"titles\": [{\"number\": 1, \"title\": \"Las situaciones incomodas de mis chipirones ^^ (con @SitaKarstica) - FocusignsVlogs\"}, {\"number\": 2, \"title\": \"Reaccionando a vuestras situaciones incómodas - FocusingsVlogs\"}, {\"number\": 3, \"title\": \"Momentos Tierra Trágame: Vuestras Historias - FocusingsVlogs\"}, {\"number\": 4, \"title\": \"Las anécdotas más vergonzosas de suscriptores - FocusingsVlogs\"}, {\"number\": 5, \"title\": \"Pillada viendo porno y la regla en clase - FocusingsVlogs\"}, {\"number\": 6, \"title\": \"Nos reímos de vuestros momentos incómodos - FocusingsVlogs\"}, {\"number\": 7, \"title\": \"Top situaciones más incómodas de la vida - FocusingsVlogs\"}, {\"number\": 8, \"title\": \"¿Te ha pasado esto? Situaciones Incómodas - FocusingsVlogs\"}, {\"number\": 9, \"title\": \"Leyendo vuestras historias de Twitter y FB - FocusingsVlogs\"}, {\"number\": 10, \"title\": \"Mucha vergüenza ajena: Vuestras anécdotas - FocusingsVlogs\"}]}",
+      "elapsed": 23.785248517990112,
+      "error": null,
+      "word_count": 115,
+      "json_schema": true,
+      "thinking_budget": 32768,
+      "max_tokens": 40768
+    },
+    {
+      "scenario": "NO THINKING: JSON Schema + MaxTokens 40768",
+      "content": "{\"titles\": [{\"number\": 1, \"title\": \"Las situaciones incomodas de mis chipirones ^^ (con @SitaKarstica) - FocusignsVlogs\"}, {\"number\": 2, \"title\": \"Situaciones Incómodas que Todos Hemos Vivido - FocusingsVlogs\"}, {\"number\": 3, \"title\": \"Momentos Vergonzosos: Reaccionando a Comentarios - FocusingsVlogs\"}, {\"number\": 4, \"title\": \"Tierra Trágame: Las Peores Anécdotas de Twitter - FocusingsVlogs\"}, {\"number\": 5, \"title\": \"7 Situaciones Súper Incómodas de la Vida Real - FocusingsVlogs\"}, {\"number\": 6, \"title\": \"Reaccionando a vuestras Situaciones Incómodas - FocusingsVlogs\"}, {\"number\": 7, \"title\": \"Momentos Incomodos y Risas con Sita Karstica - FocusingsVlogs\"}, {\"number\": 8, \"title\": \"Top Vergüenzas: Historias de Mis Suscriptores - FocusingsVlogs\"}, {\"number\": 9, \"title\": \"Anécdotas Incómodas: ¡Tierra Trágame Ahora! - FocusingsVlogs\"}, {\"number\": 10, \"title\": \"Cosas Vergonzosas que Pasan (y cómo superarlas) - FocusingsVlogs\"}]}",
+      "elapsed": 27.740886211395264,
+      "error": null,
+      "word_count": 116,
+      "json_schema": true,
+      "thinking_budget": 0,
+      "max_tokens": 40768
+    },
+    {
+      "scenario": "NO SCHEMA: JSON mode + Thinking 32768",
+      "content": "{\"titles\": [{\"number\": 1, \"title\": \"Las situaciones incomodas de mis chipirones ^^ (con @SitaKarstica) - FocusignsVlogs\"}, {\"number\": 2, \"title\": \"Reaccionando a vuestras situaciones incómodas - FocusingsVlogs\"}, {\"number\": 3, \"title\": \"Momentos Incómodos: Anécdotas Reales - FocusingsVlogs\"}, {\"number\": 4, \"title\": \"Tierra Trágame: Situaciones de Vergüenza - FocusingsVlogs\"}, {\"number\": 5, \"title\": \"Las Peores Anécdotas de Mis Suscriptores - FocusingsVlogs\"}, {\"number\": 6, \"title\": \"Anécdotas Vergonzosas con Sita Karstica - FocusingsVlogs\"}, {\"number\": 7, \"title\": \"Pillada viendo porno y pedos en clase - FocusingsVlogs\"}, {\"number\": 8, \"title\": \"Top Situaciones Incómodas de la Vida - FocusingsVlogs\"}, {\"number\": 9, \"title\": \"Historias para morirse de vergüenza - FocusingsVlogs\"}, {\"number\": 10, \"title\": \"Momentos Embarazosos que todos vivimos - FocusingsVlogs\"}]}",
+      "elapsed": 26.637987852096558,
+      "error": null,
+      "word_count": 108,
+      "json_schema": false,
+      "thinking_budget": 32768,
+      "max_tokens": 40768
+    }
+  ]
+}

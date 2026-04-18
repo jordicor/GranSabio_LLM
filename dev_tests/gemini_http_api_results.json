@@ -1,0 +1,29 @@
+{
+  "test_date": "2026-01-09T21:32:04.258666",
+  "results": {
+    "no_fallback": {
+      "success": true,
+      "word_count": 68,
+      "elapsed": 22.597978591918945,
+      "error": null,
+      "generator_empty": false,
+      "session_id": "bfe84575-e6c7-44a6-b5a0-b9be610cb214"
+    },
+    "with_fallback": {
+      "success": false,
+      "word_count": 0,
+      "elapsed": 2.0826783180236816,
+      "error": "400 Client Error: Bad Request for url: http://localhost:8000/generate",
+      "generator_empty": false,
+      "session_id": null
+    },
+    "flexible": {
+      "success": true,
+      "word_count": 60,
+      "elapsed": 22.495278120040894,
+      "error": null,
+      "generator_empty": false,
+      "session_id": "3557ecdc-837d-48e7-83ea-f877a0e5b027"
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "test_date": "2026-01-09T14:02:59.637345",
+  "model": "gemini-3-pro-preview",
+  "thinking_budget": 8192,
+  "results": [
+    {
+      "scenario": "JSON Schema + NO Thinking",
+      "content": "{\"titles\": [{\"number\": 1, \"title\": \"Stop Ruining Your Pasta! 5 Mistakes Everyone Makes\"}, {\"number\": 2, \"title\": \"The Real Roman Carbonara: No Cream, Just Technique\"}, {\"number\": 3, \"title\": \"15-Minute Garlic Butter Pasta that Tastes Like a Restaurant\"}]}",
+      "elapsed": 10.035247325897217,
+      "error": null,
+      "word_count": 35,
+      "json_schema": true,
+      "thinking_budget": 0,
+      "session_id": "2f48a96e-9a24-4ee4-abb0-13c970f25e0b"
+    },
+    {
+      "scenario": "JSON Schema + WITH Thinking ⚠️",
+      "content": "{\"titles\": [{\"number\": 1, \"title\": \"Stop Boiling Pasta Like This! 5 Common Mistakes\"}, {\"number\": 2, \"title\": \"The Ultimate 15-Minute Carbonara: Authentic Italian Recipe\"}, {\"number\": 3, \"title\": \"Fresh Handmade Pasta: Easier Than You Think (No Machine Needed)\"}]}",
+      "elapsed": 8.736696720123291,
+      "error": null,
+      "word_count": 35,
+      "json_schema": true,
+      "thinking_budget": 8192,
+      "session_id": "f29bff21-61f6-4789-8240-3ccaa4681ac1"
+    },
+    {
+      "scenario": "JSON Mode (no schema) + NO Thinking",
+      "content": "{\"titles\": [{\"number\": 1, \"title\": \"Stop Boiling Your Water! The 'Fastest' Way to Cook Pasta\"}, {\"number\": 2, \"title\": \"I Ate Pasta for 7 Days Straight and This Is What Happened\"}, {\"number\": 3, \"title\": \"Authentic Carbonara: Why You Should Never Use Cream\"}]}",
+      "elapsed": 14.100937604904175,
+      "error": null,
+      "word_count": 40,
+      "json_schema": false,
+      "thinking_budget": 0,
+      "session_id": "2c5a2a6f-880a-4652-9036-5c22c20d9490"
+    },
+    {
+      "scenario": "JSON Mode (no schema) + WITH Thinking",
+      "content": "{\"titles\": [{\"number\": 1, \"title\": \"Stop Boiling Your Pasta Like This! 5 Common Mistakes\"}, {\"number\": 2, \"title\": \"The 'Secret' Ingredient for Creamy Pasta Without Cream\"}, {\"number\": 3, \"title\": \"10-Minute Dinner: Why I Stopped Buying Jarred Sauce\"}]}",
+      "elapsed": 8.70449423789978,
+      "error": null,
+      "word_count": 35,
+      "json_schema": false,
+      "thinking_budget": 8192,
+      "session_id": "1db39aef-a6af-4f71-9936-1f6f4ac8b498"
+    }
+  ]
+}

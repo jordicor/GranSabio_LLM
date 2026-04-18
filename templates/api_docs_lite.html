@@ -252,13 +252,13 @@
 
 <section id="qa-bypass" class="docs-section">
   <h2 class="docs-subheading">🚀 QA Bypass Mode</h2>
-  <p>For rapid content generation without quality evaluation, you can completely bypass QA evaluation and preflight validation by sending an empty qa_layers array.</p>
+  <p>For rapid content generation without semantic QA layers, send an empty <code>qa_layers</code> array. Preflight still runs when <code>evidence_grounding</code> is enabled.</p>
   <p>❌ Avoid for: Production content, factual accuracy requirements, editorial standards</p>
   <div class="parameter-table">
     <div class="param-row">
       <div class="param-name">qa_layers</div>
       <div class="param-type">array</div>
-      <div class="param-desc">Empty array [] fully disables QA and preflight validation.</div>
+      <div class="param-desc">Empty array [] disables semantic QA layers. It does not bypass preflight when evidence grounding is active.</div>
     </div>
     <div class="param-row">
       <div class="param-name">max_iterations</div>

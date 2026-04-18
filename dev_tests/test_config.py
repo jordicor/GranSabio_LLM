@@ -122,7 +122,8 @@ def minimal_model_specs():
         "default_models": {
             "generator": "gpt-4o",
             "qa": ["gpt-4o-mini"],
-            "gran_sabio": "claude-sonnet-4"
+            "gran_sabio": "claude-sonnet-4",
+            "arbiter": "gpt-4o-mini",
         },
         "token_validation": {
             "safety_margin": 0.95
@@ -187,7 +188,8 @@ def reasoning_model_specs():
         "default_models": {
             "generator": "gpt-5",
             "qa": ["o3"],
-            "gran_sabio": "claude-opus-4"
+            "gran_sabio": "claude-opus-4",
+            "arbiter": "o3",
         },
         "token_validation": {
             "safety_margin": 0.95
@@ -336,7 +338,7 @@ class TestEnvironmentLoading:
         import json_utils as json
         specs_json = json.dumps(minimal_model_specs)
 
-        with patch.dict(os.environ, {}, clear=False):
+        with patch.dict(os.environ, {}, clear=True):
             with patch("builtins.open", mock_open(read_data=specs_json)):
                 from config import Config
                 cfg = Config()
@@ -924,6 +926,80 @@ class TestValidateTokenLimits:
                 # o3 default is "medium"
                 assert result["adjusted_reasoning_effort"] == "medium"
 
+    def test_openai_reasoning_effort_clamps_to_supported_levels(self, mock_env_vars):
+        """Given: An OpenAI model that only supports medium, Then: Unsupported efforts are clamped."""
+        import json_utils as json
+
+        specs = {
+            "model_specifications": {
+                "openai": {
+                    "gpt-5.2-chat-latest": {
+                        "model_id": "gpt-5.2-chat-latest",
+                        "name": "GPT-5.2 Instant",
+                        "description": "Speed-optimized GPT-5.2 variant",
+                        "input_tokens": 272000,
+                        "output_tokens": 128000,
+                        "context_window": 400000,
+                        "capabilities": ["text", "reasoning"],
+                        "reasoning_effort": {
+                            "supported": True,
+                            "levels": ["medium"],
+                            "default": "medium",
+                        },
+                    }
+                }
+            },
+            "aliases": {},
+            "default_models": {"generator": "gpt-5.2-chat-latest", "qa": ["gpt-5.2-chat-latest"], "gran_sabio": "gpt-5.2-chat-latest", "arbiter": "gpt-5.2-chat-latest"},
+            "token_validation": {"safety_margin": 0.95},
+        }
+        specs_json = json.dumps(specs)
+
+        with patch.dict(os.environ, mock_env_vars, clear=False):
+            with patch("builtins.open", mock_open(read_data=specs_json)):
+                from config import Config
+                cfg = Config()
+                result = cfg.validate_token_limits("gpt-5.2-chat-latest", 8000, reasoning_effort="high")
+                assert result["adjusted_reasoning_effort"] == "medium"
+                assert result["reasoning_effort_validation"]["was_adjusted"] is True
+
+    def test_openai_reasoning_effort_preserves_supported_xhigh(self, mock_env_vars):
+        """Given: An OpenAI model that advertises xhigh, Then: xhigh is preserved."""
+        import json_utils as json
+
+        specs = {
+            "model_specifications": {
+                "openai": {
+                    "gpt-5.2": {
+                        "model_id": "gpt-5.2",
+                        "name": "GPT-5.2",
+                        "description": "Frontier GPT-5.2",
+                        "input_tokens": 272000,
+                        "output_tokens": 128000,
+                        "context_window": 400000,
+                        "capabilities": ["text", "reasoning"],
+                        "reasoning_effort": {
+                            "supported": True,
+                            "levels": ["none", "low", "medium", "high", "xhigh"],
+                            "default": "low",
+                        },
+                    }
+                }
+            },
+            "aliases": {},
+            "default_models": {"generator": "gpt-5.2", "qa": ["gpt-5.2"], "gran_sabio": "gpt-5.2", "arbiter": "gpt-5.2"},
+            "token_validation": {"safety_margin": 0.95},
+        }
+        specs_json = json.dumps(specs)
+
+        with patch.dict(os.environ, mock_env_vars, clear=False):
+            with patch("builtins.open", mock_open(read_data=specs_json)):
+                from config import Config
+                cfg = Config()
+                result = cfg.validate_token_limits("gpt-5.2", 8000, reasoning_effort="xhigh")
+                assert result["adjusted_reasoning_effort"] == "xhigh"
+                assert result["reasoning_effort_validation"]["was_adjusted"] is False
+
     def test_thinking_budget_for_claude(self, minimal_model_specs, mock_env_vars):
         """Given: thinking_budget_tokens for Claude, Then: Validates and returns"""
         import json_utils as json
@@ -1125,10 +1201,12 @@ class TestUtilityFunctions:
         with patch("builtins.open", mock_open(read_data=specs_json)):
             from config import Config
             cfg = Config()
+            assert cfg.normalize_reasoning_effort_label("none") == "none"
             assert cfg.normalize_reasoning_effort_label("low") == "low"
             assert cfg.normalize_reasoning_effort_label("medium") == "medium"
             assert cfg.normalize_reasoning_effort_label("high") == "high"
             assert cfg.normalize_reasoning_effort_label("minimal") == "minimal"
+            assert cfg.normalize_reasoning_effort_label("xhigh") == "xhigh"
 
     def test_normalize_reasoning_effort_aliases(self, minimal_model_specs):
         """Given: Reasoning effort aliases, Then: Returns normalized form"""
@@ -1144,6 +1222,8 @@ class TestUtilityFunctions:
             assert cfg.normalize_reasoning_effort_label("lo") == "low"
             assert cfg.normalize_reasoning_effort_label("min") == "minimal"
             assert cfg.normalize_reasoning_effort_label("minimum") == "minimal"
+            assert cfg.normalize_reasoning_effort_label("off") == "none"
+            assert cfg.normalize_reasoning_effort_label("xh") == "xhigh"
 
     def test_normalize_reasoning_effort_case_insensitive(self, minimal_model_specs):
         """Given: Mixed case input, Then: Normalizes correctly"""
@@ -1153,9 +1233,11 @@ class TestUtilityFunctions:
         with patch("builtins.open", mock_open(read_data=specs_json)):
             from config import Config
             cfg = Config()
+            assert cfg.normalize_reasoning_effort_label("NONE") == "none"
             assert cfg.normalize_reasoning_effort_label("LOW") == "low"
             assert cfg.normalize_reasoning_effort_label("Medium") == "medium"
             assert cfg.normalize_reasoning_effort_label("HIGH") == "high"
+            assert cfg.normalize_reasoning_effort_label("XHIGH") == "xhigh"
 
     def test_normalize_reasoning_effort_invalid_returns_none(self, minimal_model_specs):
         """Given: Invalid reasoning effort, Then: Returns None"""
@@ -1294,7 +1376,7 @@ class TestModuleLevelFunctions:
             assert "output format" in prompt.lower()
 
     def test_get_qa_system_prompt_default(self, minimal_model_specs):
-        """Given: Standard content type, Then: Returns QA prompt with edit_groups"""
+        """Given: Standard content type, Then: Returns the editorial QA system prompt"""
         import json_utils as json
         specs_json = json.dumps(minimal_model_specs)
 
@@ -1304,7 +1386,8 @@ class TestModuleLevelFunctions:
             importlib.reload(config_module)
 
             prompt = config_module.get_qa_system_prompt("article")
-            assert "edit_groups" in prompt
+            assert "professional quality rater" in prompt.lower()
+            assert "valid json" in prompt.lower()
 
     def test_get_qa_system_prompt_other(self, minimal_model_specs):
         """Given: 'other' content type, Then: Returns raw QA prompt"""

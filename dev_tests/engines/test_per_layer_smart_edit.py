@@ -174,6 +174,8 @@ def mock_qa_engine():
     """Create a mocked QA engine."""
     engine = MagicMock()
     engine._evaluate_single_semantic_layer = AsyncMock()
+    engine.bypass_engine = MagicMock()
+    engine.bypass_engine.should_skip_incremental_repair = Mock(return_value=False)
     return engine
 
 
@@ -265,6 +267,42 @@ class TestCalculateLayerAvgScore:
         result = _calculate_layer_avg_score(layer_results)
 
         assert result == 8.0  # Only gpt-4o's score counts
+
+
+class TestHasValidLayerScores:
+    """Tests for _has_valid_layer_scores() guard."""
+
+    def test_all_none_scores_returns_false(self):
+        from core.generation_processor import _has_valid_layer_scores
+
+        layer_results = {
+            "claude": QAEvaluation(
+                model="claude", layer="Test", score=None,
+                feedback="Invalid", deal_breaker=False, passes_score=False
+            ),
+            "gemini": QAEvaluation(
+                model="gemini", layer="Test", score=None,
+                feedback="Invalid", deal_breaker=False, passes_score=False
+            ),
+        }
+
+        assert _has_valid_layer_scores(layer_results) is False
+
+    def test_at_least_one_numeric_score_returns_true(self):
+        from core.generation_processor import _has_valid_layer_scores
+
+        layer_results = {
+            "claude": QAEvaluation(
+                model="claude", layer="Test", score=None,
+                feedback="Invalid", deal_breaker=False, passes_score=False
+            ),
+            "gpt": QAEvaluation(
+                model="gpt", layer="Test", score=8.0,
+                feedback="Passed", deal_breaker=False, passes_score=True
+            ),
+        }
+
+        assert _has_valid_layer_scores(layer_results) is True
 
 
 # ============================================================================
@@ -493,6 +531,207 @@ class TestProcessSingleLayerWithEdits:
         assert mock_qa_engine._evaluate_single_semantic_layer.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_gran_sabio_false_positive_score_below_min_passes_layer(
+        self, mock_qa_engine, mock_ai_service, sample_content, mock_session, monkeypatch
+    ):
+        """
+        Given: Gran Sabio approves a minority deal-breaker with a score below layer min_score
+        When: _process_single_layer_with_edits() handles the override
+        Then: The effective QA score is clamped to min_score and the layer does not loop
+        """
+        from core import app_state
+        from core.generation_processor import _process_single_layer_with_edits
+
+        strict_layer = QALayer(
+            name="Ungrounded Claims",
+            description="Hard rejection for unsupported claims",
+            criteria="Score 10 when clean, 0 when unsupported claims are present",
+            min_score=10.0,
+            order=1,
+            is_mandatory=True,
+            deal_breaker_criteria="Any clearly unsupported factual claim must fail this layer.",
+        )
+        request = ContentRequest(
+            prompt="Write a test story",
+            generator_model="gpt-4o",
+            content_type="creative",
+            max_iterations=3,
+            max_edit_rounds_per_layer=5,
+            qa_layers=[strict_layer],
+            qa_models=["gpt-5.4", "gemini-3.1-pro-preview", "claude-sonnet-4-6"],
+            gran_sabio_call_limit_per_session=-1,
+        )
+
+        flagged_eval = QAEvaluation(
+            model="gpt-5.4",
+            slot_id="qa:0",
+            evaluator_alias="Evaluator A",
+            layer="Ungrounded Claims",
+            score=0.0,
+            feedback="Unsupported claim",
+            deal_breaker=True,
+            deal_breaker_reason="Unsupported claim",
+            passes_score=False,
+            identified_issues=[],
+        )
+        passing_gemini = QAEvaluation(
+            model="gemini-3.1-pro-preview",
+            layer="Ungrounded Claims",
+            score=10.0,
+            feedback="Passed",
+            deal_breaker=False,
+            passes_score=True,
+            identified_issues=[],
+        )
+        passing_claude = QAEvaluation(
+            model="claude-sonnet-4-6",
+            layer="Ungrounded Claims",
+            score=10.0,
+            feedback="Passed",
+            deal_breaker=False,
+            passes_score=True,
+            identified_issues=[],
+        )
+
+        mock_qa_engine._evaluate_single_semantic_layer = AsyncMock(
+            return_value=(
+                {
+                    "gpt-5.4": flagged_eval,
+                    "gemini-3.1-pro-preview": passing_gemini,
+                    "claude-sonnet-4-6": passing_claude,
+                },
+                None,
+            )
+        )
+
+        gran_sabio = MagicMock()
+        gran_sabio.review_minority_deal_breakers = AsyncMock(
+            return_value=MagicMock(
+                approved=True,
+                error=None,
+                reason="The flag is a false positive.",
+                final_score=9.0,
+                final_content=sample_content,
+                modifications_made=False,
+            )
+        )
+        monkeypatch.setattr(app_state, "gran_sabio", gran_sabio)
+
+        with patch("core.generation_processor.get_tracker") as mock_get_tracker, \
+             patch("core.generation_processor._run_supervisor_review", new_callable=AsyncMock):
+            tracker = mock_get_tracker.return_value
+            tracker.record_escalation.return_value = "esc-1"
+            tracker.complete_escalation = Mock()
+
+            edited_content, layer_results, passed, deal_breaker_info = await _process_single_layer_with_edits(
+                content=sample_content,
+                layer=strict_layer,
+                qa_engine=mock_qa_engine,
+                qa_models=request.qa_models,
+                qa_model_names=request.qa_models,
+                request=request,
+                session=mock_session,
+                session_id="test-session",
+                usage_tracker=None,
+                phase_logger=None,
+                max_rounds=5,
+                ai_service=mock_ai_service,
+            )
+
+        assert edited_content == sample_content
+        assert passed is True
+        assert deal_breaker_info is None
+        assert mock_qa_engine._evaluate_single_semantic_layer.call_count == 1
+        assert gran_sabio.review_minority_deal_breakers.await_count == 1
+
+        overridden = layer_results["gpt-5.4"]
+        assert overridden.deal_breaker is False
+        assert overridden.passes_score is True
+        assert overridden.score == strict_layer.min_score
+        assert overridden.metadata["gran_sabio_raw_score"] == 9.0
+        assert overridden.metadata["gran_sabio_effective_score"] == strict_layer.min_score
+        assert overridden.metadata["gran_sabio_score_clamped_to_min"] is True
+
+
+class TestDirectOperationSafety:
+    """Tests for safety guards around literal smart-edit replacements."""
+
+    def test_incomplete_dialogue_fragment_falls_back_to_ai(self):
+        """
+        Given: A replace edit that only captures part of a quoted dialogue
+        When: _build_combined_instruction() is called
+        Then: The edit is not treated as a safe direct replacement
+        """
+        from core.generation_processor import _build_combined_instruction
+
+        edit = TextEditRange(
+            marker_mode="ids",
+            target_ids=["p8"],
+            exact_fragment='"¿Qué aprendimos de esto, Iria?',
+            edit_type=EditType.REPLACE,
+            new_content='«¿Qué aprendimos de esto, Iria?»',
+            edit_instruction="Convierte este diálogo a comillas francesas.",
+            issue_description="Falta un diálogo con comillas francesas.",
+            issue_severity=SeverityLevel.MAJOR,
+            can_use_direct=True,
+        )
+
+        instruction, direct_op = _build_combined_instruction([edit])
+
+        assert "comillas francesas" in instruction
+        assert direct_op is None
+
+    def test_plain_literal_replace_remains_direct(self):
+        """
+        Given: A normal literal replacement without structural punctuation risk
+        When: _build_combined_instruction() is called
+        Then: The edit still uses the direct-operation path
+        """
+        from core.generation_processor import _build_combined_instruction
+
+        edit = TextEditRange(
+            marker_mode="ids",
+            target_ids=["p3"],
+            exact_fragment="quikc",
+            edit_type=EditType.REPLACE,
+            new_content="quick",
+            edit_instruction="Corrige la palabra mal escrita.",
+            issue_description="Hay una errata.",
+            issue_severity=SeverityLevel.MINOR,
+            can_use_direct=True,
+        )
+
+        _, direct_op = _build_combined_instruction([edit])
+
+        assert direct_op is not None
+        assert direct_op["exact_fragment"] == "quikc"
+
+    def test_incomplete_japanese_dialogue_fragment_falls_back_to_ai(self):
+        """
+        Given: A replace edit that cuts through Japanese dialogue quotes
+        When: _build_combined_instruction() is called
+        Then: The edit does not use the direct-operation path
+        """
+        from core.generation_processor import _build_combined_instruction
+
+        edit = TextEditRange(
+            marker_mode="ids",
+            target_ids=["p9"],
+            exact_fragment="「量子写像は",
+            edit_type=EditType.REPLACE,
+            new_content="「量子写像は収束する」",
+            edit_instruction="Completa el diálogo correctamente.",
+            issue_description="El diálogo quedó cortado.",
+            issue_severity=SeverityLevel.MAJOR,
+            can_use_direct=True,
+        )
+
+        instruction, direct_op = _build_combined_instruction([edit])
+
+        assert "Completa el diálogo" in instruction
+        assert direct_op is None
+
+    @pytest.mark.asyncio
     async def test_layer_fails_with_deal_breaker_stops_immediately(
         self, sample_qa_layer_deal_breaker, mock_qa_engine, mock_ai_service,
         sample_content, sample_content_request, mock_session, deal_breaker_evaluation
@@ -625,6 +864,121 @@ class TestProcessSingleLayerWithEdits:
         assert edited_content == "Edited content after smart edit"
         # Two evaluations: fail then pass
         assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_last_round_edit_triggers_final_reevaluation(
+        self, sample_qa_layer, mock_qa_engine, mock_ai_service,
+        sample_content, sample_content_request, mock_session,
+        failing_evaluation, passing_evaluation
+    ):
+        """
+        Given: A layer that applies edits on its last allowed round
+        When: _process_single_layer_with_edits() is called
+        Then: It performs one final re-evaluation of the edited content before failing the layer
+        """
+        from core.generation_processor import _process_single_layer_with_edits
+
+        eval_calls = 0
+
+        async def mock_evaluate(*args, **kwargs):
+            nonlocal eval_calls
+            eval_calls += 1
+            if eval_calls == 1:
+                return ({"gpt-4o": failing_evaluation}, None)
+            return ({"gpt-4o": passing_evaluation}, None)
+
+        mock_qa_engine._evaluate_single_semantic_layer = AsyncMock(side_effect=mock_evaluate)
+
+        with patch('core.generation_processor._generate_smart_edits', new_callable=AsyncMock) as mock_smart_edit, \
+             patch('core.generation_processor._locate_edit_segment', return_value=(0, 50)):
+
+            mock_smart_edit.return_value = "Edited content after smart edit"
+
+            edited_content, layer_results, passed, deal_breaker_info = await _process_single_layer_with_edits(
+                content=sample_content,
+                layer=sample_qa_layer,
+                qa_engine=mock_qa_engine,
+                qa_models=["gpt-4o"],
+                qa_model_names=["gpt-4o"],
+                request=sample_content_request,
+                session=mock_session,
+                session_id="test-session",
+                usage_tracker=None,
+                phase_logger=None,
+                max_rounds=1,
+                ai_service=mock_ai_service,
+            )
+
+        assert passed is True
+        assert deal_breaker_info is None
+        assert edited_content == "Edited content after smart edit"
+        assert eval_calls == 2
+
+    @pytest.mark.asyncio
+    async def test_word_count_bypass_failure_skips_incremental_repair(
+        self, mock_qa_engine, mock_ai_service, sample_content, sample_content_request, mock_session
+    ):
+        """
+        Given: A deterministic word-count layer that fails below min_score
+        When: _process_single_layer_with_edits() is called
+        Then: It does not enter smart-edit repair and returns immediately
+        """
+        from core.generation_processor import _process_single_layer_with_edits
+
+        word_count_layer = QALayer(
+            name="Word Count Enforcement",
+            description="Validate word count",
+            criteria="Count words only",
+            min_score=10.0,
+            order=1,
+        )
+        failing_word_count_eval = QAEvaluation(
+            model="Arithmos-Prime (Algorithmic)",
+            layer="Word Count Enforcement",
+            score=7.0,
+            feedback="Content is near the lower bound but below the ideal target.",
+            deal_breaker=False,
+            passes_score=False,
+            identified_issues=[
+                TextEditRange(
+                    marker_mode="ids",
+                    target_ids=["p1"],
+                    evidence_quote="The quick brown fox jumps over the lazy dog.",
+                    issue_type="word_count",
+                    issue_description="Add more detail to reach the target length.",
+                    issue_severity=SeverityLevel.MINOR,
+                    edit_type=EditType.EXPAND,
+                )
+            ],
+        )
+
+        mock_qa_engine._evaluate_single_semantic_layer = AsyncMock(
+            return_value=({"gpt-4o": failing_word_count_eval}, None)
+        )
+        mock_qa_engine.bypass_engine.should_skip_incremental_repair = Mock(return_value=True)
+
+        with patch("core.generation_processor._generate_smart_edits", new_callable=AsyncMock) as mock_smart_edit:
+            edited_content, layer_results, passed, deal_breaker_info = await _process_single_layer_with_edits(
+                content=sample_content,
+                layer=word_count_layer,
+                qa_engine=mock_qa_engine,
+                qa_models=["gpt-4o"],
+                qa_model_names=["gpt-4o"],
+                request=sample_content_request,
+                session=mock_session,
+                session_id="test-session",
+                usage_tracker=None,
+                phase_logger=None,
+                max_rounds=5,
+                ai_service=mock_ai_service,
+            )
+
+        assert passed is False
+        assert deal_breaker_info is None
+        assert edited_content == sample_content
+        assert "gpt-4o" in layer_results
+        mock_smart_edit.assert_not_awaited()
+        mock_qa_engine._evaluate_single_semantic_layer.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_cancellation_during_layer_processing(
@@ -770,6 +1124,67 @@ class TestProcessAllLayersWithEdits:
         assert layers_summary["Layer2"]["passed"] is True
 
     @pytest.mark.asyncio
+    async def test_deterministic_word_count_failure_stops_remaining_layers(
+        self, mock_qa_engine, mock_ai_service, sample_content, sample_content_request, mock_session
+    ):
+        """
+        Given: Word count fails deterministically and requires regeneration
+        When: _process_all_layers_with_edits() is called
+        Then: Remaining layers are skipped for this iteration
+        """
+        from core.generation_processor import _process_all_layers_with_edits
+
+        layers = [
+            QALayer(name="Word Count Enforcement", description="WC", criteria="Count words", min_score=8.0, order=1),
+            QALayer(name="Clarity", description="CL", criteria="Be clear", min_score=7.0, order=2),
+        ]
+
+        failing_eval = QAEvaluation(
+            model="Arithmos-Prime (Algorithmic)",
+            layer="Word Count Enforcement",
+            score=4.0,
+            feedback="Too short",
+            deal_breaker=False,
+            passes_score=False,
+        )
+
+        with patch(
+            "core.generation_processor._process_single_layer_with_edits",
+            new_callable=AsyncMock,
+        ) as mock_process_layer:
+            mock_process_layer.side_effect = [
+                (sample_content, {"gpt-4o": failing_eval}, False, None),
+                (sample_content, {"gpt-4o": failing_eval}, True, None),
+            ]
+            mock_qa_engine.bypass_engine.should_skip_incremental_repair = Mock(
+                side_effect=lambda layer, request: layer.name == "Word Count Enforcement"
+            )
+
+            (
+                final_content, all_qa_results, all_passed,
+                deal_breaker_info, layers_summary
+            ) = await _process_all_layers_with_edits(
+                content=sample_content,
+                qa_layers=layers,
+                qa_engine=mock_qa_engine,
+                qa_models=["gpt-4o"],
+                qa_model_names=["gpt-4o"],
+                request=sample_content_request,
+                session=mock_session,
+                session_id="test-session",
+                usage_tracker=None,
+                phase_logger=None,
+                ai_service=mock_ai_service,
+            )
+
+        assert final_content == sample_content
+        assert all_passed is False
+        assert deal_breaker_info is None
+        assert list(layers_summary.keys()) == ["Word Count Enforcement"]
+        assert list(all_qa_results.keys()) == ["Word Count Enforcement"]
+        mock_process_layer.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_deal_breaker_in_layer_continues_to_next(
         self, mock_qa_engine, mock_ai_service,
         sample_content, sample_content_request, mock_session,
@@ -778,7 +1193,7 @@ class TestProcessAllLayersWithEdits:
         """
         Given: Deal-breaker in first layer
         When: _process_all_layers_with_edits() is called
-        Then: Records deal-breaker but continues to next layers
+        Then: Records deal-breaker and stops remaining layers for this iteration
         """
         from core.generation_processor import _process_all_layers_with_edits
 
@@ -824,8 +1239,7 @@ class TestProcessAllLayersWithEdits:
         assert deal_breaker_info is not None
         assert deal_breaker_info["layer"] == "Accuracy"
         assert layers_summary["Accuracy"]["deal_breaker"] is True
-        # Second layer should still be processed
-        assert "Quality" in layers_summary
+        assert "Quality" not in layers_summary
 
     @pytest.mark.asyncio
     async def test_layers_processed_in_order(

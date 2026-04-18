@@ -42,6 +42,15 @@ class GranSabioClientError(Exception):
         self.details = details or {}
 
 
+class TransientGranSabioError(GranSabioClientError):
+    """
+    Raised for transient network failures (connection errors, timeouts) that
+    may succeed on retry. Consumers running idempotent GET polls (e.g.
+    wait_for_result) can catch this subclass and back off before retrying.
+    Non-transient failures continue to raise plain GranSabioClientError.
+    """
+
+
 class GranSabioGenerationCancelled(GranSabioClientError):
     """Raised when a GranSabio generation session was cancelled by user request."""
 
@@ -72,6 +81,7 @@ __all__ = [
     "GranSabioClient",
     "AsyncGranSabioClient",
     "GranSabioClientError",
+    "TransientGranSabioError",
     "GranSabioGenerationCancelled",
     "GranSabioGenerationRejected",
     # Backward compatibility

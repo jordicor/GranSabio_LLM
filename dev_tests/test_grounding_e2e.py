@@ -626,7 +626,7 @@ class TestGroundingDirectModule:
         print(f"Time: {result.verification_time_ms:.0f}ms")
 
         assert result.enabled is True
-        assert result.model_used == GROUNDING_MODEL
+        assert GROUNDING_MODEL in result.model_used
         assert isinstance(result.passed, bool)
         assert result.verification_time_ms > 0
 

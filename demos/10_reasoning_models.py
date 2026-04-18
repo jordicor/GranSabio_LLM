@@ -26,7 +26,7 @@ Usage:
     python demos/10_reasoning_models.py
 
     # With specific model:
-    python demos/10_reasoning_models.py --model gpt-5
+    python demos/10_reasoning_models.py --model gpt-5.4
 
     # With high reasoning:
     python demos/10_reasoning_models.py --effort high
@@ -128,19 +128,8 @@ Consider trade-offs and explain your design decisions.
 
 # Model configurations
 MODEL_CONFIGS = {
-    "gpt-5": {
-        "generator_model": "gpt-5",
-        "reasoning_effort": "high",
-        "supports_thinking": False
-    },
-    "gpt-5-mini": {
-        "generator_model": "gpt-5-mini",
-        "reasoning_effort": "medium",
-        "supports_thinking": False
-    },
-    # Top reasoning models (Dec 2025) - GPT-5.2 and Claude Opus 4.5 are above O3
-    "gpt-5.2": {
-        "generator_model": "gpt-5.2",
+    "gpt-5.4": {
+        "generator_model": "gpt-5.4",
         "reasoning_effort": "high",
         "supports_thinking": False
     },
@@ -153,14 +142,14 @@ MODEL_CONFIGS = {
         "generator_model": "gemini-3-pro-preview",
         "supports_thinking": True
     },
-    # Legacy O3 models
-    "o3": {
-        "generator_model": "o3",
+    # O-series reasoning models
+    "o3-pro": {
+        "generator_model": "o3-pro",
         "reasoning_effort": "high",
         "supports_thinking": False
     },
-    "o3-mini": {
-        "generator_model": "o3-mini",
+    "o4-mini": {
+        "generator_model": "o4-mini",
         "reasoning_effort": "medium",
         "supports_thinking": False
     },
@@ -179,7 +168,7 @@ MODEL_CONFIGS = {
         "supports_thinking": True
     },
     "qwen3-thinking": {
-        "generator_model": "qwen/qwen3-235b-a22b-thinking",
+        "generator_model": "qwen/qwen3-235b-a22b-thinking-2507",
         "supports_thinking": True
     }
 }
@@ -190,7 +179,7 @@ async def demo_reasoning_models():
 
     parser = argparse.ArgumentParser(description="Reasoning Models Demo")
     parser.add_argument("--model", choices=list(MODEL_CONFIGS.keys()),
-                        default="gpt-5.2",
+                        default="gpt-5.4",
                         help="Model to use")
     parser.add_argument("--effort", choices=["low", "medium", "high"],
                         default="high",
@@ -211,7 +200,7 @@ async def demo_reasoning_models():
         print(f"Connected to: {info['service']} v{info['version']}")
 
         # Get model config
-        model_config = MODEL_CONFIGS.get(args.model, MODEL_CONFIGS["gpt-5.2"]).copy()
+        model_config = MODEL_CONFIGS.get(args.model, MODEL_CONFIGS["gpt-5.4"]).copy()
 
         # Apply custom settings
         if model_config.get("supports_thinking"):
@@ -263,11 +252,11 @@ async def demo_reasoning_models():
             "content_type": "technical",
             "temperature": 0.3,  # Lower for reasoning
             "max_tokens": 4000,
-            "qa_models": ["gpt-5-mini"],
+            "qa_models": ["gpt-5.4"],
             "qa_layers": qa_layers,
             "min_global_score": 7.5,
             "max_iterations": 2,
-            "gran_sabio_model": "claude-opus-4-6",
+            "gran_sabio_model": "claude-opus-4-7",
             "verbose": True,
             "request_name": f"Reasoning: {problem['name']}"
         }

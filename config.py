@@ -9,7 +9,7 @@ misconfigured, this module will print a clear error to stderr and raise.
 
 import os
 import sys
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 # Use optimized JSON (3.6x faster than standard json)
 import json_utils as json
 from pydantic import BaseModel, Field, AliasChoices
@@ -404,6 +404,46 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         description="System prompt used for preflight validation queries."
     )
 
+    # Long Text Mode configuration
+    LONG_TEXT_AUTO_MIN_WORDS: int = Field(default=2500, description="Minimum derived target for Long Text auto-activation")
+    LONG_TEXT_HARD_CAP_WORDS: int = Field(default=8000, description="Absolute Long Text document ceiling")
+    LONG_TEXT_TARGET_BAND_PERCENT: int = Field(default=7, description="Preferred Long Text target band percentage")
+    LONG_TEXT_EMERGENCY_BAND_PERCENT: int = Field(default=12, description="Emergency Long Text target band percentage")
+    LONG_TEXT_MAX_OUTER_ITERATIONS: int = Field(default=3, description="Maximum explicit outer iterations allowed for Long Text Mode")
+    LONG_TEXT_MAX_INTERNAL_REPAIRS: int = Field(default=3, description="Maximum internal repair rounds per Long Text controller run")
+    LONG_TEXT_MAX_SECTIONS_PER_REPAIR: int = Field(default=2, description="Maximum sections touched in one Long Text repair round")
+    LONG_TEXT_MAX_RANGES_PER_REPAIR: int = Field(default=8, description="Maximum paragraph ranges touched in one Long Text repair round")
+    LONG_TEXT_MIN_SECTION_WORDS: int = Field(default=350, description="Minimum words allowed for a planned Long Text section")
+    LONG_TEXT_MAX_SECTION_WORD_SHARE: float = Field(default=0.35, description="Maximum fraction of the target words assignable to one Long Text section")
+    LONG_TEXT_HEALTHY_COVERAGE_MIN: float = Field(default=0.80, description="Minimum per-section coverage required for a candidate to be considered healthy during Long Text repair triage")
+    LONG_TEXT_PLAN_SUM_TOLERANCE_PERCENT: int = Field(default=5, description="Allowed drift between section-budget sum and document target")
+    LONG_TEXT_MAX_ROLLING_ANCHORS: int = Field(default=3, description="Maximum number of rolling section anchors kept in prompt context")
+    LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS: int = Field(default=450, description="Maximum total words carried in rolling section anchors")
+    LONG_TEXT_CONTROLLER_EVAL_MODEL: str = Field(default="gpt-5-mini", description="Model used for Long Text semantic evaluation phases")
+    LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS: int = Field(default=90, description="Timeout for Long Text source-brief distillation")
+    LONG_TEXT_PLAN_TIMEOUT_FULL_SECONDS: int = Field(default=240, description="Timeout for Long Text planning with full profile")
+    LONG_TEXT_PLAN_TIMEOUT_BALANCED_SECONDS: int = Field(default=150, description="Timeout for Long Text planning with balanced profile")
+    LONG_TEXT_PLAN_TIMEOUT_CAPPED_SECONDS: int = Field(default=90, description="Timeout for Long Text planning with capped profile")
+    LONG_TEXT_SECTION_TIMEOUT_FULL_SECONDS: int = Field(default=180, description="Timeout for Long Text section drafting with full profile")
+    LONG_TEXT_SECTION_TIMEOUT_BALANCED_SECONDS: int = Field(default=150, description="Timeout for Long Text section drafting with balanced profile")
+    LONG_TEXT_SECTION_TIMEOUT_CAPPED_SECONDS: int = Field(default=90, description="Timeout for Long Text section drafting with capped profile")
+    LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS: int = Field(default=120, description="Timeout for Long Text targeted repairs with balanced profile")
+    LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS: int = Field(default=75, description="Timeout for Long Text targeted repairs with capped profile")
+    LONG_TEXT_FINALIZE_TIMEOUT_CAPPED_SECONDS: int = Field(default=60, description="Timeout for Long Text candidate finalization")
+    LONG_TEXT_SECTION_DRAFT_START_PROFILE: str = Field(default="balanced", description="Starting controller profile for Long Text section drafting")
+    LONG_TEXT_MAX_SECTIONS: int = Field(default=8, description="Maximum sections allowed in a Long Text plan")
+    LONG_TEXT_MAX_GENERATOR_CALLS_TOTAL: int = Field(default=20, description="Maximum Long Text generator calls per request")
+    LONG_TEXT_MAX_SEMANTIC_EVAL_CALLS: int = Field(default=16, description="Maximum Long Text semantic evaluation calls per request")
+    LONG_TEXT_MAX_TOTAL_WALL_CLOCK_SECONDS: int = Field(default=1800, description="Maximum total wall-clock budget for one Long Text request")
+    LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION: int = Field(default=2, description="Maximum tool-loop rounds allowed for one Long Text section draft")
+    LONG_TEXT_MAX_PLAN_INVALIDATIONS: int = Field(default=1, description="Maximum Long Text frozen-plan invalidations per request")
+    LONG_TEXT_MAX_CONSECUTIVE_POST_REPAIR_ASSEMBLY_FAILURES: int = Field(
+        default=2,
+        description="Maximum consecutive post-repair assembly hard-filter failures before invalidating the frozen plan",
+    )
+    LONG_TEXT_MAX_NO_VIABLE_CANDIDATES: int = Field(default=2, description="Maximum consecutive Long Text no-candidate controller failures")
+    LONG_TEXT_SECTION_DIAGNOSTIC_CONCURRENCY: int = Field(default=2, description="Maximum concurrent section-level Long Text diagnostics")
+
     # Evidence Grounding Configuration
     EVIDENCE_GROUNDING_EXTRACTION_MODEL: str = Field(
         default="gpt-5-nano",
@@ -521,6 +561,24 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         description="Maximum depth for recursive JSON field search in smart-edit extraction"
     )
 
+    # LLM-accent guard configuration (Cambio 1 v5, §5.10)
+    AI_ACCENT_AUDIT_MODEL: str = Field(
+        default="gpt-5-mini",
+        description="Model used by the inline audit_accent tool handler (Cambio 1 v5, §5.10)."
+    )
+    AI_ACCENT_AUDIT_TIMEOUT_SECONDS: int = Field(
+        default=30,
+        ge=5,
+        le=300,
+        description="Timeout for a single audit_accent model call."
+    )
+    AI_ACCENT_AUDIT_MAX_TOKENS: int = Field(
+        default=1500,
+        ge=200,
+        le=8000,
+        description="Maximum tokens for a single audit_accent model response."
+    )
+
     # Arbiter Configuration (per-layer conflict resolution)
     ARBITER_MAX_TOKENS: int = Field(
         default=8000,
@@ -596,6 +654,14 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         super().__init__()
         self.load_model_specifications()
         self.load_from_environment()
+        self.setup_legacy_models()
+
+    def reload_model_specifications(self) -> None:
+        """Reload model specs from disk and rebuild legacy provider maps."""
+        self.load_model_specifications()
+        self.OPENAI_MODELS = {}
+        self.CLAUDE_MODELS = {}
+        self.GEMINI_MODELS = {}
         self.setup_legacy_models()
     
     def load_from_environment(self):
@@ -777,6 +843,17 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             os.getenv("MAX_JSON_RECURSION_DEPTH", "3")
         )
 
+        # LLM-accent guard configuration (Cambio 1 v5, §5.10)
+        self.AI_ACCENT_AUDIT_MODEL = os.getenv(
+            "AI_ACCENT_AUDIT_MODEL", self.AI_ACCENT_AUDIT_MODEL
+        )
+        self.AI_ACCENT_AUDIT_TIMEOUT_SECONDS = int(
+            os.getenv("AI_ACCENT_AUDIT_TIMEOUT_SECONDS", str(self.AI_ACCENT_AUDIT_TIMEOUT_SECONDS))
+        )
+        self.AI_ACCENT_AUDIT_MAX_TOKENS = int(
+            os.getenv("AI_ACCENT_AUDIT_MAX_TOKENS", str(self.AI_ACCENT_AUDIT_MAX_TOKENS))
+        )
+
         # Arbiter Configuration
         self.ARBITER_MAX_TOKENS = int(os.getenv("ARBITER_MAX_TOKENS", "8000"))
         self.ARBITER_TEMPERATURE = float(os.getenv("ARBITER_TEMPERATURE", "0.3"))
@@ -798,6 +875,239 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
 
         # Tracking
         self.TRACKING_DATA_PATH = os.getenv("TRACKING_DATA_PATH", "data/tracking")
+
+        # Long Text Mode
+        self.LONG_TEXT_AUTO_MIN_WORDS = int(
+            os.getenv("LONG_TEXT_AUTO_MIN_WORDS", str(self.LONG_TEXT_AUTO_MIN_WORDS))
+        )
+        self.LONG_TEXT_HARD_CAP_WORDS = int(
+            os.getenv("LONG_TEXT_HARD_CAP_WORDS", str(self.LONG_TEXT_HARD_CAP_WORDS))
+        )
+        self.LONG_TEXT_TARGET_BAND_PERCENT = int(
+            os.getenv("LONG_TEXT_TARGET_BAND_PERCENT", str(self.LONG_TEXT_TARGET_BAND_PERCENT))
+        )
+        self.LONG_TEXT_EMERGENCY_BAND_PERCENT = int(
+            os.getenv("LONG_TEXT_EMERGENCY_BAND_PERCENT", str(self.LONG_TEXT_EMERGENCY_BAND_PERCENT))
+        )
+        self.LONG_TEXT_MAX_OUTER_ITERATIONS = int(
+            os.getenv("LONG_TEXT_MAX_OUTER_ITERATIONS", str(self.LONG_TEXT_MAX_OUTER_ITERATIONS))
+        )
+        self.LONG_TEXT_MAX_INTERNAL_REPAIRS = int(
+            os.getenv("LONG_TEXT_MAX_INTERNAL_REPAIRS", str(self.LONG_TEXT_MAX_INTERNAL_REPAIRS))
+        )
+        self.LONG_TEXT_MAX_SECTIONS_PER_REPAIR = int(
+            os.getenv("LONG_TEXT_MAX_SECTIONS_PER_REPAIR", str(self.LONG_TEXT_MAX_SECTIONS_PER_REPAIR))
+        )
+        self.LONG_TEXT_MAX_RANGES_PER_REPAIR = int(
+            os.getenv("LONG_TEXT_MAX_RANGES_PER_REPAIR", str(self.LONG_TEXT_MAX_RANGES_PER_REPAIR))
+        )
+        self.LONG_TEXT_MIN_SECTION_WORDS = int(
+            os.getenv("LONG_TEXT_MIN_SECTION_WORDS", str(self.LONG_TEXT_MIN_SECTION_WORDS))
+        )
+        self.LONG_TEXT_MAX_SECTION_WORD_SHARE = float(
+            os.getenv("LONG_TEXT_MAX_SECTION_WORD_SHARE", str(self.LONG_TEXT_MAX_SECTION_WORD_SHARE))
+        )
+        self.LONG_TEXT_HEALTHY_COVERAGE_MIN = float(
+            os.getenv("LONG_TEXT_HEALTHY_COVERAGE_MIN", str(self.LONG_TEXT_HEALTHY_COVERAGE_MIN))
+        )
+        self.LONG_TEXT_PLAN_SUM_TOLERANCE_PERCENT = int(
+            os.getenv("LONG_TEXT_PLAN_SUM_TOLERANCE_PERCENT", str(self.LONG_TEXT_PLAN_SUM_TOLERANCE_PERCENT))
+        )
+        self.LONG_TEXT_MAX_ROLLING_ANCHORS = int(
+            os.getenv("LONG_TEXT_MAX_ROLLING_ANCHORS", str(self.LONG_TEXT_MAX_ROLLING_ANCHORS))
+        )
+        self.LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS = int(
+            os.getenv("LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS", str(self.LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS))
+        )
+        self.LONG_TEXT_CONTROLLER_EVAL_MODEL = os.getenv(
+            "LONG_TEXT_CONTROLLER_EVAL_MODEL",
+            self.LONG_TEXT_CONTROLLER_EVAL_MODEL,
+        )
+        self.LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS = int(
+            os.getenv("LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS", str(self.LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS))
+        )
+        self.LONG_TEXT_PLAN_TIMEOUT_FULL_SECONDS = int(
+            os.getenv("LONG_TEXT_PLAN_TIMEOUT_FULL_SECONDS", str(self.LONG_TEXT_PLAN_TIMEOUT_FULL_SECONDS))
+        )
+        self.LONG_TEXT_PLAN_TIMEOUT_BALANCED_SECONDS = int(
+            os.getenv("LONG_TEXT_PLAN_TIMEOUT_BALANCED_SECONDS", str(self.LONG_TEXT_PLAN_TIMEOUT_BALANCED_SECONDS))
+        )
+        self.LONG_TEXT_PLAN_TIMEOUT_CAPPED_SECONDS = int(
+            os.getenv("LONG_TEXT_PLAN_TIMEOUT_CAPPED_SECONDS", str(self.LONG_TEXT_PLAN_TIMEOUT_CAPPED_SECONDS))
+        )
+        self.LONG_TEXT_SECTION_TIMEOUT_FULL_SECONDS = int(
+            os.getenv("LONG_TEXT_SECTION_TIMEOUT_FULL_SECONDS", str(self.LONG_TEXT_SECTION_TIMEOUT_FULL_SECONDS))
+        )
+        self.LONG_TEXT_SECTION_TIMEOUT_BALANCED_SECONDS = int(
+            os.getenv("LONG_TEXT_SECTION_TIMEOUT_BALANCED_SECONDS", str(self.LONG_TEXT_SECTION_TIMEOUT_BALANCED_SECONDS))
+        )
+        self.LONG_TEXT_SECTION_TIMEOUT_CAPPED_SECONDS = int(
+            os.getenv("LONG_TEXT_SECTION_TIMEOUT_CAPPED_SECONDS", str(self.LONG_TEXT_SECTION_TIMEOUT_CAPPED_SECONDS))
+        )
+        self.LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS = int(
+            os.getenv("LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS", str(self.LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS))
+        )
+        self.LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS = int(
+            os.getenv("LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS", str(self.LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS))
+        )
+        self.LONG_TEXT_FINALIZE_TIMEOUT_CAPPED_SECONDS = int(
+            os.getenv("LONG_TEXT_FINALIZE_TIMEOUT_CAPPED_SECONDS", str(self.LONG_TEXT_FINALIZE_TIMEOUT_CAPPED_SECONDS))
+        )
+        self.LONG_TEXT_SECTION_DRAFT_START_PROFILE = os.getenv(
+            "LONG_TEXT_SECTION_DRAFT_START_PROFILE",
+            self.LONG_TEXT_SECTION_DRAFT_START_PROFILE,
+        )
+        self.LONG_TEXT_MAX_SECTIONS = int(
+            os.getenv("LONG_TEXT_MAX_SECTIONS", str(self.LONG_TEXT_MAX_SECTIONS))
+        )
+        self.LONG_TEXT_MAX_GENERATOR_CALLS_TOTAL = int(
+            os.getenv("LONG_TEXT_MAX_GENERATOR_CALLS_TOTAL", str(self.LONG_TEXT_MAX_GENERATOR_CALLS_TOTAL))
+        )
+        self.LONG_TEXT_MAX_SEMANTIC_EVAL_CALLS = int(
+            os.getenv("LONG_TEXT_MAX_SEMANTIC_EVAL_CALLS", str(self.LONG_TEXT_MAX_SEMANTIC_EVAL_CALLS))
+        )
+        self.LONG_TEXT_MAX_TOTAL_WALL_CLOCK_SECONDS = int(
+            os.getenv("LONG_TEXT_MAX_TOTAL_WALL_CLOCK_SECONDS", str(self.LONG_TEXT_MAX_TOTAL_WALL_CLOCK_SECONDS))
+        )
+        self.LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION = int(
+            os.getenv("LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION", str(self.LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION))
+        )
+        self.LONG_TEXT_MAX_PLAN_INVALIDATIONS = int(
+            os.getenv("LONG_TEXT_MAX_PLAN_INVALIDATIONS", str(self.LONG_TEXT_MAX_PLAN_INVALIDATIONS))
+        )
+        self.LONG_TEXT_MAX_CONSECUTIVE_POST_REPAIR_ASSEMBLY_FAILURES = int(
+            os.getenv(
+                "LONG_TEXT_MAX_CONSECUTIVE_POST_REPAIR_ASSEMBLY_FAILURES",
+                str(self.LONG_TEXT_MAX_CONSECUTIVE_POST_REPAIR_ASSEMBLY_FAILURES),
+            )
+        )
+        self.LONG_TEXT_MAX_NO_VIABLE_CANDIDATES = int(
+            os.getenv("LONG_TEXT_MAX_NO_VIABLE_CANDIDATES", str(self.LONG_TEXT_MAX_NO_VIABLE_CANDIDATES))
+        )
+        self.LONG_TEXT_SECTION_DIAGNOSTIC_CONCURRENCY = int(
+            os.getenv(
+                "LONG_TEXT_SECTION_DIAGNOSTIC_CONCURRENCY",
+                str(self.LONG_TEXT_SECTION_DIAGNOSTIC_CONCURRENCY),
+            )
+        )
+
+        self._validate_long_text_configuration()
+
+    def _validate_long_text_configuration(self) -> None:
+        """Validate Long Text single-key and cross-key policy bounds."""
+
+        int_bounds = {
+            "LONG_TEXT_AUTO_MIN_WORDS": (1000, self.LONG_TEXT_HARD_CAP_WORDS),
+            "LONG_TEXT_HARD_CAP_WORDS": (2500, 8000),
+            "LONG_TEXT_TARGET_BAND_PERCENT": (1, 19),
+            "LONG_TEXT_EMERGENCY_BAND_PERCENT": (2, 20),
+            "LONG_TEXT_MAX_OUTER_ITERATIONS": (2, 3),
+            "LONG_TEXT_MAX_INTERNAL_REPAIRS": (0, 5),
+            "LONG_TEXT_MAX_SECTIONS_PER_REPAIR": (1, self.LONG_TEXT_MAX_SECTIONS),
+            "LONG_TEXT_MAX_RANGES_PER_REPAIR": (1, 16),
+            "LONG_TEXT_MIN_SECTION_WORDS": (150, 1000),
+            "LONG_TEXT_PLAN_SUM_TOLERANCE_PERCENT": (1, 10),
+            "LONG_TEXT_MAX_ROLLING_ANCHORS": (1, 5),
+            "LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS": (150, 800),
+            "LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS": (30, 300),
+            "LONG_TEXT_PLAN_TIMEOUT_FULL_SECONDS": (60, 600),
+            "LONG_TEXT_PLAN_TIMEOUT_BALANCED_SECONDS": (30, 599),
+            "LONG_TEXT_PLAN_TIMEOUT_CAPPED_SECONDS": (15, 598),
+            "LONG_TEXT_SECTION_TIMEOUT_FULL_SECONDS": (60, 600),
+            "LONG_TEXT_SECTION_TIMEOUT_BALANCED_SECONDS": (30, 600),
+            "LONG_TEXT_SECTION_TIMEOUT_CAPPED_SECONDS": (15, 599),
+            "LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS": (30, 300),
+            "LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS": (15, 299),
+            "LONG_TEXT_FINALIZE_TIMEOUT_CAPPED_SECONDS": (15, 180),
+            "LONG_TEXT_MAX_SECTIONS": (3, 8),
+            "LONG_TEXT_MAX_GENERATOR_CALLS_TOTAL": (4, 40),
+            "LONG_TEXT_MAX_SEMANTIC_EVAL_CALLS": (2, 40),
+            "LONG_TEXT_MAX_TOTAL_WALL_CLOCK_SECONDS": (300, 7200),
+            "LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION": (1, 5),
+            "LONG_TEXT_MAX_PLAN_INVALIDATIONS": (0, 2),
+            "LONG_TEXT_MAX_CONSECUTIVE_POST_REPAIR_ASSEMBLY_FAILURES": (1, 3),
+            "LONG_TEXT_MAX_NO_VIABLE_CANDIDATES": (1, 3),
+            "LONG_TEXT_SECTION_DIAGNOSTIC_CONCURRENCY": (1, 2),
+        }
+        for field_name, (minimum, maximum) in int_bounds.items():
+            value = getattr(self, field_name)
+            if not isinstance(value, int) or value < minimum or value > maximum:
+                raise RuntimeError(
+                    f"[CONFIG ERROR] {field_name} must be between {minimum} and {maximum}; got {value!r}."
+                )
+
+        share = self.LONG_TEXT_MAX_SECTION_WORD_SHARE
+        if not isinstance(share, (int, float)) or share < 0.20 or share > 0.50:
+            raise RuntimeError(
+                "[CONFIG ERROR] LONG_TEXT_MAX_SECTION_WORD_SHARE must be between 0.20 and 0.50."
+            )
+
+        healthy_coverage = self.LONG_TEXT_HEALTHY_COVERAGE_MIN
+        if not isinstance(healthy_coverage, (int, float)) or healthy_coverage < 0.50 or healthy_coverage > 0.95:
+            raise RuntimeError(
+                "[CONFIG ERROR] LONG_TEXT_HEALTHY_COVERAGE_MIN must be between 0.50 and 0.95."
+            )
+
+        start_profile = str(self.LONG_TEXT_SECTION_DRAFT_START_PROFILE).strip().lower()
+        if start_profile not in {"full", "balanced", "capped"}:
+            raise RuntimeError(
+                "[CONFIG ERROR] LONG_TEXT_SECTION_DRAFT_START_PROFILE must be one of: full, balanced, capped."
+            )
+        self.LONG_TEXT_SECTION_DRAFT_START_PROFILE = start_profile
+
+        if self.LONG_TEXT_TARGET_BAND_PERCENT >= self.LONG_TEXT_EMERGENCY_BAND_PERCENT:
+            raise RuntimeError(
+                "[CONFIG ERROR] LONG_TEXT_TARGET_BAND_PERCENT must be lower than LONG_TEXT_EMERGENCY_BAND_PERCENT."
+            )
+        if not (
+            self.LONG_TEXT_PLAN_TIMEOUT_CAPPED_SECONDS
+            < self.LONG_TEXT_PLAN_TIMEOUT_BALANCED_SECONDS
+            < self.LONG_TEXT_PLAN_TIMEOUT_FULL_SECONDS
+        ):
+            raise RuntimeError(
+                "[CONFIG ERROR] Long Text plan timeouts must satisfy capped < balanced < full."
+            )
+        if not (
+            self.LONG_TEXT_SECTION_TIMEOUT_CAPPED_SECONDS
+            < self.LONG_TEXT_SECTION_TIMEOUT_BALANCED_SECONDS
+            <= self.LONG_TEXT_SECTION_TIMEOUT_FULL_SECONDS
+        ):
+            raise RuntimeError(
+                "[CONFIG ERROR] Long Text section timeouts must satisfy capped < balanced <= full."
+            )
+        if self.LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS >= self.LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS:
+            raise RuntimeError(
+                "[CONFIG ERROR] LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS must be lower than LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS."
+            )
+        if self.LONG_TEXT_MAX_SECTIONS_PER_REPAIR > self.LONG_TEXT_MAX_SECTIONS:
+            raise RuntimeError(
+                "[CONFIG ERROR] LONG_TEXT_MAX_SECTIONS_PER_REPAIR cannot exceed LONG_TEXT_MAX_SECTIONS."
+            )
+        if self.LONG_TEXT_AUTO_MIN_WORDS > self.LONG_TEXT_HARD_CAP_WORDS:
+            raise RuntimeError(
+                "[CONFIG ERROR] LONG_TEXT_AUTO_MIN_WORDS cannot exceed LONG_TEXT_HARD_CAP_WORDS."
+            )
+        if self.LONG_TEXT_MIN_SECTION_WORDS > self.LONG_TEXT_HARD_CAP_WORDS:
+            raise RuntimeError(
+                "[CONFIG ERROR] LONG_TEXT_MIN_SECTION_WORDS cannot exceed LONG_TEXT_HARD_CAP_WORDS."
+            )
+
+    def has_model_spec(self, model_name: str) -> bool:
+        """Return whether a model is declared in model_specs.json without requiring API keys."""
+        if not model_name:
+            return False
+
+        base_model = model_name.rsplit(":", 1)[0] if ":" in model_name else model_name
+        if any(marker in base_model.lower() for marker in ["dumb", "fake", "test-ai", "mock"]):
+            return True
+
+        aliases = self.model_specs.get("aliases", {})
+        resolved_name = aliases.get(model_name, model_name)
+        specs = self.model_specs.get("model_specifications", {})
+        for models in specs.values():
+            if resolved_name in models or model_name in models:
+                return True
+        return False
 
     def load_model_specifications(self):
         """Load model specifications from JSON file (no fallbacks)."""
@@ -827,11 +1137,15 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         # OpenAI models
         openai_models = specs.get("openai", {})
         for model_name, model_data in openai_models.items():
+            if model_data.get("enabled", True) is False:
+                continue
             self.OPENAI_MODELS[model_name] = model_data.get("model_id", model_name)
         
         # Claude models
         anthropic_models = specs.get("anthropic", {})
         for model_name, model_data in anthropic_models.items():
+            if model_data.get("enabled", True) is False:
+                continue
             self.CLAUDE_MODELS[model_name] = model_data.get("model_id", model_name)
         
         # Add aliases for Claude models
@@ -844,6 +1158,8 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         # Gemini models
         google_models = specs.get("google", {})
         for model_name, model_data in google_models.items():
+            if model_data.get("enabled", True) is False:
+                continue
             self.GEMINI_MODELS[model_name] = model_data.get("model_id", model_name)
     
     def get_model_info(self, model_name: str) -> Dict[str, Any]:
@@ -879,6 +1195,8 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         for provider, models in specs.items():
             for model_key, model_data in models.items():
                 if model_key == resolved_name or model_key == model_name:
+                    if model_data.get("enabled", True) is False:
+                        return {"provider": "unknown", "error": f"Model '{model_name}' is disabled."}
                     api_key = ""
                     if provider == "openai":
                         api_key = self.OPENAI_API_KEY
@@ -1068,6 +1386,11 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                     adjusted_thinking_budget, thinking_details
                 ) or adjusted_reasoning_effort
 
+        adjusted_reasoning_effort, reasoning_effort_validation = self._coerce_reasoning_effort_to_supported_level(
+            adjusted_reasoning_effort,
+            reasoning_config,
+        )
+
         reasoning_timeout = self._calculate_reasoning_timeout(
             model_info, adjusted_reasoning_effort, adjusted_thinking_budget
         )
@@ -1086,6 +1409,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "percentage_value": max_tokens_percentage if percentage_used else None,
             "adjusted_reasoning_effort": adjusted_reasoning_effort,
             "adjusted_thinking_budget_tokens": adjusted_thinking_budget,
+            "reasoning_effort_validation": reasoning_effort_validation,
             "thinking_validation": thinking_validation,
             "reasoning_timeout_seconds": reasoning_timeout,
             "model_info": safe_model_info
@@ -1097,17 +1421,74 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             return None
         normalized = effort.strip().lower()
         alias_map = {
+            "off": "none",
+            "disabled": "none",
             "mid": "medium",
             "med": "medium",
             "hi": "high",
             "lo": "low",
             "minimum": "minimal",
-            "min": "minimal"
+            "min": "minimal",
+            "xh": "xhigh",
+            "extra-high": "xhigh",
+            "extra_high": "xhigh",
         }
         normalized = alias_map.get(normalized, normalized)
-        if normalized in {"minimal", "low", "medium", "high"}:
+        if normalized in {"none", "minimal", "low", "medium", "high", "xhigh"}:
             return normalized
         return None
+
+    def _normalize_reasoning_effort_levels(self, levels: Optional[List[Any]]) -> List[str]:
+        """Return normalized, de-duplicated reasoning levels from model specs."""
+        normalized_levels: List[str] = []
+        seen: set[str] = set()
+        for level in levels or []:
+            if not isinstance(level, str):
+                continue
+            normalized = self.normalize_reasoning_effort_label(level)
+            if normalized and normalized not in seen:
+                normalized_levels.append(normalized)
+                seen.add(normalized)
+        return normalized_levels
+
+    def _coerce_reasoning_effort_to_supported_level(
+        self,
+        reasoning_effort: Optional[str],
+        reasoning_config: Optional[Dict[str, Any]],
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Clamp a normalized reasoning level to those actually supported by the model."""
+        normalized = self.normalize_reasoning_effort_label(reasoning_effort)
+        supported_levels = self._normalize_reasoning_effort_levels(
+            reasoning_config.get("levels") if reasoning_config else None
+        )
+        validation = {
+            "requested": normalized,
+            "adjusted": normalized,
+            "supported_levels": supported_levels,
+            "was_adjusted": False,
+            "reason": None,
+        }
+
+        if not normalized or not supported_levels:
+            return normalized, validation
+
+        if normalized in supported_levels:
+            return normalized, validation
+
+        effort_order = ["none", "minimal", "low", "medium", "high", "xhigh"]
+        requested_index = effort_order.index(normalized)
+        adjusted = min(
+            supported_levels,
+            key=lambda level: (abs(effort_order.index(level) - requested_index), effort_order.index(level)),
+        )
+        validation.update(
+            {
+                "adjusted": adjusted,
+                "was_adjusted": True,
+                "reason": f"Model supports {supported_levels}; adjusted unsupported reasoning_effort '{normalized}' to '{adjusted}'.",
+            }
+        )
+        return adjusted, validation
 
     def _convert_reasoning_effort_to_tokens(
         self,
@@ -1123,6 +1504,9 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         details = thinking_details or self._get_thinking_budget_details(model_info.get("model_id", ""))
         if not details or not details.get("supported", False):
             return None
+
+        if label == "none":
+            return 0
 
         max_tokens = details.get("max_tokens")
         min_tokens = details.get("min_tokens", 0)
@@ -1146,6 +1530,8 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             tokens = _fraction_to_tokens(0.5)
         elif label == "high":
             tokens = max_tokens
+        elif label == "xhigh":
+            tokens = max_tokens
         else:
             tokens = default_tokens or min_tokens or max_tokens
 
@@ -1157,6 +1543,8 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         """Convert numeric thinking budget hints to OpenAI reasoning effort levels."""
         if tokens is None:
             return "medium"
+        if tokens <= 0:
+            return "none"
 
         canonical_targets = {
             "low": 8000,
@@ -1180,8 +1568,10 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         thinking_details: Optional[Dict[str, Any]]
     ) -> Optional[str]:
         """Infer reasoning effort label by comparing tokens against model limits."""
-        if not tokens or not thinking_details:
+        if tokens is None or not thinking_details:
             return None
+        if tokens <= 0:
+            return "none"
 
         max_tokens = thinking_details.get("max_tokens")
         if not max_tokens:
@@ -1228,10 +1618,12 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
 
         # Doubled timeouts to accommodate long reasoning sessions
         timeout_map = {
+            "none": 900,       # 15 minutes
             "minimal": 1200,  # 20 minutes
             "low": 1800,      # 30 minutes
             "medium": 3600,   # 60 minutes
             "high": 7200,     # 120 minutes
+            "xhigh": 14400,   # 240 minutes
         }
 
         return timeout_map.get(normalized_effort, timeout_map["medium"]) if normalized_effort else None
@@ -1417,6 +1809,8 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             provider_key = provider  # Use the provider name as-is
             
             for model_name, model_data in models.items():
+                if model_data.get("enabled", True) is False:
+                    continue
                 model_entry = {
                     "key": model_name,
                     "name": model_data.get("name", model_name),
@@ -1448,6 +1842,22 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
 # Global configuration instance
 config = Config()
 
+
+# Content types that can benefit from QA-proposed smart-edit ranges.
+# Static frozenset: no env override is needed, and immutability prevents
+# accidental mutation from other modules.
+EDITABLE_CONTENT_TYPES = frozenset({
+    "biography",
+    "article",
+    "script",
+    "story",
+    "essay",
+    "blog",
+    "novel",
+    "creative",
+})
+
+
 # Model aliases for easy reference - now loaded from model_specs.json
 def get_model_aliases():
     """Get model aliases from configuration."""
@@ -1471,6 +1881,27 @@ def get_model_parameter_requirements(model_name: str) -> Dict[str, Any]:
     Returns dict with required parameter formats and constraints.
     """
     model_lower = model_name.lower()
+
+    # OpenAI o-series reasoning models use max_completion_tokens and do not support free temperature.
+    if (
+        model_lower == "o1"
+        or model_lower.startswith("o1-")
+        or model_lower == "o3"
+        or model_lower.startswith("o3-")
+        or model_lower == "o4"
+        or model_lower.startswith("o4-")
+        or "/o1" in model_lower
+        or "/o3" in model_lower
+        or "/o4" in model_lower
+    ):
+        return {
+            "max_tokens_param": "max_completion_tokens",
+            "supports_temperature": False,
+            "supports_reasoning_effort": True,
+            "supports_thinking_budget": False,
+            "default_temperature": None,
+            "forced_temperature": 1.0,
+        }
 
     # GPT-5 series (reasoning models - no temperature support, use reasoning_effort instead)
     if "gpt-5" in model_lower:

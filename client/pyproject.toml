@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "gransabio-client"
@@ -17,6 +17,6 @@ dependencies = [
 [project.optional-dependencies]
 orjson = ["orjson>=3.9"]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["client*"]
+[tool.setuptools]
+packages = ["client"]
+package-dir = {"client" = "."}

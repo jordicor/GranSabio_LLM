@@ -23,7 +23,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import time
 import config
 
-# Check if we should skip expensive tests
+# Skip expensive API tests unless explicitly enabled
 SKIP_EXPENSIVE = os.environ.get("SKIP_EXPENSIVE_TESTS", "0") == "1"
 
 # API configuration

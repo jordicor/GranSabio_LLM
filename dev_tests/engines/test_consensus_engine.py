@@ -289,6 +289,39 @@ class TestCalculateConsensus:
         assert result.per_model_averages["claude-sonnet-4"] == 7.5  # (8.0 + 7.0) / 2
 
     @pytest.mark.asyncio
+    async def test_excludes_grounding_pseudolayer_from_consensus_aggregates(
+        self, consensus_engine, sample_layers, sample_qa_results
+    ):
+        """
+        Given: Semantic QA results plus the synthetic Evidence Grounding layer
+        When: calculate_consensus() is called
+        Then: Global averages ignore the grounding pseudo-layer
+        """
+        qa_results = {
+            **sample_qa_results,
+            "Evidence Grounding": {
+                "evidence_grounding_logprobs": QAEvaluation(
+                    model="evidence_grounding_logprobs",
+                    layer="Evidence Grounding",
+                    score=1.0,
+                    feedback="Grounding is tracked separately from semantic QA",
+                    deal_breaker=False,
+                    passes_score=False,
+                )
+            },
+        }
+
+        result = await consensus_engine.calculate_consensus(
+            content="Test content",
+            qa_results=qa_results,
+            layers=sample_layers[:2]
+        )
+
+        assert result.average_score == 7.75
+        assert result.total_evaluations == 4
+        assert "evidence_grounding_logprobs" not in result.per_model_averages
+
+    @pytest.mark.asyncio
     async def test_detects_deal_breakers(
         self, consensus_engine, sample_layers, sample_qa_results_with_deal_breaker
     ):

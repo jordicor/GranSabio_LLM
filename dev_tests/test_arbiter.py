@@ -369,73 +369,6 @@ class TestConflictDetection:
 
 
 # =============================================================================
-# PHASE 2 TESTS: Arbiter Resolution (Algorithmic)
-# =============================================================================
-
-
-class TestArbiterResolution:
-    """Tests for Arbiter algorithmic resolution."""
-
-    @pytest.fixture
-    def arbiter(self):
-        """Create Arbiter instance for testing."""
-        mock_ai_service = object()
-        return Arbiter(ai_service=mock_ai_service)
-
-    def test_resolve_algorithmically_higher_severity_wins(self, arbiter):
-        """Should prioritize higher severity edits."""
-        edits = [
-            create_proposed_edit(severity="minor", source_model="claude", paragraph_key="p1", confidence=1.0),
-            create_proposed_edit(severity="critical", source_model="gpt-4o", paragraph_key="p1", confidence=1.0),
-        ]
-        conflicts = [ConflictInfo(
-            conflict_type=ConflictType.SEVERITY_MISMATCH,
-            paragraph_key="p1",
-            involved_edits=edits,
-            description="Test"
-        )]
-        decisions = arbiter._resolve_algorithmically(edits, conflicts)
-
-        # Critical severity should win
-        applied = [d for d in decisions if d.decision == ArbiterDecision.APPLY]
-        discarded = [d for d in decisions if d.decision == ArbiterDecision.DISCARD]
-
-        assert len(applied) == 1
-        assert len(discarded) == 1
-        assert applied[0].source_model == "gpt-4o"  # Critical severity
-        assert discarded[0].source_model == "claude"  # Minor severity
-
-    def test_resolve_algorithmically_first_wins_same_severity(self, arbiter):
-        """With same severity, first processed wins."""
-        edits = [
-            create_proposed_edit(severity="major", source_model="gpt-4o", paragraph_key="p1", confidence=0.9),
-            create_proposed_edit(severity="major", source_model="claude", paragraph_key="p1", confidence=0.8),
-        ]
-        conflicts = []
-        decisions = arbiter._resolve_algorithmically(edits, conflicts)
-
-        applied = [d for d in decisions if d.decision == ArbiterDecision.APPLY]
-        discarded = [d for d in decisions if d.decision == ArbiterDecision.DISCARD]
-
-        assert len(applied) == 1
-        assert len(discarded) == 1
-        # Higher confidence should win
-        assert applied[0].source_model == "gpt-4o"
-
-    def test_resolve_no_conflict_all_apply(self, arbiter):
-        """Without conflicts, all unique edits should apply."""
-        edits = [
-            create_proposed_edit(paragraph_key="p1", source_model="gpt-4o"),
-            create_proposed_edit(paragraph_key="p2", source_model="claude"),
-            create_proposed_edit(paragraph_key="p3", source_model="gemini"),
-        ]
-        decisions = arbiter._resolve_algorithmically(edits, [])
-
-        applied = [d for d in decisions if d.decision == ArbiterDecision.APPLY]
-        assert len(applied) == 3
-
-
-# =============================================================================
 # PHASE 2 TESTS: Arbitrate Method (async tests)
 # =============================================================================
 
@@ -498,9 +431,8 @@ class TestArbitrateMethod:
         assert len(result.edits_to_apply) == 2
         assert "verified" in result.arbiter_reasoning.lower() or "aligned" in result.arbiter_reasoning.lower()
 
-    async def test_arbitrate_with_conflicts_uses_algorithmic_fallback(self, basic_context):
-        """With conflicts and failing AI, should use algorithmic fallback."""
-        # Use a mock that fails
+    async def test_arbitrate_with_conflicts_fails_fast_without_ai(self, basic_context):
+        """Without an AI client, arbitration should fail fast instead of guessing."""
         arbiter = Arbiter(ai_service=object())
         # Create conflicting edits
         basic_context.proposed_edits = [
@@ -518,15 +450,8 @@ class TestArbitrateMethod:
             ),
         ]
         basic_context.qa_model_count = 2
-        result = await arbiter.arbitrate(basic_context)
-
-        # Should detect conflict
-        assert result.conflicts_found > 0
-        # Should have applied one, discarded one
-        assert len(result.edits_to_apply) == 1
-        assert len(result.edits_discarded) == 1
-        # Critical severity should win
-        assert result.edits_to_apply[0].issue_severity.value == "critical"
+        with pytest.raises(RuntimeError, match="Arbiter AI call failed"):
+            await arbiter.arbitrate(basic_context)
 
     async def test_arbitrate_result_includes_distribution(self, arbiter, basic_context):
         """Result should include distribution classification."""
@@ -802,10 +727,12 @@ class TestExtractProposedEditsFromLayerResults:
         eval1 = MagicMock()
         eval1.identified_issues = [issue1]
         eval1.score = 7.5
+        eval1.deal_breaker = False
 
         eval2 = MagicMock()
         eval2.identified_issues = [issue2]
         eval2.score = 6.0
+        eval2.deal_breaker = False
 
         layer_results = {
             "gpt-4o": eval1,
@@ -855,10 +782,12 @@ class TestExtractProposedEditsFromLayerResults:
         eval1 = MagicMock()
         eval1.identified_issues = [minor_issue]
         eval1.score = 8.0
+        eval1.deal_breaker = False
 
         eval2 = MagicMock()
         eval2.identified_issues = [critical_issue]
         eval2.score = 5.0
+        eval2.deal_breaker = False
 
         layer_results = {"model1": eval1, "model2": eval2}
 
@@ -890,6 +819,7 @@ class TestExtractProposedEditsFromLayerResults:
         eval1 = MagicMock()
         eval1.identified_issues = issues
         eval1.score = 6.0
+        eval1.deal_breaker = False
 
         layer_results = {"model1": eval1}
 

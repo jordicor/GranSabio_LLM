@@ -449,7 +449,7 @@ class TestAsyncGenerate:
         from client import GranSabioClientError
 
         mock_response.json.return_value = {
-            "status": "rejected",
+            "status": "preflight_rejected",
             "preflight_feedback": {"user_feedback": "Contradictory requirements"}
         }
         client._session.request = AsyncMock(return_value=mock_response)
@@ -554,22 +554,60 @@ class TestAsyncWaitForResult:
         status_response.status = 200
         status_response.json = AsyncMock(return_value={
             "status": "failed",
-            "error": "Generation error"
+            "failure_reason": "Generation error"
         })
         status_response.__aenter__ = AsyncMock(return_value=status_response)
         status_response.__aexit__ = AsyncMock()
 
-        client._session.request = AsyncMock(return_value=status_response)
+        result_response = AsyncMock()
+        result_response.status = 200
+        result_response.json = AsyncMock(return_value={
+            "status": "failed",
+            "failure_reason": "Generation error",
+        })
+        result_response.__aenter__ = AsyncMock(return_value=result_response)
+        result_response.__aexit__ = AsyncMock()
+
+        client._session.request = AsyncMock(side_effect=[status_response, result_response])
 
         with pytest.raises(GranSabioClientError) as exc:
             await client.wait_for_result("sess-1", poll_interval=0.01)
 
-        assert "Generation failed" in str(exc.value)
+        assert "status 'failed'" in str(exc.value)
+        assert "Generation error" in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_wait_for_result_handles_semantic_rejection(self, client):
+        """Given: Session is semantically rejected, Then: Raises GranSabioGenerationRejected."""
+        from client import GranSabioGenerationRejected
+
+        status_response = AsyncMock()
+        status_response.status = 200
+        status_response.json = AsyncMock(return_value={"status": "rejected"})
+        status_response.__aenter__ = AsyncMock(return_value=status_response)
+        status_response.__aexit__ = AsyncMock()
+
+        result_response = AsyncMock()
+        result_response.status = 200
+        result_response.json = AsyncMock(return_value={
+            "status": "rejected",
+            "approved": False,
+            "failure_reason": "QA said no",
+        })
+        result_response.__aenter__ = AsyncMock(return_value=result_response)
+        result_response.__aexit__ = AsyncMock()
+
+        client._session.request = AsyncMock(side_effect=[status_response, result_response])
+
+        with pytest.raises(GranSabioGenerationRejected) as exc:
+            await client.wait_for_result("sess-1", poll_interval=0.01)
+
+        assert "QA said no" in str(exc.value)
 
     @pytest.mark.asyncio
     async def test_wait_for_result_handles_cancellation(self, client):
-        """Given: Session cancelled, Then: Raises GranSabioClientError."""
-        from client import GranSabioClientError
+        """Given: Session cancelled, Then: Raises GranSabioGenerationCancelled."""
+        from client import GranSabioGenerationCancelled
 
         status_response = AsyncMock()
         status_response.status = 200
@@ -579,7 +617,7 @@ class TestAsyncWaitForResult:
 
         client._session.request = AsyncMock(return_value=status_response)
 
-        with pytest.raises(GranSabioClientError) as exc:
+        with pytest.raises(GranSabioGenerationCancelled) as exc:
             await client.wait_for_result("sess-1", poll_interval=0.01)
 
         assert "cancelled" in str(exc.value)
@@ -908,3 +946,106 @@ class TestAsyncBackwardCompatibility:
             from client import AsyncGranSabioClient
             assert isinstance(client, AsyncGranSabioClient)
             assert client._session is not None
+
+
+# ==============================================================================
+# Body-read transient-error handling (retry coverage for get_status / get_result)
+# ==============================================================================
+
+class TestAsyncBodyReadTransient:
+    """get_status / get_result / stop_session must convert mid-read aiohttp
+    payload / disconnect errors to TransientGranSabioError so `_call_with_retry`
+    retries them instead of bubbling them up as raw aiohttp exceptions.
+    """
+
+    @pytest.mark.asyncio
+    async def test_get_status_converts_client_payload_error(self, client):
+        from client import TransientGranSabioError
+
+        response = AsyncMock()
+        response.status = 200
+        response.json = AsyncMock(
+            side_effect=aiohttp.ClientPayloadError("truncated chunked body")
+        )
+        response.text = AsyncMock(return_value="")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+
+        client._request = AsyncMock(return_value=response)
+
+        with pytest.raises(TransientGranSabioError) as exc_info:
+            await client.get_status("sess-123")
+        assert "transient protocol error" in str(exc_info.value).lower()
+        assert "/status/sess-123" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_get_result_converts_server_disconnected(self, client):
+        from client import TransientGranSabioError
+
+        response = AsyncMock()
+        response.status = 200
+        response.json = AsyncMock(
+            side_effect=aiohttp.ServerDisconnectedError("peer closed connection")
+        )
+        response.text = AsyncMock(return_value="")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+
+        client._request = AsyncMock(return_value=response)
+
+        with pytest.raises(TransientGranSabioError):
+            await client.get_result("sess-xyz")
+
+    @pytest.mark.asyncio
+    async def test_get_status_error_path_text_read_converts_timeout(self, client):
+        """When the error-path text() itself times out, also convert to transient."""
+        from client import TransientGranSabioError
+
+        response = AsyncMock()
+        response.status = 500  # triggers the error path that reads text
+        response.json = AsyncMock(return_value={})
+        response.text = AsyncMock(side_effect=asyncio.TimeoutError())
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+
+        client._request = AsyncMock(return_value=response)
+
+        with pytest.raises(TransientGranSabioError):
+            await client.get_status("sess-timeout")
+
+    @pytest.mark.asyncio
+    async def test_call_with_retry_retries_body_read_failure(self, client):
+        """End-to-end: _call_with_retry must retry a body-read ClientPayloadError."""
+        from client import TransientGranSabioError
+
+        # First response raises ClientPayloadError on json(); second succeeds.
+        response_fail = AsyncMock()
+        response_fail.status = 200
+        response_fail.json = AsyncMock(
+            side_effect=aiohttp.ClientPayloadError("truncated")
+        )
+        response_fail.text = AsyncMock(return_value="")
+        response_fail.__aenter__ = AsyncMock(return_value=response_fail)
+        response_fail.__aexit__ = AsyncMock(return_value=None)
+
+        response_ok = AsyncMock()
+        response_ok.status = 200
+        response_ok.json = AsyncMock(return_value={"status": "completed"})
+        response_ok.text = AsyncMock(return_value="")
+        response_ok.__aenter__ = AsyncMock(return_value=response_ok)
+        response_ok.__aexit__ = AsyncMock(return_value=None)
+
+        client._request = AsyncMock(side_effect=[response_fail, response_ok])
+
+        # Patch the retry-backoff sleep so the test runs fast.
+        import time
+        with patch("asyncio.sleep", new=AsyncMock()):
+            result = await client._call_with_retry(
+                op_name="get_status",
+                session_id="sess-retry",
+                func=lambda: client.get_status("sess-retry"),
+                start_time=time.monotonic(),
+                max_wait=60.0,
+            )
+        assert result == {"status": "completed"}
+        assert client._request.call_count == 2

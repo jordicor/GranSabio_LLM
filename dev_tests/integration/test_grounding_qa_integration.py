@@ -701,6 +701,33 @@ class TestComprehensiveEvaluationIntegration:
         assert grounding_data["flagged_claims"] == 1
 
     @pytest.mark.asyncio
+    async def test_comprehensive_force_iteration_still_includes_grounding_result(
+        self, qa_engine, grounding_config_deal_breaker, mock_grounding_result_failed
+    ):
+        """
+        Given: Grounding triggers an early stop
+        When: evaluate_content_comprehensive short-circuits
+        Then: The returned payload still exposes evidence_grounding details
+        """
+        mock_grounding_result_failed.triggered_action = "deal_breaker"
+        qa_engine.grounding_engine.run_grounding_check = AsyncMock(
+            return_value=mock_grounding_result_failed
+        )
+
+        result = await qa_engine.evaluate_content_comprehensive(
+            content="Test content about Marie Curie.",
+            layers=[],
+            qa_models=[],
+            evidence_grounding_config=grounding_config_deal_breaker,
+            context_for_grounding="Marie Curie was born in Warsaw.",
+        )
+
+        assert result["summary"]["force_iteration"] is True
+        assert result["evidence_grounding"] is not None
+        assert result["evidence_grounding"]["passed"] is False
+        assert result["evidence_grounding"]["triggered_action"] == "deal_breaker"
+
+    @pytest.mark.asyncio
     async def test_comprehensive_no_grounding_when_disabled(self, qa_engine):
         """
         Given: Grounding not enabled

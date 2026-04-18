@@ -13,15 +13,36 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from logging_utils import create_phase_logger, Phase
 from attachments_router import get_attachment_manager
-from config import Config, config
+from config import Config, EDITABLE_CONTENT_TYPES, config
 from deal_breaker_tracker import get_tracker
 from feedback_memory import get_feedback_manager
 from gran_sabio import GranSabioInvocationError, GranSabioProcessCancelled
+from gran_sabio_supervisor import GranSabioSupervisor
 from models import ContentRequest, QALayer, GenerationStatus, ImageRef, ImageData
+from deterministic_validation import has_active_generation_validators, validate_generation_candidate
 from preflight_validator import run_preflight_validation
 from .prompt_templates import build_json_validation_error_prompt, build_deal_breaker_awareness_prompt
 from qa_engine import QAProcessCancelled, QAModelUnavailableError
-from ai_service import AIRequestError, StreamChunk
+from qa_result_utils import (
+    apply_gran_sabio_false_positive_override,
+    build_qa_counts,
+    is_technical_qa_failure,
+    semantic_deal_breakers,
+)
+from ai_service import AccentGuardError, AIRequestError, StreamChunk
+from llm_accent_prompts import ACCENT_SYSTEM_PROMPT_SNIPPET
+from model_aliasing import ModelAliasRegistry, PromptPart, get_evaluator_alias, to_prompt_safe_data
+from evidence_grounding import get_effective_order
+from long_text.controller import (
+    LongTextGenerationError,
+    LongTextProcessCancelled,
+    generate_long_text_candidate,
+)
+from long_text.models import (
+    IterationCandidateResult,
+    coerce_long_text_state,
+    coerce_resolved_long_text_mode,
+)
 from services.attachment_manager import (
     AttachmentManager,
     AttachmentError,
@@ -42,6 +63,7 @@ from smart_edit import (
     TargetMode,
     TargetScope,
     EditResult,
+    build_segment_map,
     locate_by_markers,
     locate_by_word_indices,
     normalize_source_text,
@@ -323,7 +345,12 @@ async def resolve_images_for_generation(
 
 def _build_final_result(session: Dict[str, Any]):
     status = session.get("status")
-    final_states = {GenerationStatus.COMPLETED, GenerationStatus.FAILED, GenerationStatus.CANCELLED}
+    final_states = {
+        GenerationStatus.COMPLETED,
+        GenerationStatus.REJECTED,
+        GenerationStatus.FAILED,
+        GenerationStatus.CANCELLED,
+    }
     if status not in final_states:
         return ("unfinished", None)
 
@@ -388,20 +415,22 @@ def _attach_usage_metadata(session: Dict[str, Any], final_result: Dict[str, Any]
         final_result.pop("costs", None)
         return
 
-    final_result["costs"] = summary
+    alias_registry = getattr(request, "_model_alias_registry", None) or session.get("model_alias_registry")
+    prompt_safe_summary = to_prompt_safe_data(summary, alias_registry)
+    final_result["costs"] = prompt_safe_summary
     content_value = final_result.get("content")
     json_output_requested = getattr(request, "json_output", False) or getattr(request, "content_type", None) == "json"
 
     if json_output_requested:
         if isinstance(content_value, dict):
-            final_result["content"] = inject_costs_into_json_payload(content_value, summary)
+            final_result["content"] = inject_costs_into_json_payload(content_value, prompt_safe_summary)
         elif isinstance(content_value, str):
-            final_result["content"] = merge_costs_into_json_string(content_value, summary)
+            final_result["content"] = merge_costs_into_json_string(content_value, prompt_safe_summary)
         elif content_value is not None:
-            final_result["content"] = inject_costs_into_json_payload(content_value, summary)
+            final_result["content"] = inject_costs_into_json_payload(content_value, prompt_safe_summary)
     else:
         if isinstance(content_value, str):
-            final_result["content"] = tracker.embed_text_summary(content_value, level)
+            final_result["content"] = tracker.embed_text_summary(content_value, 1)
 
 def _attach_json_guard_metadata(session: Dict[str, Any], final_result: Dict[str, Any], request: ContentRequest) -> None:
     """Attach JSON guard metadata to the final result when applicable."""
@@ -446,12 +475,144 @@ def _set_last_generated_content_metrics(session: Dict[str, Any], content: str) -
     session["last_generated_content_length"] = len(content)
     session["last_generated_content_word_count"] = count_words(content) if content else 0
 
+
+def _build_smart_edit_marker_config(content: str, request: ContentRequest) -> Dict[str, Any]:
+    """Build the active smart-edit locator config for the current draft."""
+
+    from smart_edit import build_word_map, find_optimal_phrase_length
+
+    locator_mode = getattr(request, "smart_edit_locator_mode", "ids")
+    if locator_mode == "ids":
+        segment_map = build_segment_map(content)
+        return {
+            "mode": "ids",
+            "phrase_length": None,
+            "word_map": None,
+            "word_map_formatted": None,
+            "draft_map_formatted": segment_map.render_for_prompt(),
+        }
+
+    optimal_n = find_optimal_phrase_length(
+        content,
+        min_n=config.SMART_EDIT_MIN_PHRASE_LENGTH,
+        max_n=config.SMART_EDIT_MAX_PHRASE_LENGTH,
+    )
+    if optimal_n is not None:
+        return {
+            "mode": "phrase",
+            "phrase_length": optimal_n,
+            "word_map": None,
+            "word_map_formatted": None,
+            "draft_map_formatted": None,
+        }
+
+    word_map_tokens, word_map_formatted = build_word_map(content)
+    return {
+        "mode": "word_index",
+        "phrase_length": None,
+        "word_map": word_map_tokens,
+        "word_map_formatted": word_map_formatted,
+        "draft_map_formatted": None,
+    }
+
+
+def _build_compact_iteration_memory_prompt(iterations: List[Dict[str, Any]], limit: int = 3) -> str:
+    """Build a short per-session memory block for the next generation prompt."""
+
+    if not iterations:
+        return ""
+
+    lines = ["RECENT ITERATION MEMORY:"]
+    for item in iterations[-limit:]:
+        iteration_num = item.get("iteration", "?")
+        mode = item.get("generation_mode", "normal")
+        approved = item.get("approved", False)
+        status = "approved" if approved else "rejected"
+        summary_parts = [f"- Iteration {iteration_num} [{mode}] was {status}"]
+
+        smart_edit_metadata = item.get("smart_edit_metadata") or {}
+        paragraphs_affected = smart_edit_metadata.get("paragraphs_affected")
+        total_edits = smart_edit_metadata.get("total_edits")
+        if paragraphs_affected:
+            summary_parts.append(
+                f"{paragraphs_affected} target span(s) edited"
+                + (f" across {total_edits} requested change(s)" if total_edits else "")
+            )
+
+        actionable_feedback = _extract_consensus_field(item.get("consensus"), "actionable_feedback") or []
+        if not actionable_feedback:
+            actionable_feedback = _fallback_actionable_feedback(item.get("qa_results") or {})
+        if actionable_feedback:
+            summary_parts.append("focus: " + "; ".join(actionable_feedback[:2]))
+
+        lines.append(". ".join(summary_parts) + ".")
+
+    return "\n".join(lines)
+
+
+def _record_accent_fail_open(session: Dict[str, Any], *, path: str, reason: str) -> None:
+    """Increment session-level accent fail-open telemetry accumulators (§5.12)."""
+    session.setdefault("accent_fail_open_count", 0)
+    session.setdefault("accent_fail_open_paths", [])
+    session["accent_fail_open_count"] += 1
+    session["accent_fail_open_paths"].append(path)
+
+
+def _merge_accent_fail_open_into_session(session: Dict[str, Any], tool_metadata: Optional[Dict[str, Any]]) -> None:
+    """Merge envelope deltas from tool_metadata into session accumulators (§5.12)."""
+    if not tool_metadata:
+        return
+    delta_count = int(tool_metadata.get("accent_fail_open_delta_count", 0) or 0)
+    delta_paths = list(tool_metadata.get("accent_fail_open_delta_paths", []) or [])
+    if delta_count == 0 and not delta_paths:
+        return
+    session.setdefault("accent_fail_open_count", 0)
+    session.setdefault("accent_fail_open_paths", [])
+    session["accent_fail_open_count"] += delta_count
+    session["accent_fail_open_paths"].extend(delta_paths)
+
+
+def _should_use_generation_tools(request: ContentRequest) -> bool:
+    """Decide whether the generator should use the deterministic validation tool loop."""
+
+    tools_mode = getattr(request, "generation_tools_mode", "auto")
+    if tools_mode == "never":
+        return False
+
+    mechanical_active = has_active_generation_validators(request)
+    # Defensive: production ContentRequest always has llm_accent_guard via default_factory,
+    # but SimpleNamespace objects used in tests/helpers may not. Treat missing/None as "off".
+    accent_guard = getattr(request, "llm_accent_guard", None)
+    accent_mode = getattr(accent_guard, "mode", "off") if accent_guard is not None else "off"
+    accent_active = accent_mode in {"inline", "inline_post"}
+
+    if not (mechanical_active or accent_active):
+        return False
+
+    try:
+        model_info = config.get_model_info(request.generator_model)
+    except Exception:
+        return False
+
+    provider = model_info.get("provider")
+    model_id = str(model_info.get("model_id", "")).lower()
+    provider_key = (provider or "").lower()
+    supported_providers = {"openai", "claude", "anthropic", "gemini", "google", "xai", "openrouter"}
+    supported = provider_key in supported_providers
+
+    if provider_key == "openai" and any(marker in model_id for marker in ["o3-pro", "gpt-5-pro"]):
+        supported = False
+
+    if tools_mode == "always":
+        return True
+    return supported
+
 def _get_final_content(session: Dict[str, Any], raw_content: str, request: ContentRequest, is_gran_sabio: bool = False) -> Any:
     """
     Determine what content to use in the final result.
 
-    When json_output=true and content_type is NOT "json", return the parsed JSON
-    instead of the raw content if it's available.
+    When json_output=true, return the parsed JSON instead of the raw content
+    if it's available.
 
     Args:
         session: The current session
@@ -465,9 +626,7 @@ def _get_final_content(session: Dict[str, Any], raw_content: str, request: Conte
     # Check if we should use parsed JSON
     json_output_requested = getattr(request, "json_output", False) or getattr(request, "content_type", None) == "json"
 
-    # If json_output was requested AND content_type is NOT "json"
-    # (for content_type="json", keep the current behavior of returning raw)
-    if json_output_requested and getattr(request, "content_type", None) != "json":
+    if json_output_requested:
         # Check for Gran Sabio parsed content if applicable
         if is_gran_sabio:
             parsed_content = session.get("gran_sabio_json_parsed_content")
@@ -563,6 +722,7 @@ async def _generate_full_content(
     json_output_requested: bool,
     phase_logger: Optional[Any] = None,
     images: Optional[List[ImageData]] = None,
+    prompt_safety_parts: Optional[List[PromptPart]] = None,
 ) -> str:
     """
     Generate complete content from scratch using AI service.
@@ -622,6 +782,147 @@ async def _generate_full_content(
         },
     )
 
+    if _should_use_generation_tools(request):
+        tool_rounds = max(2, min(5, getattr(request, "max_iterations", 5)))
+        await add_verbose_log(
+            session_id,
+            f"[Tools] Generator validation tools enabled ({tool_rounds} internal rounds max)"
+        )
+
+        def _validate_draft_tool(candidate: str) -> Dict[str, Any]:
+            report = validate_generation_candidate(
+                candidate,
+                request,
+                include_json_validation=json_output_requested or bool(getattr(request, "target_field", None)),
+            )
+            return report.to_tool_payload(request=request)
+
+        # Accent guard gating (Cambio 1 v5, §5.8)
+        accent_mode = request.llm_accent_guard.mode
+        prose_mode = (
+            accent_mode != "off"
+            and not json_output_requested
+            and request.content_type in EDITABLE_CONTENT_TYPES
+        )
+        accent_snippet = ACCENT_SYSTEM_PROMPT_SNIPPET if prose_mode else None
+        accent_guard_for_call = request.llm_accent_guard if accent_mode != "off" else None
+        enable_validate_draft = has_active_generation_validators(request)
+
+        try:
+            content, tool_metadata = await ai_service.generate_content_with_validation_tools(
+                prompt=final_prompt,
+                model=request.generator_model,
+                validation_callback=_validate_draft_tool,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                system_prompt=request.system_prompt,
+                extra_verbose=getattr(request, 'extra_verbose', False),
+                reasoning_effort=reasoning_effort_value,
+                thinking_budget_tokens=thinking_budget_value,
+                content_type=request.content_type,
+                json_output=json_output_requested,
+                json_schema=getattr(request, 'json_schema', None),
+                usage_callback=usage_tracker.create_callback(
+                    phase="generation",
+                    role="generator",
+                    iteration=iteration + 1,
+                    metadata={"requested_model": request.generator_model, "tool_loop": True},
+                ) if usage_tracker else None,
+                phase_logger=phase_logger,
+                images=images,
+                max_rounds=tool_rounds,
+                accent_guard=accent_guard_for_call,
+                extra_system_instructions=accent_snippet,
+                enable_validate_draft=enable_validate_draft,
+                min_global_score=request.min_global_score,
+                model_alias_registry=getattr(request, "_model_alias_registry", None),
+                prompt_safety_parts=prompt_safety_parts,
+            )
+        except AccentGuardError as accent_exc:
+            # Fail-open only applies to technical accent-audit failures. A semantic
+            # rejection means the guard worked and must not fall through ungated.
+            guard = request.llm_accent_guard
+            accent_mode_local = guard.mode
+            on_error_local = guard.on_error
+            logger.warning(
+                "Session %s: AccentGuardError during generator tool loop (%s): reason=%s details=%s",
+                session_id,
+                request.generator_model,
+                accent_exc.reason,
+                accent_exc.details,
+            )
+            await add_verbose_log(
+                session_id,
+                f"[Accent] {accent_mode_local} failed ({accent_exc.reason}): {accent_exc}"
+            )
+            technical_accent_reasons = {"error", "timeout", "parse_failure"}
+            should_fail_closed = (
+                accent_mode_local in {"inline", "inline_post"}
+                and (
+                    on_error_local == "fail_closed"
+                    or accent_exc.reason not in technical_accent_reasons
+                )
+            )
+            if should_fail_closed:
+                # No fallback. Mark failure_reason so the status handler can surface accent context.
+                session["failure_reason"] = "accent_failed"
+                session["accent_guard_reason"] = accent_exc.reason
+                session["accent_guard_details"] = dict(accent_exc.details)
+                raise
+            # fail_open: record telemetry for technical failures and fall through to standard generation.
+            _record_accent_fail_open(session, path="processor_exception", reason=accent_exc.reason)
+        except ValueError as exc:
+            # Check accent fail_closed contract before allowing ungated fallback to standard generation.
+            guard = request.llm_accent_guard
+            accent_mode_local = guard.mode
+            on_error_local = guard.on_error
+            if accent_mode_local in {"inline", "inline_post"} and on_error_local == "fail_closed":
+                # Tool-loop unavailable but accent fail_closed requires gating. Upgrade to AccentGuardError.
+                session["failure_reason"] = "accent_failed"
+                session["accent_guard_reason"] = "error"
+                session["accent_guard_details"] = {
+                    "original_exception": type(exc).__name__,
+                    "path": "value_error_fallback",
+                }
+                raise AccentGuardError(
+                    f"Tool-loop unavailable for fail_closed inline accent mode: {exc}",
+                    reason="error",
+                    details={"original_exception": type(exc).__name__, "path": "value_error_fallback"},
+                ) from exc
+            if accent_mode_local in {"inline", "inline_post"} and on_error_local == "fail_open":
+                _record_accent_fail_open(session, path="value_error_fallback", reason="error")
+            logger.info(
+                "Session %s: Generation tools unavailable for %s (%s). Falling back to standard generation.",
+                session_id,
+                request.generator_model,
+                exc,
+            )
+            await add_verbose_log(session_id, f"[Tools] Fallback to standard generation: {exc}")
+        except Exception:
+            raise
+        else:
+            _merge_accent_fail_open_into_session(session, tool_metadata)
+            session["generation_tool_metadata"] = tool_metadata
+            await _debug_record_event(
+                session_id,
+                "generator_tool_loop_completed",
+                {
+                    "iteration": iteration + 1,
+                    "model": request.generator_model,
+                    "metadata": tool_metadata,
+                    "content": content,
+                },
+            )
+
+            word_count = len(content.split())
+            await add_verbose_log(
+                session_id,
+                f"[Tools] Content generated after {tool_metadata.get('turns', 0)} internal validation round(s): {word_count} words"
+            )
+
+            session["smart_edit_consecutive"] = 0
+            return content
+
     # Streaming retry configuration
     max_stream_attempts = config.MAX_RETRIES if config.RETRY_STREAMING_AFTER_PARTIAL else 1
     stream_delay = config.RETRY_DELAY
@@ -675,6 +976,8 @@ async def _generate_full_content(
                 ) if usage_tracker else None,
                 phase_logger=phase_logger,
                 images=images,
+                model_alias_registry=getattr(request, "_model_alias_registry", None),
+                prompt_safety_parts=prompt_safety_parts,
             ):
                 # Handle StreamChunk (Claude with thinking) vs plain string (other providers)
                 # StreamChunk allows us to stream thinking content live while keeping it
@@ -821,6 +1124,70 @@ async def _generate_full_content(
     return content
 
 
+async def generate_iteration_candidate(
+    *,
+    request: ContentRequest,
+    session: Dict[str, Any],
+    session_id: str,
+    final_prompt: str,
+    context_prompt: str,
+    ai_service: Any,
+    usage_tracker: Optional[UsageTracker],
+    iteration: int,
+    json_output_requested: bool,
+    phase_logger: Optional[Any],
+    images: Optional[List[ImageData]],
+    prompt_safety_parts: Optional[List[PromptPart]] = None,
+) -> IterationCandidateResult:
+    """Generate the next outer-iteration candidate in standard or Long Text mode."""
+
+    resolved_mode_payload = getattr(request, "_resolved_long_text_mode", None) or session.get("resolved_long_text_mode")
+    resolved_mode = coerce_resolved_long_text_mode(resolved_mode_payload)
+    if not resolved_mode.enabled:
+        content = await _generate_full_content(
+            final_prompt=final_prompt,
+            request=request,
+            ai_service=ai_service,
+            usage_tracker=usage_tracker,
+            session_id=session_id,
+            session=session,
+            iteration=iteration,
+            json_output_requested=json_output_requested,
+            phase_logger=phase_logger,
+            images=images,
+            prompt_safety_parts=prompt_safety_parts,
+        )
+        return IterationCandidateResult(
+            content=content,
+            mode="standard",
+            long_text_state=None,
+            controller_summary=None,
+            diagnostics_summary=None,
+            used_tool_loop=bool(session.get("generation_tool_metadata")),
+        )
+
+    controller_result = await generate_long_text_candidate(
+        request=request,
+        session=session,
+        session_id=session_id,
+        ai_service=ai_service,
+        usage_tracker=usage_tracker,
+        phase_logger=phase_logger,
+        long_text_state=session.get("long_text_state"),
+        iteration=iteration,
+        cancellation_requested=lambda: check_session_cancelled(session_id),
+        context_prompt=context_prompt,
+    )
+    return IterationCandidateResult(
+        content=controller_result.selected_candidate.public_text,
+        mode="long_text",
+        long_text_state=controller_result.long_text_state,
+        controller_summary=controller_result.controller_summary,
+        diagnostics_summary=controller_result.diagnostics_summary,
+        used_tool_loop=controller_result.used_tool_loop,
+    )
+
+
 def _build_paragraph_edit_prompt(
     base_content: str,
     edit_range,
@@ -947,6 +1314,11 @@ def _get_paragraph_key(edit_range: "TextEditRange") -> str:
     """
     marker_mode = getattr(edit_range, 'marker_mode', 'phrase')
 
+    if marker_mode == "ids":
+        target_ids = getattr(edit_range, 'target_ids', None) or []
+        if target_ids:
+            return "ids:" + ",".join(str(target_id) for target_id in target_ids)
+
     if marker_mode == "word_index":
         start_idx = getattr(edit_range, 'start_word_index', 0)
         end_idx = getattr(edit_range, 'end_word_index', 0)
@@ -1007,6 +1379,39 @@ def _locate_edit_segment(
     marker_mode = getattr(edit, 'marker_mode', 'phrase')
     start_word_idx = getattr(edit, 'start_word_index', None)
     end_word_idx = getattr(edit, 'end_word_index', None)
+
+    if marker_mode == "ids":
+        target_ids = getattr(edit, 'target_ids', None) or []
+        evidence_quote = getattr(edit, 'evidence_quote', '') or ''
+        if not target_ids:
+            logger.warning("ID mode requested but target_ids is empty")
+            return None
+
+        segment_map = build_segment_map(text)
+        resolution = segment_map.resolve_target_ids(target_ids, evidence_quote)
+        if resolution.rejected_reason:
+            logger.warning(
+                "Could not resolve target_ids %s: %s",
+                target_ids,
+                resolution.rejected_reason,
+            )
+            return None
+        if resolution.invalid_ids:
+            logger.warning(
+                "Could not resolve target_ids %s due to invalid IDs: %s",
+                target_ids,
+                resolution.invalid_ids,
+            )
+            return None
+        if len(resolution.spans) != 1:
+            logger.warning(
+                "ID mode expected exactly one contiguous span for %s but found %d",
+                target_ids,
+                len(resolution.spans),
+            )
+            return None
+        span = resolution.spans[0]
+        return (span.start, span.end)
 
     if marker_mode == "word_index" and start_word_idx is not None and end_word_idx is not None:
         # Word index mode
@@ -1081,7 +1486,8 @@ def _build_combined_instruction(
                 "exact_fragment": edit.exact_fragment,
                 "new_content": edit.new_content,  # None for DELETE
             }
-            return fallback_instruction, direct_op
+            if _is_structurally_safe_direct_operation(direct_op):
+                return fallback_instruction, direct_op
 
         # Single edit but requires AI
         return fallback_instruction, None
@@ -1096,6 +1502,68 @@ def _build_combined_instruction(
 
     combined_instruction = "Fix the following issues in this paragraph:\n" + "\n".join(issues)
     return combined_instruction, None
+
+
+def _has_unbalanced_dialogue_delimiters(text: Optional[str]) -> bool:
+    """Detect direct-replace fragments that cut through quoted dialogue unsafely."""
+    if not text:
+        return False
+
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    symmetric_dialogue_quotes = {'"', "'"}
+    dialogue_pairs = {
+        "«": "»",
+        "‹": "›",
+        "“": "”",
+        "„": "“",
+        "‘": "’",
+        "「": "」",
+        "『": "』",
+        "《": "》",
+        "〈": "〉",
+    }
+    dialogue_chars = (
+        symmetric_dialogue_quotes |
+        set(dialogue_pairs.keys()) |
+        set(dialogue_pairs.values())
+    )
+
+    starts_with_dialogue = stripped[0] in dialogue_chars
+    ends_with_dialogue = stripped[-1] in dialogue_chars
+    if starts_with_dialogue != ends_with_dialogue:
+        return True
+
+    for quote in symmetric_dialogue_quotes:
+        if stripped.startswith(quote) != stripped.endswith(quote):
+            return True
+
+    for opening, closing in dialogue_pairs.items():
+        if stripped.startswith(opening) and closing not in stripped[1:]:
+            return True
+        if stripped.endswith(closing) and opening not in stripped[:-1]:
+            return True
+
+    return False
+
+
+def _is_structurally_safe_direct_operation(direct_op: Dict[str, Any]) -> bool:
+    """Reject literal replacements that would likely leave dangling dialogue punctuation."""
+    from smart_edit import OperationType
+
+    edit_type = direct_op.get("edit_type")
+    if edit_type != OperationType.REPLACE:
+        return True
+
+    exact_fragment = direct_op.get("exact_fragment")
+    new_content = direct_op.get("new_content")
+    if _has_unbalanced_dialogue_delimiters(exact_fragment):
+        return False
+    if _has_unbalanced_dialogue_delimiters(new_content):
+        return False
+    return True
 
 
 def _apply_direct_operation(
@@ -1219,6 +1687,66 @@ def _calculate_layer_avg_score(
     return sum(scores) / len(scores) if scores else 0.0
 
 
+def _has_valid_layer_scores(layer_results: Dict[str, Any]) -> bool:
+    """Return whether at least one QA evaluation produced a numeric score."""
+    return any(
+        getattr(evaluation, "score", None) is not None
+        for evaluation in layer_results.values()
+    )
+
+
+_TECHNICAL_QA_FAILURE_REASONS = frozenset({
+    "technical error during evaluation",
+    "timeout during evaluation",
+})
+
+
+def _is_technical_qa_failure(evaluation: Any) -> bool:
+    """Return True for local/provider failures represented as QA placeholders."""
+    return is_technical_qa_failure(evaluation)
+
+
+def _suppress_technical_qa_deal_breakers(layer_results: Dict[str, Any]) -> int:
+    """Ensure technical QA placeholders cannot trigger semantic deal-breaker flow."""
+    suppressed = 0
+    for evaluation in layer_results.values():
+        if getattr(evaluation, "deal_breaker", False) and _is_technical_qa_failure(evaluation):
+            original_reason = getattr(evaluation, "deal_breaker_reason", None)
+            evaluation.deal_breaker = False
+            evaluation.deal_breaker_reason = None
+            metadata = getattr(evaluation, "metadata", None)
+            if not isinstance(metadata, dict):
+                metadata = {}
+                evaluation.metadata = metadata
+            metadata["suppressed_deal_breaker"] = True
+            metadata["suppressed_deal_breaker_reason"] = original_reason
+            suppressed += 1
+    return suppressed
+
+
+async def _run_supervisor_review(
+    *,
+    session_id: str,
+    session: Dict[str, Any],
+    request: "ContentRequest",
+) -> Dict[str, Any]:
+    """Run observe-first supervisor and persist status/debug payloads."""
+
+    supervisor = GranSabioSupervisor()
+    result = supervisor.review_session(
+        session_id=session_id or "unknown",
+        tracker=get_tracker(),
+        request=request,
+        session=session,
+    )
+    await _debug_record_event(
+        session_id,
+        "gran_sabio_supervisor_review",
+        _serialize_for_debug(result),
+    )
+    return result
+
+
 def _extract_edits_from_layer_results(
     layer_results: Dict[str, Any],
     max_edits: int = 12
@@ -1283,6 +1811,8 @@ def _extract_proposed_edits_from_layer_results(
     all_proposed: List["ProposedEdit"] = []
 
     for model_name, evaluation in layer_results.items():
+        real_model_value = getattr(evaluation, "model", model_name)
+        real_model = real_model_value if isinstance(real_model_value, str) and real_model_value.strip() else model_name
         # Skip evaluations that marked deal_breaker - those require regeneration, not edits
         if getattr(evaluation, 'deal_breaker', False):
             logger.debug(f"Skipping edit proposals from {model_name} - marked as deal_breaker")
@@ -1294,7 +1824,8 @@ def _extract_proposed_edits_from_layer_results(
                     paragraph_key = _get_paragraph_key(issue)
                     all_proposed.append(ProposedEdit(
                         edit=issue,
-                        source_model=model_name,
+                        source_model=real_model,
+                        source_alias=get_evaluator_alias(evaluation, fallback=model_name),
                         source_score=score,
                         paragraph_key=paragraph_key
                     ))
@@ -1395,7 +1926,6 @@ async def _process_single_layer_with_edits(
         - passed: Whether the layer passed min_score
         - deal_breaker_info: Dict with deal-breaker info if triggered, else None
     """
-    from smart_edit import find_optimal_phrase_length, build_word_map
     from arbiter import LayerEditHistory, ArbiterContext
 
     min_score = layer.min_score or 7.0
@@ -1405,53 +1935,32 @@ async def _process_single_layer_with_edits(
     # Initialize edit history for this layer (used by Arbiter to detect cycles)
     layer_history = LayerEditHistory(layer_name=layer_name)
 
-    # Track rounds for this layer
-    for round_num in range(max_rounds):
-        if cancel_callback and await cancel_callback():
-            await add_verbose_log(session_id, f"Cancelled during layer {layer_name} round {round_num + 1}")
-            # Return current state
-            return content, {}, False, None
-
-        # Log round start
-        if progress_callback:
-            await progress_callback(f"Layer '{layer_name}' - Round {round_num + 1}/{max_rounds}")
-        if phase_logger:
-            phase_logger.info(f"Layer '{layer_name}' - Edit round {round_num + 1}/{max_rounds}")
+    async def _evaluate_current_content(current_content: str):
+        """Evaluate the current layer against the current content snapshot."""
 
         # Calculate marker config for current content
-        smart_edit_enabled = getattr(request, 'smart_editing_mode', 'auto') != 'disabled'
+        smart_edit_mode = getattr(request, 'smart_editing_mode', 'auto')
+        smart_edit_enabled = smart_edit_mode != 'never'
         marker_mode = "phrase"
         marker_length = None
         word_map_formatted = None
-        word_map_tokens = None
+        draft_map_formatted = None
 
         if smart_edit_enabled:
-            optimal_n = find_optimal_phrase_length(
-                content,
-                min_n=config.SMART_EDIT_MIN_PHRASE_LENGTH,
-                max_n=config.SMART_EDIT_MAX_PHRASE_LENGTH
-            )
-            if optimal_n is not None:
-                marker_mode = "phrase"
-                marker_length = optimal_n
-            else:
-                marker_mode = "word_index"
-            word_map_tokens, word_map_formatted = build_word_map(content)
+            marker_config = _build_smart_edit_marker_config(current_content, request)
+            marker_mode = marker_config.get('mode', 'phrase')
+            marker_length = marker_config.get('phrase_length')
+            word_map_formatted = marker_config.get('word_map_formatted')
+            draft_map_formatted = marker_config.get('draft_map_formatted')
 
             # Store marker config in session for smart edit phase
-            session['marker_config'] = {
-                'mode': marker_mode,
-                'phrase_length': marker_length,
-                'word_map': word_map_tokens,
-                'word_map_formatted': word_map_formatted
-            }
+            session['marker_config'] = marker_config
 
         # Format edit history for QA prompt injection (empty on round 0, populated on subsequent rounds)
         edit_history_for_qa = layer_history.format_for_prompt() if layer_history.rounds else None
 
-        # Evaluate this single layer
-        layer_results, deal_breaker_info = await qa_engine._evaluate_single_semantic_layer(
-            content=content,
+        return await qa_engine._evaluate_single_semantic_layer(
+            content=current_content,
             layer=layer,
             qa_models=qa_models,
             qa_model_names=qa_model_names,
@@ -1466,10 +1975,52 @@ async def _process_single_layer_with_edits(
             marker_mode=marker_mode,
             marker_length=marker_length,
             word_map_formatted=word_map_formatted,
+            draft_map_formatted=draft_map_formatted,
             input_images=images_for_qa,
-            content_for_bypass=None,  # Will be set if JSON extraction is needed
+            content_for_bypass=(
+                current_content
+                if getattr(request, "json_output", False) or getattr(request, "target_field", None)
+                else None
+            ),
             edit_history=edit_history_for_qa,
+            model_alias_registry=getattr(request, "_model_alias_registry", None),
         )
+
+    # Track rounds for this layer
+    for round_num in range(max_rounds):
+        if cancel_callback and await cancel_callback():
+            await add_verbose_log(session_id, f"Cancelled during layer {layer_name} round {round_num + 1}")
+            # Return current state
+            return content, {}, False, None
+
+        # Log round start
+        if progress_callback:
+            await progress_callback(f"Layer '{layer_name}' - Round {round_num + 1}/{max_rounds}")
+        if phase_logger:
+            phase_logger.info(f"Layer '{layer_name}' - Edit round {round_num + 1}/{max_rounds}")
+
+        # Evaluate this single layer
+        layer_results, deal_breaker_info = await _evaluate_current_content(content)
+        suppressed_technical_deal_breakers = _suppress_technical_qa_deal_breakers(layer_results)
+        if suppressed_technical_deal_breakers:
+            logger.warning(
+                "Suppressed %d technical QA deal-breaker placeholder(s) in layer '%s'.",
+                suppressed_technical_deal_breakers,
+                layer_name,
+            )
+            if deal_breaker_info:
+                remaining_deal_breakers = [
+                    evaluation
+                    for evaluation in layer_results.values()
+                    if getattr(evaluation, "deal_breaker", False)
+                ]
+                total_models_for_consensus = len(qa_model_names) or len(layer_results)
+                if len(remaining_deal_breakers) <= (total_models_for_consensus / 2):
+                    logger.warning(
+                        "Discarding majority deal-breaker info for layer '%s' after technical placeholders were suppressed.",
+                        layer_name,
+                    )
+                    deal_breaker_info = None
 
         # Check for deal-breaker (majority already handled in qa_engine)
         if deal_breaker_info:
@@ -1479,8 +2030,9 @@ async def _process_single_layer_with_edits(
             return content, layer_results, False, deal_breaker_info
 
         # Detect minority/tie deal-breakers and escalate to Gran Sabio inline
-        deal_breakers = [eval for eval in layer_results.values() if getattr(eval, "deal_breaker", False)]
-        total_models = len(qa_model_names) or len(layer_results)
+        deal_breakers = semantic_deal_breakers(layer_results)
+        consensus_counts = build_qa_counts(layer_results, len(qa_model_names) or len(layer_results))
+        total_models = consensus_counts["valid"]
         deal_breaker_count = len(deal_breakers)
         is_tie = total_models > 0 and total_models % 2 == 0 and deal_breaker_count * 2 == total_models
         is_minority = total_models > 0 and 0 < deal_breaker_count < (total_models / 2)
@@ -1502,27 +2054,47 @@ async def _process_single_layer_with_edits(
                     "immediate_stop": True,
                     "deal_breaker_count": deal_breaker_count,
                     "total_evaluated": total_models,
-                    "total_models": total_models,
+                    "total_models": len(qa_model_names) or len(layer_results),
                     "deal_breaker_details": [
                         {"model": eval.model, "reason": eval.deal_breaker_reason or eval.reason or ""}
                         for eval in deal_breakers
                     ],
                     "majority_threshold": total_models / 2,
+                    "qa_quorum": consensus_counts,
                     "type": "gran_sabio_unavailable",
                 }
                 return content, layer_results, False, fail_info
 
             # Increment session-level escalation counter
             session["gran_sabio_escalation_count"] = session.get("gran_sabio_escalation_count", 0) + 1
+            escalation_type = "50_50_tie" if is_tie else "minority_deal_breaker"
+            tracker = get_tracker()
+            first_deal_breaker = deal_breakers[0]
+            escalation_id = tracker.record_escalation(
+                session_id=session_id or "unknown",
+                iteration=iteration,
+                layer_name=layer.name,
+                trigger_type=escalation_type,
+                triggering_model=first_deal_breaker.model,
+                deal_breaker_reason=first_deal_breaker.deal_breaker_reason or first_deal_breaker.reason or "",
+                total_models=total_models,
+                deal_breaker_count=deal_breaker_count,
+                gran_sabio_model=getattr(request, "gran_sabio_model", None),
+                deal_breaker_evaluations=deal_breakers,
+            )
+            escalation_completed = False
 
             minority_data = {
                 "has_minority_deal_breakers": True,
                 "deal_breaker_count": deal_breaker_count,
                 "total_evaluations": total_models,
+                "total_models_configured": len(qa_model_names) or len(layer_results),
+                "qa_quorum": consensus_counts,
                 "details": [
                     {
                         "layer": layer.name,
                         "model": eval.model,
+                        "evaluator": get_evaluator_alias(eval, fallback=eval.model),
                         "reason": eval.deal_breaker_reason or eval.reason or "",
                         "score_given": getattr(eval, "score", None),
                         "layer_criteria": getattr(layer, "criteria", None),
@@ -1582,6 +2154,14 @@ async def _process_single_layer_with_edits(
                     phase_logger=phase_logger,
                 )
             except GranSabioProcessCancelled:
+                if not escalation_completed:
+                    tracker.complete_escalation(
+                        escalation_id=escalation_id,
+                        decision="cancelled",
+                        reasoning="Cancelled by user request",
+                        was_real=None,
+                    )
+                    escalation_completed = True
                 # Restore status and exit phase before re-raising
                 if phase_logger:
                     phase_logger._exit_phase(Phase.GRAN_SABIO)
@@ -1589,6 +2169,15 @@ async def _process_single_layer_with_edits(
                 raise
             except Exception as e:
                 logger.error(f"Gran Sabio escalation failed for layer '{layer_name}': {e}")
+                if not escalation_completed:
+                    tracker.complete_escalation(
+                        escalation_id=escalation_id,
+                        decision="error",
+                        reasoning=str(e),
+                        was_real=None,
+                    )
+                    escalation_completed = True
+                    await _run_supervisor_review(session_id=session_id, session=session, request=request)
                 # Restore status and exit phase before returning
                 if phase_logger:
                     phase_logger._exit_phase(Phase.GRAN_SABIO)
@@ -1597,12 +2186,13 @@ async def _process_single_layer_with_edits(
                     "immediate_stop": True,
                     "deal_breaker_count": deal_breaker_count,
                     "total_evaluated": total_models,
-                    "total_models": total_models,
+                    "total_models": len(qa_model_names) or len(layer_results),
                     "deal_breaker_details": [
                         {"model": eval.model, "reason": eval.deal_breaker_reason or eval.reason or ""}
                         for eval in deal_breakers
                     ],
                     "majority_threshold": total_models / 2,
+                    "qa_quorum": consensus_counts,
                     "type": "gran_sabio_error",
                     "error": str(e),
                 }
@@ -1612,6 +2202,15 @@ async def _process_single_layer_with_edits(
                 logger.error(
                     "Gran Sabio returned error for layer '%s': %s", layer_name, gs_result.error
                 )
+                if not escalation_completed:
+                    tracker.complete_escalation(
+                        escalation_id=escalation_id,
+                        decision="error",
+                        reasoning=gs_result.error,
+                        was_real=None,
+                    )
+                    escalation_completed = True
+                    await _run_supervisor_review(session_id=session_id, session=session, request=request)
                 # Restore status and exit phase before returning
                 if phase_logger:
                     phase_logger._exit_phase(Phase.GRAN_SABIO)
@@ -1620,12 +2219,13 @@ async def _process_single_layer_with_edits(
                     "immediate_stop": True,
                     "deal_breaker_count": deal_breaker_count,
                     "total_evaluated": total_models,
-                    "total_models": total_models,
+                    "total_models": len(qa_model_names) or len(layer_results),
                     "deal_breaker_details": [
                         {"model": eval.model, "reason": eval.deal_breaker_reason or eval.reason or ""}
                         for eval in deal_breakers
                     ],
                     "majority_threshold": total_models / 2,
+                    "qa_quorum": consensus_counts,
                     "type": "gran_sabio_error",
                     "error": gs_result.error,
                 }
@@ -1635,6 +2235,15 @@ async def _process_single_layer_with_edits(
                 logger.warning(
                     "Gran Sabio confirmed deal-breaker in layer '%s'. Forcing layer failure.", layer_name
                 )
+                if not escalation_completed:
+                    tracker.complete_escalation(
+                        escalation_id=escalation_id,
+                        decision="real",
+                        reasoning=gs_result.reason,
+                        was_real=True,
+                    )
+                    escalation_completed = True
+                    await _run_supervisor_review(session_id=session_id, session=session, request=request)
                 # Restore status and exit phase before returning
                 if phase_logger:
                     phase_logger._exit_phase(Phase.GRAN_SABIO)
@@ -1643,12 +2252,13 @@ async def _process_single_layer_with_edits(
                     "immediate_stop": True,
                     "deal_breaker_count": deal_breaker_count,
                     "total_evaluated": total_models,
-                    "total_models": total_models,
+                    "total_models": len(qa_model_names) or len(layer_results),
                     "deal_breaker_details": [
                         {"model": eval.model, "reason": eval.deal_breaker_reason or eval.reason or ""}
                         for eval in deal_breakers
                     ],
                     "majority_threshold": total_models / 2,
+                    "qa_quorum": consensus_counts,
                     "gran_sabio_confirmed": True,
                     "reason": gs_result.reason,
                 }
@@ -1660,6 +2270,15 @@ async def _process_single_layer_with_edits(
             )
             if progress_callback:
                 await progress_callback(f"Gran Sabio: FALSE POSITIVE in {layer_name}. Continuing.")
+            if not escalation_completed:
+                tracker.complete_escalation(
+                    escalation_id=escalation_id,
+                    decision="false_positive",
+                    reasoning=gs_result.reason,
+                    was_real=False,
+                )
+                escalation_completed = True
+                await _run_supervisor_review(session_id=session_id, session=session, request=request)
             # Restore status and exit phase - Gran Sabio review complete
             if phase_logger:
                 phase_logger._exit_phase(Phase.GRAN_SABIO)
@@ -1667,26 +2286,25 @@ async def _process_single_layer_with_edits(
 
             for eval in deal_breakers:
                 original_reason = eval.deal_breaker_reason or eval.reason or ""
-                eval.deal_breaker = False
-                eval.deal_breaker_reason = None
-                eval.reason = (
-                    f"[Gran Sabio Override] Originally flagged as deal-breaker but "
-                    f"Gran Sabio determined it to be false positive. Original reason: {original_reason}"
+                override = apply_gran_sabio_false_positive_override(
+                    eval,
+                    final_score=getattr(gs_result, "final_score", None),
+                    layer_min_score=getattr(layer, "min_score", 0.0),
+                    original_reason=original_reason,
                 )
-                if getattr(gs_result, "final_score", None) is not None:
-                    prev_score = eval.score
-                    eval.score = gs_result.final_score
-                    eval.passes_score = gs_result.final_score >= getattr(layer, "min_score", 0.0)
-                    logger.debug(
-                        "Gran Sabio override updated %s score from %s to %s",
-                        eval.model,
-                        prev_score,
-                        eval.score,
+                logger.debug(
+                    "Gran Sabio override updated %s score from %s to %s (raw=%s, clamped_to_min=%s)",
+                    eval.model,
+                    override["previous_score"],
+                    override["effective_score"],
+                    override["raw_score"],
+                    override["clamped_to_min"],
+                )
+                if progress_callback:
+                    await progress_callback(
+                        f"Gran Sabio override: {eval.model} score "
+                        f"{override['previous_score']} -> {override['effective_score']}"
                     )
-                    if progress_callback:
-                        await progress_callback(
-                            f"Gran Sabio override: {eval.model} score {prev_score} -> {gs_result.final_score}"
-                        )
 
             gs_modified_content = getattr(gs_result, "final_content", None)
             gs_modifications_made = getattr(gs_result, "modifications_made", False)
@@ -1703,6 +2321,19 @@ async def _process_single_layer_with_edits(
                 # Restart evaluation loop for this layer with modified content
                 continue
 
+        if not _has_valid_layer_scores(layer_results):
+            logger.error(
+                "Layer '%s' produced no valid QA scores; aborting smart-edit round "
+                "instead of collapsing to avg_score=0.0.",
+                layer_name,
+            )
+            if progress_callback:
+                await progress_callback(
+                    f"Layer '{layer_name}' failed: all QA evaluator results were invalid; "
+                    "full regeneration required"
+                )
+            return content, layer_results, False, None
+
         # Check if layer passed
         avg_score = _calculate_layer_avg_score(layer_results)
         if avg_score >= min_score:
@@ -1713,6 +2344,33 @@ async def _process_single_layer_with_edits(
 
         # Layer failed - check for edits
         logger.info(f"Layer '{layer_name}' failed with score {avg_score:.2f} < {min_score}")
+
+        if qa_engine.bypass_engine.should_skip_incremental_repair(layer, request):
+            logger.info(
+                "Layer '%s' uses deterministic bypass and skips smart-edit repair. "
+                "Will continue with current content and let the next iteration regenerate if needed.",
+                layer_name,
+            )
+            if progress_callback:
+                await progress_callback(
+                    f"Layer '{layer_name}' failed deterministically; skipping smart edits and forcing regeneration strategy"
+            )
+            return content, layer_results, False, None
+
+        content_type = getattr(request, 'content_type', 'other')
+        if content_type not in EDITABLE_CONTENT_TYPES:
+            logger.info(
+                "Layer '%s' failed but content_type='%s' is not editable. "
+                "Exiting layer without consuming smart-edit rounds.",
+                layer_name,
+                content_type,
+            )
+            if progress_callback:
+                await progress_callback(
+                    f"Layer '{layer_name}' failed (score: {avg_score:.2f}), "
+                    "content type not editable; full regeneration required next iteration"
+                )
+            return content, layer_results, False, None
 
         # Extract proposed edits with source model information for Arbiter
         proposed_edits = _extract_proposed_edits_from_layer_results(
@@ -1748,7 +2406,8 @@ async def _process_single_layer_with_edits(
                 evaluator_scores=evaluator_scores,
                 layer_history=layer_history,
                 gran_sabio_model=getattr(request, 'gran_sabio_model', None),
-                qa_model_count=len(qa_model_names)
+                qa_model_count=len(qa_model_names),
+                model_alias_registry=getattr(request, "_model_alias_registry", None),
             )
 
             # Call Arbiter for intelligent conflict resolution
@@ -1782,7 +2441,8 @@ async def _process_single_layer_with_edits(
                                  if d.get('source_model') == pe.source_model),
                                 "Approved by Arbiter"
                             ),
-                            source_model=pe.source_model
+                            source_model=pe.source_model,
+                            source_alias=pe.source_alias,
                         )
                         for pe in proposed_edits
                     ]
@@ -1826,6 +2486,17 @@ async def _process_single_layer_with_edits(
         if progress_callback:
             await progress_callback(f"Layer '{layer_name}': Applying {len(valid_edits)} edit(s)")
 
+        if session.get("long_text_state") is not None:
+            logger.info(
+                "Layer '%s': Long Text Mode keeps QA evaluate-only. Skipping smart-edit mutation.",
+                layer_name,
+            )
+            if progress_callback:
+                await progress_callback(
+                    f"Layer '{layer_name}': Long Text Mode skipped smart-edit mutation"
+                )
+            return content, layer_results, False, None
+
         # Prepare smart edit data
         session["smart_edit_data"] = {
             "base_content": content,
@@ -1852,6 +2523,64 @@ async def _process_single_layer_with_edits(
             )
             content = edited_content
             logger.info(f"Layer '{layer_name}': Edits applied successfully. Re-evaluating...")
+
+            # If edits land on the last configured round, perform one final re-check
+            # with the edited content before declaring the layer exhausted.
+            if round_num == max_rounds - 1:
+                if progress_callback:
+                    await progress_callback(f"Layer '{layer_name}': Final re-evaluation after last-round edits")
+                if phase_logger:
+                    phase_logger.info(f"Layer '{layer_name}' - Final re-evaluation after last-round edits")
+
+                layer_results, deal_breaker_info = await _evaluate_current_content(content)
+
+                if deal_breaker_info:
+                    logger.warning(
+                        "Layer '%s' triggered a deal-breaker during final re-evaluation after edits.",
+                        layer_name,
+                    )
+                    if progress_callback:
+                        await progress_callback(f"Deal-breaker in '{layer_name}' after final re-evaluation.")
+                    return content, layer_results, False, deal_breaker_info
+
+                if not _has_valid_layer_scores(layer_results):
+                    logger.error(
+                        "Layer '%s' produced no valid QA scores during final re-evaluation; "
+                        "aborting instead of collapsing to avg_score=0.0.",
+                        layer_name,
+                    )
+                    if progress_callback:
+                        await progress_callback(
+                            f"Layer '{layer_name}' final re-evaluation failed: "
+                            "all QA evaluator results were invalid"
+                        )
+                    return content, layer_results, False, None
+
+                final_recheck_score = _calculate_layer_avg_score(layer_results)
+                if final_recheck_score >= min_score:
+                    logger.info(
+                        "Layer '%s' PASSED after final re-evaluation with score %.2f >= %.2f",
+                        layer_name,
+                        final_recheck_score,
+                        min_score,
+                    )
+                    if progress_callback:
+                        await progress_callback(
+                            f"Layer '{layer_name}' PASSED after final re-evaluation (score: {final_recheck_score:.2f})"
+                        )
+                    return content, layer_results, True, None
+
+                logger.info(
+                    "Layer '%s' final re-evaluation after last-round edits still failed with score %.2f < %.2f",
+                    layer_name,
+                    final_recheck_score,
+                    min_score,
+                )
+                if progress_callback:
+                    await progress_callback(
+                        f"Layer '{layer_name}' final re-evaluation failed (score: {final_recheck_score:.2f})"
+                    )
+                break
 
         except SmartEditError as e:
             logger.error(f"Layer '{layer_name}': Smart edit failed: {e}")
@@ -1952,14 +2681,19 @@ async def _process_all_layers_with_edits(
                 request_name=session.get("request_name"),
             )
 
-    # Create Arbiter for intelligent conflict resolution between QA evaluators
-    from arbiter import Arbiter
-    arbiter = Arbiter(
-        ai_service=ai_service,
-        model=getattr(request, 'arbiter_model', None),
-        stream_callback=arbiter_stream_callback,
-    )
-    logger.info(f"Arbiter initialized with model: {arbiter.model}")
+    arbiter = None
+    if session.get("long_text_state") is None:
+        # Create Arbiter for intelligent conflict resolution between QA evaluators
+        from arbiter import Arbiter
+
+        arbiter = Arbiter(
+            ai_service=ai_service,
+            model=getattr(request, 'arbiter_model', None),
+            stream_callback=arbiter_stream_callback,
+        )
+        logger.info(f"Arbiter initialized with model: {arbiter.model}")
+    else:
+        logger.info("Long Text Mode active: per-layer QA will stay evaluate-only and skip Arbiter mutation.")
 
     for layer_idx, layer in enumerate(sorted_layers):
         layer_name = layer.name
@@ -1998,7 +2732,8 @@ async def _process_all_layers_with_edits(
         )
 
         # Update content with edited version
-        current_content = edited_content
+        if session.get("long_text_state") is None:
+            current_content = edited_content
 
         # Store results for this layer
         all_qa_results[layer_name] = layer_results
@@ -2022,8 +2757,20 @@ async def _process_all_layers_with_edits(
             "order": getattr(layer, 'order', 0),
         }
 
+        requires_full_regeneration = (
+            not layer_passed
+            and qa_engine.bypass_engine.should_skip_incremental_repair(layer, request)
+        )
+
         if not layer_passed:
             all_passed = False
+            if requires_full_regeneration:
+                logger.info(
+                    "Layer '%s' requires full regeneration after deterministic failure. "
+                    "Stopping remaining layers for this iteration.",
+                    layer_name,
+                )
+                stop_processing_layers = True
 
         # Handle deal-breaker
         if deal_breaker_info:
@@ -2082,6 +2829,58 @@ def _prioritize_edit_ranges(
         key=lambda x: (priority_map.get(x.issue_severity, 1), getattr(x, 'confidence', 1.0)),
         reverse=True
     )
+
+
+def _get_evaluated_layers_for_approval(
+    configured_layers: List[QALayer],
+    qa_summary: Optional[Dict[str, Any]],
+) -> List[QALayer]:
+    """
+    Return only the layers that were actually evaluated in the current QA pass.
+
+    Per-layer smart-edit can stop early and defer regeneration to the next
+    iteration. In those cases, the approval engine must ignore layers that were
+    never reached, otherwise they appear as synthetic 0.00 failures in the
+    rejection reason.
+    """
+
+    if not configured_layers:
+        return []
+
+    layers_summary = (qa_summary or {}).get("summary", {}).get("layers_summary", {})
+    if not isinstance(layers_summary, dict) or not layers_summary:
+        return configured_layers
+
+    evaluated_names = set(layers_summary.keys())
+    evaluated_layers = [layer for layer in configured_layers if layer.name in evaluated_names]
+    return evaluated_layers or configured_layers
+
+
+def _split_layers_around_grounding(
+    qa_layers: List[QALayer],
+    grounding_config: Optional[Any],
+) -> Tuple[List[QALayer], List[QALayer]]:
+    """Split semantic layers around evidence grounding's execution order."""
+    sorted_layers = sorted(qa_layers, key=lambda x: getattr(x, "order", 0))
+    if not grounding_config or not getattr(grounding_config, "enabled", False):
+        return sorted_layers, []
+
+    grounding_order = get_effective_order(grounding_config)
+    before_grounding = [
+        layer for layer in sorted_layers
+        if getattr(layer, "order", 0) <= grounding_order
+    ]
+    after_grounding = [
+        layer for layer in sorted_layers
+        if getattr(layer, "order", 0) > grounding_order
+    ]
+    return before_grounding, after_grounding
+
+
+def _extract_grounding_qaeval(qa_results: Dict[str, Dict[str, Any]]) -> Optional[Any]:
+    """Return the synthetic QA evaluation used for evidence grounding."""
+    grounding_layer = qa_results.get("Evidence Grounding", {})
+    return grounding_layer.get("evidence_grounding_logprobs")
 
 
 def _analyze_edit_strategy(
@@ -2275,7 +3074,10 @@ async def _generate_smart_edits(
         marker_mode = "phrase"
         if edit_ranges:
             first_mode = getattr(edit_ranges[0], 'marker_mode', 'phrase')
-            if first_mode == "word_index":
+            if first_mode == "ids":
+                marker_mode = "ids"
+                logger.info("[SMART_EDIT] Using structural ID mode")
+            elif first_mode == "word_index":
                 marker_mode = "word_index"
                 logger.info(f"[SMART_EDIT] Using word_index mode with word_map size: {len(word_map) if word_map else 0}")
 
@@ -2334,6 +3136,8 @@ async def _generate_smart_edits(
                         f"  Start phrase: '{start_phrase}'\n"
                         f"  End phrase: '{end_phrase}'"
                     )
+                elif paragraph_key.startswith("ids:"):
+                    raise SmartEditError(f"Could not locate structural target for editing: {paragraph_key}")
                 else:
                     raise SmartEditError(f"Could not locate paragraph for editing: {paragraph_key}")
 
@@ -2678,6 +3482,16 @@ async def process_content_generation(
         logger.error(f"Session {session_id} not found - cannot process generation")
         return
     usage_tracker: Optional[UsageTracker] = session.get("usage_tracker")
+    model_alias_registry = getattr(request, "_model_alias_registry", None) or session.get("model_alias_registry")
+    if model_alias_registry is None:
+        model_alias_registry = ModelAliasRegistry.from_request(
+            request,
+            preflight_model=getattr(config, "PREFLIGHT_VALIDATION_MODEL", None),
+        )
+        session["model_alias_registry"] = model_alias_registry
+        session["model_alias_map_internal"] = model_alias_registry.internal_snapshot()
+        session["model_alias_map_prompt"] = model_alias_registry.prompt_snapshot()
+    request._model_alias_registry = model_alias_registry
 
     # Initialize PhaseLogger for enhanced visual logging
     phase_logger = create_phase_logger(
@@ -2747,10 +3561,36 @@ async def process_content_generation(
         except (AttachmentError, AttachmentNotFoundError, AttachmentValidationError) as exc:
             # Fail-fast: image resolution failure stops the entire generation
             logger.error("Failed to resolve images for session %s: %s", session_id, exc)
-            update_session_status(session, session_id, GenerationStatus.FAILED, "failed")
-            session["error"] = f"Image resolution failed: {exc}"
+            error_msg = f"Image resolution failed: {exc}"
             await add_verbose_log(session_id, f"[ERROR] Image resolution failed: {exc}")
-            _store_final_result(session)
+            final_result = {
+                "content": "",
+                "final_iteration": 0,
+                "final_score": 0.0,
+                "approved": False,
+                "failure_reason": error_msg,
+                "generated_at": datetime.now().isoformat()
+            }
+            _store_final_result(
+                session,
+                final_result,
+                session_id,
+                final_status=GenerationStatus.FAILED.value,
+            )
+            session["error"] = error_msg
+            update_session_status(session, session_id, GenerationStatus.FAILED, "failed")
+            await _debug_record_event(
+                session_id,
+                "session_failed",
+                {
+                    "reason": "Image resolution failed",
+                    "error": str(exc),
+                },
+            )
+            await _debug_update_status(
+                session_id,
+                status=GenerationStatus.FAILED.value,
+            )
             return
 
     async def cancellation_requested() -> bool:
@@ -2796,6 +3636,8 @@ async def process_content_generation(
         session.setdefault("generation_mode", "normal")  # "normal" | "smart_edit"
         session.setdefault("smart_edit_data", None)      # Data for smart edit generation
         session.setdefault("json_context", None)         # JSON extraction context for smart edit
+        session.setdefault("resolved_long_text_mode", getattr(request, "_resolved_long_text_mode", None))
+        session.setdefault("long_text_state", session.get("long_text_state"))
         await add_verbose_log(session_id, "🚀 Starting content generation...")
 
         # Track reason for Gran Sabio fallback (set when breaking out of iteration loop)
@@ -2922,17 +3764,28 @@ ITERATION CONTEXT:
             if request.qa_layers:
                 deal_breaker_awareness = build_deal_breaker_awareness_prompt(request.qa_layers)
 
+            iteration_memory_context = _build_compact_iteration_memory_prompt(
+                session.get("iterations", [])
+            ) if iteration > 0 else ""
+
             # Build final prompt with all contexts
             prompt_sections: List[str] = []
+            prompt_safety_parts: List[PromptPart] = []
             if context_prompt:
                 prompt_sections.append(context_prompt)
             prompt_sections.append(request.prompt)
             if deal_breaker_awareness:
                 prompt_sections.append(deal_breaker_awareness)
+                prompt_safety_parts.append(PromptPart(deal_breaker_awareness, "system_generated", "generation.deal_breaker_awareness"))
             if word_instructions:
                 prompt_sections.append(word_instructions)
+                prompt_safety_parts.append(PromptPart(word_instructions, "system_generated", "generation.word_instructions"))
             if iteration_context_block:
                 prompt_sections.append(iteration_context_block)
+                prompt_safety_parts.append(PromptPart(iteration_context_block, "system_generated", "generation.iteration_context"))
+            if iteration_memory_context:
+                prompt_sections.append(iteration_memory_context)
+                prompt_safety_parts.append(PromptPart(iteration_memory_context, "system_generated", "generation.iteration_memory"))
 
             # Add JSON error context if the previous iteration failed JSON validation
             if "last_json_error" in session:
@@ -2950,6 +3803,7 @@ ITERATION CONTEXT:
                 # Only add QA feedback and rejected content if NOT retrying JSON
                 if iteration_feedback_context:
                     prompt_sections.append(iteration_feedback_context)
+                    prompt_safety_parts.append(PromptPart(iteration_feedback_context, "system_generated", "generation.iteration_feedback"))
                 if rejected_content_context:
                     prompt_sections.append(rejected_content_context)
 
@@ -2958,7 +3812,15 @@ ITERATION CONTEXT:
             # Step 1: Generate content based on generation mode
             _set_generation_content_metrics(session, "")  # Reset generation content for new iteration
             session["partial_content"] = ""  # Initialize partial content
+            session["generation_tool_metadata"] = None
             json_guard_result_dict: Optional[Dict[str, Any]] = None
+            long_text_controller_summary: Optional[str] = None
+            long_text_diagnostics_summary: Optional[Dict[str, Any]] = None
+            long_text_enabled_for_iteration = bool(
+                coerce_resolved_long_text_mode(
+                    getattr(request, "_resolved_long_text_mode", None) or session.get("resolved_long_text_mode")
+                ).enabled
+            )
 
             # Determine generation mode
             generation_mode = session.get("generation_mode", "normal")
@@ -2970,7 +3832,7 @@ ITERATION CONTEXT:
             if generation_mode == "smart_edit":
                 request._smart_edit_metadata = session.get("smart_edit_data")
 
-            if generation_mode == "smart_edit" and session.get("smart_edit_data"):
+            if generation_mode == "smart_edit" and session.get("smart_edit_data") and not long_text_enabled_for_iteration:
                 # Smart Edit Mode: Generate and apply targeted edits
                 await add_verbose_log(
                     session_id,
@@ -3002,19 +3864,46 @@ ITERATION CONTEXT:
                     session_id,
                     "🔄 Full Generation Mode"
                 )
-
-                content = await _generate_full_content(
-                    final_prompt=final_prompt,
-                    request=request,
-                    ai_service=ai_service,
-                    usage_tracker=usage_tracker,
-                    session_id=session_id,
-                    session=session,
-                    iteration=iteration,
-                    json_output_requested=json_output_requested,
-                    phase_logger=phase_logger,
-                    images=images_for_generation,
-                )
+                try:
+                    candidate_result = await generate_iteration_candidate(
+                        request=request,
+                        session=session,
+                        session_id=session_id,
+                        final_prompt=final_prompt,
+                        context_prompt=context_prompt,
+                        ai_service=ai_service,
+                        usage_tracker=usage_tracker,
+                        iteration=iteration,
+                        json_output_requested=json_output_requested,
+                        phase_logger=phase_logger,
+                        images=images_for_generation,
+                        prompt_safety_parts=prompt_safety_parts,
+                    )
+                except LongTextProcessCancelled:
+                    await add_verbose_log(session_id, "Long Text generation cancelled by user request")
+                    phase_logger._exit_phase(Phase.GENERATION)
+                    return
+                except LongTextGenerationError as exc:
+                    if exc.long_text_state is not None:
+                        session["long_text_state"] = exc.long_text_state.model_dump(mode="python")
+                    long_text_controller_summary = str(exc)
+                    long_text_diagnostics_summary = exc.diagnostics_summary or {}
+                    await add_verbose_log(session_id, f"Long Text generation failed: {exc}")
+                    # Empty content triggers the existing outer retry/rejection path below.
+                    content = ""
+                else:
+                    content = candidate_result.content
+                    if candidate_result.long_text_state is not None:
+                        session["long_text_state"] = candidate_result.long_text_state.model_dump(mode="python")
+                    long_text_controller_summary = candidate_result.controller_summary
+                    long_text_diagnostics_summary = candidate_result.diagnostics_summary
+                    if candidate_result.mode == "long_text":
+                        session["generation_mode"] = "normal"
+                        session["smart_edit_data"] = None
+                        session["generation_tool_metadata"] = {
+                            "tool_loop_used": candidate_result.used_tool_loop,
+                            "mode": "long_text",
+                        } if candidate_result.used_tool_loop else None
 
                 # Update session state
                 _set_generation_content_metrics(session, content)
@@ -3047,8 +3936,6 @@ ITERATION CONTEXT:
                         break
 
                     # No fallback - mark as failed and return
-                    update_session_status(session, session_id, GenerationStatus.FAILED)
-                    session["error"] = error_msg
                     final_result = {
                         "content": "",
                         "final_iteration": iteration + 1,
@@ -3059,7 +3946,14 @@ ITERATION CONTEXT:
                         "generated_at": datetime.now().isoformat()
                     }
                     _attach_json_guard_metadata(session, final_result, request)
-                    _store_final_result(session, final_result, session_id)
+                    _store_final_result(
+                        session,
+                        final_result,
+                        session_id,
+                        final_status=GenerationStatus.FAILED.value,
+                    )
+                    session["error"] = error_msg
+                    update_session_status(session, session_id, GenerationStatus.FAILED)
                     await _debug_record_event(
                         session_id,
                         "session_error",
@@ -3197,6 +4091,10 @@ ITERATION CONTEXT:
                                     ) if usage_tracker else None,
                                     phase_logger=phase_logger,
                                     images=images_for_generation,
+                                    model_alias_registry=getattr(request, "_model_alias_registry", None),
+                                    prompt_safety_parts=[
+                                        PromptPart(word_instructions, "system_generated", "json_retry.word_instructions")
+                                    ] if word_instructions else None,
                                 ):
                                     # Handle StreamChunk (Claude with thinking) vs plain string
                                     if isinstance(chunk, StreamChunk):
@@ -3247,8 +4145,6 @@ ITERATION CONTEXT:
                                 break
 
                             # No fallback - mark as failed and return
-                            update_session_status(session, session_id, GenerationStatus.FAILED)
-                            session["error"] = failure_reason
                             final_result = {
                                 "content": _get_final_content(session, content, request),
                                 "final_iteration": iteration + 1,
@@ -3259,7 +4155,29 @@ ITERATION CONTEXT:
                                 "generated_at": datetime.now().isoformat()
                             }
                             _attach_json_guard_metadata(session, final_result, request)
-                            _store_final_result(session, final_result, session_id)
+                            _store_final_result(
+                                session,
+                                final_result,
+                                session_id,
+                                final_status=GenerationStatus.FAILED.value,
+                            )
+                            session["error"] = failure_reason
+                            update_session_status(session, session_id, GenerationStatus.FAILED)
+                            await _debug_record_event(
+                                session_id,
+                                "session_failed",
+                                {
+                                    "reason": "JSON validation exhausted",
+                                    "iteration": iteration + 1,
+                                    "failure_reason": failure_reason,
+                                    "final_result": final_result,
+                                },
+                            )
+                            await _debug_update_status(
+                                session_id,
+                                status=GenerationStatus.FAILED.value,
+                                final_payload=final_result,
+                            )
                             phase_logger._exit_phase(Phase.GENERATION)
                             return
 
@@ -3315,7 +4233,6 @@ ITERATION CONTEXT:
                 phase_logger._enter_phase(Phase.COMPLETION)
                 phase_logger.info(f"Generation complete: {count_words(content)} words, 1 iteration (QA bypassed)")
 
-                update_session_status(session, session_id, GenerationStatus.COMPLETED)
                 final_result = {
                     "content": _get_final_content(session, content, request),
                     "final_iteration": iteration + 1,
@@ -3333,7 +4250,27 @@ ITERATION CONTEXT:
                     "generated_at": datetime.now().isoformat()
                 }
                 _attach_json_guard_metadata(session, final_result, request)
-                _store_final_result(session, final_result, session_id)
+                _store_final_result(
+                    session,
+                    final_result,
+                    session_id,
+                    final_status=GenerationStatus.COMPLETED.value,
+                )
+                update_session_status(session, session_id, GenerationStatus.COMPLETED)
+                await _debug_record_event(
+                    session_id,
+                    "session_completed",
+                    {
+                        "iteration": iteration + 1,
+                        "reason": "QA bypassed - no layers configured",
+                        "final_result": final_result,
+                    },
+                )
+                await _debug_update_status(
+                    session_id,
+                    status=GenerationStatus.COMPLETED.value,
+                    final_payload=final_result,
+                )
 
                 # Console logging for bypassed content
                 logger.info(f"CONTENT APPROVED (QA BYPASSED) - Session {session_id}")
@@ -3538,10 +4475,9 @@ ITERATION CONTEXT:
             # =========================================================================
             smart_editing_mode = getattr(request, 'smart_editing_mode', 'auto')
             content_type = getattr(request, 'content_type', 'other')
-            editable_types = ["biography", "article", "script", "story", "essay", "blog", "novel"]
             smart_edit_enabled = (
                 smart_editing_mode == "always" or
-                (smart_editing_mode == "auto" and content_type in editable_types)
+                (smart_editing_mode == "auto" and content_type in EDITABLE_CONTENT_TYPES)
             )
 
             # =========================================================================
@@ -3566,8 +4502,39 @@ ITERATION CONTEXT:
                 if json_context and json_context.get("error") == "ambiguous_fields":
                     error_msg = json_context["message"]
                     logger.error(f"Session {session_id}: {error_msg}")
+                    final_result = {
+                        "content": _get_final_content(session, content, request),
+                        "final_iteration": iteration + 1,
+                        "final_score": 0.0,
+                        "approved": False,
+                        "failure_reason": error_msg,
+                        "qa_summary": {},
+                        "evidence_grounding": None,
+                        "generated_at": datetime.now().isoformat()
+                    }
+                    _attach_json_guard_metadata(session, final_result, request)
+                    _store_final_result(
+                        session,
+                        final_result,
+                        session_id,
+                        final_status=GenerationStatus.FAILED.value,
+                    )
                     session["error"] = error_msg
                     update_session_status(session, session_id, GenerationStatus.FAILED)
+                    await _debug_record_event(
+                        session_id,
+                        "session_failed",
+                        {
+                            "reason": "Ambiguous JSON field detection",
+                            "error": error_msg,
+                            "final_result": final_result,
+                        },
+                    )
+                    await _debug_update_status(
+                        session_id,
+                        status=GenerationStatus.FAILED.value,
+                        final_payload=final_result,
+                    )
                     return
 
                 if json_context:
@@ -3582,40 +4549,28 @@ ITERATION CONTEXT:
             session['json_context'] = json_context
 
             # Pre-scan content for optimal marker configuration (smart edit robustness)
-            from smart_edit import find_optimal_phrase_length as _find_optimal_phrase_length, build_word_map as _build_word_map
-
             marker_mode = "phrase"
             marker_length = None
             word_map_formatted = None
-            word_map_tokens = None
+            draft_map_formatted = None
 
             if smart_edit_enabled:
-                # Find optimal phrase length for unique markers
-                # Use text_for_processing (extracted from JSON if applicable) for accurate tokenization
-                optimal_n = _find_optimal_phrase_length(
-                    text_for_processing,
-                    min_n=config.SMART_EDIT_MIN_PHRASE_LENGTH,
-                    max_n=config.SMART_EDIT_MAX_PHRASE_LENGTH
-                )
+                marker_config = _build_smart_edit_marker_config(text_for_processing, request)
+                marker_mode = marker_config.get('mode', 'phrase')
+                marker_length = marker_config.get('phrase_length')
+                word_map_formatted = marker_config.get('word_map_formatted')
+                draft_map_formatted = marker_config.get('draft_map_formatted')
 
-                if optimal_n is not None:
-                    # Phrase mode with optimal length
-                    marker_mode = "phrase"
-                    marker_length = optimal_n
+                if marker_mode == "ids":
+                    logger.info(f"Session {session_id}: Smart edit using structural ID mode")
+                elif marker_mode == "phrase":
                     logger.info(f"Session {session_id}: Smart edit using phrase mode with {marker_length} words")
                 else:
-                    # Fallback to word_index mode
-                    marker_mode = "word_index"
-                    word_map_tokens, word_map_formatted = _build_word_map(text_for_processing)
+                    word_map_tokens = marker_config.get('word_map') or []
                     logger.info(f"Session {session_id}: Smart edit using word_index mode (word_map size: {len(word_map_tokens)})")
 
                 # Store marker config in session for smart edit phase
-                session['marker_config'] = {
-                    'mode': marker_mode,
-                    'phrase_length': marker_length,
-                    'word_map': word_map_tokens,
-                    'word_map_formatted': word_map_formatted
-                }
+                session['marker_config'] = marker_config
 
             # Determine if we should pass images to QA (vision-enabled QA)
             qa_input_images = None
@@ -3641,82 +4596,161 @@ ITERATION CONTEXT:
                     else:
                         qa_model_names.append(str(m))
 
-                # Process all layers with per-layer smart-edit
-                (
-                    edited_content,
-                    qa_results,
-                    all_layers_passed,
-                    deal_breaker_info,
-                    layers_summary
-                ) = await _process_all_layers_with_edits(
-                    content=text_for_processing,
-                    qa_layers=qa_layers_to_use,
-                    qa_engine=qa_engine,
-                    qa_models=normalized_qa_models,
-                    qa_model_names=qa_model_names,
-                    request=request,
-                    session=session,
-                    session_id=session_id,
-                    usage_tracker=usage_tracker,
-                    phase_logger=phase_logger,
-                    ai_service=ai_service,
-                    cancel_callback=cancellation_requested,
-                    progress_callback=qa_progress_callback,
-                    stream_callback=qa_stream_callback,
-                    images_for_qa=qa_input_images,
-                    iteration=iteration + 1,
+                grounding_result = None
+                grounding_force_iteration = False
+                qa_results = {}
+                layers_summary = {}
+                deal_breaker_info = None
+                processed_text = text_for_processing
+
+                before_grounding_layers, after_grounding_layers = _split_layers_around_grounding(
+                    qa_layers_to_use,
+                    grounding_config,
                 )
+                continue_pipeline = True
+
+                async def _run_layer_segment(segment_layers: List[QALayer], current_text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+                    nonlocal deal_breaker_info, continue_pipeline
+
+                    if not segment_layers:
+                        return current_text, None
+
+                    (
+                        updated_text,
+                        segment_results,
+                        _all_layers_passed,
+                        segment_deal_breaker_info,
+                        segment_layers_summary,
+                    ) = await _process_all_layers_with_edits(
+                        content=current_text,
+                        qa_layers=segment_layers,
+                        qa_engine=qa_engine,
+                        qa_models=normalized_qa_models,
+                        qa_model_names=qa_model_names,
+                        request=request,
+                        session=session,
+                        session_id=session_id,
+                        usage_tracker=usage_tracker,
+                        phase_logger=phase_logger,
+                        ai_service=ai_service,
+                        cancel_callback=cancellation_requested,
+                        progress_callback=qa_progress_callback,
+                        stream_callback=qa_stream_callback,
+                        images_for_qa=qa_input_images,
+                        iteration=iteration + 1,
+                    )
+
+                    qa_results.update(segment_results)
+                    layers_summary.update(segment_layers_summary)
+
+                    if deal_breaker_info is None and segment_deal_breaker_info is not None:
+                        deal_breaker_info = segment_deal_breaker_info
+
+                    if segment_deal_breaker_info is not None or len(segment_layers_summary) < len(segment_layers):
+                        continue_pipeline = False
+
+                    return updated_text, segment_deal_breaker_info
+
+                processed_text, _ = await _run_layer_segment(before_grounding_layers, processed_text)
+
+                if grounding_enabled and continue_pipeline:
+                    grounding_payload = await qa_engine.evaluate_content_comprehensive(
+                        content=processed_text,
+                        layers=[],
+                        qa_models=normalized_qa_models,
+                        progress_callback=qa_progress_callback,
+                        original_request=request,
+                        stream_callback=qa_stream_callback,
+                        gran_sabio_engine=gran_sabio if can_escalate_in_session else None,
+                        session_id=session_id,
+                        cancel_callback=cancellation_requested,
+                        usage_tracker=usage_tracker,
+                        iteration=iteration + 1,
+                        gran_sabio_stream_callback=gran_sabio_inline_stream_callback,
+                        evidence_grounding_config=grounding_config,
+                        context_for_grounding=_build_grounding_context(request, context_prompt),
+                        model_alias_registry=getattr(request, "_model_alias_registry", None),
+                    )
+
+                    grounding_results = grounding_payload.get("qa_results", {})
+                    if grounding_results:
+                        qa_results.update(grounding_results)
+
+                    grounding_result = grounding_payload.get("evidence_grounding")
+                    grounding_force_iteration = bool(
+                        grounding_payload.get("summary", {}).get("force_iteration")
+                    )
+
+                    grounding_eval = _extract_grounding_qaeval(grounding_results)
+                    if grounding_eval is not None:
+                        layers_summary["Evidence Grounding"] = {
+                            "passed": bool(grounding_result.get("passed", True)) if grounding_result else True,
+                            "score": getattr(grounding_eval, "score", 0.0) or 0.0,
+                            "min_score": None,
+                            "deal_breaker": bool(getattr(grounding_eval, "deal_breaker", False)),
+                            "order": get_effective_order(grounding_config),
+                        }
+
+                    if grounding_force_iteration:
+                        continue_pipeline = False
+
+                if continue_pipeline:
+                    processed_text, _ = await _run_layer_segment(after_grounding_layers, processed_text)
 
                 # Update content with edited version
                 if json_context:
                     # Reconstruct JSON with edited text
-                    edited_texts = {path: edited_content for path in json_context["target_field_paths"]}
+                    edited_texts = {path: processed_text for path in json_context["target_field_paths"]}
                     content = reconstruct_json(json_context, edited_texts)
                 else:
-                    content = edited_content
+                    content = processed_text
 
                 # Update session with new content
                 _set_generation_content_metrics(session, content)
                 _set_last_generated_content_metrics(session, content)
 
-                # Calculate summary statistics from returned values
-                # (deal_breaker_info and layers_summary are returned by _process_all_layers_with_edits)
-                total_score = 0.0
-                total_evals = 0
+                all_scores = []
                 critical_issues = []
 
-                for layer_name, layer_data in layers_summary.items():
-                    total_score += layer_data.get("score", 0.0)
-                    total_evals += 1
-                    if layer_data.get("deal_breaker"):
+                for layer_name, layer_results in qa_results.items():
+                    layer_scores = [
+                        evaluation.score
+                        for evaluation in layer_results.values()
+                        if getattr(evaluation, "score", None) is not None
+                    ]
+                    all_scores.extend(layer_scores)
+
+                    has_layer_deal_breaker = any(
+                        bool(getattr(evaluation, "deal_breaker", False))
+                        for evaluation in layer_results.values()
+                    )
+                    if has_layer_deal_breaker:
+                        layer_score = sum(layer_scores) / len(layer_scores) if layer_scores else 0.0
                         critical_issues.append({
                             "layer": layer_name,
                             "description": f"Deal-breaker in layer '{layer_name}'",
-                            "score": layer_data.get("score", 0.0),
+                            "score": layer_score,
                         })
 
-                avg_score = total_score / total_evals if total_evals > 0 else 0.0
-
-                # Calculate deal-breaker flags from returned data:
-                # - has_deal_breakers: True if any layer had a deal-breaker (majority or minority)
-                # - force_iteration: True only if there was a majority deal-breaker (deal_breaker_info not None)
-                has_deal_breakers = (
-                    deal_breaker_info is not None or
-                    any(layer_data.get("deal_breaker") for layer_data in layers_summary.values())
+                avg_score = sum(all_scores) / len(all_scores) if all_scores else 0.0
+                has_deal_breakers = any(
+                    bool(getattr(evaluation, "deal_breaker", False))
+                    for layer_results in qa_results.values()
+                    for evaluation in layer_results.values()
                 )
-                force_iteration = deal_breaker_info is not None
+                force_iteration = deal_breaker_info is not None or grounding_force_iteration
 
                 qa_comprehensive_result = {
                     "summary": {
                         "has_deal_breakers": has_deal_breakers,
                         "force_iteration": force_iteration,
                         "average_score": avg_score,
-                        "total_evaluations": total_evals,
+                        "total_evaluations": len(all_scores),
                         "layers_summary": layers_summary,
                     },
                     "qa_results": qa_results,
                     "critical_issues": critical_issues,
-                    "evidence_grounding": None,  # Evidence grounding handled separately if enabled
+                    "evidence_grounding": grounding_result,
                 }
 
                 # Log summary
@@ -3736,29 +4770,7 @@ ITERATION CONTEXT:
                     session_id,
                     f"QA stopped: {qa_model_err}"
                 )
-                update_session_status(session, session_id, GenerationStatus.FAILED)
-                session["error"] = str(qa_model_err)
-                final_result = {
-                    "content": _get_final_content(session, content, request),
-                    "final_iteration": iteration + 1,
-                    "approved": False,
-                    "failure_reason": str(qa_model_err),
-                    "qa_summary": {},
-                    "evidence_grounding": None,
-                    "generated_at": datetime.now().isoformat()
-                }
-                _attach_json_guard_metadata(session, final_result, request)
-                _store_final_result(session, final_result, session_id)
-                phase_logger._exit_phase(Phase.QA)
-                return
-
-            except Exception as e:
-                # Fail-fast: log error clearly, mark as FAILED, and stop (do NOT continue)
-                error_msg = f"QA processing failed: {type(e).__name__}: {e}"
-                await add_verbose_log(session_id, f"FATAL: {error_msg}")
-                logger.exception(f"Session {session_id}: {error_msg}")
-                update_session_status(session, session_id, GenerationStatus.FAILED)
-                session["error"] = error_msg
+                error_msg = str(qa_model_err)
                 final_result = {
                     "content": _get_final_content(session, content, request),
                     "final_iteration": iteration + 1,
@@ -3769,7 +4781,70 @@ ITERATION CONTEXT:
                     "generated_at": datetime.now().isoformat()
                 }
                 _attach_json_guard_metadata(session, final_result, request)
-                _store_final_result(session, final_result, session_id)
+                _store_final_result(
+                    session,
+                    final_result,
+                    session_id,
+                    final_status=GenerationStatus.FAILED.value,
+                )
+                session["error"] = error_msg
+                update_session_status(session, session_id, GenerationStatus.FAILED)
+                await _debug_record_event(
+                    session_id,
+                    "session_failed",
+                    {
+                        "reason": "QA model unavailable",
+                        "error": error_msg,
+                        "iteration": iteration + 1,
+                        "final_result": final_result,
+                    },
+                )
+                await _debug_update_status(
+                    session_id,
+                    status=GenerationStatus.FAILED.value,
+                    final_payload=final_result,
+                )
+                phase_logger._exit_phase(Phase.QA)
+                return
+
+            except Exception as e:
+                # Fail-fast: log error clearly, mark as FAILED, and stop (do NOT continue)
+                error_msg = f"QA processing failed: {type(e).__name__}: {e}"
+                await add_verbose_log(session_id, f"FATAL: {error_msg}")
+                logger.exception(f"Session {session_id}: {error_msg}")
+                final_result = {
+                    "content": _get_final_content(session, content, request),
+                    "final_iteration": iteration + 1,
+                    "approved": False,
+                    "failure_reason": error_msg,
+                    "qa_summary": {},
+                    "evidence_grounding": None,
+                    "generated_at": datetime.now().isoformat()
+                }
+                _attach_json_guard_metadata(session, final_result, request)
+                _store_final_result(
+                    session,
+                    final_result,
+                    session_id,
+                    final_status=GenerationStatus.FAILED.value,
+                )
+                session["error"] = error_msg
+                update_session_status(session, session_id, GenerationStatus.FAILED)
+                await _debug_record_event(
+                    session_id,
+                    "session_failed",
+                    {
+                        "reason": "QA processing exception",
+                        "error": str(e),
+                        "iteration": iteration + 1,
+                        "final_result": final_result,
+                    },
+                )
+                await _debug_update_status(
+                    session_id,
+                    status=GenerationStatus.FAILED.value,
+                    final_payload=final_result,
+                )
                 phase_logger._exit_phase(Phase.QA)
                 return
 
@@ -3890,6 +4965,26 @@ ITERATION CONTEXT:
             content_word_count = len(content.split())
             content_char_count = len(content)
             content_summary = content[:500] + "..." if len(content) > 500 else content
+            long_text_state_snapshot = (
+                coerce_long_text_state(session.get("long_text_state"))
+                if long_text_enabled_for_iteration and session.get("long_text_state") is not None
+                else None
+            )
+            long_text_failed_section_ids = (
+                list(long_text_state_snapshot.failed_section_ids)
+                if long_text_state_snapshot is not None
+                else []
+            )
+            long_text_band_status = (
+                (long_text_diagnostics_summary or {}).get("band_status")
+                if long_text_enabled_for_iteration
+                else None
+            )
+            long_text_total_words = (
+                (long_text_diagnostics_summary or {}).get("total_words")
+                if long_text_enabled_for_iteration
+                else None
+            )
 
             iteration_data = {
                 "iteration": iteration + 1,
@@ -3902,12 +4997,19 @@ ITERATION CONTEXT:
                 "generation_mode": generation_mode,  # "normal" or "smart_edit"
                 "smart_edit_applied": generation_mode == "smart_edit",
                 "smart_edit_metadata": (session.get("smart_edit_data") or {}).get("edit_metadata") if generation_mode == "smart_edit" else None,
+                "generation_tool_metadata": session.get("generation_tool_metadata"),
                 "qa_layers_config": qa_layers_config,
                 "qa_results": qa_results,
                 "consensus": consensus_result,
                 "deal_breaker_found": deal_breaker_found_flag,
                 "timestamp": datetime.now().isoformat(),
-                "json_guard": json_guard_result_dict
+                "json_guard": json_guard_result_dict,
+                "long_text_enabled": long_text_enabled_for_iteration,
+                "long_text_controller_summary": long_text_controller_summary,
+                "long_text_band_status": long_text_band_status,
+                "long_text_total_words": long_text_total_words,
+                "long_text_failed_section_ids": long_text_failed_section_ids,
+                "long_text_diagnostics_summary": long_text_diagnostics_summary,
             }
 
             phrase_guard_results = qa_results.get("Phrase Frequency Guard")
@@ -3964,7 +5066,8 @@ ITERATION CONTEXT:
                             session_id=session_id,
                             feedback_text=feedback_text,
                             content_snapshot=content[:500],  # First 500 chars as snapshot
-                            iteration_num=iteration
+                            iteration_num=iteration,
+                            model_alias_registry=getattr(request, "_model_alias_registry", None),
                         )
                         session["feedback_prompt"] = feedback_prompt
                         await add_verbose_log(session_id, "📝 Feedback memory updated with iteration results")
@@ -3976,15 +5079,21 @@ ITERATION CONTEXT:
                     # Continue without feedback memory update
 
             # Step 4: New layer-based approval logic
+            evaluated_qa_layers = _get_evaluated_layers_for_approval(
+                qa_layers_to_use,
+                qa_comprehensive_result,
+            )
             approval_result = _evaluate_layer_based_approval(
                 qa_results,
                 consensus_result,
                 request,
                 session_id,
                 iteration + 1,
-                qa_layers_to_use,
+                evaluated_qa_layers,
                 qa_comprehensive_result,
             )
+            iteration_data["approved"] = approval_result["approved"]
+            iteration_data["approval_reason"] = approval_result.get("reason")
             
             if approval_result["approved"]:
                 session["approved"] = True  # Update for project status tracking
@@ -3994,7 +5103,6 @@ ITERATION CONTEXT:
                 phase_logger._enter_phase(Phase.COMPLETION)
                 phase_logger.info(f"Generation complete: {count_words(content)} words, {iteration + 1} iterations")
 
-                update_session_status(session, session_id, GenerationStatus.COMPLETED)
                 final_result = {
                     "content": _get_final_content(session, content, request),
                     "final_iteration": iteration + 1,
@@ -4004,7 +5112,13 @@ ITERATION CONTEXT:
                     "generated_at": datetime.now().isoformat()
                 }
                 _attach_json_guard_metadata(session, final_result, request)
-                _store_final_result(session, final_result, session_id)
+                _store_final_result(
+                    session,
+                    final_result,
+                    session_id,
+                    final_status=GenerationStatus.COMPLETED.value,
+                )
+                update_session_status(session, session_id, GenerationStatus.COMPLETED)
 
                 usage_summary = None
                 if usage_tracker and usage_tracker.enabled:
@@ -4071,20 +5185,26 @@ ITERATION CONTEXT:
                     break  # Exit the iteration loop to trigger fallback
                 else:
                     await add_verbose_log(session_id, f"Final rejection: {approval_result['reason']}")
-                    update_session_status(session, session_id, GenerationStatus.FAILED)
-                    session["error"] = approval_result["reason"]
+                    rejection_reason = approval_result["reason"]
                     final_result = {
                         "content": session.get("last_generated_content", "No content generated"),
                         "final_iteration": iteration + 1,
                         "final_score": consensus_result.average_score if "consensus_result" in locals() else 0.0,
                         "approved": False,
-                        "failure_reason": approval_result["reason"],
+                        "failure_reason": rejection_reason,
                         "qa_summary": consensus_result.dict() if "consensus_result" in locals() else {},
                         "evidence_grounding": qa_comprehensive_result.get("evidence_grounding") if qa_comprehensive_result else None,
                         "generated_at": datetime.now().isoformat()
                     }
                     _attach_json_guard_metadata(session, final_result, request)
-                    _store_final_result(session, final_result, session_id)
+                    _store_final_result(
+                        session,
+                        final_result,
+                        session_id,
+                        final_status=GenerationStatus.REJECTED.value,
+                    )
+                    session["error"] = rejection_reason
+                    update_session_status(session, session_id, GenerationStatus.REJECTED)
 
                     usage_summary = None
                     if usage_tracker and usage_tracker.enabled:
@@ -4106,7 +5226,7 @@ ITERATION CONTEXT:
                     )
                     await _debug_update_status(
                         session_id,
-                        status=GenerationStatus.FAILED.value,
+                        status=GenerationStatus.REJECTED.value,
                         final_payload=final_result,
                     )
 
@@ -4371,6 +5491,7 @@ ITERATION CONTEXT:
                     marker_mode_gs = marker_config_gs.get('mode', 'phrase')
                     marker_length_gs = marker_config_gs.get('phrase_length')
                     word_map_formatted_gs = marker_config_gs.get('word_map_formatted')
+                    draft_map_formatted_gs = marker_config_gs.get('draft_map_formatted')
 
                     # Determine if we should pass images to QA (vision-enabled QA) - for Gran Sabio fallback
                     qa_input_images = None
@@ -4419,9 +5540,11 @@ ITERATION CONTEXT:
                                     marker_mode=marker_mode_gs,
                                     marker_length=marker_length_gs,
                                     word_map_formatted=word_map_formatted_gs,
+                                    draft_map_formatted=draft_map_formatted_gs,
                                     input_images=qa_input_images,
                                     evidence_grounding_config=getattr(request, 'evidence_grounding', None),
                                     context_for_grounding=_build_grounding_context(request, context_prompt),
+                                    model_alias_registry=getattr(request, "_model_alias_registry", None),
                                 ),
                                 timeout=comprehensive_timeout_gs
                             )
@@ -4486,7 +5609,10 @@ ITERATION CONTEXT:
                                 request,
                                 session_id,
                                 request.max_iterations + 1,
-                                qa_layers_to_use,
+                                _get_evaluated_layers_for_approval(
+                                    qa_layers_to_use,
+                                    qa_comprehensive_result,
+                                ),
                                 qa_comprehensive_result,
                             )
 
@@ -4504,7 +5630,6 @@ ITERATION CONTEXT:
                                 phase_logger._enter_phase(Phase.COMPLETION)
                                 phase_logger.info(f"Gran Sabio regeneration approved: {count_words(gran_sabio_content)} words")
 
-                                update_session_status(session, session_id, GenerationStatus.COMPLETED)
                                 final_payload = {
                                     "content": _get_final_content(session, gran_sabio_content, request, is_gran_sabio=True),
                                     "final_iteration": "Gran Sabio",
@@ -4516,7 +5641,13 @@ ITERATION CONTEXT:
                                 if fallback_notes:
                                     final_payload["gran_sabio_fallback_notes"] = fallback_notes.copy()
                                 _attach_json_guard_metadata(session, final_payload, request)
-                                _store_final_result(session, final_payload, session_id)
+                                _store_final_result(
+                                    session,
+                                    final_payload,
+                                    session_id,
+                                    final_status=GenerationStatus.COMPLETED.value,
+                                )
+                                update_session_status(session, session_id, GenerationStatus.COMPLETED)
 
                                 usage_summary = None
                                 if usage_tracker and usage_tracker.enabled:
@@ -4728,25 +5859,31 @@ ITERATION CONTEXT:
             logger.error(f"Reason: {gran_sabio_result.error}")
             logger.error(separator)
             await add_verbose_log(session_id, f"Gran Sabio failed: {gran_sabio_result.error}")
-            update_session_status(session, session_id, GenerationStatus.FAILED)
-            session["error"] = gran_sabio_result.error
+            error_msg = gran_sabio_result.error
             final_payload = {
                 "content": (last_iteration or {}).get("content", ""),
                 "final_iteration": "Gran Sabio",
                 "final_score": 0.0,
                 "approved": False,
-                "failure_reason": gran_sabio_result.error,
+                "failure_reason": error_msg,
                 "evidence_grounding": None,
                 "generated_at": datetime.now().isoformat()
             }
             _attach_json_guard_metadata(session, final_payload, request)
-            _store_final_result(session, final_payload, session_id)
+            _store_final_result(
+                session,
+                final_payload,
+                session_id,
+                final_status=GenerationStatus.FAILED.value,
+            )
+            session["error"] = error_msg
+            update_session_status(session, session_id, GenerationStatus.FAILED)
             await _debug_record_event(
                 session_id,
                 "gran_sabio_error",
                 {
                     "final_result": final_payload,
-                    "error": gran_sabio_result.error,
+                    "error": error_msg,
                 },
             )
             await _debug_update_status(
@@ -4791,9 +5928,7 @@ ITERATION CONTEXT:
                         session_id,
                         error_messages
                     )
-                    update_session_status(session, session_id, GenerationStatus.FAILED)
                     failure_reason = "Gran Sabio review produced invalid JSON"
-                    session["error"] = failure_reason
                     final_payload = {
                         "content": gran_sabio_result.final_content or "",
                         "final_iteration": "Gran Sabio",
@@ -4807,7 +5942,14 @@ ITERATION CONTEXT:
                     if fallback_notes:
                         final_payload["gran_sabio_fallback_notes"] = fallback_notes.copy()
                     _attach_json_guard_metadata(session, final_payload, request)
-                    _store_final_result(session, final_payload, session_id)
+                    _store_final_result(
+                        session,
+                        final_payload,
+                        session_id,
+                        final_status=GenerationStatus.FAILED.value,
+                    )
+                    session["error"] = failure_reason
+                    update_session_status(session, session_id, GenerationStatus.FAILED)
                     await _debug_record_event(
                         session_id,
                         "gran_sabio_review_json_error",
@@ -4837,9 +5979,8 @@ ITERATION CONTEXT:
             phase_logger._enter_phase(Phase.COMPLETION)
             phase_logger.info(f"Gran Sabio final decision: {count_words(gran_sabio_result.final_content)} words")
 
-            update_session_status(session, session_id, GenerationStatus.COMPLETED)
             final_payload = {
-                "content": gran_sabio_result.final_content,
+                "content": _get_final_content(session, gran_sabio_result.final_content, request, is_gran_sabio=True),
                 "final_iteration": "Gran Sabio",
                 "final_score": gran_sabio_result.final_score,
                 "gran_sabio_reason": gran_sabio_result.reason,
@@ -4849,7 +5990,13 @@ ITERATION CONTEXT:
             if fallback_notes:
                 final_payload["gran_sabio_fallback_notes"] = fallback_notes.copy()
             _attach_json_guard_metadata(session, final_payload, request)
-            _store_final_result(session, final_payload, session_id)
+            _store_final_result(
+                session,
+                final_payload,
+                session_id,
+                final_status=GenerationStatus.COMPLETED.value,
+            )
+            update_session_status(session, session_id, GenerationStatus.COMPLETED)
             usage_summary = None
             if usage_tracker and usage_tracker.enabled:
                 try:
@@ -4885,22 +6032,28 @@ ITERATION CONTEXT:
             logger.info(f"Reason: {gran_sabio_result.reason[:200]}...")
             logger.info(separator)
             await add_verbose_log(session_id, f"GRAN SABIO REJECTED: {gran_sabio_result.reason}")
-            update_session_status(session, session_id, GenerationStatus.FAILED)
-            session["error"] = gran_sabio_result.reason
+            rejection_reason = gran_sabio_result.reason
             final_payload = {
                 "content": session.get("last_generated_content", "No content generated"),
                 "final_iteration": "Gran Sabio - REJECTED",
                 "final_score": gran_sabio_result.final_score,
                 "approved": False,
-                "failure_reason": gran_sabio_result.reason,
-                "gran_sabio_reason": gran_sabio_result.reason,
+                "failure_reason": rejection_reason,
+                "gran_sabio_reason": rejection_reason,
                 "evidence_grounding": None,  # Not available in Gran Sabio review flow
                 "generated_at": datetime.now().isoformat()
             }
             if fallback_notes:
                 final_payload["gran_sabio_fallback_notes"] = fallback_notes.copy()
             _attach_json_guard_metadata(session, final_payload, request)
-            _store_final_result(session, final_payload, session_id)
+            _store_final_result(
+                session,
+                final_payload,
+                session_id,
+                final_status=GenerationStatus.REJECTED.value,
+            )
+            session["error"] = rejection_reason
+            update_session_status(session, session_id, GenerationStatus.REJECTED)
             usage_summary = None
             if usage_tracker and usage_tracker.enabled:
                 try:
@@ -4919,7 +6072,7 @@ ITERATION CONTEXT:
             )
             await _debug_update_status(
                 session_id,
-                status=GenerationStatus.FAILED.value,
+                status=GenerationStatus.REJECTED.value,
                 final_payload=final_payload,
             )
             
@@ -4934,24 +6087,30 @@ ITERATION CONTEXT:
     
     except Exception as e:
         await add_verbose_log(session_id, f"💥 Error in generation: {str(e)}")
-        update_session_status(session, session_id, GenerationStatus.FAILED)
-        session["error"] = str(e)
+        error_msg = str(e)
         final_result = {
             "content": session.get("last_generated_content", "No content generated"),
             "final_iteration": session.get("current_iteration", 0),
             "final_score": 0.0,
             "approved": False,
-            "failure_reason": str(e),
+            "failure_reason": error_msg,
             "evidence_grounding": None,
             "generated_at": datetime.now().isoformat()
         }
         _attach_json_guard_metadata(session, final_result, request)
-        _store_final_result(session, final_result, session_id)
+        _store_final_result(
+            session,
+            final_result,
+            session_id,
+            final_status=GenerationStatus.FAILED.value,
+        )
+        session["error"] = error_msg
+        update_session_status(session, session_id, GenerationStatus.FAILED)
         await _debug_record_event(
             session_id,
             "session_error",
             {
-                "error": str(e),
+                "error": error_msg,
                 "final_result": final_result,
             },
         )

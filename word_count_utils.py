@@ -14,6 +14,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# Reserved order for synthetic accent-guard layer (see proposal Cambio 1 v5 §5.7).
+LAYER_ORDER_LLM_ACCENT_GUARD = 999_999
+
+
 def word_count_config_to_dict(config: Any) -> Optional[Dict[str, Any]]:
     """
     Normalize a word count configuration to a dictionary.
@@ -258,14 +262,18 @@ def create_word_count_qa_layer(min_words: Optional[int], max_words: Optional[int
         f"Count the words in the content and verify it falls within the acceptable range. "
         f"Target: {target_desc} with {flexibility_desc} flexibility. "
         f"Acceptable range: {abs_min}-{abs_max} words. "
-        f"Simply count all words and check if the count is within this range."
+        f"Simply count all words and check if the count is within this range. "
+        "Also reject content that includes meta commentary about the draft, the prompt, "
+        "planned revisions, or word-count compliance instead of only returning the requested content."
     )
     
     # Deal breaker criteria
     deal_breaker_criteria = None
     if severity == "deal_breaker":
         deal_breaker_criteria = (
-            f"word count is outside the range {abs_min}-{abs_max} words"
+            f"word count is outside the range {abs_min}-{abs_max} words, "
+            "or the content includes meta commentary about its own draft status, prompt, "
+            "planned revisions, or word-count compliance"
         )
     
     return QALayer(
@@ -396,22 +404,38 @@ def build_word_count_instructions(request: ContentRequest) -> str:
     if request.min_words is None and request.max_words is None:
         return ""
 
+    long_form_guidance = ""
+    long_form_target = max(request.min_words or 0, request.max_words or 0)
+    if long_form_target >= 2500:
+        midpoint = None
+        if request.min_words and request.max_words:
+            midpoint = (request.min_words + request.max_words) // 2
+        long_form_guidance = (
+            "\n- PLAN the full piece before writing so it reaches the requested length naturally"
+            "\n- Deliver the complete work, not a synopsis, fragment, teaser, or compressed summary"
+            "\n- If paragraphs or sections are requested, make each one substantial enough to support the full target length"
+            "\n- Resolve the narrative inside the requested range; do not continue into an unnecessary epilogue once the ending is earned"
+            "\n- If you are approaching the maximum, compress the final scenes instead of adding more scenes or reflections"
+        )
+        if midpoint is not None:
+            long_form_guidance += f"\n- AIM for approximately {midpoint} words so the final draft lands safely inside the range"
+
     if request.min_words and request.max_words:
         return f"""CRITICAL WORD COUNT REQUIREMENT: Between {request.min_words} and {request.max_words} words.
 - MANDATORY to comply with this requirement
 - If you do not meet this requirement, the content will be REJECTED and you will have to regenerate it
 - VERIFY the word count before delivering the text
-- Count carefully to ensure you are within the specified range"""
+- Count carefully to ensure you are within the specified range{long_form_guidance}"""
     if request.max_words:
         return f"""CRITICAL WORD COUNT REQUIREMENT: Maximum {request.max_words} words.
 - MANDATORY to comply with this requirement
 - If you exceed this limit, the content will be REJECTED and you will have to regenerate it
-- VERIFY the word count before delivering the text"""
+- VERIFY the word count before delivering the text{long_form_guidance}"""
     if request.min_words:
         return f"""CRITICAL WORD COUNT REQUIREMENT: Minimum {request.min_words} words.
 - MANDATORY to comply with this requirement
 - If you do not meet this minimum, the content will be REJECTED and you will have to regenerate it
-- VERIFY the word count before delivering the text"""
+- VERIFY the word count before delivering the text{long_form_guidance}"""
 
     return ""
 
@@ -537,5 +561,55 @@ def prepare_qa_layers_with_word_count(request: ContentRequest, preflight_result=
                 "Added cumulative repetition layer (order=0, cumulative_words=%d)",
                 cumulative_words,
             )
+
+    # Synthetic LLM-accent guard layer (post / inline_post modes) (Cambio 1 v5, §5.7)
+    if request.llm_accent_guard.mode in {"post", "inline_post"}:
+        # Runtime collision defense: no pre-existing layer may occupy the reserved slot.
+        for existing in qa_layers:
+            if getattr(existing, "order", None) == LAYER_ORDER_LLM_ACCENT_GUARD:
+                raise ValueError(
+                    f"QA layer '{existing.name}' occupies the reserved order "
+                    f"{LAYER_ORDER_LLM_ACCENT_GUARD} for the synthetic accent layer."
+                )
+
+        # Secondary defense: effective-layers emptiness check was already run at the route layer.
+        # If we reach here with no other layers and force_accent_with_empty_layers=False,
+        # fail closed - the route-level check is the primary guard.
+        if (
+            not qa_layers
+            and not request.llm_accent_guard.force_accent_with_empty_layers
+        ):
+            raise ValueError(
+                "synthetic accent layer cannot be the sole QA layer without "
+                "force_accent_with_empty_layers=True."
+            )
+
+        from llm_accent_prompts import build_accent_criteria_block
+        min_score = request.llm_accent_guard.min_score
+        if min_score is None:
+            min_score = max(7.0, float(request.min_global_score) - 0.5)
+        criteria_block = build_accent_criteria_block(request.llm_accent_guard.criteria)
+        accent_layer = QALayer(
+            name="LLM accent guard",
+            description="Audit the draft for recognizably generic AI-style prose and formulaic patterns.",
+            criteria=criteria_block,
+            min_score=float(min_score),
+            is_mandatory=True,
+            deal_breaker_criteria=(
+                "Draft sounds like generic assistant prose, uses formulaic contrast frames, "
+                "or exhibits meta/commentary style."
+                if request.llm_accent_guard.deal_breaker else None
+            ),
+            is_deal_breaker=bool(request.llm_accent_guard.deal_breaker),
+            concise_on_pass=False,
+            order=LAYER_ORDER_LLM_ACCENT_GUARD,
+        )
+        qa_layers.append(accent_layer)
+        logger.info(
+            "Added synthetic LLM accent guard layer (order=%d, min_score=%.2f, deal_breaker=%s)",
+            accent_layer.order,
+            accent_layer.min_score,
+            request.llm_accent_guard.deal_breaker,
+        )
 
     return qa_layers

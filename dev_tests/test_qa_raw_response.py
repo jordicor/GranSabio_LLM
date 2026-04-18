@@ -92,7 +92,7 @@ IMPORTANT INSTRUCTIONS:
 """
 
 
-async def test_model(ai_service, model_config: dict) -> dict:
+async def run_model_check(ai_service, model_config: dict) -> dict:
     """Test a single model and return its raw response."""
     model = model_config["model"]
     temperature = model_config["temperature"]
@@ -197,7 +197,7 @@ async def main():
 
     for model_config in TEST_MODELS:
         try:
-            result = await test_model(ai_service, model_config)
+            result = await run_model_check(ai_service, model_config)
             results.append(result)
         except Exception as e:
             print(f"Failed to test {model_config['model']}: {e}")

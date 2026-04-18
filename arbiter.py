@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 from enum import Enum
 from pydantic import BaseModel, Field
+from model_aliasing import PromptPart
 
 if TYPE_CHECKING:
     from smart_edit import TextEditRange
@@ -77,6 +78,11 @@ class ProposedEdit:
     source_model: str               # Which model proposed it (e.g., "gpt-4o")
     source_score: float             # Score given by that model
     paragraph_key: str              # Unique key for the paragraph
+    source_alias: Optional[str] = None  # Prompt-facing evaluator label
+
+    @property
+    def prompt_source(self) -> str:
+        return self.source_alias or self.source_model
 
 
 @dataclass
@@ -96,6 +102,11 @@ class ArbiterEditDecision:
     reason: str
     source_model: str
     conflict_resolved: Optional[ConflictInfo] = None
+    source_alias: Optional[str] = None
+
+    @property
+    def prompt_source(self) -> str:
+        return self.source_alias or self.source_model
 
 
 @dataclass
@@ -196,7 +207,7 @@ class LayerEditHistory:
                     desc = decision.edit.issue_description[:50]
                 elif hasattr(decision.edit, 'edit_instruction') and decision.edit.edit_instruction:
                     desc = decision.edit.edit_instruction[:50]
-                lines.append(f"- Applied: {op.upper()} {desc} - {decision.source_model}")
+                lines.append(f"- Applied: {op.upper()} {desc} - {decision.prompt_source}")
 
             for decision in record.edits_discarded:
                 op = decision.edit.edit_type.value if hasattr(decision.edit, 'edit_type') else "EDIT"
@@ -205,7 +216,7 @@ class LayerEditHistory:
                     desc = decision.edit.issue_description[:50]
                 elif hasattr(decision.edit, 'edit_instruction') and decision.edit.edit_instruction:
                     desc = decision.edit.edit_instruction[:50]
-                lines.append(f"- Discarded: {op.upper()} {desc} - {decision.source_model}")
+                lines.append(f"- Discarded: {op.upper()} {desc} - {decision.prompt_source}")
                 lines.append(f"  Reason: {decision.reason[:80]}")
 
         lines.append("[/PREVIOUS_EDITS_IN_LAYER]")
@@ -285,6 +296,7 @@ class ArbiterContext:
     # Model escalation (for minority/conflict/tie cases)
     gran_sabio_model: Optional[str] = None  # Powerful model for difficult cases
     qa_model_count: int = 1                 # Total number of QA models (for distribution calc)
+    model_alias_registry: Optional[Any] = None
 
 
 # =============================================================================
@@ -563,19 +575,19 @@ class Arbiter:
         Returns:
             Formatted string for prompt injection
         """
-        models_with_edits = set(pe.source_model for pe in proposed_edits)
+        models_with_edits = set(pe.prompt_source for pe in proposed_edits)
         proposing_count = len(models_with_edits)
 
         lines = [
-            f"Total QA Models: {qa_model_count}",
-            f"Models proposing edits: {proposing_count} ({', '.join(models_with_edits) if models_with_edits else 'none'})",
+            f"Total QA evaluators: {qa_model_count}",
+            f"Evaluators proposing edits: {proposing_count} ({', '.join(sorted(models_with_edits)) if models_with_edits else 'none'})",
             f"Distribution: {distribution.value.upper()}"
         ]
 
         if distribution == EditDistribution.MINORITY:
-            lines.append("WARNING: MINORITY of models proposed these edits. Be extra skeptical.")
+            lines.append("WARNING: MINORITY of evaluators proposed these edits. Be extra skeptical.")
         elif distribution == EditDistribution.TIE:
-            lines.append("WARNING: TIE/DISAGREEMENT between models. Careful analysis required.")
+            lines.append("WARNING: TIE/DISAGREEMENT between evaluators. Careful analysis required.")
         elif distribution == EditDistribution.CONFLICT:
             lines.append("WARNING: CONFLICTING edits detected. Must resolve incompatibilities.")
 
@@ -652,6 +664,7 @@ class Arbiter:
                 discarded_info.append({
                     "edit_type": edit.edit_type.value if hasattr(edit, 'edit_type') else "unknown",
                     "source_model": pe.source_model,
+                    "source_alias": pe.source_alias,
                     "reason": f"STALE_FRAGMENT: exact_fragment no longer exists in content",
                     "paragraph_key": pe.paragraph_key[:80],
                     "conflict_type": ConflictType.STALE_FRAGMENT.value
@@ -674,6 +687,7 @@ class Arbiter:
                         discarded_info.append({
                             "edit_type": edit.edit_type.value if hasattr(edit, 'edit_type') else "unknown",
                             "source_model": pe.source_model,
+                            "source_alias": pe.source_alias,
                             "reason": f"ALREADY_APPLIED: suggested_text equals exact_fragment (noop)",
                             "paragraph_key": pe.paragraph_key[:80],
                             "conflict_type": ConflictType.ALREADY_APPLIED.value
@@ -948,7 +962,7 @@ class Arbiter:
 
             # Build edit info with fragment details
             edit_info = (
-                f"[{i}] {op.upper()} (severity={sev}) by {pe.source_model}\n"
+                f"[{i}] {op.upper()} (severity={sev}) by {pe.prompt_source}\n"
                 f"    Paragraph: {pe.paragraph_key[:60]}...\n"
                 f"    Description: {desc}"
             )
@@ -984,11 +998,11 @@ class Arbiter:
 
         lines = []
         for i, conflict in enumerate(conflicts):
-            involved_models = [pe.source_model for pe in conflict.involved_edits]
+            involved_evaluators = [pe.prompt_source for pe in conflict.involved_edits]
             lines.append(
                 f"[Conflict {i + 1}] {conflict.conflict_type.value}\n"
                 f"  Paragraph: {conflict.paragraph_key[:60]}...\n"
-                f"  Involved models: {', '.join(involved_models)}\n"
+                f"  Involved evaluators: {', '.join(involved_evaluators)}\n"
                 f"  Description: {conflict.description}"
             )
 
@@ -1073,6 +1087,26 @@ class Arbiter:
         from config import config
 
         prompt = self._build_arbiter_prompt(context, conflicts, distribution)
+        prompt_safety_parts = None
+        if context.model_alias_registry:
+            prompt_safety_parts = [
+                PromptPart(
+                    text="\n\n".join(
+                        [
+                            context.layer_history.format_for_prompt(),
+                            self._format_edits_for_prompt(context.proposed_edits),
+                            self._format_distribution_info(
+                                distribution,
+                                context.proposed_edits,
+                                context.qa_model_count,
+                            ),
+                            self._format_conflicts_for_prompt(conflicts),
+                        ]
+                    ),
+                    source="system_generated",
+                    label="arbiter.evaluator_context",
+                )
+            ]
 
         try:
             response_content = ""
@@ -1085,7 +1119,9 @@ class Arbiter:
                     system_prompt=ARBITER_SYSTEM_PROMPT,
                     max_tokens=config.ARBITER_MAX_TOKENS,
                     temperature=config.ARBITER_TEMPERATURE,
-                    json_output=True
+                    json_output=True,
+                    model_alias_registry=context.model_alias_registry,
+                    prompt_safety_parts=prompt_safety_parts,
                 ):
                     # Handle StreamChunk (Claude thinking) vs plain string
                     if hasattr(chunk, 'text'):
@@ -1109,7 +1145,9 @@ class Arbiter:
                     system_prompt=ARBITER_SYSTEM_PROMPT,
                     max_tokens=config.ARBITER_MAX_TOKENS,
                     temperature=config.ARBITER_TEMPERATURE,
-                    json_output=True
+                    json_output=True,
+                    model_alias_registry=context.model_alias_registry,
+                    prompt_safety_parts=prompt_safety_parts,
                 )
 
             return self._parse_ai_response_json(response_content)
@@ -1209,7 +1247,8 @@ class Arbiter:
                 decision=decision,
                 reason=reason,
                 source_model=pe.source_model,
-                conflict_resolved=edit_to_conflict.get(i)
+                conflict_resolved=edit_to_conflict.get(i),
+                source_alias=pe.source_alias,
             ))
 
         return decisions
@@ -1315,6 +1354,7 @@ class Arbiter:
             {
                 "edit_type": d.edit.edit_type.value if hasattr(d.edit, 'edit_type') else "unknown",
                 "source_model": d.source_model,
+                "source_alias": d.source_alias,
                 "reason": d.reason,
                 "paragraph_key": _get_paragraph_key_for_history(d.edit)[:80]
             }
@@ -1336,6 +1376,7 @@ class Arbiter:
                 {
                     "decision": d.decision.value,
                     "source_model": d.source_model,
+                    "source_alias": d.source_alias,
                     "reason": d.reason[:100]
                 }
                 for d in decisions

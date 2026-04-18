@@ -540,6 +540,37 @@ class TestBudgetScorer:
         assert results[0].budget_gap == 0.0
         assert not results[0].flagged
 
+    @pytest.mark.asyncio
+    async def test_score_claims_passes_budget_gap_threshold_from_config(self, mock_ai_service, sample_claim, sample_spans):
+        """score_claims should respect the per-request threshold instead of the global fallback."""
+        scorer = BudgetScorer(mock_ai_service)
+        scorer.score_claim = AsyncMock(return_value=ClaimBudgetResult(
+            idx=sample_claim.idx,
+            claim=sample_claim.claim,
+            cited_spans=sample_claim.cited_spans,
+            posterior_yes=0.9,
+            prior_yes=0.2,
+            required_bits=0.1,
+            observed_bits=0.3,
+            budget_gap=-0.2,
+            flagged=False,
+            confidence_delta=0.7,
+        ))
+        config_obj = EvidenceGroundingConfig(
+            enabled=True,
+            model="gpt-4o-mini",
+            budget_gap_threshold=0.17,
+        )
+
+        await scorer.score_claims(
+            claims=[sample_claim],
+            spans=sample_spans,
+            config_obj=config_obj,
+        )
+
+        scorer.score_claim.assert_awaited_once()
+        assert scorer.score_claim.await_args.kwargs["budget_gap_threshold"] == 0.17
+
 
 # =============================================================================
 # Tests for ENTAILMENT_SYSTEM_PROMPT

@@ -8,6 +8,7 @@ Provides alerts when models show excessive false positive rates.
 
 import logging
 import os
+import hashlib
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,8 @@ class DealBreakerTracker:
         # In-memory storage
         self.escalations: Dict[str, List[GranSabioEscalation]] = {}  # session_id -> [escalations]
         self.model_stats: Dict[str, ModelReliabilityStats] = {}  # model_name -> stats
+        self.events: Dict[str, List[Dict[str, Any]]] = {}  # session_id -> event dicts
+        self.escalation_event_links: Dict[str, List[str]] = {}
 
         # Load from disk if exists
         self._load_model_stats()
@@ -47,7 +50,8 @@ class DealBreakerTracker:
         deal_breaker_reason: str,
         total_models: int,
         deal_breaker_count: int,
-        gran_sabio_model: str
+        gran_sabio_model: str,
+        deal_breaker_evaluations: Optional[List[Any]] = None,
     ) -> str:
         """
         Record a new Gran Sabio escalation
@@ -74,10 +78,116 @@ class DealBreakerTracker:
             self.escalations[session_id] = []
 
         self.escalations[session_id].append(escalation)
+        event_ids = self.record_deal_breaker_events(
+            session_id=session_id,
+            iteration=iteration,
+            layer_name=layer_name,
+            trigger_type=trigger_type,
+            deal_breakers=deal_breaker_evaluations or [
+                {
+                    "model": triggering_model,
+                    "deal_breaker_reason": deal_breaker_reason,
+                    "reason": deal_breaker_reason,
+                }
+            ],
+            total_models=total_models,
+            deal_breaker_count=deal_breaker_count,
+            gran_sabio_model=gran_sabio_model,
+            escalation_id=escalation_id,
+        )
+        self.escalation_event_links[escalation_id] = event_ids
 
         logger.info(f"Recorded escalation {escalation_id} for session {session_id}")
 
         return escalation_id
+
+    def record_deal_breaker_events(
+        self,
+        session_id: str,
+        iteration: int,
+        layer_name: str,
+        trigger_type: str,
+        deal_breakers: List[Any],
+        total_models: int,
+        deal_breaker_count: int,
+        gran_sabio_model: str,
+        escalation_id: Optional[str] = None,
+    ) -> List[str]:
+        """Record one deal-breaker event per evaluator that raised it."""
+
+        if session_id not in self.events:
+            self.events[session_id] = []
+
+        event_ids: List[str] = []
+        for item in deal_breakers:
+            model_name = self._event_value(item, "model") or self._event_value(item, "real_model") or "unknown"
+            reason = (
+                self._event_value(item, "deal_breaker_reason")
+                or self._event_value(item, "reason")
+                or ""
+            )
+            slot_id = self._event_value(item, "slot_id")
+            config_fingerprint = self._event_value(item, "config_fingerprint")
+            event_id = f"{session_id}_db_event_{len(self.events[session_id])}"
+            event = {
+                "event_id": event_id,
+                "event_type": "deal_breaker_raised",
+                "session_id": session_id,
+                "iteration": iteration,
+                "layer_name": layer_name,
+                "trigger_type": trigger_type,
+                "escalation_id": escalation_id,
+                "slot_id": slot_id,
+                "config_fingerprint": config_fingerprint,
+                "real_model": model_name,
+                "evaluator_alias": self._event_value(item, "evaluator_alias"),
+                "reason": reason,
+                "reason_fingerprint": self._reason_fingerprint(reason),
+                "total_models_evaluated": total_models,
+                "deal_breaker_count": deal_breaker_count,
+                "gran_sabio_model_used": gran_sabio_model,
+                "created_at": datetime.now(),
+                "completed_at": None,
+                "decision": "pending",
+                "reasoning": "",
+                "was_real_deal_breaker": None,
+            }
+            self.events[session_id].append(event)
+            event_ids.append(event_id)
+
+        return event_ids
+
+    def record_technical_failure(
+        self,
+        session_id: str,
+        layer_name: str,
+        model_name: str,
+        *,
+        slot_id: Optional[str] = None,
+        error_type: Optional[str] = None,
+        reason: Optional[str] = None,
+        iteration: Optional[int] = None,
+    ) -> str:
+        """Record a QA technical failure separately from semantic false positives."""
+
+        if session_id not in self.events:
+            self.events[session_id] = []
+        event_id = f"{session_id}_technical_event_{len(self.events[session_id])}"
+        self.events[session_id].append(
+            {
+                "event_id": event_id,
+                "event_type": "technical_failure",
+                "session_id": session_id,
+                "iteration": iteration,
+                "layer_name": layer_name,
+                "slot_id": slot_id,
+                "real_model": model_name,
+                "error_type": error_type,
+                "reason": reason or "",
+                "created_at": datetime.now(),
+            }
+        )
+        return event_id
 
     def complete_escalation(
         self,
@@ -112,14 +222,72 @@ class DealBreakerTracker:
             escalation.completed_at - escalation.started_at
         ).total_seconds()
 
-        # Update model statistics
-        model_name = escalation.triggering_model
-        self._update_model_stats(model_name, was_real)
+        linked_event_ids = self.escalation_event_links.get(escalation_id, [])
+        if linked_event_ids:
+            self.complete_deal_breaker_events(
+                event_ids=linked_event_ids,
+                decision=decision,
+                reasoning=reasoning,
+                was_real=was_real,
+            )
+        else:
+            # Backward compatibility for escalations created before event tracking.
+            model_name = escalation.triggering_model
+            self._update_model_stats(model_name, was_real)
 
         logger.info(
             f"Completed escalation {escalation_id}: "
             f"decision={decision}, was_real={was_real}"
         )
+
+    def complete_deal_breaker_events(
+        self,
+        event_ids: List[str],
+        decision: str,
+        reasoning: str,
+        was_real: Optional[bool],
+    ) -> None:
+        """Complete all evaluator events associated with a Gran Sabio decision."""
+
+        wanted = set(event_ids)
+        for session_events in self.events.values():
+            for event in session_events:
+                if event.get("event_id") not in wanted:
+                    continue
+                event["decision"] = decision
+                event["reasoning"] = reasoning
+                event["was_real_deal_breaker"] = was_real
+                event["completed_at"] = datetime.now()
+                if event.get("event_type") == "deal_breaker_raised":
+                    self._update_model_stats(str(event.get("real_model") or "unknown"), was_real)
+
+    def record_model_benched(
+        self,
+        session_id: str,
+        layer_name: str,
+        model_name: str,
+        *,
+        slot_id: Optional[str] = None,
+        reason: str = "",
+    ) -> str:
+        """Record that the supervisor benched a model slot for the session/layer."""
+
+        if session_id not in self.events:
+            self.events[session_id] = []
+        event_id = f"{session_id}_bench_event_{len(self.events[session_id])}"
+        self.events[session_id].append(
+            {
+                "event_id": event_id,
+                "event_type": "model_benched",
+                "session_id": session_id,
+                "layer_name": layer_name,
+                "slot_id": slot_id,
+                "real_model": model_name,
+                "reason": reason,
+                "created_at": datetime.now(),
+            }
+        )
+        return event_id
 
     def _update_model_stats(self, model_name: str, was_real_deal_breaker: Optional[bool]):
         """Update statistics for a model"""
@@ -168,6 +336,10 @@ class DealBreakerTracker:
     def get_session_escalations(self, session_id: str) -> List[GranSabioEscalation]:
         """Get all escalations for a session"""
         return self.escalations.get(session_id, [])
+
+    def get_session_events(self, session_id: str) -> List[Dict[str, Any]]:
+        """Get all tracked supervisor/tracker events for a session."""
+        return self.events.get(session_id, [])
 
     def get_session_escalation_count(self, session_id: str) -> int:
         """Get total escalation count for a session"""
@@ -223,6 +395,7 @@ class DealBreakerTracker:
                 }
                 for name, stats in self.model_stats.items()
             },
+            "event_statistics": self._event_statistics(),
             "high_reliability_models": [
                 name for name, stats in self.model_stats.items()
                 if stats.reliability_badge == "HIGH"
@@ -232,6 +405,55 @@ class DealBreakerTracker:
                 if stats.reliability_badge == "LOW"
             ]
         }
+
+    def _event_statistics(self) -> Dict[str, Any]:
+        """Aggregate in-memory event statistics for supervisor/debug views."""
+
+        by_type: Dict[str, int] = {}
+        false_positive_by_model: Dict[str, int] = {}
+        false_positive_by_layer_model: Dict[str, int] = {}
+
+        for session_events in self.events.values():
+            for event in session_events:
+                event_type = str(event.get("event_type") or "unknown")
+                by_type[event_type] = by_type.get(event_type, 0) + 1
+                if (
+                    event_type == "deal_breaker_raised"
+                    and event.get("was_real_deal_breaker") is False
+                ):
+                    model = str(event.get("real_model") or "unknown")
+                    layer = str(event.get("layer_name") or "unknown")
+                    false_positive_by_model[model] = false_positive_by_model.get(model, 0) + 1
+                    key = f"{layer}::{model}"
+                    false_positive_by_layer_model[key] = false_positive_by_layer_model.get(key, 0) + 1
+
+        return {
+            "by_type": by_type,
+            "false_positive_by_model": false_positive_by_model,
+            "false_positive_by_layer_model": false_positive_by_layer_model,
+        }
+
+    def _event_value(self, item: Any, key: str) -> Optional[Any]:
+        if isinstance(item, dict):
+            value = item.get(key)
+            if value is not None:
+                return value
+            metadata = item.get("metadata")
+            if isinstance(metadata, dict):
+                return metadata.get(key)
+            return None
+
+        value = getattr(item, key, None)
+        if value is not None:
+            return value
+        metadata = getattr(item, "metadata", None)
+        if isinstance(metadata, dict):
+            return metadata.get(key)
+        return None
+
+    def _reason_fingerprint(self, reason: str) -> str:
+        normalized = " ".join(str(reason or "").lower().split())
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
     def _save_model_stats(self):
         """Persist model statistics to disk"""

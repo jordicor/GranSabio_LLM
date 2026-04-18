@@ -325,6 +325,7 @@ class SeverityLevel(str, Enum):
 
 class MarkerMode(str, Enum):
     """Marker identification mode for smart edit paragraph location."""
+    IDS = "ids"                # Use structural paragraph/sentence IDs
     PHRASE = "phrase"          # Use n-word phrase markers (default)
     WORD_INDEX = "word_index"  # Use word map indices (fallback for repetitive content)
 
@@ -343,7 +344,7 @@ class MarkerConfig(EditBaseModel):
     """
     mode: MarkerMode = Field(
         default=MarkerMode.PHRASE,
-        description="How paragraphs are identified: 'phrase' uses text markers, 'word_index' uses indices"
+        description="How paragraphs are identified: 'ids' uses structural paragraph/sentence IDs, 'phrase' uses text markers, 'word_index' uses indices"
     )
     phrase_length: Optional[int] = Field(
         default=None,
@@ -359,6 +360,10 @@ class MarkerConfig(EditBaseModel):
         default=None,
         description="Formatted word map string for QA prompt inclusion"
     )
+    draft_map_formatted: Optional[str] = Field(
+        default=None,
+        description="Formatted paragraph/sentence map for ID-based targeting"
+    )
 
 
 class TextEditRange(EditBaseModel):
@@ -366,6 +371,7 @@ class TextEditRange(EditBaseModel):
     Identifies a specific text range to edit, as identified by QA evaluation.
 
     Supports two identification modes:
+    - ids mode: Uses structural paragraph/sentence IDs
     - phrase mode: Uses paragraph_start/paragraph_end text markers
     - word_index mode: Uses start_word_index/end_word_index from word map
     """
@@ -373,7 +379,16 @@ class TextEditRange(EditBaseModel):
     # Marker mode selection
     marker_mode: str = Field(
         default="phrase",
-        description="Identification mode: 'phrase' (text markers) or 'word_index' (word map indices)"
+        description="Identification mode: 'ids', 'phrase' (text markers), or 'word_index' (word map indices)"
+    )
+
+    target_ids: List[str] = Field(
+        default_factory=list,
+        description="Structural paragraph/sentence IDs for ID-based smart edit targeting"
+    )
+    evidence_quote: str = Field(
+        default="",
+        description="Optional evidence quote used to verify the target IDs still match the intended span"
     )
 
     # Paragraph identification - phrase mode (optional for word_index mode)

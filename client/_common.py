@@ -287,12 +287,43 @@ def validate_result(result: Dict[str, Any]) -> None:
     raw_status = result.get("status")
     status = str(raw_status or "").lower().strip()
 
+    if status == "cancelled":
+        raise GranSabioGenerationCancelled(
+            "Generation was cancelled by user request.",
+            session_id=result.get("session_id"),
+        )
+
+    if status == "rejected":
+        failure = (
+            result.get("failure_reason")
+            or result.get("error")
+            or result.get("qa_summary")
+            or "QA rejected the content."
+        )
+        raise GranSabioGenerationRejected(
+            f"Generation rejected by QA ({failure}).",
+            details={
+                "status": raw_status,
+                "failure_reason": result.get("failure_reason"),
+                "qa_summary": result.get("qa_summary"),
+                "qa_results": result.get("qa_results"),
+                "final_score": result.get("final_score"),
+                "session_id": result.get("session_id"),
+            },
+        )
+
+    if status == "failed":
+        message = (
+            result.get("error")
+            or result.get("failure_reason")
+            or result.get("qa_summary")
+            or "unknown error"
+        )
+        raise GranSabioClientError(
+            f"Generation returned status '{status}' ({message})."
+        )
+
     if status and status not in {"completed", "success", "succeeded"}:
-        if status == "cancelled":
-            raise GranSabioGenerationCancelled(
-                "Generation was cancelled by user request.",
-                session_id=result.get("session_id"),
-            )
         message = (
             result.get("error")
             or result.get("failure_reason")

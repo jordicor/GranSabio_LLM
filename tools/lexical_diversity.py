@@ -58,6 +58,7 @@ from tools.stopwords_utils import (
     get_stopwords_for_language,
     resolve_language_hint,
 )
+from tools.string_utils import remove_invisible_control
 
 WORD_PUNCT_RE = re.compile(r"\w+(?:['']\w+)*|[^\w\s]+", re.UNICODE)
 WORD_TOKEN_RE = re.compile(r"^\w+(?:['']\w+)*$", re.UNICODE)
@@ -65,18 +66,6 @@ WORD_TOKEN_RE = re.compile(r"^\w+(?:['']\w+)*$", re.UNICODE)
 def strip_accents(text: str) -> str:
     nfkd = unicodedata.normalize("NFKD", text)
     return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
-
-def _remove_invisible_control(text: str) -> str:
-    out: List[str] = []
-    for ch in text:
-        cat = unicodedata.category(ch)
-        if cat == "Cf":
-            continue
-        if cat == "Cc" and ch not in ("\n", "\t"):
-            out.append(" ")
-            continue
-        out.append(ch)
-    return "".join(out)
 
 def tokenize_with_spans(
     text: str,
@@ -87,7 +76,7 @@ def tokenize_with_spans(
     """
     Returns tokens and char spans (start, end) for each token.
     """
-    clean = _remove_invisible_control(text)
+    clean = remove_invisible_control(text)
     tokens: List[str] = []
     spans: List[Tuple[int, int]] = []
 

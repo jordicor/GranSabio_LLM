@@ -290,6 +290,22 @@ Block specific phrases or patterns:
 
 ---
 
+### Deterministic Validation and Structural Smart Edit
+
+Two request flags control the new deterministic path without changing existing iteration or token budgets:
+
+```json
+{
+  "generation_tools_mode": "auto",
+  "smart_edit_locator_mode": "ids"
+}
+```
+
+- **`generation_tools_mode`**: `auto`, `always`, or `never`. In `auto`, supported providers (`OpenAI`, `Claude`, `Gemini`, `xAI`, and `OpenRouter`) can call a local `validate_draft` tool when measurable constraints are active, such as word count, JSON target-field extraction, phrase frequency, lexical diversity, or cumulative repetition.
+- **`smart_edit_locator_mode`**: `ids` or `legacy`. `ids` is now the default and targets paragraph/sentence IDs like `p1` or `p2s3`; `legacy` preserves the previous phrase-marker plus word-index fallback behavior.
+
+---
+
 ### Evidence Grounding (Confabulation Detection)
 
 Detect when AI models claim to use evidence but actually ignore it:
@@ -464,8 +480,8 @@ Content is approved immediately. Perfect for testing, bulk generation, or conten
 ### 1. Clone and Install
 
 ```bash
-git clone https://github.com/jordicor/Gran_Sabio_LLM.git
-cd Gran_Sabio_LLM
+git clone https://github.com/jordicor/GranSabio_LLM.git
+cd GranSabio_LLM
 python quick_start.py
 ```
 
@@ -658,7 +674,7 @@ The scripts automatically detect paths and register the MCP server with Claude C
 
 ```bash
 # Use absolute paths - relative paths won't work!
-claude mcp add gransabio-llm -- python /path/to/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py
+claude mcp add gransabio-llm -- python /path/to/GranSabio_LLM/mcp_server/gransabio_mcp_server.py
 ```
 
 **Gemini CLI** (`~/.gemini/settings.json`):
@@ -667,7 +683,7 @@ claude mcp add gransabio-llm -- python /path/to/Gran_Sabio_LLM/mcp_server/gransa
   "mcpServers": {
     "gransabio-llm": {
       "command": "python",
-      "args": ["/path/to/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py"]
+      "args": ["/path/to/GranSabio_LLM/mcp_server/gransabio_mcp_server.py"]
     }
   }
 }
@@ -677,7 +693,7 @@ claude mcp add gransabio-llm -- python /path/to/Gran_Sabio_LLM/mcp_server/gransa
 ```toml
 [mcp_servers.gransabio-llm]
 command = "python"
-args = ["/path/to/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py"]
+args = ["/path/to/GranSabio_LLM/mcp_server/gransabio_mcp_server.py"]
 ```
 
 ### Example Usage

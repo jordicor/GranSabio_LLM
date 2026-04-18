@@ -1,0 +1,31 @@
+{
+  "test_date": "2026-01-09T21:23:57.316684",
+  "model": "gemini-3-pro-preview",
+  "prompt_length": 5423,
+  "results": {
+    "exact_params": {
+      "success": true,
+      "word_count": 121,
+      "content": "{\n  \"titles\": [\n    {\n      \"number\": 1,\n      \"title\": \"Situaciones Incómodas: Reaccionando a Suscriptores\"\n    },\n    {\n      \"number\": 2,\n      \"title\": \"Momentos Vergonzosos: ¡Tierra Trágame! (Recopilación)\"\n    },\n    {\n      \"number\": 3,\n      \"title\": \"Las Peores Situaciones Incómodas que Todos Vivimos\"\n    },\n    {\n      \"number\": 4,\n      \"title\": \"Anécdotas de Vergüenza Ajena: Historias de Twitter\"\n    },\n    {\n      \"number\": 5,\n      \"title\": \"Top Situaciones Incómodas que Dan Mucha ",
+      "elapsed": 23.447164
+    },
+    "no_thinking": {
+      "success": true,
+      "word_count": 127,
+      "content": "{\n  \"titles\": [\n    {\n      \"number\": 1,\n      \"title\": \"Situaciones Incómodas: Momentos 'Tierra Trágame' Reales\"\n    },\n    {\n      \"number\": 2,\n      \"title\": \"Las Situaciones Más Vergonzosas de Mis Suscriptores\"\n    },\n    {\n      \"number\": 3,\n      \"title\": \"Momentos Incómodos: Cuando Deseas que la Tierra te Trague\"\n    },\n    {\n      \"number\": 4,\n      \"title\": \"Anécdotas Graciosas: Situaciones Incómodas en Público\"\n    },\n    {\n      \"number\": 5,\n      \"title\": \"Reaccionando a vuestras Peo",
+      "elapsed": 19.316548
+    },
+    "no_schema": {
+      "success": true,
+      "word_count": 128,
+      "content": "{\n  \"titles\": [\n    {\n      \"number\": 1,\n      \"title\": \"Situaciones Incómodas: Momentos 'Tierra Trágame' Reales\"\n    },\n    {\n      \"number\": 2,\n      \"title\": \"Pillado Viendo Porno y Otras Situaciones Incómodas\"\n    },\n    {\n      \"number\": 3,\n      \"title\": \"Me Bajó la Regla en Público: Historias Vergonzosas\"\n    },\n    {\n      \"number\": 4,\n      \"title\": \"10 Situaciones Incómodas que Todos Hemos Vivido\"\n    },\n    {\n      \"number\": 5,\n      \"title\": \"Reaccionando a Vuestras Situaciones Más I",
+      "elapsed": 20.744675
+    },
+    "simple_schema": {
+      "success": true,
+      "word_count": 135,
+      "content": "{\n  \"titles\": [\n    {\n      \"number\": 1,\n      \"title\": \"Las Situaciones Más Incómodas Que Todos Hemos Vivido\"\n    },\n    {\n      \"number\": 2,\n      \"title\": \"Momentos Tierra Trágame: Anécdotas de Suscriptores\"\n    },\n    {\n      \"number\": 3,\n      \"title\": \"Reaccionando a Vuestras Situaciones Más Vergonzosas\"\n    },\n    {\n      \"number\": 4,\n      \"title\": \"Ver Escenas Subidas de Tono con Padres y Otros Dramas\"\n    },\n    {\n      \"number\": 5,\n      \"title\": \"Se Me Escapó un Pedo en Clase: Histor",
+      "elapsed": 24.009041
+    }
+  }
+}

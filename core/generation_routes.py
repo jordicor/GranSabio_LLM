@@ -5,6 +5,7 @@ Generation and streaming API routes for Gran Sabio LLM.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import uuid
 from datetime import datetime
@@ -21,11 +22,13 @@ from models import (
     GenerationInitResponse,
     GenerationStatus,
     ImageData,
+    PreflightIssue,
     PreflightResult,
     ProjectInitRequest,
     ProjectInitResponse,
 )
 from preflight_validator import run_preflight_validation
+from model_aliasing import ModelAliasRegistry
 from services.attachment_manager import (
     AttachmentManager,
     AttachmentError,
@@ -67,6 +70,7 @@ from .app_state import (
 from .generation_processor import (
     _attach_json_guard_metadata,
     _build_final_result,
+    _get_final_content,
     add_verbose_log,
     process_content_generation,
     resolve_images_for_generation,
@@ -74,10 +78,54 @@ from .generation_processor import (
 )
 
 
+def compute_base_effective_layers(request: "ContentRequest") -> List[str]:
+    """Effective QA layers for this request.
+
+    Returns label tokens for:
+      - User-defined QA layers (by `.name`)
+      - Built-in synthetic layers that QA will actually run (word_count, phrase_frequency,
+        lexical_diversity, cumulative_repetition, evidence_grounding) - based on their
+        INJECTION preconditions, not just validator activation.
+    """
+    labels: List[str] = []
+    labels.extend(layer.name for layer in (request.qa_layers or []))
+
+    word_count_enforcement = getattr(request, "word_count_enforcement", None)
+    min_words = getattr(request, "min_words", None)
+    max_words = getattr(request, "max_words", None)
+    if (
+        word_count_enforcement
+        and getattr(word_count_enforcement, "enabled", False)
+        and (min_words or max_words)
+    ):
+        labels.append("__auto_word_count_enforcement__")
+
+    phrase_frequency = getattr(request, "phrase_frequency", None)
+    phrase_frequency_active = bool(phrase_frequency and getattr(phrase_frequency, "enabled", False))
+    if phrase_frequency_active:
+        labels.append("__auto_phrase_frequency__")
+
+    lexical_diversity = getattr(request, "lexical_diversity", None)
+    if lexical_diversity and getattr(lexical_diversity, "enabled", False):
+        labels.append("__auto_lexical_diversity__")
+
+    if getattr(request, "cumulative_text", None) and phrase_frequency_active:
+        labels.append("__auto_cumulative_repetition__")
+
+    evidence_grounding = getattr(request, "evidence_grounding", None)
+    if evidence_grounding and getattr(evidence_grounding, "enabled", False):
+        labels.append("__auto_evidence_grounding__")
+
+    return labels
+
+
 MIN_ITERATION_TIMEOUT_SECONDS = 900  # 15 minutes baseline per iteration
 QA_LAYER_PADDING_SECONDS = 120       # 2 minutes per QA layer
 GRAN_SABIO_PADDING_SECONDS = 600     # 10 minutes buffer if Gran Sabio fallback enabled
 SESSION_TIMEOUT_CAP_SECONDS = 8 * 3600  # Never recommend more than 8 hours
+DEFAULT_WORD_LIMIT_TOKEN_FLOOR = 8000
+ESTIMATED_TOKENS_PER_WORD = 2.2
+LONG_FORM_TOKEN_BUFFER = 1024
 
 
 def _get_request_fields_set(request: Any) -> set:
@@ -107,6 +155,209 @@ def _estimate_session_timeout(
 
     # Apply sane bounds to avoid runaway recommendations
     return int(min(max(total, MIN_ITERATION_TIMEOUT_SECONDS), SESSION_TIMEOUT_CAP_SECONDS))
+
+
+def _estimate_tokens_for_word_target(request: ContentRequest) -> Optional[int]:
+    """Estimate a generation token budget from the requested word target."""
+
+    target_words: Optional[int] = None
+    if request.max_words:
+        target_words = request.max_words
+    elif request.min_words:
+        target_words = request.min_words
+
+    if not target_words:
+        return None
+
+    estimated_tokens = int(math.ceil(target_words * ESTIMATED_TOKENS_PER_WORD))
+    estimated_tokens += LONG_FORM_TOKEN_BUFFER
+    return max(DEFAULT_WORD_LIMIT_TOKEN_FLOOR, estimated_tokens)
+
+
+def _build_advisory(*, code: str, message: str, severity: str = "warning") -> PreflightIssue:
+    """Create a non-blocking accepted-path advisory."""
+
+    return PreflightIssue(
+        code=code,
+        severity=severity,
+        message=message,
+        blockers=False,
+    )
+
+
+def _supports_long_text_generation_tools(model_name: str) -> bool:
+    """Return whether the generator supports Long Text section-draft tool loops."""
+
+    try:
+        model_info = config.get_model_info(model_name)
+    except Exception:
+        return False
+
+    provider = str(model_info.get("provider", "")).lower()
+    model_id = str(model_info.get("model_id", "")).lower()
+    if provider not in {"openai", "claude", "anthropic", "gemini", "google", "xai", "openrouter"}:
+        return False
+    if provider == "openai" and any(marker in model_id for marker in ["o3-pro", "gpt-5-pro"]):
+        return False
+    return True
+
+
+def _clip_long_text_bound(
+    value: int,
+    *,
+    request: ContentRequest,
+    hard_cap_words: int,
+    lower: bool,
+) -> int:
+    """Clip Long Text target bands against request bounds and the hard cap."""
+
+    if lower:
+        if request.min_words is not None:
+            value = max(value, request.min_words)
+        value = min(value, hard_cap_words)
+        return max(1, value)
+
+    if request.max_words is not None:
+        value = min(value, request.max_words)
+    value = min(value, hard_cap_words)
+    if request.min_words is not None:
+        value = max(value, request.min_words)
+    return max(1, value)
+
+
+def _resolve_long_text_mode(
+    request: ContentRequest,
+    request_fields_set: set,
+) -> tuple[Dict[str, Any], List[PreflightIssue]]:
+    """Resolve request-level Long Text activation and derived word bands."""
+
+    requested_mode = getattr(request, "long_text_mode", "auto")
+    hard_cap_words = int(config.LONG_TEXT_HARD_CAP_WORDS)
+    user_set_max_iterations = "max_iterations" in request_fields_set
+    explicit_min_words = "min_words" in request_fields_set and request.min_words is not None
+    explicit_max_words = "max_words" in request_fields_set and request.max_words is not None
+    advisories: List[PreflightIssue] = []
+
+    resolved: Dict[str, Any] = {
+        "enabled": False,
+        "requested_mode": requested_mode,
+        "activation_reason": "Long Text Mode disabled.",
+        "derived_target_words": None,
+        "target_min_words": None,
+        "target_max_words": None,
+        "emergency_min_words": None,
+        "emergency_max_words": None,
+        "hard_cap_words": hard_cap_words,
+        "user_set_max_iterations": user_set_max_iterations,
+    }
+
+    if requested_mode == "off":
+        resolved["activation_reason"] = "Long Text Mode explicitly disabled by the caller."
+        return resolved, advisories
+
+    derived_target_words: Optional[int] = None
+    if request.min_words is not None and request.max_words is not None:
+        derived_target_words = int(round((request.min_words + request.max_words) / 2.0))
+    elif requested_mode == "on" and request.min_words is not None:
+        derived_target_words = request.min_words
+    elif requested_mode == "on" and request.max_words is not None:
+        derived_target_words = request.max_words
+
+    resolved["derived_target_words"] = derived_target_words
+
+    if requested_mode == "auto":
+        if not (explicit_min_words and explicit_max_words):
+            reason = "Long Text Mode stayed off because auto mode requires both min_words and max_words."
+            resolved["activation_reason"] = reason
+            if request.min_words is not None or request.max_words is not None:
+                advisories.append(
+                    _build_advisory(
+                        code="long_text_auto_declined_one_sided_bounds",
+                        message=reason,
+                    )
+                )
+            return resolved, advisories
+
+        if derived_target_words is None:
+            resolved["activation_reason"] = "Long Text Mode stayed off because no derived target could be resolved."
+            return resolved, advisories
+
+        if derived_target_words < config.LONG_TEXT_AUTO_MIN_WORDS:
+            reason = (
+                f"Long Text Mode stayed off because the derived target ({derived_target_words} words) "
+                f"is below the auto-activation threshold ({config.LONG_TEXT_AUTO_MIN_WORDS})."
+            )
+            resolved["activation_reason"] = reason
+            advisories.append(
+                _build_advisory(
+                    code="long_text_auto_declined_below_threshold",
+                    message=reason,
+                    severity="info",
+                )
+            )
+            return resolved, advisories
+
+    if requested_mode == "on" and derived_target_words is None:
+        raise HTTPException(
+            status_code=400,
+            detail="long_text_mode='on' requires min_words, max_words, or both so a target can be derived.",
+        )
+
+    if derived_target_words is not None:
+        if derived_target_words < config.LONG_TEXT_AUTO_MIN_WORDS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Long Text Mode requires a derived target between {config.LONG_TEXT_AUTO_MIN_WORDS} "
+                    f"and {hard_cap_words} words; got {derived_target_words}."
+                ),
+            )
+        if derived_target_words > hard_cap_words:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Long Text Mode V1 is capped at {hard_cap_words} words. Split the request across "
+                    "multiple runs instead of requesting a larger single document."
+                ),
+            )
+
+    resolved["enabled"] = True
+    resolved["activation_reason"] = (
+        f"Long Text Mode enabled ({requested_mode}) with a derived target of {derived_target_words} words."
+    )
+
+    band_delta = max(1, int(round((derived_target_words or 0) * (config.LONG_TEXT_TARGET_BAND_PERCENT / 100.0))))
+    emergency_delta = max(
+        1,
+        int(round((derived_target_words or 0) * (config.LONG_TEXT_EMERGENCY_BAND_PERCENT / 100.0))),
+    )
+
+    resolved["target_min_words"] = _clip_long_text_bound(
+        (derived_target_words or 0) - band_delta,
+        request=request,
+        hard_cap_words=hard_cap_words,
+        lower=True,
+    )
+    resolved["target_max_words"] = _clip_long_text_bound(
+        (derived_target_words or 0) + band_delta,
+        request=request,
+        hard_cap_words=hard_cap_words,
+        lower=False,
+    )
+    resolved["emergency_min_words"] = _clip_long_text_bound(
+        (derived_target_words or 0) - emergency_delta,
+        request=request,
+        hard_cap_words=hard_cap_words,
+        lower=True,
+    )
+    resolved["emergency_max_words"] = _clip_long_text_bound(
+        (derived_target_words or 0) + emergency_delta,
+        request=request,
+        hard_cap_words=hard_cap_words,
+        lower=False,
+    )
+
+    return resolved, advisories
 
 @app.post("/project/new", response_model=ProjectInitResponse)
 async def allocate_project_id(request: Optional[ProjectInitRequest] = Body(default=None)):
@@ -236,6 +487,63 @@ async def generate_content(request: ContentRequest):
     #logger.info("Incoming /generate request payload: %s", json.dumps(request_payload, ensure_ascii=False))
 
     request_fields_set = _get_request_fields_set(request)
+    resolved_long_text_mode, long_text_advisories = _resolve_long_text_mode(request, request_fields_set)
+    request._resolved_long_text_mode = resolved_long_text_mode
+    explicit_arbiter_model = "arbiter_model" in request_fields_set
+
+    # Accent guard + Long Text fail-fast (Cambio 1 v5, §5.1)
+    if resolved_long_text_mode.get("enabled") and request.llm_accent_guard.mode != "off":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "llm_accent_guard is not supported when Long Text Mode is enabled. "
+                "Disable accent guard or set long_text_mode to 'auto'/'off'."
+            ),
+        )
+
+    # Accent post-mode on empty pipeline fail-fast (Cambio 1 v5, §5.1)
+    accent_mode = request.llm_accent_guard.mode
+    if accent_mode in {"post", "inline_post"}:
+        base_layers = compute_base_effective_layers(request)
+        if not base_layers and not request.llm_accent_guard.force_accent_with_empty_layers:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "accent post mode would re-enable QA on an empty pipeline; "
+                    "set force_accent_with_empty_layers=true or add a qa_layer."
+                ),
+            )
+        if (
+            not base_layers
+            and request.llm_accent_guard.force_accent_with_empty_layers
+            and not request.qa_models
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "force_accent_with_empty_layers requires at least one qa_model "
+                    "to evaluate the synthetic accent layer."
+                ),
+            )
+
+    # Accent inline requires tool-calling provider (Cambio 1 v5, §5.1)
+    if accent_mode in {"inline", "inline_post"}:
+        try:
+            gen_info = config.get_model_info(request.generator_model)
+        except Exception:
+            gen_info = None
+        if gen_info is not None:
+            provider_key = (gen_info.get("provider") or "").lower()
+            model_id_lc = str(gen_info.get("model_id") or "").lower()
+            supported_providers = {"openai", "claude", "anthropic", "gemini", "google", "xai", "openrouter"}
+            if provider_key not in supported_providers or any(m in model_id_lc for m in ("o3-pro", "gpt-5-pro")):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "accent_guard inline mode requires a provider with tool-calling support; "
+                        "this generator_model does not qualify."
+                    ),
+                )
 
     def _ensure_model_known(model_name: str, field_label: str) -> None:
         """Validate that a model exists in model_specs.json, raising HTTP 400 otherwise."""
@@ -255,9 +563,9 @@ async def generate_content(request: ContentRequest):
         )
     _ensure_model_known(request.generator_model, "generator_model")
 
-    # Require QA models only when QA layers are provided
-    qa_layers_present = bool(request.qa_layers)
-    if qa_layers_present:
+    # Require QA models when effective QA pipeline is non-empty or accent post/inline_post mode
+    qa_required = bool(compute_base_effective_layers(request)) or request.llm_accent_guard.mode in {"post", "inline_post"}
+    if qa_required:
         if "qa_models" not in request_fields_set:
             raise HTTPException(
                 status_code=400,
@@ -284,7 +592,7 @@ async def generate_content(request: ContentRequest):
             _ensure_model_known(model_name, "qa_models")
 
     # Require Gran Sabio model when its flows can run (QA enabled or fallback requested)
-    gran_sabio_needed = qa_layers_present or bool(getattr(request, "gran_sabio_fallback", False))
+    gran_sabio_needed = qa_required or bool(getattr(request, "gran_sabio_fallback", False))
     if gran_sabio_needed:
         if "gran_sabio_model" not in request_fields_set:
             raise HTTPException(
@@ -344,10 +652,24 @@ async def generate_content(request: ContentRequest):
         if not request.min_words and not request.max_words:
             raise HTTPException(status_code=400, detail="Word count enforcement is enabled but no min_words or max_words specified")
     
-    # Give AI models maximum space to generate content when word limits are specified
-    # Use a very high token limit so the AI can focus on word count rather than token constraints
-    if request.min_words or request.max_words:
-        request.max_tokens = 8000  # Very high limit to remove token constraints
+    # When word targets are present and the caller did not set an explicit token budget,
+    # auto-raise the default generation budget so long-form requests are not silently capped.
+    if (
+        (request.min_words or request.max_words)
+        and request.max_tokens_percentage is None
+        and "max_tokens" not in request_fields_set
+    ):
+        estimated_budget = _estimate_tokens_for_word_target(request)
+        if estimated_budget is not None and estimated_budget > (request.max_tokens or 0):
+            logger.info(
+                "Auto-adjusting generation max_tokens for word-targeted request: %s -> %s "
+                "(min_words=%s, max_words=%s)",
+                request.max_tokens,
+                estimated_budget,
+                request.min_words,
+                request.max_words,
+            )
+            request.max_tokens = estimated_budget
 
     json_output_requested = request.json_output or request.content_type == "json"
 
@@ -366,6 +688,68 @@ async def generate_content(request: ContentRequest):
                     adjusted_iterations,
                 )
             request.max_iterations = adjusted_iterations
+
+    long_text_enabled = bool(resolved_long_text_mode.get("enabled"))
+    long_text_tools_supported = _supports_long_text_generation_tools(request.generator_model)
+    if long_text_enabled:
+        if not config.has_model_spec(config.LONG_TEXT_CONTROLLER_EVAL_MODEL):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Long Text controller eval model '{config.LONG_TEXT_CONTROLLER_EVAL_MODEL}' "
+                    "is not declared in model_specs.json."
+                ),
+            )
+        if not resolved_long_text_mode.get("user_set_max_iterations"):
+            request.max_iterations = 2
+        elif request.max_iterations > config.LONG_TEXT_MAX_OUTER_ITERATIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Long Text Mode allows at most {config.LONG_TEXT_MAX_OUTER_ITERATIONS} outer iterations "
+                    f"when max_iterations is set explicitly; got {request.max_iterations}."
+                ),
+            )
+
+        if json_output_requested:
+            raise HTTPException(
+                status_code=400,
+                detail="Long Text Mode only supports plain-text generation and cannot be combined with JSON output.",
+            )
+        if getattr(request, "target_field", None):
+            raise HTTPException(
+                status_code=400,
+                detail="Long Text Mode does not support target_field or text_field_path requests.",
+            )
+        if getattr(request, "images", None):
+            raise HTTPException(
+                status_code=400,
+                detail="Long Text Mode V1 does not support image inputs.",
+            )
+        if explicit_arbiter_model:
+            raise HTTPException(
+                status_code=400,
+                detail="Long Text Mode manages structural repairs internally and does not accept an explicit arbiter_model.",
+            )
+        if request.generation_tools_mode == "always" and not long_text_tools_supported:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"generation_tools_mode='always' is not supported for generator_model "
+                    f"'{request.generator_model}' in Long Text section drafting."
+                ),
+            )
+        if request.generation_tools_mode == "auto" and not long_text_tools_supported:
+            long_text_advisories.append(
+                _build_advisory(
+                    code="long_text_tools_auto_downgraded",
+                    message=(
+                        f"Generator '{request.generator_model}' does not support tool-assisted Long Text "
+                        "section drafting. The request was accepted with standard streaming drafts instead."
+                    ),
+                    severity="info",
+                )
+            )
 
     attachment_manager: Optional[AttachmentManager] = None
     resolved_attachments: List[ResolvedAttachment] = []
@@ -524,6 +908,11 @@ async def generate_content(request: ContentRequest):
         reasoning_timeout_hint = None
 
     recommended_timeout_seconds = _estimate_session_timeout(request, reasoning_timeout_hint)
+    model_alias_registry = ModelAliasRegistry.from_request(
+        request,
+        preflight_model=getattr(config, "PREFLIGHT_VALIDATION_MODEL", None),
+    )
+    request._model_alias_registry = model_alias_registry
 
     # session_id was already generated earlier (before project_id handling)
     # Register temp session for preflight streaming
@@ -555,8 +944,11 @@ async def generate_content(request: ContentRequest):
                 )
             )
 
-    # Check if QA is disabled (empty qa_layers) - bypass preflight if so
-    if not request.qa_layers:
+    grounding_config = getattr(request, "evidence_grounding", None)
+    grounding_enabled = bool(grounding_config and grounding_config.enabled)
+
+    # Check if semantic QA is disabled and grounding is not active - bypass preflight if so
+    if not request.qa_layers and not grounding_enabled and request.llm_accent_guard.mode == "off":
         # No QA layers means no potential contradictions - always proceed
         from preflight_validator import _analyze_word_count_conflicts
         from models import PreflightResult
@@ -591,16 +983,29 @@ async def generate_content(request: ContentRequest):
                 stream_callback=preflight_stream_callback,
                 usage_tracker=usage_tracker,
                 phase_logger=preflight_phase_logger,
+                model_alias_registry=model_alias_registry,
             )
+
+    if long_text_enabled and not request.qa_layers and not grounding_enabled:
+        long_text_advisories.append(
+            _build_advisory(
+                code="long_text_qa_bypass",
+                message=(
+                    "Long Text Mode was accepted with qa_layers=[]. Outer QA, consensus, and Gran Sabio "
+                    "safeguards are bypassed for this request."
+                ),
+            )
+        )
+
     if preflight_result.decision != "proceed":
         # Clean up session on rejection
         await pop_session(session_id)
         return GenerationInitResponse(
-            status="rejected",
+            status="preflight_rejected",
             session_id=None,
             project_id=project_id,
             request_name=getattr(request, "request_name", None),
-            preflight_feedback=preflight_result
+            preflight_feedback=preflight_result,
         )
 
     # Extract QA layer names for status tracking (respect processing order)
@@ -637,6 +1042,9 @@ async def generate_content(request: ContentRequest):
         "gran_sabio_escalations": [],  # List[str] escalation_ids
         "gran_sabio_escalation_count": 0,  # Total count for this session
         "usage_tracker": usage_tracker,
+        "model_alias_registry": model_alias_registry,
+        "model_alias_map_internal": model_alias_registry.internal_snapshot(),
+        "model_alias_map_prompt": model_alias_registry.prompt_snapshot(),
         "show_query_costs": getattr(request, "show_query_costs", 0),
         "project_id": project_id,
         # Project status tracking fields
@@ -655,6 +1063,24 @@ async def generate_content(request: ContentRequest):
         # Cached metrics for project status
         "last_generated_content_length": 0,
         "last_generated_content_word_count": 0,
+        "resolved_long_text_mode": resolved_long_text_mode,
+        "long_text_state": ({
+            "resolved_mode": resolved_long_text_mode,
+            "source_brief": None,
+            "frozen_plan": None,
+            "sections_by_id": {},
+            "accepted_section_ids": [],
+            "failed_section_ids": [],
+            "pending_repair_targets": [],
+            "candidate_history": [],
+            "outer_feedback_digest": None,
+            "last_controller_summary": None,
+            "plan_invalidation_count": 0,
+            "no_viable_candidate_count": 0,
+            "generator_call_count": 0,
+            "semantic_eval_call_count": 0,
+            "consecutive_post_repair_assembly_failures": 0,
+        } if long_text_enabled else None),
     })
 
     logger.info(f"GRANSABIO_MAIN: About to record session {session_id[:8]}... with project_id: {project_id if project_id else 'NULL'}")
@@ -687,7 +1113,8 @@ async def generate_content(request: ContentRequest):
         session_id=session_id,
         project_id=project_id,
         request_name=getattr(request, "request_name", None),
-        recommended_timeout_seconds=recommended_timeout_seconds
+        recommended_timeout_seconds=recommended_timeout_seconds,
+        advisories=(long_text_advisories or None),
     )
 
 
@@ -722,7 +1149,13 @@ async def get_status(session_id: str):
                 }
                 for esc in escalations
             ]
-        }
+        },
+        "error": session.get("error"),
+        "failure_reason": (
+            (session.get("final_result") or {}).get("failure_reason")
+            or session.get("error")
+        ),
+        "approved": session.get("approved"),
     })
     if summary is None:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -755,7 +1188,12 @@ async def stop_session(session_id: str):
     '''Stop/cancel an active content generation session'''
 
     def _cancel(session: Dict[str, Any]):
-        final_states = {GenerationStatus.COMPLETED, GenerationStatus.FAILED, GenerationStatus.CANCELLED}
+        final_states = {
+            GenerationStatus.COMPLETED,
+            GenerationStatus.REJECTED,
+            GenerationStatus.FAILED,
+            GenerationStatus.CANCELLED,
+        }
         if session.get("status") in final_states:
             return {
                 "changed": False,
@@ -767,19 +1205,25 @@ async def stop_session(session_id: str):
             }
 
         session["cancelled"] = True
-        update_session_status(session, session_id, GenerationStatus.CANCELLED)
+        raw_content = session.get("last_generated_content", "No content generated before cancellation")
+        original_request = session.get("request")
         final_result = {
-            "content": session.get("last_generated_content", "No content generated before cancellation"),
+            "content": _get_final_content(session, raw_content, original_request) if original_request else raw_content,
             "final_iteration": session.get("current_iteration", 0),
             "final_score": 0.0,
             "approved": False,
             "failure_reason": "Session cancelled by user",
             "generated_at": datetime.now().isoformat(),
         }
-        original_request = session.get("request")
         if original_request:
             _attach_json_guard_metadata(session, final_result, original_request)
-        _store_final_result(session, final_result, session_id)
+        _store_final_result(
+            session,
+            final_result,
+            session_id,
+            final_status=GenerationStatus.CANCELLED.value,
+        )
+        update_session_status(session, session_id, GenerationStatus.CANCELLED)
         asyncio.create_task(
             _debug_record_event(
                 session_id,

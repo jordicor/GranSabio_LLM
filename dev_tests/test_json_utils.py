@@ -103,6 +103,15 @@ class TestDumps:
         assert isinstance(result, str)
         assert not isinstance(result, bytes)
 
+    def test_sort_keys_orders_dictionary_keys(self):
+        """
+        Given: A dictionary with unsorted keys
+        When: dumps() is called with sort_keys=True
+        Then: Keys are serialized in lexical order
+        """
+        result = json.dumps({"b": 2, "a": 1}, sort_keys=True)
+        assert result == '{"a":1,"b":2}'
+
     def test_handles_none_values(self):
         """
         Given: Dictionary with None value
@@ -257,6 +266,17 @@ class TestDump:
         file_obj.seek(0)
         content = file_obj.read()
         assert "\n" in content
+
+    def test_writes_sorted_keys_when_requested(self):
+        """
+        Given: Data, file object, and sort_keys=True
+        When: dump() is called
+        Then: JSON is written with sorted keys
+        """
+        file_obj = StringIO()
+        json.dump({"b": 2, "a": 1}, file_obj, sort_keys=True)
+        file_obj.seek(0)
+        assert file_obj.read() == '{"a":1,"b":2}'
 
 
 class TestLoad:

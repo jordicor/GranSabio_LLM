@@ -78,16 +78,24 @@ def json_schema_to_pydantic(
             ]
             return Union[tuple(variants)]
 
-        # Enums
+        # Enums. Anthropic's Structured Outputs validator rejects bare enum
+        # schemas that include null without an explicit type/combinator. Build
+        # nullable enums as a union so Pydantic emits anyOf with typed branches.
         if "enum" in spec and isinstance(spec["enum"], list):
-            values = tuple(spec["enum"])
+            enum_values = tuple(spec["enum"])
+            non_null_values = tuple(value for value in enum_values if value is not None)
+            has_null = len(non_null_values) != len(enum_values)
             base = str if json_type in (None, "string") else Any
             try:
                 from typing import Literal
 
-                return Literal.__getitem__(values)
+                if has_null:
+                    if non_null_values:
+                        return Union[Literal.__getitem__(non_null_values), type(None)]
+                    return type(None)
+                return Literal.__getitem__(enum_values)
             except Exception:
-                return base
+                return Union[base, type(None)] if has_null else base
 
         if json_type == "string":
             return str

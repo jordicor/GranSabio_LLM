@@ -3,14 +3,14 @@
     "IMPORTANT: Copy this file to .mcp.json and replace the path below with your ABSOLUTE path.",
     "MCP servers require absolute paths - relative paths will NOT work.",
     "Recommended: Use install_mcp.bat (Windows) or install_mcp.sh (Linux/macOS) instead.",
-    "Windows example: C:/Projects/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py",
-    "Linux example: /home/user/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py"
+    "Windows example: C:/Projects/GranSabio_LLM/mcp_server/gransabio_mcp_server.py",
+    "Linux example: /home/user/GranSabio_LLM/mcp_server/gransabio_mcp_server.py"
   ],
   "mcpServers": {
     "gransabio-llm": {
       "type": "stdio",
       "command": "python",
-      "args": ["/REPLACE/WITH/YOUR/ABSOLUTE/PATH/TO/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py"],
+      "args": ["/REPLACE/WITH/YOUR/ABSOLUTE/PATH/TO/GranSabio_LLM/mcp_server/gransabio_mcp_server.py"],
       "env": {
         "GRANSABIO_API_URL": "${GRANSABIO_API_URL:-http://localhost:8000}",
         "GRANSABIO_API_KEY": "${GRANSABIO_API_KEY:-}",

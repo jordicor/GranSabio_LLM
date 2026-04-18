@@ -22,6 +22,7 @@ class GenerationStatus(str, Enum):
     QA_EVALUATION = "qa_evaluation"
     GRAN_SABIO_REVIEW = "gran_sabio_review"
     COMPLETED = "completed"
+    REJECTED = "rejected"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
@@ -775,6 +776,43 @@ class ImageData(BaseModel):
     detail: Optional[str] = Field(default=None, description="Detail level applied for OpenAI")
 
 
+class LlmAccentGuard(BaseModel):
+    """Configuration for LLM-accent guard (Cambio 1 v5, §5.1)."""
+    mode: Literal["off", "inline", "post", "inline_post"] = Field(
+        default="off",
+        description="off = disabled; inline = generator self-audits via tool; post = synthetic QA layer; inline_post = both."
+    )
+    criteria: Optional[str] = Field(
+        default=None,
+        max_length=2000,
+        description="Optional user-supplied evaluation criteria appended to the default accent rubric."
+    )
+    min_score: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=10.0,
+        description="Minimum accent score. When None, resolved at dispatch time to max(7.0, request.min_global_score - 0.5)."
+    )
+    deal_breaker: bool = Field(
+        default=False,
+        description="If True, the synthetic accent layer is marked as deal-breaker (immediate rejection on failure)."
+    )
+    on_error: Literal["fail_closed", "fail_open"] = Field(
+        default="fail_closed",
+        description="Behavior when accent audit fails (timeout, error, parse failure): fail_closed raises AccentGuardError; fail_open accepts with warning."
+    )
+    max_inline_calls: int = Field(
+        default=3,
+        ge=1,
+        le=8,
+        description="Maximum audit_accent tool calls per tool loop."
+    )
+    force_accent_with_empty_layers: bool = Field(
+        default=False,
+        description="Allow accent post/inline_post mode on an otherwise-empty QA pipeline. Requires non-empty qa_models."
+    )
+
+
 class ProjectInitRequest(BaseModel):
     """Optional payload used when allocating or reserving a project identifier."""
 
@@ -871,6 +909,10 @@ class ContentRequest(BaseModel):
     system_prompt: Optional[str] = Field(default=None, description="Custom system prompt to override default editorial prompt")
     min_words: Optional[int] = Field(default=None, gt=0, description="Minimum words for generation")
     max_words: Optional[int] = Field(default=None, gt=0, description="Maximum words for generation (takes precedence over max_tokens)")
+    long_text_mode: Literal["auto", "on", "off"] = Field(
+        default="auto",
+        description="Long Text Mode activation: auto enables only for explicit long-form word ranges, on forces validation, off disables it.",
+    )
     language: Optional[str] = Field(
         default=None,
         description="Language hint for generation and QA modules (ISO 639-1 or locale code, e.g., 'es', 'en-US')",
@@ -917,7 +959,57 @@ class ContentRequest(BaseModel):
         default=None,
         description="Per-model QA configuration by model name. Example: {'gpt-5-mini': {'reasoning_effort': 'high', 'max_tokens': 12000}}"
     )
-    qa_layers: List[QALayer] = Field(default=[], description="QA evaluation layers - use empty list [] to bypass QA evaluation")
+    qa_execution_mode: Literal["auto", "sequential", "parallel", "progressive_quorum"] = Field(
+        default="auto",
+        description=(
+            "QA execution strategy. auto uses progressive quorum for deal-breaker layers "
+            "and bounded parallel execution for normal scoring layers."
+        ),
+    )
+    on_qa_model_unavailable: Literal["fail", "skip_if_quorum", "skip"] = Field(
+        default="skip_if_quorum",
+        description="Policy when a QA model has a provider/API failure.",
+    )
+    on_qa_timeout: Literal[
+        "fail",
+        "skip_as_technical_failure",
+        "retry_then_fail",
+        "retry_then_skip_if_quorum",
+    ] = Field(
+        default="retry_then_skip_if_quorum",
+        description="Policy when a QA model times out.",
+    )
+    min_valid_qa_models: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional absolute minimum number of valid semantic QA model results. "
+            "When omitted, the default is strict majority: floor(n / 2) + 1."
+        ),
+    )
+    min_valid_qa_model_ratio: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Optional ratio for minimum valid semantic QA model results. "
+            "No implicit ratio is applied by default."
+        ),
+    )
+    qa_replacement_policy: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Optional explicit QA replacement/bench policy. Disabled by default; "
+            "replacements require user-provided substitutes."
+        ),
+    )
+    qa_layers: List[QALayer] = Field(
+        default=[],
+        description=(
+            "QA evaluation layers. Use empty list [] to bypass semantic QA layers. "
+            "Preflight still runs when evidence_grounding is enabled."
+        ),
+    )
     qa_with_vision: bool = Field(
         default=False,
         description="Enable vision support in QA evaluation. When true, input images are passed to QA layers that have include_input_images=True. Only works when images are provided in the request."
@@ -946,6 +1038,30 @@ class ContentRequest(BaseModel):
             "'auto' - System decides based on content type and QA feedback (default for factual content), "
             "'always' - Always request specific edit ranges (forces structured QA responses), "
             "'never' - Never request edit ranges (for opinion/voting/evaluation scenarios)"
+        )
+    )
+    smart_edit_locator_mode: Literal["ids", "legacy"] = Field(
+        default="ids",
+        description=(
+            "How smart edit identifies target spans: "
+            "'ids' - use structural paragraph/sentence IDs by default, "
+            "'legacy' - use the previous phrase-marker mode with automatic word-index fallback."
+        )
+    )
+    generation_tools_mode: Literal["auto", "always", "never"] = Field(
+        default="auto",
+        description=(
+            "Control generator tool usage for deterministic checks such as word count or lexical guards: "
+            "'auto' - enable tools only when the selected model/provider supports them and measurable checks are active, "
+            "'always' - attempt tool-assisted generation first and fall back if unsupported, "
+            "'never' - disable generator tool calls."
+        )
+    )
+    include_stylistic_metrics: bool = Field(
+        default=False,
+        description=(
+            "When true, include cadence/openings/n-gram/punctuation telemetry in validate_draft tool payload "
+            "(Cambio 1 v5, §4). Informational metrics; does not gate generation alone."
         )
     )
 
@@ -1001,6 +1117,12 @@ class ContentRequest(BaseModel):
         description="Evidence grounding verification configuration (logprob-based claim verification)"
     )
 
+    # LLM-accent guard configuration
+    llm_accent_guard: LlmAccentGuard = Field(
+        default_factory=LlmAccentGuard,
+        description="LLM-accent guard configuration (Cambio 1 v5, §5)."
+    )
+
     # Cost tracking configuration
     show_query_costs: int = Field(
         default=0,
@@ -1036,6 +1158,7 @@ class ContentRequest(BaseModel):
     _total_iterations: Optional[int] = None
     _generation_mode: Optional[str] = None  # "normal" | "smart_edit"
     _smart_edit_metadata: Optional[Dict[str, Any]] = None
+    _resolved_long_text_mode: Optional[Dict[str, Any]] = None
 
     @field_validator('max_tokens_percentage')
     @classmethod
@@ -1101,6 +1224,31 @@ class ContentRequest(BaseModel):
         return v
 
     @model_validator(mode="after")
+    def _validate_min_max_words_ordering(self):
+        """Ensure min_words does not exceed max_words when both are provided."""
+        if self.min_words and self.max_words and self.min_words > self.max_words:
+            raise ValueError("min_words cannot be greater than max_words")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_qa_scheduler_quorum(self):
+        """Ensure custom QA quorum settings are explicit and satisfiable."""
+        if self.min_valid_qa_models is not None and self.min_valid_qa_model_ratio is not None:
+            raise ValueError(
+                "Configure only one of min_valid_qa_models or min_valid_qa_model_ratio."
+            )
+        qa_model_count = len(self.qa_models or [])
+        if (
+            self.min_valid_qa_models is not None
+            and qa_model_count > 0
+            and self.min_valid_qa_models > qa_model_count
+        ):
+            raise ValueError(
+                "min_valid_qa_models cannot exceed the number of configured qa_models."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _propagate_language(self):
         """Ensure nested QA configs inherit the request language when unspecified."""
         lang = (self.language or "").strip()
@@ -1110,6 +1258,63 @@ class ContentRequest(BaseModel):
             self.lexical_diversity.language = lang
         if self.phrase_frequency and not self.phrase_frequency.language:
             self.phrase_frequency.language = lang
+        return self
+
+    @model_validator(mode="after")
+    def _validate_llm_accent_guard(self):
+        """Fail-fast validators for LLM-accent guard (Cambio 1 v5, §5.1)."""
+        guard = self.llm_accent_guard
+        if guard.mode in {"inline", "inline_post"} and self.generation_tools_mode == "never":
+            raise ValueError(
+                "llm_accent_guard.mode 'inline'/'inline_post' requires generation_tools_mode != 'never'."
+            )
+        if guard.mode != "off" and self.long_text_mode == "on":
+            raise ValueError(
+                "llm_accent_guard is not supported when long_text_mode is 'on'. "
+                "Disable accent guard or set long_text_mode to 'auto'/'off'."
+            )
+        if guard.mode in {"inline", "inline_post"}:
+            try:
+                model_info = config.get_model_info(self.generator_model)
+            except Exception:
+                model_info = None
+            if model_info is not None:
+                provider_key = str(model_info.get("provider") or "").lower()
+                model_id_lc = str(model_info.get("model_id") or "").lower()
+                supported_providers = {
+                    "openai", "claude", "anthropic", "gemini", "google", "xai", "openrouter",
+                }
+                if (
+                    provider_key not in supported_providers
+                    or any(marker in model_id_lc for marker in ("o3-pro", "gpt-5-pro"))
+                ):
+                    raise ValueError(
+                        "llm_accent_guard inline mode requires a provider with tool-calling "
+                        "support; this generator_model does not qualify."
+                    )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_evidence_grounding_order(self):
+        """Reserve order range >= 999_000 for built-in synthetic layers (Cambio 1 v5, §5.1)."""
+        if self.evidence_grounding is not None:
+            order = self.evidence_grounding.order
+            if order is not None and order >= 999_000:
+                raise ValueError(
+                    "evidence_grounding.order must be < 999_000. Orders >= 999_000 are reserved "
+                    "for built-in synthetic layers (e.g., LLM accent guard at 999_999)."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_qa_layer_reserved_order(self):
+        """User-defined QA layers cannot occupy the reserved synthetic-layer range (Cambio 1 v5, §5.1)."""
+        for layer in self.qa_layers or []:
+            if layer.order >= 999_000:
+                raise ValueError(
+                    f"QA layer '{layer.name}' has order={layer.order}. Orders >= 999_000 "
+                    "are reserved for built-in synthetic layers (e.g., LLM accent guard at 999_999)."
+                )
         return self
 
     class Config:
@@ -1228,6 +1433,9 @@ class ContentRequest(BaseModel):
 class QAEvaluation(BaseModel):
     """Result of a QA evaluation"""
     model: str = Field(..., description="AI model that performed the evaluation")
+    slot_id: Optional[str] = Field(default=None, description="Internal evaluator slot id (e.g., qa:0)")
+    evaluator_alias: Optional[str] = Field(default=None, description="Prompt-facing evaluator alias")
+    config_fingerprint: Optional[str] = Field(default=None, description="Evaluator config fingerprint for slot-level identity")
     layer: str = Field(..., description="QA layer name")
     score: Optional[float] = Field(
         default=None,
@@ -1443,7 +1651,7 @@ class PreflightResult(BaseModel):
 
 class GenerationInitResponse(BaseModel):
     """Response returned when initializing a generation request"""
-    status: str = Field(..., description="Initialization status (e.g., 'initialized', 'rejected')")
+    status: str = Field(..., description="Initialization status (e.g., 'initialized', 'preflight_rejected')")
     session_id: Optional[str] = Field(default=None, description="Session identifier when generation starts")
     project_id: Optional[str] = Field(
         default=None,
@@ -1457,6 +1665,10 @@ class GenerationInitResponse(BaseModel):
     recommended_timeout_seconds: Optional[int] = Field(
         default=None,
         description="Recommended wait time (in seconds) before assuming a timeout"
+    )
+    advisories: Optional[List[PreflightIssue]] = Field(
+        default=None,
+        description="Accepted-path warnings or informational notes that do not block generation.",
     )
 
 

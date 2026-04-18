@@ -1,0 +1,69 @@
+{
+  "test_date": "2026-01-09T21:40:36.772588",
+  "results": {
+    "1_schema_auto_thinking": {
+      "success": true,
+      "generator_empty": false,
+      "content_length": 912,
+      "elapsed": 25.467260360717773,
+      "final_iteration": 1,
+      "session_id": "fdcf6953-88df-43ae-bf74-5ce4eab51d2d"
+    },
+    "2_schema_min_thinking": {
+      "success": true,
+      "generator_empty": false,
+      "content_length": 904,
+      "elapsed": 22.36292552947998,
+      "final_iteration": 1,
+      "session_id": "1e88a456-cf43-4796-847e-821ceefccb65"
+    },
+    "3_schema_low_thinking": {
+      "success": true,
+      "generator_empty": false,
+      "content_length": 898,
+      "elapsed": 25.431460857391357,
+      "final_iteration": 1,
+      "session_id": "1432a9eb-25b5-4c60-aeac-36d44025be68"
+    },
+    "4_schema_medium_thinking": {
+      "success": true,
+      "generator_empty": false,
+      "content_length": 927,
+      "elapsed": 22.376439571380615,
+      "final_iteration": 1,
+      "session_id": "1f356057-fcc5-4d9a-9ed8-6c8a12953b93"
+    },
+    "5_schema_high_thinking": {
+      "success": true,
+      "generator_empty": false,
+      "content_length": 927,
+      "elapsed": 22.41960620880127,
+      "final_iteration": 1,
+      "session_id": "6ce2ef10-3fa3-4439-833b-ada5886dafee"
+    },
+    "6_no_schema_auto_thinking": {
+      "success": true,
+      "generator_empty": false,
+      "content_length": 968,
+      "elapsed": 28.51417636871338,
+      "final_iteration": 1,
+      "session_id": "d6d5736e-8772-4493-b310-20a346aceeb4"
+    },
+    "7_no_schema_high_thinking": {
+      "success": true,
+      "generator_empty": false,
+      "content_length": 991,
+      "elapsed": 22.39342164993286,
+      "final_iteration": 1,
+      "session_id": "cfd92f47-d55a-450f-8686-07fec0337d8e"
+    },
+    "8_no_schema_min_thinking": {
+      "success": true,
+      "generator_empty": false,
+      "content_length": 900,
+      "elapsed": 25.455294370651245,
+      "final_iteration": 1,
+      "session_id": "c4c3d2e8-5120-4c5e-9253-73e487783b93"
+    }
+  }
+}

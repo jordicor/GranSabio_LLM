@@ -1,0 +1,36 @@
+{
+  "test_date": "2026-01-09T20:43:41.911768",
+  "model": "gemini-3-pro-preview",
+  "config_analysis": {
+    "no_thinking_input": 32768,
+    "zero_thinking_input": 0,
+    "explicit_thinking_input": 8192,
+    "auto_applies": true
+  },
+  "api_tests": [
+    {
+      "scenario": "API without thinking_budget_tokens",
+      "content": "{\"titles\":[{\"number\":1,\"title\":\"Stop Boiling Your Pasta Like This! (Chef Secrets)\"},{\"number\":2,\"title\":\"10 Minute Pasta Recipes That Taste Expensive\"},{\"number\":3,\"title\":\"Why You Should Finish Pasta in the Sauce - The Science of Emulsion\"}]}",
+      "elapsed": 13.362393140792847,
+      "error": null,
+      "word_count": 26,
+      "session_id": "de4b845a-04b5-4e05-a0e9-928ff736b13a"
+    },
+    {
+      "scenario": "API with thinking_budget_tokens=0",
+      "content": "",
+      "elapsed": 2.0644314289093018,
+      "error": "422 Client Error: Unprocessable Entity for url: http://localhost:8000/generate",
+      "word_count": 0,
+      "session_id": null
+    },
+    {
+      "scenario": "API with JSON mode (no schema) + auto thinking",
+      "content": "{\"titles\":[{\"number\":1,\"title\":\"Stop Boiling Your Pasta Like This! (5 Common Mistakes)\"},{\"number\":2,\"title\":\"The Science of Perfect Al Dente: Why Salt Water Matters\"},{\"number\":3,\"title\":\"I Cooked Pasta for an Italian Nonna and Here is What Happened\"}]}",
+      "elapsed": 13.349172115325928,
+      "error": null,
+      "word_count": 29,
+      "session_id": "d804aa46-8d61-41c6-88e0-fb45f959868e"
+    }
+  ]
+}

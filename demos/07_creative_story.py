@@ -209,13 +209,13 @@ Write the story directly, no preamble or explanation needed.
                 "direction": "both",
                 "severity": "important"
             },
-            qa_models=["gpt-5-mini", "deepseek/deepseek-v3.2-exp"],
+            qa_models=["gpt-5.4", "deepseek/deepseek-v3.2-exp"],
             qa_layers=qa_layers,
             phrase_frequency=phrase_frequency,
             lexical_diversity=lexical_diversity,
             min_global_score=7.5,
             max_iterations=4,
-            gran_sabio_model="gpt-5.2",
+            gran_sabio_model="claude-opus-4-7",
             verbose=True,
             request_name=f"Creative Story ({args.genre})",
             wait_for_completion=False  # Return immediately with session_id

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 from ai_service import StreamChunk
 from config import config
+from model_aliasing import ModelAliasRegistry, PromptPart
 from models import ContentRequest, PreflightResult, PreflightIssue, WordCountAnalysis
 from usage_tracking import UsageTracker
 from word_count_utils import (
@@ -57,6 +58,7 @@ def _build_validation_payload(
     request: ContentRequest,
     context_documents: Optional[List[Dict[str, Any]]] = None,
     image_info: Optional[Dict[str, Any]] = None,
+    model_alias_registry: Optional[ModelAliasRegistry] = None,
 ) -> Dict[str, Any]:
     """Collect the relevant pieces of the request for the validator.
 
@@ -119,11 +121,17 @@ def _build_validation_payload(
         except AttributeError:
             lexical_diversity_info = dict(request.lexical_diversity)
 
+    qa_model_names = _normalize_qa_models(request.qa_models)
+    if model_alias_registry:
+        qa_evaluators = [model_alias_registry.qa_alias(index) for index, _ in enumerate(qa_model_names)]
+    else:
+        qa_evaluators = [f"Evaluator {chr(ord('A') + index)}" for index, _ in enumerate(qa_model_names)]
+
     payload: Dict[str, Any] = {
         "prompt": request.prompt,
         "content_type": request.content_type,
-        "generator_model": request.generator_model,
-        "qa_models": _normalize_qa_models(request.qa_models),
+        "generator_role": "Generator",
+        "qa_evaluators": qa_evaluators,
         "qa_layers": qa_layers,
         "min_global_score": request.min_global_score,
         "max_iterations": request.max_iterations,
@@ -146,6 +154,12 @@ def _build_validation_payload(
         payload["phrase_frequency"] = phrase_frequency_info
     if lexical_diversity_info:
         payload["lexical_diversity"] = lexical_diversity_info
+
+    # Accent-vs-AI-style-request conflict detection (Cambio 1 v5, §6).
+    # Only the mode enum value is serialized - never the user-supplied criteria.
+    guard = getattr(request, "llm_accent_guard", None)
+    if guard is not None and getattr(guard, "mode", "off") != "off":
+        payload["llm_accent_guard_mode"] = guard.mode
 
     return payload
 
@@ -195,6 +209,15 @@ def _build_validator_prompt(payload: Dict[str, Any]) -> str:
         "2. Check for contradictions: if QA layers require 'text-only' analysis or forbid visual references, but images are provided, flag as warning. "
         "3. If prompt explicitly mentions analyzing/describing images but no images are provided, issue a warning (not rejection). "
         "4. Vision-enabled requests are valid for all content types - images can provide context for biographies, articles, scripts, etc. "
+
+        "LLM ACCENT GUARD CONFLICT DETECTION: "
+        "If the payload includes 'llm_accent_guard_mode' with any value other than 'off' AND "
+        "the user prompt explicitly requests AI-style, 'slop', or formulaic-AI content as the primary "
+        "deliverable (NOT merely as illustrative examples embedded inside a larger legitimate deliverable), "
+        "REJECT with decision='reject'. Provide user_feedback in the user's own language that (a) identifies "
+        "the conflict between the accent guard and the explicit AI-style request, and (b) suggests disabling "
+        "one of the two (either llm_accent_guard or the explicit AI-style request). "
+        "Ambiguous cases (e.g., 'explain AI patterns with short examples') should PROCEED. "
 
         "If no blocking issue exists, respond with decision 'proceed'. "
         "Always return STRICT JSON matching the described schema. Do not include code fences or commentary."
@@ -470,6 +493,7 @@ async def run_preflight_validation(
     stream_callback: Optional[callable] = None,
     usage_tracker: Optional[UsageTracker] = None,
     phase_logger: Optional["PhaseLogger"] = None,
+    model_alias_registry: Optional[ModelAliasRegistry] = None,
 ) -> PreflightResult:
     """Run the preflight validator and return a structured decision.
 
@@ -515,8 +539,18 @@ async def run_preflight_validation(
         request,
         context_documents=context_documents,
         image_info=image_info,
+        model_alias_registry=model_alias_registry,
     )
     validator_prompt = _build_validator_prompt(payload)
+    guard_payload = dict(payload)
+    guard_payload.pop("prompt", None)
+    prompt_safety_parts = [
+        PromptPart(
+            text=json.dumps(guard_payload, ensure_ascii=True, indent=2),
+            source="system_generated",
+            label="preflight.validation_payload",
+        )
+    ]
 
     try:
         if phase_logger:
@@ -560,6 +594,8 @@ async def run_preflight_validation(
                 extra_verbose=False,
                 usage_callback=usage_callback,
                 phase_logger=phase_logger,
+                model_alias_registry=model_alias_registry,
+                prompt_safety_parts=prompt_safety_parts,
             ):
                 # Handle StreamChunk (Claude with thinking) vs plain string
                 if isinstance(chunk, StreamChunk):
@@ -587,6 +623,8 @@ async def run_preflight_validation(
                 extra_verbose=False,
                 usage_callback=usage_callback,
                 phase_logger=phase_logger,
+                model_alias_registry=model_alias_registry,
+                prompt_safety_parts=prompt_safety_parts,
             )
 
         # Log response if phase_logger is available

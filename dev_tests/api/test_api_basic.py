@@ -628,18 +628,18 @@ class TestGenerateEndpointValidation:
         assert "recommended_timeout_seconds" in data
         assert isinstance(data["recommended_timeout_seconds"], int)
 
-    def test_generate_preflight_reject_returns_rejected_status(
+    def test_generate_preflight_reject_returns_preflight_rejected_status(
         self, client, valid_generate_request_with_qa, mock_preflight_reject
     ):
         """
         Given: Request that fails preflight validation
         When: POST /generate is called
-        Then: Returns status 'rejected' with preflight_feedback
+        Then: Returns status 'preflight_rejected' with preflight_feedback
         """
         response = client.post("/generate", json=valid_generate_request_with_qa)
         assert response.status_code == 200
         data = response.json()
-        assert data["status"] == "rejected"
+        assert data["status"] == "preflight_rejected"
         assert data["session_id"] is None
         assert "preflight_feedback" in data
 
@@ -657,6 +657,38 @@ class TestGenerateEndpointValidation:
             "qa_layers": []
         })
         assert response.status_code == 200
+
+    def test_generate_with_grounding_enabled_does_not_bypass_preflight(
+        self, client, valid_generate_request
+    ):
+        """
+        Given: qa_layers=[] but evidence grounding enabled
+        When: POST /generate is called
+        Then: Preflight still runs instead of being bypassed
+        """
+        from models import PreflightResult
+
+        valid_generate_request["evidence_grounding"] = {"enabled": True}
+        reject_result = PreflightResult(
+            decision="reject",
+            user_feedback="Grounding model is invalid",
+            summary="Evidence grounding config rejected",
+            confidence=0.99,
+            enable_algorithmic_word_count=False,
+            duplicate_word_count_layers_to_remove=[],
+        )
+
+        with patch(
+            "core.generation_routes.run_preflight_validation",
+            new_callable=AsyncMock,
+            return_value=reject_result,
+        ) as mock_run:
+            response = client.post("/generate", json=valid_generate_request)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "preflight_rejected"
+        mock_run.assert_awaited_once()
 
 
 # ============================================================================

@@ -17,7 +17,7 @@ What's new in 2.3.2
 -------------------
 - Fix: Paragraph/block detection now uses the exact same normalized text domain as token spans
   to avoid CRLF vs. LF mismatches. compute_token_segments_from_blanklines() now runs on
-  _remove_invisible_control(text), aligning character coordinates with token_spans.
+  remove_invisible_control(text), aligning character coordinates with token_spans.
 
 What's new in 2.3.1
 -------------------
@@ -53,6 +53,7 @@ import hashlib
 from multiprocessing import get_context
 
 from tools.stopwords_utils import get_stopwords_for_language, resolve_language_hint
+from tools.string_utils import remove_invisible_control
 
 # Optional psutil for physical core detection (best effort)
 try:
@@ -72,18 +73,6 @@ def strip_accents(text: str) -> str:
     nfkd = unicodedata.normalize("NFKD", text)
     return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
 
-def _remove_invisible_control(text: str) -> str:
-    out: List[str] = []
-    for ch in text:
-        cat = unicodedata.category(ch)
-        if cat == "Cf":
-            continue
-        if cat == "Cc" and ch not in ("\n", "\t"):
-            out.append(" ")
-            continue
-        out.append(ch)
-    return "".join(out)
-
 # Words (Unicode-aware) OR runs of non-(word|space) as punctuation tokens.
 WORD_PUNCT_RE = re.compile(r"\w+(?:['’]\w+)*|[^\w\s]+", re.UNICODE)
 WORD_TOKEN_RE = re.compile(r"^\w+(?:['’]\w+)*$", re.UNICODE)
@@ -93,7 +82,7 @@ def tokenize_word_punct_with_spans(
     lowercase: bool = True,
     remove_accents_flag: bool = False,
 ) -> Tuple[List[str], List[Tuple[int, int]]]:
-    clean = _remove_invisible_control(text)
+    clean = remove_invisible_control(text)
     tokens: List[str] = []
     spans: List[Tuple[int, int]] = []
     for m in WORD_PUNCT_RE.finditer(clean):
@@ -111,7 +100,7 @@ def tokenize_alnum_with_spans(
     lowercase: bool = True,
     remove_accents_flag: bool = False,
 ) -> Tuple[List[str], List[Tuple[int, int]]]:
-    clean = _remove_invisible_control(text)
+    clean = remove_invisible_control(text)
     tokens: List[str] = []
     spans: List[Tuple[int, int]] = []
     buf: List[str] = []
@@ -287,13 +276,13 @@ def compute_token_segments_from_blanklines(
 
     IMPORTANT:
     To avoid CRLF vs LF domain mismatches, we compute boundaries on the SAME cleaned
-    text domain used to produce token_spans, i.e., _remove_invisible_control(text).
+    text domain used to produce token_spans, i.e., remove_invisible_control(text).
     This keeps character coordinates aligned with token_spans.
     """
     if not token_spans:
         return []
     # Use the exact same cleaning as tokenization so char coordinates align.
-    s = _remove_invisible_control(text)
+    s = remove_invisible_control(text)
 
     sep_re = _compile_blankline_sep(min_blank_lines)
     boundaries: List[int] = [0]

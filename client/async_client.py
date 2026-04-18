@@ -22,7 +22,7 @@ import os
 import time
 import asyncio
 import logging
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Coroutine, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 import aiohttp
 
@@ -34,7 +34,16 @@ except ImportError:
     pass
 
 # Import shared exceptions from package
-from . import GranSabioClientError, GranSabioGenerationCancelled, GranSabioGenerationRejected
+from . import (
+    GranSabioClientError,
+    GranSabioGenerationCancelled,
+    GranSabioGenerationRejected,
+    TransientGranSabioError,
+)
+
+# Reuse the backoff curve from the sync client so sync and async share one
+# source of truth for the retry schedule.
+from .sync_client import _POLL_RETRY_BACKOFF_SECONDS
 
 # Import shared utilities from _common
 from ._common import (
@@ -54,6 +63,11 @@ from ._common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Generic return type for _call_with_retry so it can wrap any idempotent async
+# operation (ClientResponse, parsed JSON dict, etc.).
+_RetryT = TypeVar("_RetryT")
 
 
 class AsyncGranSabioClient:
@@ -167,15 +181,64 @@ class AsyncGranSabioClient:
         try:
             response = await self.session.request(method, url, json=json_data, **kwargs)
             return response
-        except aiohttp.ClientConnectorError as e:
+        # ClientSSLError must be caught BEFORE ClientConnectorError because
+        # aiohttp.ClientSSLError is a subclass of ClientConnectorError; without
+        # this explicit branch, genuine TLS problems (bad cert, hostname
+        # mismatch, unsupported TLS version) would be silently reclassified as
+        # transient and retried. They are not transient -- fail fast.
+        except aiohttp.ClientSSLError as e:
             raise GranSabioClientError(
+                f"TLS/SSL error connecting to {self.base_url}: {e}"
+            ) from e
+        except aiohttp.ClientConnectorError as e:
+            raise TransientGranSabioError(
                 f"Cannot connect to Gran Sabio API at {self.base_url}. "
                 "Ensure the server is running."
             ) from e
         except asyncio.TimeoutError as e:
-            raise GranSabioClientError(f"Request to {endpoint} timed out") from e
+            raise TransientGranSabioError(
+                f"Request to {endpoint} timed out"
+            ) from e
+        # ServerDisconnectedError and ClientPayloadError name specific mid-
+        # response failure modes (connection closed or compressed/chunked body
+        # truncated while aiohttp was still reading). They are genuinely
+        # retryable on an idempotent GET.
+        except (aiohttp.ServerDisconnectedError,
+                aiohttp.ClientPayloadError) as e:
+            raise TransientGranSabioError(
+                f"Transient protocol error on request to {endpoint}: {e}"
+            ) from e
         except aiohttp.ClientError as e:
             raise GranSabioClientError(f"Request failed: {e}") from e
+
+    # Body-read helpers — aiohttp raises ClientPayloadError / ServerDisconnectedError
+    # during `response.json()` / `response.text()` when the connection drops or the
+    # chunked/compressed body is truncated mid-read. Those failures occur AFTER
+    # `_request()` returned successfully, so without these helpers they would
+    # escape the retry envelope in `_call_with_retry` as generic exceptions.
+    async def _read_json(self, response: aiohttp.ClientResponse, endpoint: str) -> Any:
+        """Read JSON body, converting transient mid-read failures to TransientGranSabioError."""
+        try:
+            return await response.json()
+        except (aiohttp.ClientPayloadError,
+                aiohttp.ServerDisconnectedError,
+                aiohttp.ClientConnectionError,
+                asyncio.TimeoutError) as exc:
+            raise TransientGranSabioError(
+                f"Transient protocol error reading JSON from {endpoint}: {exc}"
+            ) from exc
+
+    async def _read_text(self, response: aiohttp.ClientResponse, endpoint: str) -> str:
+        """Read text body, converting transient mid-read failures to TransientGranSabioError."""
+        try:
+            return await response.text()
+        except (aiohttp.ClientPayloadError,
+                aiohttp.ServerDisconnectedError,
+                aiohttp.ClientConnectionError,
+                asyncio.TimeoutError) as exc:
+            raise TransientGranSabioError(
+                f"Transient protocol error reading text from {endpoint}: {exc}"
+            ) from exc
 
     # =========================================================================
     # Health & Info
@@ -410,7 +473,7 @@ class AsyncGranSabioClient:
             result = await response.json()
 
         # Handle preflight rejection
-        if result.get("status") == "rejected":
+        if result.get("status") in {"preflight_rejected", "rejected"} and result.get("preflight_feedback"):
             feedback = result.get("preflight_feedback", {})
             raise GranSabioClientError(
                 f"Request rejected by preflight: {feedback.get('user_feedback', 'Unknown reason')}",
@@ -435,40 +498,116 @@ class AsyncGranSabioClient:
 
     async def get_status(self, session_id: str) -> Dict[str, Any]:
         """Get current status of a generation session."""
-        async with await self._request("GET", f"/status/{session_id}") as response:
+        endpoint = f"/status/{session_id}"
+        async with await self._request("GET", endpoint) as response:
             if response.status != 200:
-                text = await response.text()
+                text = await self._read_text(response, endpoint)
                 raise GranSabioClientError(
                     f"Failed to get status: {text}",
                     status_code=response.status
                 )
-            return await response.json()
+            return await self._read_json(response, endpoint)
 
     async def get_result(self, session_id: str) -> Dict[str, Any]:
         """Get the result of a completed generation session."""
-        async with await self._request("GET", f"/result/{session_id}") as response:
+        endpoint = f"/result/{session_id}"
+        async with await self._request("GET", endpoint) as response:
             if response.status == 202:
                 return {"status": "in_progress", "session_id": session_id}
 
             if response.status != 200:
-                text = await response.text()
+                text = await self._read_text(response, endpoint)
                 raise GranSabioClientError(
                     f"Failed to get result: {text}",
                     status_code=response.status
                 )
 
-            return await response.json()
+            return await self._read_json(response, endpoint)
 
     async def stop_session(self, session_id: str) -> Dict[str, Any]:
         """Cancel an active generation session."""
-        async with await self._request("POST", f"/stop/{session_id}") as response:
+        endpoint = f"/stop/{session_id}"
+        async with await self._request("POST", endpoint) as response:
             if response.status not in (200, 202):
-                text = await response.text()
+                text = await self._read_text(response, endpoint)
                 raise GranSabioClientError(
                     f"Failed to stop session: {text}",
                     status_code=response.status
                 )
-            return await response.json()
+            return await self._read_json(response, endpoint)
+
+    async def _call_with_retry(
+        self,
+        op_name: str,
+        session_id: str,
+        func: Callable[[], Awaitable[_RetryT]],
+        start_time: float,
+        max_wait: float,
+    ) -> _RetryT:
+        """
+        Invoke an idempotent polling operation (get_status / get_result / raw
+        GET /result) with exponential backoff on transient network errors.
+        Non-transient errors propagate immediately. Retry sleeps count against
+        the deadline implied by ``start_time + max_wait``; if the budget
+        expires mid-sleep, the call is aborted.
+
+        The retry budget is whatever the caller chose by passing ``start_time``.
+        Callers that pass a fresh ``start_time`` per invocation (as
+        ``_fetch_result_polling`` does) give each call its own full retry
+        budget. Callers that pass a shared ``start_time`` (as
+        ``wait_for_result`` does) make retries compete for the overall deadline
+        -- intentional, so long-stalled sessions don't silently extend past
+        ``max_wait`` via retries.
+        """
+        retries = len(_POLL_RETRY_BACKOFF_SECONDS)
+        last_err: Optional[TransientGranSabioError] = None
+
+        # Initial attempt (not counted as a retry in log messages).
+        try:
+            return await func()
+        except TransientGranSabioError as err:
+            last_err = err
+
+        # Retry loop: iterate directly over the backoff curve so retry_number
+        # naturally indexes into it without an awkward `+ 1`.
+        for retry_number, sleep_for in enumerate(_POLL_RETRY_BACKOFF_SECONDS, start=1):
+            logger.warning(
+                "Transient error polling session %s via %s (retry %d/%d): %s. "
+                "Retrying in %ds.",
+                session_id, op_name, retry_number, retries, last_err, sleep_for,
+            )
+
+            # Respect the overall max_wait budget. If the backoff would push us
+            # past the deadline, abort now rather than sleep past it.
+            elapsed = time.monotonic() - start_time
+            if elapsed + sleep_for > max_wait:
+                assert last_err is not None
+                raise GranSabioClientError(
+                    f"Timed out waiting for session {session_id} after {max_wait}s "
+                    f"while backing off from transient error: {last_err}. "
+                    f"Session {session_id} may still be running on the server. "
+                    f"Check with GET /result/{session_id} or GET /status/{session_id}."
+                ) from last_err
+            await asyncio.sleep(sleep_for)
+
+            try:
+                return await func()
+            except TransientGranSabioError as err:
+                last_err = err
+
+        assert last_err is not None
+        logger.error(
+            "Transient error polling session %s via %s exhausted %d retries: %s. "
+            "Session may still be running on the server. "
+            "Check with GET /result/%s or GET /status/%s.",
+            session_id, op_name, retries, last_err, session_id, session_id,
+        )
+        raise GranSabioClientError(
+            f"Transient network errors exhausted retries for session {session_id} "
+            f"during {op_name}: {last_err}. Session {session_id} may still be "
+            f"running on the server. Check with GET /result/{session_id} or "
+            f"GET /status/{session_id}."
+        ) from last_err
 
     async def wait_for_result(
         self,
@@ -479,6 +618,12 @@ class AsyncGranSabioClient:
     ) -> Dict[str, Any]:
         """
         Poll until generation completes and return result.
+
+        Transient network errors (connection drops, timeouts, mid-response
+        protocol errors) during status or result polling are retried with
+        exponential backoff (_POLL_RETRY_BACKOFF_SECONDS) before giving up.
+        Retry sleeps count against max_wait. Non-transient errors (HTTP
+        4xx/5xx, etc.) fail fast.
 
         Args:
             session_id: Session to wait for
@@ -498,29 +643,44 @@ class AsyncGranSabioClient:
                     f"Timed out waiting for session {session_id} after {max_wait}s"
                 )
 
-            status = await self.get_status(session_id)
+            status = await self._call_with_retry(
+                "get_status",
+                session_id,
+                lambda: self.get_status(session_id),
+                start_time,
+                max_wait,
+            )
 
             if on_status:
                 on_status(status)
 
             current_status = status.get("status", "")
 
-            if current_status == "completed":
-                return await self.get_result(session_id)
-
-            if current_status == "failed":
-                raise GranSabioClientError(
-                    f"Generation failed: {status.get('error', 'Unknown error')}",
-                    details=status
+            if current_status in {"completed", "rejected", "failed", "cancelled"}:
+                final = await self._call_with_retry(
+                    "get_result",
+                    session_id,
+                    lambda: self.get_result(session_id),
+                    start_time,
+                    max_wait,
                 )
+                if final.get("status") == "in_progress":
+                    raise GranSabioClientError(
+                        f"Generation returned terminal status '{current_status}' but final result is not ready yet",
+                        details=status,
+                    )
+                validate_result(final)
+                return final
 
-            if current_status == "cancelled":
-                raise GranSabioClientError(
-                    "Generation was cancelled",
-                    details=status
-                )
-
-            await asyncio.sleep(poll_interval)
+            # Bound the poll sleep by the remaining max_wait budget. Without
+            # this, a full poll_interval sleep can push total wait up to
+            # poll_interval past max_wait, since the timeout check only runs
+            # at loop top.
+            remaining = max_wait - (time.monotonic() - start_time)
+            if remaining <= 0:
+                # Fall through: next iteration's max_wait check will raise.
+                continue
+            await asyncio.sleep(min(poll_interval, remaining))
 
     # Alias for backward compatibility with demos
     async def wait_for_completion(
@@ -883,10 +1043,12 @@ class AsyncGranSabioClient:
         )
 
         content = result.get("content", "{}")
-        if isinstance(content, str):
+        if isinstance(content, dict):
+            result["parsed_content"] = content
+        elif isinstance(content, str):
             try:
                 result["parsed_content"] = json.loads(content)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, ValueError):
                 result["parsed_content"] = None
                 result["parse_error"] = True
 
@@ -1054,42 +1216,98 @@ class AsyncGranSabioClient:
         """
         result_url = f"/result/{session_id}"
         deadline = time.monotonic() + timeout_seconds if timeout_seconds else None
+        # Per-invocation retry budget for transient network errors on the
+        # idempotent GET /result call. When no outer timeout is set, the retry
+        # layer still caps its own backoff sleeps (they remain bounded by
+        # _POLL_RETRY_BACKOFF_SECONDS).
+        retry_max_wait = float(timeout_seconds) if timeout_seconds else float("inf")
+
+        async def _fetch_once() -> Tuple[int, Optional[Dict[str, Any]], str, str]:
+            """One GET /result attempt. Returns (status, parsed_json, detail, text_body).
+
+            Transient failures propagate as TransientGranSabioError (either from
+            _request or from reading the response body) so the retry layer can
+            handle them. text_body is only populated when the caller will need
+            it for an error message (non-retryable non-200 status).
+            """
+            async with await self._request("GET", result_url) as response:
+                status_code = response.status
+                if status_code == 200:
+                    try:
+                        body = await response.json()
+                    except aiohttp.ClientPayloadError as exc:
+                        # Mid-response truncation on the success branch is
+                        # transient for an idempotent GET -- let the retry
+                        # layer try again.
+                        raise TransientGranSabioError(
+                            f"Transient protocol error reading /result/{session_id}: {exc}"
+                        ) from exc
+                    return status_code, body, "", ""
+
+                parsed: Optional[Dict[str, Any]] = None
+                detail = ""
+                try:
+                    parsed = await response.json()
+                    if isinstance(parsed, dict):
+                        detail = str(parsed.get("detail", ""))
+                except aiohttp.ClientPayloadError as exc:
+                    # Mid-response truncation on the non-200 branch is still
+                    # transient for an idempotent GET.
+                    raise TransientGranSabioError(
+                        f"Transient protocol error reading /result/{session_id}: {exc}"
+                    ) from exc
+                except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError):
+                    parsed = None
+
+                text_body = ""
+                # Only bother reading the body text when we may need it for an
+                # error message (non-retryable status). Retryable statuses skip
+                # this to avoid wasted I/O.
+                is_retryable_status = status_code in (202, 425, 503, 400)
+                if not is_retryable_status:
+                    try:
+                        text_body = await response.text()
+                    except aiohttp.ClientPayloadError as exc:
+                        raise TransientGranSabioError(
+                            f"Transient protocol error reading /result/{session_id}: {exc}"
+                        ) from exc
+
+                return status_code, parsed, detail, text_body
 
         while True:
-            async with await self._request("GET", result_url) as response:
-                if response.status == 200:
-                    final_result = await response.json()
-                    logger.info(
-                        "Final result retrieved for session %s: status = %s",
-                        session_id,
-                        final_result.get("status", "unknown"),
-                    )
-                    return final_result
+            call_start = time.monotonic()
+            status_code, _payload, detail_message, text_body = await self._call_with_retry(
+                "get_result",
+                session_id,
+                _fetch_once,
+                call_start,
+                retry_max_wait,
+            )
 
-                detail_message = ""
-                try:
-                    payload = await response.json()
-                    if isinstance(payload, dict):
-                        detail_message = str(payload.get("detail", ""))
-                except Exception:
-                    payload = None
+            if status_code == 200:
+                final_result = _payload if isinstance(_payload, dict) else {}
+                logger.info(
+                    "Final result retrieved for session %s: status = %s",
+                    session_id,
+                    final_result.get("status", "unknown"),
+                )
+                return final_result
 
-                should_retry = False
-                if response.status in (202, 425, 503, 400):
-                    lower_detail = detail_message.lower()
-                    if "not finished" in lower_detail or "still in progress" in lower_detail:
-                        should_retry = True
-                    elif response.status == 202 and not detail_message:
-                        should_retry = True
+            should_retry = False
+            if status_code in (202, 425, 503, 400):
+                lower_detail = detail_message.lower()
+                if "not finished" in lower_detail or "still in progress" in lower_detail:
+                    should_retry = True
+                elif status_code == 202 and not detail_message:
+                    should_retry = True
 
-                if not should_retry:
-                    text_body = await response.text()
-                    raise GranSabioClientError(
-                        f"Result retrieval failed: {response.status} - {text_body}",
-                        status_code=response.status,
-                    )
+            if not should_retry:
+                raise GranSabioClientError(
+                    f"Result retrieval failed: {status_code} - {text_body}",
+                    status_code=status_code,
+                )
 
-            # Retryable -- check deadline
+            # Retryable (server reports in-progress) -- check deadline.
             now = time.monotonic()
             if deadline is not None and now >= deadline:
                 if activity_monitor and timeout_seconds:
@@ -1113,7 +1331,11 @@ class AsyncGranSabioClient:
                     )
 
             remaining = None if deadline is None else max(0.0, deadline - now)
-            sleep_interval = poll_interval if remaining is None else min(poll_interval, max(1.0, remaining))
+            # Clamp the sleep to remaining budget (not to a 1s floor) so we
+            # never overshoot the deadline. If remaining is 0 the sleep is a
+            # no-op and the next iteration's deadline check fires and either
+            # extends or aborts.
+            sleep_interval = poll_interval if remaining is None else max(0.0, min(poll_interval, remaining))
             await asyncio.sleep(sleep_interval)
 
     async def _stream_progress(
@@ -1239,7 +1461,7 @@ class AsyncGranSabioClient:
                                 qa_callback(clean_entry, "QA System", "info")
 
                     # Check for terminal status
-                    if data.get("status") in ("completed", "failed", "cancelled"):
+                    if data.get("status") in ("completed", "rejected", "failed", "cancelled"):
                         await result_queue.put(data.get("status"))
                         break
 

@@ -40,41 +40,40 @@ from typing import Dict, Any
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from client import AsyncGranSabioClient
+from client import AsyncGranSabioClient, GranSabioClientError
 from demos.common import run_demo, print_header, colorize, safe_print
 
 
-def print_preflight_result(result: Dict[str, Any], title: str):
-    """Pretty print preflight validation result."""
+def print_preflight_result(result: Dict[str, Any], title: str, *, rejected: bool = False):
+    """Pretty print preflight validation result.
+
+    For accepted requests, `result` is the API response dict.
+    For rejected requests, `result` is the preflight_feedback dict and
+    `rejected` must be True.
+    """
     print()
     print(f"Request: {title}")
     print("-" * 50)
 
-    status = result.get("status", "unknown")
-    preflight = result.get("preflight_feedback", {})
-
-    # Status with color
-    if status == "rejected":
-        print(f"Status: \033[91mREJECTED\033[0m")  # Red
-    elif status == "initialized":
-        print(f"Status: \033[92mACCEPTED\033[0m")  # Green
+    if rejected:
+        print(f"Status: \033[91mREJECTED\033[0m")
+        preflight = result
     else:
+        status = result.get("status", "unknown")
+        if status == "initialized":
+            print(f"Status: \033[92mACCEPTED\033[0m")
+            print(f"Session ID: {result.get('session_id', 'N/A')}")
+            return
         print(f"Status: {status}")
+        preflight = result.get("preflight_feedback", {})
 
-    if status == "initialized":
-        print(f"Session ID: {result.get('session_id', 'N/A')}")
-        return
-
-    # Preflight feedback
     decision = preflight.get("decision", "unknown")
     print(f"Decision: {decision}")
 
-    # User feedback
     user_feedback = preflight.get("user_feedback", "")
     if user_feedback:
         print()
         print("Feedback:")
-        # Wrap long feedback
         words = user_feedback.split()
         line = "  "
         for word in words:
@@ -85,7 +84,6 @@ def print_preflight_result(result: Dict[str, Any], title: str):
         if line.strip():
             print(line)
 
-    # Issues
     issues = preflight.get("issues", [])
     if issues:
         print()
@@ -115,7 +113,7 @@ TEST_CASES = [
         "request": {
             "prompt": "Write an informative article about the benefits of meditation for stress relief. Include scientific research and practical tips.",
             "content_type": "article",
-            "generator_model": "gpt-5-mini",
+            "generator_model": "gpt-5.4",
             "qa_layers": [
                 {
                     "name": "Accuracy",
@@ -141,7 +139,7 @@ TEST_CASES = [
         "request": {
             "prompt": "Write a fantasy story about dragons in medieval Europe. Be creative and imaginative with magical elements.",
             "content_type": "creative",
-            "generator_model": "gpt-5-mini",
+            "generator_model": "gpt-5.4",
             "qa_layers": [
                 {
                     "name": "Historical Accuracy",
@@ -162,7 +160,7 @@ TEST_CASES = [
         "request": {
             "prompt": "Write a comprehensive analysis of all major world religions, comparing their origins, beliefs, practices, rituals, history, and modern influence. Include specific examples and scholarly references.",
             "content_type": "article",
-            "generator_model": "gpt-5-mini",
+            "generator_model": "gpt-5.4",
             "min_words": 50,
             "max_words": 100,
             "word_count_enforcement": {
@@ -190,7 +188,7 @@ TEST_CASES = [
         "request": {
             "prompt": "Write formal academic content using street slang and casual memes.",
             "content_type": "technical",
-            "generator_model": "gpt-5-mini",
+            "generator_model": "gpt-5.4",
             "qa_layers": [
                 {
                     "name": "Academic Formality",
@@ -252,38 +250,45 @@ async def demo_preflight_validation():
 
             # Add required fields if missing
             if "qa_models" not in request:
-                request["qa_models"] = ["gpt-5-mini"]
+                request["qa_models"] = ["gpt-5.4"]
             if "max_iterations" not in request:
                 request["max_iterations"] = 1
 
             try:
                 request["wait_for_completion"] = False  # Return immediately
                 result = await client.generate(**request)
+
+                # If we get here, the request was accepted (no exception)
                 print_preflight_result(result, test_case["title"])
 
-                # Check expectation
-                was_rejected = result.get("status") == "rejected"
-                expected = test_case["expect_rejection"]
+                if not test_case["expect_rejection"]:
+                    print()
+                    print("\033[92m[OK] Correctly accepted valid request\033[0m")
 
-                if was_rejected == expected:
-                    if was_rejected:
+                    session_id = result.get("session_id")
+                    if session_id:
+                        try:
+                            await client.stop_session(session_id)
+                            print(f"(Session {session_id[:8]}... cancelled)")
+                        except Exception:
+                            pass
+                else:
+                    print()
+                    print("\033[93m[UNEXPECTED] Expected rejection but request was accepted\033[0m")
+
+            except GranSabioClientError as e:
+                preflight_feedback = e.details.get("preflight_feedback")
+                if preflight_feedback:
+                    print_preflight_result(preflight_feedback, test_case["title"], rejected=True)
+
+                    if test_case["expect_rejection"]:
                         print()
                         print("\033[92m[OK] Correctly rejected invalid request\033[0m")
                     else:
                         print()
-                        print("\033[92m[OK] Correctly accepted valid request\033[0m")
-
-                        # Cancel the session since we don't need the actual content
-                        session_id = result.get("session_id")
-                        if session_id:
-                            try:
-                                await client.stop_session(session_id)
-                                print(f"(Session {session_id[:8]}... cancelled)")
-                            except Exception:
-                                pass
+                        print("\033[93m[UNEXPECTED] Expected acceptance but request was rejected\033[0m")
                 else:
-                    print()
-                    print(f"\033[93m[UNEXPECTED] Expected rejection={expected}, got rejection={was_rejected}\033[0m")
+                    print(f"\033[91m[ERROR] {e}\033[0m")
 
             except Exception as e:
                 print(f"\033[91m[ERROR] {e}\033[0m")

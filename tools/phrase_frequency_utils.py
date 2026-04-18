@@ -332,3 +332,64 @@ def analyze_phrase_frequency(text: str, settings: PhraseFrequencySettings) -> Ph
     analyzer_output.setdefault("meta", {})["stop_words_filtered"] = stop_words_applied
 
     return PhraseFrequencyResult(issues=issues, analyzer_output=analyzer_output, max_over_limit=max_over_limit)
+
+
+def compute_top_repeated_ngrams(
+    text: str,
+    *,
+    min_count: int = 2,
+    bigram_cap: int = 5,
+    trigram_cap: int = 3,
+    fourgram_cap: int = 2,
+    language_hint: Optional[str] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Return the top repeated bigrams/trigrams/4-grams keyed by ngram size.
+
+    Each entry: {"phrase": str, "count": int}. Only phrases with count >= min_count
+    are returned. Phrases are lowercased joined tokens (space-delimited). Stop-word
+    filtering is NOT applied here — the caller decides. Used by the stylistic_metrics
+    payload (see deterministic_validation.build_stylistic_metrics_snapshot).
+    """
+    # language_hint reserved for future use (e.g., locale-aware tokenization);
+    # the current tokenizer is Unicode-aware and language-agnostic.
+    del language_hint
+
+    caps = {
+        "bigram": max(0, int(bigram_cap)),
+        "trigram": max(0, int(trigram_cap)),
+        "fourgram": max(0, int(fourgram_cap)),
+    }
+    result: Dict[str, List[Dict[str, Any]]] = {
+        "bigram": [],
+        "trigram": [],
+        "fourgram": [],
+    }
+
+    if not text:
+        return result
+
+    tokens, _ = tokenize_word_punct_with_spans(text, lowercase=True, remove_accents_flag=False)
+    if not tokens:
+        return result
+
+    min_count_effective = max(2, int(min_count))
+
+    size_to_key = {2: "bigram", 3: "trigram", 4: "fourgram"}
+    for n, key in size_to_key.items():
+        cap = caps[key]
+        if cap <= 0 or len(tokens) < n:
+            continue
+        counts: Dict[str, int] = {}
+        for i in range(len(tokens) - n + 1):
+            gram = " ".join(tokens[i : i + n])
+            counts[gram] = counts.get(gram, 0) + 1
+        filtered = [
+            (phrase, count) for phrase, count in counts.items() if count >= min_count_effective
+        ]
+        filtered.sort(key=lambda item: (-item[1], item[0]))
+        result[key] = [
+            {"phrase": phrase, "count": count} for phrase, count in filtered[:cap]
+        ]
+
+    return result
+

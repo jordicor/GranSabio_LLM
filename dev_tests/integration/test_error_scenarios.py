@@ -124,7 +124,7 @@ class TestPreflightRejection:
         """
         Given: Request that fails preflight validation
         When: POST /generate
-        Then: Returns rejected status with feedback
+        Then: Returns preflight_rejected status with feedback
         """
         response = rejection_test_client.post("/generate", json={
             "prompt": "Write a fictional story about dragons with magic powers.",
@@ -145,7 +145,7 @@ class TestPreflightRejection:
         })
         assert response.status_code == 200
         data = response.json()
-        assert data["status"] == "rejected"
+        assert data["status"] == "preflight_rejected"
         assert data["session_id"] is None
 
     def test_preflight_rejection_includes_feedback(self, rejection_test_client):

@@ -556,17 +556,35 @@ def locate_by_markers(
         end = {"1": "lazy", "2": "dog."}
         locate_by_markers(text, start, end, expected_phrase_length=3)  # Returns (0, 44)
     """
-    # Fail fast: expected_phrase_length is required for safe marker validation
-    if expected_phrase_length is None:
-        logger.warning("locate_by_markers called without expected_phrase_length")
-        return None
+    effective_phrase_length = expected_phrase_length
+    if effective_phrase_length is None:
+        inferred_lengths: List[int] = []
+        for candidate in (paragraph_start, paragraph_end):
+            if isinstance(candidate, dict) and candidate:
+                inferred_lengths.append(len(candidate))
+            elif isinstance(candidate, str) and candidate.strip():
+                inferred_lengths.append(len(candidate.split()))
+        if inferred_lengths:
+            effective_phrase_length = max(1, min(inferred_lengths))
+        else:
+            logger.warning("locate_by_markers called without expected_phrase_length")
+            return None
+    else:
+        available_lengths: List[int] = []
+        for candidate in (paragraph_start, paragraph_end):
+            if isinstance(candidate, dict) and candidate:
+                available_lengths.append(len(candidate))
+            elif isinstance(candidate, str) and candidate.strip():
+                available_lengths.append(len(candidate.split()))
+        if available_lengths:
+            effective_phrase_length = min(effective_phrase_length, min(available_lengths))
 
     # Extract phrase strings from counted format
     start_phrase = extract_phrase_from_response(
-        paragraph_start, expected_phrase_length, "paragraph_start"
+        paragraph_start, effective_phrase_length, "paragraph_start"
     )
     end_phrase = extract_phrase_from_response(
-        paragraph_end, expected_phrase_length, "paragraph_end"
+        paragraph_end, effective_phrase_length, "paragraph_end"
     )
 
     if not start_phrase or not end_phrase:

@@ -168,12 +168,14 @@ class TestBuildValidationPayload:
 
         assert "prompt" in payload
         assert "content_type" in payload
-        assert "generator_model" in payload
-        assert "qa_models" in payload
+        assert "generator_role" in payload
+        assert "qa_evaluators" in payload
+        assert "generator_model" not in payload
+        assert "qa_models" not in payload
         assert "qa_layers" in payload
         assert payload["prompt"] == minimal_request.prompt
         assert payload["content_type"] == "article"
-        assert payload["generator_model"] == "gpt-4o"
+        assert payload["generator_role"] == "Generator"
 
     def test_qa_layers_serialized_correctly(self, request_with_qa_layers):
         """Given: Request with QA layers, Then: Layers serialized properly."""

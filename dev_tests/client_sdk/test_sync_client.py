@@ -358,7 +358,7 @@ class TestGenerate:
         from client import GranSabioClientError
 
         mock_response.json.return_value = {
-            "status": "rejected",
+            "status": "preflight_rejected",
             "preflight_feedback": {
                 "user_feedback": "Contradictory requirements"
             }
@@ -482,25 +482,57 @@ class TestWaitForResult:
         status_response.status_code = 200
         status_response.json.return_value = {
             "status": "failed",
-            "error": "Generation error"
+            "failure_reason": "Generation error"
         }
-        mock_requests.request.return_value = status_response
+
+        result_response = Mock()
+        result_response.status_code = 200
+        result_response.json.return_value = {
+            "status": "failed",
+            "failure_reason": "Generation error",
+        }
+
+        mock_requests.request.side_effect = [status_response, result_response]
 
         with pytest.raises(GranSabioClientError) as exc:
             client.wait_for_result("sess-1", poll_interval=0.01)
 
-        assert "Generation failed" in str(exc.value)
+        assert "status 'failed'" in str(exc.value)
+        assert "Generation error" in str(exc.value)
+
+    def test_wait_for_result_handles_semantic_rejection(self, client, mock_requests):
+        """Given: Session is semantically rejected, Then: Raises GranSabioGenerationRejected."""
+        from client import GranSabioGenerationRejected
+
+        status_response = Mock()
+        status_response.status_code = 200
+        status_response.json.return_value = {"status": "rejected"}
+
+        result_response = Mock()
+        result_response.status_code = 200
+        result_response.json.return_value = {
+            "status": "rejected",
+            "approved": False,
+            "failure_reason": "QA said no",
+        }
+
+        mock_requests.request.side_effect = [status_response, result_response]
+
+        with pytest.raises(GranSabioGenerationRejected) as exc:
+            client.wait_for_result("sess-1", poll_interval=0.01)
+
+        assert "QA said no" in str(exc.value)
 
     def test_wait_for_result_handles_cancellation(self, client, mock_requests):
-        """Given: Session cancelled, Then: Raises GranSabioClientError."""
-        from client import GranSabioClientError
+        """Given: Session cancelled, Then: Raises GranSabioGenerationCancelled."""
+        from client import GranSabioGenerationCancelled
 
         status_response = Mock()
         status_response.status_code = 200
         status_response.json.return_value = {"status": "cancelled"}
         mock_requests.request.return_value = status_response
 
-        with pytest.raises(GranSabioClientError) as exc:
+        with pytest.raises(GranSabioGenerationCancelled) as exc:
             client.wait_for_result("sess-1", poll_interval=0.01)
 
         assert "cancelled" in str(exc.value)

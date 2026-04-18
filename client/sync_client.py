@@ -16,7 +16,7 @@ import queue
 import threading
 import time
 import logging
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 import requests
 from requests import exceptions as requests_exceptions
@@ -29,7 +29,12 @@ except ImportError:
     pass
 
 # Import shared exceptions from package
-from . import GranSabioClientError, GranSabioGenerationCancelled, GranSabioGenerationRejected
+from . import (
+    GranSabioClientError,
+    GranSabioGenerationCancelled,
+    GranSabioGenerationRejected,
+    TransientGranSabioError,
+)
 
 # Import shared utilities from _common
 from ._common import (
@@ -49,6 +54,19 @@ from ._common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Exponential backoff curve for transient polling errors in wait_for_result.
+# Applied only to idempotent GETs (get_status / get_result). Ten attempts
+# totalling ~6 minutes, enough to ride out VPN flaps, brief DNS failures, and
+# momentary server overload without abandoning a session the server is still
+# working on. POST /generate is NOT retried here: retrying it would start
+# duplicate sessions.
+_POLL_RETRY_BACKOFF_SECONDS: Tuple[int, ...] = (5, 10, 20, 40, 60, 60, 60, 60, 60, 60)
+
+# Generic return type for _call_with_retry so it can wrap any idempotent GET
+# (requests.Response, parsed JSON dict, etc.).
+_RetryT = TypeVar("_RetryT")
 
 
 class GranSabioClient:
@@ -144,14 +162,34 @@ class GranSabioClient:
         try:
             response = requests.request(method, url, json=json_data, **kwargs)
             return response
-        except requests_exceptions.ConnectionError as e:
+        # SSLError must be caught BEFORE ConnectionError because
+        # requests.exceptions.SSLError is a subclass of ConnectionError; without
+        # this explicit branch, genuine TLS problems (bad cert, hostname
+        # mismatch, unsupported TLS version) would be silently reclassified as
+        # transient and retried. They are not transient -- fail fast.
+        except requests_exceptions.SSLError as e:
             raise GranSabioClientError(
+                f"TLS/SSL error connecting to {self.base_url}: {e}"
+            ) from e
+        except requests_exceptions.ConnectionError as e:
+            raise TransientGranSabioError(
                 f"Cannot connect to Gran Sabio API at {self.base_url}. "
                 "Ensure the server is running."
             ) from e
         except requests_exceptions.Timeout as e:
-            raise GranSabioClientError(
+            raise TransientGranSabioError(
                 f"Request to {endpoint} timed out after {self.timeout}s"
+            ) from e
+        # ChunkedEncodingError and ContentDecodingError name specific mid-response
+        # failure modes (VPN flap or server reset while the body is still
+        # streaming; gzip stream truncated mid-transfer). They are genuinely
+        # retryable on an idempotent GET. urllib3's ProtocolError and
+        # ReadTimeoutError surface via requests as ConnectionError /
+        # ChunkedEncodingError, so covering these two classes is sufficient.
+        except (requests_exceptions.ChunkedEncodingError,
+                requests_exceptions.ContentDecodingError) as e:
+            raise TransientGranSabioError(
+                f"Transient protocol error on request to {endpoint}: {e}"
             ) from e
         except requests_exceptions.RequestException as e:
             raise GranSabioClientError(f"Request failed: {e}") from e
@@ -388,7 +426,7 @@ class GranSabioClient:
         result = response.json()
 
         # Handle preflight rejection
-        if result.get("status") == "rejected":
+        if result.get("status") in {"preflight_rejected", "rejected"} and result.get("preflight_feedback"):
             feedback = result.get("preflight_feedback", {})
             raise GranSabioClientError(
                 f"Request rejected by preflight: {feedback.get('user_feedback', 'Unknown reason')}",
@@ -447,6 +485,79 @@ class GranSabioClient:
             )
         return response.json()
 
+    def _call_with_retry(
+        self,
+        op_name: str,
+        session_id: str,
+        func: Callable[[], _RetryT],
+        start_time: float,
+        max_wait: float,
+    ) -> _RetryT:
+        """
+        Invoke an idempotent polling GET (get_status / get_result) with
+        exponential backoff on transient network errors. Non-transient errors
+        propagate immediately. Retry sleeps count against the deadline implied
+        by ``start_time + max_wait``; if the budget expires mid-sleep, the call
+        is aborted.
+
+        The retry budget is whatever the caller chose by passing ``start_time``.
+        Callers that pass a fresh ``start_time`` per invocation (as
+        ``_fetch_result_polling`` does) give each call its own full retry
+        budget. Callers that pass a shared ``start_time`` (as
+        ``wait_for_result`` does) make retries compete for the overall deadline
+        -- intentional, so long-stalled sessions don't silently extend past
+        ``max_wait`` via retries.
+        """
+        retries = len(_POLL_RETRY_BACKOFF_SECONDS)
+        last_err: Optional[TransientGranSabioError] = None
+
+        # Initial attempt (not counted as a retry in log messages).
+        try:
+            return func()
+        except TransientGranSabioError as err:
+            last_err = err
+
+        # Retry loop: iterate directly over the backoff curve so retry_number
+        # naturally indexes into it without an awkward `+ 1`.
+        for retry_number, sleep_for in enumerate(_POLL_RETRY_BACKOFF_SECONDS, start=1):
+            logger.warning(
+                "Transient error polling session %s via %s (retry %d/%d): %s. "
+                "Retrying in %ds.",
+                session_id, op_name, retry_number, retries, last_err, sleep_for,
+            )
+
+            # Respect the overall max_wait budget. If the backoff would push us
+            # past the deadline, abort now rather than sleep past it.
+            elapsed = time.monotonic() - start_time
+            if elapsed + sleep_for > max_wait:
+                assert last_err is not None
+                raise GranSabioClientError(
+                    f"Timed out waiting for session {session_id} after {max_wait}s "
+                    f"while backing off from transient error: {last_err}. "
+                    f"Session {session_id} may still be running on the server. "
+                    f"Check with GET /result/{session_id} or GET /status/{session_id}."
+                ) from last_err
+            time.sleep(sleep_for)
+
+            try:
+                return func()
+            except TransientGranSabioError as err:
+                last_err = err
+
+        assert last_err is not None
+        logger.error(
+            "Transient error polling session %s via %s exhausted %d retries: %s. "
+            "Session may still be running on the server. "
+            "Check with GET /result/%s or GET /status/%s.",
+            session_id, op_name, retries, last_err, session_id, session_id,
+        )
+        raise GranSabioClientError(
+            f"Transient network errors exhausted retries for session {session_id} "
+            f"during {op_name}: {last_err}. Session {session_id} may still be "
+            f"running on the server. Check with GET /result/{session_id} or "
+            f"GET /status/{session_id}."
+        ) from last_err
+
     def wait_for_result(
         self,
         session_id: str,
@@ -456,6 +567,12 @@ class GranSabioClient:
     ) -> Dict[str, Any]:
         """
         Poll until generation completes and return result.
+
+        Transient network errors (connection drops, timeouts) during status or
+        result polling are retried with exponential backoff
+        (_POLL_RETRY_BACKOFF_SECONDS) before giving up. Retry sleeps count
+        against max_wait. Non-transient errors (HTTP 4xx/5xx, protocol errors)
+        fail fast.
 
         Args:
             session_id: Session to wait for
@@ -475,29 +592,43 @@ class GranSabioClient:
                     f"Timed out waiting for session {session_id} after {max_wait}s"
                 )
 
-            status = self.get_status(session_id)
+            status = self._call_with_retry(
+                "get_status",
+                session_id,
+                lambda: self.get_status(session_id),
+                start_time,
+                max_wait,
+            )
 
             if on_status:
                 on_status(status)
 
             current_status = status.get("status", "")
 
-            if current_status == "completed":
-                return self.get_result(session_id)
-
-            if current_status == "failed":
-                raise GranSabioClientError(
-                    f"Generation failed: {status.get('error', 'Unknown error')}",
-                    details=status
+            if current_status in {"completed", "rejected", "failed", "cancelled"}:
+                final = self._call_with_retry(
+                    "get_result",
+                    session_id,
+                    lambda: self.get_result(session_id),
+                    start_time,
+                    max_wait,
                 )
+                if final.get("status") == "in_progress":
+                    raise GranSabioClientError(
+                        f"Generation returned terminal status '{current_status}' but final result is not ready yet",
+                        details=status,
+                    )
+                validate_result(final)
+                return final
 
-            if current_status == "cancelled":
-                raise GranSabioClientError(
-                    "Generation was cancelled",
-                    details=status
-                )
-
-            time.sleep(poll_interval)
+            # Bound the poll sleep by the remaining max_wait budget. Without this,
+            # a full poll_interval sleep can push total wait up to poll_interval
+            # past max_wait, since the timeout check only runs at loop top.
+            remaining = max_wait - (time.monotonic() - start_time)
+            if remaining <= 0:
+                # Fall through: next iteration's max_wait check will raise.
+                continue
+            time.sleep(min(poll_interval, remaining))
 
     # =========================================================================
     # Streaming Generation
@@ -714,7 +845,7 @@ class GranSabioClient:
 
                     # Detect completion signals
                     status = event.get("status", "")
-                    if status in ("completed", "failed", "cancelled"):
+                    if status in ("completed", "rejected", "failed", "cancelled"):
                         completion_queue.put(status)
                         return
 
@@ -895,9 +1026,20 @@ class GranSabioClient:
             GranSabioClientError: On timeout or unexpected server errors.
         """
         deadline = time.monotonic() + timeout_seconds if timeout_seconds else None
+        # Per-invocation retry budget for transient network errors. When no
+        # outer timeout is set, the retry layer still caps its own backoff
+        # sleeps at infinity (they remain bounded by _POLL_RETRY_BACKOFF_SECONDS).
+        retry_max_wait = float(timeout_seconds) if timeout_seconds else float("inf")
 
         while True:
-            response = self._request("GET", f"/result/{session_id}")
+            call_start = time.monotonic()
+            response = self._call_with_retry(
+                "get_result",
+                session_id,
+                lambda: self._request("GET", f"/result/{session_id}"),
+                call_start,
+                retry_max_wait,
+            )
 
             if response.status_code == 200:
                 return response.json()
@@ -940,7 +1082,11 @@ class GranSabioClient:
                         )
 
                 remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-                sleep_time = poll_interval if remaining is None else min(poll_interval, max(1.0, remaining))
+                # Clamp the sleep to remaining budget (not to a 1s floor) so we
+                # never overshoot the deadline. If remaining is 0 the sleep is
+                # a no-op and the next iteration's deadline check fires and
+                # either extends or aborts.
+                sleep_time = poll_interval if remaining is None else max(0.0, min(poll_interval, remaining))
                 time.sleep(sleep_time)
                 continue
 
@@ -1389,7 +1535,9 @@ class GranSabioClient:
 
         # Parse JSON content
         content = result.get("content", "{}")
-        if isinstance(content, str):
+        if isinstance(content, dict):
+            result["parsed_content"] = content
+        elif isinstance(content, str):
             try:
                 result["parsed_content"] = json.loads(content)
             except (json.JSONDecodeError, ValueError):

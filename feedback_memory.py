@@ -31,6 +31,7 @@ from pathlib import Path
 import aiosqlite
 from ai_service import get_ai_service
 from config import config
+from model_aliasing import ModelAliasRegistry, PromptPart
 
 logger = logging.getLogger(__name__)
 
@@ -497,7 +498,11 @@ class FeedbackProcessor:
         self.config = config
         self.ai_service = get_ai_service()
 
-    async def extract_feedback_analysis(self, feedback_text: str) -> Dict[str, Any]:
+    async def extract_feedback_analysis(
+        self,
+        feedback_text: str,
+        model_alias_registry: Optional[ModelAliasRegistry] = None,
+    ) -> Dict[str, Any]:
         """Extract structured analysis from feedback text using AI"""
 
         prompt = f"""Analyze this QA consensus feedback and extract structured information.
@@ -530,7 +535,15 @@ Return ONLY valid JSON, no additional text."""
                 prompt=prompt,
                 model=self.config.analysis_model,
                 temperature=self.config.analysis_temperature,
-                json_output=True
+                json_output=True,
+                model_alias_registry=model_alias_registry,
+                prompt_safety_parts=[
+                    PromptPart(
+                        text=feedback_text,
+                        source="system_generated",
+                        label="feedback_memory.feedback_text",
+                    )
+                ] if model_alias_registry else None,
             )
 
             # Parse and validate response
@@ -742,12 +755,21 @@ class FeedbackMemoryManager:
 
         return common[:20]  # Top 20 patterns
 
-    async def add_iteration_feedback(self, session_id: str, feedback_text: str,
-                                    content_snapshot: str, iteration_num: int) -> str:
+    async def add_iteration_feedback(
+        self,
+        session_id: str,
+        feedback_text: str,
+        content_snapshot: str,
+        iteration_num: int,
+        model_alias_registry: Optional[ModelAliasRegistry] = None,
+    ) -> str:
         """Process and store feedback for an iteration"""
 
         # Extract structured analysis from feedback
-        analysis = await self.processor.extract_feedback_analysis(feedback_text)
+        analysis = await self.processor.extract_feedback_analysis(
+            feedback_text,
+            model_alias_registry=model_alias_registry,
+        )
 
         summaries = analysis['tiered_summaries']
         issues = analysis['issues']

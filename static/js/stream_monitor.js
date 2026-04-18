@@ -718,6 +718,11 @@ function createRequestTab(request) {
             statusClass = 'completed';
             infoText = request.finalScore ? request.finalScore.toFixed(1) : 'done';
             break;
+        case 'rejected':
+            statusIcon = '!';
+            statusClass = 'failed';
+            infoText = 'rejected';
+            break;
         case 'failed':
             statusIcon = 'x';
             statusClass = 'failed';
@@ -1020,6 +1025,7 @@ function renderOverflowMenu(overflowRequests) {
         let statusIcon;
         switch (request.status) {
             case 'completed': statusIcon = '[+]'; break;
+            case 'rejected': statusIcon = '[!]'; break;
             case 'failed': statusIcon = '[x]'; break;
             case 'pending': statusIcon = '[o]'; break;
             default: statusIcon = '[*]';

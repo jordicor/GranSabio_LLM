@@ -1,0 +1,47 @@
+{
+  "test_time": "2026-01-18T22:59:13.214251",
+  "results": [
+    {
+      "qa_model": "gpt-5.2",
+      "started_at": "2026-01-18T22:54:43.572033",
+      "success": false,
+      "error": "Result fetch failed: 202",
+      "session_id": "af47f535-bdba-41f7-9024-e783ed0f71c0",
+      "has_edit_groups": false,
+      "edit_groups_count": 0,
+      "edit_groups_valid_format": false,
+      "first_edit_group": null,
+      "issues": []
+    },
+    {
+      "qa_model": "gpt-4o",
+      "started_at": "2026-01-18T22:56:45.744638",
+      "success": true,
+      "error": null,
+      "session_id": "4b6b150a-ec1e-45f9-b91e-9f4b193e4728",
+      "has_edit_groups": false,
+      "edit_groups_count": 0,
+      "edit_groups_valid_format": false,
+      "first_edit_group": null,
+      "issues": [
+        "No evaluation found for gpt-4o"
+      ],
+      "finished_at": "2026-01-18T22:57:25.450721"
+    },
+    {
+      "qa_model": "claude-sonnet-4-20250514",
+      "started_at": "2026-01-18T22:57:25.450721",
+      "success": true,
+      "error": null,
+      "session_id": "4c0a89fa-8e58-4a6f-9701-6db68ffd7c01",
+      "has_edit_groups": false,
+      "edit_groups_count": 0,
+      "edit_groups_valid_format": false,
+      "first_edit_group": null,
+      "issues": [
+        "No evaluation found for claude-sonnet-4-20250514"
+      ],
+      "finished_at": "2026-01-18T22:59:13.211219"
+    }
+  ]
+}

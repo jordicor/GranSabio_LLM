@@ -23,8 +23,8 @@ def bypass_ip_filter():
     """
     Automatically bypass IP filter for all integration tests.
 
-    This patches the INTERNAL_NETWORKS to include all IPs and
-    allows the test client to access all endpoints.
+    This patches the current security helpers to allow all IPs and
+    lets the FastAPI TestClient reach internal endpoints.
     """
     # Include all private networks and testclient default
     test_networks = [
@@ -32,7 +32,7 @@ def bypass_ip_filter():
         ipaddress.ip_network('::/0'),        # Allow all IPv6
     ]
 
-    with patch('core.security.INTERNAL_NETWORKS', test_networks), \
+    with patch('core.security._load_internal_networks', return_value=test_networks), \
          patch('core.security.is_ip_allowed', return_value=True):
         yield
 

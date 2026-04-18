@@ -84,6 +84,13 @@ from .locators import (
     validate_counted_phrase_format,
     extract_phrase_from_response,
 )
+from .segment_map import (
+    TextNode,
+    TargetSpan,
+    TargetResolution,
+    SegmentMap,
+    build_segment_map,
+)
 from .analyzer import (
     TextAnalyzer,
     calculate_stats,
@@ -93,6 +100,7 @@ from .qa_integration import (
     parse_qa_edit_groups,
     get_operation_type,
     OPERATION_TYPE_MAP,
+    QA_EDIT_FORMAT_ID_MODE,
     QA_EDIT_FORMAT_PHRASE_MODE,
     QA_EDIT_FORMAT_WORD_INDEX_MODE,
     QA_SIMPLE_FORMAT,
@@ -128,6 +136,11 @@ __all__ = [
     "locate_by_word_indices",
     "validate_marker_uniqueness",
     "analyze_text_for_markers",
+    "TextNode",
+    "TargetSpan",
+    "TargetResolution",
+    "SegmentMap",
+    "build_segment_map",
     # Text normalization
     "normalize_source_text",
     "normalize_for_matching",
@@ -144,6 +157,7 @@ __all__ = [
     "get_operation_type",
     "OPERATION_TYPE_MAP",
     # QA prompt templates (for advanced customization)
+    "QA_EDIT_FORMAT_ID_MODE",
     "QA_EDIT_FORMAT_PHRASE_MODE",
     "QA_EDIT_FORMAT_WORD_INDEX_MODE",
     "QA_SIMPLE_FORMAT",

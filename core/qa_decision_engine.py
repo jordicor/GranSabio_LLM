@@ -7,8 +7,40 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from models import QALayer
+from model_aliasing import get_evaluator_alias
+from qa_result_utils import build_qa_counts, is_valid_semantic_qa_result
 
 from .feedback_formatter import create_user_friendly_reason
+
+
+def _extract_grounding_result(
+    qa_summary: Optional[Dict[str, Any]],
+    qa_results: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Extract the full evidence grounding result when present."""
+    summary_grounding = (qa_summary or {}).get("evidence_grounding")
+    if isinstance(summary_grounding, dict):
+        return summary_grounding
+
+    grounding_results = (qa_results or {}).get("Evidence Grounding", {})
+    grounding_eval = grounding_results.get("evidence_grounding_logprobs")
+    metadata = getattr(grounding_eval, "metadata", None) if grounding_eval else None
+    grounding_result = metadata.get("grounding_result") if isinstance(metadata, dict) else None
+    return grounding_result if isinstance(grounding_result, dict) else None
+
+
+def _build_grounding_reason(grounding_result: Dict[str, Any]) -> str:
+    """Create a concise approval/rejection reason from grounding data."""
+    flagged_claims = grounding_result.get("flagged_claims", 0)
+    max_budget_gap = grounding_result.get("max_budget_gap")
+    claims_verified = grounding_result.get("claims_verified", 0)
+
+    reason = (
+        f"Evidence grounding flagged {flagged_claims} claim(s) out of {claims_verified} verified"
+    )
+    if isinstance(max_budget_gap, (int, float)):
+        reason += f" (max budget gap: {max_budget_gap:.2f} bits)"
+    return reason
 
 
 def _evaluate_layer_based_approval(
@@ -28,6 +60,36 @@ def _evaluate_layer_based_approval(
     4. Mandatory layers that fail after max iterations -> FINAL REJECTION
     5. If no mandatory failures, check global score override
     """
+
+    grounding_result = _extract_grounding_result(qa_summary, qa_results)
+    if (
+        grounding_result
+        and not grounding_result.get("passed", True)
+        and grounding_result.get("triggered_action") in ("deal_breaker", "regenerate")
+    ):
+        grounding_reason = _build_grounding_reason(grounding_result)
+        if iteration >= request.max_iterations:
+            if hasattr(request, "gran_sabio_fallback") and request.gran_sabio_fallback:
+                return {
+                    "approved": False,
+                    "final_rejection": True,
+                    "reason": grounding_reason,
+                    "deal_breaker_type": "evidence_grounding",
+                    "allow_fallback": True,
+                }
+            return {
+                "approved": False,
+                "final_rejection": True,
+                "reason": grounding_reason,
+                "deal_breaker_type": "evidence_grounding",
+            }
+
+        return {
+            "approved": False,
+            "final_rejection": False,
+            "reason": grounding_reason,
+            "deal_breaker_type": "evidence_grounding_retry",
+        }
 
     # Step 1: Check if this came from a force_iteration (majority deal-breakers detected early)
     if qa_summary and qa_summary.get("summary", {}).get("force_iteration"):
@@ -177,7 +239,9 @@ def _evaluate_layer_based_approval(
                 "reason": friendly_reason,
             }
 
-    # Step 4: If all layers passed, approve immediately
+    # Step 4: If all semantic QA layers passed, approve immediately.
+    # When qa_layers=[] there is no semantic score surface for min_global_score,
+    # so warn-only evidence grounding remains advisory instead of blocking approval.
     if not mandatory_failures and not non_mandatory_failures:
         return {
             "approved": True,
@@ -240,15 +304,22 @@ def _check_minority_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
     total_models = len(qa_models) if qa_models else 0
 
     for layer_name, model_results in qa_results.items():
-        layer_total = len(model_results)
+        counts = build_qa_counts(model_results, total_models or len(model_results))
+        layer_total = counts["valid"]
         if layer_total == 0:
             continue
 
         layer_db_details = []
         for model, evaluation in model_results.items():
-            if getattr(evaluation, "deal_breaker", False):
+            if is_valid_semantic_qa_result(evaluation) and getattr(evaluation, "deal_breaker", False):
+                evaluator = get_evaluator_alias(evaluation, fallback=model)
                 layer_db_details.append(
-                    {"layer": layer_name, "model": model, "reason": evaluation.deal_breaker_reason}
+                    {
+                        "layer": layer_name,
+                        "model": model,
+                        "evaluator": evaluator,
+                        "reason": evaluation.deal_breaker_reason,
+                    }
                 )
 
         if not layer_db_details:
@@ -283,38 +354,49 @@ def _check_50_50_tie_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
     tie_layers = []
     total_models = len(qa_models)
 
-    # Only proceed if we have an even number of models (50-50 ties only possible with even numbers)
-    if total_models % 2 != 0:
-        return {
-            "has_50_50_ties": False,
-            "tie_layers": [],
-            "total_models": total_models,
-            "summary": "No 50-50 ties possible with odd number of models",
-        }
-
     for layer_name, model_results in qa_results.items():
         deal_breaker_count = 0
         approve_count = 0
         layer_details = []
+        counts = build_qa_counts(model_results, total_models or len(model_results))
+        valid_total = counts["valid"]
+        if valid_total == 0 or valid_total % 2 != 0:
+            continue
 
         for model, evaluation in model_results.items():
+            if not is_valid_semantic_qa_result(evaluation):
+                continue
+            evaluator = get_evaluator_alias(evaluation, fallback=model)
             if evaluation.deal_breaker:
                 deal_breaker_count += 1
                 layer_details.append(
-                    {"model": model, "decision": "deal_breaker", "reason": evaluation.deal_breaker_reason}
+                    {
+                        "model": model,
+                        "evaluator": evaluator,
+                        "decision": "deal_breaker",
+                        "reason": evaluation.deal_breaker_reason,
+                    }
                 )
             else:
                 approve_count += 1
-                layer_details.append({"model": model, "decision": "approve", "score": evaluation.score})
+                layer_details.append(
+                    {
+                        "model": model,
+                        "evaluator": evaluator,
+                        "decision": "approve",
+                        "score": evaluation.score,
+                    }
+                )
 
         # Check if this layer has exactly 50% deal-breakers (perfect tie)
-        if deal_breaker_count == total_models / 2 and approve_count == total_models / 2:
+        if valid_total > 0 and deal_breaker_count == valid_total / 2 and approve_count == valid_total / 2:
             tie_layers.append(
                 {
                     "layer": layer_name,
                     "deal_breaker_count": deal_breaker_count,
                     "approve_count": approve_count,
-                    "total_models": total_models,
+                    "total_models": valid_total,
+                    "total_models_configured": total_models,
                     "details": layer_details,
                 }
             )

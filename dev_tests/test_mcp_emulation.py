@@ -317,7 +317,7 @@ Analyze and respond in JSON format:
             content = result.get("content", "")
             if content:
                 try:
-                    review = json.loads(content)
+                    review = content if isinstance(content, dict) else json.loads(content)
                     print(f"\n[Review Details]")
                     print(f"  Verdict: {review.get('verdict', 'N/A')}")
                     print(f"  Solves Issue: {review.get('solves_issue', 'N/A')}")
@@ -325,7 +325,7 @@ Analyze and respond in JSON format:
                     print(f"  Security Impact: {review.get('security_impact', 'N/A')}")
                     print(f"  Performance Impact: {review.get('performance_impact', 'N/A')}")
                     print(f"\n  Explanation: {review.get('explanation', 'N/A')[:200]}...")
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, TypeError):
                     print(f"\n[Raw Content]\n{content[:500]}...")
 
             # Show costs if available

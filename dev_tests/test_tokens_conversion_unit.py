@@ -26,10 +26,12 @@ class TestReasoningEffortNormalization:
 
     def test_normalize_standard_labels(self):
         """Test that standard labels are preserved."""
+        assert self.config.normalize_reasoning_effort_label("none") == "none"
         assert self.config.normalize_reasoning_effort_label("minimal") == "minimal"
         assert self.config.normalize_reasoning_effort_label("low") == "low"
         assert self.config.normalize_reasoning_effort_label("medium") == "medium"
         assert self.config.normalize_reasoning_effort_label("high") == "high"
+        assert self.config.normalize_reasoning_effort_label("xhigh") == "xhigh"
 
     def test_normalize_aliases(self):
         """Test that aliases are correctly mapped."""
@@ -46,14 +48,18 @@ class TestReasoningEffortNormalization:
         # min -> minimal
         assert self.config.normalize_reasoning_effort_label("min") == "minimal"
         assert self.config.normalize_reasoning_effort_label("minimum") == "minimal"
+        assert self.config.normalize_reasoning_effort_label("off") == "none"
+        assert self.config.normalize_reasoning_effort_label("xh") == "xhigh"
 
     def test_normalize_case_insensitive(self):
         """Test that normalization is case-insensitive."""
+        assert self.config.normalize_reasoning_effort_label("NONE") == "none"
         assert self.config.normalize_reasoning_effort_label("HIGH") == "high"
         assert self.config.normalize_reasoning_effort_label("Medium") == "medium"
         assert self.config.normalize_reasoning_effort_label("LOW") == "low"
         assert self.config.normalize_reasoning_effort_label("MINIMAL") == "minimal"
         assert self.config.normalize_reasoning_effort_label("MID") == "medium"
+        assert self.config.normalize_reasoning_effort_label("XHIGH") == "xhigh"
 
     def test_normalize_none_input(self):
         """Test that None returns None."""
@@ -279,9 +285,12 @@ class TestConvertTokensToReasoningEffort:
         assert self.config._convert_tokens_to_reasoning_effort(9000) == "low"
 
     def test_very_low_tokens_to_low_effort(self):
-        """Very low tokens should still map to low effort."""
+        """Very low positive tokens should still map to low effort."""
         assert self.config._convert_tokens_to_reasoning_effort(1000) == "low"
-        assert self.config._convert_tokens_to_reasoning_effort(0) == "low"
+
+    def test_zero_tokens_to_none_effort(self):
+        """Zero thinking tokens should map to disabled reasoning."""
+        assert self.config._convert_tokens_to_reasoning_effort(0) == "none"
 
     def test_none_defaults_to_medium(self):
         """None should default to medium effort."""

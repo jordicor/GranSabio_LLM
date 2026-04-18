@@ -258,7 +258,7 @@ Use advanced models that "think" before responding.
 python demos/10_reasoning_models.py
 
 # Specific model:
-python demos/10_reasoning_models.py --model gpt-5
+python demos/10_reasoning_models.py --model gpt-5.4
 
 # High reasoning effort:
 python demos/10_reasoning_models.py --effort high
@@ -399,7 +399,7 @@ async with AsyncGranSabioClient() as client:
     result = await client.generate(
         prompt="Your prompt here",
         content_type="article",
-        generator_model="gpt-4o"
+        generator_model="gpt-5.4"
     )
 
     # Wait for completion
@@ -443,5 +443,5 @@ Optional:
 - Check `/models` endpoint for available models
 
 **Slow response times**
-- Reasoning models (GPT-5, O3, Claude thinking) are slower by design
-- Use faster models (gpt-4o-mini) for quick tests
+- Reasoning models (GPT-5.4, O3, Claude thinking) are slower by design
+- Use faster models (gpt-5.4) for quick tests

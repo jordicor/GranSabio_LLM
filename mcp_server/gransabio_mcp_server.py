@@ -573,10 +573,11 @@ Provide a comprehensive analysis in JSON format with:
     # Parse the content if successful
     if result.get("success") and result.get("content"):
         try:
-            analysis = json.loads(result["content"])
+            content = result["content"]
+            analysis = content if isinstance(content, dict) else json.loads(content)
             result["analysis"] = analysis
             del result["content"]  # Replace raw content with parsed
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):
             result["raw_content"] = result.get("content")
 
     return result
@@ -664,10 +665,11 @@ Analyze and respond in JSON format:
     # Parse the content if successful
     if result.get("success") and result.get("content"):
         try:
-            review = json.loads(result["content"])
+            content = result["content"]
+            review = content if isinstance(content, dict) else json.loads(content)
             result["review"] = review
             del result["content"]
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):
             result["raw_content"] = result.get("content")
 
     return result

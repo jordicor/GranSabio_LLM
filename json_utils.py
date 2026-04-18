@@ -12,7 +12,13 @@ import orjson
 from typing import Any, Optional
 
 
-def dumps(obj: Any, ensure_ascii: bool = True, indent: Optional[int] = None, default: callable = None) -> str:
+def dumps(
+    obj: Any,
+    ensure_ascii: bool = True,
+    indent: Optional[int] = None,
+    default: callable = None,
+    sort_keys: bool = False,
+) -> str:
     """
     Serialize obj to JSON string using orjson (optimized)
 
@@ -21,6 +27,7 @@ def dumps(obj: Any, ensure_ascii: bool = True, indent: Optional[int] = None, def
         ensure_ascii: If True, ensure ASCII output (for compatibility)
         indent: Indentation level for pretty printing
         default: Callable for objects that cannot be serialized (e.g., default=str)
+        sort_keys: If True, serialize object keys in sorted order
 
     Returns:
         JSON string
@@ -32,6 +39,9 @@ def dumps(obj: Any, ensure_ascii: bool = True, indent: Optional[int] = None, def
 
     if indent is not None:
         option |= orjson.OPT_INDENT_2
+
+    if sort_keys:
+        option |= orjson.OPT_SORT_KEYS
 
     if not ensure_ascii:
         option |= orjson.OPT_NON_STR_KEYS
@@ -57,7 +67,13 @@ def loads(s: str) -> Any:
     return orjson.loads(s)
 
 
-def dump(obj: Any, fp, ensure_ascii: bool = True, indent: Optional[int] = None) -> None:
+def dump(
+    obj: Any,
+    fp,
+    ensure_ascii: bool = True,
+    indent: Optional[int] = None,
+    sort_keys: bool = False,
+) -> None:
     """
     Serialize obj to JSON and write to file-like object
     
@@ -66,8 +82,14 @@ def dump(obj: Any, fp, ensure_ascii: bool = True, indent: Optional[int] = None) 
         fp: File-like object to write to
         ensure_ascii: If True, ensure ASCII output
         indent: Indentation level for pretty printing
+        sort_keys: If True, serialize object keys in sorted order
     """
-    json_str = dumps(obj, ensure_ascii=ensure_ascii, indent=indent)
+    json_str = dumps(
+        obj,
+        ensure_ascii=ensure_ascii,
+        indent=indent,
+        sort_keys=sort_keys,
+    )
     fp.write(json_str)
 
 

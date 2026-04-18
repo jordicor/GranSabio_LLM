@@ -62,14 +62,14 @@ install_mcp.bat --uninstall    # Windows
 
 **Claude Code CLI:**
 ```bash
-# Replace /path/to/Gran_Sabio_LLM with your actual path
-claude mcp add gransabio-llm -- python /path/to/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py
+# Replace /path/to/GranSabio_LLM with your actual path
+claude mcp add gransabio-llm -- python /path/to/GranSabio_LLM/mcp_server/gransabio_mcp_server.py
 
 # Windows example:
-claude mcp add gransabio-llm -- python C:\Projects\Gran_Sabio_LLM\mcp_server\gransabio_mcp_server.py
+claude mcp add gransabio-llm -- python C:\Projects\GranSabio_LLM\mcp_server\gransabio_mcp_server.py
 
 # Linux/macOS example:
-claude mcp add gransabio-llm -- python /home/user/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py
+claude mcp add gransabio-llm -- python /home/user/GranSabio_LLM/mcp_server/gransabio_mcp_server.py
 ```
 
 **Gemini CLI** (`~/.gemini/settings.json`):
@@ -78,7 +78,7 @@ claude mcp add gransabio-llm -- python /home/user/Gran_Sabio_LLM/mcp_server/gran
   "mcpServers": {
     "gransabio-llm": {
       "command": "python",
-      "args": ["/path/to/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py"]
+      "args": ["/path/to/GranSabio_LLM/mcp_server/gransabio_mcp_server.py"]
     }
   }
 }
@@ -91,10 +91,10 @@ rmcp_client = true
 
 [mcp_servers.gransabio-llm]
 command = "python"
-args = ["/path/to/Gran_Sabio_LLM/mcp_server/gransabio_mcp_server.py"]
+args = ["/path/to/GranSabio_LLM/mcp_server/gransabio_mcp_server.py"]
 ```
 
-> **Note**: Replace `/path/to/Gran_Sabio_LLM` with your actual installation path.
+> **Note**: Replace `/path/to/GranSabio_LLM` with your actual installation path.
 
 ## Available Tools
 
@@ -261,7 +261,7 @@ python gransabio_mcp_server.py
 
 ## Using with Remote Gran Sabio (SaaS)
 
-If you're using a hosted Gran Sabio LLM instance (run from Gran_Sabio_LLM directory):
+If you're using a hosted Gran Sabio LLM instance (run from GranSabio_LLM directory):
 
 ```bash
 claude mcp add gransabio-llm \
@@ -296,13 +296,13 @@ On Windows, use the `install_mcp.bat` script for automatic setup.
 For manual installation, use absolute paths:
 
 ```cmd
-claude mcp add gransabio-llm -- python C:\path\to\Gran_Sabio_LLM\mcp_server\gransabio_mcp_server.py
+claude mcp add gransabio-llm -- python C:\path\to\GranSabio_LLM\mcp_server\gransabio_mcp_server.py
 ```
 
 If Python is not in your PATH, use the full Python path:
 
 ```cmd
-claude mcp add gransabio-llm -- C:\Python311\python.exe C:\path\to\Gran_Sabio_LLM\mcp_server\gransabio_mcp_server.py
+claude mcp add gransabio-llm -- C:\Python311\python.exe C:\path\to\GranSabio_LLM\mcp_server\gransabio_mcp_server.py
 ```
 
 ## Troubleshooting

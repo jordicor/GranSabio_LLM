@@ -23,6 +23,23 @@ from qa_bypass_engine import QABypassEngine
 from models import QALayer, QAEvaluation
 
 
+def make_check_result(
+    score: float,
+    *,
+    deal_breaker: bool = False,
+    summary: str = "",
+    metadata=None,
+):
+    """Create a minimal deterministic-check stub for bypass tests."""
+
+    result = Mock()
+    result.score = score
+    result.deal_breaker = deal_breaker
+    result.summary = summary
+    result.metadata = metadata or {}
+    return result
+
+
 # ============================================================================
 # Fixtures
 # ============================================================================
@@ -118,6 +135,13 @@ def mock_phrase_frequency_config():
     config = Mock()
     config.enabled = True
     config.to_settings = Mock(return_value=Mock(rules=[]))
+    config.build_layer = Mock(return_value=QALayer(
+        name="Phrase Frequency Guard",
+        description="Checks for phrase repetition",
+        criteria="Detect overused phrases",
+        min_score=7.0,
+        order=1,
+    ))
     return config
 
 
@@ -130,6 +154,15 @@ def mock_lexical_diversity_config():
         top_words_k=50,
         language=None
     ))
+    config.top_words_k = 50
+    config.language = None
+    config.build_layer = Mock(return_value=QALayer(
+        name="Lexical Diversity Guard",
+        description="Analyzes vocabulary diversity",
+        criteria="Check lexical diversity metrics",
+        min_score=7.0,
+        order=2,
+    ))
     return config
 
 
@@ -140,6 +173,8 @@ def mock_request_with_word_count(mock_word_count_config):
     request.word_count_enforcement = mock_word_count_config
     request.min_words = 400
     request.max_words = 600
+    request.json_output = False
+    request.target_field = None
     return request
 
 
@@ -148,6 +183,8 @@ def mock_request_with_phrase_frequency(mock_phrase_frequency_config):
     """Create a mock request with phrase frequency config."""
     request = Mock()
     request.phrase_frequency = mock_phrase_frequency_config
+    request.json_output = False
+    request.target_field = None
     return request
 
 
@@ -156,6 +193,8 @@ def mock_request_with_lexical_diversity(mock_lexical_diversity_config):
     """Create a mock request with lexical diversity config."""
     request = Mock()
     request.lexical_diversity = mock_lexical_diversity_config
+    request.json_output = False
+    request.target_field = None
     return request
 
 
@@ -166,6 +205,8 @@ def mock_request_with_cumulative(mock_phrase_frequency_config):
     request.cumulative_text = "Previous chapter content. " * 100
     request.cumulative_word_count = 400
     request.phrase_frequency = mock_phrase_frequency_config
+    request.json_output = False
+    request.target_field = None
     return request
 
 
@@ -364,26 +405,27 @@ class TestCanBypassLayer:
 class TestBypassLayerEvaluation:
     """Tests for bypass_layer_evaluation()."""
 
-    @patch('qa_bypass_engine.check_word_count_compliance')
+    @patch('qa_bypass_engine.evaluate_word_count_check')
     def test_word_count_layer_calls_word_count_bypass(
-        self, mock_compliance, bypass_engine, word_count_layer, mock_request_with_word_count
+        self, mock_check, bypass_engine, word_count_layer, mock_request_with_word_count
     ):
         """
         Given: Word Count Enforcement layer
         When: bypass_layer_evaluation() is called
         Then: Calls word count bypass method
         """
-        mock_compliance.return_value = {
-            'actual_count': 500,
-            'required_min': 360,
-            'required_max': 660,
-            'target_min': 400,
-            'target_max': 600,
-            'score': 10.0,
-            'severity': 'important',
-            'target_field': None,
-            'is_json_extraction': False
-        }
+        mock_check.return_value = make_check_result(
+            10.0,
+            metadata={
+                'actual_count': 500,
+                'required_min': 360,
+                'required_max': 660,
+                'target_min': 400,
+                'target_max': 600,
+                'score': 10.0,
+                'severity': 'important',
+            },
+        )
 
         result = bypass_engine.bypass_layer_evaluation(
             "word " * 500,
@@ -395,21 +437,25 @@ class TestBypassLayerEvaluation:
         assert len(result) == 2
         assert "gpt-4o" in result
         assert "claude-sonnet-4" in result
-        mock_compliance.assert_called_once()
+        mock_check.assert_called_once()
 
-    @patch('qa_bypass_engine.analyze_phrase_frequency')
+    @patch('qa_bypass_engine.evaluate_phrase_frequency_check')
     def test_phrase_frequency_layer_calls_phrase_bypass(
-        self, mock_analyze, bypass_engine, phrase_frequency_layer, mock_request_with_phrase_frequency
+        self, mock_check, bypass_engine, phrase_frequency_layer, mock_request_with_phrase_frequency
     ):
         """
         Given: Phrase Frequency Guard layer
         When: bypass_layer_evaluation() is called
         Then: Calls phrase frequency bypass method
         """
-        mock_result = Mock()
-        mock_result.issues = []
-        mock_result.analyzer_output = {"meta": {}, "summary": {"top_by_count": {}}}
-        mock_analyze.return_value = mock_result
+        mock_check.return_value = make_check_result(
+            10.0,
+            metadata={
+                "issues": [],
+                "analysis": {"meta": {}, "summary": {"top_by_count": {}}},
+                "rules_total": 0,
+            },
+        )
 
         result = bypass_engine.bypass_layer_evaluation(
             "test content",
@@ -419,24 +465,25 @@ class TestBypassLayerEvaluation:
         )
 
         assert len(result) == 1
-        mock_analyze.assert_called_once()
+        mock_check.assert_called_once()
 
-    @patch('qa_bypass_engine.analyze_text_lexical_diversity')
+    @patch('qa_bypass_engine.evaluate_lexical_diversity_check')
     def test_lexical_diversity_layer_calls_lexical_bypass(
-        self, mock_analyze, bypass_engine, lexical_diversity_layer, mock_request_with_lexical_diversity
+        self, mock_check, bypass_engine, lexical_diversity_layer, mock_request_with_lexical_diversity
     ):
         """
         Given: Lexical Diversity Guard layer
         When: bypass_layer_evaluation() is called
         Then: Calls lexical diversity bypass method
         """
-        mock_result = Mock()
-        mock_result.decision_label = "GREEN"
-        mock_result.score = 9.0
-        mock_result.deal_breaker = False
-        mock_result.adjusted_grades = {"mtld": "GREEN"}
-        mock_result.analysis = {"metrics": {}, "meta": {}, "top_words": [], "windows": []}
-        mock_analyze.return_value = mock_result
+        mock_check.return_value = make_check_result(
+            9.0,
+            metadata={
+                "decision": "GREEN",
+                "adjusted_grades": {"mtld": "GREEN"},
+                "analysis": {"metrics": {}, "meta": {}, "top_words": [], "windows": []},
+            },
+        )
 
         result = bypass_engine.bypass_layer_evaluation(
             "test content with diverse vocabulary",
@@ -446,7 +493,7 @@ class TestBypassLayerEvaluation:
         )
 
         assert len(result) == 1
-        mock_analyze.assert_called_once()
+        mock_check.assert_called_once()
 
     def test_unsupported_layer_returns_empty_dict(
         self, bypass_engine, generic_layer, mock_request_with_word_count
@@ -473,26 +520,27 @@ class TestBypassLayerEvaluation:
 class TestBypassWordCountEvaluation:
     """Tests for _bypass_word_count_evaluation()."""
 
-    @patch('qa_bypass_engine.check_word_count_compliance')
+    @patch('qa_bypass_engine.evaluate_word_count_check')
     def test_perfect_compliance_returns_score_10(
-        self, mock_compliance, bypass_engine, word_count_layer, mock_request_with_word_count
+        self, mock_check, bypass_engine, word_count_layer, mock_request_with_word_count
     ):
         """
         Given: Content with perfect word count compliance
         When: _bypass_word_count_evaluation() is called
         Then: Returns score 10.0 with no deal_breaker
         """
-        mock_compliance.return_value = {
-            'actual_count': 500,
-            'required_min': 360,
-            'required_max': 660,
-            'target_min': 400,
-            'target_max': 600,
-            'score': 10.0,
-            'severity': 'important',
-            'target_field': None,
-            'is_json_extraction': False
-        }
+        mock_check.return_value = make_check_result(
+            10.0,
+            metadata={
+                'actual_count': 500,
+                'required_min': 360,
+                'required_max': 660,
+                'target_min': 400,
+                'target_max': 600,
+                'score': 10.0,
+                'severity': 'important',
+            },
+        )
 
         result = bypass_engine._bypass_word_count_evaluation(
             "word " * 500,
@@ -505,26 +553,27 @@ class TestBypassWordCountEvaluation:
         assert result["gpt-4o"].deal_breaker is False
         assert "PERFECT COMPLIANCE" in result["gpt-4o"].feedback
 
-    @patch('qa_bypass_engine.check_word_count_compliance')
+    @patch('qa_bypass_engine.evaluate_word_count_check')
     def test_within_flexibility_buffer_returns_partial_score(
-        self, mock_compliance, bypass_engine, word_count_layer, mock_request_with_word_count
+        self, mock_check, bypass_engine, word_count_layer, mock_request_with_word_count
     ):
         """
         Given: Content within flexibility buffer but outside target
         When: _bypass_word_count_evaluation() is called
         Then: Returns partial score (between 5-10)
         """
-        mock_compliance.return_value = {
-            'actual_count': 375,
-            'required_min': 360,
-            'required_max': 660,
-            'target_min': 400,
-            'target_max': 600,
-            'score': 6.5,
-            'severity': 'important',
-            'target_field': None,
-            'is_json_extraction': False
-        }
+        mock_check.return_value = make_check_result(
+            6.5,
+            metadata={
+                'actual_count': 375,
+                'required_min': 360,
+                'required_max': 660,
+                'target_min': 400,
+                'target_max': 600,
+                'score': 6.5,
+                'severity': 'important',
+            },
+        )
 
         result = bypass_engine._bypass_word_count_evaluation(
             "word " * 375,
@@ -537,26 +586,29 @@ class TestBypassWordCountEvaluation:
         assert result["gpt-4o"].deal_breaker is False
         assert "ACCEPTABLE" in result["gpt-4o"].feedback
 
-    @patch('qa_bypass_engine.check_word_count_compliance')
+    @patch('qa_bypass_engine.evaluate_word_count_check')
     def test_outside_absolute_limits_returns_deal_breaker(
-        self, mock_compliance, bypass_engine, word_count_layer, mock_request_with_word_count
+        self, mock_check, bypass_engine, word_count_layer, mock_request_with_word_count
     ):
         """
         Given: Content outside absolute limits (score = 0)
         When: _bypass_word_count_evaluation() is called
         Then: Returns score 0.0 with deal_breaker=True
         """
-        mock_compliance.return_value = {
-            'actual_count': 200,
-            'required_min': 360,
-            'required_max': 660,
-            'target_min': 400,
-            'target_max': 600,
-            'score': 0.0,
-            'severity': 'deal_breaker',
-            'target_field': None,
-            'is_json_extraction': False
-        }
+        mock_check.return_value = make_check_result(
+            0.0,
+            deal_breaker=True,
+            summary="Word count is below the acceptable range.",
+            metadata={
+                'actual_count': 200,
+                'required_min': 360,
+                'required_max': 660,
+                'target_min': 400,
+                'target_max': 600,
+                'score': 0.0,
+                'severity': 'deal_breaker',
+            },
+        )
 
         result = bypass_engine._bypass_word_count_evaluation(
             "word " * 200,
@@ -569,26 +621,27 @@ class TestBypassWordCountEvaluation:
         assert result["gpt-4o"].deal_breaker is True
         assert "VIOLATION" in result["gpt-4o"].feedback
 
-    @patch('qa_bypass_engine.check_word_count_compliance')
+    @patch('qa_bypass_engine.evaluate_word_count_check')
     def test_replicates_evaluation_for_all_models(
-        self, mock_compliance, bypass_engine, word_count_layer, mock_request_with_word_count
+        self, mock_check, bypass_engine, word_count_layer, mock_request_with_word_count
     ):
         """
         Given: Multiple QA models
         When: _bypass_word_count_evaluation() is called
         Then: Returns same evaluation for all models
         """
-        mock_compliance.return_value = {
-            'actual_count': 500,
-            'required_min': 360,
-            'required_max': 660,
-            'target_min': 400,
-            'target_max': 600,
-            'score': 10.0,
-            'severity': 'important',
-            'target_field': None,
-            'is_json_extraction': False
-        }
+        mock_check.return_value = make_check_result(
+            10.0,
+            metadata={
+                'actual_count': 500,
+                'required_min': 360,
+                'required_max': 660,
+                'target_min': 400,
+                'target_max': 600,
+                'score': 10.0,
+                'severity': 'important',
+            },
+        )
 
         models = ["gpt-4o", "claude-sonnet-4", "gemini-pro"]
         result = bypass_engine._bypass_word_count_evaluation(
@@ -603,29 +656,32 @@ class TestBypassWordCountEvaluation:
         assert result["gpt-4o"] is result["claude-sonnet-4"]
         assert result["gpt-4o"] is result["gemini-pro"]
 
-    @patch('qa_bypass_engine.check_word_count_compliance')
+    @patch('qa_bypass_engine.evaluate_word_count_check')
     def test_includes_target_field_info_when_json_extraction(
-        self, mock_compliance, bypass_engine, word_count_layer, mock_request_with_word_count
+        self, mock_check, bypass_engine, word_count_layer, mock_request_with_word_count
     ):
         """
         Given: Content with JSON extraction target_field
         When: _bypass_word_count_evaluation() is called
         Then: Feedback includes target_field info
         """
-        mock_compliance.return_value = {
-            'actual_count': 500,
-            'required_min': 360,
-            'required_max': 660,
-            'target_min': 400,
-            'target_max': 600,
-            'score': 10.0,
-            'severity': 'important',
-            'target_field': 'content',
-            'is_json_extraction': True
-        }
+        mock_request_with_word_count.json_output = True
+        mock_request_with_word_count.target_field = "content"
+        mock_check.return_value = make_check_result(
+            10.0,
+            metadata={
+                'actual_count': 500,
+                'required_min': 360,
+                'required_max': 660,
+                'target_min': 400,
+                'target_max': 600,
+                'score': 10.0,
+                'severity': 'important',
+            },
+        )
 
         result = bypass_engine._bypass_word_count_evaluation(
-            '{"content": "test content..."}',
+            '{"content": "test content with enough words to be measured correctly."}',
             word_count_layer,
             ["gpt-4o"],
             mock_request_with_word_count
@@ -634,26 +690,27 @@ class TestBypassWordCountEvaluation:
         assert "content" in result["gpt-4o"].feedback
         assert "JSON extraction" in result["gpt-4o"].feedback
 
-    @patch('qa_bypass_engine.check_word_count_compliance')
+    @patch('qa_bypass_engine.evaluate_word_count_check')
     def test_evaluation_has_correct_layer_name(
-        self, mock_compliance, bypass_engine, word_count_layer, mock_request_with_word_count
+        self, mock_check, bypass_engine, word_count_layer, mock_request_with_word_count
     ):
         """
         Given: Word count layer
         When: _bypass_word_count_evaluation() is called
         Then: Evaluation has correct layer name
         """
-        mock_compliance.return_value = {
-            'actual_count': 500,
-            'required_min': 360,
-            'required_max': 660,
-            'target_min': 400,
-            'target_max': 600,
-            'score': 10.0,
-            'severity': 'important',
-            'target_field': None,
-            'is_json_extraction': False
-        }
+        mock_check.return_value = make_check_result(
+            10.0,
+            metadata={
+                'actual_count': 500,
+                'required_min': 360,
+                'required_max': 660,
+                'target_min': 400,
+                'target_max': 600,
+                'score': 10.0,
+                'severity': 'important',
+            },
+        )
 
         result = bypass_engine._bypass_word_count_evaluation(
             "word " * 500,
@@ -664,26 +721,27 @@ class TestBypassWordCountEvaluation:
 
         assert result["gpt-4o"].layer == "Word Count Enforcement"
 
-    @patch('qa_bypass_engine.check_word_count_compliance')
+    @patch('qa_bypass_engine.evaluate_word_count_check')
     def test_evaluation_includes_algorithmic_model_name(
-        self, mock_compliance, bypass_engine, word_count_layer, mock_request_with_word_count
+        self, mock_check, bypass_engine, word_count_layer, mock_request_with_word_count
     ):
         """
         Given: Word count layer
         When: _bypass_word_count_evaluation() is called
         Then: Model name indicates algorithmic evaluation
         """
-        mock_compliance.return_value = {
-            'actual_count': 500,
-            'required_min': 360,
-            'required_max': 660,
-            'target_min': 400,
-            'target_max': 600,
-            'score': 10.0,
-            'severity': 'important',
-            'target_field': None,
-            'is_json_extraction': False
-        }
+        mock_check.return_value = make_check_result(
+            10.0,
+            metadata={
+                'actual_count': 500,
+                'required_min': 360,
+                'required_max': 660,
+                'target_min': 400,
+                'target_max': 600,
+                'score': 10.0,
+                'severity': 'important',
+            },
+        )
 
         result = bypass_engine._bypass_word_count_evaluation(
             "word " * 500,
@@ -695,6 +753,41 @@ class TestBypassWordCountEvaluation:
         assert "Arithmos" in result["gpt-4o"].model
         assert "Algorithmic" in result["gpt-4o"].model
 
+    @patch('qa_bypass_engine.evaluate_word_count_check')
+    def test_uses_prepared_text_directly_when_requested(
+        self, mock_check, bypass_engine, word_count_layer, mock_request_with_word_count
+    ):
+        """
+        Given: target_field is configured and bypass content is already extracted
+        When: _bypass_word_count_evaluation() is called with content_already_prepared=True
+        Then: It evaluates the prepared text directly instead of expecting JSON
+        """
+        mock_request_with_word_count.json_output = True
+        mock_request_with_word_count.target_field = "content"
+        mock_check.return_value = make_check_result(
+            10.0,
+            metadata={
+                'actual_count': 12,
+                'required_min': 10,
+                'required_max': 20,
+                'target_min': 12,
+                'target_max': 18,
+                'score': 10.0,
+                'severity': 'important',
+            },
+        )
+
+        result = bypass_engine._bypass_word_count_evaluation(
+            "prepared extracted text only",
+            word_count_layer,
+            ["gpt-4o"],
+            mock_request_with_word_count,
+            content_already_prepared=True,
+        )
+
+        assert result["gpt-4o"].metadata["target_field_paths"] == ["content"]
+        mock_check.assert_called_once_with("prepared extracted text only", mock_request_with_word_count)
+
 
 # ============================================================================
 # TestBypassPhraseFrequencyEvaluation
@@ -703,19 +796,23 @@ class TestBypassWordCountEvaluation:
 class TestBypassPhraseFrequencyEvaluation:
     """Tests for _bypass_phrase_frequency_evaluation()."""
 
-    @patch('qa_bypass_engine.analyze_phrase_frequency')
+    @patch('qa_bypass_engine.evaluate_phrase_frequency_check')
     def test_no_issues_returns_score_10(
-        self, mock_analyze, bypass_engine, phrase_frequency_layer, mock_request_with_phrase_frequency
+        self, mock_check, bypass_engine, phrase_frequency_layer, mock_request_with_phrase_frequency
     ):
         """
         Given: Content with no phrase frequency issues
         When: _bypass_phrase_frequency_evaluation() is called
         Then: Returns score 10.0
         """
-        mock_result = Mock()
-        mock_result.issues = []
-        mock_result.analyzer_output = {"meta": {"total_tokens": 100}, "summary": {"top_by_count": {}}}
-        mock_analyze.return_value = mock_result
+        mock_check.return_value = make_check_result(
+            10.0,
+            metadata={
+                "issues": [],
+                "analysis": {"meta": {"total_tokens": 100}, "summary": {"top_by_count": {}}},
+                "rules_total": 0,
+            },
+        )
 
         result = bypass_engine._bypass_phrase_frequency_evaluation(
             "diverse content with varied vocabulary",
@@ -727,29 +824,33 @@ class TestBypassPhraseFrequencyEvaluation:
         assert result["gpt-4o"].score == 10.0
         assert result["gpt-4o"].deal_breaker is False
 
-    @patch('qa_bypass_engine.analyze_phrase_frequency')
+    @patch('qa_bypass_engine.evaluate_phrase_frequency_check')
     def test_deal_breaker_issues_returns_low_score(
-        self, mock_analyze, bypass_engine, phrase_frequency_layer, mock_request_with_phrase_frequency
+        self, mock_check, bypass_engine, phrase_frequency_layer, mock_request_with_phrase_frequency
     ):
         """
         Given: Content with deal-breaker phrase frequency issues
         When: _bypass_phrase_frequency_evaluation() is called
         Then: Returns low score with deal_breaker=True
         """
-        issue = Mock()
-        issue.phrase = "repeated phrase"
-        issue.n = 2
-        issue.count = 20
-        issue.limit = 5
-        issue.severity = "deal_breaker"
-        issue.rule_label = "test_rule"
-        issue.repeat_ratio_tokens = 0.1
-        issue.guidance = "Vary your language"
-
-        mock_result = Mock()
-        mock_result.issues = [issue]
-        mock_result.analyzer_output = {"meta": {"total_tokens": 100}, "summary": {"top_by_count": {}}}
-        mock_analyze.return_value = mock_result
+        mock_check.return_value = make_check_result(
+            2.0,
+            deal_breaker=True,
+            metadata={
+                "issues": [{
+                    "phrase": "repeated phrase",
+                    "n": 2,
+                    "count": 20,
+                    "limit": 5,
+                    "severity": "deal_breaker",
+                    "rule": "test_rule",
+                    "guidance": "Vary your language",
+                    "repeat_ratio_tokens": 0.1,
+                }],
+                "analysis": {"meta": {"total_tokens": 100}, "summary": {"top_by_count": {}}},
+                "rules_total": 1,
+            },
+        )
 
         result = bypass_engine._bypass_phrase_frequency_evaluation(
             "repeated phrase " * 20,
@@ -761,29 +862,32 @@ class TestBypassPhraseFrequencyEvaluation:
         assert result["gpt-4o"].score == 2.0
         assert result["gpt-4o"].deal_breaker is True
 
-    @patch('qa_bypass_engine.analyze_phrase_frequency')
+    @patch('qa_bypass_engine.evaluate_phrase_frequency_check')
     def test_warning_issues_returns_medium_score(
-        self, mock_analyze, bypass_engine, phrase_frequency_layer, mock_request_with_phrase_frequency
+        self, mock_check, bypass_engine, phrase_frequency_layer, mock_request_with_phrase_frequency
     ):
         """
         Given: Content with warning-level phrase frequency issues
         When: _bypass_phrase_frequency_evaluation() is called
         Then: Returns medium score without deal_breaker
         """
-        issue = Mock()
-        issue.phrase = "somewhat repeated"
-        issue.n = 2
-        issue.count = 8
-        issue.limit = 5
-        issue.severity = "warning"
-        issue.rule_label = "test_rule"
-        issue.repeat_ratio_tokens = None
-        issue.guidance = None
-
-        mock_result = Mock()
-        mock_result.issues = [issue]
-        mock_result.analyzer_output = {"meta": {"total_tokens": 100}, "summary": {"top_by_count": {}}}
-        mock_analyze.return_value = mock_result
+        mock_check.return_value = make_check_result(
+            7.5,
+            metadata={
+                "issues": [{
+                    "phrase": "somewhat repeated",
+                    "n": 2,
+                    "count": 8,
+                    "limit": 5,
+                    "severity": "warning",
+                    "rule": "test_rule",
+                    "guidance": None,
+                    "repeat_ratio_tokens": None,
+                }],
+                "analysis": {"meta": {"total_tokens": 100}, "summary": {"top_by_count": {}}},
+                "rules_total": 1,
+            },
+        )
 
         result = bypass_engine._bypass_phrase_frequency_evaluation(
             "content with somewhat repeated phrases",
@@ -823,27 +927,28 @@ class TestBypassPhraseFrequencyEvaluation:
 class TestBypassLexicalDiversityEvaluation:
     """Tests for _bypass_lexical_diversity_evaluation()."""
 
-    @patch('qa_bypass_engine.analyze_text_lexical_diversity')
+    @patch('qa_bypass_engine.evaluate_lexical_diversity_check')
     def test_green_decision_returns_high_score(
-        self, mock_analyze, bypass_engine, lexical_diversity_layer, mock_request_with_lexical_diversity
+        self, mock_check, bypass_engine, lexical_diversity_layer, mock_request_with_lexical_diversity
     ):
         """
         Given: Content with GREEN lexical diversity decision
         When: _bypass_lexical_diversity_evaluation() is called
         Then: Returns high score without deal_breaker
         """
-        mock_result = Mock()
-        mock_result.decision_label = "GREEN"
-        mock_result.score = 9.0
-        mock_result.deal_breaker = False
-        mock_result.adjusted_grades = {"mtld": "GREEN", "hdd": "GREEN"}
-        mock_result.analysis = {
-            "metrics": {"mtld": 80.5, "hdd": 0.85},
-            "meta": {"total_tokens": 500},
-            "top_words": [{"word": "the", "count": 20, "freq": 0.04}],
-            "windows": []
-        }
-        mock_analyze.return_value = mock_result
+        mock_check.return_value = make_check_result(
+            9.0,
+            metadata={
+                "decision": "GREEN",
+                "adjusted_grades": {"mtld": "GREEN", "hdd": "GREEN"},
+                "analysis": {
+                    "metrics": {"mtld": 80.5, "hdd": 0.85},
+                    "meta": {"total_tokens": 500},
+                    "top_words": [{"word": "the", "count": 20, "freq": 0.04}],
+                    "windows": [],
+                },
+            },
+        )
 
         result = bypass_engine._bypass_lexical_diversity_evaluation(
             "diverse content with rich vocabulary",
@@ -856,27 +961,29 @@ class TestBypassLexicalDiversityEvaluation:
         assert result["gpt-4o"].deal_breaker is False
         assert "GREEN" in result["gpt-4o"].feedback
 
-    @patch('qa_bypass_engine.analyze_text_lexical_diversity')
+    @patch('qa_bypass_engine.evaluate_lexical_diversity_check')
     def test_red_decision_triggers_deal_breaker(
-        self, mock_analyze, bypass_engine, lexical_diversity_layer, mock_request_with_lexical_diversity
+        self, mock_check, bypass_engine, lexical_diversity_layer, mock_request_with_lexical_diversity
     ):
         """
         Given: Content with RED lexical diversity decision
         When: _bypass_lexical_diversity_evaluation() is called
         Then: Returns deal_breaker=True
         """
-        mock_result = Mock()
-        mock_result.decision_label = "RED"
-        mock_result.score = 3.0
-        mock_result.deal_breaker = True
-        mock_result.adjusted_grades = {"mtld": "RED", "hdd": "RED"}
-        mock_result.analysis = {
-            "metrics": {"mtld": 20.5, "hdd": 0.45},
-            "meta": {},
-            "top_words": [],
-            "windows": []
-        }
-        mock_analyze.return_value = mock_result
+        mock_check.return_value = make_check_result(
+            3.0,
+            deal_breaker=True,
+            metadata={
+                "decision": "RED",
+                "adjusted_grades": {"mtld": "RED", "hdd": "RED"},
+                "analysis": {
+                    "metrics": {"mtld": 20.5, "hdd": 0.45},
+                    "meta": {},
+                    "top_words": [],
+                    "windows": [],
+                },
+            },
+        )
 
         result = bypass_engine._bypass_lexical_diversity_evaluation(
             "repetitive repetitive repetitive content",
@@ -888,27 +995,28 @@ class TestBypassLexicalDiversityEvaluation:
         assert result["gpt-4o"].deal_breaker is True
         assert result["gpt-4o"].deal_breaker_reason is not None
 
-    @patch('qa_bypass_engine.analyze_text_lexical_diversity')
+    @patch('qa_bypass_engine.evaluate_lexical_diversity_check')
     def test_includes_metadata_payload(
-        self, mock_analyze, bypass_engine, lexical_diversity_layer, mock_request_with_lexical_diversity
+        self, mock_check, bypass_engine, lexical_diversity_layer, mock_request_with_lexical_diversity
     ):
         """
         Given: Lexical diversity analysis
         When: _bypass_lexical_diversity_evaluation() is called
         Then: Evaluation includes metadata payload
         """
-        mock_result = Mock()
-        mock_result.decision_label = "AMBER"
-        mock_result.score = 6.0
-        mock_result.deal_breaker = False
-        mock_result.adjusted_grades = {"mtld": "AMBER"}
-        mock_result.analysis = {
-            "metrics": {"mtld": 50.0},
-            "meta": {"language_hint": "en"},
-            "top_words": [{"word": "test", "count": 10, "freq": 0.05}],
-            "windows": []
-        }
-        mock_analyze.return_value = mock_result
+        mock_check.return_value = make_check_result(
+            6.0,
+            metadata={
+                "decision": "AMBER",
+                "adjusted_grades": {"mtld": "AMBER"},
+                "analysis": {
+                    "metrics": {"mtld": 50.0},
+                    "meta": {"language_hint": "en"},
+                    "top_words": [{"word": "test", "count": 10, "freq": 0.05}],
+                    "windows": [],
+                },
+            },
+        )
 
         result = bypass_engine._bypass_lexical_diversity_evaluation(
             "test content",
@@ -949,21 +1057,24 @@ class TestBypassLexicalDiversityEvaluation:
 class TestBypassCumulativeRepetitionEvaluation:
     """Tests for _bypass_cumulative_repetition_evaluation()."""
 
-    @patch('qa_bypass_engine.analyze_phrase_frequency')
-    @patch('qa_bypass_engine.count_words')
+    @patch('qa_bypass_engine.evaluate_cumulative_repetition_check')
     def test_no_issues_returns_score_10(
-        self, mock_count, mock_analyze, bypass_engine, cumulative_repetition_layer, mock_request_with_cumulative
+        self, mock_check, bypass_engine, cumulative_repetition_layer, mock_request_with_cumulative
     ):
         """
         Given: Cumulative content with no repetition issues
         When: _bypass_cumulative_repetition_evaluation() is called
         Then: Returns score 10.0
         """
-        mock_count.return_value = 100
-        mock_result = Mock()
-        mock_result.issues = []
-        mock_result.analyzer_output = {"meta": {}, "summary": {}}
-        mock_analyze.return_value = mock_result
+        mock_check.return_value = make_check_result(
+            10.0,
+            metadata={
+                "issues": [],
+                "analysis": {"meta": {}, "summary": {}},
+                "total_word_count": 500,
+                "rules_total": 0,
+            },
+        )
 
         result = bypass_engine._bypass_cumulative_repetition_evaluation(
             "new chapter content",
@@ -976,32 +1087,34 @@ class TestBypassCumulativeRepetitionEvaluation:
         assert result["gpt-4o"].deal_breaker is False
         assert "CUMULATIVE ANALYSIS" in result["gpt-4o"].feedback
 
-    @patch('qa_bypass_engine.analyze_phrase_frequency')
-    @patch('qa_bypass_engine.count_words')
+    @patch('qa_bypass_engine.evaluate_cumulative_repetition_check')
     def test_deal_breaker_issues_returns_low_score(
-        self, mock_count, mock_analyze, bypass_engine, cumulative_repetition_layer, mock_request_with_cumulative
+        self, mock_check, bypass_engine, cumulative_repetition_layer, mock_request_with_cumulative
     ):
         """
         Given: Cumulative content with deal-breaker repetition
         When: _bypass_cumulative_repetition_evaluation() is called
         Then: Returns low score with deal_breaker=True
         """
-        mock_count.return_value = 100
-
-        issue = Mock()
-        issue.phrase = "repeated across chapters"
-        issue.n = 3
-        issue.count = 50
-        issue.limit = 10
-        issue.severity = "deal_breaker"
-        issue.rule_label = "cumulative_rule"
-        issue.repeat_ratio_tokens = 0.15
-        issue.guidance = "Vary your chapter openings"
-
-        mock_result = Mock()
-        mock_result.issues = [issue]
-        mock_result.analyzer_output = {"meta": {}, "summary": {}}
-        mock_analyze.return_value = mock_result
+        mock_check.return_value = make_check_result(
+            2.0,
+            deal_breaker=True,
+            metadata={
+                "issues": [{
+                    "phrase": "repeated across chapters",
+                    "n": 3,
+                    "count": 50,
+                    "limit": 10,
+                    "severity": "deal_breaker",
+                    "rule": "cumulative_rule",
+                    "guidance": "Vary your chapter openings",
+                    "repeat_ratio_tokens": 0.15,
+                }],
+                "analysis": {"meta": {}, "summary": {}},
+                "total_word_count": 500,
+                "rules_total": 1,
+            },
+        )
 
         result = bypass_engine._bypass_cumulative_repetition_evaluation(
             "new chapter with repeated across chapters",

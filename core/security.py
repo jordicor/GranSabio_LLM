@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 from pathlib import Path
 from typing import List, Set
 
@@ -37,13 +38,13 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # =============================================================================
 
-# Networks allowed to access the API
-# Override by modifying this list before app startup if needed
-INTERNAL_NETWORKS: List[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
-    ipaddress.ip_network('127.0.0.0/8'),       # localhost IPv4
-    ipaddress.ip_network('::1/128'),           # localhost IPv6
-    ipaddress.ip_network('192.168.50.0/24'),   # specific LAN
-]
+# Networks allowed to access the API.
+# Override with INTERNAL_ALLOWED_CIDRS="127.0.0.0/8,::1/128,192.168.0.0/16"
+DEFAULT_INTERNAL_NETWORK_CIDRS: tuple[str, ...] = (
+    "127.0.0.0/8",    # localhost IPv4
+    "::1/128",        # localhost IPv6
+    "192.168.0.0/16",  # RFC1918 private range — override via INTERNAL_ALLOWED_CIDRS
+)
 
 # Trusted proxies file (one CIDR per line).
 TRUSTED_PROXIES_PATH = Path(__file__).with_name("trusted_proxies.txt")
@@ -78,6 +79,24 @@ def _load_trusted_proxy_networks() -> List[ipaddress.IPv4Network | ipaddress.IPv
 
 
 TRUSTED_PROXY_NETWORKS = _load_trusted_proxy_networks()
+
+
+def _load_internal_networks() -> List[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    raw_value = os.getenv("INTERNAL_ALLOWED_CIDRS", "")
+    cidr_values = [value.strip() for value in raw_value.split(",") if value.strip()]
+    if not cidr_values:
+        cidr_values = list(DEFAULT_INTERNAL_NETWORK_CIDRS)
+
+    networks: List[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for cidr in cidr_values:
+        try:
+            networks.append(ipaddress.ip_network(cidr))
+        except ValueError:
+            logger.warning("Invalid internal CIDR ignored: %s", cidr)
+
+    if not networks:
+        networks = [ipaddress.ip_network(cidr) for cidr in DEFAULT_INTERNAL_NETWORK_CIDRS]
+    return networks
 
 # Paths that are always allowed (health checks, static files, etc.)
 # These bypass IP filtering even when middleware is active
@@ -114,7 +133,7 @@ def is_ip_allowed(client_ip: str | None) -> bool:
 
     try:
         ip = ipaddress.ip_address(client_ip)
-        return any(ip in network for network in INTERNAL_NETWORKS)
+        return any(ip in network for network in _load_internal_networks())
     except ValueError:
         logger.warning("Invalid IP address format: %s", client_ip)
         return False
@@ -162,6 +181,10 @@ def get_client_ip(request: Request) -> str | None:
     client_ip = request.client.host if request.client else None
     if not client_ip:
         return None
+
+    # Starlette/FastAPI TestClient uses the sentinel host "testclient".
+    if client_ip == "testclient":
+        return "127.0.0.1"
 
     if not is_trusted_proxy(client_ip):
         return client_ip

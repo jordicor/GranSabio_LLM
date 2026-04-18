@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Model Admin - Gran Sabio LLM</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    body {
+      background:
+        radial-gradient(circle at top left, rgba(49,130,206,.12), transparent 30%),
+        radial-gradient(circle at top right, rgba(56,161,105,.10), transparent 28%),
+        var(--bg-primary);
+    }
+    .admin-shell { width: min(1480px, calc(100% - 32px)); margin: 0 auto; padding: 20px 0 40px; }
+
+    /* ── Header ─────────────────────────────── */
+    .admin-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 16px 0; border-bottom: 1px solid var(--border-light); margin-bottom: 20px;
+    }
+    .admin-header .logo { font-size: 1.1rem; font-weight: 700; color: var(--text-primary); }
+    .admin-header .logo .accent { color: var(--accent-blue); }
+    .admin-header .back-link {
+      font-size: .85rem; color: var(--text-secondary); text-decoration: none;
+      padding: 6px 14px; border-radius: 8px; border: 1px solid var(--border-light);
+      transition: all .15s;
+    }
+    .admin-header .back-link:hover { background: var(--bg-secondary); color: var(--text-primary); }
+
+    /* ── Title bar ──────────────────────────── */
+    .title-bar {
+      display: flex; align-items: baseline; justify-content: space-between;
+      margin-bottom: 16px; flex-wrap: wrap; gap: 8px;
+    }
+    .title-bar h1 { font-size: 1.5rem; font-weight: 700; margin: 0; color: var(--text-primary); }
+    .title-bar .meta { font-size: .82rem; color: var(--text-secondary); }
+    .title-bar .meta span { margin-left: 16px; }
+
+    /* ── Tabs ───────────────────────────────── */
+    .tab-strip {
+      display: flex; gap: 4px; border-bottom: 2px solid var(--border-light);
+      margin-bottom: 20px; overflow-x: auto; padding-bottom: 0;
+    }
+    .tab-btn {
+      padding: 10px 18px; font-size: .85rem; font-weight: 600;
+      color: var(--text-secondary); background: none; border: none;
+      border-bottom: 2px solid transparent; cursor: pointer;
+      white-space: nowrap; transition: all .15s; margin-bottom: -2px;
+    }
+    .tab-btn:hover { color: var(--text-primary); }
+    .tab-btn.active { color: var(--accent-blue); border-bottom-color: var(--accent-blue); }
+    .tab-btn .badge {
+      display: inline-block; font-size: .72rem; font-weight: 600;
+      background: var(--bg-secondary); color: var(--text-secondary);
+      padding: 1px 7px; border-radius: 10px; margin-left: 6px;
+    }
+    .tab-btn.active .badge { background: var(--accent-blue-bg); color: var(--accent-blue); }
+
+    /* ── Content panel ──────────────────────── */
+    .content-panel {
+      background: rgba(255,255,255,.92); border: 1px solid rgba(226,232,240,.9);
+      box-shadow: 0 12px 40px rgba(15,23,42,.06); border-radius: 16px; padding: 24px;
+    }
+    .panel { display: none; }
+    .panel.active { display: block; }
+
+    /* ── Toolbar ────────────────────────────── */
+    .toolbar {
+      display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 16px;
+    }
+    .toolbar input[type="text"] {
+      flex: 1; min-width: 200px; padding: 8px 14px; font-size: .85rem;
+      border: 1px solid var(--border-light); border-radius: 8px; background: var(--bg-primary);
+      outline: none; transition: border-color .15s;
+    }
+    .toolbar input[type="text"]:focus { border-color: var(--accent-blue); }
+    .toolbar select {
+      padding: 8px 12px; font-size: .85rem; border: 1px solid var(--border-light);
+      border-radius: 8px; background: var(--bg-primary); cursor: pointer;
+    }
+    .btn-primary {
+      padding: 8px 18px; font-size: .85rem; font-weight: 600; color: #fff;
+      background: var(--accent-blue); border: none; border-radius: 8px; cursor: pointer;
+      transition: opacity .15s; white-space: nowrap;
+    }
+    .btn-primary:hover { opacity: .88; }
+    .btn-primary:disabled { opacity: .45; cursor: not-allowed; }
+    .btn-secondary {
+      padding: 8px 18px; font-size: .85rem; font-weight: 600;
+      color: var(--text-secondary); background: var(--bg-secondary);
+      border: 1px solid var(--border-light); border-radius: 8px; cursor: pointer;
+      transition: all .15s; white-space: nowrap;
+    }
+    .btn-secondary:hover { background: var(--bg-accent); color: var(--text-primary); }
+    .btn-danger {
+      padding: 8px 18px; font-size: .85rem; font-weight: 600; color: #fff;
+      background: var(--error); border: none; border-radius: 8px; cursor: pointer;
+      transition: opacity .15s;
+    }
+    .btn-danger:hover { opacity: .88; }
+    .btn-sm { padding: 5px 10px; font-size: .78rem; }
+
+    /* ── Table ──────────────────────────────── */
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+    th {
+      text-align: left; padding: 10px 12px; font-size: .72rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: .08em; color: var(--text-muted);
+      border-bottom: 1px solid var(--border-light); white-space: nowrap;
+    }
+    th.sortable { cursor: pointer; user-select: none; }
+    th.sortable:hover { color: var(--text-primary); }
+    th .sort-icon { margin-left: 4px; font-size: .65rem; }
+    td { padding: 10px 12px; border-bottom: 1px solid rgba(226,232,240,.5); vertical-align: middle; }
+    tr:hover td { background: rgba(49,130,206,.03); }
+    tr.disabled td { opacity: .45; }
+    tr.disabled td:first-child { opacity: 1; }
+    .model-name { font-weight: 600; color: var(--text-primary); }
+    .model-id { font-size: .78rem; color: var(--text-muted); margin-left: 6px; }
+    .provider-pill {
+      display: inline-block; font-size: .68rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .06em; padding: 3px 8px; border-radius: 6px;
+    }
+    .provider-pill.openai { background: #e8f5e9; color: #2e7d32; }
+    .provider-pill.anthropic { background: #fce4ec; color: #c62828; }
+    .provider-pill.google { background: #e3f2fd; color: #1565c0; }
+    .provider-pill.xai { background: #f3e5f5; color: #7b1fa2; }
+    .provider-pill.openrouter { background: #fff3e0; color: #e65100; }
+    .provider-pill.ollama { background: #e0e0e0; color: #424242; }
+    .provider-pill.fake { background: #f5f5f5; color: #9e9e9e; }
+    .price { font-family: var(--font-mono); font-size: .78rem; color: var(--text-secondary); }
+    .ctx { font-family: var(--font-mono); font-size: .78rem; }
+    .row-actions { display: flex; gap: 4px; opacity: 0; transition: opacity .15s; }
+    tr:hover .row-actions { opacity: 1; }
+    .icon-btn {
+      background: none; border: none; cursor: pointer; padding: 4px;
+      color: var(--text-muted); font-size: .9rem; border-radius: 4px;
+    }
+    .icon-btn:hover { color: var(--error); background: var(--error-bg); }
+
+    /* ── Toggle switch ─────────────────────── */
+    .toggle { position: relative; display: inline-block; width: 36px; height: 20px; }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .toggle .slider {
+      position: absolute; inset: 0; cursor: pointer; border-radius: 20px;
+      background: #cbd5e1; transition: background .2s;
+    }
+    .toggle .slider::before {
+      content: ""; position: absolute; width: 16px; height: 16px;
+      left: 2px; bottom: 2px; border-radius: 50%; background: #fff;
+      transition: transform .2s;
+    }
+    .toggle input:checked + .slider { background: var(--success); }
+    .toggle input:checked + .slider::before { transform: translateX(16px); }
+
+    /* ── Provider header ───────────────────── */
+    .provider-header {
+      display: flex; align-items: baseline; justify-content: space-between;
+      margin-bottom: 16px; flex-wrap: wrap; gap: 8px;
+    }
+    .provider-header h2 { font-size: 1.2rem; font-weight: 700; margin: 0; }
+    .provider-header .meta { font-size: .82rem; color: var(--text-secondary); }
+
+    /* ── Collapsible sections ──────────────── */
+    .section {
+      border: 1px solid var(--border-light); border-radius: 12px;
+      margin-bottom: 12px; overflow: hidden;
+    }
+    .section-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 16px; cursor: pointer; user-select: none;
+      transition: background .15s;
+    }
+    .section-header:hover { background: var(--bg-secondary); }
+    .section-header .left { display: flex; align-items: center; gap: 10px; }
+    .section-header .count {
+      font-size: .78rem; font-weight: 600; padding: 2px 8px; border-radius: 8px;
+    }
+    .section-header .chevron { font-size: .75rem; color: var(--text-muted); transition: transform .2s; }
+    .section.open .section-header .chevron { transform: rotate(90deg); }
+    .section-body { display: none; padding: 0 16px 16px; }
+    .section.open .section-body { display: block; }
+
+    .section.new .section-header { border-left: 3px solid var(--accent-blue); }
+    .section.new .count { background: var(--accent-blue-bg); color: var(--accent-blue); }
+    .section.updated .section-header { border-left: 3px solid var(--warning); }
+    .section.updated .count { background: var(--warning-bg); color: var(--warning); }
+    .section.current .section-header { border-left: 3px solid var(--success); }
+    .section.current .count { background: var(--success-bg); color: var(--success); }
+    .section.missing .section-header { border-left: 3px solid var(--error); }
+    .section.missing .count { background: var(--error-bg); color: var(--error); }
+
+    .section-title { font-size: .9rem; font-weight: 700; margin: 0; }
+    .section-desc { font-size: .78rem; color: var(--text-secondary); margin: 0; }
+    .section-actions { display: flex; gap: 6px; }
+
+    /* ── Diff display ──────────────────────── */
+    .diff-field { font-size: .78rem; color: var(--text-secondary); margin-top: 2px; }
+    .diff-old { color: var(--error); text-decoration: line-through; }
+    .diff-new { color: var(--success); font-weight: 600; }
+
+    /* ── Action bar (bottom) ───────────────── */
+    .action-bar {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border-light);
+    }
+    .action-summary { font-size: .85rem; color: var(--text-secondary); }
+
+    /* ── Notice ─────────────────────────────── */
+    .notice {
+      padding: 12px 16px; border-radius: 10px; font-size: .85rem;
+      margin-bottom: 16px; display: none;
+    }
+    .notice.visible { display: flex; align-items: center; gap: 10px; }
+    .notice.loading { background: var(--accent-blue-bg); color: var(--accent-blue); }
+    .notice.success { background: var(--success-bg); color: var(--success); }
+    .notice.error { background: var(--error-bg); color: var(--error); }
+    .notice .title { font-weight: 600; }
+    .spinner { width: 16px; height: 16px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin .6s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Modal ──────────────────────────────── */
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 1000;
+      display: none; align-items: center; justify-content: center; padding: 20px;
+    }
+    .modal-overlay.visible { display: flex; }
+    .modal {
+      background: #fff; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,.2);
+      max-width: 600px; width: 100%; max-height: 80vh; overflow-y: auto; padding: 28px;
+    }
+    .modal h3 { font-size: 1.15rem; font-weight: 700; margin: 0 0 6px; }
+    .modal .subtitle { font-size: .85rem; color: var(--text-secondary); margin-bottom: 20px; }
+    .modal-section { margin-bottom: 16px; }
+    .modal-section .label {
+      font-size: .78rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .06em; margin-bottom: 6px;
+    }
+    .modal-section .label.add { color: var(--success); }
+    .modal-section .label.update { color: var(--warning); }
+    .modal-section .label.remove { color: var(--error); }
+    .modal-section ul { list-style: none; padding: 0; margin: 0; font-size: .85rem; }
+    .modal-section li { padding: 3px 0; color: var(--text-primary); }
+    .modal-section li .diff-detail { font-size: .78rem; color: var(--text-muted); margin-left: 8px; }
+    .modal-footer {
+      display: flex; gap: 10px; justify-content: flex-end;
+      margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border-light);
+    }
+    .modal-footer .backup-note { font-size: .78rem; color: var(--text-muted); margin-right: auto; align-self: center; }
+
+    /* ── Sync-all modal ────────────────────── */
+    .sync-all-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 0; border-bottom: 1px solid rgba(226,232,240,.5);
+    }
+    .sync-all-row:last-child { border-bottom: none; }
+    .sync-all-row .provider-name { font-weight: 600; }
+    .sync-all-row .stats { font-size: .82rem; color: var(--text-secondary); }
+    .sync-all-row .status-icon { font-size: .82rem; }
+    .sync-all-total { font-weight: 700; padding-top: 10px; border-top: 1px solid var(--border-light); margin-top: 10px; }
+
+    /* ── Delete popover ────────────────────── */
+    .delete-popover {
+      position: absolute; background: #fff; border: 1px solid var(--border-light);
+      border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.12);
+      padding: 14px; z-index: 500; min-width: 240px;
+    }
+    .delete-popover p { margin: 0 0 10px; font-size: .85rem; }
+    .delete-popover .actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+    /* ── Empty state ───────────────────────── */
+    .empty-state {
+      text-align: center; padding: 40px 20px; color: var(--text-muted); font-size: .9rem;
+    }
+
+    /* ── Checkbox in section rows ──────────── */
+    .section-row {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 0; border-bottom: 1px solid rgba(226,232,240,.3);
+    }
+    .section-row:last-child { border-bottom: none; }
+    .section-row input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
+    .section-row .info { flex: 1; min-width: 0; }
+    .section-row .model-name { font-weight: 600; font-size: .85rem; }
+    .section-row .model-meta { font-size: .78rem; color: var(--text-secondary); }
+
+    /* ── Responsive ─────────────────────────── */
+    @media (max-width: 900px) {
+      .toolbar { flex-direction: column; }
+      .toolbar input[type="text"] { min-width: unset; width: 100%; }
+    }
+    @media (max-width: 600px) {
+      .admin-shell { padding: 10px 0 20px; }
+      .content-panel { border-radius: 10px; padding: 14px; }
+      .tab-btn { padding: 8px 12px; font-size: .78rem; }
+    }
+  </style>
+</head>
+<body class="models-admin-page">
+  <div class="admin-shell">
+    <!-- Header -->
+    <header class="admin-header">
+      <div class="logo">Gran Sabio <span class="accent">LLM</span></div>
+      <a href="/" class="back-link">Back to app</a>
+    </header>
+
+    <!-- Title bar -->
+    <div class="title-bar">
+      <h1>Model Admin</h1>
+      <div class="meta">
+        <span id="modelCount">-- models</span>
+        <span id="lastSyncMeta"></span>
+      </div>
+    </div>
+
+    <!-- Notice area -->
+    <div id="globalNotice" class="notice"></div>
+
+    <!-- Tab strip -->
+    <div class="tab-strip" id="tabStrip">
+      <button type="button" class="tab-btn active" data-tab="catalog">Catalog <span class="badge" id="badge-catalog">--</span></button>
+      <button type="button" class="tab-btn" data-tab="openai">OpenAI <span class="badge" id="badge-openai">--</span></button>
+      <button type="button" class="tab-btn" data-tab="anthropic">Anthropic <span class="badge" id="badge-anthropic">--</span></button>
+      <button type="button" class="tab-btn" data-tab="google">Google <span class="badge" id="badge-google">--</span></button>
+      <button type="button" class="tab-btn" data-tab="xai">xAI <span class="badge" id="badge-xai">--</span></button>
+      <button type="button" class="tab-btn" data-tab="openrouter">OpenRouter <span class="badge" id="badge-openrouter">--</span></button>
+    </div>
+
+    <!-- Content panel -->
+    <div class="content-panel">
+
+      <!-- ═══ CATALOG PANEL ═══ -->
+      <div class="panel active" id="catalogPanel" data-tab-panel="catalog">
+        <div class="toolbar">
+          <input type="text" id="catalogSearch" placeholder="Search models...">
+          <select id="catalogProviderFilter">
+            <option value="">All providers</option>
+          </select>
+          <select id="catalogStatusFilter">
+            <option value="">All</option>
+            <option value="enabled">Enabled</option>
+            <option value="disabled">Disabled</option>
+          </select>
+          <button type="button" class="btn-primary" id="syncAllBtn">Sync All Providers</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:50px">On</th>
+                <th class="sortable" data-sort="provider">Provider <span class="sort-icon"></span></th>
+                <th class="sortable" data-sort="name">Model <span class="sort-icon"></span></th>
+                <th class="sortable" data-sort="context">Context <span class="sort-icon"></span></th>
+                <th class="sortable" data-sort="input_price">Input $/M <span class="sort-icon"></span></th>
+                <th class="sortable" data-sort="output_price">Output $/M <span class="sort-icon"></span></th>
+                <th style="width:40px"></th>
+              </tr>
+            </thead>
+            <tbody id="catalogBody"></tbody>
+          </table>
+        </div>
+        <div id="catalogEmpty" class="empty-state" style="display:none">No models match your filters.</div>
+      </div>
+
+      <!-- ═══ PROVIDER PANEL ═══ -->
+      <div class="panel" id="providerPanel" data-tab-panel="provider">
+        <div class="provider-header">
+          <div>
+            <h2 id="providerTitle">--</h2>
+            <span class="meta" id="providerMeta"></span>
+          </div>
+          <div>
+            <button type="button" class="btn-secondary btn-sm" id="refreshProviderBtn">Refresh</button>
+          </div>
+        </div>
+
+        <div id="providerNotice" class="notice"></div>
+
+        <!-- Sections rendered by JS -->
+        <div id="providerSections"></div>
+
+        <!-- Action bar -->
+        <div class="action-bar" id="providerActionBar" style="display:none">
+          <span class="action-summary" id="actionSummary"></span>
+          <button type="button" class="btn-primary" id="applyChangesBtn" disabled>No changes to apply</button>
+        </div>
+      </div>
+
+    </div><!-- /content-panel -->
+  </div><!-- /admin-shell -->
+
+  <!-- ═══ CONFIRM MODAL ═══ -->
+  <div class="modal-overlay" id="confirmModal">
+    <div class="modal">
+      <h3 id="confirmTitle">Confirm sync</h3>
+      <p class="subtitle" id="confirmSubtitle">The following changes will be applied to model_specs.json:</p>
+      <div id="confirmBody"></div>
+      <div class="modal-footer">
+        <span class="backup-note">A backup will be created automatically.</span>
+        <button type="button" class="btn-secondary" id="confirmCancel">Cancel</button>
+        <button type="button" class="btn-primary" id="confirmApply">Apply changes</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ SYNC ALL MODAL ═══ -->
+  <div class="modal-overlay" id="syncAllModal">
+    <div class="modal">
+      <h3>Sync All Providers</h3>
+      <p class="subtitle">Fetching models from all provider APIs...</p>
+      <div id="syncAllBody"></div>
+      <div id="syncAllTotal" class="sync-all-total" style="display:none"></div>
+      <div class="modal-footer">
+        <span class="backup-note">A backup will be created automatically.</span>
+        <button type="button" class="btn-secondary" id="syncAllCancel">Cancel</button>
+        <button type="button" class="btn-primary" id="syncAllApply" disabled>Apply all changes</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    window.ADMIN_BOOT = {
+      initialTab: "{{ initial_tab }}",
+      providers: {{ supported_providers | tojson }}
+    };
+  </script>
+  <script src="/static/js/models_admin.js"></script>
+</body>
+</html>

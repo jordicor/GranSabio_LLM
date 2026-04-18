@@ -357,7 +357,7 @@ async def startup_event():
             db_path=config.DEBUGGER.db_path,
         )
         await debug_logger.initialize()
-        if config.DEBUGGER.enabled:
+        if config.DEBUGGER.enabled and debug_logger.storage_available:
             logger.info("Debugger persistence initialized")
             # Cleanup old sessions on startup (older than 7 days)
             cleanup_result = await debug_logger.cleanup_old_sessions(retention_days=7)
@@ -367,6 +367,11 @@ async def startup_event():
                     cleanup_result["deleted_sessions"],
                     cleanup_result["deleted_events"]
                 )
+        elif config.DEBUGGER.enabled and debug_logger.storage_disabled_reason:
+            logger.warning(
+                "Debugger persistence disabled during startup: %s",
+                debug_logger.storage_disabled_reason,
+            )
     except Exception as e:
         logger.error(f"Failed to initialize debugger persistence: {e}")
         debug_logger = None
@@ -474,13 +479,18 @@ async def get_session(session_id: str) -> Optional[Dict[str, Any]]:
         return active_sessions.get(session_id)
 
 
-def _store_final_result(session: Dict[str, Any], final_result: Dict[str, Any], session_id: Optional[str] = None) -> None:
+def _store_final_result(
+    session: Dict[str, Any],
+    final_result: Dict[str, Any],
+    session_id: Optional[str] = None,
+    final_status: Optional[str] = None,
+) -> None:
     """Persist the final_result for a session while attaching project metadata."""
     project_id = session.get("project_id")
     if project_id:
         final_result.setdefault("project_id", project_id)
     session["final_result"] = final_result
-    status = final_result.get("status") or session.get("status")
+    status = final_result.get("status") or final_status or session.get("status")
     session_identifier = session_id or session.get("session_id")  # session_id not stored; caller should pass when available
     if status and session_identifier:
         queue_project_session_end(session, session_identifier, str(status))
@@ -649,6 +659,7 @@ def _build_project_phase_event(
     *,
     event: str,
     phase: str,
+    subphase: Optional[str] = None,
     session_id: Optional[str] = None,
     request_name: Optional[str] = None,
     content: Optional[str] = None,
@@ -672,6 +683,8 @@ def _build_project_phase_event(
         "phase": phase,
         "timestamp": int(time.time() * 1000),
     }
+    if subphase:
+        obj["subphase"] = subphase
     if session_id:
         obj["session_id"] = session_id
     if request_name:
@@ -709,6 +722,7 @@ async def publish_project_phase_chunk(
     phase: str,
     content: Optional[str],
     *,
+    subphase: Optional[str] = None,
     session_id: Optional[str] = None,
     request_name: Optional[str] = None,
     event: str = "chunk",
@@ -755,6 +769,7 @@ async def publish_project_phase_chunk(
     payload = _build_project_phase_event(
         event=event,
         phase=phase,
+        subphase=subphase,
         session_id=session_id,
         request_name=request_name,
         content=content,
@@ -1032,6 +1047,7 @@ async def perform_session_cleanup() -> None:
                     age_seconds = timeout_seconds + 1
                 is_final = status in {
                     GenerationStatus.COMPLETED,
+                    GenerationStatus.REJECTED,
                     GenerationStatus.FAILED,
                     GenerationStatus.CANCELLED
                 }
@@ -1087,7 +1103,7 @@ async def get_project_status(project_id: str) -> dict:
     Returns a JSON-serializable dict with the structure:
     {
         "project_id": str,
-        "status": "idle" | "running" | "completed" | "failed" | "cancelled",
+        "status": "idle" | "running" | "completed" | "rejected" | "failed" | "cancelled",
         "sessions": [...],
         "summary": { "total_sessions": int, "active_sessions": int, "completed_sessions": int }
     }
@@ -1227,6 +1243,8 @@ async def get_project_status(project_id: str) -> dict:
         project_status = "cancelled"
     elif last_status == "completed":
         project_status = "completed"
+    elif last_status == "rejected":
+        project_status = "rejected"
     elif last_status in ("failed", "error"):
         project_status = "failed"
     else:

@@ -88,7 +88,8 @@ def sample_model_specs():
         "default_models": {
             "generator": "gpt-4o",
             "qa": ["gpt-4o"],
-            "gran_sabio": "claude-sonnet-4-20250514"
+            "gran_sabio": "claude-sonnet-4-20250514",
+            "arbiter": "gpt-4o",
         }
     }
 

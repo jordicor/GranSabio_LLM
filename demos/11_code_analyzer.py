@@ -101,7 +101,10 @@ def process_data(items):
 class UserManager:
     def __init__(self):
         self.users = {}
-        self.password = "admin123"  # Hardcoded credential
+        # INTENTIONAL demo anti-pattern: hardcoded credential. This demo feeds
+        # the block below to Gran Sabio so the model flags vulnerabilities —
+        # the literal is realistic on purpose. Do NOT copy this into real code.
+        self.password = "admin123"  # noqa: S105
 
     def add_user(self, name, email):
         # Missing input validation
@@ -376,8 +379,8 @@ async def demo_code_analyzer():
     parser.add_argument("--file", help="Path to code file to analyze")
     parser.add_argument("--clean", action="store_true",
                         help="Use clean code sample (shows handling of no issues)")
-    parser.add_argument("--model", default="gpt-5.2",
-                        help="Generator model (default: gpt-5.2)")
+    parser.add_argument("--model", default="gpt-5.4",
+                        help="Generator model (default: gpt-5.4)")
 
     args, _ = parser.parse_known_args()
 
@@ -423,7 +426,7 @@ async def demo_code_analyzer():
         print(f"Lines: {len(code_to_analyze.splitlines())}")
         print(f"Generator: {args.model}")
         print(f"QA Models: grok-4-1-fast-non-reasoning, gemini-3-flash-preview")
-        print(f"Gran Sabio: claude-opus-4-6")
+        print(f"Gran Sabio: claude-opus-4-7")
         print("-" * 60)
 
         # Show code preview
@@ -482,7 +485,7 @@ async def demo_code_analyzer():
             max_iterations=3,
 
             # Gran Sabio for escalation
-            gran_sabio_model="claude-opus-4-6",
+            gran_sabio_model="claude-opus-4-7",
 
             # Metadata
             verbose=True,

@@ -21,7 +21,7 @@ async def list_active_connections():
             "projects": [
                 {
                     "project_id": str,
-                    "status": str,  # idle, running, completed, failed, cancelled
+                    "status": str,  # idle, running, completed, rejected, failed, cancelled
                     "session_count": int,
                     "active_sessions": int,
                     "last_activity": str (ISO timestamp)
@@ -72,9 +72,11 @@ async def list_active_connections():
                     proj["status"] = "running"
                 elif status_str == "completed" and proj["status"] != "running":
                     proj["status"] = "completed"
-                elif status_str in ("failed", "error") and proj["status"] not in ("running", "completed"):
+                elif status_str == "rejected" and proj["status"] not in ("running", "completed"):
+                    proj["status"] = "rejected"
+                elif status_str in ("failed", "error") and proj["status"] not in ("running", "completed", "rejected"):
                     proj["status"] = "failed"
-                elif status_str == "cancelled" and proj["status"] not in ("running", "completed", "failed"):
+                elif status_str == "cancelled" and proj["status"] not in ("running", "completed", "rejected", "failed"):
                     proj["status"] = "cancelled"
 
                 # Track last activity

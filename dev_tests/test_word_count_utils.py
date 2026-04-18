@@ -700,6 +700,19 @@ class TestBuildWordCountInstructions:
         assert "1000" in result
         assert "CRITICAL" in result
 
+    def test_long_form_limits_add_completion_guidance(self):
+        """Given: A long-form target, Then: Adds anti-summary guidance."""
+        request = Mock()
+        request.min_words = 4200
+        request.max_words = 4800
+
+        result = build_word_count_instructions(request)
+
+        assert "synopsis" in result
+        assert "substantial" in result
+        assert "Resolve the narrative inside the requested range" in result
+        assert "AIM for approximately 4500 words" in result
+
     def test_min_only_returns_minimum_instruction(self):
         """Given: Only min_words, Then: Returns minimum instruction"""
         request = Mock()

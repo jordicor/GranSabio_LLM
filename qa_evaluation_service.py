@@ -18,8 +18,11 @@ if TYPE_CHECKING:
     from models import ImageData
 
 from ai_service import AIRequestError, StreamChunk
-from config import config
+from config import EDITABLE_CONTENT_TYPES, config
+from model_aliasing import ModelAliasRegistry, PromptPart
 from models import QAEvaluation
+from qa_response_schemas import QA_SCHEMA_EDITABLE, QA_SCHEMA_SIMPLE
+from tools.ai_json_cleanroom import extract_json_payload
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 class MissingScoreTagError(ValueError):
     """Raised when a QA response does not include the required [SCORE] tag."""
+
+
+class QAResponseParseError(ValueError):
+    """Raised when a QA model response cannot be parsed as QA JSON."""
 
 
 class QAEvaluationService:
@@ -69,8 +76,10 @@ class QAEvaluationService:
         marker_mode: str = "phrase",
         marker_length: Optional[int] = None,
         word_map_formatted: Optional[str] = None,
+        draft_map_formatted: Optional[str] = None,
         input_images: Optional[List["ImageData"]] = None,
         edit_history: Optional[str] = None,
+        model_alias_registry: Optional[ModelAliasRegistry] = None,
     ) -> QAEvaluation:
         """
         Evaluate content quality using specified AI model
@@ -98,18 +107,21 @@ class QAEvaluationService:
         # Determine appropriate QA system prompt based on content type and request_edit_info
         content_type = getattr(original_request, 'content_type', 'biography') if original_request else 'biography'
 
-        # Editable content types that benefit from smart edit
-        editable_content_types = ["biography", "article", "script", "story", "essay", "blog", "novel"]
-
         # Decide whether to request edit information
         # Smart-edit works in two modes:
+        # - ids mode: requires draft_map_formatted
         # - phrase mode: requires marker_length (n-gram length for unique identification)
         # - word_index mode: requires word_map_formatted (fallback for repetitive content)
         should_request_edits = (
             request_edit_info
-            and content_type in editable_content_types
-            and (marker_length is not None or (marker_mode == "word_index" and word_map_formatted))
+            and content_type in EDITABLE_CONTENT_TYPES
+            and (
+                (marker_mode == "ids" and draft_map_formatted)
+                or (marker_mode == "word_index" and word_map_formatted)
+                or (marker_mode != "ids" and marker_mode != "word_index" and marker_length is not None)
+            )
         )
+        qa_response_schema = QA_SCHEMA_EDITABLE if should_request_edits else QA_SCHEMA_SIMPLE
 
         if should_request_edits:
             qa_system_prompt = config.QA_SYSTEM_PROMPT  # Full prompt with editable fields
@@ -240,10 +252,12 @@ The criteria below only describe WHAT to review and HOW to score. Ignore any ins
             marker_mode=marker_mode,
             phrase_length=marker_length,
             word_map_formatted=word_map_formatted,
+            draft_map_formatted=draft_map_formatted,
             feedback_format_example=feedback_format_example,
             include_edit_info=should_request_edits,
             edit_history=edit_history,
             min_score=min_score,
+            structured_output=should_request_edits,
         )
 
         if output_requirements:
@@ -314,9 +328,13 @@ IMPORTANT:
 
         # Use provided temperature or default to 0.3 for consistent evaluation
         eval_temperature = temperature if temperature is not None else 0.3
+        streamed_response_started = False
 
-        try:
-            # Use streaming for real-time QA response chunks
+        async def _generate_qa_response(json_schema: Optional[Dict[str, Any]]) -> str:
+            """Call the configured QA model once and return its final text."""
+            nonlocal streamed_response_started
+            streamed_response_started = False
+
             if stream_callback:
                 response_chunks = []
                 async for chunk in self.ai_service.generate_content_stream(
@@ -332,6 +350,16 @@ IMPORTANT:
                     usage_callback=usage_callback,
                     phase_logger=phase_logger,
                     images=input_images,
+                    json_output=True,
+                    json_schema=json_schema,
+                    model_alias_registry=model_alias_registry,
+                    prompt_safety_parts=[
+                        PromptPart(
+                            text=edit_history or "",
+                            source="system_generated",
+                            label="qa.edit_history",
+                        )
+                    ] if edit_history else None,
                 ):
                     # Handle StreamChunk (Claude with thinking) vs plain string
                     if isinstance(chunk, StreamChunk):
@@ -344,27 +372,56 @@ IMPORTANT:
                     # Only accumulate non-thinking content for final response
                     if not is_thinking:
                         response_chunks.append(chunk_text)
+                        if chunk_text:
+                            streamed_response_started = True
                     # Send all chunks (including thinking) to callback for real-time display
                     await stream_callback(chunk_text, model, layer_name)
 
-                # Combine all chunks for parsing
-                response = "".join(response_chunks)
-            else:
-                # Non-streaming: call generate_content directly
-                response = await self.ai_service.generate_content(
-                    prompt=evaluation_prompt,
-                    model=model,
-                    temperature=eval_temperature,
-                    max_tokens=max_tokens,
-                    system_prompt=qa_system_prompt,
-                    extra_verbose=extra_verbose,
-                    content_type=content_type,
-                    reasoning_effort=reasoning_effort,
-                    thinking_budget_tokens=thinking_budget_tokens,
-                    usage_callback=usage_callback,
-                    phase_logger=phase_logger,
-                    images=input_images,
-                )
+                return "".join(response_chunks)
+
+            return await self.ai_service.generate_content(
+                prompt=evaluation_prompt,
+                model=model,
+                temperature=eval_temperature,
+                max_tokens=max_tokens,
+                system_prompt=qa_system_prompt,
+                extra_verbose=extra_verbose,
+                content_type=content_type,
+                reasoning_effort=reasoning_effort,
+                thinking_budget_tokens=thinking_budget_tokens,
+                usage_callback=usage_callback,
+                phase_logger=phase_logger,
+                images=input_images,
+                json_output=True,
+                json_schema=json_schema,
+                model_alias_registry=model_alias_registry,
+                prompt_safety_parts=[
+                    PromptPart(
+                        text=edit_history or "",
+                        source="system_generated",
+                        label="qa.edit_history",
+                    )
+                ] if edit_history else None,
+            )
+
+        try:
+            try:
+                response = await _generate_qa_response(qa_response_schema)
+            except Exception as exc:
+                if (
+                    not streamed_response_started
+                    and self._is_structured_output_schema_error(exc)
+                ):
+                    logger.warning(
+                        "QA structured-output schema rejected for %s@%s; "
+                        "retrying once with JSON mode and no schema: %s",
+                        model,
+                        layer_name,
+                        exc,
+                    )
+                    response = await _generate_qa_response(None)
+                else:
+                    raise
 
             # Log full QA response if extra_verbose is enabled
             if phase_logger:
@@ -414,31 +471,14 @@ IMPORTANT:
 
         except asyncio.TimeoutError:
             logger.error(f"QA evaluation timeout for {model} on layer {layer_name}")
-            return QAEvaluation(
-                model=model,
-                layer=layer_name,
-                score=0.0,
-                feedback=f"Timeout during evaluation with {model}",
-                deal_breaker=True,
-                deal_breaker_reason="Timeout during evaluation",
-                passes_score=False,
-                reason="Timeout during evaluation"  # Backward compatibility
-            )
+            raise
         except AIRequestError:
+            raise
+        except QAResponseParseError:
             raise
         except Exception as e:
             logger.error(f"Content evaluation failed for {model}: {str(e)}")
-            # Return a default low score on error
-            return QAEvaluation(
-                model=model,
-                layer=layer_name,
-                score=0.0,
-                feedback=f"Error during evaluation: {str(e)}",
-                deal_breaker=True,
-                deal_breaker_reason="Technical error during evaluation",
-                passes_score=False,
-                reason="Technical error during evaluation"  # Backward compatibility
-            )
+            raise
 
     async def evaluate_content_extended(
         self,
@@ -497,6 +537,35 @@ IMPORTANT:
         # No additional processing needed
         return result
 
+    @staticmethod
+    def _is_structured_output_schema_error(exc: Exception) -> bool:
+        """Return True for provider/local errors caused by schema incompatibility."""
+        messages = [str(exc)]
+        cause = getattr(exc, "cause", None)
+        if cause is not None:
+            messages.append(str(cause))
+        if exc.__cause__ is not None:
+            messages.append(str(exc.__cause__))
+
+        text = " ".join(messages).lower()
+        return any(
+            marker in text
+            for marker in (
+                "schema validation error",
+                "json_schema",
+                "response_schema",
+                "response format",
+                "response_format",
+                "structured output",
+                "structured-output",
+                "schema must have",
+                "additionalproperties",
+                "additional_properties",
+                "unsupported schema",
+                "invalid schema",
+            )
+        )
+
     def _parse_qa_json_response(self, response: str, model: str, layer_name: str) -> Dict[str, Any]:
         """
         Parse JSON response from QA evaluation.
@@ -505,37 +574,98 @@ IMPORTANT:
             Dict with keys: score, feedback, deal_breaker, deal_breaker_reason,
                            editable, edit_strategy, edit_groups
         """
-        import json_utils as json
-        import re
-
-        # Clean response (sometimes models add markdown)
-        cleaned = response.strip()
-
-        # Remove markdown code blocks if present
-        if cleaned.startswith('```'):
-            # Extract JSON from ```json ... ``` or ``` ... ```
-            match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', cleaned, re.DOTALL)
-            if match:
-                cleaned = match.group(1).strip()
-
         try:
-            data = json.loads(cleaned)
+            payload, extraction_info = extract_json_payload(response)
+            source = extraction_info.get("source") if extraction_info else None
+            if payload is None:
+                logger.error(
+                    "No JSON payload found in QA response for %s@%s. "
+                    "Response preview: %r. Extraction info: %s",
+                    model,
+                    layer_name,
+                    response[:500] if isinstance(response, str) else response,
+                    extraction_info,
+                )
+                raise QAResponseParseError(
+                    f"No JSON payload found in QA response from {model}@{layer_name}"
+                )
+
+            if source and source != "raw":
+                logger.warning(
+                    "QA response from %s@%s required JSON recovery (source=%s). "
+                    "Model should return pure JSON via Structured Outputs.",
+                    model,
+                    layer_name,
+                    source,
+                )
+
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                logger.error(
+                    "Failed to json.loads() extracted payload for %s@%s: %s. "
+                    "Payload preview: %r",
+                    model,
+                    layer_name,
+                    exc,
+                    payload[:500],
+                )
+                raise QAResponseParseError(
+                    f"Invalid JSON payload from {model}@{layer_name}: {exc}"
+                ) from exc
+
+            if not isinstance(data, dict):
+                raise QAResponseParseError(
+                    f"QA response from {model}@{layer_name} parsed to "
+                    f"{type(data).__name__}, expected dict"
+                )
 
             # Validate required fields
             if 'score' not in data:
-                raise ValueError("Missing required field: score")
+                raise QAResponseParseError(
+                    f"Missing required field 'score' in QA response from {model}@{layer_name}"
+                )
             if 'feedback' not in data:
-                raise ValueError("Missing required field: feedback")
+                raise QAResponseParseError(
+                    f"Missing required field 'feedback' in QA response from {model}@{layer_name}"
+                )
+
+            try:
+                score = float(data['score'])
+            except (TypeError, ValueError) as exc:
+                raise QAResponseParseError(
+                    f"Field 'score' from {model}@{layer_name} is not numeric: {data['score']!r}"
+                ) from exc
+
+            edit_groups = data.get('edit_groups', [])
+            if not isinstance(edit_groups, list):
+                logger.warning(
+                    "QA response from %s@%s returned non-list edit_groups (%s); ignoring.",
+                    model,
+                    layer_name,
+                    type(edit_groups).__name__,
+                )
+                edit_groups = []
+
+            edit_strategy = data.get('edit_strategy')
+            if edit_strategy not in (None, "incremental", "regenerate"):
+                logger.warning(
+                    "QA response from %s@%s returned unknown edit_strategy=%r; normalizing to null.",
+                    model,
+                    layer_name,
+                    edit_strategy,
+                )
+                edit_strategy = None
 
             # Normalize fields
             result = {
-                'score': float(data['score']),
+                'score': score,
                 'feedback': str(data['feedback']),
                 'deal_breaker': bool(data.get('deal_breaker', False)),
                 'deal_breaker_reason': data.get('deal_breaker_reason'),
                 'editable': data.get('editable'),
-                'edit_strategy': data.get('edit_strategy'),
-                'edit_groups': data.get('edit_groups', [])
+                'edit_strategy': edit_strategy,
+                'edit_groups': edit_groups
             }
 
             # Validate score range
@@ -543,13 +673,20 @@ IMPORTANT:
 
             return result
 
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parsing failed for {model}@{layer_name}: {str(e)}")
-            logger.error(f"Response preview: {cleaned[:500]}")
-            raise ValueError(f"Invalid JSON response: {str(e)}")
-        except Exception as e:
-            logger.error(f"QA response parsing failed for {model}@{layer_name}: {str(e)}")
+        except QAResponseParseError:
             raise
+        except Exception as e:
+            logger.error(
+                "Unexpected error parsing QA response for %s@%s: %s. Response preview: %r",
+                model,
+                layer_name,
+                e,
+                response[:500] if isinstance(response, str) else response,
+                exc_info=True,
+            )
+            raise QAResponseParseError(
+                f"Unexpected parse error from {model}@{layer_name}: {e}"
+            ) from e
 
     def _parse_edit_groups_to_ranges(
         self,
@@ -575,8 +712,8 @@ IMPORTANT:
         Returns:
             List of TextEditRange objects, or None if no valid groups or marker_length missing
         """
-        # Fail fast: cannot safely parse edit groups without marker_length
-        if marker_length is None:
+        # Fail fast for phrase mode: cannot safely parse edit groups without marker_length
+        if marker_mode == "phrase" and marker_length is None:
             if edit_groups:
                 logger.warning(
                     "Ignoring edit_groups: marker_length not provided. "

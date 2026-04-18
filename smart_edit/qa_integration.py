@@ -51,6 +51,61 @@ logger = logging.getLogger(__name__)
 # PROMPT TEMPLATES FOR QA EDIT FORMAT
 # =============================================================================
 
+# Template for ID mode (uses paragraph/sentence IDs from draft_map)
+QA_EDIT_FORMAT_ID_MODE = '''
+{draft_map_formatted}
+
+RESPONSE FORMAT - RETURN VALID JSON ONLY:
+{{
+  "score": <float 0.0-10.0>,
+  "feedback": "{feedback_format_example}",
+  "deal_breaker": <boolean>,
+  "deal_breaker_reason": <string or null>,
+  "editable": <boolean>,
+  "edit_strategy": <"incremental"|"regenerate"|null>,
+  "edit_groups": [
+    {{
+      "target_ids": ["<p2>" or "<p2s1>", "<p2s2>"],
+      "evidence_quote": "<short verbatim quote copied from the same target IDs>",
+      "operation_type": "<delete|replace|rephrase|add_before|add_after>",
+      "instruction": "<what to fix>",
+      "severity": "<minor|major|critical>",
+      "exact_fragment": "<VERBATIM copy of text to delete/replace, min {phrase_length} words>",
+      "suggested_text": "<replacement text for replace ops, ignored for delete>"
+    }}
+  ]
+}}
+
+RULES FOR TARGET IDS:
+- Use ONLY IDs that appear in DRAFT_MAP above
+- Each edit group must target exactly ONE paragraph (`pN`) OR one contiguous sentence block inside the SAME paragraph (`pNs1`, `pNs2`, ...)
+- Do NOT mix sentence IDs from different paragraphs in one edit group
+- Prefer sentence IDs for local issues and paragraph IDs only when the full paragraph needs rewriting
+- evidence_quote MUST come from the same target_ids and should be copied verbatim from the draft
+
+OPERATION TYPES:
+- "delete": Remove the exact_fragment entirely (no AI needed if exact_fragment provided)
+- "replace": Replace exact_fragment with suggested_text (no AI needed if both provided)
+- "rephrase": AI rewrites the targeted text maintaining meaning
+- "add_before": AI adds content before the fragment
+- "add_after": AI adds content after the fragment
+
+DIRECT OPERATIONS (delete/replace) - CRITICAL:
+- exact_fragment MUST be a VERBATIM copy from the content
+- exact_fragment MUST have AT LEAST {phrase_length} words to guarantee uniqueness
+- For delete: only exact_fragment is required
+- For replace: both exact_fragment AND suggested_text are required
+
+DEAL-BREAKER vs EDITS (CRITICAL):
+- If deal_breaker=true: set editable=false, edit_strategy=null, edit_groups=[]
+- Deal-breakers require FULL REGENERATION - edit fields become irrelevant
+- If a problem CAN be fixed with specific paragraph/sentence edits, it is NOT a deal-breaker
+
+PASSING SCORE BEHAVIOR (score >= {min_score}):
+- When score >= {min_score}: feedback="Passed", editable=false, edit_strategy=null, edit_groups=[]
+- When content passes, edit fields are not processed
+'''
+
 # Template for phrase mode (uses paragraph_start/paragraph_end text markers)
 QA_EDIT_FORMAT_PHRASE_MODE = '''
 RESPONSE FORMAT - RETURN VALID JSON ONLY:
@@ -144,6 +199,80 @@ WHY THIS MATTERS:
 - Clear pass/fail signaling helps the pipeline make efficient decisions
 
 Note: Output format compliance is tracked to optimize model selection for future evaluations.
+
+GENERAL RULES:
+- Set editable=true only for narrative text that can be fixed with specific edits
+- Set editable=false for code, formulas, structural issues, or when deal_breaker=true
+- Use edit_strategy="incremental" when specific paragraph-level fixes are possible
+- Use edit_strategy="regenerate" when problems are widespread (but NOT a deal-breaker)
+- Provide edit_groups only when edit_strategy="incremental"
+- Each edit group should target one paragraph with clear fix instructions
+- For direct operations: delete needs exact_fragment; replace needs both exact_fragment and suggested_text
+'''
+
+# Structured-output schemas cannot portably express arbitrary counted keys
+# ("1", "2", ..., N) with additionalProperties=false. This variant asks for
+# plain marker strings; extract_phrase_from_response() already supports that
+# format and truncates to the expected marker length.
+QA_EDIT_FORMAT_PHRASE_MODE_STRUCTURED = '''
+RESPONSE FORMAT - RETURN VALID JSON ONLY:
+{{
+  "score": <float 0.0-10.0>,
+  "feedback": "{feedback_format_example}",
+  "deal_breaker": <boolean>,
+  "deal_breaker_reason": <string or null>,
+  "editable": <boolean>,
+  "edit_strategy": <"incremental"|"regenerate"|null>,
+  "edit_groups": [
+    {{
+      "paragraph_start": "<plain {phrase_length}+ word marker copied from the paragraph start>",
+      "paragraph_end": "<plain {phrase_length}+ word marker copied from the paragraph end>",
+      "operation_type": "<delete|replace|rephrase|add_before|add_after>",
+      "instruction": "<what to fix>",
+      "severity": "<minor|major|critical>",
+      "exact_fragment": "<VERBATIM copy of text to delete/replace, min {phrase_length} words>",
+      "suggested_text": "<replacement text for replace ops, ignored for delete>",
+      "target_ids": null,
+      "target_id": null,
+      "evidence_quote": null,
+      "start_word_index": null,
+      "end_word_index": null
+    }}
+  ]
+}}
+
+PHRASE MARKER RULES:
+- paragraph_start and paragraph_end MUST be strings, not objects.
+- Each marker must contain AT LEAST {phrase_length} whitespace-separated words.
+- Copy marker text character-for-character from the evaluated content.
+- Extra marker words are allowed; the parser truncates to {phrase_length} words.
+- Use null for fields that do not apply to phrase mode.
+
+OPERATION TYPES:
+- "delete": Remove the exact_fragment entirely (no AI needed if exact_fragment provided)
+- "replace": Replace exact_fragment with suggested_text (no AI needed if both provided)
+- "rephrase": AI rewrites the paragraph maintaining meaning
+- "add_before": AI adds content before the fragment
+- "add_after": AI adds content after the fragment
+
+DIRECT OPERATIONS (delete/replace) - CRITICAL:
+exact_fragment and suggested_text perform LITERAL find-and-replace operations:
+- exact_fragment MUST be a VERBATIM copy from the content (character-for-character)
+- exact_fragment MUST have AT LEAST {phrase_length} words to guarantee uniqueness
+- Always COPY exact_fragment directly from the content, never paraphrase or summarize
+- For delete: only exact_fragment is required (suggested_text is ignored)
+- For replace: both exact_fragment AND suggested_text are required
+
+DEAL-BREAKER vs EDITS (CRITICAL):
+- If deal_breaker=true: set editable=false, edit_strategy=null, edit_groups=[]
+- Deal-breakers require FULL REGENERATION - edit fields become irrelevant
+- If a problem CAN be fixed with specific paragraph edits, it is NOT a deal-breaker
+
+PASSING SCORE BEHAVIOR (score >= {min_score}):
+- When score >= {min_score}: feedback="Passed", editable=false, edit_strategy=null, edit_groups=[]
+- "Passed" must be the exact string value (not a boolean, not a sentence)
+- When content passes, edit fields are not processed
+- Only provide detailed feedback and edit_groups when score < {min_score}
 
 GENERAL RULES:
 - Set editable=true only for narrative text that can be fixed with specific edits
@@ -256,10 +385,12 @@ def build_qa_edit_prompt(
     marker_mode: str = "phrase",
     phrase_length: int = 5,
     word_map_formatted: Optional[str] = None,
+    draft_map_formatted: Optional[str] = None,
     feedback_format_example: str = "Your detailed feedback here",
     include_edit_info: bool = True,
     edit_history: Optional[str] = None,
     min_score: Optional[float] = None,
+    structured_output: bool = False,
 ) -> str:
     """
     Build the JSON format section for QA evaluation prompts.
@@ -269,9 +400,10 @@ def build_qa_edit_prompt(
     for smart editing.
 
     Args:
-        marker_mode: How paragraphs are identified ("phrase" or "word_index")
+        marker_mode: How paragraphs are identified ("ids", "phrase", or "word_index")
         phrase_length: Number of words for phrase markers (default 5)
         word_map_formatted: Pre-formatted word map string (required for word_index mode)
+        draft_map_formatted: Pre-formatted paragraph/sentence ID map (required for ids mode)
         feedback_format_example: Example text for feedback field
         include_edit_info: Whether to include edit_groups in format
         edit_history: Optional formatted edit history from previous rounds in this layer.
@@ -279,6 +411,8 @@ def build_qa_edit_prompt(
                      Informs QA about what edits were already applied/discarded.
         min_score: Minimum passing score for this layer. Used to inform the AI
                   when to use concise "Passed" response vs detailed feedback.
+        structured_output: If True, phrase mode uses plain string markers so the
+                           prompt matches the strict provider JSON schema.
 
     Returns:
         Formatted prompt string for QA response format
@@ -293,6 +427,7 @@ def build_qa_edit_prompt(
     """
     # Default min_score if not provided
     effective_min_score = min_score if min_score is not None else 8.0
+    effective_phrase_length = phrase_length or 5
 
     if not include_edit_info:
         return QA_SIMPLE_FORMAT.format(
@@ -300,15 +435,28 @@ def build_qa_edit_prompt(
         )
 
     # Build the base format string
-    if marker_mode == "word_index" and word_map_formatted:
+    if marker_mode == "ids" and draft_map_formatted:
+        base_format = QA_EDIT_FORMAT_ID_MODE.format(
+            draft_map_formatted=draft_map_formatted,
+            phrase_length=effective_phrase_length,
+            feedback_format_example=feedback_format_example,
+            min_score=effective_min_score,
+        )
+    elif marker_mode == "word_index" and word_map_formatted:
         base_format = QA_EDIT_FORMAT_WORD_INDEX_MODE.format(
             word_map_formatted=word_map_formatted,
+            phrase_length=effective_phrase_length,
             feedback_format_example=feedback_format_example,
             min_score=effective_min_score,
         )
     else:
-        base_format = QA_EDIT_FORMAT_PHRASE_MODE.format(
-            phrase_length=phrase_length,
+        phrase_template = (
+            QA_EDIT_FORMAT_PHRASE_MODE_STRUCTURED
+            if structured_output
+            else QA_EDIT_FORMAT_PHRASE_MODE
+        )
+        base_format = phrase_template.format(
+            phrase_length=effective_phrase_length,
             feedback_format_example=feedback_format_example,
             min_score=effective_min_score,
         )
@@ -394,21 +542,22 @@ def _can_use_direct_operation(
 def parse_qa_edit_groups(
     edit_groups: List[Dict[str, Any]],
     marker_mode: str = "phrase",
-    marker_length: int = 5,
+    marker_length: Optional[int] = 5,
     model_name: Optional[str] = None,
 ) -> Optional[List[TextEditRange]]:
     """
     Convert edit_groups from QA AI response to TextEditRange objects.
 
-    Handles both phrase mode (paragraph_start/end) and word_index mode
-    (start_word_index/end_word_index) based on the marker_mode parameter.
+    Handles ids mode (target_ids), phrase mode (paragraph_start/end), and
+    word_index mode (start_word_index/end_word_index) based on the
+    marker_mode parameter.
 
     Phrase mode uses counted format: {"1": "word1", "2": "word2", ...}
     Position as key forces AIs to count first, and allows duplicate words.
 
     Args:
         edit_groups: List of edit group dicts from AI response
-        marker_mode: "phrase" or "word_index"
+        marker_mode: "ids", "phrase", or "word_index"
         marker_length: Number of words in phrase markers (for phrase mode)
         model_name: Name of the model that produced these edit groups (for logging)
 
@@ -446,11 +595,19 @@ def parse_qa_edit_groups(
                 else SeverityLevel.MINOR
             )
 
-            # Parse operation_type (default to 'replace' for backward compat)
-            raw_op_type = group.get('operation_type', 'replace')
+            # Parse operation_type. Unknown operations are skipped instead of
+            # silently defaulting to REPLACE, which could mutate the wrong text.
+            raw_op_type = group.get('operation_type')
             if raw_op_type:
                 raw_op_type = str(raw_op_type).lower().strip()
-            operation_type = OPERATION_TYPE_MAP.get(raw_op_type, OperationType.REPLACE)
+            operation_type = OPERATION_TYPE_MAP.get(raw_op_type)
+            if operation_type is None:
+                logger.warning(
+                    "Skipping edit group with unsupported operation_type=%r: %s",
+                    raw_op_type,
+                    group,
+                )
+                continue
 
             # Get exact_fragment and suggested_text
             exact_fragment = group.get('exact_fragment', '')
@@ -462,12 +619,53 @@ def parse_qa_edit_groups(
             )
 
             # Build TextEditRange based on marker mode
-            if marker_mode == "word_index":
-                # Word index mode - use start_word_index and end_word_index
-                start_idx = group.get('start_word_index')
-                end_idx = group.get('end_word_index')
+            raw_target_ids = group.get('target_ids')
+            if raw_target_ids is None and group.get('target_id'):
+                raw_target_ids = [group.get('target_id')]
 
-                # Validate indices are present
+            if marker_mode == "ids" and raw_target_ids:
+                if isinstance(raw_target_ids, str):
+                    target_ids = [raw_target_ids.strip()] if raw_target_ids.strip() else []
+                elif isinstance(raw_target_ids, list):
+                    target_ids = [
+                        str(item).strip()
+                        for item in raw_target_ids
+                        if str(item).strip()
+                    ]
+                else:
+                    logger.warning(
+                        f"ID mode but invalid target_ids type: {type(raw_target_ids).__name__}"
+                    )
+                    continue
+
+                if not target_ids:
+                    logger.warning(f"ID mode but empty target_ids in edit group: {group}")
+                    continue
+
+                ranges.append(TextEditRange(
+                    marker_mode="ids",
+                    target_ids=target_ids,
+                    evidence_quote=group.get('evidence_quote', '') or "",
+                    paragraph_start="",
+                    paragraph_end="",
+                    exact_fragment=exact_fragment or "",
+                    edit_type=operation_type,
+                    new_content=suggested_text,
+                    edit_instruction=group.get('instruction', ''),
+                    issue_severity=severity,
+                    issue_description=group.get('instruction', ''),
+                    is_unique=True,
+                    confidence=1.0,
+                    can_use_direct=can_use_direct,
+                ))
+                continue
+
+            start_idx = group.get('start_word_index')
+            end_idx = group.get('end_word_index')
+            if marker_mode == "word_index" or (
+                marker_mode == "ids" and start_idx is not None and end_idx is not None
+            ):
+                # Word index mode - use start_word_index and end_word_index
                 if start_idx is None or end_idx is None:
                     logger.warning(
                         f"Word index mode but missing indices in edit group: {group}"
@@ -491,6 +689,12 @@ def parse_qa_edit_groups(
                     can_use_direct=can_use_direct,
                 ))
             else:
+                if marker_length is None:
+                    logger.warning(
+                        "Phrase parsing requested but marker_length is missing; skipping edit group."
+                    )
+                    continue
+
                 # Phrase mode - uses counted format {"word": position}
                 raw_start = group.get('paragraph_start', '')
                 raw_end = group.get('paragraph_end', '')
@@ -546,20 +750,20 @@ def parse_qa_edit_groups(
     return ranges if ranges else None
 
 
-def get_operation_type(raw_type: str) -> OperationType:
+def get_operation_type(raw_type: str) -> Optional[OperationType]:
     """
-    Convert a string operation type to OperationType enum.
+    Convert a supported operation type string to OperationType enum.
 
     Args:
         raw_type: String operation type (e.g., "delete", "replace", "rephrase")
 
     Returns:
-        Corresponding OperationType enum value
+        Corresponding OperationType enum value, or None if unsupported
 
     Example:
         >>> get_operation_type("delete")
         <OperationType.DELETE: 'delete'>
     """
     if raw_type:
-        raw_type = raw_type.lower().strip()
-    return OPERATION_TYPE_MAP.get(raw_type, OperationType.REPLACE)
+        raw_type = str(raw_type).lower().strip()
+    return OPERATION_TYPE_MAP.get(raw_type)

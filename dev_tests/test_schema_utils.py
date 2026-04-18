@@ -8,6 +8,7 @@ Converts JSON Schema dicts to Pydantic models for structured outputs.
 import pytest
 from pydantic import ValidationError
 
+from qa_response_schemas import QA_SCHEMA_EDITABLE
 from schema_utils import json_schema_to_pydantic
 
 
@@ -215,6 +216,31 @@ class TestJsonSchemaToPydanticEnums:
         Model = json_schema_to_pydantic(schema)
         instance = Model(status="active")
         assert instance.status == "active"
+
+    def test_nullable_enum_emits_typed_anyof_for_anthropic(self):
+        """
+        Given: The editable QA schema with nullable enum fields
+        When: json_schema_to_pydantic() is converted back to JSON schema
+        Then: Nullable enums are emitted as typed anyOf branches, not bare enum+null
+        """
+        Model = json_schema_to_pydantic(QA_SCHEMA_EDITABLE)
+        model_schema = Model.model_json_schema()
+
+        edit_strategy = model_schema["properties"]["edit_strategy"]
+        assert "anyOf" in edit_strategy
+        assert {"type": "null"} in edit_strategy["anyOf"]
+        assert not (
+            "enum" in edit_strategy
+            and None in edit_strategy["enum"]
+            and "type" not in edit_strategy
+        )
+
+        edit_groups_def_name = next(
+            name for name in model_schema["$defs"] if name.endswith("EditGroupsItemModel")
+        )
+        operation_type = model_schema["$defs"][edit_groups_def_name]["properties"]["operation_type"]
+        assert "anyOf" in operation_type
+        assert {"type": "null"} in operation_type["anyOf"]
 
 
 class TestJsonSchemaToPydanticOptionals:

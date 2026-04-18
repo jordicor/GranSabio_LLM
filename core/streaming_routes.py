@@ -134,7 +134,7 @@ async def stream_content_direct(session_id: str):
                 last_content_length = len(current_content)
 
             status = snapshot["status"]
-            if status in [GenerationStatus.COMPLETED, GenerationStatus.FAILED, GenerationStatus.CANCELLED]:
+            if status in [GenerationStatus.COMPLETED, GenerationStatus.REJECTED, GenerationStatus.FAILED, GenerationStatus.CANCELLED]:
                 final_content = snapshot.get("last_generated_content", "")
                 if len(final_content) > last_content_length:
                     final_chunk = final_content[last_content_length:]
@@ -191,7 +191,7 @@ async def stream_generation_content(session_id: str):
                     last_content_length = len(current_content)
 
             status = snapshot["status"]
-            if status in [GenerationStatus.COMPLETED, GenerationStatus.FAILED, GenerationStatus.CANCELLED]:
+            if status in [GenerationStatus.COMPLETED, GenerationStatus.REJECTED, GenerationStatus.FAILED, GenerationStatus.CANCELLED]:
                 break
 
             # Send SSE heartbeat to keep connection alive
@@ -243,7 +243,7 @@ async def stream_qa_content(session_id: str):
                     last_content_length = len(current_content)
 
             status = snapshot["status"]
-            if status in [GenerationStatus.COMPLETED, GenerationStatus.FAILED, GenerationStatus.CANCELLED]:
+            if status in [GenerationStatus.COMPLETED, GenerationStatus.REJECTED, GenerationStatus.FAILED, GenerationStatus.CANCELLED]:
                 break
 
             # Send SSE heartbeat to keep connection alive
@@ -294,7 +294,7 @@ async def stream_preflight_content(session_id: str):
                 last_content_length = len(current_content)
 
             status = snapshot["status"]
-            if status in [GenerationStatus.COMPLETED, GenerationStatus.FAILED, GenerationStatus.CANCELLED]:
+            if status in [GenerationStatus.COMPLETED, GenerationStatus.REJECTED, GenerationStatus.FAILED, GenerationStatus.CANCELLED]:
                 break
 
             # Send SSE heartbeat to keep connection alive
@@ -346,7 +346,7 @@ async def stream_gran_sabio_content(session_id: str):
                     last_content_length = len(current_content)
 
             status = snapshot["status"]
-            if status in [GenerationStatus.COMPLETED, GenerationStatus.FAILED, GenerationStatus.CANCELLED]:
+            if status in [GenerationStatus.COMPLETED, GenerationStatus.REJECTED, GenerationStatus.FAILED, GenerationStatus.CANCELLED]:
                 break
 
             # Send SSE heartbeat to keep connection alive

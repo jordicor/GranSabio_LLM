@@ -1,0 +1,133 @@
+{
+  "test_time": "2026-01-18T22:30:49.038990",
+  "results": [
+    {
+      "model": "gpt-5.2",
+      "response_time": 34.567499,
+      "response_length": 8402,
+      "parsed": true,
+      "score": 4.8,
+      "has_edit_groups": true,
+      "edit_groups_count": 7,
+      "first_edit_group": {
+        "paragraph_start": {
+          "1": "Marie",
+          "2": "Curie",
+          "3": "was",
+          "4": "born",
+          "5": "Maria",
+          "6": "Sklodowska",
+          "7": "on",
+          "8": "November",
+          "9": "7,",
+          "10": "1867,"
+        },
+        "paragraph_end": {
+          "1": "dedicated",
+          "2": "to",
+          "3": "education",
+          "4": "and",
+          "5": "academic",
+          "6": "pursuits."
+        },
+        "operation_type": "rephrase",
+        "instruction": "Remove weak words (very/really), avoid repetition, and tighten the introduction while keeping the same facts.",
+        "severity": "major",
+        "exact_fragment": "Marie Curie was born Maria Sklodowska on November 7, 1867, in Warsaw, Poland. She was very much interested in learning from a very young age. Her family was really really dedicated to education and academic pursuits.",
+        "suggested_text": "Marie Curie was born Maria Sklodowska on November 7, 1867, in Warsaw, Poland. From an early age, she showed a strong interest in learning. Her family valued education and academic life."
+      },
+      "paragraph_start_type": "dict",
+      "paragraph_start_value": {
+        "1": "Marie",
+        "2": "Curie",
+        "3": "was",
+        "4": "born",
+        "5": "Maria",
+        "6": "Sklodowska",
+        "7": "on",
+        "8": "November",
+        "9": "7,",
+        "10": "1867,"
+      },
+      "raw_response_preview": "{\n  \"score\": 4.8,\n  \"feedback\": \"Style issues significantly reduce quality. (1) Weak/overused intensifiers appear throughout (\\\"very\\\", \\\"really\\\", \\\"absolutely\\\", \\\"amazing\\\", \\\"truly\\\"), including stacked repetition (\\\"really really\\\") that reads informal and imprecise. (2) Redundancy/tautology: \\\"very difficult and very challenging,\\\" \\\"hard work and dedication\\\" repeated, \\\"forever and ever,\\\" and \\\"has never been repeated... ever before or since\\\". (3) Cliches/generic phrasing: \\\"pursue her dreams,\\\" \\\"changed science forever,\\\" \\\"paid off,\\\" \\\"overcome any obstacle,\\\" \\\"legacy shows\\\". (4) Clarity/accuracy framing: several sentences overclaim or are awkwardly structured (e.g., \\\"inspiring to everyone who knew her personally\\\"; Nobel line overstates uniqueness). Recommend tightening sentences, removing intensifiers, and using specific, concrete phrasing.\",\n  \"deal_breaker\": false,\n  \"deal_breaker_reason\": null,\n  \"editable\": true,\n  \"edit_strategy\": \"incremental\",\n  \"edit_groups\": [\n    {\n      \"paragraph_start\": {\n        \"1\": \"Marie\",\n        \"2\": \"Curie\",\n        \"3\": \"was\",\n        \"4\": \"born\",\n        \"5\": \"Maria\",\n        \"6\": \"Sklodowska\",\n        \"7\": \"on\",\n        \"8\": \"November\",\n        \"9\": \"7,\",\n        \"10\": \"1867,\"\n      },\n      \"paragraph_end\": {\n        \"1\": \"dedicated\",\n        \"2\": \"to\",\n        \"3\": \"education\",\n        \"4\": \"and\",\n        \"5\": \"academic\",\n        \"6\": \"pursuits.\"\n      },\n      \"operation_type\": \"rephrase\",\n      \"instruction\": \"Rem"
+    },
+    {
+      "model": "gpt-4o",
+      "response_time": 33.308509,
+      "response_length": 3926,
+      "parsed": true,
+      "score": 5.0,
+      "has_edit_groups": true,
+      "edit_groups_count": 5,
+      "first_edit_group": {
+        "paragraph_start": {
+          "1": "Marie",
+          "2": "Curie",
+          "3": "was",
+          "4": "born",
+          "5": "Maria"
+        },
+        "paragraph_end": {
+          "1": "academic",
+          "2": "pursuits.",
+          "3": "",
+          "4": "",
+          "5": ""
+        },
+        "operation_type": "replace",
+        "instruction": "Remove weak words and redundancy.",
+        "severity": "major",
+        "exact_fragment": "She was very much interested in learning from a very young age. Her family was really really dedicated to education and academic pursuits.",
+        "suggested_text": "She was interested in learning from a young age. Her family was dedicated to education and academic pursuits."
+      },
+      "paragraph_start_type": "dict",
+      "paragraph_start_value": {
+        "1": "Marie",
+        "2": "Curie",
+        "3": "was",
+        "4": "born",
+        "5": "Maria"
+      },
+      "raw_response_preview": "```json\n{\n  \"score\": 5.0,\n  \"feedback\": \"The text contains multiple style issues including frequent use of weak words such as 'very', 'really', 'absolutely', and 'amazing'. There are several instances of redundancy and cliches, such as 'really really dedicated', 'absolutely amazing and inspiring', and 'changed science forever and ever'. The writing lacks clarity in some areas due to these issues.\",\n  \"deal_breaker\": false,\n  \"deal_breaker_reason\": null,\n  \"editable\": true,\n  \"edit_strategy\": \"incremental\",\n  \"edit_groups\": [\n    {\n      \"paragraph_start\": {\"1\": \"Marie\", \"2\": \"Curie\", \"3\": \"was\", \"4\": \"born\", \"5\": \"Maria\"},\n      \"paragraph_end\": {\"1\": \"academic\", \"2\": \"pursuits.\", \"3\": \"\", \"4\": \"\", \"5\": \"\"},\n      \"operation_type\": \"replace\",\n      \"instruction\": \"Remove weak words and redundancy.\",\n      \"severity\": \"major\",\n      \"exact_fragment\": \"She was very much interested in learning from a very young age. Her family was really really dedicated to education and academic pursuits.\",\n      \"suggested_text\": \"She was interested in learning from a young age. Her family was dedicated to education and academic pursuits.\"\n    },\n    {\n      \"paragraph_start\": {\"1\": \"Growing\", \"2\": \"up\", \"3\": \"under\", \"4\": \"Russian\", \"5\": \"occupation\"},\n      \"paragraph_end\": {\"1\": \"knew\", \"2\": \"her\", \"3\": \"personally.\", \"4\": \"\", \"5\": \"\"},\n      \"operation_type\": \"replace\",\n      \"instruction\": \"Remove weak words and cliches.\",\n      \"severity\": \"major\",\n      \"exact_fragment\": \"Growing up und"
+    },
+    {
+      "model": "claude-sonnet-4-20250514",
+      "response_time": 20.311304,
+      "response_length": 5133,
+      "parsed": true,
+      "score": 3.5,
+      "has_edit_groups": true,
+      "edit_groups_count": 7,
+      "first_edit_group": {
+        "paragraph_start": {
+          "1": "She",
+          "2": "was",
+          "3": "very",
+          "4": "much",
+          "5": "interested"
+        },
+        "paragraph_end": {
+          "1": "and",
+          "2": "academic",
+          "3": "pursuits.",
+          "4": "",
+          "5": ""
+        },
+        "operation_type": "replace",
+        "instruction": "Remove weak words and redundancy",
+        "severity": "major",
+        "exact_fragment": "She was very much interested in learning from a very young age. Her family was really really dedicated to education and academic pursuits.",
+        "suggested_text": "She showed a keen interest in learning from an early age. Her family was deeply committed to education and academic pursuits."
+      },
+      "paragraph_start_type": "dict",
+      "paragraph_start_value": {
+        "1": "She",
+        "2": "was",
+        "3": "very",
+        "4": "much",
+        "5": "interested"
+      },
+      "raw_response_preview": "```json\n{\n  \"score\": 3.5,\n  \"feedback\": \"The text contains numerous style issues including excessive use of weak words ('very', 'really', 'absolutely', 'amazing'), redundant phrases, and unclear sentence structures. Multiple instances of repetitive language and tautologies significantly impact readability.\",\n  \"deal_breaker\": false,\n  \"deal_breaker_reason\": null,\n  \"editable\": true,\n  \"edit_strategy\": \"incremental\",\n  \"edit_groups\": [\n    {\n      \"paragraph_start\": {\"1\": \"She\", \"2\": \"was\", \"3\": \"very\", \"4\": \"much\", \"5\": \"interested\"},\n      \"paragraph_end\": {\"1\": \"and\", \"2\": \"academic\", \"3\": \"pursuits.\", \"4\": \"\", \"5\": \"\"},\n      \"operation_type\": \"replace\",\n      \"instruction\": \"Remove weak words and redundancy\",\n      \"severity\": \"major\",\n      \"exact_fragment\": \"She was very much interested in learning from a very young age. Her family was really really dedicated to education and academic pursuits.\",\n      \"suggested_text\": \"She showed a keen interest in learning from an early age. Her family was deeply committed to education and academic pursuits.\"\n    },\n    {\n      \"paragraph_start\": {\"1\": \"Growing\", \"2\": \"up\", \"3\": \"under\", \"4\": \"Russian\", \"5\": \"occupation\"},\n      \"paragraph_end\": {\"1\": \"who\", \"2\": \"knew\", \"3\": \"her\", \"4\": \"personally.\", \"5\": \"\"},\n      \"operation_type\": \"replace\",\n      \"instruction\": \"Remove excessive weak words and redundant phrases\",\n      \"severity\": \"major\",\n      \"exact_fragment\": \"Growing up under Russian occupation was very difficult and very "
+    }
+  ]
+}

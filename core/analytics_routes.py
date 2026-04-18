@@ -10,6 +10,7 @@ from fastapi import Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from deal_breaker_tracker import get_tracker
+from version import BUILD_VERSION_INFO
 
 from .app_state import app, config, templates, _ensure_services, active_sessions, logger
 from .security import require_internal_ip
@@ -39,7 +40,8 @@ async def health_check():
     return {
         "status": "healthy",
         "active_sessions": len(active_sessions),
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "version": BUILD_VERSION_INFO,
     }
 
 
@@ -144,6 +146,7 @@ async def get_qa_models():
     """Get list of models suitable for QA evaluation"""
     from config import config
     all_models = config.get_available_models()
+    defaults = config.model_specs.get("default_models", {}) or {}
     
     qa_suitable_models = []
     
@@ -181,5 +184,6 @@ async def get_qa_models():
             "fast": [m["key"] for m in qa_suitable_models if m["qa_priority"] == "fast"][:3],
             "balanced": [m["key"] for m in qa_suitable_models if m["qa_priority"] == "standard"][:3],
             "premium": [m["key"] for m in qa_suitable_models if m["qa_priority"] == "premium"][:2]
-        }
+        },
+        "defaults": defaults,
     }

@@ -43,7 +43,7 @@ from typing import Dict, Any, Optional
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from client import AsyncGranSabioClient
+from client import AsyncGranSabioClient, GranSabioClientError
 from demos.common import run_demo, print_header, colorize, safe_print
 
 
@@ -59,8 +59,15 @@ def print_grounding_result(result: Dict[str, Any], title: str):
     # Status with color
     if status == "completed":
         print(f"Generation Status: \033[92mCOMPLETED\033[0m")
-    elif status == "rejected":
+    elif status in ("preflight_rejected", "rejected"):
         print(f"Generation Status: \033[91mREJECTED\033[0m")
+        preflight = result.get("preflight_feedback")
+        if preflight:
+            print(f"\n  Preflight rejected this request:")
+            print(f"  {preflight.get('user_feedback', 'No details')}")
+            print(f"\n  This is expected -- the preflight validator caught the")
+            print(f"  contradictory/unsupported request before generation started.")
+        return
     else:
         print(f"Generation Status: {status}")
 
@@ -181,14 +188,17 @@ async def run_scenario(
     request = {
         "prompt": f"CONTEXT:\n{scenario['context']}\n\nTASK:\n{scenario['prompt']}",
         "content_type": "article",
-        "generator_model": "gpt-4o-mini",
+        "generator_model": "gpt-5.4",
         "qa_layers": [],  # Bypass semantic QA for this demo
-        "qa_models": ["gpt-4o-mini"],
+        "qa_models": ["gpt-5.4"],
         "max_iterations": 1,
         "min_words": 50,
         "max_words": 200,
         "evidence_grounding": {
             "enabled": True,
+            # Scoring phase uses logprobs; GPT-5 family doesn't expose them.
+            # Keep a logprobs-capable model here (gpt-4o-mini). Generator/qa_models above
+            # don't need logprobs and can use gpt-5.4 safely.
             "model": "gpt-4o-mini",
             "max_claims": 10,
             "filter_trivial": True,
@@ -201,19 +211,21 @@ async def run_scenario(
         "request_name": f"Evidence Grounding Demo: {scenario['title']}"
     }
 
-    # Generate and wait for result
-    init_result = await client.generate(**request)
-    session_id = init_result.get("session_id")
+    try:
+        result = await client.generate(**request, wait_for_completion=False)
+    except GranSabioClientError as e:
+        if e.details.get("preflight_feedback"):
+            return {
+                "status": "preflight_rejected",
+                "preflight_feedback": e.details["preflight_feedback"],
+            }
+        raise
 
+    session_id = result.get("session_id")
     if not session_id:
         return {"error": "No session_id returned", "status": "error"}
 
-    # Wait for completion
-    try:
-        final_result = await client.wait_for_result(session_id, timeout=120)
-        return final_result
-    except Exception as e:
-        return {"error": str(e), "status": "error", "session_id": session_id}
+    return await client.wait_for_result(session_id, max_wait=120)
 
 
 async def demo_evidence_grounding():
@@ -274,15 +286,22 @@ async def demo_evidence_grounding():
                 result = await run_scenario(client, scenario_key, args.mode)
                 print_grounding_result(result, scenario["title"])
 
-                # Check expectation
-                grounding = result.get("evidence_grounding", {})
-                actual_pass = grounding.get("passed", True)
+                was_preflight_rejected = result.get("status") == "preflight_rejected"
                 expected_pass = scenario["expect_pass"]
+
+                if was_preflight_rejected:
+                    # Preflight caught a contradictory request -- counts as "flagged"
+                    actual_pass = False
+                else:
+                    grounding = result.get("evidence_grounding", {})
+                    actual_pass = grounding.get("passed", True)
 
                 if actual_pass == expected_pass:
                     print()
                     if actual_pass:
                         print("\033[92m[OK] Correctly passed - content is well-grounded\033[0m")
+                    elif was_preflight_rejected:
+                        print("\033[92m[OK] Correctly caught by preflight - contradictory request blocked\033[0m")
                     else:
                         print("\033[92m[OK] Correctly flagged - confabulation detected\033[0m")
                 else:
@@ -297,7 +316,7 @@ async def demo_evidence_grounding():
                     "scenario": scenario_key,
                     "expected": expected_pass,
                     "actual": actual_pass,
-                    "match": actual_pass == expected_pass
+                    "match": actual_pass == expected_pass,
                 })
 
             except Exception as e:
@@ -307,7 +326,7 @@ async def demo_evidence_grounding():
                     "expected": scenario["expect_pass"],
                     "actual": None,
                     "match": False,
-                    "error": str(e)
+                    "error": str(e),
                 })
 
             # Brief pause between scenarios

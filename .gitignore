@@ -25,6 +25,7 @@ MANIFEST
 
 # Virtual environments
 venv/
+.venv/
 env/
 ENV/
 env.bak/
@@ -67,6 +68,17 @@ NDH6SA~M
 # Claude Code local config
 .claude/
 
+# Codex local config
+.codex
+
+# macOS WebDAV metadata (accidentally synced from network drive)
+._DAV/
+
+# pytest-cov coverage data
+.coverage
+htmlcov/
+
+
 # User data (contains personal uploads)
 data/users/
 
@@ -98,6 +110,7 @@ cache/
 *.pdf
 !**/README.md
 !CLAUDE.md
+!SYNC_GITHUB.md
 !requirements.txt
 !core/trusted_proxies.txt
 !dev_tests/fake_ai/*.txt
@@ -108,8 +121,5 @@ pgbench_test.ps1
 # Windows null device
 nul
 
-# Biography App (separate repository)
-#biography_app#/
-
-# Marketing outreach data (private contacts/tracking)
-marketing/
+# GitHub sync tool output (plans + summaries, regenerated per sync)
+tools/sync_github/output/

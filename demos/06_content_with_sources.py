@@ -237,7 +237,7 @@ Do not add claims or statistics that are not in the research.
             qa_layers=qa_layers,
             min_global_score=7.5,
             max_iterations=3,
-            gran_sabio_model="claude-opus-4-6",
+            gran_sabio_model="claude-opus-4-7",
             verbose=True,
             username=args.username,
             context_documents=[
