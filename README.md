@@ -102,6 +102,15 @@ Beyond direct API connections (OpenAI, Anthropic, Google, xAI), you can access *
 ![OpenRouter Models](screenshots/openrouter-models.png)
 *Access hundreds of models through OpenRouter integration*
 
+### Admin Models Catalog
+
+Use `/admin/models` to manage the local model catalog without hand-editing `model_specs.json`:
+
+- Toggle models enabled/disabled for runtime use
+- Delete local catalog entries
+- Fetch remote provider catalogs
+- Run **Sync All** for the selected provider/model entries
+
 ---
 
 ### Session Debugger: Full Transparency
@@ -145,7 +154,22 @@ Define what "quality" means for YOUR use case:
 }
 ```
 
-**Each layer is evaluated by ALL configured QA models.** If GPT-4o passes but Claude finds an issue, you'll know. Consensus is calculated automatically.
+QA scheduling is configurable through `qa_execution_mode`, `on_qa_model_unavailable`, `on_qa_timeout`, `min_valid_qa_models`, `min_valid_qa_model_ratio`, and `qa_replacement_policy`. The default `auto` mode uses progressive quorum for deal-breaker layers, so it may stop once a reliable quorum is guaranteed, and bounded parallel execution for normal scoring layers.
+
+---
+
+### Final Verification
+
+Enable a read-only final QA pass when you need a last check over the approved content snapshot:
+
+```json
+{
+  "qa_final_verification_mode": "after_modifications",
+  "qa_final_verification_strategy": "full_parallel"
+}
+```
+
+Use `after_modifications` to verify only after QA/smart-edit/Gran Sabio rewrites content, or `always` to verify whenever a QA contract exists. Strategies are `full_parallel`, `full_sequential`, and `fast_global`.
 
 ---
 
@@ -301,7 +325,7 @@ Two request flags control the new deterministic path without changing existing i
 }
 ```
 
-- **`generation_tools_mode`**: `auto`, `always`, or `never`. In `auto`, supported providers (`OpenAI`, `Claude`, `Gemini`, `xAI`, and `OpenRouter`) can call a local `validate_draft` tool when measurable constraints are active, such as word count, JSON target-field extraction, phrase frequency, lexical diversity, or cumulative repetition.
+- **`generation_tools_mode`**: `auto` or `never`. In `auto`, supported providers (`OpenAI`, `Claude`, `Gemini`, `xAI`, and `OpenRouter`) can call a local `validate_draft` tool when measurable constraints are active, such as word count, JSON target-field extraction, phrase frequency, lexical diversity, or cumulative repetition.
 - **`smart_edit_locator_mode`**: `ids` or `legacy`. `ids` is now the default and targets paragraph/sentence IDs like `p1` or `p2s3`; `legacy` preserves the previous phrase-marker plus word-index fallback behavior.
 
 ---
@@ -584,6 +608,7 @@ Full interactive documentation available at:
 | `/stop/{session_id}` | POST | Cancel active generation |
 | `/models` | GET | List available AI models |
 | `/debugger` | GET | Session history and inspection UI |
+| `/admin/models` | GET | Manage local model catalog and provider sync |
 
 ### Analysis Endpoints
 
@@ -604,6 +629,19 @@ Group multiple sessions under a single project ID:
 | `/project/start/{id}` | POST | Activate a project |
 | `/project/stop/{id}` | POST | Cancel all project sessions |
 | `/stream/project/{id}` | GET | Stream all project events |
+
+---
+
+### Admin Model Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/admin/models/catalog` | GET | Read the local model catalog |
+| `/api/admin/models/providers/{provider}/remote` | GET | Fetch remote provider models |
+| `/api/admin/models/providers/{provider}/sync` | POST | Sync selected provider models |
+| `/api/admin/models/catalog/{provider}` | PATCH | Enable or disable one local catalog model |
+| `/api/admin/models/catalog/{provider}` | DELETE | Remove one local catalog model |
+| `/api/admin/models/sync-all` | POST | Sync the provider/model selection supplied in the request body |
 
 ---
 
@@ -632,6 +670,8 @@ Stream progress:
 for event in client.stream_generate(prompt="...", qa_layers=[...]):
     print(f"[{event.phase}] {event.message}")
 ```
+
+The SDK raises `TransientGranSabioError` for temporary transport failures and retries idempotent polling GETs with backoff. It does not automatically retry POST operations such as `generate`, `stop_session`, project mutations, or attachment uploads, because the server may have accepted the operation before the response failed.
 
 ---
 

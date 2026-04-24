@@ -18,7 +18,9 @@ from typing import Dict, Any
 from types import SimpleNamespace
 
 # Import the module under test
-from ai_service import AIService, AIRequestError
+from ai_service import AIService, AIRequestError, _ensure_aiohttp_compatibility
+from deterministic_validation import DraftValidationResult
+from tool_loop_models import OutputContract, ToolLoopEnvelope
 
 
 # ============================================================================
@@ -55,6 +57,11 @@ def mock_config():
         mock_cfg.GENERATOR_SYSTEM_PROMPT = "You are a helpful assistant."
         mock_cfg.GENERATOR_SYSTEM_PROMPT_RAW = "Raw system prompt."
         mock_cfg.get_model_specs = Mock(return_value={"model_specifications": {}})
+        # Tool-loop constants used by call_ai_with_validation_tools defensive gates.
+        mock_cfg.TOOL_LOOP_MAX_PROMPT_CHARS = 200_000
+        mock_cfg.VALIDATE_DRAFT_MAX_LENGTH = 200_000
+        # Default: unknown model → estimate_prompt_overflow falls back to hard cap.
+        mock_cfg.get_model_info = Mock(side_effect=RuntimeError("unknown model for tests"))
         yield mock_cfg
 
 
@@ -206,6 +213,15 @@ class TestShouldRetryException:
         """
         exc = AttributeError("'aiohttp.ClientSession' has no attribute 'foo'")
         assert AIService._should_retry_exception(exc) is True
+
+
+def test_ensure_aiohttp_compatibility_aliases_missing_dns_connector(monkeypatch):
+    """Older aiohttp versions must not break google-genai exception handling."""
+    monkeypatch.delattr(aiohttp, "ClientConnectorDNSError", raising=False)
+
+    _ensure_aiohttp_compatibility()
+
+    assert aiohttp.ClientConnectorDNSError is aiohttp.ClientConnectorError
 
 
 class TestExtractRequestId:
@@ -534,6 +550,55 @@ class TestConvertNullableToGeminiFormat:
         assert result["type"] == "string"
         assert result["description"] == "A name"
         assert "nullable" not in result
+
+
+class TestPrepareStructuredOutputSchema:
+    """Tests for provider-specific structured-output schema preparation."""
+
+    def test_claude_nullable_enums_are_normalized_to_anyof(self):
+        """
+        Given: Editable QA schema with nullable enum fields
+        When: Preparing schema for Claude native structured outputs
+        Then: Nullable enums are emitted as typed anyOf branches
+        """
+        from qa_response_schemas import QA_SCHEMA_EDITABLE
+
+        result = AIService._prepare_structured_output_schema(
+            "claude",
+            "claude-sonnet-4-6",
+            QA_SCHEMA_EDITABLE,
+        )
+
+        edit_strategy = result["properties"]["edit_strategy"]
+        assert "anyOf" in edit_strategy
+        assert {"type": "null"} in edit_strategy["anyOf"]
+        assert not (
+            "enum" in edit_strategy
+            and None in edit_strategy["enum"]
+            and "type" in edit_strategy
+        )
+
+    @pytest.mark.parametrize(
+        ("provider", "model_id"),
+        [
+            ("openai", "gpt-4o"),
+            ("xai", "grok-2-1212"),
+            ("openrouter", "openai/gpt-4o-mini"),
+        ],
+    )
+    def test_openai_compatible_schemas_are_left_unchanged(self, provider, model_id):
+        """OpenAI-compatible providers use the schema shape as supplied."""
+        schema = {
+            "type": "object",
+            "properties": {"decision": {"type": "string"}},
+            "required": ["decision"],
+        }
+
+        assert AIService._prepare_structured_output_schema(
+            provider,
+            model_id,
+            schema,
+        ) is schema
 
 
 class TestValidateSchemaForStructuredOutputs:
@@ -1180,8 +1245,102 @@ class TestExecuteWithRetries:
             )
 
 
+class TestExecuteWithoutRetries:
+    """Tests for single-attempt provider execution normalization."""
+
+    @pytest.mark.asyncio
+    async def test_wraps_retryable_sdk_error_as_ai_request_error(self, ai_service_instance):
+        """Retry-disabled paths still surface provider/SDK failures as typed API errors."""
+
+        async def failing_operation():
+            raise AttributeError("module aiohttp has no attribute ClientConnectorDNSError")
+
+        with pytest.raises(AIRequestError) as exc_info:
+            await ai_service_instance._execute_without_retries(
+                failing_operation,
+                provider="gemini",
+                model_id="gemini-3.1-pro-preview",
+                action="tool_loop_generation",
+            )
+
+        assert exc_info.value.provider == "gemini"
+        assert exc_info.value.model == "gemini-3.1-pro-preview"
+        assert exc_info.value.attempts == 1
+        assert exc_info.value.max_attempts == 1
+        assert isinstance(exc_info.value.cause, AttributeError)
+
+    @pytest.mark.asyncio
+    async def test_preserves_non_retryable_errors(self, ai_service_instance):
+        """Local contract/programming errors must not be relabeled as provider failures."""
+
+        async def failing_operation():
+            raise ValueError("Invalid local contract")
+
+        with pytest.raises(ValueError, match="Invalid local contract"):
+            await ai_service_instance._execute_without_retries(
+                failing_operation,
+                provider="gemini",
+                model_id="gemini-3.1-pro-preview",
+                action="tool_loop_generation",
+            )
+
+
+def _approved_result(word_count: int = 3, feedback: str = "Looks good.") -> DraftValidationResult:
+    return DraftValidationResult(
+        approved=True,
+        hard_failed=False,
+        score=10.0,
+        word_count=word_count,
+        feedback=feedback,
+        issues=[],
+        metrics={"word_count": word_count},
+        checks={},
+        stylistic_metrics=None,
+        visible_payload={},
+    )
+
+
+def _rejected_result(
+    word_count: int = 0, feedback: str = "Still invalid."
+) -> DraftValidationResult:
+    return DraftValidationResult(
+        approved=False,
+        hard_failed=False,
+        score=0.0,
+        word_count=word_count,
+        feedback=feedback,
+        issues=[],
+        metrics={"word_count": word_count},
+        checks={},
+        stylistic_metrics=None,
+        visible_payload={},
+    )
+
+
+def _result_for_target(candidate: str, target: str) -> DraftValidationResult:
+    """Helper for tests that approve only a specific candidate string."""
+    approved = candidate == target
+    return DraftValidationResult(
+        approved=approved,
+        hard_failed=False,
+        score=10.0 if approved else 0.0,
+        word_count=len(candidate.split()),
+        feedback="Looks good." if approved else "Still invalid.",
+        issues=[],
+        metrics={"word_count": len(candidate.split())},
+        checks={},
+        stylistic_metrics=None,
+        visible_payload={},
+    )
+
+
 class TestGenerationToolLoop:
-    """Tests for generator tool-loop behavior across providers."""
+    """Tests for generator tool-loop behavior across providers.
+
+    Migrated from the legacy dict-callback / ``generate_content_with_validation_tools``
+    API to the new ``call_ai_with_validation_tools`` + ``DraftValidationResult`` contract
+    and typed ``ToolLoopEnvelope`` return shape.
+    """
 
     @pytest.mark.asyncio
     async def test_tool_loop_exhaustion_without_validated_text_raises_after_forced_final_turn(
@@ -1189,7 +1348,7 @@ class TestGenerationToolLoop:
     ):
         """
         Given: The tool loop keeps asking for validation but never produces an approved draft
-        When: generate_content_with_validation_tools() exhausts its rounds and the forced final turn also fails
+        When: call_ai_with_validation_tools() exhausts its rounds and the forced final turn also fails
         Then: It raises ValueError so callers can fall back to standard generation
         """
 
@@ -1237,17 +1396,11 @@ class TestGenerationToolLoop:
         )
 
         with pytest.raises(ValueError, match="Tool loop exhausted without producing a validated draft"):
-            await ai_service_instance.generate_content_with_validation_tools(
+            await ai_service_instance.call_ai_with_validation_tools(
                 prompt="Write something long.",
                 model="gpt-4o",
-                validation_callback=lambda _: {
-                    "approved": False,
-                    "score": 0.0,
-                    "feedback": "Still invalid.",
-                    "word_count": 0,
-                    "hard_failed": False,
-                },
-                max_rounds=2,
+                validation_callback=lambda _: _rejected_result(),
+                max_tool_rounds=2,
             )
 
     @pytest.mark.asyncio
@@ -1300,25 +1453,29 @@ class TestGenerationToolLoop:
             }
         )
 
-        def validation_callback(candidate: str):
-            return {
-                "approved": candidate == "valid final answer",
-                "score": 10.0 if candidate == "valid final answer" else 0.0,
-                "feedback": "Still invalid." if candidate != "valid final answer" else "Looks good.",
-                "word_count": len(candidate.split()),
-                "hard_failed": False,
-            }
+        force_finalize_events: list = []
 
-        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+        async def tool_event_cb(event_type: str, payload: Dict[str, Any]) -> None:
+            if event_type == "force_finalize":
+                force_finalize_events.append(payload)
+
+        content, envelope = await ai_service_instance.call_ai_with_validation_tools(
             prompt="Write something long.",
             model="gpt-4o",
-            validation_callback=validation_callback,
-            max_rounds=2,
+            validation_callback=lambda candidate: _result_for_target(candidate, "valid final answer"),
+            max_tool_rounds=2,
+            tool_event_callback=tool_event_cb,
         )
 
         assert content == "valid final answer"
-        assert metadata["accepted"] == "forced_final_turn"
+        assert isinstance(envelope, ToolLoopEnvelope)
+        assert envelope.accepted_via == "forced_final_turn"
+        assert envelope.accepted is True
         assert ai_service_instance.openai_client.chat.completions.create.await_count == 2
+        # Verify the force_finalize hook fired at least once with a reason string.
+        assert force_finalize_events, "force_finalize hook should fire on budget exhaustion"
+        assert "reason" in force_finalize_events[0]
+        assert "turn" in force_finalize_events[0]
 
     @pytest.mark.asyncio
     async def test_openai_tool_loop_overflow_prefers_validate_draft_tool(
@@ -1382,23 +1539,20 @@ class TestGenerationToolLoop:
                 "reasoning_timeout_seconds": None,
             }
         )
+        mock_config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS = 30
+        mock_config.AI_ACCENT_AUDIT_MAX_TOKENS = 1024
+
         seen_candidates = []
 
         def validation_callback(candidate: str):
             seen_candidates.append(candidate)
-            return {
-                "approved": candidate == "valid overflow draft",
-                "score": 10.0 if candidate == "valid overflow draft" else 0.0,
-                "feedback": "Still invalid." if candidate != "valid overflow draft" else "Looks good.",
-                "word_count": len(candidate.split()),
-                "hard_failed": False,
-            }
+            return _result_for_target(candidate, "valid overflow draft")
 
-        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+        content, envelope = await ai_service_instance.call_ai_with_validation_tools(
             prompt="Write something long.",
             model="gpt-4o",
             validation_callback=validation_callback,
-            max_rounds=2,
+            max_tool_rounds=2,
             accent_guard=SimpleNamespace(
                 mode="inline",
                 criteria=None,
@@ -1409,7 +1563,8 @@ class TestGenerationToolLoop:
         )
 
         assert content == "valid overflow draft"
-        assert metadata["accepted"] == "validated_tool_argument"
+        assert envelope.accepted_via == "validated_tool_argument"
+        assert envelope.accepted is True
         assert seen_candidates == ["valid overflow draft"]
 
     @pytest.mark.asyncio
@@ -1465,11 +1620,11 @@ class TestGenerationToolLoop:
             raise RuntimeError("validator boom")
 
         with pytest.raises(ValueError, match="Validation callback failed during openai_tool_loop"):
-            await ai_service_instance.generate_content_with_validation_tools(
+            await ai_service_instance.call_ai_with_validation_tools(
                 prompt="Write something long.",
                 model="gpt-4o",
                 validation_callback=failing_callback,
-                max_rounds=2,
+                max_tool_rounds=2,
             )
 
     @pytest.mark.asyncio
@@ -1479,7 +1634,7 @@ class TestGenerationToolLoop:
         """
         Given: A turn that would consume most of the tool-call budget
         When: The tool loop processes the turn
-        Then: Metadata trace includes an early budget warning
+        Then: The envelope trace includes an early budget warning
         """
 
         async def passthrough(operation, **kwargs):
@@ -1536,23 +1691,28 @@ class TestGenerationToolLoop:
         )
 
         def validation_callback(candidate: str):
-            return {
-                "approved": candidate == "draft three",
-                "score": 10.0 if candidate == "draft three" else 0.0,
-                "feedback": "Needs work.",
-                "word_count": len(candidate.split()),
-                "hard_failed": False,
-            }
+            return _result_for_target(candidate, "draft three")
 
-        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+        # Capture the per-turn tool_call_start events to exercise the new hook.
+        tool_call_start_events: list = []
+
+        async def tool_event_cb(event_type: str, payload: Dict[str, Any]) -> None:
+            if event_type == "tool_call_start":
+                tool_call_start_events.append(payload)
+
+        content, envelope = await ai_service_instance.call_ai_with_validation_tools(
             prompt="Write something long.",
             model="gpt-4o",
             validation_callback=validation_callback,
-            max_rounds=2,
+            max_tool_rounds=2,
+            tool_event_callback=tool_event_cb,
         )
 
         assert content == "draft three"
-        assert any(event.get("event") == "tool_call_budget_warning" for event in metadata["trace"])
+        assert isinstance(envelope, ToolLoopEnvelope)
+        assert any(entry.event == "tool_call_budget_warning" for entry in envelope.trace)
+        # At least one tool_call_start event was emitted before a validate_draft call.
+        assert any(evt.get("tool") == "validate_draft" for evt in tool_call_start_events)
 
     @pytest.mark.asyncio
     async def test_openrouter_tool_loop_uses_openrouter_client(
@@ -1604,21 +1764,16 @@ class TestGenerationToolLoop:
             }
         )
 
-        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+        content, envelope = await ai_service_instance.call_ai_with_validation_tools(
             prompt="Write something long.",
             model="or-meta",
-            validation_callback=lambda _: {
-                "approved": True,
-                "score": 10.0,
-                "feedback": "Looks good.",
-                "word_count": 3,
-                "hard_failed": False,
-            },
-            max_rounds=2,
+            validation_callback=lambda _: _approved_result(),
+            max_tool_rounds=2,
         )
 
         assert content == "validated via openrouter"
-        assert metadata["mode"] == "openrouter_tool_loop"
+        assert isinstance(envelope, ToolLoopEnvelope)
+        assert envelope.accepted is True
         ai_service_instance.openrouter_client.chat.completions.create.assert_awaited_once()
         ai_service_instance.openai_client.chat.completions.create.assert_not_called()
 
@@ -1662,21 +1817,16 @@ class TestGenerationToolLoop:
             }
         )
 
-        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+        content, envelope = await ai_service_instance.call_ai_with_validation_tools(
             prompt="Write something long.",
             model="claude-sonnet-4-5",
-            validation_callback=lambda _: {
-                "approved": True,
-                "score": 10.0,
-                "feedback": "Looks good.",
-                "word_count": 3,
-                "hard_failed": False,
-            },
-            max_rounds=2,
+            validation_callback=lambda _: _approved_result(),
+            max_tool_rounds=2,
         )
 
         assert content == "validated via claude"
-        assert metadata["mode"] == "claude_tool_loop"
+        assert isinstance(envelope, ToolLoopEnvelope)
+        assert envelope.accepted is True
         ai_service_instance.anthropic_client.messages.create.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -1726,23 +1876,18 @@ class TestGenerationToolLoop:
         )
 
         def validation_callback(candidate: str):
-            return {
-                "approved": candidate == "valid claude final answer",
-                "score": 10.0 if candidate == "valid claude final answer" else 0.0,
-                "feedback": "Still invalid." if candidate != "valid claude final answer" else "Looks good.",
-                "word_count": len(candidate.split()),
-                "hard_failed": False,
-            }
+            return _result_for_target(candidate, "valid claude final answer")
 
-        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+        content, envelope = await ai_service_instance.call_ai_with_validation_tools(
             prompt="Write something long.",
             model="claude-sonnet-4-5",
             validation_callback=validation_callback,
-            max_rounds=2,
+            max_tool_rounds=2,
         )
 
         assert content == "valid claude final answer"
-        assert metadata["accepted"] == "forced_final_turn"
+        assert envelope.accepted_via == "forced_final_turn"
+        assert envelope.accepted is True
         assert ai_service_instance.anthropic_client.messages.create.await_count == 3
 
     @pytest.mark.asyncio
@@ -1802,23 +1947,20 @@ class TestGenerationToolLoop:
                 "reasoning_timeout_seconds": None,
             }
         )
+        mock_config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS = 30
+        mock_config.AI_ACCENT_AUDIT_MAX_TOKENS = 1024
+
         seen_candidates = []
 
         def validation_callback(candidate: str):
             seen_candidates.append(candidate)
-            return {
-                "approved": candidate == "valid claude overflow draft",
-                "score": 10.0 if candidate == "valid claude overflow draft" else 0.0,
-                "feedback": "Still invalid." if candidate != "valid claude overflow draft" else "Looks good.",
-                "word_count": len(candidate.split()),
-                "hard_failed": False,
-            }
+            return _result_for_target(candidate, "valid claude overflow draft")
 
-        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+        content, envelope = await ai_service_instance.call_ai_with_validation_tools(
             prompt="Write something long.",
             model="claude-sonnet-4-5",
             validation_callback=validation_callback,
-            max_rounds=2,
+            max_tool_rounds=2,
             accent_guard=SimpleNamespace(
                 mode="inline",
                 criteria=None,
@@ -1829,7 +1971,7 @@ class TestGenerationToolLoop:
         )
 
         assert content == "valid claude overflow draft"
-        assert metadata["accepted"] == "validated_tool_argument"
+        assert envelope.accepted_via == "validated_tool_argument"
         assert seen_candidates == ["valid claude overflow draft"]
 
     @pytest.mark.asyncio
@@ -1879,21 +2021,16 @@ class TestGenerationToolLoop:
             }
         )
 
-        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+        content, envelope = await ai_service_instance.call_ai_with_validation_tools(
             prompt="Write something long.",
             model="gemini-2.5-flash",
-            validation_callback=lambda _: {
-                "approved": True,
-                "score": 10.0,
-                "feedback": "Looks good.",
-                "word_count": 3,
-                "hard_failed": False,
-            },
-            max_rounds=2,
+            validation_callback=lambda _: _approved_result(),
+            max_tool_rounds=2,
         )
 
         assert content == "validated via gemini"
-        assert metadata["mode"] == "gemini_tool_loop"
+        assert isinstance(envelope, ToolLoopEnvelope)
+        assert envelope.accepted is True
         ai_service_instance.google_new_client.aio.models.generate_content.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -1913,6 +2050,9 @@ class TestGenerationToolLoop:
 
         async def fake_generate_content(*args, **kwargs):
             captured_config["config"] = kwargs["config"]
+            # Emit JSON text as the validate_draft argument so the
+            # JSON_STRUCTURED contract parser accepts the draft as
+            # the final payload (content == draft under Path 1).
             return SimpleNamespace(
                 candidates=[
                     SimpleNamespace(
@@ -1921,7 +2061,7 @@ class TestGenerationToolLoop:
                                 SimpleNamespace(
                                     function_call=SimpleNamespace(
                                         name="validate_draft",
-                                        args={"text": "validated via gemini"},
+                                        args={"text": '{"content":"validated via gemini"}'},
                                     )
                                 )
                             ]
@@ -1960,24 +2100,49 @@ class TestGenerationToolLoop:
             "required": ["content"],
         }
 
-        content, metadata = await ai_service_instance.generate_content_with_validation_tools(
+        content, envelope = await ai_service_instance.call_ai_with_validation_tools(
             prompt="Write something structured.",
             model="gemini-2.5-flash",
-            validation_callback=lambda _: {
-                "approved": True,
-                "score": 10.0,
-                "feedback": "Looks good.",
-                "word_count": 3,
-                "hard_failed": False,
-            },
-            json_output=True,
-            json_schema=schema,
-            max_rounds=2,
+            validation_callback=lambda _: _approved_result(),
+            max_tool_rounds=2,
+            output_contract=OutputContract.JSON_STRUCTURED,
+            response_format=schema,
         )
 
         config = captured_config["config"]
-        assert content == "validated via gemini"
-        assert metadata["mode"] == "gemini_tool_loop"
+        assert content == '{"content":"validated via gemini"}'
+        assert isinstance(envelope, ToolLoopEnvelope)
+        assert envelope.payload == {"content": "validated via gemini"}
         assert getattr(config, "response_mime_type", None) is None
         assert getattr(config, "response_json_schema", None) is None
         assert getattr(config, "response_schema", None) is None
+
+
+# ============================================================================
+# TestIsOpenAIResponsesApiModel - Centralized Responses API capability lookup
+# ============================================================================
+
+class TestIsOpenAIResponsesApiModel:
+    """Verify that the capability-backed helper recognises the Responses API models."""
+
+    def test_base_responses_api_models_return_true(self):
+        assert AIService._is_openai_responses_api_model("o3-pro") is True
+        assert AIService._is_openai_responses_api_model("gpt-5-pro") is True
+
+    def test_dated_responses_api_variants_return_true(self):
+        assert AIService._is_openai_responses_api_model("o3-pro-2025-06-10") is True
+        assert AIService._is_openai_responses_api_model("gpt-5-pro-2025-10-06") is True
+
+    def test_case_insensitive_match(self):
+        assert AIService._is_openai_responses_api_model("O3-Pro") is True
+        assert AIService._is_openai_responses_api_model("GPT-5-PRO") is True
+
+    def test_non_responses_api_openai_model_returns_false(self):
+        assert AIService._is_openai_responses_api_model("gpt-4o") is False
+        assert AIService._is_openai_responses_api_model("gpt-5") is False
+
+    def test_unknown_model_returns_false(self):
+        assert AIService._is_openai_responses_api_model("nonexistent-model-xyz") is False
+
+    def test_empty_model_id_returns_false(self):
+        assert AIService._is_openai_responses_api_model("") is False

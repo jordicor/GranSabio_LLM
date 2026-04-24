@@ -145,6 +145,46 @@ def _evaluate_layer_based_approval(
                 "deal_breaker_type": "majority_consensus_retry",
             }
 
+    approval_contract = ((qa_summary or {}).get("summary") or {}).get("approval_contract")
+    if approval_contract == "fast_global":
+        return _evaluate_fast_global_approval(
+            qa_results=qa_results,
+            consensus_result=consensus_result,
+            request=request,
+            iteration=iteration,
+            evaluated_layers=evaluated_layers,
+        )
+
+    majority_deal_breakers = _check_majority_deal_breakers(qa_results, request.qa_models)
+    if majority_deal_breakers["has_majority_deal_breakers"]:
+        user_friendly_reason = create_user_friendly_reason(
+            qa_summary,
+            qa_results,
+            iteration,
+            request.max_iterations,
+            request,
+            evaluated_layers,
+        )
+        if iteration >= request.max_iterations:
+            result = {
+                "approved": False,
+                "final_rejection": True,
+                "reason": user_friendly_reason,
+                "deal_breaker_type": "majority_consensus",
+                "majority_deal_breakers": majority_deal_breakers,
+            }
+            if hasattr(request, "gran_sabio_fallback") and request.gran_sabio_fallback:
+                result["allow_fallback"] = True
+            return result
+
+        return {
+            "approved": False,
+            "final_rejection": False,
+            "reason": user_friendly_reason,
+            "deal_breaker_type": "majority_consensus_retry",
+            "majority_deal_breakers": majority_deal_breakers,
+        }
+
     # Step 2: Check for 50-50 ties first (exact 50% deal-breakers should escalate to Gran Sabio)
     tie_deal_breakers = _check_50_50_tie_deal_breakers(qa_results, request.qa_models)
     if tie_deal_breakers["has_50_50_ties"]:
@@ -294,6 +334,141 @@ def _evaluate_layer_based_approval(
         }
 
 
+def _evaluate_fast_global_approval(
+    *,
+    qa_results,
+    consensus_result,
+    request,
+    iteration,
+    evaluated_layers,
+) -> Dict[str, Any]:
+    """Evaluate the isolated fast-global final verification contract."""
+
+    layer_config_by_name: Dict[str, QALayer] = {}
+    for layer in evaluated_layers or []:
+        if layer and layer.name not in layer_config_by_name:
+            layer_config_by_name[layer.name] = layer
+
+    def retry_or_reject(reason: str, deal_breaker_type: Optional[str] = None) -> Dict[str, Any]:
+        result = {
+            "approved": False,
+            "final_rejection": iteration >= request.max_iterations,
+            "reason": reason,
+        }
+        if deal_breaker_type:
+            result["deal_breaker_type"] = deal_breaker_type
+        if result["final_rejection"] and getattr(request, "gran_sabio_fallback", False):
+            result["allow_fallback"] = True
+        return result
+
+    deal_breaker_details = []
+    for layer_name, model_results in qa_results.items():
+        for model_name, evaluation in model_results.items():
+            if is_valid_semantic_qa_result(evaluation) and getattr(evaluation, "deal_breaker", False):
+                deal_breaker_details.append(
+                    {
+                        "layer": layer_name,
+                        "model": model_name,
+                        "evaluator": get_evaluator_alias(evaluation, fallback=model_name),
+                        "reason": evaluation.deal_breaker_reason or evaluation.reason or "",
+                    }
+                )
+
+    if deal_breaker_details:
+        return retry_or_reject(
+            "Fast global final verification failed: unsuppressed deal-breaker(s) detected.",
+            "fast_global_deal_breaker",
+        )
+
+    deterministic_failures = []
+    synthetic_layer_name = "Final Global QA Verification"
+    for layer_name, layer in layer_config_by_name.items():
+        if layer_name == synthetic_layer_name:
+            continue
+        layer_avg = consensus_result.layer_averages.get(layer_name, 0.0)
+        if layer_avg < layer.min_score:
+            deterministic_failures.append(f"{layer_name} ({layer_avg:.2f} < {layer.min_score})")
+
+    if deterministic_failures:
+        return retry_or_reject(
+            "Fast global final verification failed deterministic guard(s): "
+            + ", ".join(deterministic_failures)
+        )
+
+    synthetic_layer = layer_config_by_name.get(synthetic_layer_name)
+    if synthetic_layer is not None:
+        synthetic_score = consensus_result.layer_averages.get(synthetic_layer_name, 0.0)
+        min_global_score = getattr(request, "min_global_score", synthetic_layer.min_score)
+        if synthetic_score < min_global_score:
+            return retry_or_reject(
+                f"Fast global final verification failed: global score {synthetic_score:.2f} < {min_global_score}."
+            )
+
+        return {
+            "approved": True,
+            "final_rejection": False,
+            "reason": (
+                f"Fast global final verification passed "
+                f"(Global score: {synthetic_score:.2f} >= {min_global_score})"
+            ),
+        }
+
+    return {
+        "approved": True,
+        "final_rejection": False,
+        "reason": "Fast global final verification passed deterministic/special guards.",
+    }
+
+
+def _check_majority_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
+    """Check for majority deal-breakers across all available QA layer results."""
+
+    majority_layers = []
+    total_models = len(qa_models) if qa_models else 0
+
+    for layer_name, model_results in qa_results.items():
+        counts = build_qa_counts(model_results, total_models or len(model_results))
+        valid_total = counts["valid"]
+        if valid_total == 0:
+            continue
+
+        layer_details = []
+        for model, evaluation in model_results.items():
+            if is_valid_semantic_qa_result(evaluation) and getattr(evaluation, "deal_breaker", False):
+                evaluator = get_evaluator_alias(evaluation, fallback=model)
+                layer_details.append(
+                    {
+                        "layer": layer_name,
+                        "model": model,
+                        "evaluator": evaluator,
+                        "reason": evaluation.deal_breaker_reason or evaluation.reason or "",
+                    }
+                )
+
+        deal_breaker_count = len(layer_details)
+        if (
+            valid_total >= counts["required_valid"]
+            and deal_breaker_count >= counts["required_majority"]
+        ):
+            majority_layers.append(
+                {
+                    "layer": layer_name,
+                    "deal_breaker_count": deal_breaker_count,
+                    "valid_total": valid_total,
+                    "total_models_configured": total_models,
+                    "qa_quorum": counts,
+                    "details": layer_details,
+                }
+            )
+
+    return {
+        "has_majority_deal_breakers": bool(majority_layers),
+        "layers": majority_layers,
+        "deal_breaker_count": sum(layer["deal_breaker_count"] for layer in majority_layers),
+        "total_models": total_models,
+    }
+
+
 def _check_minority_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
     """
     Check for minority deal-breakers across all layers.
@@ -326,10 +501,9 @@ def _check_minority_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
             continue
 
         db_count = len(layer_db_details)
-        is_tie = layer_total % 2 == 0 and db_count * 2 == layer_total
         is_minority = db_count < (layer_total / 2)
 
-        if is_tie or is_minority:
+        if is_minority:
             all_deal_breakers.extend(layer_db_details)
             total_evaluations += layer_total
 

@@ -5,7 +5,28 @@ from core.generation_processor import _locate_edit_segment
 from smart_edit import build_segment_map
 from smart_edit.models import TextEditRange
 from smart_edit.qa_integration import parse_qa_edit_groups
+from tools.ai_json_cleanroom import make_loose_json_validate_options
+from tool_loop_models import PayloadScope
 from word_count_utils import create_word_count_qa_layer
+
+
+def _json_request(**overrides):
+    base = {
+        "json_output": True,
+        "content_type": "json",
+        "json_schema": None,
+        "json_expectations": None,
+        "target_field": None,
+        "min_words": None,
+        "max_words": None,
+        "word_count_enforcement": None,
+        "phrase_frequency": None,
+        "lexical_diversity": None,
+        "cumulative_text": None,
+        "include_stylistic_metrics": False,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
 
 
 def test_prepare_validation_context_extracts_target_field_without_json_validation():
@@ -24,6 +45,113 @@ def test_prepare_validation_context_extracts_target_field_without_json_validatio
 
     assert context.text_for_validation == "Uno dos tres."
     assert context.target_field_paths == ["content"]
+
+
+def test_json_object_without_string_fields_passes_when_no_text_validators():
+    request = _json_request()
+
+    report = validate_generation_candidate(
+        '{"ids": [1, 2, 3], "meta": {"ok": true}}',
+        request,
+        json_options=make_loose_json_validate_options(),
+    )
+
+    assert report.approved is True
+    assert report.word_count == 0
+    assert report.checks["json_output"]["passed"] is True
+    payload = report.build_visible_payload(PayloadScope.MEASUREMENT_ONLY)
+    assert "word_count" not in payload
+    assert "word_count" not in payload["metrics"]
+    assert "target_field_paths" not in payload["metrics"]["json_output"]
+
+
+def test_json_array_without_string_fields_passes_when_no_text_validators():
+    request = _json_request()
+
+    report = validate_generation_candidate(
+        '[{"id": 1}, {"id": 2}]',
+        request,
+        json_options=make_loose_json_validate_options(),
+    )
+
+    assert report.approved is True
+    assert report.word_count == 0
+    assert report.checks["json_output"]["passed"] is True
+
+
+def test_json_without_text_fields_fails_only_when_text_validation_is_required():
+    request = _json_request(min_words=1)
+
+    report = validate_generation_candidate(
+        '{"ids": [1, 2, 3]}',
+        request,
+        json_options=make_loose_json_validate_options(),
+    )
+
+    assert report.approved is False
+    assert report.checks["json_output"]["passed"] is False
+    assert report.word_count == 0
+
+
+def test_json_target_field_missing_still_fails():
+    request = _json_request(target_field="content")
+
+    report = validate_generation_candidate(
+        '{"other": "Uno dos tres."}',
+        request,
+        json_options=make_loose_json_validate_options(),
+    )
+
+    assert report.approved is False
+    assert report.checks["json_output"]["passed"] is False
+
+
+def test_json_target_field_text_can_satisfy_word_count():
+    request = _json_request(target_field="content", min_words=3)
+
+    report = validate_generation_candidate(
+        '{"content": "Uno dos tres cuatro."}',
+        request,
+        json_options=make_loose_json_validate_options(),
+    )
+
+    assert report.approved is True
+    assert report.word_count == 4
+    assert report.checks["json_output"]["passed"] is True
+    assert report.checks["word_count"]["passed"] is True
+    payload = report.build_visible_payload(PayloadScope.MEASUREMENT_ONLY)
+    assert payload["word_count"] == 4
+    assert payload["metrics"]["word_count"] == 4
+    assert payload["metrics"]["target_field_paths"] == ["content"]
+
+
+def test_content_type_json_alias_activates_json_validation():
+    request = _json_request(json_output=False, content_type="json")
+
+    report = validate_generation_candidate(
+        '{"ids": [1, 2, 3]}',
+        request,
+        json_options=make_loose_json_validate_options(),
+    )
+
+    assert report.approved is True
+    assert "json_output" in report.checks
+
+
+def test_loose_json_options_extract_embedded_json_like_default_options():
+    request = _json_request()
+    content = 'prefix {"ids": [1, 2, 3]}'
+
+    default_report = validate_generation_candidate(content, request)
+    loose_report = validate_generation_candidate(
+        content,
+        request,
+        json_options=make_loose_json_validate_options(),
+    )
+
+    assert default_report.approved is True
+    assert loose_report.approved is True
+    assert loose_report.checks["json_output"]["passed"] is True
 
 
 def test_parse_qa_edit_groups_ids_mode_preserves_target_ids_and_quote():

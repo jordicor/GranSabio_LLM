@@ -21,6 +21,7 @@
   --method-get: #10b981;
   --method-post: #3b82f6;
   --method-put: #f59e0b;
+  --method-patch: #8b5cf6;
   --method-delete: #ef4444;
   
   /* Neutral Colors */
@@ -253,6 +254,10 @@ body {
 
 .http-method.put {
   background-color: var(--method-put);
+}
+
+.http-method.patch {
+  background-color: var(--method-patch);
 }
 
 .http-method.delete {

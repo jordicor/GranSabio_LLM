@@ -17,7 +17,8 @@ from deterministic_validation import (
     evaluate_word_count_check,
     prepare_validation_context,
 )
-from models import QALayer, QAEvaluation
+from models import QALayer, QAEvaluation, is_json_output_requested
+from phrase_frequency_config import is_phrase_frequency_active
 from word_count_utils import (
     count_words,
     is_word_count_enforcement_enabled,
@@ -63,10 +64,8 @@ def _get_validation_text_for_bypass(
     if context.text_for_validation:
         return context.text_for_validation, list(context.target_field_paths)
 
-    if _get_request_attr(original_request, "json_output", False) or _get_request_attr(
-        original_request,
-        "target_field",
-        None,
+    if is_json_output_requested(original_request) or _get_request_attr(
+        original_request, "target_field", None
     ):
         logger.warning(
             "Algorithmic bypass could not extract target-field text; skipping deterministic bypass"
@@ -135,10 +134,13 @@ class QABypassEngine:
             if is_word_count_enforcement_enabled(config):
                 return True
 
-        if (layer.name == "Phrase Frequency Guard" and
-            hasattr(original_request, 'phrase_frequency') and
-            original_request.phrase_frequency and
-            getattr(original_request.phrase_frequency, 'enabled', False)):
+        if (
+            layer.name == "Phrase Frequency Guard"
+            and is_phrase_frequency_active(
+                getattr(original_request, "phrase_frequency", None),
+                context="QA bypass phrase-frequency layer",
+            )
+        ):
             return True
 
         if (layer.name == "Lexical Diversity Guard" and
@@ -147,12 +149,15 @@ class QABypassEngine:
             getattr(original_request.lexical_diversity, 'enabled', False)):
             return True
 
-        if (layer.name == "Cumulative Repetition Guard" and
-            hasattr(original_request, 'cumulative_text') and
-            original_request.cumulative_text and
-            hasattr(original_request, 'phrase_frequency') and
-            original_request.phrase_frequency and
-            getattr(original_request.phrase_frequency, 'enabled', False)):
+        if (
+            layer.name == "Cumulative Repetition Guard"
+            and hasattr(original_request, 'cumulative_text')
+            and original_request.cumulative_text
+            and is_phrase_frequency_active(
+                getattr(original_request, "phrase_frequency", None),
+                context="QA bypass cumulative repetition layer",
+            )
+        ):
             return True
 
         return False

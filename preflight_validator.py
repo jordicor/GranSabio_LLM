@@ -19,13 +19,62 @@ from config import config
 from model_aliasing import ModelAliasRegistry, PromptPart
 from models import ContentRequest, PreflightResult, PreflightIssue, WordCountAnalysis
 from usage_tracking import UsageTracker
-from word_count_utils import (
-    is_word_count_enforcement_enabled,
-    word_count_config_to_dict,
-)
+from word_count_utils import word_count_config_to_dict
 
 
 logger = logging.getLogger(__name__)
+
+
+def _normalise_model_name(value: Any) -> Optional[str]:
+    """Return a usable model name, treating empty strings as unconfigured."""
+    if value is None:
+        return None
+    model_name = str(value).strip()
+    return model_name or None
+
+
+def resolve_preflight_model(request: ContentRequest) -> Optional[str]:
+    """Resolve the required LLM model for preflight validation."""
+    configured_model = _normalise_model_name(getattr(config, "PREFLIGHT_VALIDATION_MODEL", None))
+    if configured_model:
+        return configured_model
+
+    arbiter_model = _normalise_model_name(getattr(request, "arbiter_model", None))
+    if arbiter_model:
+        return arbiter_model
+
+    return _normalise_model_name(getattr(request, "gran_sabio_model", None))
+
+
+def _build_preflight_failure_result(
+    *,
+    code: str,
+    message: str,
+    summary: str,
+    model: Optional[str] = None,
+) -> PreflightResult:
+    """Build a fail-closed preflight result when LLM validation cannot complete."""
+    related = ["preflight"]
+    if model:
+        related.append(model)
+
+    return PreflightResult(
+        decision="reject",
+        user_feedback=message,
+        summary=summary,
+        issues=[
+            PreflightIssue(
+                code=code,
+                severity="critical",
+                message=message,
+                blockers=True,
+                related_requirements=related,
+            )
+        ],
+        word_count_analysis=None,
+        enable_algorithmic_word_count=False,
+        duplicate_word_count_layers_to_remove=[],
+    )
 
 
 def _normalize_qa_models(qa_models: Any) -> List[str]:
@@ -162,6 +211,49 @@ def _build_validation_payload(
         payload["llm_accent_guard_mode"] = guard.mode
 
     return payload
+
+
+def _build_prompt_safety_parts(payload: Dict[str, Any]) -> List[PromptPart]:
+    """Classify preflight prompt fields by source for model-identity blinding."""
+    user_supplied_keys = {
+        "prompt",
+        "content_type",
+        "source_text",
+        "qa_layers",
+        "context_documents",
+        "context_documents_total_bytes",
+        "images",
+        "word_count",
+        "phrase_frequency",
+        "lexical_diversity",
+    }
+    system_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in user_supplied_keys
+    }
+    user_payload = {
+        key: value
+        for key, value in payload.items()
+        if key in user_supplied_keys
+    }
+
+    parts = [
+        PromptPart(
+            text=json.dumps(system_payload, ensure_ascii=True, indent=2),
+            source="system_generated",
+            label="preflight.validation_payload.system",
+        )
+    ]
+    if user_payload:
+        parts.append(
+            PromptPart(
+                text=json.dumps(user_payload, ensure_ascii=True, indent=2),
+                source="user_supplied",
+                label="preflight.validation_payload.user",
+            )
+        )
+    return parts
 
 
 def _build_validator_prompt(payload: Dict[str, Any]) -> str:
@@ -321,83 +413,14 @@ def _parse_validator_response(raw_output: str) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        return json.loads(json_blob)
+        parsed = json.loads(json_blob)
     except json.JSONDecodeError:
         return None
 
+    if not isinstance(parsed, dict):
+        return None
 
-def _analyze_word_count_conflicts(request: ContentRequest) -> Dict[str, Any]:
-    """
-    Analyze QA layers for word count conflicts and determine optimization strategy.
-
-    This function identifies scenarios where algorithmic word count enforcement
-    would conflict with manual AI evaluation layers, causing unnecessary iterations
-    and false rejections.
-
-    Args:
-        request: Content request to analyze
-
-    Returns:
-        Dictionary with optimization recommendations
-    """
-    # Check if we have word limits that would trigger algorithmic enforcement
-    has_word_limits = request.min_words is not None or request.max_words is not None
-    has_word_count_enforcement = is_word_count_enforcement_enabled(request.word_count_enforcement)
-
-    # If no word limits or enforcement, no conflicts possible
-    if not has_word_limits or not has_word_count_enforcement:
-        return {
-            "enable_algorithmic_word_count": False,
-            "duplicate_layers_to_remove": [],
-            "analysis_reason": "No word count enforcement configured"
-        }
-
-    # Algorithmic word count is ALWAYS enabled when word count enforcement is configured
-    # The severity (deal_breaker vs important) only affects whether violations trigger deal_breaker
-
-    # Identify QA layers that might conflict with algorithmic word counting
-    # These are layers that evaluate word count, length, budget adherence, etc.
-    word_count_related_keywords = [
-        "word count", "word budget", "length", "brevity", "extensión",
-        "longitud", "palabras", "budget adherence", "word limit",
-        "count adherence", "length adherence", "size", "tamaño"
-    ]
-
-    duplicate_layers_to_remove = []
-    conflicting_layers_found = []
-
-    for layer in request.qa_layers:
-        layer_name_lower = layer.name.lower()
-        layer_desc_lower = layer.description.lower() if layer.description else ""
-        layer_criteria_lower = layer.criteria.lower() if layer.criteria else ""
-
-        # Check if this layer is related to word counting
-        is_word_count_related = any(
-            keyword in layer_name_lower or
-            keyword in layer_desc_lower or
-            keyword in layer_criteria_lower
-            for keyword in word_count_related_keywords
-        )
-
-        if is_word_count_related:
-            conflicting_layers_found.append(layer.name)
-            # ALWAYS remove word count related layers - algorithmic enforcement handles this
-            duplicate_layers_to_remove.append(layer.name)
-
-    # Decision logic: Enable algorithmic enforcement if we found conflicting layers
-    if conflicting_layers_found:
-        analysis_reason = f"Found {len(conflicting_layers_found)} word count-related QA layers that may conflict with algorithmic enforcement: {', '.join(conflicting_layers_found)}"
-        if duplicate_layers_to_remove:
-            analysis_reason += f". Recommending removal of {len(duplicate_layers_to_remove)} layers with deal-breaker potential to prevent conflicts."
-    else:
-        analysis_reason = "No conflicting word count-related QA layers found"
-
-    return {
-        "enable_algorithmic_word_count": len(conflicting_layers_found) > 0,
-        "duplicate_layers_to_remove": duplicate_layers_to_remove,
-        "analysis_reason": analysis_reason,
-        "conflicting_layers_found": conflicting_layers_found
-    }
+    return parsed
 
 
 def _validate_evidence_grounding_config(request: ContentRequest) -> Optional[PreflightIssue]:
@@ -509,6 +532,19 @@ async def run_preflight_validation(
     Returns:
         PreflightResult with decision (proceed/reject) and validation feedback.
     """
+    selected_model = resolve_preflight_model(request)
+    if not selected_model:
+        message = (
+            "Preflight validation could not start because no preflight, Arbiter, "
+            "or GranSabio model is configured."
+        )
+        logger.error(message)
+        return _build_preflight_failure_result(
+            code="preflight_model_unavailable",
+            message=message,
+            summary="Preflight model unavailable",
+        )
+
     # Early validation: Check evidence grounding model compatibility (no API call needed)
     evidence_grounding_issue = _validate_evidence_grounding_config(request)
     if evidence_grounding_issue:
@@ -523,18 +559,6 @@ async def run_preflight_validation(
             duplicate_word_count_layers_to_remove=[],
         )
 
-    if not getattr(config, "PREFLIGHT_VALIDATION_MODEL", None):
-        heuristic_analysis = _analyze_word_count_conflicts(request)
-        return PreflightResult(
-            decision="proceed",
-            user_feedback="Preflight validator disabled by configuration.",
-            summary="Preflight skipped (no model configured).",
-            issues=[],
-            word_count_analysis=None,
-            enable_algorithmic_word_count=heuristic_analysis["enable_algorithmic_word_count"],
-            duplicate_word_count_layers_to_remove=heuristic_analysis["duplicate_layers_to_remove"],
-        )
-
     payload = _build_validation_payload(
         request,
         context_documents=context_documents,
@@ -542,27 +566,19 @@ async def run_preflight_validation(
         model_alias_registry=model_alias_registry,
     )
     validator_prompt = _build_validator_prompt(payload)
-    guard_payload = dict(payload)
-    guard_payload.pop("prompt", None)
-    prompt_safety_parts = [
-        PromptPart(
-            text=json.dumps(guard_payload, ensure_ascii=True, indent=2),
-            source="system_generated",
-            label="preflight.validation_payload",
-        )
-    ]
+    prompt_safety_parts = _build_prompt_safety_parts(payload)
 
     try:
         if phase_logger:
-            phase_logger.info(f"Running preflight validation with model: {config.PREFLIGHT_VALIDATION_MODEL}")
+            phase_logger.info(f"Running preflight validation with model: {selected_model}")
         else:
-            logger.info(f"Running preflight validation with model: {config.PREFLIGHT_VALIDATION_MODEL}")
+            logger.info(f"Running preflight validation with model: {selected_model}")
             logger.debug(f"Preflight prompt: {validator_prompt[:500]}...")
 
         # Log full prompt if extra_verbose is enabled via phase_logger
         if phase_logger:
             phase_logger.log_prompt(
-                model=config.PREFLIGHT_VALIDATION_MODEL,
+                model=selected_model,
                 system_prompt=config.PREFLIGHT_SYSTEM_PROMPT,
                 user_prompt=validator_prompt,
                 temperature=0.0,
@@ -576,6 +592,7 @@ async def run_preflight_validation(
                 operation="preflight_validation",
                 metadata={
                     "context_documents": len(context_documents or []),
+                    "model": selected_model,
                 },
             )
             if usage_tracker and usage_tracker.enabled
@@ -587,7 +604,7 @@ async def run_preflight_validation(
             accumulated_content = ""
             async for chunk in ai_service.generate_content_stream(
                 prompt=validator_prompt,
-                model=config.PREFLIGHT_VALIDATION_MODEL,
+                model=selected_model,
                 temperature=0.0,
                 max_tokens=800,
                 system_prompt=config.PREFLIGHT_SYSTEM_PROMPT,
@@ -616,7 +633,7 @@ async def run_preflight_validation(
             # Use non-streaming generation (original behavior)
             raw_output = await ai_service.generate_content(
                 prompt=validator_prompt,
-                model=config.PREFLIGHT_VALIDATION_MODEL,
+                model=selected_model,
                 temperature=0.0,
                 max_tokens=800,
                 system_prompt=config.PREFLIGHT_SYSTEM_PROMPT,
@@ -630,7 +647,7 @@ async def run_preflight_validation(
         # Log response if phase_logger is available
         if phase_logger:
             phase_logger.log_response(
-                model=config.PREFLIGHT_VALIDATION_MODEL,
+                model=selected_model,
                 response=raw_output
             )
         else:
@@ -638,34 +655,42 @@ async def run_preflight_validation(
 
     except Exception as exc:
         logger.error("Preflight validation request failed: %s", exc, exc_info=True)
-        heuristic_analysis = _analyze_word_count_conflicts(request)
-        return PreflightResult(
-            decision="proceed",
-            user_feedback="Preflight validator unavailable. Proceeding with generation.",
-            summary="Preflight request failed",
-            issues=[],
-            word_count_analysis=None,
-            enable_algorithmic_word_count=heuristic_analysis["enable_algorithmic_word_count"],
-            duplicate_word_count_layers_to_remove=heuristic_analysis["duplicate_layers_to_remove"],
+        return _build_preflight_failure_result(
+            code="preflight_llm_call_failed",
+            message=(
+                f"Preflight validation could not be completed with model '{selected_model}': "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            summary="Preflight LLM call failed",
+            model=selected_model,
         )
 
     parsed = _parse_validator_response(raw_output)
     if not parsed:
         logger.warning("Preflight validator returned unparseable output: %s", raw_output)
-        heuristic_analysis = _analyze_word_count_conflicts(request)
-        return PreflightResult(
-            decision="proceed",
-            user_feedback="Preflight validator returned unexpected output. Proceeding with generation.",
+        return _build_preflight_failure_result(
+            code="preflight_invalid_response",
+            message=(
+                f"Preflight validation failed because model '{selected_model}' returned "
+                "an unparseable response."
+            ),
             summary="Preflight response unparseable",
-            issues=[],
-            word_count_analysis=None,
-            enable_algorithmic_word_count=heuristic_analysis["enable_algorithmic_word_count"],
-            duplicate_word_count_layers_to_remove=heuristic_analysis["duplicate_layers_to_remove"],
+            model=selected_model,
         )
 
-    decision = str(parsed.get("decision", "proceed")).strip().lower()
+    decision_raw = parsed.get("decision")
+    decision = str(decision_raw).strip().lower() if decision_raw is not None else ""
     if decision not in {"proceed", "reject"}:
-        decision = "proceed"
+        logger.warning("Preflight validator returned invalid decision: %s", decision_raw)
+        return _build_preflight_failure_result(
+            code="preflight_invalid_decision",
+            message=(
+                f"Preflight validation failed because model '{selected_model}' returned "
+                f"an invalid decision: {decision_raw!r}."
+            ),
+            summary="Preflight decision invalid",
+            model=selected_model,
+        )
 
     issues = _normalise_issues(parsed.get("issues"))
 
@@ -716,8 +741,11 @@ async def run_preflight_validation(
             if removed_count > 0:
                 logger.info(f"Removed {removed_count} conflicting QA layers: {recommended_removals}")
 
-    # Fallback to heuristic analysis if AI didn't provide word count analysis
-    heuristic_analysis = _analyze_word_count_conflicts(request)
+    llm_recommended_removals = (
+        word_count_analysis.recommended_removals
+        if word_count_analysis is not None
+        else []
+    )
 
     result = PreflightResult(
         decision=decision,
@@ -726,8 +754,8 @@ async def run_preflight_validation(
         issues=issues,
         confidence=confidence,
         word_count_analysis=word_count_analysis,
-        enable_algorithmic_word_count=heuristic_analysis["enable_algorithmic_word_count"],
-        duplicate_word_count_layers_to_remove=heuristic_analysis["duplicate_layers_to_remove"],
+        enable_algorithmic_word_count=bool(llm_recommended_removals),
+        duplicate_word_count_layers_to_remove=llm_recommended_removals,
     )
 
     # Log decision using phase_logger if available

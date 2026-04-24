@@ -175,7 +175,7 @@ class FakeLongTextAIService:
         for chunk in chunks:
             yield chunk
 
-    async def generate_content_with_validation_tools(self, *args, **kwargs):
+    async def call_ai_with_validation_tools(self, *args, **kwargs):
         raise AssertionError("Tool loop should not run in these unit tests")
 
 

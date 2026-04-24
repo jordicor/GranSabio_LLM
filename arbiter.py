@@ -13,7 +13,7 @@ The actual Arbiter class implementation will be added in Phase 2.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
+from typing import List, Dict, Any, Optional, Tuple, Callable, Awaitable, TYPE_CHECKING
 from enum import Enum
 from pydantic import BaseModel, Field
 from model_aliasing import PromptPart
@@ -42,7 +42,6 @@ class ArbiterDecision(str, Enum):
     """Arbiter's decision for an edit."""
     APPLY = "apply"
     DISCARD = "discard"
-    MERGE = "merge"  # Combine with another edit
 
 
 class EditDistribution(str, Enum):
@@ -75,14 +74,9 @@ class EditDistribution(str, Enum):
 class ProposedEdit:
     """An edit proposed by a QA evaluator."""
     edit: "TextEditRange"           # The actual edit
-    source_model: str               # Which model proposed it (e.g., "gpt-4o")
-    source_score: float             # Score given by that model
+    source_evaluator: str           # Blind evaluator alias (e.g., "Evaluator A")
+    source_score: float             # Score given by that evaluator
     paragraph_key: str              # Unique key for the paragraph
-    source_alias: Optional[str] = None  # Prompt-facing evaluator label
-
-    @property
-    def prompt_source(self) -> str:
-        return self.source_alias or self.source_model
 
 
 @dataclass
@@ -100,13 +94,8 @@ class ArbiterEditDecision:
     edit: "TextEditRange"
     decision: ArbiterDecision
     reason: str
-    source_model: str
+    source_evaluator: str
     conflict_resolved: Optional[ConflictInfo] = None
-    source_alias: Optional[str] = None
-
-    @property
-    def prompt_source(self) -> str:
-        return self.source_alias or self.source_model
 
 
 @dataclass
@@ -126,6 +115,19 @@ class EditRoundRecord:
     def edits_discarded(self) -> List[ArbiterEditDecision]:
         """Get all edits that were discarded."""
         return [d for d in self.decisions if d.decision == ArbiterDecision.DISCARD]
+
+
+def _enum_or_text_value(value: Any, default: str = "unknown") -> str:
+    """Return enum .value when present, otherwise a stable string value."""
+    if value is None:
+        return default
+    raw_value = value.value if hasattr(value, "value") else value
+    text = str(raw_value).strip()
+    return text or default
+
+
+def _edit_type_value(edit: Any, default: str = "unknown") -> str:
+    return _enum_or_text_value(getattr(edit, "edit_type", None), default)
 
 
 def _get_paragraph_key_for_history(edit: "TextEditRange") -> str:
@@ -201,22 +203,22 @@ class LayerEditHistory:
             lines.append(f"Round {record.round_number}:")
 
             for decision in record.edits_applied:
-                op = decision.edit.edit_type.value if hasattr(decision.edit, 'edit_type') else "EDIT"
+                op = _edit_type_value(decision.edit, "EDIT")
                 desc = ""
                 if hasattr(decision.edit, 'issue_description') and decision.edit.issue_description:
                     desc = decision.edit.issue_description[:50]
                 elif hasattr(decision.edit, 'edit_instruction') and decision.edit.edit_instruction:
                     desc = decision.edit.edit_instruction[:50]
-                lines.append(f"- Applied: {op.upper()} {desc} - {decision.prompt_source}")
+                lines.append(f"- Applied: {op.upper()} {desc} - {decision.source_evaluator}")
 
             for decision in record.edits_discarded:
-                op = decision.edit.edit_type.value if hasattr(decision.edit, 'edit_type') else "EDIT"
+                op = _edit_type_value(decision.edit, "EDIT")
                 desc = ""
                 if hasattr(decision.edit, 'issue_description') and decision.edit.issue_description:
                     desc = decision.edit.issue_description[:50]
                 elif hasattr(decision.edit, 'edit_instruction') and decision.edit.edit_instruction:
                     desc = decision.edit.edit_instruction[:50]
-                lines.append(f"- Discarded: {op.upper()} {desc} - {decision.prompt_source}")
+                lines.append(f"- Discarded: {op.upper()} {desc} - {decision.source_evaluator}")
                 lines.append(f"  Reason: {decision.reason[:80]}")
 
         lines.append("[/PREVIOUS_EDITS_IN_LAYER]")
@@ -249,6 +251,7 @@ class ArbiterResult(BaseModel):
     """Result from Arbiter arbitration."""
     edits_to_apply: List[Any] = Field(default_factory=list, description="TextEditRange objects to apply")
     edits_discarded: List[Dict[str, Any]] = Field(default_factory=list, description="Discarded edits with reasons")
+    edit_decisions: List[Any] = Field(default_factory=list, exclude=True, description="Internal ArbiterEditDecision records")
     conflicts_found: int = Field(default=0, description="Number of conflicts detected")
     conflicts_resolved: int = Field(default=0, description="Number of conflicts resolved")
     round_record: Optional[Dict[str, Any]] = Field(default=None, description="EditRoundRecord as dict for history")
@@ -297,6 +300,13 @@ class ArbiterContext:
     gran_sabio_model: Optional[str] = None  # Powerful model for difficult cases
     qa_model_count: int = 1                 # Total number of QA models (for distribution calc)
     model_alias_registry: Optional[Any] = None
+
+    # Tool-loop activation knob forwarded from ``ContentRequest.arbiter_tools_mode``.
+    # ``"auto"`` lets the Arbiter activate the shared ``call_ai_with_validation_tools``
+    # loop when the provider supports it; ``"never"`` forces the legacy single-shot
+    # path. Declared here (not on the constructor) so tests and callers can vary
+    # it per-arbitration without mutating Arbiter state.
+    arbiter_tools_mode: str = "auto"
 
 
 # =============================================================================
@@ -366,7 +376,6 @@ Minimum Score: {layer_min_score}
 Analyze EACH proposed edit and decide:
 1. APPLY - The edit should be applied (well-reasoned and aligned with request)
 2. DISCARD - The edit should NOT be applied (explain why - misalignment, poor reasoning, etc.)
-3. MERGE - Combine with another edit (specify which)
 
 CRITICAL VERIFICATION (check for EACH edit):
 1. Does this edit CONTRADICT the user's original instructions? If yes → DISCARD
@@ -383,20 +392,105 @@ RESPONSE FORMAT (JSON):
   "decisions": [
     {{
       "edit_index": 0,
-      "decision": "apply|discard|merge",
-      "reason": "Specific reason - if discarding, explain the misalignment or flaw",
-      "merge_with": null
+      "decision": "APPLY|DISCARD",
+      "reason": "Specific reason - if discarding, explain the misalignment or flaw"
     }}
   ],
   "conflicts_resolved": [
     {{
-      "conflict_type": "opposite_operations",
-      "resolution": "How you resolved it",
-      "chosen_edit_index": 0
+      "conflict_index": 0,
+      "resolution": "How you resolved it"
     }}
   ]
 }}
 """
+
+
+# =============================================================================
+# ARBITER RESPONSE SCHEMA (JSON Structured Outputs contract)
+# =============================================================================
+
+# Schema conventions (mirroring ``qa_response_schemas.py``):
+# - No numeric ``minimum``/``maximum`` — OpenAI strict structured outputs
+#   reject those keywords.
+# - ``additionalProperties: false`` at every object level (root + items).
+# - Every property listed in ``required`` (nullables are expressed via
+#   ``"type": [..., "null"]`` inside ``properties``, not by omission).
+# - MERGE decision removed — only ``APPLY`` / ``DISCARD`` survive.
+
+ARBITER_RESPONSE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["decisions", "conflicts_resolved", "reasoning"],
+    "properties": {
+        "decisions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["edit_index", "decision", "reason"],
+                "properties": {
+                    "edit_index": {"type": "integer"},
+                    "decision": {"type": "string", "enum": ["APPLY", "DISCARD"]},
+                    "reason": {"type": "string"},
+                },
+            },
+        },
+        "conflicts_resolved": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["conflict_index", "resolution"],
+                "properties": {
+                    "conflict_index": {"type": "integer"},
+                    "resolution": {"type": "string"},
+                },
+            },
+        },
+        "reasoning": {"type": "string"},
+    },
+}
+
+
+# =============================================================================
+# ARBITER PARSE ERROR (fail-closed exception for the hardened parser)
+# =============================================================================
+
+
+class ArbiterParseError(Exception):
+    """Raised when the Arbiter response violates the decision contract.
+
+    Carries granular lists for telemetry so operators can diagnose which
+    criterion failed (missing index, duplicate, out-of-range, or an invalid
+    decision value). When raised inside the runtime arbitration flow the
+    caller fail-closes the batch — no edit is applied.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        missing_indices: Optional[List[int]] = None,
+        duplicate_indices: Optional[List[int]] = None,
+        out_of_range: Optional[List[int]] = None,
+        invalid_decisions: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.missing_indices: List[int] = list(missing_indices or [])
+        self.duplicate_indices: List[int] = list(duplicate_indices or [])
+        self.out_of_range: List[int] = list(out_of_range or [])
+        self.invalid_decisions: List[Dict[str, Any]] = list(invalid_decisions or [])
+
+    def to_event_payload(self) -> Dict[str, Any]:
+        """Shape the exception data into a debug-event payload dict."""
+        return {
+            "message": str(self),
+            "missing_indices": list(self.missing_indices),
+            "duplicate_indices": list(self.duplicate_indices),
+            "out_of_range": list(self.out_of_range),
+            "invalid_decisions": list(self.invalid_decisions),
+        }
 
 
 # =============================================================================
@@ -433,7 +527,9 @@ class Arbiter:
         self,
         ai_service: Any,
         model: Optional[str] = None,
-        stream_callback: Optional[callable] = None
+        stream_callback: Optional[callable] = None,
+        debug_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
     ):
         """
         Initialize Arbiter.
@@ -443,11 +539,28 @@ class Arbiter:
             model: Model to use for conflict resolution (default from config)
             stream_callback: Optional callback for streaming AI responses.
                              Signature: async def callback(chunk: str, model: str, operation: str)
+            debug_event_callback: Optional pre-bound callback that persists arbitration
+                events to the debugger DB. Signature: async def cb(event_type, payload).
+                The caller is responsible for binding session_id at construction time.
+            tool_event_callback: Optional pre-bound callback for live tool-loop events
+                pushed to /stream/project. Signature: async def cb(event_type, payload).
+                Used when the Arbiter runs inside the shared tool loop.
         """
         self.ai_service = ai_service
         self._model = model
         self.stream_callback = stream_callback
+        self._debug_event_callback = debug_event_callback
+        self._tool_event_callback = tool_event_callback
         self._logger = __import__('logging').getLogger(__name__)
+
+    async def _emit_debug_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+        """Persist an arbiter event to the debugger DB if a callback is bound."""
+        if self._debug_event_callback is None:
+            return
+        try:
+            await self._debug_event_callback(event_type, payload)
+        except Exception:
+            self._logger.exception("Arbiter debug_event_callback failed for %s", event_type)
 
     @property
     def model(self) -> str:
@@ -485,14 +598,14 @@ class Arbiter:
         if qa_model_count <= 0:
             return EditDistribution.SINGLE_QA
 
-        # Count unique models that proposed edits
-        models_with_edits = set(pe.source_model for pe in proposed_edits)
-        proposing_count = len(models_with_edits)
+        # Count unique evaluators that proposed edits
+        evaluators_with_edits = set(pe.source_evaluator for pe in proposed_edits)
+        proposing_count = len(evaluators_with_edits)
 
         # Check for conflicts first (always escalate)
         if conflicts:
-            # Check if it's a tie situation (2 models, any disagreement)
-            if qa_model_count == 2 and proposing_count >= 1:
+            # With 2 models, any conflict is a TIE (disagreement between the pair)
+            if qa_model_count == 2:
                 return EditDistribution.TIE
             return EditDistribution.CONFLICT
 
@@ -525,8 +638,9 @@ class Arbiter:
 
         if ratio > 0.5:
             return EditDistribution.MAJORITY  # >50% proposed
-        else:
-            return EditDistribution.MINORITY  # ≤50% proposed (includes exactly 50%)
+        if proposing_count * 2 == qa_model_count:
+            return EditDistribution.TIE  # Exactly 50% proposed
+        return EditDistribution.MINORITY  # <50% proposed
 
     def _select_model_for_distribution(
         self,
@@ -575,12 +689,12 @@ class Arbiter:
         Returns:
             Formatted string for prompt injection
         """
-        models_with_edits = set(pe.prompt_source for pe in proposed_edits)
-        proposing_count = len(models_with_edits)
+        evaluators_with_edits = set(pe.source_evaluator for pe in proposed_edits)
+        proposing_count = len(evaluators_with_edits)
 
         lines = [
             f"Total QA evaluators: {qa_model_count}",
-            f"Evaluators proposing edits: {proposing_count} ({', '.join(sorted(models_with_edits)) if models_with_edits else 'none'})",
+            f"Evaluators proposing edits: {proposing_count} ({', '.join(sorted(evaluators_with_edits)) if evaluators_with_edits else 'none'})",
             f"Distribution: {distribution.value.upper()}"
         ]
 
@@ -622,7 +736,7 @@ class Arbiter:
         self,
         proposed_edits: List[ProposedEdit],
         current_content: str
-    ) -> Tuple[List[ProposedEdit], List[Dict[str, Any]]]:
+    ) -> Tuple[List[ProposedEdit], List[Dict[str, Any]], List[Tuple[int, ArbiterEditDecision]]]:
         """
         Filter out stale edits that are no longer applicable to current content.
 
@@ -638,12 +752,13 @@ class Arbiter:
             current_content: Current content after previous edits
 
         Returns:
-            Tuple of (valid_edits, discarded_edits_info)
+            Tuple of (valid_edits, discarded_edits_info, discarded_decisions_by_original_index)
         """
         valid_edits = []
         discarded_info = []
+        discarded_decisions: List[Tuple[int, ArbiterEditDecision]] = []
 
-        for pe in proposed_edits:
+        for original_index, pe in enumerate(proposed_edits):
             edit = pe.edit
 
             # Get exact_fragment and suggested_text from edit
@@ -657,41 +772,60 @@ class Arbiter:
 
             # Check 1: Does exact_fragment still exist in content?
             if exact_fragment not in current_content:
+                reason = "STALE_FRAGMENT: exact_fragment no longer exists in content"
                 self._logger.info(
                     f"Stale edit detected (STALE_FRAGMENT): '{exact_fragment[:40]}...' "
-                    f"no longer in content [model: {pe.source_model}]"
+                    f"no longer in content [evaluator: {pe.source_evaluator}]"
                 )
                 discarded_info.append({
-                    "edit_type": edit.edit_type.value if hasattr(edit, 'edit_type') else "unknown",
-                    "source_model": pe.source_model,
-                    "source_alias": pe.source_alias,
-                    "reason": f"STALE_FRAGMENT: exact_fragment no longer exists in content",
+                    "edit_type": _edit_type_value(edit),
+                    "source_evaluator": pe.source_evaluator,
+                    "reason": reason,
                     "paragraph_key": pe.paragraph_key[:80],
                     "conflict_type": ConflictType.STALE_FRAGMENT.value
                 })
+                discarded_decisions.append((
+                    original_index,
+                    ArbiterEditDecision(
+                        edit=edit,
+                        decision=ArbiterDecision.DISCARD,
+                        reason=reason,
+                        source_evaluator=pe.source_evaluator,
+                    ),
+                ))
                 continue
 
-            # Check 2: Is suggested_text already in place? (for REPLACE operations)
+            # Check 2: Is suggested_text already in place? (REPLACE/MODIFY only)
+            # DELETE operations have new_content=None and are not covered here:
+            # an already-applied DELETE leaves exact_fragment absent from content,
+            # so Check 1 (STALE_FRAGMENT) catches that case.
             if suggested_text is not None:
-                # Find where exact_fragment is and check if surrounding context
-                # already has the suggested_text
                 fragment_pos = current_content.find(exact_fragment)
                 if fragment_pos != -1:
-                    # Check if suggested_text is already at this position
-                    # (meaning the edit was already applied or content matches)
+                    # suggested_text == exact_fragment means the edit is a noop
+                    # (already applied or nothing to change).
                     if exact_fragment == suggested_text:
+                        reason = "ALREADY_APPLIED: suggested_text equals exact_fragment (noop)"
                         self._logger.info(
                             f"Stale edit detected (ALREADY_APPLIED): suggested_text equals "
-                            f"exact_fragment [model: {pe.source_model}]"
+                            f"exact_fragment [evaluator: {pe.source_evaluator}]"
                         )
                         discarded_info.append({
-                            "edit_type": edit.edit_type.value if hasattr(edit, 'edit_type') else "unknown",
-                            "source_model": pe.source_model,
-                            "source_alias": pe.source_alias,
-                            "reason": f"ALREADY_APPLIED: suggested_text equals exact_fragment (noop)",
+                            "edit_type": _edit_type_value(edit),
+                            "source_evaluator": pe.source_evaluator,
+                            "reason": reason,
                             "paragraph_key": pe.paragraph_key[:80],
                             "conflict_type": ConflictType.ALREADY_APPLIED.value
                         })
+                        discarded_decisions.append((
+                            original_index,
+                            ArbiterEditDecision(
+                                edit=edit,
+                                decision=ArbiterDecision.DISCARD,
+                                reason=reason,
+                                source_evaluator=pe.source_evaluator,
+                            ),
+                        ))
                         continue
 
             # Edit is valid
@@ -703,7 +837,7 @@ class Arbiter:
                 f"{len(valid_edits)} valid edit(s) remaining"
             )
 
-        return valid_edits, discarded_info
+        return valid_edits, discarded_info, discarded_decisions
 
     def _detect_opposite_operations(
         self,
@@ -725,7 +859,7 @@ class Arbiter:
 
         op_types = []
         for pe in edits:
-            op = pe.edit.edit_type.value.lower() if hasattr(pe.edit, 'edit_type') else "unknown"
+            op = _edit_type_value(pe.edit).lower()
             op_types.append(op)
 
         has_destructive = any(op in _DESTRUCTIVE_OPS for op in op_types)
@@ -760,7 +894,7 @@ class Arbiter:
 
         op_types = []
         for pe in edits:
-            op = pe.edit.edit_type.value.lower() if hasattr(pe.edit, 'edit_type') else "unknown"
+            op = _edit_type_value(pe.edit).lower()
             op_types.append(op)
 
         has_expanding = any(op in _EXPANDING_OPS for op in op_types)
@@ -795,7 +929,7 @@ class Arbiter:
 
         severities = []
         for pe in edits:
-            sev = pe.edit.issue_severity.value if hasattr(pe.edit, 'issue_severity') else "minor"
+            sev = _enum_or_text_value(getattr(pe.edit, "issue_severity", None), "minor")
             severities.append(sev)
 
         unique_severities = set(severities)
@@ -834,7 +968,7 @@ class Arbiter:
         # they are likely redundant
         op_counts: Dict[str, int] = {}
         for pe in edits:
-            op = pe.edit.edit_type.value.lower() if hasattr(pe.edit, 'edit_type') else "unknown"
+            op = _edit_type_value(pe.edit).lower()
             op_counts[op] = op_counts.get(op, 0) + 1
 
         redundant_ops = [op for op, count in op_counts.items() if count > 1]
@@ -948,8 +1082,8 @@ class Arbiter:
 
         lines = []
         for i, pe in enumerate(proposed_edits):
-            op = pe.edit.edit_type.value if hasattr(pe.edit, 'edit_type') else "EDIT"
-            sev = pe.edit.issue_severity.value if hasattr(pe.edit, 'issue_severity') else "minor"
+            op = _edit_type_value(pe.edit, "EDIT")
+            sev = _enum_or_text_value(getattr(pe.edit, "issue_severity", None), "minor")
             desc = ""
             if hasattr(pe.edit, 'issue_description') and pe.edit.issue_description:
                 desc = pe.edit.issue_description[:100]
@@ -962,7 +1096,7 @@ class Arbiter:
 
             # Build edit info with fragment details
             edit_info = (
-                f"[{i}] {op.upper()} (severity={sev}) by {pe.prompt_source}\n"
+                f"[{i}] {op.upper()} (severity={sev}) by {pe.source_evaluator}\n"
                 f"    Paragraph: {pe.paragraph_key[:60]}...\n"
                 f"    Description: {desc}"
             )
@@ -998,7 +1132,7 @@ class Arbiter:
 
         lines = []
         for i, conflict in enumerate(conflicts):
-            involved_evaluators = [pe.prompt_source for pe in conflict.involved_edits]
+            involved_evaluators = [pe.source_evaluator for pe in conflict.involved_edits]
             lines.append(
                 f"[Conflict {i + 1}] {conflict.conflict_type.value}\n"
                 f"  Paragraph: {conflict.paragraph_key[:60]}...\n"
@@ -1027,17 +1161,16 @@ class Arbiter:
         """
         system_prompt_section = ""
         if context.system_prompt:
-            system_prompt_section = f"System Prompt: {context.system_prompt[:500]}..."
+            system_prompt_section = f"System Prompt: {context.system_prompt}"
 
         # Get history formatted
         history_str = context.layer_history.format_for_prompt()
         if not history_str:
             history_str = "No previous edits in this layer."
 
-        # Get content excerpt
-        content_excerpt = context.content_excerpt or context.current_content[:2000]
-        if len(context.current_content) > 2000:
-            content_excerpt += "\n[... content truncated ...]"
+        # Use full content excerpt; context budget is enforced by the tool loop
+        # (estimate_prompt_overflow + TOOL_LOOP_MAX_PROMPT_CHARS), fail-fast if overflow.
+        content_excerpt = context.content_excerpt or context.current_content
 
         # Format distribution info
         distribution_info = self._format_distribution_info(
@@ -1046,10 +1179,10 @@ class Arbiter:
 
         return ARBITER_USER_PROMPT_TEMPLATE.format(
             content_type=context.content_type,
-            original_prompt=context.original_prompt[:1000],
+            original_prompt=context.original_prompt,
             system_prompt_section=system_prompt_section,
             layer_name=context.layer_name,
-            layer_criteria=context.layer_criteria[:500],
+            layer_criteria=context.layer_criteria,
             layer_min_score=context.layer_min_score,
             content_excerpt=content_excerpt,
             layer_history=history_str,
@@ -1062,6 +1195,46 @@ class Arbiter:
     # AI RESOLUTION METHODS
     # =========================================================================
 
+    @staticmethod
+    def _should_use_arbiter_tools(mode: str, model: Optional[str]) -> bool:
+        """Decide whether to route the Arbiter call through the shared tool loop.
+
+        Returns ``False`` when:
+
+        - ``mode == "never"`` (user explicitly disabled).
+        - Model resolves to the OpenAI Responses API (single-shot only — the
+          tool loop does not support that API today).
+        - Provider is outside the supported matrix
+          (``openai``, ``openrouter``, ``xai``, ``claude``, ``gemini``).
+
+        Returns ``True`` otherwise. Unknown / unresolvable models fall back
+        to ``False`` (fail-closed — no tools if we can't prove support).
+        """
+        if mode == "never":
+            return False
+        if not model:
+            return False
+
+        from ai_service import AIService
+        from config import config as _config
+
+        try:
+            info = _config.get_model_info(model)
+        except Exception:
+            return False
+
+        provider_raw = info.get("provider", "") if isinstance(info, dict) else ""
+        model_id = info.get("model_id", model) if isinstance(info, dict) else model
+        provider_key = AIService._normalize_tool_loop_provider(provider_raw)
+
+        if provider_key == "openai" and AIService._is_openai_responses_api_model(model_id):
+            return False
+
+        if provider_key not in {"openai", "openrouter", "xai", "claude", "gemini"}:
+            return False
+
+        return True
+
     async def _resolve_with_ai(
         self,
         context: ArbiterContext,
@@ -1073,7 +1246,15 @@ class Arbiter:
         Call AI to analyze and decide on proposed edits.
 
         ALWAYS called - verifies alignment with original request even without conflicts.
-        Supports streaming when stream_callback is provided.
+
+        When ``context.arbiter_tools_mode == "auto"`` and the provider/model
+        support the shared tool loop, dispatches through
+        :meth:`AIService.call_ai_with_validation_tools` with
+        ``OutputContract.JSON_STRUCTURED`` + ``ARBITER_RESPONSE_SCHEMA`` so the
+        returned ``envelope.payload`` is a parsed+validated dict. When the tool
+        loop is not usable (mode ``"never"`` or unsupported provider), the
+        legacy single-shot path runs through ``generate_content`` /
+        ``generate_content_stream``.
 
         Args:
             context: Full arbitration context
@@ -1108,85 +1289,190 @@ class Arbiter:
                 )
             ]
 
+        tool_loop_enabled = self._should_use_arbiter_tools(
+            context.arbiter_tools_mode, selected_model
+        )
+
         try:
-            response_content = ""
-
-            if self.stream_callback:
-                # Streaming mode - emit chunks in real-time
-                async for chunk in self.ai_service.generate_content_stream(
+            if tool_loop_enabled:
+                parsed = await self._resolve_with_tool_loop(
+                    context=context,
                     prompt=prompt,
-                    model=selected_model,
-                    system_prompt=ARBITER_SYSTEM_PROMPT,
-                    max_tokens=config.ARBITER_MAX_TOKENS,
-                    temperature=config.ARBITER_TEMPERATURE,
-                    json_output=True,
-                    model_alias_registry=context.model_alias_registry,
+                    selected_model=selected_model,
                     prompt_safety_parts=prompt_safety_parts,
-                ):
-                    # Handle StreamChunk (Claude thinking) vs plain string
-                    if hasattr(chunk, 'text'):
-                        chunk_text = chunk.text
-                        is_thinking = getattr(chunk, 'is_thinking', False)
-                    else:
-                        chunk_text = chunk
-                        is_thinking = False
-
-                    if chunk_text:
-                        # Only accumulate non-thinking for JSON parsing
-                        if not is_thinking:
-                            response_content += chunk_text
-                        # Stream all (including thinking) for live monitoring
-                        await self.stream_callback(chunk_text, selected_model, "arbitration")
+                )
             else:
-                # Non-streaming mode
-                response_content = await self.ai_service.generate_content(
+                parsed = await self._resolve_single_shot(
+                    context=context,
                     prompt=prompt,
-                    model=selected_model,
-                    system_prompt=ARBITER_SYSTEM_PROMPT,
-                    max_tokens=config.ARBITER_MAX_TOKENS,
-                    temperature=config.ARBITER_TEMPERATURE,
-                    json_output=True,
-                    model_alias_registry=context.model_alias_registry,
+                    selected_model=selected_model,
                     prompt_safety_parts=prompt_safety_parts,
                 )
 
-            return self._parse_ai_response_json(response_content)
+            await self._emit_debug_event(
+                "arbiter_ai_resolution",
+                {
+                    "model": selected_model,
+                    "layer_name": context.layer_name,
+                    "distribution": distribution.value,
+                    "proposed_edit_count": len(context.proposed_edits),
+                    "conflict_count": len(conflicts),
+                    "has_decisions": bool(parsed.get("decisions")),
+                    "tool_loop": tool_loop_enabled,
+                },
+            )
+            return parsed
 
         except Exception as e:
             self._logger.error(f"Arbiter AI call failed: {e}")
+            await self._emit_debug_event(
+                "arbiter_ai_error",
+                {
+                    "model": selected_model,
+                    "layer_name": context.layer_name,
+                    "error": str(e),
+                    "tool_loop": tool_loop_enabled,
+                },
+            )
             raise RuntimeError(f"Arbiter AI call failed: {e}") from e
 
-    def _parse_ai_response_json(self, response: str) -> Dict[str, Any]:
+    async def _resolve_with_tool_loop(
+        self,
+        *,
+        context: ArbiterContext,
+        prompt: str,
+        selected_model: str,
+        prompt_safety_parts: Optional[List[Any]],
+    ) -> Dict[str, Any]:
+        """Dispatch the Arbiter call through ``call_ai_with_validation_tools``.
+
+        Uses ``OutputContract.JSON_STRUCTURED`` with ``ARBITER_RESPONSE_SCHEMA``
+        so ``envelope.payload`` arrives already parsed and schema-validated.
         """
-        Parse AI response JSON string into dict.
+        from config import config
+        from tool_loop_models import (
+            LoopScope,
+            OutputContract,
+            PayloadScope,
+        )
 
-        Args:
-            response: JSON string from AI
+        # A neutral validation callback is required by the tool loop signature.
+        # The Arbiter does not iterate on draft metrics — it arbitrates edits.
+        # The initial measurement is the current content so the LLM sees the
+        # deterministic picture before making a decision; subsequent turns
+        # only happen if the model chooses to call ``validate_draft`` again.
+        from deterministic_validation import DraftValidationResult
+        from word_count_utils import count_words
 
-        Returns:
-            Parsed dict, or empty dict on error
+        def _neutral_validation_callback(text: str) -> DraftValidationResult:
+            wc = count_words(text or "")
+            return DraftValidationResult(
+                approved=True,
+                hard_failed=False,
+                score=10.0,
+                word_count=wc,
+                feedback="Arbiter measurement snapshot (no enforced constraints).",
+                issues=[],
+                metrics={"word_count": wc},
+                checks={},
+                stylistic_metrics=None,
+                visible_payload={},
+            )
+
+        max_rounds = getattr(config, "ARBITER_MAX_TOOL_ROUNDS", 2)
+
+        _, envelope = await self.ai_service.call_ai_with_validation_tools(
+            prompt=prompt,
+            model=selected_model,
+            validation_callback=_neutral_validation_callback,
+            output_contract=OutputContract.JSON_STRUCTURED,
+            response_format=ARBITER_RESPONSE_SCHEMA,
+            payload_scope=PayloadScope.MEASUREMENT_ONLY,
+            stop_on_approval=False,
+            loop_scope=LoopScope.ARBITER,
+            retries_enabled=True,
+            max_tool_rounds=max_rounds,
+            initial_measurement_text=context.current_content,
+            tool_event_callback=self._tool_event_callback,
+            temperature=config.ARBITER_TEMPERATURE,
+            max_tokens=config.ARBITER_MAX_TOKENS,
+            system_prompt=ARBITER_SYSTEM_PROMPT,
+            model_alias_registry=context.model_alias_registry,
+            prompt_safety_parts=prompt_safety_parts,
+        )
+
+        payload = envelope.payload if envelope is not None else None
+        if not isinstance(payload, dict):
+            # Tool loop fell back (e.g. ``tools_skipped_reason``) without
+            # producing a parsed dict. Fail-closed to the caller; the
+            # arbitrate() layer will DISCARD the batch conservatively.
+            from tool_loop_models import JsonContractError
+            reason = (
+                envelope.tools_skipped_reason
+                if envelope is not None else "tool_loop_payload_missing"
+            )
+            raise JsonContractError(
+                f"Arbiter tool-loop returned no parsed payload (reason={reason})."
+            )
+        return payload
+
+    async def _resolve_single_shot(
+        self,
+        *,
+        context: ArbiterContext,
+        prompt: str,
+        selected_model: str,
+        prompt_safety_parts: Optional[List[Any]],
+    ) -> Dict[str, Any]:
+        """Legacy single-shot arbitration path (tools disabled / unsupported).
+
+        Supports streaming when ``stream_callback`` is set. Parses the final
+        JSON via :func:`tool_loop_models.parse_json_with_markdown_fences` so
+        the strip-markdown logic lives in a single utility.
         """
-        import json_utils as json
+        from config import config
+        from tool_loop_models import parse_json_with_markdown_fences
 
-        # Handle response that might be wrapped in markdown code blocks
-        text = response.strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
+        response_content = ""
+        if self.stream_callback:
+            async for chunk in self.ai_service.generate_content_stream(
+                prompt=prompt,
+                model=selected_model,
+                system_prompt=ARBITER_SYSTEM_PROMPT,
+                max_tokens=config.ARBITER_MAX_TOKENS,
+                temperature=config.ARBITER_TEMPERATURE,
+                json_output=True,
+                model_alias_registry=context.model_alias_registry,
+                prompt_safety_parts=prompt_safety_parts,
+            ):
+                if hasattr(chunk, 'text'):
+                    chunk_text = chunk.text
+                    is_thinking = getattr(chunk, 'is_thinking', False)
+                else:
+                    chunk_text = chunk
+                    is_thinking = False
 
-        try:
-            return json.loads(text)
-        except Exception as e:
-            self._logger.warning(f"Failed to parse Arbiter response as JSON: {e}")
-            return {
-                "reasoning": "Failed to parse AI response",
-                "decisions": [],
-                "conflicts_resolved": []
-            }
+                if chunk_text:
+                    if not is_thinking:
+                        response_content += chunk_text
+                    await self.stream_callback(chunk_text, selected_model, "arbitration")
+        else:
+            response_content = await self.ai_service.generate_content(
+                prompt=prompt,
+                model=selected_model,
+                system_prompt=ARBITER_SYSTEM_PROMPT,
+                max_tokens=config.ARBITER_MAX_TOKENS,
+                temperature=config.ARBITER_TEMPERATURE,
+                json_output=True,
+                model_alias_registry=context.model_alias_registry,
+                prompt_safety_parts=prompt_safety_parts,
+            )
+
+        return parse_json_with_markdown_fences(
+            response_content,
+            schema=ARBITER_RESPONSE_SCHEMA,
+            context="Arbiter response",
+        )
 
     def _parse_arbiter_response(
         self,
@@ -1197,6 +1483,20 @@ class Arbiter:
         """
         Convert AI response into ArbiterEditDecision objects.
 
+        Fail-closed validation contract (§3.4.2 of the refactor proposal):
+
+        1. **Coverage**: every ``edit_index`` in ``[0, N-1]`` must appear in
+           ``ai_response["decisions"]`` exactly once (``N = len(proposed_edits)``).
+        2. **Uniqueness**: no duplicate ``edit_index`` values.
+        3. **Range**: every ``edit_index`` must fall inside ``[0, N-1]``.
+        4. **Decision validity**: the ``decision`` field must be exactly
+           ``"APPLY"`` or ``"DISCARD"`` (uppercase, no case-insensitive mapping,
+           no ``"merge"`` survivors).
+
+        Any violation raises :class:`ArbiterParseError` carrying the offending
+        indices/values for telemetry. The caller (``arbitrate``) catches it
+        and fail-closes the batch (DISCARD for every edit).
+
         Args:
             ai_response: Parsed AI response dict
             proposed_edits: Original proposed edits
@@ -1204,11 +1504,76 @@ class Arbiter:
 
         Returns:
             List of ArbiterEditDecision objects
-        """
-        decisions: List[ArbiterEditDecision] = []
-        ai_decisions = ai_response.get("decisions", [])
 
-        # Create a map of edit index to conflict
+        Raises:
+            ArbiterParseError: if the response violates any of the 4 criteria.
+        """
+        total_edits = len(proposed_edits)
+        raw_decisions_any = ai_response.get("decisions", [])
+        if not isinstance(raw_decisions_any, list):
+            raise ArbiterParseError(
+                "Arbiter response 'decisions' must be a list, "
+                f"got {type(raw_decisions_any).__name__}."
+            )
+
+        # Uniqueness + range + decision-validity passes -------------------------
+        seen_indices: Dict[int, Dict[str, Any]] = {}
+        duplicate_indices: List[int] = []
+        out_of_range: List[int] = []
+        invalid_decisions: List[Dict[str, Any]] = []
+
+        valid_decision_values = {"APPLY", "DISCARD"}
+
+        for raw in raw_decisions_any:
+            if not isinstance(raw, dict):
+                invalid_decisions.append(
+                    {"edit_index": None, "decision": None, "issue": "non_object_entry"}
+                )
+                continue
+
+            raw_index = raw.get("edit_index")
+            if not isinstance(raw_index, int) or isinstance(raw_index, bool):
+                invalid_decisions.append(
+                    {"edit_index": raw_index, "decision": raw.get("decision"),
+                     "issue": "edit_index_not_integer"}
+                )
+                continue
+
+            raw_decision = raw.get("decision")
+            if raw_decision not in valid_decision_values:
+                # Exact uppercase match required — no case normalization so
+                # "apply" / "merge" / etc. all fall through as invalid.
+                invalid_decisions.append(
+                    {"edit_index": raw_index, "decision": raw_decision,
+                     "issue": "invalid_decision_value"}
+                )
+                continue
+
+            if raw_index < 0 or raw_index >= total_edits:
+                out_of_range.append(raw_index)
+                continue
+
+            if raw_index in seen_indices:
+                duplicate_indices.append(raw_index)
+                continue
+
+            seen_indices[raw_index] = raw
+
+        # Coverage pass ---------------------------------------------------------
+        missing_indices = [i for i in range(total_edits) if i not in seen_indices]
+
+        if missing_indices or duplicate_indices or out_of_range or invalid_decisions:
+            raise ArbiterParseError(
+                "Arbiter response failed fail-closed validation: "
+                f"missing={missing_indices}, duplicates={duplicate_indices}, "
+                f"out_of_range={out_of_range}, invalid={invalid_decisions}.",
+                missing_indices=missing_indices,
+                duplicate_indices=duplicate_indices,
+                out_of_range=out_of_range,
+                invalid_decisions=invalid_decisions,
+            )
+
+        # Map each proposed edit index to the resolved conflict (if any) -------
         edit_to_conflict: Dict[int, ConflictInfo] = {}
         for conflict in conflicts:
             for pe in conflict.involved_edits:
@@ -1218,40 +1583,57 @@ class Arbiter:
                 except ValueError:
                     pass
 
-        # Process each proposed edit
+        decisions: List[ArbiterEditDecision] = []
         for i, pe in enumerate(proposed_edits):
-            # Find AI decision for this edit
-            ai_decision = None
-            for d in ai_decisions:
-                if d.get("edit_index") == i:
-                    ai_decision = d
-                    break
-
-            if ai_decision:
-                decision_str = ai_decision.get("decision", "apply").lower()
-                reason = ai_decision.get("reason", "AI decision")
-
-                if decision_str == "discard":
-                    decision = ArbiterDecision.DISCARD
-                elif decision_str == "merge":
-                    decision = ArbiterDecision.MERGE
-                else:
-                    decision = ArbiterDecision.APPLY
-            else:
-                # No explicit AI decision - default to apply
-                decision = ArbiterDecision.APPLY
-                reason = "No conflict / default apply"
-
+            entry = seen_indices[i]
+            decision_value = entry["decision"]
+            reason = entry.get("reason") or "AI decision"
+            decision_enum = (
+                ArbiterDecision.APPLY if decision_value == "APPLY"
+                else ArbiterDecision.DISCARD
+            )
             decisions.append(ArbiterEditDecision(
                 edit=pe.edit,
-                decision=decision,
+                decision=decision_enum,
                 reason=reason,
-                source_model=pe.source_model,
+                source_evaluator=pe.source_evaluator,
                 conflict_resolved=edit_to_conflict.get(i),
-                source_alias=pe.source_alias,
             ))
 
         return decisions
+
+    def _fail_closed_discard_all(
+        self,
+        proposed_edits: List[ProposedEdit],
+        conflicts: List[ConflictInfo],
+        reason: str,
+    ) -> List[ArbiterEditDecision]:
+        """Build a conservative DISCARD decision for every proposed edit.
+
+        Used when the Arbiter parser raises :class:`ArbiterParseError` (any of
+        the 4 criteria) or when the AI returns no decisions at all. No edit is
+        applied — the QA feedback still exists but the batch cannot be
+        arbitrated safely.
+        """
+        edit_to_conflict: Dict[int, ConflictInfo] = {}
+        for conflict in conflicts:
+            for pe in conflict.involved_edits:
+                try:
+                    idx = proposed_edits.index(pe)
+                    edit_to_conflict[idx] = conflict
+                except ValueError:
+                    pass
+
+        return [
+            ArbiterEditDecision(
+                edit=pe.edit,
+                decision=ArbiterDecision.DISCARD,
+                reason=reason,
+                source_evaluator=pe.source_evaluator,
+                conflict_resolved=edit_to_conflict.get(i),
+            )
+            for i, pe in enumerate(proposed_edits)
+        ]
 
     # =========================================================================
     # MAIN ARBITRATION METHOD
@@ -1280,7 +1662,8 @@ class Arbiter:
         Returns:
             ArbiterResult with edits to apply and history record
         """
-        proposed_edits = context.proposed_edits
+        original_proposed_edits = list(context.proposed_edits)
+        proposed_edits = original_proposed_edits
 
         # If no edits proposed, nothing to do
         if not proposed_edits:
@@ -1296,17 +1679,36 @@ class Arbiter:
             )
 
         # Filter stale edits (exact_fragment missing or suggested_text already applied)
-        proposed_edits, stale_discarded = self._filter_stale_edits(
+        proposed_edits, stale_discarded, stale_decision_entries = self._filter_stale_edits(
             proposed_edits, context.current_content
         )
 
         # If all edits were stale, nothing left to do
         if not proposed_edits:
+            stale_decisions = [decision for _, decision in stale_decision_entries]
             return ArbiterResult(
                 edits_to_apply=[],
                 edits_discarded=stale_discarded,
+                edit_decisions=stale_decisions,
                 conflicts_found=0,
                 conflicts_resolved=0,
+                round_record={
+                    "proposed_count": len(original_proposed_edits),
+                    "conflicts_detected": 0,
+                    "distribution": EditDistribution.CONSENSUS.value,
+                    "model_used": "",
+                    "escalated_to_gran_sabio": False,
+                    "applied_count": 0,
+                    "discarded_count": len(stale_discarded),
+                    "decisions": [
+                        {
+                            "decision": d.decision.value,
+                            "source_evaluator": d.source_evaluator,
+                            "reason": d.reason[:100],
+                        }
+                        for d in stale_decisions
+                    ],
+                },
                 arbiter_reasoning="All proposed edits were stale (fragments no longer in content)",
                 distribution=EditDistribution.CONSENSUS.value,
                 escalated_to_gran_sabio=False,
@@ -1336,25 +1738,107 @@ class Arbiter:
         self._logger.info(f"Verifying {len(proposed_edits)} edit(s) with AI ({selected_model})...")
         ai_response = await self._resolve_with_ai(context, conflicts, distribution, selected_model)
 
-        if not ai_response.get("decisions"):
-            # AI returned no decisions - fail fast to avoid corrupting text with unresolved conflicts
+        ai_decisions = ai_response.get("decisions")
+        if ai_decisions is None:
             error_msg = ai_response.get("reasoning", "AI returned no decisions")
             self._logger.error(f"Arbiter AI verification failed: {error_msg}")
             raise RuntimeError(f"Arbiter cannot resolve edits: {error_msg}")
+        if not ai_decisions:
+            # AI returned an empty list. Preserve the reasoning as the
+            # discard justification so the user sees why the batch was
+            # rejected. With the schema enforcing uppercase enum values, we
+            # must produce synthetic entries that match — lowercase would
+            # fail-close at the parser boundary below.
+            reasoning = ai_response.get("reasoning")
+            if not reasoning:
+                self._logger.error("Arbiter AI verification failed: empty decisions without reasoning")
+                raise RuntimeError("Arbiter cannot resolve edits: AI returned no decisions")
+            ai_response = {
+                **ai_response,
+                "decisions": [
+                    {"edit_index": index, "decision": "DISCARD", "reason": reasoning}
+                    for index, _ in enumerate(proposed_edits)
+                ],
+            }
 
-        # Parse AI response
-        decisions = self._parse_arbiter_response(
-            ai_response, proposed_edits, conflicts
+        # Parse AI response with fail-closed contract
+        try:
+            decisions = self._parse_arbiter_response(
+                ai_response, proposed_edits, conflicts
+            )
+            reasoning = ai_response.get("reasoning", "AI-verified edits")
+        except ArbiterParseError as parse_error:
+            # Fail-closed: DISCARD every edit conservatively. The batch has
+            # QA-flagged issues but the AI failed to deliver valid arbitration,
+            # so applying any edit is unsafe.
+            self._logger.error(
+                f"Arbiter parser fail-closed: {parse_error}"
+            )
+            await self._emit_debug_event(
+                "arbiter_parse_error",
+                {
+                    "layer_name": context.layer_name,
+                    "distribution": distribution.value,
+                    "total_edits": len(proposed_edits),
+                    **parse_error.to_event_payload(),
+                },
+            )
+            decisions = self._fail_closed_discard_all(
+                proposed_edits,
+                conflicts,
+                reason=f"Arbiter parse error: {parse_error}",
+            )
+            reasoning = f"Arbiter parse error (fail-closed DISCARD batch): {parse_error}"
+
+        await self._emit_debug_event(
+            "arbiter_decision",
+            {
+                "layer_name": context.layer_name,
+                "distribution": distribution.value,
+                "total_edits": len(proposed_edits),
+                "applied": sum(1 for d in decisions if d.decision == ArbiterDecision.APPLY),
+                "discarded": sum(1 for d in decisions if d.decision == ArbiterDecision.DISCARD),
+                "decisions": [
+                    {
+                        "decision": d.decision.value,
+                        "reason": d.reason[:200],
+                        "source_evaluator": d.source_evaluator,
+                    }
+                    for d in decisions
+                ],
+            },
         )
-        reasoning = ai_response.get("reasoning", "AI-verified edits")
+
+        stale_decisions_by_index = dict(stale_decision_entries)
+        expected_decision_count = len(original_proposed_edits) - len(stale_decision_entries)
+        if len(decisions) != expected_decision_count:
+            raise RuntimeError(
+                "Arbiter AI returned a decision count that does not match the number of "
+                f"non-stale proposed edits: expected {expected_decision_count}, got {len(decisions)} "
+                f"(original proposals={len(original_proposed_edits)}, stale filtered={len(stale_decision_entries)})."
+            )
+
+        valid_decision_index = 0
+        all_decisions: List[ArbiterEditDecision] = []
+        for original_index, _ in enumerate(original_proposed_edits):
+            stale_decision = stale_decisions_by_index.get(original_index)
+            if stale_decision is not None:
+                all_decisions.append(stale_decision)
+                continue
+            all_decisions.append(decisions[valid_decision_index])
+            valid_decision_index += 1
+        assert valid_decision_index == len(decisions), (
+            f"Arbiter interleave invariant broken: consumed {valid_decision_index} "
+            f"of {len(decisions)} non-stale decisions "
+            f"(original={len(original_proposed_edits)}, stale={len(stale_decision_entries)})"
+        )
 
         # Build result
         edits_to_apply = [d.edit for d in decisions if d.decision == ArbiterDecision.APPLY]
         ai_discarded = [
             {
-                "edit_type": d.edit.edit_type.value if hasattr(d.edit, 'edit_type') else "unknown",
-                "source_model": d.source_model,
-                "source_alias": d.source_alias,
+                "edit_type": _edit_type_value(d.edit),
+                "source_evaluator": d.source_evaluator,
                 "reason": d.reason,
                 "paragraph_key": _get_paragraph_key_for_history(d.edit)[:80]
             }
@@ -1365,7 +1849,7 @@ class Arbiter:
 
         # Build round record for history
         round_record = {
-            "proposed_count": len(proposed_edits),
+            "proposed_count": len(original_proposed_edits),
             "conflicts_detected": num_conflicts,
             "distribution": distribution.value,
             "model_used": selected_model,
@@ -1375,11 +1859,10 @@ class Arbiter:
             "decisions": [
                 {
                     "decision": d.decision.value,
-                    "source_model": d.source_model,
-                    "source_alias": d.source_alias,
+                    "source_evaluator": d.source_evaluator,
                     "reason": d.reason[:100]
                 }
-                for d in decisions
+                for d in all_decisions
             ]
         }
 
@@ -1391,6 +1874,7 @@ class Arbiter:
         return ArbiterResult(
             edits_to_apply=edits_to_apply,
             edits_discarded=edits_discarded,
+            edit_decisions=all_decisions,
             conflicts_found=num_conflicts,
             conflicts_resolved=conflicts_resolved,
             round_record=round_record,

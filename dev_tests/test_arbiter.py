@@ -61,10 +61,10 @@ class TestArbiterDecisionEnum:
     """Tests for ArbiterDecision enum."""
 
     def test_enum_values_exist(self):
-        """Verify all expected decisions are defined."""
+        """Verify all expected decisions are defined (MERGE removed — §3.4.2)."""
         assert ArbiterDecision.APPLY == "apply"
         assert ArbiterDecision.DISCARD == "discard"
-        assert ArbiterDecision.MERGE == "merge"
+        assert len(list(ArbiterDecision)) == 2
 
 
 class TestLayerEditHistory:
@@ -205,7 +205,7 @@ class MockTextEditRange:
 def create_proposed_edit(
     edit_type: str = "replace",
     severity: str = "minor",
-    source_model: str = "gpt-4o",
+    source_evaluator: str = "Evaluator A",
     paragraph_key: str = "para_1",
     description: str = "Test issue",
     start_marker: str = None,
@@ -221,7 +221,7 @@ def create_proposed_edit(
     )
     return ProposedEdit(
         edit=edit,
-        source_model=source_model,
+        source_evaluator=source_evaluator,
         source_score=7.0,
         paragraph_key=paragraph_key
     )
@@ -244,8 +244,8 @@ class TestConflictDetection:
     def test_detect_opposite_operations_delete_vs_replace(self, arbiter):
         """Should detect DELETE vs REPLACE on same fragment."""
         edits = [
-            create_proposed_edit(edit_type="delete", source_model="gpt-4o", paragraph_key="p1"),
-            create_proposed_edit(edit_type="replace", source_model="claude", paragraph_key="p1"),
+            create_proposed_edit(edit_type="delete", source_evaluator="gpt-4o", paragraph_key="p1"),
+            create_proposed_edit(edit_type="replace", source_evaluator="claude", paragraph_key="p1"),
         ]
         conflict = arbiter._detect_opposite_operations(edits, "p1")
         assert conflict is not None
@@ -255,8 +255,8 @@ class TestConflictDetection:
     def test_detect_opposite_operations_delete_vs_rephrase(self, arbiter):
         """Should detect DELETE vs REPHRASE on same fragment."""
         edits = [
-            create_proposed_edit(edit_type="delete", source_model="gpt-4o", paragraph_key="p1"),
-            create_proposed_edit(edit_type="rephrase", source_model="gemini", paragraph_key="p1"),
+            create_proposed_edit(edit_type="delete", source_evaluator="gpt-4o", paragraph_key="p1"),
+            create_proposed_edit(edit_type="rephrase", source_evaluator="gemini", paragraph_key="p1"),
         ]
         conflict = arbiter._detect_opposite_operations(edits, "p1")
         assert conflict is not None
@@ -265,8 +265,8 @@ class TestConflictDetection:
     def test_detect_opposite_directions_expand_vs_condense(self, arbiter):
         """Should detect EXPAND vs CONDENSE on same paragraph."""
         edits = [
-            create_proposed_edit(edit_type="expand", source_model="gpt-4o", paragraph_key="p1"),
-            create_proposed_edit(edit_type="condense", source_model="claude", paragraph_key="p1"),
+            create_proposed_edit(edit_type="expand", source_evaluator="gpt-4o", paragraph_key="p1"),
+            create_proposed_edit(edit_type="condense", source_evaluator="claude", paragraph_key="p1"),
         ]
         conflict = arbiter._detect_opposite_directions(edits, "p1")
         assert conflict is not None
@@ -276,8 +276,8 @@ class TestConflictDetection:
     def test_detect_severity_mismatch(self, arbiter):
         """Should detect same issue with different severities (critical vs minor)."""
         edits = [
-            create_proposed_edit(edit_type="replace", severity="critical", source_model="gpt-4o", paragraph_key="p1"),
-            create_proposed_edit(edit_type="replace", severity="minor", source_model="claude", paragraph_key="p1"),
+            create_proposed_edit(edit_type="replace", severity="critical", source_evaluator="gpt-4o", paragraph_key="p1"),
+            create_proposed_edit(edit_type="replace", severity="minor", source_evaluator="claude", paragraph_key="p1"),
         ]
         conflict = arbiter._detect_severity_mismatch(edits, "p1")
         assert conflict is not None
@@ -286,8 +286,8 @@ class TestConflictDetection:
     def test_no_severity_mismatch_for_similar_severities(self, arbiter):
         """Should NOT flag severity mismatch for critical vs major."""
         edits = [
-            create_proposed_edit(edit_type="replace", severity="critical", source_model="gpt-4o", paragraph_key="p1"),
-            create_proposed_edit(edit_type="replace", severity="major", source_model="claude", paragraph_key="p1"),
+            create_proposed_edit(edit_type="replace", severity="critical", source_evaluator="gpt-4o", paragraph_key="p1"),
+            create_proposed_edit(edit_type="replace", severity="major", source_evaluator="claude", paragraph_key="p1"),
         ]
         conflict = arbiter._detect_severity_mismatch(edits, "p1")
         assert conflict is None  # Only flags critical vs minor
@@ -295,8 +295,8 @@ class TestConflictDetection:
     def test_detect_semantic_redundancy(self, arbiter):
         """Should detect multiple edits of same type on same paragraph."""
         edits = [
-            create_proposed_edit(edit_type="rephrase", source_model="gpt-4o", paragraph_key="p1"),
-            create_proposed_edit(edit_type="rephrase", source_model="claude", paragraph_key="p1"),
+            create_proposed_edit(edit_type="rephrase", source_evaluator="gpt-4o", paragraph_key="p1"),
+            create_proposed_edit(edit_type="rephrase", source_evaluator="claude", paragraph_key="p1"),
         ]
         conflict = arbiter._detect_semantic_redundancy(edits, "p1")
         assert conflict is not None
@@ -316,14 +316,14 @@ class TestConflictDetection:
                 edit=discarded_edit,
                 decision=ArbiterDecision.DISCARD,
                 reason="Test discard",
-                source_model="gpt-4o"
+                source_evaluator="gpt-4o"
             )]
         )
         history.add_round(record)
 
         # Now propose same edit again
         new_edit = create_proposed_edit(
-            source_model="claude",
+            source_evaluator="claude",
             paragraph_key="p1",
             start_marker="the quick brown fox"
         )
@@ -334,8 +334,8 @@ class TestConflictDetection:
     def test_no_conflict_different_paragraphs(self, arbiter):
         """Edits on different paragraphs should not conflict."""
         edits = [
-            create_proposed_edit(edit_type="delete", source_model="gpt-4o", paragraph_key="p1"),
-            create_proposed_edit(edit_type="delete", source_model="claude", paragraph_key="p2"),
+            create_proposed_edit(edit_type="delete", source_evaluator="gpt-4o", paragraph_key="p1"),
+            create_proposed_edit(edit_type="delete", source_evaluator="claude", paragraph_key="p2"),
         ]
         history = LayerEditHistory(layer_name="test")
         conflicts = arbiter._detect_conflicts(edits, history)
@@ -345,8 +345,8 @@ class TestConflictDetection:
     def test_detect_conflicts_finds_multiple_issues(self, arbiter):
         """Should find multiple conflict types in same edit set."""
         edits = [
-            create_proposed_edit(edit_type="delete", severity="critical", source_model="gpt-4o", paragraph_key="p1"),
-            create_proposed_edit(edit_type="replace", severity="minor", source_model="claude", paragraph_key="p1"),
+            create_proposed_edit(edit_type="delete", severity="critical", source_evaluator="gpt-4o", paragraph_key="p1"),
+            create_proposed_edit(edit_type="replace", severity="minor", source_evaluator="claude", paragraph_key="p1"),
         ]
         history = LayerEditHistory(layer_name="test")
         conflicts = arbiter._detect_conflicts(edits, history)
@@ -358,9 +358,9 @@ class TestConflictDetection:
     def test_group_edits_by_paragraph(self, arbiter):
         """Should correctly group edits by paragraph key."""
         edits = [
-            create_proposed_edit(paragraph_key="p1", source_model="gpt-4o"),
-            create_proposed_edit(paragraph_key="p2", source_model="claude"),
-            create_proposed_edit(paragraph_key="p1", source_model="gemini"),
+            create_proposed_edit(paragraph_key="p1", source_evaluator="gpt-4o"),
+            create_proposed_edit(paragraph_key="p2", source_evaluator="claude"),
+            create_proposed_edit(paragraph_key="p1", source_evaluator="gemini"),
         ]
         groups = arbiter._group_edits_by_paragraph(edits)
         assert len(groups) == 2
@@ -382,7 +382,7 @@ class TestArbitrateMethod:
         from unittest.mock import AsyncMock, MagicMock
         service = MagicMock()
         # Return a valid JSON response approving all edits
-        service.generate_content = AsyncMock(return_value='{"reasoning": "All edits verified", "decisions": [{"edit_index": 0, "decision": "apply", "reason": "Aligned with request"}, {"edit_index": 1, "decision": "apply", "reason": "Aligned with request"}], "conflicts_resolved": []}')
+        service.generate_content = AsyncMock(return_value='{"reasoning": "All edits verified", "decisions": [{"edit_index": 0, "decision": "APPLY", "reason": "Aligned with request"}, {"edit_index": 1, "decision": "APPLY", "reason": "Aligned with request"}], "conflicts_resolved": []}')
         return service
 
     @pytest.fixture
@@ -392,7 +392,7 @@ class TestArbitrateMethod:
 
     @pytest.fixture
     def basic_context(self):
-        """Create a basic ArbiterContext for testing."""
+        """Create a basic ArbiterContext for testing (single-shot path, no tools)."""
         return ArbiterContext(
             original_prompt="Write a biography",
             content_type="biography",
@@ -406,7 +406,8 @@ class TestArbitrateMethod:
             evaluator_scores={"gpt-4o": 6.5},
             layer_history=LayerEditHistory(layer_name="Accuracy"),
             gran_sabio_model="claude-opus-4-5-20251101",
-            qa_model_count=2
+            qa_model_count=2,
+            arbiter_tools_mode="never",
         )
 
     async def test_arbitrate_no_edits_returns_empty(self, arbiter, basic_context):
@@ -421,8 +422,8 @@ class TestArbitrateMethod:
     async def test_arbitrate_always_calls_ai(self, arbiter, mock_ai_service, basic_context):
         """Arbiter should ALWAYS call AI to verify edits, even without conflicts."""
         basic_context.proposed_edits = [
-            create_proposed_edit(paragraph_key="p1", source_model="gpt-4o"),
-            create_proposed_edit(paragraph_key="p2", source_model="claude"),
+            create_proposed_edit(paragraph_key="p1", source_evaluator="gpt-4o"),
+            create_proposed_edit(paragraph_key="p2", source_evaluator="claude"),
         ]
         result = await arbiter.arbitrate(basic_context)
 
@@ -439,13 +440,13 @@ class TestArbitrateMethod:
             create_proposed_edit(
                 edit_type="delete",
                 severity="critical",
-                source_model="gpt-4o",
+                source_evaluator="gpt-4o",
                 paragraph_key="p1"
             ),
             create_proposed_edit(
                 edit_type="replace",
                 severity="minor",
-                source_model="claude",
+                source_evaluator="claude",
                 paragraph_key="p1"
             ),
         ]
@@ -456,7 +457,7 @@ class TestArbitrateMethod:
     async def test_arbitrate_result_includes_distribution(self, arbiter, basic_context):
         """Result should include distribution classification."""
         basic_context.proposed_edits = [
-            create_proposed_edit(paragraph_key="p1", source_model="gpt-4o"),
+            create_proposed_edit(paragraph_key="p1", source_evaluator="gpt-4o"),
         ]
         basic_context.qa_model_count = 2  # Only 1 of 2 proposed = TIE
 
@@ -482,30 +483,30 @@ class TestDistributionClassification:
 
     def test_single_qa_model(self, arbiter):
         """With 1 QA model, should classify as SINGLE_QA."""
-        edits = [create_proposed_edit(source_model="gpt-4o")]
+        edits = [create_proposed_edit(source_evaluator="gpt-4o")]
         distribution = arbiter._classify_distribution(edits, qa_model_count=1, conflicts=[])
         assert distribution == EditDistribution.SINGLE_QA
 
     def test_two_models_both_propose_different_paragraphs(self, arbiter):
         """With 2 models proposing edits for different paragraphs, should be CONSENSUS."""
         edits = [
-            create_proposed_edit(source_model="gpt-4o", paragraph_key="p1"),
-            create_proposed_edit(source_model="claude", paragraph_key="p2"),
+            create_proposed_edit(source_evaluator="gpt-4o", paragraph_key="p1"),
+            create_proposed_edit(source_evaluator="claude", paragraph_key="p2"),
         ]
         distribution = arbiter._classify_distribution(edits, qa_model_count=2, conflicts=[])
         assert distribution == EditDistribution.CONSENSUS
 
     def test_two_models_only_one_proposes(self, arbiter):
         """With 2 models and only 1 proposes edit, should be TIE (disagreement)."""
-        edits = [create_proposed_edit(source_model="gpt-4o", paragraph_key="p1")]
+        edits = [create_proposed_edit(source_evaluator="gpt-4o", paragraph_key="p1")]
         distribution = arbiter._classify_distribution(edits, qa_model_count=2, conflicts=[])
         assert distribution == EditDistribution.TIE
 
     def test_two_models_with_conflict(self, arbiter):
         """With 2 models and conflict, should be TIE."""
         edits = [
-            create_proposed_edit(source_model="gpt-4o", paragraph_key="p1"),
-            create_proposed_edit(source_model="claude", paragraph_key="p1"),
+            create_proposed_edit(source_evaluator="gpt-4o", paragraph_key="p1"),
+            create_proposed_edit(source_evaluator="claude", paragraph_key="p1"),
         ]
         conflicts = [ConflictInfo(
             conflict_type=ConflictType.OPPOSITE_OPERATIONS,
@@ -518,15 +519,15 @@ class TestDistributionClassification:
 
     def test_three_models_minority(self, arbiter):
         """With 3 models and only 1 proposes, should be MINORITY."""
-        edits = [create_proposed_edit(source_model="gpt-4o", paragraph_key="p1")]
+        edits = [create_proposed_edit(source_evaluator="gpt-4o", paragraph_key="p1")]
         distribution = arbiter._classify_distribution(edits, qa_model_count=3, conflicts=[])
         assert distribution == EditDistribution.MINORITY
 
     def test_three_models_majority(self, arbiter):
         """With 3 models and 2 propose, should be MAJORITY."""
         edits = [
-            create_proposed_edit(source_model="gpt-4o", paragraph_key="p1"),
-            create_proposed_edit(source_model="claude", paragraph_key="p2"),
+            create_proposed_edit(source_evaluator="gpt-4o", paragraph_key="p1"),
+            create_proposed_edit(source_evaluator="claude", paragraph_key="p2"),
         ]
         distribution = arbiter._classify_distribution(edits, qa_model_count=3, conflicts=[])
         assert distribution == EditDistribution.MAJORITY
@@ -534,9 +535,9 @@ class TestDistributionClassification:
     def test_three_models_consensus(self, arbiter):
         """With 3 models and all propose, should be CONSENSUS."""
         edits = [
-            create_proposed_edit(source_model="gpt-4o", paragraph_key="p1"),
-            create_proposed_edit(source_model="claude", paragraph_key="p2"),
-            create_proposed_edit(source_model="gemini", paragraph_key="p3"),
+            create_proposed_edit(source_evaluator="gpt-4o", paragraph_key="p1"),
+            create_proposed_edit(source_evaluator="claude", paragraph_key="p2"),
+            create_proposed_edit(source_evaluator="gemini", paragraph_key="p3"),
         ]
         distribution = arbiter._classify_distribution(edits, qa_model_count=3, conflicts=[])
         assert distribution == EditDistribution.CONSENSUS
@@ -544,8 +545,8 @@ class TestDistributionClassification:
     def test_three_models_with_conflict(self, arbiter):
         """With 3 models and conflict, should be CONFLICT."""
         edits = [
-            create_proposed_edit(source_model="gpt-4o", paragraph_key="p1"),
-            create_proposed_edit(source_model="claude", paragraph_key="p1"),
+            create_proposed_edit(source_evaluator="gpt-4o", paragraph_key="p1"),
+            create_proposed_edit(source_evaluator="claude", paragraph_key="p1"),
         ]
         conflicts = [ConflictInfo(
             conflict_type=ConflictType.OPPOSITE_OPERATIONS,
@@ -645,7 +646,7 @@ class TestPromptBuilding:
             create_proposed_edit(
                 edit_type="delete",
                 severity="critical",
-                source_model="gpt-4o",
+                source_evaluator="gpt-4o",
                 paragraph_key="p1",
                 description="Remove duplicate word"
             ),
@@ -661,8 +662,8 @@ class TestPromptBuilding:
     def test_format_conflicts_for_prompt(self, arbiter):
         """Should format conflicts clearly for AI prompt."""
         edits = [
-            create_proposed_edit(source_model="gpt-4o", paragraph_key="p1"),
-            create_proposed_edit(source_model="claude", paragraph_key="p1"),
+            create_proposed_edit(source_evaluator="gpt-4o", paragraph_key="p1"),
+            create_proposed_edit(source_evaluator="claude", paragraph_key="p1"),
         ]
         conflicts = [ConflictInfo(
             conflict_type=ConflictType.OPPOSITE_OPERATIONS,
@@ -696,8 +697,8 @@ class TestPromptBuilding:
 class TestExtractProposedEditsFromLayerResults:
     """Tests for _extract_proposed_edits_from_layer_results function."""
 
-    def test_extracts_edits_with_source_model(self):
-        """Should extract edits preserving source model information."""
+    def test_extracts_edits_with_source_evaluator(self):
+        """Should extract edits preserving evaluator alias information."""
         from core.generation_processor import _extract_proposed_edits_from_layer_results
         from smart_edit import TextEditRange, SeverityLevel, OperationType
         from unittest.mock import MagicMock
@@ -744,12 +745,12 @@ class TestExtractProposedEditsFromLayerResults:
 
         # Verify source model is preserved
         assert len(proposed_edits) == 2
-        models = {pe.source_model for pe in proposed_edits}
+        models = {pe.source_evaluator for pe in proposed_edits}
         assert "gpt-4o" in models
         assert "claude-sonnet" in models
 
         # Verify source scores are preserved
-        gpt_edit = next(pe for pe in proposed_edits if pe.source_model == "gpt-4o")
+        gpt_edit = next(pe for pe in proposed_edits if pe.source_evaluator == "gpt-4o")
         assert gpt_edit.source_score == 7.5
 
     def test_sorts_by_severity_and_confidence(self):
@@ -861,12 +862,12 @@ class TestArbiterIntegration:
 
         proposed = ProposedEdit(
             edit=edit,
-            source_model="gpt-4o",
+            source_evaluator="Evaluator A",
             source_score=7.5,
             paragraph_key="The quick brown fox"
         )
 
-        assert proposed.source_model == "gpt-4o"
+        assert proposed.source_evaluator == "Evaluator A"
         assert proposed.source_score == 7.5
         assert proposed.paragraph_key == "The quick brown fox"
 
@@ -878,7 +879,7 @@ class TestArbiterIntegration:
 
         # Create mock AI service
         mock_ai_service = MagicMock()
-        mock_ai_service.generate_content = AsyncMock(return_value='{"reasoning": "Test", "decisions": [{"edit_index": 0, "decision": "apply", "reason": "OK"}], "conflicts_resolved": []}')
+        mock_ai_service.generate_content = AsyncMock(return_value='{"reasoning": "Test", "decisions": [{"edit_index": 0, "decision": "APPLY", "reason": "OK"}], "conflicts_resolved": []}')
 
         arbiter = Arbiter(ai_service=mock_ai_service, model="gpt-4o-mini")
 
@@ -895,7 +896,8 @@ class TestArbiterIntegration:
             evaluator_scores={"gpt-4o": 6.5},
             layer_history=LayerEditHistory(layer_name="Test Layer"),
             gran_sabio_model="claude-opus",
-            qa_model_count=1
+            qa_model_count=1,
+            arbiter_tools_mode="never",
         )
 
         result = await arbiter.arbitrate(context)

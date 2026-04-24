@@ -933,11 +933,10 @@ class GranSabioInterface {
             };
         }
         
-        // Keep max_tokens as fallback if no word limits are set
+        // Keep max_tokens only when derived from an explicit word target.
+        // If omitted, the server defaults to the selected model's max output.
         if (!requestData.min_words && !requestData.max_words && maxWords) {
             requestData.max_tokens = this.wordsToTokens(parseInt(maxWords));
-        } else if (!requestData.min_words && !requestData.max_words) {
-            requestData.max_tokens = 4000; // Default
         }
 
         // Add reasoning effort parameter for supported models

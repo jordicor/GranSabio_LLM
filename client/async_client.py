@@ -41,10 +41,6 @@ from . import (
     TransientGranSabioError,
 )
 
-# Reuse the backoff curve from the sync client so sync and async share one
-# source of truth for the retry schedule.
-from .sync_client import _POLL_RETRY_BACKOFF_SECONDS
-
 # Import shared utilities from _common
 from ._common import (
     ActivityMonitor,
@@ -59,10 +55,14 @@ from ._common import (
     RESULT_POLL_GRACE_SECONDS,
     RESULT_POLL_INTERVAL_SECONDS,
     STREAM_ACTIVITY_CHECK_SECONDS,
+    POLL_RETRY_BACKOFF_SECONDS,
     PROVIDER_KEY_ENV_MAP,
 )
 
 logger = logging.getLogger(__name__)
+
+
+_POLL_RETRY_BACKOFF_SECONDS = POLL_RETRY_BACKOFF_SECONDS
 
 
 # Generic return type for _call_with_retry so it can wrap any idempotent async
@@ -223,9 +223,30 @@ class AsyncGranSabioClient:
         except (aiohttp.ClientPayloadError,
                 aiohttp.ServerDisconnectedError,
                 aiohttp.ClientConnectionError,
-                asyncio.TimeoutError) as exc:
+                asyncio.TimeoutError,
+                aiohttp.ContentTypeError,
+                json.JSONDecodeError,
+                ValueError) as exc:
             raise TransientGranSabioError(
                 f"Transient protocol error reading JSON from {endpoint}: {exc}"
+            ) from exc
+
+    async def _read_json_no_retry(self, response: aiohttp.ClientResponse, endpoint: str) -> Any:
+        """Read JSON body for non-idempotent POSTs without converting to retryable errors."""
+        try:
+            return await response.json()
+        except (
+            aiohttp.ClientPayloadError,
+            aiohttp.ServerDisconnectedError,
+            aiohttp.ClientConnectionError,
+            asyncio.TimeoutError,
+            aiohttp.ContentTypeError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as exc:
+            raise GranSabioClientError(
+                f"Failed to read JSON response from {endpoint}; "
+                f"the operation may have been accepted by the server: {exc}"
             ) from exc
 
     async def _read_text(self, response: aiohttp.ClientResponse, endpoint: str) -> str:
@@ -239,6 +260,17 @@ class AsyncGranSabioClient:
             raise TransientGranSabioError(
                 f"Transient protocol error reading text from {endpoint}: {exc}"
             ) from exc
+
+    async def _read_error_text(self, response: aiohttp.ClientResponse, endpoint: str) -> str:
+        """Read a non-2xx error body without reclassifying HTTP errors as retryable."""
+        try:
+            return await response.text()
+        except (aiohttp.ClientPayloadError,
+                aiohttp.ServerDisconnectedError,
+                aiohttp.ClientConnectionError,
+                asyncio.TimeoutError) as exc:
+            logger.warning("Could not read error body from %s: %s", endpoint, exc)
+            return "<body unreadable>"
 
     # =========================================================================
     # Health & Info
@@ -257,7 +289,7 @@ class AsyncGranSabioClient:
                     f"Health check failed: {response.status}",
                     status_code=response.status
                 )
-            return await response.json()
+            return await self._read_json(response, "/health")
 
     async def get_models(self) -> Dict[str, Any]:
         """
@@ -272,7 +304,7 @@ class AsyncGranSabioClient:
                     f"Failed to get models: {response.status}",
                     status_code=response.status
                 )
-            return await response.json()
+            return await self._read_json(response, "/models")
 
     async def is_available(self) -> bool:
         """Check if the API is reachable and healthy."""
@@ -314,35 +346,35 @@ class AsyncGranSabioClient:
         payload = {"project_id": project_id} if project_id else {}
         async with await self._request("POST", "/project/new", json_data=payload) as response:
             if response.status not in (200, 201):
-                text = await response.text()
+                text = await self._read_error_text(response, "/project/new")
                 raise GranSabioClientError(
                     f"Failed to reserve project: {text}",
                     status_code=response.status
                 )
-            data = await response.json()
+            data = await self._read_json_no_retry(response, "/project/new")
             return data["project_id"]
 
     async def start_project(self, project_id: str) -> Dict[str, Any]:
         """Activate/reactivate a project."""
         async with await self._request("POST", f"/project/start/{project_id}") as response:
             if response.status not in (200, 201):
-                text = await response.text()
+                text = await self._read_error_text(response, f"/project/start/{project_id}")
                 raise GranSabioClientError(
                     f"Failed to start project: {text}",
                     status_code=response.status
                 )
-            return await response.json()
+            return await self._read_json_no_retry(response, f"/project/start/{project_id}")
 
     async def stop_project(self, project_id: str) -> Dict[str, Any]:
         """Cancel a project and all its active sessions."""
         async with await self._request("POST", f"/project/stop/{project_id}") as response:
             if response.status not in (200, 202):
-                text = await response.text()
+                text = await self._read_error_text(response, f"/project/stop/{project_id}")
                 raise GranSabioClientError(
                     f"Failed to stop project: {text}",
                     status_code=response.status
                 )
-            return await response.json()
+            return await self._read_json_no_retry(response, f"/project/stop/{project_id}")
 
     # =========================================================================
     # Content Generation
@@ -354,7 +386,7 @@ class AsyncGranSabioClient:
         content_type: str = "article",
         generator_model: str = "gpt-4o",
         temperature: float = 0.7,
-        max_tokens: int = 4000,
+        max_tokens: Optional[int] = None,
         min_words: Optional[int] = None,
         max_words: Optional[int] = None,
         qa_models: Optional[List[str]] = None,
@@ -387,7 +419,9 @@ class AsyncGranSabioClient:
             content_type: Type of content (article, creative, json, etc.)
             generator_model: AI model to use for generation
             temperature: Creativity level (0.0-2.0)
-            max_tokens: Maximum tokens to generate
+            max_tokens: Maximum tokens to generate. When omitted, the server
+                uses the selected model's max output from model_specs.json
+                (fallback: 8192).
             min_words: Minimum word count (optional)
             max_words: Maximum word count (optional)
             qa_models: Models for QA evaluation (required if qa_layers not empty)
@@ -421,7 +455,6 @@ class AsyncGranSabioClient:
             "content_type": content_type,
             "generator_model": generator_model,
             "temperature": temperature,
-            "max_tokens": max_tokens,
             "min_global_score": min_global_score,
             "max_iterations": max_iterations,
             "gran_sabio_model": gran_sabio_model,
@@ -434,6 +467,8 @@ class AsyncGranSabioClient:
             payload["min_words"] = min_words
         if max_words is not None:
             payload["max_words"] = max_words
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         if qa_models is not None:
             payload["qa_models"] = qa_models
         if qa_layers is not None:
@@ -463,14 +498,15 @@ class AsyncGranSabioClient:
         # Start generation
         async with await self._request("POST", "/generate", json_data=payload) as response:
             if response.status != 200:
-                text = await response.text()
+                text = await self._read_error_text(response, "/generate")
+                error_details = {"payload": payload}
                 raise GranSabioClientError(
                     f"Generation request failed: {text}",
                     status_code=response.status,
-                    details={"payload": payload}
+                    details=error_details,
                 )
 
-            result = await response.json()
+            result = await self._read_json_no_retry(response, "/generate")
 
         # Handle preflight rejection
         if result.get("status") in {"preflight_rejected", "rejected"} and result.get("preflight_feedback"):
@@ -501,7 +537,7 @@ class AsyncGranSabioClient:
         endpoint = f"/status/{session_id}"
         async with await self._request("GET", endpoint) as response:
             if response.status != 200:
-                text = await self._read_text(response, endpoint)
+                text = await self._read_error_text(response, endpoint)
                 raise GranSabioClientError(
                     f"Failed to get status: {text}",
                     status_code=response.status
@@ -516,7 +552,7 @@ class AsyncGranSabioClient:
                 return {"status": "in_progress", "session_id": session_id}
 
             if response.status != 200:
-                text = await self._read_text(response, endpoint)
+                text = await self._read_error_text(response, endpoint)
                 raise GranSabioClientError(
                     f"Failed to get result: {text}",
                     status_code=response.status
@@ -529,12 +565,12 @@ class AsyncGranSabioClient:
         endpoint = f"/stop/{session_id}"
         async with await self._request("POST", endpoint) as response:
             if response.status not in (200, 202):
-                text = await self._read_text(response, endpoint)
+                text = await self._read_error_text(response, endpoint)
                 raise GranSabioClientError(
                     f"Failed to stop session: {text}",
                     status_code=response.status
                 )
-            return await self._read_json(response, endpoint)
+            return await self._read_json_no_retry(response, endpoint)
 
     async def _call_with_retry(
         self,
@@ -736,12 +772,12 @@ class AsyncGranSabioClient:
 
         async with await self._request("POST", "/analysis/lexical-diversity", json_data=payload) as response:
             if response.status != 200:
-                text_response = await response.text()
+                text_response = await self._read_error_text(response, "/analysis/lexical-diversity")
                 raise GranSabioClientError(
                     f"Lexical diversity analysis failed: {text_response}",
                     status_code=response.status
                 )
-            return await response.json()
+            return await self._read_json_no_retry(response, "/analysis/lexical-diversity")
 
     async def analyze_repetition(
         self,
@@ -776,12 +812,12 @@ class AsyncGranSabioClient:
 
         async with await self._request("POST", "/analysis/repetition", json_data=payload) as response:
             if response.status != 200:
-                text_response = await response.text()
+                text_response = await self._read_error_text(response, "/analysis/repetition")
                 raise GranSabioClientError(
                     f"Repetition analysis failed: {text_response}",
                     status_code=response.status
                 )
-            return await response.json()
+            return await self._read_json_no_retry(response, "/analysis/repetition")
 
     # =========================================================================
     # Specialized Repetition Analysis Wrappers
@@ -833,12 +869,12 @@ class AsyncGranSabioClient:
 
         async with await self._request("POST", "/analysis/repetition", json_data=payload) as response:
             if response.status != 200:
-                text_response = await response.text()
+                text_response = await self._read_error_text(response, "/analysis/repetition")
                 raise GranSabioClientError(
                     f"Unigram repetition analysis failed: {text_response}",
                     status_code=response.status,
                 )
-            data = await response.json()
+            data = await self._read_json_no_retry(response, "/analysis/repetition")
 
         counts: Dict[str, int] = {}
         summary = data.get("summary") if isinstance(data, dict) else None
@@ -913,12 +949,12 @@ class AsyncGranSabioClient:
 
         async with await self._request("POST", "/analysis/repetition", json_data=payload) as response:
             if response.status != 200:
-                text_response = await response.text()
+                text_response = await self._read_error_text(response, "/analysis/repetition")
                 raise GranSabioClientError(
                     f"Positional bias analysis failed: {text_response}",
                     status_code=response.status,
                 )
-            data = await response.json()
+            data = await self._read_json_no_retry(response, "/analysis/repetition")
 
         if not isinstance(data, dict):
             return {}
@@ -967,12 +1003,12 @@ class AsyncGranSabioClient:
             headers=headers
         ) as response:
             if response.status != 200:
-                text = await response.text()
+                text = await self._read_error_text(response, "/attachments")
                 raise GranSabioClientError(
                     f"Attachment upload failed: {text}",
                     status_code=response.status
                 )
-            return await response.json()
+            return await self._read_json_no_retry(response, "/attachments")
 
     async def upload_attachment_base64(
         self,
@@ -1002,12 +1038,12 @@ class AsyncGranSabioClient:
 
         async with await self._request("POST", "/attachments/base64", json_data=payload) as response:
             if response.status != 200:
-                text = await response.text()
+                text = await self._read_error_text(response, "/attachments/base64")
                 raise GranSabioClientError(
                     f"Attachment upload failed: {text}",
                     status_code=response.status
                 )
-            return await response.json()
+            return await self._read_json_no_retry(response, "/attachments/base64")
 
     # =========================================================================
     # Convenience Methods
@@ -1225,20 +1261,32 @@ class AsyncGranSabioClient:
         async def _fetch_once() -> Tuple[int, Optional[Dict[str, Any]], str, str]:
             """One GET /result attempt. Returns (status, parsed_json, detail, text_body).
 
-            Transient failures propagate as TransientGranSabioError (either from
-            _request or from reading the response body) so the retry layer can
-            handle them. text_body is only populated when the caller will need
-            it for an error message (non-retryable non-200 status).
+            Transient failures propagate as TransientGranSabioError so the retry
+            layer can handle them. Body-read transients include ClientPayloadError,
+            ServerDisconnectedError, ClientConnectionError, and asyncio.TimeoutError;
+            additional transients may originate in _request. text_body is only
+            populated when the caller will need it for an error message
+            (non-retryable non-200 status).
             """
+            transient_body_errors = (
+                aiohttp.ClientPayloadError,
+                aiohttp.ServerDisconnectedError,
+                aiohttp.ClientConnectionError,
+                asyncio.TimeoutError,
+            )
             async with await self._request("GET", result_url) as response:
                 status_code = response.status
                 if status_code == 200:
                     try:
                         body = await response.json()
-                    except aiohttp.ClientPayloadError as exc:
+                    except transient_body_errors as exc:
                         # Mid-response truncation on the success branch is
                         # transient for an idempotent GET -- let the retry
                         # layer try again.
+                        raise TransientGranSabioError(
+                            f"Transient protocol error reading /result/{session_id}: {exc}"
+                        ) from exc
+                    except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError) as exc:
                         raise TransientGranSabioError(
                             f"Transient protocol error reading /result/{session_id}: {exc}"
                         ) from exc
@@ -1246,16 +1294,17 @@ class AsyncGranSabioClient:
 
                 parsed: Optional[Dict[str, Any]] = None
                 detail = ""
+                is_retryable_status = status_code in (202, 425, 503, 400)
                 try:
                     parsed = await response.json()
                     if isinstance(parsed, dict):
                         detail = str(parsed.get("detail", ""))
-                except aiohttp.ClientPayloadError as exc:
-                    # Mid-response truncation on the non-200 branch is still
-                    # transient for an idempotent GET.
-                    raise TransientGranSabioError(
-                        f"Transient protocol error reading /result/{session_id}: {exc}"
-                    ) from exc
+                except transient_body_errors as exc:
+                    if is_retryable_status:
+                        raise TransientGranSabioError(
+                            f"Transient protocol error reading /result/{session_id}: {exc}"
+                        ) from exc
+                    parsed = None
                 except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError):
                     parsed = None
 
@@ -1263,14 +1312,12 @@ class AsyncGranSabioClient:
                 # Only bother reading the body text when we may need it for an
                 # error message (non-retryable status). Retryable statuses skip
                 # this to avoid wasted I/O.
-                is_retryable_status = status_code in (202, 425, 503, 400)
                 if not is_retryable_status:
                     try:
                         text_body = await response.text()
-                    except aiohttp.ClientPayloadError as exc:
-                        raise TransientGranSabioError(
-                            f"Transient protocol error reading /result/{session_id}: {exc}"
-                        ) from exc
+                    except transient_body_errors as exc:
+                        logger.warning("Could not read /result/%s error body: %s", session_id, exc)
+                        text_body = "<body unreadable>"
 
                 return status_code, parsed, detail, text_body
 
@@ -1513,7 +1560,7 @@ class AsyncGranSabioClient:
         content_type: str = "article",
         generator_model: str = "gpt-4o",
         temperature: float = 0.7,
-        max_tokens: int = 4000,
+        max_tokens: Optional[int] = None,
         min_words: Optional[int] = None,
         max_words: Optional[int] = None,
         qa_models: Optional[List[str]] = None,
@@ -1550,7 +1597,9 @@ class AsyncGranSabioClient:
             content_type: Type of content (article, creative, json, etc.).
             generator_model: AI model to use for generation.
             temperature: Creativity level (0.0-2.0).
-            max_tokens: Maximum tokens to generate.
+            max_tokens: Maximum tokens to generate. When omitted, the server
+                uses the selected model's max output from model_specs.json
+                (fallback: 8192).
             min_words: Minimum word count (optional).
             max_words: Maximum word count (optional).
             qa_models: Models for QA evaluation.
@@ -1584,7 +1633,6 @@ class AsyncGranSabioClient:
             "content_type": content_type,
             "generator_model": generator_model,
             "temperature": temperature,
-            "max_tokens": max_tokens,
             "min_words": min_words,
             "max_words": max_words,
             "qa_models": qa_models,
@@ -1605,6 +1653,8 @@ class AsyncGranSabioClient:
             "thinking_budget_tokens": thinking_budget_tokens,
             "wait_for_completion": False,
         }
+        if max_tokens is not None:
+            gen_kwargs["max_tokens"] = max_tokens
         gen_kwargs.update(kwargs)
 
         # Start generation without waiting
@@ -1728,10 +1778,6 @@ class AsyncGranSabioClient:
         validate_result(final)
 
         return final
-
-
-# Backward compatibility alias
-AsyncBioAIClient = AsyncGranSabioClient
 
 
 # Module-level convenience function

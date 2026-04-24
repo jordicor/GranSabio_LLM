@@ -330,6 +330,27 @@ class ValidateOptions:
             self.stop_on_first_error = True
 
 
+def make_loose_json_validate_options() -> ValidateOptions:
+    """Build AI-output options for the JSON_LOOSE contract.
+
+    JSON_LOOSE means "JSON requested without a schema": extract the first JSON
+    object/array from common AI wrappers, repair conservative syntax slips, then
+    validate expectations. A fresh instance is returned on every call so no
+    shared mutable options object can be changed by another caller.
+    """
+
+    return ValidateOptions(
+        strict=True,
+        extract_json=True,
+        tolerate_trailing_commas=True,
+        allow_json_in_code_fences=True,
+        allow_bare_top_level_scalars=False,
+        enable_safe_repairs=True,
+        allow_json5_like=True,
+        normalize_curly_quotes="auto",
+    )
+
+
 # ----------------------------- Utilities -----------------------------
 
 JSON_PRIMITIVE_TYPES = (dict, list, str, int, float, bool, type(None))
@@ -2009,6 +2030,25 @@ def validate_ai_json(
         warnings=warnings,
         data=parsed if json_valid else None,
         info=info
+    )
+
+
+def validate_loose_json(
+    content: str,
+    *,
+    expectations: Optional[List[Dict[str, Any]]] = None,
+) -> ValidationResult:
+    """Validate JSON_LOOSE: extract/repair AI JSON object/array, no schema.
+
+    Text outside the first JSON payload is ignored, markdown fences are
+    unwrapped, and conservative repair passes handle typical AI syntax slips.
+    Top-level scalars and expectation failures still fail validation.
+    """
+
+    return validate_ai_json(
+        content,
+        expectations=expectations,
+        options=make_loose_json_validate_options(),
     )
 
 

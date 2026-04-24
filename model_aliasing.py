@@ -7,6 +7,7 @@ prompt builders can use stable role/slot aliases.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence
 
@@ -108,7 +109,6 @@ IDENTITY_FIELD_NAMES = frozenset(
         "model_id",
         "model_used",
         "used_model",
-        "source_model",
         "triggering_model",
         "qa_model",
         "qa_model_name",
@@ -127,7 +127,6 @@ IDENTITY_FIELD_ALIAS_KEYS: Dict[str, str] = {
     "model_id": "model_id_alias",
     "model_used": "model_used_alias",
     "used_model": "used_model_alias",
-    "source_model": "source_evaluator",
     "triggering_model": "triggering_evaluator",
     "qa_model": "qa_evaluator",
     "qa_model_name": "qa_evaluator",
@@ -174,6 +173,20 @@ def _fingerprint_from_config(model: Any) -> Optional[str]:
         if value is not None:
             parts.append(f"{attr}={value}")
     return "|".join(parts) if parts else None
+
+
+def _lookup_catalog_identity(real_model: str) -> tuple[Optional[str], Optional[str]]:
+    """Resolve provider/model_id from model_specs without requiring provider API keys."""
+    from config import config, resolve_model_catalog_entry
+
+    resolved = resolve_model_catalog_entry(real_model, getattr(config, "model_specs", {}) or {})
+    if not resolved["matched"]:
+        return None, None
+    if not resolved["enabled"]:
+        msg = f"[CONFIG ERROR] Model '{real_model}' is disabled."
+        print(msg, file=sys.stderr, flush=True)
+        raise RuntimeError(msg)
+    return resolved["model_id"], resolved["provider"]
 
 
 def get_evaluator_alias(evaluation: Any, fallback: Optional[str] = None) -> str:
@@ -312,16 +325,7 @@ class ModelAliasRegistry:
         model_id: Optional[str] = None
         provider: Optional[str] = None
 
-        try:
-            from config import config
-
-            info = config.get_model_info(real_model)
-            if isinstance(info, dict):
-                model_id = str(info.get("model_id") or "") or None
-                provider = str(info.get("provider") or "") or None
-        except Exception:
-            model_id = None
-            provider = None
+        model_id, provider = _lookup_catalog_identity(real_model)
 
         slot = ModelSlot(
             slot_id=slot_id,
@@ -378,16 +382,20 @@ class ModelAliasRegistry:
             evaluation.slot_id = slot.slot_id
             evaluation.evaluator_alias = slot.alias
             evaluation.config_fingerprint = slot.config_fingerprint
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError(
+                f"Unable to attach evaluator alias metadata for slot '{slot_id}'."
+            ) from exc
 
         metadata = getattr(evaluation, "metadata", None)
         if metadata is None:
             metadata = {}
             try:
                 evaluation.metadata = metadata
-            except Exception:
-                return evaluation
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Unable to attach evaluator metadata dict for slot '{slot_id}'."
+                ) from exc
         if isinstance(metadata, dict):
             metadata.setdefault("slot_id", slot.slot_id)
             metadata.setdefault("evaluator_alias", slot.alias)

@@ -345,6 +345,14 @@ class DealBreakerTracker:
         """Get total escalation count for a session"""
         return len(self.escalations.get(session_id, []))
 
+    def clear_session(self, session_id: str) -> None:
+        """Release in-memory tracker state scoped to a completed/expired session."""
+        self.events.pop(session_id, None)
+        self.escalations.pop(session_id, None)
+        for escalation_id in list(self.escalation_event_links):
+            if escalation_id.startswith(f"{session_id}_"):
+                self.escalation_event_links.pop(escalation_id, None)
+
     def get_model_stats(self, model_name: str) -> Optional[ModelReliabilityStats]:
         """Get reliability stats for a specific model"""
         return self.model_stats.get(model_name)

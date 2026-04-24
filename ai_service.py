@@ -39,8 +39,21 @@ except ImportError:
 import json_utils as json
 
 from config import config, get_model_parameter_requirements
+from deterministic_validation import DraftValidationResult
 from models import QAEvaluation
 from schema_utils import json_schema_to_pydantic
+from tool_loop_models import (
+    JsonContractError,
+    LoopScope,
+    OutputContract,
+    PayloadScope,
+    ToolLoopContractError,
+    ToolLoopContextOverflow,
+    ToolLoopEnvelope,
+    ToolLoopSchemaViolationError,
+    ToolLoopTraceEntry,
+    ValidationToolInputTooLarge,
+)
 from tools.string_utils import escape_xml_delimiters, remove_invisible_control
 from llm_accent_prompts import (
     DEFAULT_ACCENT_RUBRIC,
@@ -54,6 +67,24 @@ from model_aliasing import PromptPart, assert_prompt_is_model_blind
 logger = logging.getLogger(__name__)
 
 
+def _ensure_aiohttp_compatibility() -> None:
+    """Patch aiohttp symbols expected by provider SDKs when older versions lack them."""
+
+    if (
+        not hasattr(aiohttp, "ClientConnectorDNSError")
+        and hasattr(aiohttp, "ClientConnectorError")
+    ):
+        setattr(aiohttp, "ClientConnectorDNSError", aiohttp.ClientConnectorError)
+        logger.warning(
+            "aiohttp.ClientConnectorDNSError is missing; aliasing it to "
+            "ClientConnectorError for google-genai compatibility. Upgrade aiohttp "
+            "to avoid this runtime shim."
+        )
+
+
+_ensure_aiohttp_compatibility()
+
+
 def _truncate_to_bytes(text: str, limit: int) -> str:
     """Truncate a UTF-8 string to at most ``limit`` bytes (safe-decoding remainder)."""
     if text is None:
@@ -62,6 +93,80 @@ def _truncate_to_bytes(text: str, limit: int) -> str:
     if len(encoded) <= limit:
         return text
     return encoded[:limit].decode("utf-8", errors="ignore")
+
+def _should_normalize_json_contract_content(
+    raw_content: str,
+    validation_result: Any,
+) -> bool:
+    """Return True when validation had to extract or repair the JSON payload."""
+
+    info = getattr(validation_result, "info", {}) or {}
+    if info.get("source") != "raw" or info.get("repair"):
+        return True
+    try:
+        return json.loads(raw_content) != getattr(validation_result, "data", None)
+    except Exception:
+        return True
+
+
+def _stringify_finish_reason(value: Any) -> Optional[str]:
+    """Return provider finish/stop reasons as stable strings."""
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    name = getattr(value, "name", None)
+    if isinstance(name, str):
+        return name
+    value_attr = getattr(value, "value", None)
+    if isinstance(value_attr, str):
+        return value_attr
+    return str(value)
+
+
+def _is_token_limit_finish_reason(reason: Any) -> bool:
+    """Detect provider stop reasons that mean output was cut by token budget."""
+
+    reason_text = (_stringify_finish_reason(reason) or "").strip().lower()
+    if not reason_text:
+        return False
+    normalized = reason_text.replace("-", "_").replace(" ", "_")
+    if normalized in {
+        "length",
+        "max_tokens",
+        "max_output_tokens",
+        "max_token",
+        "token_limit",
+        "output_token_limit",
+        "max_tokens_exceeded",
+        "max_output_tokens_exceeded",
+    }:
+        return True
+    return "max" in normalized and "token" in normalized
+
+
+def _build_finish_metadata(
+    *,
+    provider: str,
+    finish_reason: Any,
+    max_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Build lightweight streaming finish metadata."""
+
+    finish_reason_text = _stringify_finish_reason(finish_reason)
+    metadata: Dict[str, Any] = {
+        "provider": provider,
+        "output_truncated": _is_token_limit_finish_reason(finish_reason_text),
+    }
+    if finish_reason_text is not None:
+        metadata["finish_reason"] = finish_reason_text
+        metadata["provider_stop_reason"] = finish_reason_text
+    if max_tokens is not None:
+        metadata["max_tokens"] = max_tokens
+    if metadata["output_truncated"]:
+        metadata["truncation_reason"] = "output_token_limit"
+    return metadata
 
 
 class AccentGuardError(Exception):
@@ -114,11 +219,17 @@ class StreamChunk:
     markers. In the future, consider adding tags like [THINKING]...[/THINKING]
     or a structured format to help frontends differentiate and style them.
     """
-    __slots__ = ('text', 'is_thinking')
+    __slots__ = ('text', 'is_thinking', 'metadata')
 
-    def __init__(self, text: str, is_thinking: bool = False):
+    def __init__(
+        self,
+        text: str,
+        is_thinking: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         self.text = text
         self.is_thinking = is_thinking
+        self.metadata = metadata or {}
 
     def __str__(self) -> str:
         return self.text
@@ -157,6 +268,43 @@ _shared_ai_service: Optional["AIService"] = None
 _ai_service_init_lock = threading.Lock()
 
 
+def estimate_prompt_overflow(
+    model_id: str,
+    prompt_chars: int,
+    max_tokens: int,
+    thinking_budget: int = 0,
+) -> Optional[str]:
+    """Cheap gate for ``context_too_large`` before dispatching a tool loop.
+
+    Returns ``None`` when the prompt likely fits the model's context window
+    (or when the model is unknown and the caller must rely on the paranoid
+    ``TOOL_LOOP_MAX_PROMPT_CHARS`` hard cap instead). Returns the string
+    ``"context_too_large"`` when an overflow is estimated.
+
+    ``model_specs`` is the primary source of truth; a rough ``chars // 4``
+    token estimate feeds the arithmetic. This is deliberately conservative:
+    a false positive is better than a wasted round-trip on a request that
+    the provider would reject anyway.
+    """
+    try:
+        model_info = config.get_model_info(model_id)
+    except RuntimeError:
+        return None
+    except Exception:
+        return None
+
+    context_window = model_info.get("input_tokens") or model_info.get("context_window")
+    if not context_window:
+        return None
+
+    estimated_input_tokens = prompt_chars // 4
+    overhead = 512  # system-prompt fragments + tool definitions safety margin
+    available = int(context_window) - int(max_tokens) - int(thinking_budget or 0) - overhead
+    if estimated_input_tokens > available:
+        return "context_too_large"
+    return None
+
+
 def get_ai_service() -> "AIService":
     """Return the shared AIService instance, creating it on first use."""
     global _shared_ai_service
@@ -165,6 +313,16 @@ def get_ai_service() -> "AIService":
             if _shared_ai_service is None:
                 _shared_ai_service = AIService()
     return _shared_ai_service
+
+
+async def call_ai_with_validation_tools(*args: Any, **kwargs: Any):
+    """Module-level shortcut for ``get_ai_service().call_ai_with_validation_tools``.
+
+    Exposed so tests and ad-hoc callers can import the entry point without
+    materializing an ``AIService`` themselves. Delegates to the shared
+    service pool.
+    """
+    return await get_ai_service().call_ai_with_validation_tools(*args, **kwargs)
 
 
 class AIService:
@@ -491,6 +649,38 @@ class AIService:
                 result[key] = value
 
         return result
+
+    @staticmethod
+    def _prepare_structured_output_schema(
+        provider: str,
+        model_id: str,
+        json_schema: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Return a provider-compatible JSON Schema copy for native JSON output."""
+
+        if not json_schema:
+            return json_schema
+
+        provider_key = (provider or "").lower()
+        model_lower = (model_id or "").lower()
+
+        if provider_key in {"gemini", "google"}:
+            effective_schema = AIService._strip_additional_properties(json_schema)
+            return AIService._convert_nullable_to_gemini_format(effective_schema)
+
+        if (
+            provider_key in {"claude", "anthropic"}
+            and AIService._claude_supports_structured_outputs(model_lower)
+        ):
+            try:
+                return json_schema_to_pydantic(json_schema).model_json_schema()
+            except Exception as exc:  # noqa: BLE001 - normalize schema errors
+                raise ValueError(
+                    f"Schema validation error for {model_id}: failed to normalize "
+                    f"Claude structured-output schema: {exc}"
+                ) from exc
+
+        return json_schema
 
     @staticmethod
     def _apply_gemini_structured_output_schema(
@@ -900,6 +1090,9 @@ class AIService:
                 raise
             except AccentGuardError:
                 raise
+            except ToolLoopContextOverflow:
+                # Authoritative provider signal — do not retry, surface to caller.
+                raise
             except Exception as exc:
                 last_exception = exc
                 should_retry = attempt < max_attempts and self._should_retry_exception(exc)
@@ -927,6 +1120,41 @@ class AIService:
         assert last_exception is not None
         raise AIRequestError(provider, model_id, max_attempts, max_attempts, last_exception) from last_exception
 
+    async def _execute_without_retries(
+        self,
+        operation: Callable[[], Awaitable[T]],
+        *,
+        provider: str,
+        model_id: str,
+        action: str,
+    ) -> T:
+        """Run one provider attempt and normalize transient provider failures."""
+
+        try:
+            return await operation()
+        except AIRequestError:
+            raise
+        except AccentGuardError:
+            raise
+        except ToolLoopContextOverflow:
+            raise
+        except Exception as exc:
+            if not self._should_retry_exception(exc):
+                raise
+
+            request_id = self._extract_request_id(exc)
+            suffix = f" (request_id={request_id})" if request_id else ""
+            logger.error(
+                "AI %s failed for %s via %s with retries disabled%s: %s",
+                action,
+                model_id,
+                provider,
+                suffix,
+                exc,
+                exc_info=True,
+            )
+            raise AIRequestError(provider, model_id, 1, 1, exc) from exc
+
     @staticmethod
     def _normalize_usage(usage_obj: Any) -> Optional[Dict[str, Any]]:
         """Extract token metrics from provider-specific usage objects."""
@@ -948,6 +1176,17 @@ class AIService:
         output_tokens = _pluck(usage_obj, "completion_tokens", "output_tokens", "output_token_count") or 0
         total_tokens = _pluck(usage_obj, "total_tokens", "total_token_count")
         reasoning_tokens = _pluck(usage_obj, "reasoning_tokens", "thinking_tokens")
+        finish_reason = None
+        for name in ("finish_reason", "stop_reason", "provider_stop_reason"):
+            if isinstance(usage_obj, dict) and usage_obj.get(name) is not None:
+                finish_reason = usage_obj.get(name)
+                break
+            if hasattr(usage_obj, name):
+                finish_reason = getattr(usage_obj, name)
+                break
+        output_truncated = None
+        if isinstance(usage_obj, dict) and "output_truncated" in usage_obj:
+            output_truncated = bool(usage_obj.get("output_truncated"))
 
         # Some providers return nested metadata (e.g., Anthropic streaming final response)
         if hasattr(usage_obj, "model_dump"):
@@ -957,15 +1196,78 @@ class AIService:
                     input_tokens = dumped.get("input_tokens", input_tokens) or input_tokens
                     output_tokens = dumped.get("output_tokens", output_tokens) or output_tokens
                     total_tokens = dumped.get("total_tokens", total_tokens)
+                    finish_reason = finish_reason or dumped.get("finish_reason") or dumped.get("stop_reason")
             except Exception:
                 pass
 
-        return {
+        normalized = {
             "input_tokens": int(input_tokens or 0),
             "output_tokens": int(output_tokens or 0),
             "total_tokens": int(total_tokens) if total_tokens is not None else None,
             "reasoning_tokens": int(reasoning_tokens) if reasoning_tokens is not None else None,
         }
+        finish_reason_text = _stringify_finish_reason(finish_reason)
+        if finish_reason_text is not None:
+            normalized["finish_reason"] = finish_reason_text
+            normalized["provider_stop_reason"] = finish_reason_text
+        if output_truncated is None:
+            output_truncated = _is_token_limit_finish_reason(finish_reason_text)
+        normalized["output_truncated"] = bool(output_truncated)
+        if normalized["output_truncated"]:
+            normalized["truncation_reason"] = "output_token_limit"
+        return normalized
+
+    def _usage_with_finish_metadata(
+        self,
+        usage_obj: Any,
+        response: Any,
+        *,
+        provider: str,
+        max_tokens: Optional[int] = None,
+        fallback_finish_reason: Any = None,
+    ) -> Dict[str, Any]:
+        """Combine token usage with provider stop/finish reason metadata."""
+
+        usage_payload = self._normalize_usage(usage_obj) or {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": None,
+            "reasoning_tokens": None,
+        }
+        finish_reason = fallback_finish_reason
+
+        if finish_reason is None:
+            finish_reason = getattr(response, "stop_reason", None)
+        if finish_reason is None:
+            finish_reason = getattr(response, "finish_reason", None)
+        if finish_reason is None:
+            choices = getattr(response, "choices", None) or []
+            if choices:
+                finish_reason = getattr(choices[0], "finish_reason", None)
+        if finish_reason is None:
+            candidates = getattr(response, "candidates", None) or []
+            if candidates:
+                finish_reason = getattr(candidates[0], "finish_reason", None)
+        if finish_reason is None:
+            incomplete_details = getattr(response, "incomplete_details", None)
+            if incomplete_details is not None:
+                finish_reason = getattr(incomplete_details, "reason", None)
+                if finish_reason is None and isinstance(incomplete_details, dict):
+                    finish_reason = incomplete_details.get("reason")
+
+        finish_reason_text = _stringify_finish_reason(finish_reason)
+        if finish_reason_text:
+            usage_payload["finish_reason"] = finish_reason_text
+            usage_payload["provider_stop_reason"] = finish_reason_text
+        usage_payload["provider"] = provider
+        if max_tokens is not None:
+            usage_payload["max_tokens"] = max_tokens
+        if _is_token_limit_finish_reason(finish_reason_text):
+            usage_payload["output_truncated"] = True
+            usage_payload["truncation_reason"] = "output_token_limit"
+        else:
+            usage_payload.setdefault("output_truncated", False)
+        return usage_payload
 
     def _emit_usage(
         self,
@@ -1097,19 +1399,17 @@ class AIService:
         if usage_extra:
             extra_payload.update(usage_extra)
 
-        # Enforce structured-output schema compatibility upfront
-        # For Gemini, transform schema to match their requirements:
-        # 1. Strip additionalProperties (not supported)
-        # 2. Convert nullable types from ["type", "null"] to {"type": "type", "nullable": true}
+        # Enforce structured-output schema compatibility upfront, using the
+        # same provider-normalized schema that native JSON calls will receive.
         effective_json_schema = json_schema
         if json_output and json_schema:
-            if provider in ("gemini", "google"):
-                effective_json_schema = self._strip_additional_properties(json_schema)
-                effective_json_schema = self._convert_nullable_to_gemini_format(effective_json_schema)
+            effective_json_schema = self._prepare_structured_output_schema(
+                provider,
+                model_id,
+                json_schema,
+            )
             self._validate_schema_for_structured_outputs(effective_json_schema, provider, model_id)
-        elif json_output and not json_schema and provider == "openai" and any(
-            marker in model_id.lower() for marker in ["o3-pro", "gpt-5-pro"]
-        ):
+        elif json_output and not json_schema and provider == "openai" and self._is_openai_responses_api_model(model_id):
             fallback_schema = {"type": "object", "additionalProperties": False, "properties": {}}
             self._validate_schema_for_structured_outputs(fallback_schema, provider, model_id)
 
@@ -1199,7 +1499,7 @@ class AIService:
                     extra_verbose=extra_verbose,
                     request_timeout=request_timeout,
                     json_output=json_output,
-                    json_schema=json_schema,
+                    json_schema=effective_json_schema,
                     images=images,
                 )
 
@@ -1235,7 +1535,7 @@ class AIService:
                     thinking_budget_tokens,
                     request_timeout=request_timeout,
                     json_output=json_output,
-                    json_schema=json_schema,
+                    json_schema=effective_json_schema,
                     images=images,
                 )
 
@@ -1301,7 +1601,7 @@ class AIService:
                     adjusted_max_tokens,
                     system_prompt or "",
                     json_output=json_output,
-                    json_schema=json_schema,
+                    json_schema=effective_json_schema,
                     images=images,
                 )
 
@@ -1334,7 +1634,7 @@ class AIService:
                     adjusted_max_tokens,
                     system_prompt or "",
                     json_output=json_output,
-                    json_schema=json_schema,
+                    json_schema=effective_json_schema,
                     images=images,
                 )
 
@@ -1367,7 +1667,7 @@ class AIService:
                     adjusted_max_tokens,
                     system_prompt or "",
                     json_output=json_output,
-                    json_schema=json_schema,
+                    json_schema=effective_json_schema,
                 )
 
                 # Log full response if extra_verbose is enabled
@@ -1399,7 +1699,7 @@ class AIService:
                     adjusted_max_tokens,
                     system_prompt or "",
                     json_output=json_output,
-                    json_schema=json_schema,
+                    json_schema=effective_json_schema,
                 )
 
                 # Log full response if extra_verbose is enabled
@@ -1448,14 +1748,98 @@ class AIService:
         return provider_key
 
     @staticmethod
+    def _supports_structured_outputs(provider: str, model_id: str) -> bool:
+        """Return True when the provider/model can enforce JSON through native structured outputs."""
+        provider_key = (provider or "").lower()
+        model_lower = (model_id or "").lower()
+        if provider_key == "openai":
+            return True
+        if provider_key in {"claude", "anthropic"}:
+            return AIService._claude_supports_structured_outputs(model_lower)
+        if provider_key in {"gemini", "google"}:
+            return True
+        if provider_key == "xai":
+            return "grok-" in model_lower
+        if provider_key == "openrouter":
+            return True
+        return False
+
+    @staticmethod
+    def _effective_json_schema_for_request(
+        provider: str,
+        model_id: str,
+        json_output: bool,
+        json_schema: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Return the schema that the provider path will actually use, if any.
+
+        This is stricter than simply checking ``json_schema``: some provider/model
+        combinations synthesize an internal flexible schema when callers request JSON
+        output without supplying one explicitly.
+        """
+        if not json_output:
+            return None
+
+        provider_key = (provider or "").lower()
+        model_lower = (model_id or "").lower()
+
+        if json_schema and AIService._supports_structured_outputs(provider_key, model_lower):
+            return json_schema
+
+        if not json_schema and provider_key == "openai" and AIService._is_openai_responses_api_model(model_lower):
+            return {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {},
+            }
+
+        return None
+
+    @staticmethod
+    def _uses_native_structured_outputs(
+        provider: str,
+        model_id: str,
+        json_schema: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Return True when the provider/model will enforce JSON through native structured outputs."""
+        return json_schema is not None and AIService._supports_structured_outputs(provider, model_id)
+
+    @staticmethod
+    def _should_inject_json_prompt(
+        provider: str,
+        model_id: str,
+        json_output: bool,
+        json_schema: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Return True when the legacy JSON prompt instruction is still needed."""
+        effective_schema = AIService._effective_json_schema_for_request(
+            provider,
+            model_id,
+            json_output,
+            json_schema,
+        )
+        return json_output and not AIService._uses_native_structured_outputs(
+            provider,
+            model_id,
+            effective_schema,
+        )
+
+    @staticmethod
     def _build_validation_tool_parameters_schema() -> Dict[str, Any]:
-        """Return the shared JSON schema for the local validation tool."""
+        """Return the shared JSON schema for the local validation tool.
+
+        ``maxLength`` is the schema-declared upper bound on the ``text``
+        argument. Server-side centralized enforcement lives in
+        ``_invoke_validation_callback`` (defense in depth — some providers
+        skip the ``maxLength`` check).
+        """
         return {
             "type": "object",
             "properties": {
                 "text": {
                     "type": "string",
                     "description": "The exact current draft to validate.",
+                    "maxLength": getattr(config, "VALIDATE_DRAFT_MAX_LENGTH", 200000),
                 }
             },
             "required": ["text"],
@@ -1524,29 +1908,55 @@ class AIService:
     @staticmethod
     def _claude_supports_structured_outputs(model_lower: str) -> bool:
         """Return True when the Claude model id supports native structured outputs (Sec 5.11)."""
-        markers = (
-            "sonnet-4-5", "sonnet-4.5",
-            "sonnet-4-6", "sonnet-4.6",
-            "opus-4-1", "opus-4.1",
-            "opus-4-5", "opus-4.5",
-            "opus-4-6", "opus-4.6",
-            "haiku-4-5", "haiku-4.5",
-        )
-        return any(marker in model_lower for marker in markers)
+        parts = (model_lower or "").replace(".", "-").split("-")
+        for index, part in enumerate(parts):
+            if part not in {"sonnet", "opus", "haiku"}:
+                continue
+            if index + 2 >= len(parts) or parts[index + 1] != "4":
+                continue
+            try:
+                minor = int(parts[index + 2])
+            except ValueError:
+                continue
+            if part == "opus" and minor == 1:
+                return True
+            if minor >= 5:
+                return True
+        return False
 
     @staticmethod
     def _audit_model_supports_structured_outputs(provider_key: str, model_id: str) -> bool:
-        """Return True when the audit model's provider supports native JSON-schema constrained output (Sec 5.11)."""
-        model_lower = (model_id or "").lower()
-        if provider_key == "openai":
-            return not any(marker in model_lower for marker in ("o3-pro", "gpt-5-pro"))
-        if provider_key in {"claude", "anthropic"}:
-            return AIService._claude_supports_structured_outputs(model_lower)
-        if provider_key in {"gemini", "google"}:
-            return True
-        if provider_key == "xai":
-            return "grok-" in model_lower
-        if provider_key == "openrouter":
+        """Return True when the audit model's provider supports native JSON-schema constrained output (Sec 5.11).
+
+        Note: since round 4, ("openai", "o3-pro") returns True because the Responses API
+        path now emits strict structured audit payloads via the text.format channel.
+        """
+        return AIService._supports_structured_outputs(provider_key, model_id)
+
+    @staticmethod
+    def _is_openai_responses_api_model(model_id: str) -> bool:
+        """Return True when the given OpenAI model id uses the Responses API.
+
+        Reads the ``responses_api`` capability from already-loaded ``config.model_specs``
+        (no disk IO). Matches both the model key and the ``model_id`` field so dated
+        variants (e.g. ``o3-pro-2025-06-10``) resolve correctly. Returns False when the
+        model is unknown (fail-safe).
+        """
+        if not model_id:
+            return False
+        specs = getattr(config, "model_specs", None) or {}
+        openai_specs = (specs.get("model_specifications", {}) or {}).get("openai", {}) or {}
+        target = model_id.lower()
+        for model_key, model_data in openai_specs.items():
+            if not isinstance(model_data, dict):
+                continue
+            declared_id = str(model_data.get("model_id") or model_key).lower()
+            if declared_id != target and str(model_key).lower() != target:
+                continue
+            capabilities = model_data.get("capabilities") or []
+            for cap in capabilities:
+                if isinstance(cap, str) and cap.lower() == "responses_api":
+                    return True
             return False
         return False
 
@@ -1612,13 +2022,11 @@ class AIService:
         return _truncate_to_bytes("\n".join(body_lines), 2048)
 
     @staticmethod
-    def _build_trace_metrics(tool_payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Merge mechanical/stylistic/validation metrics from a validator payload (Sec 4.4)."""
-        snapshot: Dict[str, Any] = dict(tool_payload.get("metrics") or {})
-        if "stylistic_metrics" in tool_payload:
-            snapshot["stylistic"] = tool_payload["stylistic_metrics"]
-        if "validation_metrics" in tool_payload:
-            snapshot["validation"] = tool_payload["validation_metrics"]
+    def _build_trace_metrics(result: "DraftValidationResult") -> Dict[str, Any]:
+        """Merge mechanical/stylistic/validation metrics from a ``DraftValidationResult`` (Sec 4.4)."""
+        snapshot: Dict[str, Any] = dict(result.metrics or {})
+        if result.stylistic_metrics is not None:
+            snapshot["stylistic"] = result.stylistic_metrics
         return snapshot
 
     @staticmethod
@@ -1652,17 +2060,62 @@ class AIService:
 
     def _invoke_validation_callback(
         self,
-        validation_callback: Callable[[str], Dict[str, Any]],
+        validation_callback: Callable[[str], "DraftValidationResult"],
         draft: str,
         *,
         mode_name: str,
         model_id: str,
         turn: int,
         stage: str,
-    ) -> Dict[str, Any]:
-        """Run the local validator with consistent error handling across providers."""
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+    ) -> "DraftValidationResult":
+        """Run the local validator with consistent error handling across providers.
+
+        Single insertion point that protects all four tool loops (OpenAI-compatible,
+        Claude, Gemini new SDK, Gemini legacy SDK). Performs:
+
+        1. Centralized ``VALIDATE_DRAFT_MAX_LENGTH`` enforcement (defense in
+           depth — some providers do not strictly enforce tool schema
+           ``maxLength``). Raises ``ValidationToolInputTooLarge`` so the loop
+           can force-finalize with a neutral response to the model.
+        2. Fail-fast error handling if the callback itself raises or returns
+           a value of the wrong type.
+
+        The return value is a ``DraftValidationResult`` consumed internally by
+        the loop for gate/feedback decisions and filtered through
+        ``build_visible_payload(scope)`` before it travels to the LLM.
+        """
+        max_length = getattr(config, "VALIDATE_DRAFT_MAX_LENGTH", 200000)
+        if draft is not None and len(draft) > max_length:
+            if tool_event_callback is not None:
+                # Best-effort telemetry — we schedule the emission but do not
+                # block the exception path on the coroutine awaiting success.
+                try:
+                    awaitable = tool_event_callback(
+                        "validate_draft_oversize",
+                        {
+                            "received_chars": len(draft),
+                            "limit": max_length,
+                            "turn": turn,
+                            "stage": stage,
+                        },
+                    )
+                    if asyncio.iscoroutine(awaitable):
+                        asyncio.ensure_future(awaitable)
+                except Exception:
+                    logger.warning(
+                        "tool_event_callback failed to emit validate_draft_oversize",
+                        exc_info=True,
+                    )
+            raise ValidationToolInputTooLarge(
+                actual_length=len(draft),
+                max_length=max_length,
+            )
+
         try:
-            payload = validation_callback(draft)
+            result = validation_callback(draft)
+        except ValidationToolInputTooLarge:
+            raise
         except Exception as exc:
             message = (
                 f"Validation callback failed during {mode_name} for {model_id} "
@@ -1671,15 +2124,119 @@ class AIService:
             logger.exception(message)
             raise ValueError(message) from exc
 
-        if not isinstance(payload, dict):
+        if not isinstance(result, DraftValidationResult):
             message = (
-                f"Validation callback returned {type(payload).__name__} during {mode_name} "
-                f"for {model_id} (turn {turn}, stage {stage}); expected dict."
+                f"Validation callback returned {type(result).__name__} during {mode_name} "
+                f"for {model_id} (turn {turn}, stage {stage}); expected DraftValidationResult."
             )
             logger.error(message)
             raise ValueError(message)
 
-        return payload
+        return result
+
+    @staticmethod
+    async def _emit_tool_event_safe(
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]],
+        event_type: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        """Emit a tool-loop event via ``tool_event_callback`` without breaking the loop.
+
+        Telemetry MUST never take down the pipeline. If the callback is ``None``
+        this is a no-op; if it raises, the exception is logged and swallowed.
+        """
+        if tool_event_callback is None:
+            return
+        try:
+            awaitable = tool_event_callback(event_type, payload)
+            if asyncio.iscoroutine(awaitable):
+                await awaitable
+        except Exception:
+            logger.warning(
+                "tool_event_callback failed to emit %s", event_type, exc_info=True
+            )
+
+    async def _maybe_raise_context_overflow_midloop(
+        self,
+        exc: BaseException,
+        *,
+        provider_key: str,
+        turn: int,
+        accumulated_chars_estimate: int,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]],
+    ) -> None:
+        """Translate provider-specific context-window errors into ``ToolLoopContextOverflow``.
+
+        When ``exc`` matches a provider context-overflow pattern, emit the
+        ``context_overflow_midloop`` telemetry event and raise the tagged
+        exception. Otherwise do nothing — the caller re-raises ``exc`` normally.
+        """
+        if not self._classify_context_overflow_error(exc, provider_key):
+            return
+        await self._emit_tool_event_safe(
+            tool_event_callback,
+            "context_overflow_midloop",
+            {
+                "turn": turn,
+                "accumulated_chars_estimate": accumulated_chars_estimate,
+                "provider_error": str(exc),
+            },
+        )
+        raise ToolLoopContextOverflow(
+            turn=turn,
+            accumulated_chars_estimate=accumulated_chars_estimate,
+            provider_error=exc,
+        ) from exc
+
+    @staticmethod
+    def _classify_context_overflow_error(
+        exc: BaseException,
+        provider_key: str,
+    ) -> bool:
+        """Return ``True`` when ``exc`` is a provider-reported context-window overflow.
+
+        Covers:
+        - OpenAI / OpenAI-compatible: ``openai.BadRequestError`` with
+          ``error.code == "context_length_exceeded"`` or message substring match.
+        - Anthropic / Claude: ``anthropic.BadRequestError`` whose message mentions
+          ``too long`` / ``context`` / ``max_tokens``.
+        - Gemini (new + legacy): ``google.api_core.exceptions.InvalidArgument``
+          (or equivalent) whose message mentions ``context``.
+        """
+        message = str(exc or "").lower()
+
+        if provider_key in {"openai", "openrouter", "xai"}:
+            if isinstance(exc, openai.BadRequestError):
+                code = getattr(exc, "code", None)
+                if code == "context_length_exceeded":
+                    return True
+                body = getattr(exc, "body", None) or {}
+                if isinstance(body, dict):
+                    err = body.get("error") or {}
+                    if isinstance(err, dict) and err.get("code") == "context_length_exceeded":
+                        return True
+                if "context_length_exceeded" in message or "maximum context length" in message:
+                    return True
+
+        if provider_key == "claude":
+            if isinstance(exc, anthropic.BadRequestError):
+                if "too long" in message or "context" in message or "max_tokens" in message:
+                    return True
+
+        if provider_key == "gemini":
+            # Lazy import — google.api_core is a transitive dep of both SDKs but
+            # may be absent in test environments that stub Gemini clients.
+            try:
+                from google.api_core import exceptions as google_exceptions  # type: ignore
+                if isinstance(exc, google_exceptions.InvalidArgument) and "context" in message:
+                    return True
+            except ImportError:
+                pass
+            # Fallback: some SDK paths raise plain ``ValueError`` with a context message.
+            if "context" in message and ("window" in message or "length" in message or "token" in message):
+                if exc.__class__.__name__ in {"InvalidArgument", "FailedPrecondition"}:
+                    return True
+        return False
 
     async def audit_accent(
         self,
@@ -2049,7 +2606,7 @@ class AIService:
         provider: str,
         model_id: str,
         prompt: str,
-        validation_callback: Callable[[str], Dict[str, Any]],
+        validation_callback: Callable[[str], "DraftValidationResult"],
         temperature: float,
         max_tokens: int,
         system_prompt: str,
@@ -2064,8 +2621,37 @@ class AIService:
         extra_verbose: bool = False,
         accent_context: Optional[Dict[str, Any]] = None,
         enable_validate_draft: bool = True,
+        *,
+        stop_on_approval: bool = True,
+        output_contract: OutputContract = OutputContract.FREE_TEXT,
+        payload_scope: PayloadScope = PayloadScope.GENERATOR,
+        loop_scope: LoopScope = LoopScope.GENERATOR,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        initial_measurement_text: Optional[str] = None,
+        measurement_feedback_message: Optional[str] = None,
+        force_finalize_message: Optional[str] = None,
+        retries_enabled: bool = True,
     ) -> Tuple[str, Dict[str, Any]]:
-        """Run the deterministic validator tool-loop on OpenAI-style chat APIs."""
+        """Run the deterministic validator tool-loop on OpenAI-style chat APIs.
+
+        New keyword-only parameters (v11 tool-loop refactor):
+
+        - ``stop_on_approval``: when ``True`` (generator default) the loop
+          returns as soon as a ``validate_draft`` tool call approves the
+          draft. When ``False`` the loop keeps going so evaluators can
+          reason with metrics in hand.
+        - ``output_contract``: ``FREE_TEXT``, ``JSON_LOOSE``, or
+          ``JSON_STRUCTURED``.
+        - ``payload_scope``: filters ``DraftValidationResult`` before it
+          reaches the LLM (``GENERATOR`` gives full payload, evaluators
+          get ``MEASUREMENT_ONLY``).
+        - ``tool_event_callback``: awaitable invoked on tool-loop events
+          (``tool_call_start``, ``tool_call_result``, ``force_finalize``,
+          ``tool_loop_complete``).
+        - ``initial_measurement_text``: when provided, ``validate_draft`` is
+          computed server-side before the first turn and injected into the
+          system prompt. Generator keeps this ``None``.
+        """
         if not (enable_validate_draft or accent_context is not None):
             raise ValueError(
                 "OpenAI-compatible tool loop invoked with neither validate_draft nor accent_context."
@@ -2128,6 +2714,20 @@ class AIService:
 
             def _draft_hash(value: str) -> str:
                 return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
+
+            def _estimate_accumulated_chars() -> int:
+                total = 0
+                for msg in messages:
+                    content = msg.get("content") if isinstance(msg, dict) else None
+                    if isinstance(content, str):
+                        total += len(content)
+                    elif isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict):
+                                text_val = part.get("text")
+                                if isinstance(text_val, str):
+                                    total += len(text_val)
+                return total
 
             def _build_active_tool_schemas() -> List[Dict[str, Any]]:
                 tools: List[Dict[str, Any]] = []
@@ -2210,6 +2810,11 @@ class AIService:
                 feedback: str,
                 draft: str,
             ) -> Optional[Tuple[str, Dict[str, Any]]]:
+                await self._emit_tool_event_safe(
+                    tool_event_callback,
+                    "force_finalize",
+                    {"turn": turn, "reason": reason},
+                )
                 forced_messages = list(messages)
                 forced_messages.append(
                     {
@@ -2232,10 +2837,20 @@ class AIService:
                     json_schema=json_schema,
                     tools_enabled=False,
                 )
-                response = await client.chat.completions.create(
-                    **create_params,
-                    **request_kwargs,
-                )
+                try:
+                    response = await client.chat.completions.create(
+                        **create_params,
+                        **request_kwargs,
+                    )
+                except Exception as provider_exc:
+                    await self._maybe_raise_context_overflow_midloop(
+                        provider_exc,
+                        provider_key=provider_key,
+                        turn=turn,
+                        accumulated_chars_estimate=_estimate_accumulated_chars(),
+                        tool_event_callback=tool_event_callback,
+                    )
+                    raise
                 usage_meta = getattr(response, "usage", None)
                 self._emit_usage(usage_callback, model_id, provider_key, usage_meta, extra_payload)
 
@@ -2252,6 +2867,30 @@ class AIService:
                 if not candidate:
                     return None
 
+                if payload_scope == PayloadScope.MEASUREMENT_ONLY:
+                    # Evaluators (QA/Arbiter/GranSabio) do not gate the final
+                    # turn on ``validate_generation_candidate`` — that validator
+                    # measures generator drafts, not evaluator JSON. The
+                    # authoritative schema check runs in
+                    # ``call_ai_with_validation_tools`` for
+                    # ``JSON_STRUCTURED`` contracts.
+                    trace.append(
+                        {
+                            "turn": turn,
+                            "skipped_final_validation_for_evaluator": True,
+                            "stage": "forced_final_turn",
+                        }
+                    )
+                    await _sync_audit_or_fail(candidate, "path_c", turn)
+                    envelope = {
+                        "mode": mode_name,
+                        "turns": turn,
+                        "accepted": "forced_final_turn",
+                        "trace": trace,
+                    }
+                    envelope.update(_build_accent_envelope())
+                    return candidate, envelope
+
                 final_report = self._invoke_validation_callback(
                     validation_callback,
                     candidate,
@@ -2259,20 +2898,21 @@ class AIService:
                     model_id=model_id,
                     turn=turn,
                     stage="forced_final_turn",
+                    tool_event_callback=tool_event_callback,
                 )
                 trace.append(
                     {
                         "turn": turn,
                         "validator_after_forced_final": {
-                            "approved": bool(final_report.get("approved")),
-                            "score": final_report.get("score"),
-                            "word_count": final_report.get("word_count"),
-                            "hard_failed": bool(final_report.get("hard_failed")),
+                            "approved": bool(final_report.approved),
+                            "score": final_report.score,
+                            "word_count": final_report.word_count,
+                            "hard_failed": bool(final_report.hard_failed),
                         },
                         "metrics": self._build_trace_metrics(final_report),
                     }
                 )
-                if not final_report.get("approved"):
+                if not final_report.approved:
                     return None
 
                 await _sync_audit_or_fail(candidate, "path_c", turn)
@@ -2308,10 +2948,20 @@ class AIService:
                         create_params,
                     )
 
-                response = await client.chat.completions.create(
-                    **create_params,
-                    **request_kwargs,
-                )
+                try:
+                    response = await client.chat.completions.create(
+                        **create_params,
+                        **request_kwargs,
+                    )
+                except Exception as provider_exc:
+                    await self._maybe_raise_context_overflow_midloop(
+                        provider_exc,
+                        provider_key=provider_key,
+                        turn=turn,
+                        accumulated_chars_estimate=_estimate_accumulated_chars(),
+                        tool_event_callback=tool_event_callback,
+                    )
+                    raise
                 usage_meta = getattr(response, "usage", None)
                 self._emit_usage(usage_callback, model_id, provider_key, usage_meta, extra_payload)
 
@@ -2359,9 +3009,10 @@ class AIService:
                             model_id=model_id,
                             turn=turn,
                             stage="overflow_tool_argument",
+                            tool_event_callback=tool_event_callback,
                         )
                         latest_feedback = str(
-                            overflow_report.get("feedback") or "The draft failed deterministic validation."
+                            overflow_report.feedback or "The draft failed deterministic validation."
                         ).strip()
                         latest_invalid_draft = overflow_draft
                         trace.append(
@@ -2373,7 +3024,7 @@ class AIService:
                                 "metrics": self._build_trace_metrics(overflow_report),
                             }
                         )
-                        if overflow_report.get("approved"):
+                        if overflow_report.approved:
                             await _sync_audit_or_fail(overflow_draft, "path_e", turn)
                             envelope = {
                                 "mode": mode_name,
@@ -2412,8 +3063,9 @@ class AIService:
                     )
 
                     candidate_validated_draft: Optional[str] = None
-                    last_validate_payload: Optional[Dict[str, Any]] = None
+                    last_validate_payload: Optional["DraftValidationResult"] = None
                     turn_accent_rejected_text: Optional[str] = None
+                    input_too_large_detected = False
                     for call in tool_calls:
                         tool_name = call.function.name or ""
                         try:
@@ -2480,41 +3132,126 @@ class AIService:
                             continue
 
                         # validate_draft (default)
-                        tool_payload = self._invoke_validation_callback(
-                            validation_callback,
-                            draft,
-                            mode_name=mode_name,
-                            model_id=model_id,
-                            turn=turn,
-                            stage="tool_argument",
+                        await self._emit_tool_event_safe(
+                            tool_event_callback,
+                            "tool_call_start",
+                            {
+                                "tool": "validate_draft",
+                                "turn": turn,
+                                "args_preview": draft[:200],
+                            },
                         )
+                        try:
+                            tool_payload = self._invoke_validation_callback(
+                                validation_callback,
+                                draft,
+                                mode_name=mode_name,
+                                model_id=model_id,
+                                turn=turn,
+                                stage="tool_argument",
+                                tool_event_callback=tool_event_callback,
+                            )
+                        except ValidationToolInputTooLarge as oversize_exc:
+                            await self._emit_tool_event_safe(
+                                tool_event_callback,
+                                "tool_call_error",
+                                {
+                                    "turn": turn,
+                                    "reason": "input_too_large",
+                                    "actual_length": oversize_exc.actual_length,
+                                    "max_length": oversize_exc.max_length,
+                                },
+                            )
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": call.id,
+                                    "content": json.dumps(
+                                        {"error": "text_exceeds_limit"},
+                                        ensure_ascii=True,
+                                        sort_keys=True,
+                                    ),
+                                }
+                            )
+                            trace.append(
+                                {
+                                    "turn": turn,
+                                    "tool": tool_name,
+                                    "event": "tool_call_error",
+                                    "reason": "input_too_large",
+                                    "actual_length": oversize_exc.actual_length,
+                                    "max_length": oversize_exc.max_length,
+                                }
+                            )
+                            input_too_large_detected = True
+                            continue
                         total_tool_calls += 1
                         tool_call_counts["validate_draft"] += 1
-                        if tool_payload.get("approved"):
+                        if tool_payload.approved:
                             candidate_validated_draft = draft
                             last_validate_payload = tool_payload
                         else:
                             latest_feedback = str(
-                                tool_payload.get("feedback") or "The draft failed deterministic validation."
+                                tool_payload.feedback or "The draft failed deterministic validation."
                             ).strip()
                             latest_invalid_draft = draft
                         messages.append(
                             {
                                 "role": "tool",
                                 "tool_call_id": call.id,
-                                "content": json.dumps(tool_payload, ensure_ascii=True, sort_keys=True),
+                                "content": json.dumps(
+                                    tool_payload.build_visible_payload(payload_scope),
+                                    ensure_ascii=True,
+                                    sort_keys=True,
+                                ),
                             }
                         )
                         trace.append(
                             {
                                 "turn": turn,
                                 "tool": tool_name,
-                                "approved": bool(tool_payload.get("approved")),
-                                "score": tool_payload.get("score"),
-                                "word_count": tool_payload.get("word_count"),
-                                "hard_failed": bool(tool_payload.get("hard_failed")),
+                                "approved": bool(tool_payload.approved),
+                                "score": tool_payload.score,
+                                "word_count": tool_payload.word_count,
+                                "hard_failed": bool(tool_payload.hard_failed),
                                 "metrics": self._build_trace_metrics(tool_payload),
                             }
+                        )
+                        await self._emit_tool_event_safe(
+                            tool_event_callback,
+                            "tool_call_result",
+                            {
+                                "turn": turn,
+                                "score": tool_payload.score,
+                                "hard_failed": bool(tool_payload.hard_failed),
+                                "word_count": tool_payload.word_count,
+                                "issue_codes": [
+                                    i.get("code") for i in (tool_payload.issues or [])
+                                    if isinstance(i, dict)
+                                ],
+                            },
+                        )
+
+                    # If any validate_draft call in this turn carried an
+                    # oversize ``text`` argument, short-circuit into a
+                    # forced_final_turn so the model produces a final answer
+                    # without relying on the oversize measurement (proposal
+                    # §3.2.4 Path 4). The neutral tool_response pairing is
+                    # already appended above.
+                    if input_too_large_detected:
+                        forced_result = await _run_forced_final_turn(
+                            turn=turn + 1,
+                            reason="input_too_large",
+                            feedback=(
+                                latest_feedback
+                                or "The draft failed deterministic validation."
+                            ),
+                            draft=latest_invalid_draft,
+                        )
+                        if forced_result:
+                            return forced_result
+                        raise ToolLoopSchemaViolationError(
+                            "Tool loop exhausted after validate_draft input_too_large"
                         )
 
                     # Combined gate after processing all calls in this turn.
@@ -2552,27 +3289,19 @@ class AIService:
                 if not candidate:
                     continue
 
-                final_report = self._invoke_validation_callback(
-                    validation_callback,
-                    candidate,
-                    mode_name=mode_name,
-                    model_id=model_id,
-                    turn=turn,
-                    stage="assistant_final",
-                )
-                trace.append(
-                    {
-                        "turn": turn,
-                        "validator_after_final": {
-                            "approved": bool(final_report.get("approved")),
-                            "score": final_report.get("score"),
-                            "word_count": final_report.get("word_count"),
-                            "hard_failed": bool(final_report.get("hard_failed")),
-                        },
-                        "metrics": self._build_trace_metrics(final_report),
-                    }
-                )
-                if final_report.get("approved"):
+                if payload_scope == PayloadScope.MEASUREMENT_ONLY:
+                    # Evaluator layers bypass ``validate_generation_candidate``
+                    # on the final turn: that validator measures generator
+                    # drafts, not evaluator JSON. Schema validation for
+                    # ``JSON_STRUCTURED`` contracts runs downstream in
+                    # ``call_ai_with_validation_tools``.
+                    trace.append(
+                        {
+                            "turn": turn,
+                            "skipped_final_validation_for_evaluator": True,
+                            "stage": "assistant_final",
+                        }
+                    )
                     if accent_inline_required and _draft_hash(candidate) not in audit_accent_approved_hashes:
                         feedback_msg = self._build_audit_accent_feedback_message(
                             candidate[:200], latest_audit_result
@@ -2593,7 +3322,49 @@ class AIService:
                     envelope.update(_build_accent_envelope())
                     return candidate, envelope
 
-                feedback = str(final_report.get("feedback") or "The draft failed deterministic validation.").strip()
+                final_report = self._invoke_validation_callback(
+                    validation_callback,
+                    candidate,
+                    mode_name=mode_name,
+                    model_id=model_id,
+                    turn=turn,
+                    stage="assistant_final",
+                    tool_event_callback=tool_event_callback,
+                )
+                trace.append(
+                    {
+                        "turn": turn,
+                        "validator_after_final": {
+                            "approved": bool(final_report.approved),
+                            "score": final_report.score,
+                            "word_count": final_report.word_count,
+                            "hard_failed": bool(final_report.hard_failed),
+                        },
+                        "metrics": self._build_trace_metrics(final_report),
+                    }
+                )
+                if final_report.approved:
+                    if accent_inline_required and _draft_hash(candidate) not in audit_accent_approved_hashes:
+                        feedback_msg = self._build_audit_accent_feedback_message(
+                            candidate[:200], latest_audit_result
+                        )
+                        messages.append({"role": "user", "content": feedback_msg})
+                        trace.append({
+                            "turn": turn,
+                            "event": "accent_gate_blocked",
+                            "stage": "assistant_final",
+                        })
+                        continue
+                    envelope = {
+                        "mode": mode_name,
+                        "turns": turn,
+                        "accepted": "assistant_final",
+                        "trace": trace,
+                    }
+                    envelope.update(_build_accent_envelope())
+                    return candidate, envelope
+
+                feedback = str(final_report.feedback or "The draft failed deterministic validation.").strip()
                 latest_feedback = feedback
                 latest_invalid_draft = candidate
                 messages.append(
@@ -2625,7 +3396,14 @@ class AIService:
 
             raise ValueError("Tool loop exhausted without producing a validated draft")
 
-        return await self._execute_with_retries(
+        if retries_enabled:
+            return await self._execute_with_retries(
+                _single_attempt,
+                provider=provider_key,
+                model_id=model_id,
+                action="tool_loop_generation",
+            )
+        return await self._execute_without_retries(
             _single_attempt,
             provider=provider_key,
             model_id=model_id,
@@ -2637,7 +3415,7 @@ class AIService:
         provider: str,
         model_id: str,
         prompt: str,
-        validation_callback: Callable[[str], Dict[str, Any]],
+        validation_callback: Callable[[str], "DraftValidationResult"],
         temperature: float,
         max_tokens: int,
         system_prompt: str,
@@ -2652,6 +3430,16 @@ class AIService:
         extra_verbose: bool = False,
         accent_context: Optional[Dict[str, Any]] = None,
         enable_validate_draft: bool = True,
+        *,
+        stop_on_approval: bool = True,
+        output_contract: OutputContract = OutputContract.FREE_TEXT,
+        payload_scope: PayloadScope = PayloadScope.GENERATOR,
+        loop_scope: LoopScope = LoopScope.GENERATOR,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        initial_measurement_text: Optional[str] = None,
+        measurement_feedback_message: Optional[str] = None,
+        force_finalize_message: Optional[str] = None,
+        retries_enabled: bool = True,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on Claude messages API."""
         if not (enable_validate_draft or accent_context is not None):
@@ -2704,14 +3492,6 @@ class AIService:
                     create_params["tool_choice"] = {"type": "auto", "disable_parallel_tool_use": True}
 
             effective_system = system_prompt.strip() if system_prompt else ""
-            if json_output and not use_structured_outputs:
-                json_instructions = (
-                    "CRITICAL REQUIREMENT: You MUST respond with valid JSON only. Start your response with '{' immediately. "
-                    "When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") "
-                    "to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". "
-                    "Do not include any text, explanation, or commentary before or after the JSON object."
-                )
-                effective_system = f"{effective_system}\n\n{json_instructions}" if effective_system else json_instructions
             if effective_system:
                 create_params["system"] = effective_system
 
@@ -2762,6 +3542,20 @@ class AIService:
 
             def _draft_hash(value: str) -> str:
                 return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
+
+            def _estimate_accumulated_chars() -> int:
+                total = 0
+                for msg in messages:
+                    content = msg.get("content") if isinstance(msg, dict) else None
+                    if isinstance(content, str):
+                        total += len(content)
+                    elif isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict):
+                                text_val = part.get("text")
+                                if isinstance(text_val, str):
+                                    total += len(text_val)
+                return total
 
             def _build_active_tool_schemas() -> List[Dict[str, Any]]:
                 tools: List[Dict[str, Any]] = []
@@ -2839,6 +3633,11 @@ class AIService:
                 feedback: str,
                 draft: str,
             ) -> Optional[Tuple[str, Dict[str, Any]]]:
+                await self._emit_tool_event_safe(
+                    tool_event_callback,
+                    "force_finalize",
+                    {"turn": turn, "reason": reason},
+                )
                 forced_messages = list(messages)
                 forced_messages.append(
                     {
@@ -2850,7 +3649,17 @@ class AIService:
                         ),
                     }
                 )
-                response = await _create_response(forced_messages, tools_enabled=False)
+                try:
+                    response = await _create_response(forced_messages, tools_enabled=False)
+                except Exception as provider_exc:
+                    await self._maybe_raise_context_overflow_midloop(
+                        provider_exc,
+                        provider_key=provider_key,
+                        turn=turn,
+                        accumulated_chars_estimate=_estimate_accumulated_chars(),
+                        tool_event_callback=tool_event_callback,
+                    )
+                    raise
                 usage_meta = getattr(response, "usage", None)
                 self._emit_usage(usage_callback, model_id, provider_key, usage_meta, extra_payload)
 
@@ -2866,6 +3675,24 @@ class AIService:
                 if not candidate:
                     return None
 
+                if payload_scope == PayloadScope.MEASUREMENT_ONLY:
+                    trace.append(
+                        {
+                            "turn": turn,
+                            "skipped_final_validation_for_evaluator": True,
+                            "stage": "forced_final_turn",
+                        }
+                    )
+                    await _sync_audit_or_fail(candidate, "path_c", turn)
+                    envelope = {
+                        "mode": mode_name,
+                        "turns": turn,
+                        "accepted": "forced_final_turn",
+                        "trace": trace,
+                    }
+                    envelope.update(_build_accent_envelope())
+                    return candidate, envelope
+
                 final_report = self._invoke_validation_callback(
                     validation_callback,
                     candidate,
@@ -2873,20 +3700,21 @@ class AIService:
                     model_id=model_id,
                     turn=turn,
                     stage="forced_final_turn",
+                    tool_event_callback=tool_event_callback,
                 )
                 trace.append(
                     {
                         "turn": turn,
                         "validator_after_forced_final": {
-                            "approved": bool(final_report.get("approved")),
-                            "score": final_report.get("score"),
-                            "word_count": final_report.get("word_count"),
-                            "hard_failed": bool(final_report.get("hard_failed")),
+                            "approved": bool(final_report.approved),
+                            "score": final_report.score,
+                            "word_count": final_report.word_count,
+                            "hard_failed": bool(final_report.hard_failed),
                         },
                         "metrics": self._build_trace_metrics(final_report),
                     }
                 )
-                if not final_report.get("approved"):
+                if not final_report.approved:
                     return None
 
                 await _sync_audit_or_fail(candidate, "path_c", turn)
@@ -2902,11 +3730,21 @@ class AIService:
 
             for turn in range(1, max_rounds + 1):
                 active_tools = _build_active_tool_schemas()
-                response = await _create_response(
-                    messages,
-                    tools_enabled=bool(active_tools),
-                    tool_schemas=active_tools if active_tools else None,
-                )
+                try:
+                    response = await _create_response(
+                        messages,
+                        tools_enabled=bool(active_tools),
+                        tool_schemas=active_tools if active_tools else None,
+                    )
+                except Exception as provider_exc:
+                    await self._maybe_raise_context_overflow_midloop(
+                        provider_exc,
+                        provider_key=provider_key,
+                        turn=turn,
+                        accumulated_chars_estimate=_estimate_accumulated_chars(),
+                        tool_event_callback=tool_event_callback,
+                    )
+                    raise
                 usage_meta = getattr(response, "usage", None)
                 self._emit_usage(usage_callback, model_id, provider_key, usage_meta, extra_payload)
 
@@ -2953,9 +3791,10 @@ class AIService:
                             model_id=model_id,
                             turn=turn,
                             stage="overflow_tool_argument",
+                            tool_event_callback=tool_event_callback,
                         )
                         latest_feedback = str(
-                            overflow_report.get("feedback") or "The draft failed deterministic validation."
+                            overflow_report.feedback or "The draft failed deterministic validation."
                         ).strip()
                         latest_invalid_draft = overflow_draft
                         trace.append(
@@ -2967,7 +3806,7 @@ class AIService:
                                 "metrics": self._build_trace_metrics(overflow_report),
                             }
                         )
-                        if overflow_report.get("approved"):
+                        if overflow_report.approved:
                             await _sync_audit_or_fail(overflow_draft, "path_e", turn)
                             envelope = {
                                 "mode": mode_name,
@@ -2997,6 +3836,7 @@ class AIService:
                     tool_results: List[Dict[str, Any]] = []
                     candidate_validated_draft: Optional[str] = None
                     turn_accent_rejected_text: Optional[str] = None
+                    input_too_large_detected = False
                     for block in tool_uses:
                         tool_name = getattr(block, "name", "validate_draft") or "validate_draft"
                         args = getattr(block, "input", {}) or {}
@@ -3057,40 +3897,124 @@ class AIService:
                             })
                             continue
 
-                        tool_payload = self._invoke_validation_callback(
-                            validation_callback,
-                            draft,
-                            mode_name=mode_name,
-                            model_id=model_id,
-                            turn=turn,
-                            stage="tool_argument",
+                        await self._emit_tool_event_safe(
+                            tool_event_callback,
+                            "tool_call_start",
+                            {
+                                "tool": "validate_draft",
+                                "turn": turn,
+                                "args_preview": draft[:200],
+                            },
                         )
+                        try:
+                            tool_payload = self._invoke_validation_callback(
+                                validation_callback,
+                                draft,
+                                mode_name=mode_name,
+                                model_id=model_id,
+                                turn=turn,
+                                stage="tool_argument",
+                                tool_event_callback=tool_event_callback,
+                            )
+                        except ValidationToolInputTooLarge as oversize_exc:
+                            await self._emit_tool_event_safe(
+                                tool_event_callback,
+                                "tool_call_error",
+                                {
+                                    "turn": turn,
+                                    "reason": "input_too_large",
+                                    "actual_length": oversize_exc.actual_length,
+                                    "max_length": oversize_exc.max_length,
+                                },
+                            )
+                            tool_results.append(
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": getattr(block, "id", ""),
+                                    "content": json.dumps(
+                                        {"error": "text_exceeds_limit"},
+                                        ensure_ascii=True,
+                                        sort_keys=True,
+                                    ),
+                                }
+                            )
+                            trace.append(
+                                {
+                                    "turn": turn,
+                                    "tool": tool_name,
+                                    "event": "tool_call_error",
+                                    "reason": "input_too_large",
+                                    "actual_length": oversize_exc.actual_length,
+                                    "max_length": oversize_exc.max_length,
+                                }
+                            )
+                            input_too_large_detected = True
+                            continue
                         total_tool_calls += 1
                         tool_call_counts["validate_draft"] += 1
-                        if tool_payload.get("approved"):
+                        if tool_payload.approved:
                             candidate_validated_draft = draft
                         else:
                             latest_feedback = str(
-                                tool_payload.get("feedback") or "The draft failed deterministic validation."
+                                tool_payload.feedback or "The draft failed deterministic validation."
                             ).strip()
                             latest_invalid_draft = draft
                         tool_results.append(
                             {
                                 "type": "tool_result",
                                 "tool_use_id": getattr(block, "id", ""),
-                                "content": json.dumps(tool_payload, ensure_ascii=True, sort_keys=True),
+                                "content": json.dumps(
+                                    tool_payload.build_visible_payload(payload_scope),
+                                    ensure_ascii=True,
+                                    sort_keys=True,
+                                ),
                             }
                         )
                         trace.append(
                             {
                                 "turn": turn,
                                 "tool": tool_name,
-                                "approved": bool(tool_payload.get("approved")),
-                                "score": tool_payload.get("score"),
-                                "word_count": tool_payload.get("word_count"),
-                                "hard_failed": bool(tool_payload.get("hard_failed")),
+                                "approved": bool(tool_payload.approved),
+                                "score": tool_payload.score,
+                                "word_count": tool_payload.word_count,
+                                "hard_failed": bool(tool_payload.hard_failed),
                                 "metrics": self._build_trace_metrics(tool_payload),
                             }
+                        )
+                        await self._emit_tool_event_safe(
+                            tool_event_callback,
+                            "tool_call_result",
+                            {
+                                "turn": turn,
+                                "score": tool_payload.score,
+                                "hard_failed": bool(tool_payload.hard_failed),
+                                "word_count": tool_payload.word_count,
+                                "issue_codes": [
+                                    i.get("code") for i in (tool_payload.issues or [])
+                                    if isinstance(i, dict)
+                                ],
+                            },
+                        )
+
+                    if input_too_large_detected:
+                        # Append tool_results (with neutral error) so the
+                        # provider has the paired tool_result for every
+                        # tool_use. Then force-finalize (proposal §3.2.4
+                        # Path 4).
+                        messages.append({"role": "user", "content": list(tool_results)})
+                        forced_result = await _run_forced_final_turn(
+                            turn=turn + 1,
+                            reason="input_too_large",
+                            feedback=(
+                                latest_feedback
+                                or "The draft failed deterministic validation."
+                            ),
+                            draft=latest_invalid_draft,
+                        )
+                        if forced_result:
+                            return forced_result
+                        raise ToolLoopSchemaViolationError(
+                            "Tool loop exhausted after validate_draft input_too_large"
                         )
 
                     if candidate_validated_draft is not None and (
@@ -3132,27 +4056,14 @@ class AIService:
                 if not candidate:
                     continue
 
-                final_report = self._invoke_validation_callback(
-                    validation_callback,
-                    candidate,
-                    mode_name=mode_name,
-                    model_id=model_id,
-                    turn=turn,
-                    stage="assistant_final",
-                )
-                trace.append(
-                    {
-                        "turn": turn,
-                        "validator_after_final": {
-                            "approved": bool(final_report.get("approved")),
-                            "score": final_report.get("score"),
-                            "word_count": final_report.get("word_count"),
-                            "hard_failed": bool(final_report.get("hard_failed")),
-                        },
-                        "metrics": self._build_trace_metrics(final_report),
-                    }
-                )
-                if final_report.get("approved"):
+                if payload_scope == PayloadScope.MEASUREMENT_ONLY:
+                    trace.append(
+                        {
+                            "turn": turn,
+                            "skipped_final_validation_for_evaluator": True,
+                            "stage": "assistant_final",
+                        }
+                    )
                     if accent_inline_required and _draft_hash(candidate) not in audit_accent_approved_hashes:
                         messages.append({
                             "role": "user",
@@ -3178,7 +4089,54 @@ class AIService:
                     envelope.update(_build_accent_envelope())
                     return candidate, envelope
 
-                feedback = str(final_report.get("feedback") or "The draft failed deterministic validation.").strip()
+                final_report = self._invoke_validation_callback(
+                    validation_callback,
+                    candidate,
+                    mode_name=mode_name,
+                    model_id=model_id,
+                    turn=turn,
+                    stage="assistant_final",
+                    tool_event_callback=tool_event_callback,
+                )
+                trace.append(
+                    {
+                        "turn": turn,
+                        "validator_after_final": {
+                            "approved": bool(final_report.approved),
+                            "score": final_report.score,
+                            "word_count": final_report.word_count,
+                            "hard_failed": bool(final_report.hard_failed),
+                        },
+                        "metrics": self._build_trace_metrics(final_report),
+                    }
+                )
+                if final_report.approved:
+                    if accent_inline_required and _draft_hash(candidate) not in audit_accent_approved_hashes:
+                        messages.append({
+                            "role": "user",
+                            "content": [{
+                                "type": "text",
+                                "text": self._build_audit_accent_feedback_message(
+                                    candidate[:200], latest_audit_result
+                                ),
+                            }],
+                        })
+                        trace.append({
+                            "turn": turn,
+                            "event": "accent_gate_blocked",
+                            "stage": "assistant_final",
+                        })
+                        continue
+                    envelope = {
+                        "mode": mode_name,
+                        "turns": turn,
+                        "accepted": "assistant_final",
+                        "trace": trace,
+                    }
+                    envelope.update(_build_accent_envelope())
+                    return candidate, envelope
+
+                feedback = str(final_report.feedback or "The draft failed deterministic validation.").strip()
                 latest_feedback = feedback
                 latest_invalid_draft = candidate
                 messages.append(
@@ -3207,7 +4165,14 @@ class AIService:
 
             raise ValueError("Tool loop exhausted without producing a validated draft")
 
-        return await self._execute_with_retries(
+        if retries_enabled:
+            return await self._execute_with_retries(
+                _single_attempt,
+                provider=provider_key,
+                model_id=model_id,
+                action="tool_loop_generation",
+            )
+        return await self._execute_without_retries(
             _single_attempt,
             provider=provider_key,
             model_id=model_id,
@@ -3218,7 +4183,7 @@ class AIService:
         self,
         model_id: str,
         prompt: str,
-        validation_callback: Callable[[str], Dict[str, Any]],
+        validation_callback: Callable[[str], "DraftValidationResult"],
         temperature: float,
         max_tokens: int,
         system_prompt: str,
@@ -3232,6 +4197,16 @@ class AIService:
         extra_verbose: bool = False,
         accent_context: Optional[Dict[str, Any]] = None,
         enable_validate_draft: bool = True,
+        *,
+        stop_on_approval: bool = True,
+        output_contract: OutputContract = OutputContract.FREE_TEXT,
+        payload_scope: PayloadScope = PayloadScope.GENERATOR,
+        loop_scope: LoopScope = LoopScope.GENERATOR,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        initial_measurement_text: Optional[str] = None,
+        measurement_feedback_message: Optional[str] = None,
+        force_finalize_message: Optional[str] = None,
+        retries_enabled: bool = True,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on the new Gemini SDK."""
         if not (enable_validate_draft or accent_context is not None):
@@ -3245,13 +4220,6 @@ class AIService:
 
         mode_name = "gemini_tool_loop"
         effective_system = system_prompt or ""
-        if json_output:
-            json_instructions = (
-                "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, "
-                "use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. "
-                "Example: He said 'hello' instead of He said \"hello\"."
-            )
-            effective_system = f"{effective_system}\n\n{json_instructions}" if effective_system else json_instructions
 
         initial_parts: List[Any] = []
         if images:
@@ -3356,6 +4324,26 @@ class AIService:
             def _draft_hash(value: str) -> str:
                 return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
 
+            def _estimate_accumulated_chars() -> int:
+                total = 0
+                for entry in contents:
+                    parts = None
+                    if isinstance(entry, dict):
+                        parts = entry.get("parts")
+                    else:
+                        parts = getattr(entry, "parts", None)
+                    if not parts:
+                        continue
+                    for part in parts:
+                        text_val = None
+                        if isinstance(part, dict):
+                            text_val = part.get("text")
+                        else:
+                            text_val = getattr(part, "text", None)
+                        if isinstance(text_val, str):
+                            total += len(text_val)
+                return total
+
             def _build_accent_envelope() -> Dict[str, Any]:
                 if accent_context is None:
                     return {}
@@ -3421,6 +4409,11 @@ class AIService:
                 feedback: str,
                 draft: str,
             ) -> Optional[Tuple[str, Dict[str, Any]]]:
+                await self._emit_tool_event_safe(
+                    tool_event_callback,
+                    "force_finalize",
+                    {"turn": turn, "reason": reason},
+                )
                 forced_contents = list(contents)
                 forced_contents.append(
                     types.Content(
@@ -3436,11 +4429,21 @@ class AIService:
                         ],
                     )
                 )
-                response = await self.google_new_client.aio.models.generate_content(
-                    model=model_id,
-                    contents=forced_contents,
-                    config=_build_generate_config(tools_enabled=False),
-                )
+                try:
+                    response = await self.google_new_client.aio.models.generate_content(
+                        model=model_id,
+                        contents=forced_contents,
+                        config=_build_generate_config(tools_enabled=False),
+                    )
+                except Exception as provider_exc:
+                    await self._maybe_raise_context_overflow_midloop(
+                        provider_exc,
+                        provider_key="gemini",
+                        turn=turn,
+                        accumulated_chars_estimate=_estimate_accumulated_chars(),
+                        tool_event_callback=tool_event_callback,
+                    )
+                    raise
                 usage_meta = getattr(response, "usage_metadata", None)
                 self._emit_usage(usage_callback, model_id, "gemini", usage_meta, extra_payload)
 
@@ -3456,6 +4459,24 @@ class AIService:
                 if not candidate:
                     return None
 
+                if payload_scope == PayloadScope.MEASUREMENT_ONLY:
+                    trace.append(
+                        {
+                            "turn": turn,
+                            "skipped_final_validation_for_evaluator": True,
+                            "stage": "forced_final_turn",
+                        }
+                    )
+                    await _sync_audit_or_fail(candidate, "path_c", turn)
+                    envelope = {
+                        "mode": mode_name,
+                        "turns": turn,
+                        "accepted": "forced_final_turn",
+                        "trace": trace,
+                    }
+                    envelope.update(_build_accent_envelope())
+                    return candidate, envelope
+
                 final_report = self._invoke_validation_callback(
                     validation_callback,
                     candidate,
@@ -3463,20 +4484,21 @@ class AIService:
                     model_id=model_id,
                     turn=turn,
                     stage="forced_final_turn",
+                    tool_event_callback=tool_event_callback,
                 )
                 trace.append(
                     {
                         "turn": turn,
                         "validator_after_forced_final": {
-                            "approved": bool(final_report.get("approved")),
-                            "score": final_report.get("score"),
-                            "word_count": final_report.get("word_count"),
-                            "hard_failed": bool(final_report.get("hard_failed")),
+                            "approved": bool(final_report.approved),
+                            "score": final_report.score,
+                            "word_count": final_report.word_count,
+                            "hard_failed": bool(final_report.hard_failed),
                         },
                         "metrics": self._build_trace_metrics(final_report),
                     }
                 )
-                if not final_report.get("approved"):
+                if not final_report.approved:
                     return None
 
                 await _sync_audit_or_fail(candidate, "path_c", turn)
@@ -3499,15 +4521,25 @@ class AIService:
                     and tool_call_counts["audit_accent"] < audit_accent_cap
                 )
                 any_tools = enable_validate_draft or include_audit_accent
-                response = await self.google_new_client.aio.models.generate_content(
-                    model=model_id,
-                    contents=contents,
-                    config=_build_generate_config(
-                        tools_enabled=any_tools,
-                        include_validate_draft=enable_validate_draft,
-                        include_audit_accent=include_audit_accent,
-                    ),
-                )
+                try:
+                    response = await self.google_new_client.aio.models.generate_content(
+                        model=model_id,
+                        contents=contents,
+                        config=_build_generate_config(
+                            tools_enabled=any_tools,
+                            include_validate_draft=enable_validate_draft,
+                            include_audit_accent=include_audit_accent,
+                        ),
+                    )
+                except Exception as provider_exc:
+                    await self._maybe_raise_context_overflow_midloop(
+                        provider_exc,
+                        provider_key="gemini",
+                        turn=turn,
+                        accumulated_chars_estimate=_estimate_accumulated_chars(),
+                        tool_event_callback=tool_event_callback,
+                    )
+                    raise
                 usage_meta = getattr(response, "usage_metadata", None)
                 self._emit_usage(usage_callback, model_id, "gemini", usage_meta, extra_payload)
 
@@ -3548,9 +4580,10 @@ class AIService:
                             model_id=model_id,
                             turn=turn,
                             stage="overflow_tool_argument",
+                            tool_event_callback=tool_event_callback,
                         )
                         latest_feedback = str(
-                            overflow_report.get("feedback") or "The draft failed deterministic validation."
+                            overflow_report.feedback or "The draft failed deterministic validation."
                         ).strip()
                         latest_invalid_draft = overflow_draft
                         trace.append(
@@ -3562,7 +4595,7 @@ class AIService:
                                 "metrics": self._build_trace_metrics(overflow_report),
                             }
                         )
-                        if overflow_report.get("approved"):
+                        if overflow_report.approved:
                             await _sync_audit_or_fail(overflow_draft, "path_e", turn)
                             envelope = {
                                 "mode": mode_name,
@@ -3589,6 +4622,7 @@ class AIService:
                     function_response_parts: List[Any] = []
                     candidate_validated_draft: Optional[str] = None
                     turn_accent_rejected_text: Optional[str] = None
+                    input_too_large_detected = False
                     for call in function_calls:
                         call_name = getattr(call, "name", "validate_draft") or "validate_draft"
                         args = dict(getattr(call, "args", {}) or {})
@@ -3650,39 +4684,112 @@ class AIService:
                             })
                             continue
 
-                        tool_payload = self._invoke_validation_callback(
-                            validation_callback,
-                            draft,
-                            mode_name=mode_name,
-                            model_id=model_id,
-                            turn=turn,
-                            stage="tool_argument",
+                        await self._emit_tool_event_safe(
+                            tool_event_callback,
+                            "tool_call_start",
+                            {
+                                "tool": "validate_draft",
+                                "turn": turn,
+                                "args_preview": draft[:200],
+                            },
                         )
+                        try:
+                            tool_payload = self._invoke_validation_callback(
+                                validation_callback,
+                                draft,
+                                mode_name=mode_name,
+                                model_id=model_id,
+                                turn=turn,
+                                stage="tool_argument",
+                                tool_event_callback=tool_event_callback,
+                            )
+                        except ValidationToolInputTooLarge as oversize_exc:
+                            await self._emit_tool_event_safe(
+                                tool_event_callback,
+                                "tool_call_error",
+                                {
+                                    "turn": turn,
+                                    "reason": "input_too_large",
+                                    "actual_length": oversize_exc.actual_length,
+                                    "max_length": oversize_exc.max_length,
+                                },
+                            )
+                            function_response_parts.append(
+                                types.Part.from_function_response(
+                                    name=call_name,
+                                    response={"error": "text_exceeds_limit"},
+                                )
+                            )
+                            trace.append(
+                                {
+                                    "turn": turn,
+                                    "tool": call_name,
+                                    "event": "tool_call_error",
+                                    "reason": "input_too_large",
+                                    "actual_length": oversize_exc.actual_length,
+                                    "max_length": oversize_exc.max_length,
+                                }
+                            )
+                            input_too_large_detected = True
+                            continue
                         total_tool_calls += 1
                         tool_call_counts["validate_draft"] += 1
-                        if tool_payload.get("approved"):
+                        if tool_payload.approved:
                             candidate_validated_draft = draft
                         else:
                             latest_feedback = str(
-                                tool_payload.get("feedback") or "The draft failed deterministic validation."
+                                tool_payload.feedback or "The draft failed deterministic validation."
                             ).strip()
                             latest_invalid_draft = draft
                         function_response_parts.append(
                             types.Part.from_function_response(
                                 name=call_name,
-                                response=tool_payload,
+                                response=tool_payload.build_visible_payload(payload_scope),
                             )
                         )
                         trace.append(
                             {
                                 "turn": turn,
                                 "tool": call_name,
-                                "approved": bool(tool_payload.get("approved")),
-                                "score": tool_payload.get("score"),
-                                "word_count": tool_payload.get("word_count"),
-                                "hard_failed": bool(tool_payload.get("hard_failed")),
+                                "approved": bool(tool_payload.approved),
+                                "score": tool_payload.score,
+                                "word_count": tool_payload.word_count,
+                                "hard_failed": bool(tool_payload.hard_failed),
                                 "metrics": self._build_trace_metrics(tool_payload),
                             }
+                        )
+                        await self._emit_tool_event_safe(
+                            tool_event_callback,
+                            "tool_call_result",
+                            {
+                                "turn": turn,
+                                "score": tool_payload.score,
+                                "hard_failed": bool(tool_payload.hard_failed),
+                                "word_count": tool_payload.word_count,
+                                "issue_codes": [
+                                    i.get("code") for i in (tool_payload.issues or [])
+                                    if isinstance(i, dict)
+                                ],
+                            },
+                        )
+
+                    if input_too_large_detected:
+                        contents.append(
+                            types.Content(role="user", parts=list(function_response_parts))
+                        )
+                        forced_result = await _run_forced_final_turn(
+                            turn=turn + 1,
+                            reason="input_too_large",
+                            feedback=(
+                                latest_feedback
+                                or "The draft failed deterministic validation."
+                            ),
+                            draft=latest_invalid_draft,
+                        )
+                        if forced_result:
+                            return forced_result
+                        raise ToolLoopSchemaViolationError(
+                            "Tool loop exhausted after validate_draft input_too_large"
                         )
 
                     if candidate_validated_draft is not None and (
@@ -3725,27 +4832,14 @@ class AIService:
                 if not candidate:
                     continue
 
-                final_report = self._invoke_validation_callback(
-                    validation_callback,
-                    candidate,
-                    mode_name=mode_name,
-                    model_id=model_id,
-                    turn=turn,
-                    stage="assistant_final",
-                )
-                trace.append(
-                    {
-                        "turn": turn,
-                        "validator_after_final": {
-                            "approved": bool(final_report.get("approved")),
-                            "score": final_report.get("score"),
-                            "word_count": final_report.get("word_count"),
-                            "hard_failed": bool(final_report.get("hard_failed")),
-                        },
-                        "metrics": self._build_trace_metrics(final_report),
-                    }
-                )
-                if final_report.get("approved"):
+                if payload_scope == PayloadScope.MEASUREMENT_ONLY:
+                    trace.append(
+                        {
+                            "turn": turn,
+                            "skipped_final_validation_for_evaluator": True,
+                            "stage": "assistant_final",
+                        }
+                    )
                     if accent_inline_required and _draft_hash(candidate) not in audit_accent_approved_hashes:
                         contents.append(
                             types.Content(
@@ -3774,7 +4868,57 @@ class AIService:
                     envelope.update(_build_accent_envelope())
                     return candidate, envelope
 
-                feedback = str(final_report.get("feedback") or "The draft failed deterministic validation.").strip()
+                final_report = self._invoke_validation_callback(
+                    validation_callback,
+                    candidate,
+                    mode_name=mode_name,
+                    model_id=model_id,
+                    turn=turn,
+                    stage="assistant_final",
+                    tool_event_callback=tool_event_callback,
+                )
+                trace.append(
+                    {
+                        "turn": turn,
+                        "validator_after_final": {
+                            "approved": bool(final_report.approved),
+                            "score": final_report.score,
+                            "word_count": final_report.word_count,
+                            "hard_failed": bool(final_report.hard_failed),
+                        },
+                        "metrics": self._build_trace_metrics(final_report),
+                    }
+                )
+                if final_report.approved:
+                    if accent_inline_required and _draft_hash(candidate) not in audit_accent_approved_hashes:
+                        contents.append(
+                            types.Content(
+                                role="user",
+                                parts=[
+                                    types.Part(
+                                        text=self._build_audit_accent_feedback_message(
+                                            candidate[:200], latest_audit_result
+                                        )
+                                    )
+                                ],
+                            )
+                        )
+                        trace.append({
+                            "turn": turn,
+                            "event": "accent_gate_blocked",
+                            "stage": "assistant_final",
+                        })
+                        continue
+                    envelope = {
+                        "mode": mode_name,
+                        "turns": turn,
+                        "accepted": "assistant_final",
+                        "trace": trace,
+                    }
+                    envelope.update(_build_accent_envelope())
+                    return candidate, envelope
+
+                feedback = str(final_report.feedback or "The draft failed deterministic validation.").strip()
                 latest_feedback = feedback
                 latest_invalid_draft = candidate
                 contents.append(
@@ -3806,7 +4950,14 @@ class AIService:
 
             raise ValueError("Tool loop exhausted without producing a validated draft")
 
-        return await self._execute_with_retries(
+        if retries_enabled:
+            return await self._execute_with_retries(
+                _single_attempt,
+                provider="gemini",
+                model_id=model_id,
+                action="tool_loop_generation",
+            )
+        return await self._execute_without_retries(
             _single_attempt,
             provider="gemini",
             model_id=model_id,
@@ -3817,7 +4968,7 @@ class AIService:
         self,
         model_id: str,
         prompt: str,
-        validation_callback: Callable[[str], Dict[str, Any]],
+        validation_callback: Callable[[str], "DraftValidationResult"],
         temperature: float,
         max_tokens: int,
         system_prompt: str,
@@ -3829,6 +4980,16 @@ class AIService:
         extra_verbose: bool = False,
         accent_context: Optional[Dict[str, Any]] = None,
         enable_validate_draft: bool = True,
+        *,
+        stop_on_approval: bool = True,
+        output_contract: OutputContract = OutputContract.FREE_TEXT,
+        payload_scope: PayloadScope = PayloadScope.GENERATOR,
+        loop_scope: LoopScope = LoopScope.GENERATOR,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        initial_measurement_text: Optional[str] = None,
+        measurement_feedback_message: Optional[str] = None,
+        force_finalize_message: Optional[str] = None,
+        retries_enabled: bool = True,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on the legacy Gemini SDK."""
         if not (enable_validate_draft or accent_context is not None):
@@ -3840,13 +5001,6 @@ class AIService:
 
         mode_name = "gemini_tool_loop"
         system_instruction = system_prompt or ""
-        if json_output:
-            json_instructions = (
-                "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, "
-                "use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. "
-                "Example: He said 'hello' instead of He said \"hello\"."
-            )
-            system_instruction = f"{system_instruction}\n\n{json_instructions}" if system_instruction else json_instructions
 
         model = self.genai_client.GenerativeModel(
             model_name=model_id,
@@ -3940,6 +5094,29 @@ class AIService:
             def _draft_hash(value: str) -> str:
                 return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
 
+            def _estimate_accumulated_chars() -> int:
+                total = 0
+                for entry in history:
+                    parts = None
+                    if isinstance(entry, dict):
+                        parts = entry.get("parts")
+                    else:
+                        parts = getattr(entry, "parts", None)
+                    if not parts:
+                        continue
+                    for part in parts:
+                        if isinstance(part, str):
+                            total += len(part)
+                            continue
+                        text_val = None
+                        if isinstance(part, dict):
+                            text_val = part.get("text")
+                        else:
+                            text_val = getattr(part, "text", None)
+                        if isinstance(text_val, str):
+                            total += len(text_val)
+                return total
+
             def _build_accent_envelope() -> Dict[str, Any]:
                 if accent_context is None:
                     return {}
@@ -4005,6 +5182,11 @@ class AIService:
                 feedback: str,
                 draft: str,
             ) -> Optional[Tuple[str, Dict[str, Any]]]:
+                await self._emit_tool_event_safe(
+                    tool_event_callback,
+                    "force_finalize",
+                    {"turn": turn, "reason": reason},
+                )
                 forced_history = list(history)
                 forced_history.append(
                     {
@@ -4018,10 +5200,20 @@ class AIService:
                         ],
                     }
                 )
-                response = await model.generate_content_async(
-                    forced_history,
-                    generation_config=_build_generation_config(tools_enabled=False),
-                )
+                try:
+                    response = await model.generate_content_async(
+                        forced_history,
+                        generation_config=_build_generation_config(tools_enabled=False),
+                    )
+                except Exception as provider_exc:
+                    await self._maybe_raise_context_overflow_midloop(
+                        provider_exc,
+                        provider_key="gemini",
+                        turn=turn,
+                        accumulated_chars_estimate=_estimate_accumulated_chars(),
+                        tool_event_callback=tool_event_callback,
+                    )
+                    raise
                 usage_meta = getattr(response, "usage_metadata", None)
                 self._emit_usage(usage_callback, model_id, "gemini", usage_meta, extra_payload)
 
@@ -4037,6 +5229,24 @@ class AIService:
                 if not candidate:
                     return None
 
+                if payload_scope == PayloadScope.MEASUREMENT_ONLY:
+                    trace.append(
+                        {
+                            "turn": turn,
+                            "skipped_final_validation_for_evaluator": True,
+                            "stage": "forced_final_turn",
+                        }
+                    )
+                    await _sync_audit_or_fail(candidate, "path_c", turn)
+                    envelope = {
+                        "mode": mode_name,
+                        "turns": turn,
+                        "accepted": "forced_final_turn",
+                        "trace": trace,
+                    }
+                    envelope.update(_build_accent_envelope())
+                    return candidate, envelope
+
                 final_report = self._invoke_validation_callback(
                     validation_callback,
                     candidate,
@@ -4044,20 +5254,21 @@ class AIService:
                     model_id=model_id,
                     turn=turn,
                     stage="forced_final_turn",
+                    tool_event_callback=tool_event_callback,
                 )
                 trace.append(
                     {
                         "turn": turn,
                         "validator_after_forced_final": {
-                            "approved": bool(final_report.get("approved")),
-                            "score": final_report.get("score"),
-                            "word_count": final_report.get("word_count"),
-                            "hard_failed": bool(final_report.get("hard_failed")),
+                            "approved": bool(final_report.approved),
+                            "score": final_report.score,
+                            "word_count": final_report.word_count,
+                            "hard_failed": bool(final_report.hard_failed),
                         },
                         "metrics": self._build_trace_metrics(final_report),
                     }
                 )
-                if not final_report.get("approved"):
+                if not final_report.approved:
                     return None
 
                 await _sync_audit_or_fail(candidate, "path_c", turn)
@@ -4083,12 +5294,22 @@ class AIService:
                     include_validate_draft=enable_validate_draft,
                     include_audit_accent=include_audit_accent,
                 )
-                response = await model.generate_content_async(
-                    history,
-                    generation_config=_build_generation_config(tools_enabled=bool(active_tools)),
-                    tools=active_tools if active_tools else None,
-                    tool_config=tool_config if active_tools else None,
-                )
+                try:
+                    response = await model.generate_content_async(
+                        history,
+                        generation_config=_build_generation_config(tools_enabled=bool(active_tools)),
+                        tools=active_tools if active_tools else None,
+                        tool_config=tool_config if active_tools else None,
+                    )
+                except Exception as provider_exc:
+                    await self._maybe_raise_context_overflow_midloop(
+                        provider_exc,
+                        provider_key="gemini",
+                        turn=turn,
+                        accumulated_chars_estimate=_estimate_accumulated_chars(),
+                        tool_event_callback=tool_event_callback,
+                    )
+                    raise
                 usage_meta = getattr(response, "usage_metadata", None)
                 self._emit_usage(usage_callback, model_id, "gemini", usage_meta, extra_payload)
 
@@ -4129,9 +5350,10 @@ class AIService:
                             model_id=model_id,
                             turn=turn,
                             stage="overflow_tool_argument",
+                            tool_event_callback=tool_event_callback,
                         )
                         latest_feedback = str(
-                            overflow_report.get("feedback") or "The draft failed deterministic validation."
+                            overflow_report.feedback or "The draft failed deterministic validation."
                         ).strip()
                         latest_invalid_draft = overflow_draft
                         trace.append(
@@ -4143,7 +5365,7 @@ class AIService:
                                 "metrics": self._build_trace_metrics(overflow_report),
                             }
                         )
-                        if overflow_report.get("approved"):
+                        if overflow_report.approved:
                             await _sync_audit_or_fail(overflow_draft, "path_e", turn)
                             envelope = {
                                 "mode": mode_name,
@@ -4170,6 +5392,7 @@ class AIService:
                     function_response_parts: List[Any] = []
                     candidate_validated_draft: Optional[str] = None
                     turn_accent_rejected_text: Optional[str] = None
+                    input_too_large_detected = False
                     for call in function_calls:
                         call_name = getattr(call, "name", "validate_draft") or "validate_draft"
                         args = dict(getattr(call, "args", {}) or {})
@@ -4233,28 +5456,70 @@ class AIService:
                             })
                             continue
 
-                        tool_payload = self._invoke_validation_callback(
-                            validation_callback,
-                            draft,
-                            mode_name=mode_name,
-                            model_id=model_id,
-                            turn=turn,
-                            stage="tool_argument",
+                        await self._emit_tool_event_safe(
+                            tool_event_callback,
+                            "tool_call_start",
+                            {
+                                "tool": "validate_draft",
+                                "turn": turn,
+                                "args_preview": draft[:200],
+                            },
                         )
+                        try:
+                            tool_payload = self._invoke_validation_callback(
+                                validation_callback,
+                                draft,
+                                mode_name=mode_name,
+                                model_id=model_id,
+                                turn=turn,
+                                stage="tool_argument",
+                                tool_event_callback=tool_event_callback,
+                            )
+                        except ValidationToolInputTooLarge as oversize_exc:
+                            await self._emit_tool_event_safe(
+                                tool_event_callback,
+                                "tool_call_error",
+                                {
+                                    "turn": turn,
+                                    "reason": "input_too_large",
+                                    "actual_length": oversize_exc.actual_length,
+                                    "max_length": oversize_exc.max_length,
+                                },
+                            )
+                            function_response_parts.append(
+                                self.genai_client.protos.Part(
+                                    function_response=self.genai_client.protos.FunctionResponse(
+                                        name=call_name,
+                                        response={"error": "text_exceeds_limit"},
+                                    )
+                                )
+                            )
+                            trace.append(
+                                {
+                                    "turn": turn,
+                                    "tool": call_name,
+                                    "event": "tool_call_error",
+                                    "reason": "input_too_large",
+                                    "actual_length": oversize_exc.actual_length,
+                                    "max_length": oversize_exc.max_length,
+                                }
+                            )
+                            input_too_large_detected = True
+                            continue
                         total_tool_calls += 1
                         tool_call_counts["validate_draft"] += 1
-                        if tool_payload.get("approved"):
+                        if tool_payload.approved:
                             candidate_validated_draft = draft
                         else:
                             latest_feedback = str(
-                                tool_payload.get("feedback") or "The draft failed deterministic validation."
+                                tool_payload.feedback or "The draft failed deterministic validation."
                             ).strip()
                             latest_invalid_draft = draft
                         function_response_parts.append(
                             self.genai_client.protos.Part(
                                 function_response=self.genai_client.protos.FunctionResponse(
                                     name=call_name,
-                                    response=tool_payload,
+                                    response=tool_payload.build_visible_payload(payload_scope),
                                 )
                             )
                         )
@@ -4262,12 +5527,47 @@ class AIService:
                             {
                                 "turn": turn,
                                 "tool": call_name,
-                                "approved": bool(tool_payload.get("approved")),
-                                "score": tool_payload.get("score"),
-                                "word_count": tool_payload.get("word_count"),
-                                "hard_failed": bool(tool_payload.get("hard_failed")),
+                                "approved": bool(tool_payload.approved),
+                                "score": tool_payload.score,
+                                "word_count": tool_payload.word_count,
+                                "hard_failed": bool(tool_payload.hard_failed),
                                 "metrics": self._build_trace_metrics(tool_payload),
                             }
+                        )
+                        await self._emit_tool_event_safe(
+                            tool_event_callback,
+                            "tool_call_result",
+                            {
+                                "turn": turn,
+                                "score": tool_payload.score,
+                                "hard_failed": bool(tool_payload.hard_failed),
+                                "word_count": tool_payload.word_count,
+                                "issue_codes": [
+                                    i.get("code") for i in (tool_payload.issues or [])
+                                    if isinstance(i, dict)
+                                ],
+                            },
+                        )
+
+                    if input_too_large_detected:
+                        history.append(
+                            self.genai_client.protos.Content(
+                                role="user", parts=list(function_response_parts)
+                            )
+                        )
+                        forced_result = await _run_forced_final_turn(
+                            turn=turn + 1,
+                            reason="input_too_large",
+                            feedback=(
+                                latest_feedback
+                                or "The draft failed deterministic validation."
+                            ),
+                            draft=latest_invalid_draft,
+                        )
+                        if forced_result:
+                            return forced_result
+                        raise ToolLoopSchemaViolationError(
+                            "Tool loop exhausted after validate_draft input_too_large"
                         )
 
                     if candidate_validated_draft is not None and (
@@ -4310,27 +5610,14 @@ class AIService:
                 if not candidate:
                     continue
 
-                final_report = self._invoke_validation_callback(
-                    validation_callback,
-                    candidate,
-                    mode_name=mode_name,
-                    model_id=model_id,
-                    turn=turn,
-                    stage="assistant_final",
-                )
-                trace.append(
-                    {
-                        "turn": turn,
-                        "validator_after_final": {
-                            "approved": bool(final_report.get("approved")),
-                            "score": final_report.get("score"),
-                            "word_count": final_report.get("word_count"),
-                            "hard_failed": bool(final_report.get("hard_failed")),
-                        },
-                        "metrics": self._build_trace_metrics(final_report),
-                    }
-                )
-                if final_report.get("approved"):
+                if payload_scope == PayloadScope.MEASUREMENT_ONLY:
+                    trace.append(
+                        {
+                            "turn": turn,
+                            "skipped_final_validation_for_evaluator": True,
+                            "stage": "assistant_final",
+                        }
+                    )
                     if accent_inline_required and _draft_hash(candidate) not in audit_accent_approved_hashes:
                         history.append(
                             {
@@ -4357,7 +5644,55 @@ class AIService:
                     envelope.update(_build_accent_envelope())
                     return candidate, envelope
 
-                feedback = str(final_report.get("feedback") or "The draft failed deterministic validation.").strip()
+                final_report = self._invoke_validation_callback(
+                    validation_callback,
+                    candidate,
+                    mode_name=mode_name,
+                    model_id=model_id,
+                    turn=turn,
+                    stage="assistant_final",
+                    tool_event_callback=tool_event_callback,
+                )
+                trace.append(
+                    {
+                        "turn": turn,
+                        "validator_after_final": {
+                            "approved": bool(final_report.approved),
+                            "score": final_report.score,
+                            "word_count": final_report.word_count,
+                            "hard_failed": bool(final_report.hard_failed),
+                        },
+                        "metrics": self._build_trace_metrics(final_report),
+                    }
+                )
+                if final_report.approved:
+                    if accent_inline_required and _draft_hash(candidate) not in audit_accent_approved_hashes:
+                        history.append(
+                            {
+                                "role": "user",
+                                "parts": [
+                                    self._build_audit_accent_feedback_message(
+                                        candidate[:200], latest_audit_result
+                                    )
+                                ],
+                            }
+                        )
+                        trace.append({
+                            "turn": turn,
+                            "event": "accent_gate_blocked",
+                            "stage": "assistant_final",
+                        })
+                        continue
+                    envelope = {
+                        "mode": mode_name,
+                        "turns": turn,
+                        "accepted": "assistant_final",
+                        "trace": trace,
+                    }
+                    envelope.update(_build_accent_envelope())
+                    return candidate, envelope
+
+                feedback = str(final_report.feedback or "The draft failed deterministic validation.").strip()
                 latest_feedback = feedback
                 latest_invalid_draft = candidate
                 history.append(
@@ -4386,18 +5721,42 @@ class AIService:
 
             raise ValueError("Tool loop exhausted without producing a validated draft")
 
-        return await self._execute_with_retries(
+        if retries_enabled:
+            return await self._execute_with_retries(
+                _single_attempt,
+                provider="gemini",
+                model_id=model_id,
+                action="tool_loop_generation",
+            )
+        return await self._execute_without_retries(
             _single_attempt,
             provider="gemini",
             model_id=model_id,
             action="tool_loop_generation",
         )
 
-    async def generate_content_with_validation_tools(
+    async def call_ai_with_validation_tools(
         self,
         prompt: str,
         model: str,
-        validation_callback: Callable[[str], Dict[str, Any]],
+        validation_callback: Callable[[str], "DraftValidationResult"],
+        *,
+        stop_on_approval: bool = True,
+        output_contract: OutputContract = OutputContract.FREE_TEXT,
+        response_format: Optional[Dict[str, Any]] = None,
+        json_expectations: Optional[List[Dict[str, Any]]] = None,
+        payload_scope: PayloadScope = PayloadScope.GENERATOR,
+        max_tool_rounds: Optional[int] = None,
+        max_tool_calls: Optional[int] = None,
+        force_finalize_message: Optional[str] = None,
+        measurement_feedback_message: Optional[str] = None,
+        include_audit_accent: bool = False,
+        retries_enabled: bool = True,
+        model_alias_registry: Optional[Any] = None,
+        prompt_safety_parts: Optional[List[Any]] = None,
+        loop_scope: LoopScope = LoopScope.GENERATOR,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        initial_measurement_text: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 8000,
         system_prompt: Optional[str] = None,
@@ -4405,33 +5764,76 @@ class AIService:
         reasoning_effort: Optional[str] = None,
         thinking_budget_tokens: Optional[int] = None,
         content_type: str = "biography",
-        json_output: bool = False,
-        json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
         phase_logger: Optional["PhaseLogger"] = None,
         images: Optional[List["ImageData"]] = None,
-        max_rounds: int = 4,
         accent_guard: Optional["LlmAccentGuard"] = None,
         extra_system_instructions: Optional[str] = None,
         enable_validate_draft: bool = True,
         min_global_score: Optional[float] = None,
-        model_alias_registry: Optional[Any] = None,
-        prompt_safety_parts: Optional[List[Any]] = None,
-    ) -> Tuple[str, Dict[str, Any]]:
-        """
-        Generate content with a provider-specific tool loop that delegates
-        measurable checks to a local validator callback.
+    ) -> Tuple[str, ToolLoopEnvelope]:
+        """Reusable entry point for the shared ``validate_draft`` tool loop.
 
-        ``accent_guard`` opts into the LLM-accent guard (Cambio 1 v5, Sec 5.4). When its
-        ``mode`` is ``inline`` or ``inline_post`` the ``audit_accent`` tool is registered
-        alongside ``validate_draft`` and all five tool-loop exit paths enforce hash-bound
-        accent approval. ``extra_system_instructions`` is appended to the final system
-        prompt. ``enable_validate_draft=False`` lets the caller run an accent-only loop.
+        Entry point for the shared ``validate_draft`` tool loop. Supports all
+        four current callers (Generator, QA, Arbiter, GranSabio) via the new
+        ``loop_scope`` + ``payload_scope`` + ``output_contract`` parameters.
+
+        Central responsibilities handled here (§3.7):
+
+        - Fallback to single-shot for OpenAI Responses API models
+          (``o3-pro`` / ``gpt-5-pro``) with
+          ``envelope.tools_skipped_reason="responses_api"``.
+        - Fallback to single-shot for providers without tool support
+          (``envelope.tools_skipped_reason="no_tool_support"``).
+        - Fail-fast ``context_too_large`` detection before dispatch
+          (``envelope.tools_skipped_reason="context_too_large"``).
+
+        Returns ``(content, envelope)`` where ``content`` is the final string
+        emitted by the provider. For ``OutputContract.JSON_STRUCTURED``,
+        ``envelope.payload`` carries the parsed-and-validated dict. For
+        ``OutputContract.JSON_LOOSE``, the provider may include common AI
+        wrappers around a JSON object/array; the first valid payload is
+        extracted and normalized, but no payload is attached to the envelope.
         """
 
-        if max_rounds < 1:
-            raise ValueError("max_rounds must be >= 1")
+        # Resolve rounds budget. ``max_tool_rounds`` is the new parameter name;
+        # older generator callers passed ``max_rounds`` so we default to the
+        # existing generator constant when unspecified.
+        effective_max_rounds = max_tool_rounds if max_tool_rounds is not None else 4
+        if effective_max_rounds < 1:
+            raise ValueError("max_tool_rounds must be >= 1")
+
+        try:
+            output_contract = OutputContract(output_contract)
+        except ValueError as exc:
+            raise ToolLoopContractError(
+                f"unsupported output_contract for tool loop: {output_contract!r}"
+            ) from exc
+
+        if output_contract == OutputContract.JSON_STRUCTURED:
+            if response_format is None:
+                raise ToolLoopContractError(
+                    "JSON_STRUCTURED requires a non-empty object response_format"
+                )
+            if not isinstance(response_format, dict) or not response_format:
+                raise ToolLoopContractError(
+                    "JSON_STRUCTURED response_format must be a non-empty dict"
+                )
+            if response_format.get("type") != "object":
+                raise ToolLoopContractError(
+                    "JSON_STRUCTURED response_format top-level type must be 'object'"
+                )
+        elif output_contract == OutputContract.JSON_LOOSE:
+            if response_format is not None:
+                raise ToolLoopContractError(
+                    "JSON_LOOSE forbids response_format; omit json_schema for loose JSON"
+                )
+        elif output_contract == OutputContract.FREE_TEXT:
+            if response_format is not None:
+                raise ToolLoopContractError(
+                    "FREE_TEXT forbids response_format"
+                )
 
         accent_mode = (
             getattr(accent_guard, "mode", "off") if accent_guard is not None else "off"
@@ -4439,7 +5841,7 @@ class AIService:
         accent_inline_active = accent_mode in {"inline", "inline_post"}
         if not enable_validate_draft and not accent_inline_active:
             raise ValueError(
-                "generate_content_with_validation_tools: enable_validate_draft=False "
+                "call_ai_with_validation_tools: enable_validate_draft=False "
                 "requires accent_guard.mode in {inline, inline_post}."
             )
 
@@ -4455,8 +5857,31 @@ class AIService:
 
         provider_key = self._normalize_tool_loop_provider(provider)
 
-        if provider_key == "openai" and any(marker in model_id.lower() for marker in ["o3-pro", "gpt-5-pro"]):
-            raise ValueError("Generation tool loop is not supported for Responses API models.")
+        # ----- Centralized provider fallback protection (§3.7) ---------------
+        # Responses API models do not support the tool-call contract the loops
+        # rely on. Return an envelope flagged ``responses_api`` instead of
+        # raising — the caller can then route to a single-shot path.
+        if provider_key == "openai" and self._is_openai_responses_api_model(model_id):
+            envelope = ToolLoopEnvelope(
+                loop_scope=loop_scope,
+                tools_skipped_reason="responses_api",
+                turns=0,
+                accepted=False,
+                accepted_via="tools_skipped",
+            )
+            return "", envelope
+
+        # Providers outside the supported matrix: surface a ``no_tool_support``
+        # envelope rather than an exception (§3.7).
+        if provider_key not in {"openai", "openrouter", "xai", "claude", "gemini"}:
+            envelope = ToolLoopEnvelope(
+                loop_scope=loop_scope,
+                tools_skipped_reason="no_tool_support",
+                turns=0,
+                accepted=False,
+                accepted_via="tools_skipped",
+            )
+            return "", envelope
 
         request_timeout = token_validation.get("reasoning_timeout_seconds")
         reasoning_effort = adjusted_reasoning_effort
@@ -4470,8 +5895,19 @@ class AIService:
                 f"[EXTRA_VERBOSE] Temperature overridden to {temperature} due to reasoning policy for {model}"
             )
 
+        # ``output_contract`` replaces the bool ``json_output`` + dict
+        # ``json_schema`` pair at the public surface. Internally the 4 loops
+        # still speak that older vocabulary, so translate once here.
+        json_output_flag = output_contract in {
+            OutputContract.JSON_LOOSE,
+            OutputContract.JSON_STRUCTURED,
+        }
+        json_schema_arg = (
+            response_format if output_contract == OutputContract.JSON_STRUCTURED else None
+        )
+
         if system_prompt is None:
-            if content_type in {"other", "json"} or json_output:
+            if content_type in {"other", "json"} or json_output_flag:
                 system_prompt = config.GENERATOR_SYSTEM_PROMPT_RAW
             else:
                 system_prompt = config.GENERATOR_SYSTEM_PROMPT
@@ -4480,7 +5916,7 @@ class AIService:
         language_instruction = "\n\nIMPORTANT: Always respond in the same language as the user's request, regardless of the language used in these instructions."
         date_instruction = f"\n\nCurrent date: {current_date}"
         effective_system_prompt = (system_prompt or "") + language_instruction + date_instruction
-        if json_output:
+        if self._should_inject_json_prompt(provider, model_id, json_output_flag, json_schema_arg):
             json_instructions = (
                 "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, "
                 "use single quotes (') instead of double quotes (\") to avoid JSON parsing errors."
@@ -4492,13 +5928,68 @@ class AIService:
             if stripped_extra:
                 effective_system_prompt = f"{effective_system_prompt}\n\n{stripped_extra}"
 
+        # ----- Initial measurement injection (§3.2 + §3.2.3bis) -------------
+        # Evaluator layers (QA/Arbiter/GranSabio) pass ``initial_measurement_text``
+        # so the server computes ``validate_draft`` BEFORE the first turn and
+        # injects the filtered-by-``payload_scope`` result into the system
+        # prompt. The generator keeps ``initial_measurement_text=None``.
+        initial_measurement_trace: Optional[Dict[str, Any]] = None
+        if initial_measurement_text is not None and enable_validate_draft:
+            initial_result = self._invoke_validation_callback(
+                validation_callback,
+                initial_measurement_text,
+                mode_name="initial_measurement",
+                model_id=model_id,
+                turn=0,
+                stage="initial_measurement",
+                tool_event_callback=tool_event_callback,
+            )
+            visible = initial_result.build_visible_payload(payload_scope)
+            effective_system_prompt = (
+                f"{effective_system_prompt}\n\n"
+                f"<initial_measurement>"
+                f"{json.dumps(visible, ensure_ascii=True, sort_keys=True)}"
+                f"</initial_measurement>"
+            )
+            initial_measurement_trace = {
+                "turn": 0,
+                "scope": loop_scope.value,
+                "event": "initial_measurement",
+                "approved": initial_result.approved,
+                "score": initial_result.score,
+                "word_count": initial_result.word_count,
+                "hard_failed": initial_result.hard_failed,
+            }
+
         self._assert_model_blind_prompt(
             prompt=prompt,
             system_prompt=effective_system_prompt,
             model_alias_registry=model_alias_registry,
             prompt_safety_parts=prompt_safety_parts,
-            boundary="generate_content_with_validation_tools",
+            boundary="call_ai_with_validation_tools",
         )
+
+        # ----- Context-budget fail-fast (§3.2.5) -----------------------------
+        prompt_chars = len(effective_system_prompt or "") + len(prompt or "")
+        overflow_reason = estimate_prompt_overflow(
+            model_id=model_id,
+            prompt_chars=prompt_chars,
+            max_tokens=adjusted_max_tokens,
+            thinking_budget=adjusted_thinking_budget or 0,
+        )
+        hard_cap = getattr(config, "TOOL_LOOP_MAX_PROMPT_CHARS", 200000)
+        if overflow_reason is None and prompt_chars > hard_cap:
+            overflow_reason = "context_too_large"
+        if overflow_reason == "context_too_large":
+            envelope = ToolLoopEnvelope(
+                loop_scope=loop_scope,
+                tools_skipped_reason="context_too_large",
+                turns=0,
+                accepted=False,
+                accepted_via="tools_skipped",
+                context_size_estimate=prompt_chars,
+            )
+            return "", envelope
 
         accent_context: Optional[Dict[str, Any]] = None
         if accent_inline_active and accent_guard is not None:
@@ -4515,19 +6006,19 @@ class AIService:
                 "min_score": resolved_min_score,
             }
 
-        effective_json_schema = json_schema
-        if json_output and json_schema:
-            if provider_key == "gemini":
-                effective_json_schema = self._strip_additional_properties(json_schema)
-                effective_json_schema = self._convert_nullable_to_gemini_format(effective_json_schema)
+        effective_json_schema = json_schema_arg
+        if json_output_flag and json_schema_arg:
+            effective_json_schema = self._prepare_structured_output_schema(
+                provider_key,
+                model_id,
+                json_schema_arg,
+            )
             self._validate_schema_for_structured_outputs(
                 effective_json_schema,
                 provider,
                 model_id,
             )
-        elif json_output and not json_schema and provider_key == "openai" and any(
-            marker in model_id.lower() for marker in ["o3-pro", "gpt-5-pro"]
-        ):
+        elif json_output_flag and not json_schema_arg and provider_key == "openai" and self._is_openai_responses_api_model(model_id):
             fallback_schema = {"type": "object", "additionalProperties": False, "properties": {}}
             self._validate_schema_for_structured_outputs(fallback_schema, provider, model_id)
 
@@ -4537,7 +6028,7 @@ class AIService:
                 "max_tokens": adjusted_max_tokens,
                 "tool_loop": True,
                 "tool_name": "validate_draft",
-                "tool_rounds": max_rounds,
+                "tool_rounds": effective_max_rounds,
             }
             if reasoning_effort:
                 params["reasoning_effort"] = reasoning_effort
@@ -4558,6 +6049,18 @@ class AIService:
         if usage_extra:
             extra_payload.update(usage_extra)
 
+        loop_common_kwargs: Dict[str, Any] = {
+            "stop_on_approval": stop_on_approval,
+            "output_contract": output_contract,
+            "payload_scope": payload_scope,
+            "loop_scope": loop_scope,
+            "tool_event_callback": tool_event_callback,
+            "initial_measurement_text": initial_measurement_text,
+            "measurement_feedback_message": measurement_feedback_message,
+            "force_finalize_message": force_finalize_message,
+            "retries_enabled": retries_enabled,
+        }
+
         try:
             if provider_key in {"openai", "openrouter", "xai"}:
                 content, metadata = await self._run_openai_compatible_validation_tool_loop(
@@ -4570,15 +6073,16 @@ class AIService:
                     system_prompt=effective_system_prompt,
                     request_timeout=request_timeout,
                     reasoning_effort=reasoning_effort,
-                    json_output=json_output,
+                    json_output=json_output_flag,
                     json_schema=effective_json_schema,
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                     images=images,
-                    max_rounds=max_rounds,
+                    max_rounds=effective_max_rounds,
                     extra_verbose=extra_verbose,
                     accent_context=accent_context,
                     enable_validate_draft=enable_validate_draft,
+                    **loop_common_kwargs,
                 )
             elif provider_key == "claude":
                 content, metadata = await self._run_claude_validation_tool_loop(
@@ -4591,15 +6095,16 @@ class AIService:
                     system_prompt=effective_system_prompt,
                     request_timeout=request_timeout,
                     thinking_budget_tokens=thinking_budget_tokens,
-                    json_output=json_output,
+                    json_output=json_output_flag,
                     json_schema=effective_json_schema,
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                     images=images,
-                    max_rounds=max_rounds,
+                    max_rounds=effective_max_rounds,
                     extra_verbose=extra_verbose,
                     accent_context=accent_context,
                     enable_validate_draft=enable_validate_draft,
+                    **loop_common_kwargs,
                 )
             elif provider_key == "gemini":
                 if self.google_new_client:
@@ -4611,15 +6116,16 @@ class AIService:
                         max_tokens=adjusted_max_tokens,
                         system_prompt=effective_system_prompt,
                         thinking_budget_tokens=thinking_budget_tokens,
-                        json_output=json_output,
+                        json_output=json_output_flag,
                         json_schema=effective_json_schema,
                         usage_callback=usage_callback,
                         usage_extra=extra_payload,
                         images=images,
-                        max_rounds=max_rounds,
+                        max_rounds=effective_max_rounds,
                         extra_verbose=extra_verbose,
                         accent_context=accent_context,
                         enable_validate_draft=enable_validate_draft,
+                        **loop_common_kwargs,
                     )
                 elif self.genai_client:
                     if images:
@@ -4635,23 +6141,89 @@ class AIService:
                         temperature=temperature,
                         max_tokens=adjusted_max_tokens,
                         system_prompt=effective_system_prompt,
-                        json_output=json_output,
+                        json_output=json_output_flag,
                         json_schema=effective_json_schema,
                         usage_callback=usage_callback,
                         usage_extra=extra_payload,
-                        max_rounds=max_rounds,
+                        max_rounds=effective_max_rounds,
                         extra_verbose=extra_verbose,
                         accent_context=accent_context,
                         enable_validate_draft=enable_validate_draft,
+                        **loop_common_kwargs,
                     )
                 else:
-                    raise ValueError("No Gemini client initialized")
+                    # Fail-fast fallback envelope when Gemini credentials are
+                    # missing — no legacy ``ValueError`` path.
+                    envelope = ToolLoopEnvelope(
+                        loop_scope=loop_scope,
+                        tools_skipped_reason="no_tool_support",
+                        turns=0,
+                        accepted=False,
+                        accepted_via="tools_skipped",
+                        context_size_estimate=prompt_chars,
+                    )
+                    return "", envelope
             else:
-                raise ValueError(
-                    f"Generation tool loop is not supported for provider: {provider_key}"
+                # Should never reach here given the earlier gate; keep a
+                # defensive envelope in case someone adds a provider_key.
+                envelope = ToolLoopEnvelope(
+                    loop_scope=loop_scope,
+                    tools_skipped_reason="no_tool_support",
+                    turns=0,
+                    accepted=False,
+                    accepted_via="tools_skipped",
+                    context_size_estimate=prompt_chars,
                 )
+                return "", envelope
+        except ToolLoopContextOverflow as overflow_exc:
+            # Provider reported context-window overflow mid-loop — fail-fast
+            # with a typed envelope. No recovery, no truncation.
+            logger.warning(
+                "Tool-loop context overflow for %s at turn %d (accumulated_chars~%d): %s",
+                model,
+                overflow_exc.turn,
+                overflow_exc.accumulated_chars_estimate,
+                overflow_exc.provider_error,
+            )
+            envelope = ToolLoopEnvelope(
+                loop_scope=loop_scope,
+                tools_skipped_reason="context_too_large",
+                turns=overflow_exc.turn,
+                accepted=False,
+                accepted_via="tools_skipped",
+                context_size_estimate=overflow_exc.accumulated_chars_estimate,
+            )
+            return "", envelope
         except Exception as e:
-            logger.error(f"Tool-loop generation failed for {model}: {str(e)}")
+            logger.error(
+                "Tool-loop generation failed for %s via %s: %s",
+                model,
+                provider_key,
+                e,
+                exc_info=True,
+            )
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_loop_error",
+                {
+                    "model": model,
+                    "provider": provider_key,
+                    "model_id": model_id,
+                    "loop_scope": loop_scope.value,
+                    "exception_class": type(e).__name__,
+                    "message": str(e)[:500],
+                    "cause_class": (
+                        type(getattr(e, "cause", None)).__name__
+                        if getattr(e, "cause", None) is not None
+                        else None
+                    ),
+                    "cause_message": (
+                        str(getattr(e, "cause", ""))[:500]
+                        if getattr(e, "cause", None) is not None
+                        else None
+                    ),
+                },
+            )
             raise
 
         if phase_logger:
@@ -4666,7 +6238,172 @@ class AIService:
                 },
             )
 
-        return content, metadata
+        # ----- Build the typed envelope from the loop metadata --------------
+        trace_entries: List[ToolLoopTraceEntry] = []
+        raw_trace = metadata.get("trace") or []
+        if initial_measurement_trace is not None:
+            raw_trace = [initial_measurement_trace] + list(raw_trace)
+        for entry in raw_trace:
+            # Loops emit plain dict trace entries today; coerce them into the
+            # typed model so consumers get a stable shape.
+            scope_value = entry.get("scope", loop_scope.value)
+            try:
+                scope_enum = LoopScope(scope_value)
+            except ValueError:
+                scope_enum = loop_scope
+            turn_value = entry.get("turn", 0)
+            try:
+                turn_int = int(turn_value)
+            except (TypeError, ValueError):
+                turn_int = 0
+            event_value = entry.get("event") or (
+                "tool_call" if entry.get("tool") else "turn"
+            )
+            trace_entries.append(
+                ToolLoopTraceEntry(
+                    turn=turn_int,
+                    scope=scope_enum,
+                    event=event_value,
+                    tool=entry.get("tool"),
+                    approved=entry.get("approved"),
+                    score=entry.get("score"),
+                    word_count=entry.get("word_count"),
+                    hard_failed=entry.get("hard_failed"),
+                    metrics=entry.get("metrics"),
+                    stage=entry.get("stage"),
+                    reason=entry.get("reason"),
+                )
+            )
+
+        accepted_via_raw = str(metadata.get("accepted") or "")
+        # ``tool_loop_exhausted`` means the budget was consumed without a valid
+        # finalize turn — Proposal §3.2.4 Path 5 is explicitly fail-fast, so we
+        # surface it as a schema-violation exception rather than letting
+        # callers treat exhaustion as acceptance.
+        if accepted_via_raw == "tool_loop_exhausted":
+            raise ToolLoopSchemaViolationError(
+                f"tool loop exhausted without valid output for {model}"
+            )
+        accepted = bool(accepted_via_raw) and accepted_via_raw not in {
+            "tools_skipped",
+            "tool_loop_exhausted",
+            "",
+        }
+
+        payload_parsed: Optional[Dict[str, Any]] = None
+        output_schema_valid = True
+        if output_contract == OutputContract.JSON_LOOSE and accepted:
+            if not content:
+                raise JsonContractError(
+                    "empty content under JSON_LOOSE contract"
+                )
+            try:
+                from tools.ai_json_cleanroom import validate_loose_json
+            except Exception as exc:  # noqa: BLE001 - fail closed on import issue
+                output_schema_valid = False
+                raise ToolLoopSchemaViolationError(
+                    f"validate_loose_json unavailable for JSON validation: {exc}"
+                ) from exc
+
+            validation_result = validate_loose_json(
+                content,
+                expectations=json_expectations,
+            )
+            if not validation_result.json_valid:
+                output_schema_valid = False
+                error_details = "; ".join(
+                    f"{issue.path}: {issue.message}"
+                    for issue in (validation_result.errors or [])
+                ) or "unknown JSON violation"
+                raise JsonContractError(
+                    f"JSON_LOOSE output failed validation for {model}: {error_details}"
+                )
+            if validation_result.data is not None and _should_normalize_json_contract_content(content, validation_result):
+                content = json.dumps(validation_result.data, ensure_ascii=False)
+        elif output_contract == OutputContract.JSON_STRUCTURED and accepted:
+            if not content:
+                raise JsonContractError(
+                    "empty content under JSON_STRUCTURED contract"
+                )
+            if response_format is None:
+                raise JsonContractError(
+                    "JSON_STRUCTURED requires response_format"
+                )
+            try:
+                from tools.ai_json_cleanroom import validate_ai_json
+            except Exception as exc:  # noqa: BLE001 - fail closed on import issue
+                output_schema_valid = False
+                raise ToolLoopSchemaViolationError(
+                    f"validate_ai_json unavailable for schema validation: {exc}"
+                ) from exc
+
+            validation_result = validate_ai_json(
+                content,
+                schema=response_format,
+                expectations=json_expectations,
+            )
+            if not validation_result.json_valid:
+                output_schema_valid = False
+                error_details = "; ".join(
+                    f"{issue.path}: {issue.message}"
+                    for issue in (validation_result.errors or [])
+                ) or "unknown schema violation"
+                raise ToolLoopSchemaViolationError(
+                    f"JSON_STRUCTURED output failed schema validation for "
+                    f"{model}: {error_details}"
+                )
+            if not isinstance(validation_result.data, dict):
+                output_schema_valid = False
+                raise ToolLoopSchemaViolationError(
+                    f"JSON_STRUCTURED output for {model} parsed to "
+                    f"{type(validation_result.data).__name__}, expected object"
+                )
+            payload_parsed = validation_result.data
+            if _should_normalize_json_contract_content(content, validation_result):
+                content = json.dumps(payload_parsed, ensure_ascii=False)
+
+        # Merge the legacy per-loop metadata dict (accent fail-open counters,
+        # accent approved hash counts, etc.) into the envelope's open extras
+        # so existing consumers keep working with attribute access.
+        legacy_extras: Dict[str, Any] = {}
+        for key, value in metadata.items():
+            if key in {"mode", "turns", "accepted", "trace"}:
+                continue
+            legacy_extras[key] = value
+
+        envelope = ToolLoopEnvelope(
+            loop_scope=loop_scope,
+            trace=trace_entries,
+            output_schema_valid=output_schema_valid,
+            streaming_disabled_reason=None,
+            tools_skipped_reason=metadata.get("tools_skipped_reason"),
+            turns=int(metadata.get("turns") or 0),
+            accepted=accepted,
+            accepted_via=accepted_via_raw,
+            context_size_estimate=prompt_chars,
+            payload=payload_parsed,
+            **legacy_extras,
+        )
+
+        if tool_event_callback is not None:
+            try:
+                awaitable = tool_event_callback(
+                    "tool_loop_complete",
+                    {
+                        "total_turns": envelope.turns,
+                        "accepted_via": envelope.accepted_via,
+                        "loop_scope": envelope.loop_scope.value,
+                    },
+                )
+                if asyncio.iscoroutine(awaitable):
+                    await awaitable
+            except Exception:
+                logger.warning(
+                    "tool_event_callback failed to emit tool_loop_complete",
+                    exc_info=True,
+                )
+
+        return content, envelope
 
     async def _generate_openai(
         self,
@@ -4691,8 +6428,8 @@ class AIService:
         if request_timeout and request_timeout > 0:
             request_kwargs["timeout"] = request_timeout
 
-        # Add JSON instruction to system prompt (not user message) to avoid prompt contamination
-        if json_output:
+        # Add JSON instruction only when native structured outputs are unavailable.
+        if self._should_inject_json_prompt("openai", model_id, json_output, json_schema):
             json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
             effective_system_prompt = f"{effective_system_prompt}\n\n{json_instructions}"
 
@@ -4802,7 +6539,12 @@ class AIService:
                     "2) SDK regression in output_text. Suggestion: increase max_output_tokens."
                 )
 
-            return content or "", getattr(response, "usage", None)
+            return content or "", self._usage_with_finish_metadata(
+                getattr(response, "usage", None),
+                response,
+                provider="openai",
+                max_tokens=max_tokens,
+            )
 
         # --- GPT-5 Pro: Responses API ---
         elif "gpt-5-pro" in model_id.lower():
@@ -4895,7 +6637,12 @@ class AIService:
                     "2) SDK regression in output_text. Suggestion: increase max_output_tokens."
                 )
 
-            return content or "", getattr(response, "usage", None)
+            return content or "", self._usage_with_finish_metadata(
+                getattr(response, "usage", None),
+                response,
+                provider="openai",
+                max_tokens=max_tokens,
+            )
 
         # --- GPT-5 por Chat Completions ---
         elif "gpt-5" in model_id.lower():
@@ -4938,7 +6685,12 @@ class AIService:
                 logger.error(error_msg)
                 raise Exception(error_msg)
 
-            return content, getattr(response, "usage", None)
+            return content, self._usage_with_finish_metadata(
+                getattr(response, "usage", None),
+                response,
+                provider="openai",
+                max_tokens=max_tokens,
+            )
 
         # --- Standard models via Chat Completions ---
         else:
@@ -4968,7 +6720,12 @@ class AIService:
                 **standard_params,
                 **request_kwargs,
             )
-            return response.choices[0].message.content, getattr(response, "usage", None)
+            return response.choices[0].message.content, self._usage_with_finish_metadata(
+                getattr(response, "usage", None),
+                response,
+                provider="openai",
+                max_tokens=max_tokens,
+            )
 
     async def generate_with_logprobs(
         self,
@@ -5218,19 +6975,17 @@ class AIService:
         if usage_extra:
             extra_payload.update(usage_extra)
 
-        # Enforce structured-output schema compatibility upfront
-        # For Gemini, transform schema to match their requirements:
-        # 1. Strip additionalProperties (not supported)
-        # 2. Convert nullable types from ["type", "null"] to {"type": "type", "nullable": true}
+        # Enforce structured-output schema compatibility upfront, using the
+        # provider-normalized schema for dict-based native JSON calls.
         effective_json_schema = json_schema
         if json_output and json_schema:
-            if provider in ("gemini", "google"):
-                effective_json_schema = self._strip_additional_properties(json_schema)
-                effective_json_schema = self._convert_nullable_to_gemini_format(effective_json_schema)
+            effective_json_schema = self._prepare_structured_output_schema(
+                provider,
+                model_id,
+                json_schema,
+            )
             self._validate_schema_for_structured_outputs(effective_json_schema, provider, model_id)
-        elif json_output and not json_schema and provider == "openai" and any(
-            marker in model_id.lower() for marker in ["o3-pro", "gpt-5-pro"]
-        ):
+        elif json_output and not json_schema and provider == "openai" and self._is_openai_responses_api_model(model_id):
             fallback_schema = {"type": "object", "additionalProperties": False, "properties": {}}
             self._validate_schema_for_structured_outputs(fallback_schema, provider, model_id)
 
@@ -5309,7 +7064,7 @@ class AIService:
                     thinking_budget_tokens,
                     request_timeout=request_timeout,
                     json_output=json_output,
-                    json_schema=json_schema,
+                    json_schema=effective_json_schema,
                     usage_callback=usage_callback,
                     provider=provider,
                     resolved_model_id=model_id,
@@ -5358,7 +7113,7 @@ class AIService:
                     adjusted_max_tokens,
                     system_prompt,
                     json_output=json_output,
-                    json_schema=json_schema,
+                    json_schema=effective_json_schema,
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                     images=images,
@@ -5372,7 +7127,7 @@ class AIService:
                     adjusted_max_tokens,
                     system_prompt,
                     json_output=json_output,
-                    json_schema=json_schema,
+                    json_schema=effective_json_schema,
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                     images=images,
@@ -5386,7 +7141,7 @@ class AIService:
                     adjusted_max_tokens,
                     system_prompt,
                     json_output=json_output,
-                    json_schema=json_schema,
+                    json_schema=effective_json_schema,
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                 ):
@@ -5399,7 +7154,7 @@ class AIService:
                     adjusted_max_tokens,
                     system_prompt,
                     json_output=json_output,
-                    json_schema=json_schema,
+                    json_schema=effective_json_schema,
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                 ):
@@ -5522,7 +7277,7 @@ class AIService:
 
         # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
         effective_system = system_prompt.strip() if system_prompt else ""
-        if json_output and not use_structured_outputs:
+        if self._should_inject_json_prompt("claude", model_id, json_output, json_schema):
             json_instructions = "CRITICAL REQUIREMENT: You MUST respond with valid JSON only. Start your response with '{' immediately. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\". Do not include any text, explanation, or commentary before or after the JSON object."
             if effective_system:
                 effective_system = f"{effective_system}\n\n{json_instructions}"
@@ -5565,7 +7320,12 @@ class AIService:
 
         # Handle thinking mode responses which may have different content structure
         content = self._extract_text_from_claude_response(response)
-        return content, getattr(response, "usage", None)
+        return content, self._usage_with_finish_metadata(
+            getattr(response, "usage", None),
+            response,
+            provider="claude",
+            max_tokens=max_tokens,
+        )
 
     def _extract_text_from_claude_response(self, response) -> str:
         """
@@ -5575,52 +7335,14 @@ class AIService:
         - ThinkingBlock objects (which we skip)
         - TextBlock objects (which contain the actual response text)
         """
-        text_content = []
-
         try:
-            for content_block in response.content:
-                # Handle different block types properly
-                block_type = getattr(content_block, 'type', None)
-
-                if block_type == 'thinking':
-                    # Skip thinking blocks - we only want the final answer
-                    continue
-                elif block_type == 'text' and hasattr(content_block, 'text'):
-                    # Standard text block
-                    text_content.append(content_block.text)
-                elif hasattr(content_block, 'text'):
-                    # Fallback for blocks with text attribute but no type
-                    text_content.append(content_block.text)
-                else:
-                    # Try to get text from other possible structures
-                    if hasattr(content_block, 'content'):
-                        if isinstance(content_block.content, str):
-                            text_content.append(content_block.content)
-
-            # Join all text content
-            result = "".join(text_content).strip()
-
-            # Fallback: if no text found, try original approach
-            if not result and response.content:
-                try:
-                    # Try to get text from the first content block that isn't thinking
-                    for block in response.content:
-                        if getattr(block, 'type', None) != 'thinking' and hasattr(block, 'text'):
-                            result = block.text
-                            break
-
-                    # If still no result, try the old method
-                    if not result:
-                        result = response.content[0].text if hasattr(response.content[0], 'text') else str(response.content[0])
-                except (AttributeError, IndexError):
-                    result = ""
-
-            return result or "No text content found in response"
+            return self._extract_text_from_claude_content(
+                getattr(response, "content", []) or []
+            )
 
         except Exception as e:
             logger.error(f"Error extracting text from Claude response: {e}")
-            # Ultimate fallback
-            return f"Error extracting response content: {str(e)}"
+            return ""
 
     async def _generate_gemini(
         self,
@@ -5694,7 +7416,7 @@ class AIService:
 
             # Build system instruction (separate from user content to avoid prompt contamination)
             effective_system = system_prompt or ""
-            if json_output:
+            if self._should_inject_json_prompt("gemini", model_id, json_output, json_schema):
                 json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
                 if effective_system:
                     effective_system = f"{effective_system}\n\n{json_instructions}"
@@ -5745,7 +7467,12 @@ class AIService:
 
             # Extract text from response
             if hasattr(response, 'text') and response.text:
-                return response.text, getattr(response, 'usage_metadata', None)
+                return response.text, self._usage_with_finish_metadata(
+                    getattr(response, 'usage_metadata', None),
+                    response,
+                    provider="gemini",
+                    max_tokens=max_tokens,
+                )
             elif hasattr(response, 'candidates') and response.candidates:
                 candidate = response.candidates[0]
                 if hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts'):
@@ -5754,11 +7481,22 @@ class AIService:
                         if hasattr(part, 'text') and part.text:
                             text_parts.append(part.text)
                     if text_parts:
-                        return "".join(text_parts), getattr(response, 'usage_metadata', None)
+                        return "".join(text_parts), self._usage_with_finish_metadata(
+                            getattr(response, 'usage_metadata', None),
+                            response,
+                            provider="gemini",
+                            max_tokens=max_tokens,
+                            fallback_finish_reason=getattr(candidate, "finish_reason", None),
+                        )
 
             return (
                 "Unable to generate content. The response may have been blocked by safety filters.",
-                getattr(response, 'usage_metadata', None),
+                self._usage_with_finish_metadata(
+                    getattr(response, 'usage_metadata', None),
+                    response,
+                    provider="gemini",
+                    max_tokens=max_tokens,
+                ),
             )
 
         except Exception as e:
@@ -5788,7 +7526,7 @@ class AIService:
         """
         # Build system instruction with JSON instructions if needed (avoids prompt contamination in user message)
         system_instruction = system_prompt or ""
-        if json_output:
+        if self._should_inject_json_prompt("gemini", model_id, json_output, json_schema):
             json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
             if system_instruction:
                 system_instruction = f"{system_instruction}\n\n{json_instructions}"
@@ -5849,10 +7587,20 @@ class AIService:
 
             return (
                 "Unable to generate content. The response may have been blocked by safety filters or the model didn't return valid content. Please try rephrasing your request.",
-                getattr(response, 'usage_metadata', None),
+                self._usage_with_finish_metadata(
+                    getattr(response, 'usage_metadata', None),
+                    response,
+                    provider="gemini",
+                    max_tokens=max_tokens,
+                ),
             )
 
-        return response.text, getattr(response, 'usage_metadata', None)
+        return response.text, self._usage_with_finish_metadata(
+            getattr(response, 'usage_metadata', None),
+            response,
+            provider="gemini",
+            max_tokens=max_tokens,
+        )
 
     def _apply_temperature_policies(
         self,
@@ -5993,7 +7741,7 @@ class AIService:
 
         # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
         effective_system = system_prompt or ""
-        if json_output:
+        if self._should_inject_json_prompt("xai", model_id, json_output, json_schema):
             json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
             if effective_system:
                 effective_system = f"{effective_system}\n\n{json_instructions}"
@@ -6041,7 +7789,12 @@ class AIService:
             **request_params
         )
 
-        return response.choices[0].message.content, getattr(response, "usage", None)
+        return response.choices[0].message.content, self._usage_with_finish_metadata(
+            getattr(response, "usage", None),
+            response,
+            provider="xai",
+            max_tokens=max_tokens,
+        )
 
     async def _generate_openrouter(
         self,
@@ -6060,7 +7813,7 @@ class AIService:
 
         # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
         effective_system = system_prompt or ""
-        if json_output:
+        if self._should_inject_json_prompt("openrouter", model_id, json_output, json_schema):
             json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
             if effective_system:
                 effective_system = f"{effective_system}\n\n{json_instructions}"
@@ -6108,7 +7861,12 @@ class AIService:
             **request_params
         )
 
-        return response.choices[0].message.content, getattr(response, "usage", None)
+        return response.choices[0].message.content, self._usage_with_finish_metadata(
+            getattr(response, "usage", None),
+            response,
+            provider="openrouter",
+            max_tokens=max_tokens,
+        )
 
     async def health_check(self) -> Dict[str, bool]:
         """Check health of all AI service providers"""
@@ -6203,8 +7961,8 @@ class AIService:
         if request_timeout and request_timeout > 0:
             request_kwargs["timeout"] = request_timeout
 
-        # Add JSON instruction to system prompt (not user message) to avoid prompt contamination
-        if json_output:
+        # Add JSON instruction only when native structured outputs are unavailable.
+        if self._should_inject_json_prompt(provider, model_id, json_output, json_schema):
             json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
             effective_system_prompt = f"{effective_system_prompt}\n\n{json_instructions}"
 
@@ -6246,6 +8004,15 @@ class AIService:
                     images=images,
                 )
                 yield content
+                yield StreamChunk(
+                    "",
+                    is_thinking=False,
+                    metadata=_build_finish_metadata(
+                        provider=provider,
+                        finish_reason=(usage_meta or {}).get("finish_reason") if isinstance(usage_meta, dict) else None,
+                        max_tokens=max_tokens,
+                    ),
+                )
                 self._emit_usage(
                     usage_callback,
                     resolved_model_id or model_id,
@@ -6272,6 +8039,15 @@ class AIService:
                     images=images,
                 )
                 yield content
+                yield StreamChunk(
+                    "",
+                    is_thinking=False,
+                    metadata=_build_finish_metadata(
+                        provider=provider,
+                        finish_reason=(usage_meta or {}).get("finish_reason") if isinstance(usage_meta, dict) else None,
+                        max_tokens=max_tokens,
+                    ),
+                )
                 self._emit_usage(
                     usage_callback,
                     resolved_model_id or model_id,
@@ -6368,9 +8144,12 @@ class AIService:
             chunk_count = 0
             total_content = ""
             usage_obj = None
+            finish_reason = None
             async for chunk in stream:
                 # Verify that choices exists and has elements before accessing
                 if chunk.choices and len(chunk.choices) > 0:
+                    if getattr(chunk.choices[0], "finish_reason", None) is not None:
+                        finish_reason = getattr(chunk.choices[0], "finish_reason", None)
                     if chunk.choices[0].delta.content is not None:
                         chunk_count += 1
                         content_piece = chunk.choices[0].delta.content
@@ -6395,12 +8174,28 @@ class AIService:
             elif hasattr(stream, "usage") and stream.usage:
                 usage_obj = stream.usage
 
+            usage_with_finish = self._usage_with_finish_metadata(
+                usage_obj,
+                None,
+                provider=provider,
+                max_tokens=max_tokens,
+                fallback_finish_reason=finish_reason,
+            )
             self._emit_usage(
                 usage_callback,
                 resolved_model_id or model_id,
                 provider,
-                usage_obj,
+                usage_with_finish,
                 extra_payload,
+            )
+            yield StreamChunk(
+                "",
+                is_thinking=False,
+                metadata=_build_finish_metadata(
+                    provider=provider,
+                    finish_reason=finish_reason,
+                    max_tokens=max_tokens,
+                ),
             )
 
         except Exception as e:
@@ -6496,6 +8291,8 @@ class AIService:
 
             async with stream_context as stream:
                 final_usage = None
+                final_response = None
+                stop_reason = None
                 input_tokens = 0
                 output_tokens = 0
 
@@ -6508,6 +8305,9 @@ class AIService:
 
                     # Capture usage from message_delta event (contains cumulative output_tokens)
                     elif event.type == "message_delta":
+                        delta = getattr(event, "delta", None)
+                        if delta is not None and getattr(delta, "stop_reason", None) is not None:
+                            stop_reason = getattr(delta, "stop_reason", None)
                         if hasattr(event, 'usage'):
                             usage_obj = event.usage
                             output_tokens = getattr(usage_obj, 'output_tokens', 0)
@@ -6536,6 +8336,7 @@ class AIService:
                 try:
                     final_response = await stream.get_final_response()
                     final_usage = getattr(final_response, "usage", None)
+                    stop_reason = getattr(final_response, "stop_reason", stop_reason)
                 except Exception:
                     final_usage = None
 
@@ -6550,12 +8351,28 @@ class AIService:
 
                     final_usage = UsageData(input_tokens, output_tokens)
 
+                usage_with_finish = self._usage_with_finish_metadata(
+                    final_usage,
+                    final_response,
+                    provider=provider,
+                    max_tokens=max_tokens,
+                    fallback_finish_reason=stop_reason,
+                )
                 self._emit_usage(
                     usage_callback,
                     resolved_model_id or model_id,
                     provider,
-                    final_usage,
+                    usage_with_finish,
                     extra_payload,
+                )
+                yield StreamChunk(
+                    "",
+                    is_thinking=False,
+                    metadata=_build_finish_metadata(
+                        provider=provider,
+                        finish_reason=stop_reason,
+                        max_tokens=max_tokens,
+                    ),
                 )
         except Exception as e:
             logger.error(f"Claude streaming error: {e}")
@@ -6638,7 +8455,7 @@ class AIService:
 
             # Build system instruction (separate from user content to avoid prompt contamination)
             effective_system = system_prompt or ""
-            if json_output:
+            if self._should_inject_json_prompt("gemini", model_id, json_output, json_schema):
                 json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
                 if effective_system:
                     effective_system = f"{effective_system}\n\n{json_instructions}"
@@ -6697,6 +8514,7 @@ class AIService:
             yielded_chunks = False
             fallback_needed = False
             fallback_reason: Optional[BaseException] = None
+            finish_reason = None
 
             try:
                 async for chunk in stream_response:
@@ -6706,6 +8524,8 @@ class AIService:
                         yield chunk.text
                     elif hasattr(chunk, 'candidates') and chunk.candidates:
                         candidate = chunk.candidates[0]
+                        if getattr(candidate, "finish_reason", None) is not None:
+                            finish_reason = getattr(candidate, "finish_reason", None)
                         if hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts'):
                             try:
                                 for part in candidate.content.parts:
@@ -6750,17 +8570,35 @@ class AIService:
                     if fallback_text:
                         yield fallback_text
                     usage_metadata = fallback_usage
+                    if isinstance(fallback_usage, dict):
+                        finish_reason = fallback_usage.get("finish_reason") or fallback_usage.get("provider_stop_reason")
                     logger.info("Gemini stream fallback succeeded after streaming error")
                 except Exception as fallback_error:
                     logger.error(f"Gemini fallback generation failed after streaming error ({fallback_reason}): {fallback_error}")
                     raise
 
+            usage_with_finish = self._usage_with_finish_metadata(
+                usage_metadata,
+                None,
+                provider=provider,
+                max_tokens=max_tokens,
+                fallback_finish_reason=finish_reason,
+            )
             self._emit_usage(
                 usage_callback,
                 model_id,
                 provider,
-                usage_metadata,
+                usage_with_finish,
                 extra_payload,
+            )
+            yield StreamChunk(
+                "",
+                is_thinking=False,
+                metadata=_build_finish_metadata(
+                    provider=provider,
+                    finish_reason=finish_reason,
+                    max_tokens=max_tokens,
+                ),
             )
 
         except Exception as e:
@@ -6786,7 +8624,7 @@ class AIService:
         try:
             # Build system instruction with JSON instructions if needed (avoids prompt contamination in user message)
             system_instruction = system_prompt or ""
-            if json_output:
+            if self._should_inject_json_prompt("gemini", model_id, json_output, json_schema):
                 json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
                 if system_instruction:
                     system_instruction = f"{system_instruction}\n\n{json_instructions}"
@@ -6821,7 +8659,11 @@ class AIService:
             response = await model.generate_content_async(prompt, stream=True)
 
             usage_metadata = None
+            finish_reason = None
             async for chunk in response:
+                candidates = getattr(chunk, "candidates", None) or []
+                if candidates and getattr(candidates[0], "finish_reason", None) is not None:
+                    finish_reason = getattr(candidates[0], "finish_reason", None)
                 if chunk.text:
                     yield chunk.text
                 if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
@@ -6830,12 +8672,28 @@ class AIService:
             logger.error(f"Legacy Gemini SDK streaming error: {e}")
             raise
 
+        usage_with_finish = self._usage_with_finish_metadata(
+            usage_metadata,
+            None,
+            provider=provider,
+            max_tokens=max_tokens,
+            fallback_finish_reason=finish_reason,
+        )
         self._emit_usage(
             usage_callback,
             model_id,
             provider,
-            usage_metadata,
+            usage_with_finish,
             extra_payload,
+        )
+        yield StreamChunk(
+            "",
+            is_thinking=False,
+            metadata=_build_finish_metadata(
+                provider=provider,
+                finish_reason=finish_reason,
+                max_tokens=max_tokens,
+            ),
         )
     
     async def _stream_xai(
@@ -6872,7 +8730,7 @@ class AIService:
 
         # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
         effective_system = system_prompt or ""
-        if json_output:
+        if self._should_inject_json_prompt("ollama", model_id, json_output, json_schema):
             json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
             if effective_system:
                 effective_system = f"{effective_system}\n\n{json_instructions}"
@@ -6924,9 +8782,12 @@ class AIService:
             stream = await self.xai_client.chat.completions.create(**create_params)
 
             usage_obj = None
+            finish_reason = None
             async for chunk in stream:
                 # Verify that choices exists and has elements before accessing
                 if chunk.choices and len(chunk.choices) > 0:
+                    if getattr(chunk.choices[0], "finish_reason", None) is not None:
+                        finish_reason = getattr(chunk.choices[0], "finish_reason", None)
                     if chunk.choices[0].delta.content is not None:
                         yield chunk.choices[0].delta.content
                 # Capture usage even if choices is empty
@@ -6938,12 +8799,28 @@ class AIService:
             elif hasattr(stream, "usage") and stream.usage:
                 usage_obj = stream.usage
 
+            usage_with_finish = self._usage_with_finish_metadata(
+                usage_obj,
+                None,
+                provider="xai",
+                max_tokens=max_tokens,
+                fallback_finish_reason=finish_reason,
+            )
             self._emit_usage(
                 usage_callback,
                 model_id,
                 "xai",
-                usage_obj,
+                usage_with_finish,
                 extra_payload,
+            )
+            yield StreamChunk(
+                "",
+                is_thinking=False,
+                metadata=_build_finish_metadata(
+                    provider="xai",
+                    finish_reason=finish_reason,
+                    max_tokens=max_tokens,
+                ),
             )
         except Exception as e:
             logger.error(f"xAI streaming error: {e}")
@@ -6970,7 +8847,7 @@ class AIService:
 
         # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
         effective_system = system_prompt or ""
-        if json_output:
+        if self._should_inject_json_prompt("openrouter", model_id, json_output, json_schema):
             json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
             if effective_system:
                 effective_system = f"{effective_system}\n\n{json_instructions}"
@@ -7022,9 +8899,12 @@ class AIService:
             stream = await self.openrouter_client.chat.completions.create(**create_params)
 
             usage_obj = None
+            finish_reason = None
             async for chunk in stream:
                 # Verify that choices exists and has elements before accessing
                 if chunk.choices and len(chunk.choices) > 0:
+                    if getattr(chunk.choices[0], "finish_reason", None) is not None:
+                        finish_reason = getattr(chunk.choices[0], "finish_reason", None)
                     if chunk.choices[0].delta.content is not None:
                         yield chunk.choices[0].delta.content
                 # Capture usage even if choices is empty
@@ -7036,12 +8916,28 @@ class AIService:
             elif hasattr(stream, "usage") and stream.usage:
                 usage_obj = stream.usage
 
+            usage_with_finish = self._usage_with_finish_metadata(
+                usage_obj,
+                None,
+                provider="openrouter",
+                max_tokens=max_tokens,
+                fallback_finish_reason=finish_reason,
+            )
             self._emit_usage(
                 usage_callback,
                 model_id,
                 "openrouter",
-                usage_obj,
+                usage_with_finish,
                 extra_payload,
+            )
+            yield StreamChunk(
+                "",
+                is_thinking=False,
+                metadata=_build_finish_metadata(
+                    provider="openrouter",
+                    finish_reason=finish_reason,
+                    max_tokens=max_tokens,
+                ),
             )
         except Exception as e:
             logger.error(f"OpenRouter streaming error: {e}")
@@ -7073,7 +8969,7 @@ class AIService:
 
         # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
         effective_system = system_prompt or ""
-        if json_output:
+        if self._should_inject_json_prompt("ollama", model_id, json_output, json_schema):
             json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
             if effective_system:
                 effective_system = f"{effective_system}\n\n{json_instructions}"
@@ -7109,7 +9005,12 @@ class AIService:
             **request_params
         )
 
-        return response.choices[0].message.content, getattr(response, "usage", None)
+        return response.choices[0].message.content, self._usage_with_finish_metadata(
+            getattr(response, "usage", None),
+            response,
+            provider="ollama",
+            max_tokens=max_tokens,
+        )
 
     async def _stream_ollama(
         self,
@@ -7143,7 +9044,7 @@ class AIService:
 
         # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
         effective_system = system_prompt or ""
-        if json_output:
+        if self._should_inject_json_prompt("ollama", model_id, json_output, json_schema):
             json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
             if effective_system:
                 effective_system = f"{effective_system}\n\n{json_instructions}"
@@ -7180,9 +9081,12 @@ class AIService:
             stream = await self.ollama_client.chat.completions.create(**create_params)
 
             usage_obj = None
+            finish_reason = None
             async for chunk in stream:
                 # Verify that choices exists and has elements before accessing
                 if chunk.choices and len(chunk.choices) > 0:
+                    if getattr(chunk.choices[0], "finish_reason", None) is not None:
+                        finish_reason = getattr(chunk.choices[0], "finish_reason", None)
                     if chunk.choices[0].delta.content is not None:
                         yield chunk.choices[0].delta.content
                 # Capture usage even if choices is empty
@@ -7194,12 +9098,28 @@ class AIService:
             elif hasattr(stream, "usage") and stream.usage:
                 usage_obj = stream.usage
 
+            usage_with_finish = self._usage_with_finish_metadata(
+                usage_obj,
+                None,
+                provider="ollama",
+                max_tokens=max_tokens,
+                fallback_finish_reason=finish_reason,
+            )
             self._emit_usage(
                 usage_callback,
                 model_id,
                 "ollama",
-                usage_obj,
+                usage_with_finish,
                 extra_payload,
+            )
+            yield StreamChunk(
+                "",
+                is_thinking=False,
+                metadata=_build_finish_metadata(
+                    provider="ollama",
+                    finish_reason=finish_reason,
+                    max_tokens=max_tokens,
+                ),
             )
         except Exception as e:
             logger.error(f"Ollama streaming error: {e}")
@@ -7243,10 +9163,12 @@ class AIService:
         )
 
         content = response.choices[0].message.content
-        usage = {
-            "input_tokens": getattr(response.usage, "prompt_tokens", 0) if response.usage else 0,
-            "output_tokens": getattr(response.usage, "completion_tokens", 0) if response.usage else 0,
-        }
+        usage = self._usage_with_finish_metadata(
+            getattr(response, "usage", None),
+            response,
+            provider="fake",
+            max_tokens=max_tokens,
+        )
 
         logger.info(f"[FakeAI] Response from {model_id}: {len(content)} chars")
         return content, usage
@@ -7297,9 +9219,13 @@ class AIService:
             )
 
             usage_obj = None
+            finish_reason = None
             async for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+                if chunk.choices:
+                    if getattr(chunk.choices[0], "finish_reason", None) is not None:
+                        finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+                    if chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
                 # Capture usage from streaming response if available
                 if hasattr(chunk, "usage") and chunk.usage:
                     usage_obj = chunk.usage
@@ -7310,12 +9236,28 @@ class AIService:
             elif hasattr(stream, "usage") and stream.usage:
                 usage_obj = stream.usage
 
+            usage_with_finish = self._usage_with_finish_metadata(
+                usage_obj,
+                None,
+                provider="fake",
+                max_tokens=max_tokens,
+                fallback_finish_reason=finish_reason,
+            )
             self._emit_usage(
                 usage_callback,
                 model_id,
                 "fake",
-                usage_obj,
+                usage_with_finish,
                 extra_payload,
+            )
+            yield StreamChunk(
+                "",
+                is_thinking=False,
+                metadata=_build_finish_metadata(
+                    provider="fake",
+                    finish_reason=finish_reason,
+                    max_tokens=max_tokens,
+                ),
             )
         except Exception as e:
             logger.error(f"Fake AI streaming error: {e}")

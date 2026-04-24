@@ -27,6 +27,10 @@ XAI_LANGUAGE_MODELS_URL = "https://api.x.ai/v1/language-models"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 GOOGLE_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 ANTHROPIC_API_VERSION = "2023-06-01"
+REMOTE_JSON_HEADERS = {
+    "Accept": "application/json",
+    "Accept-Encoding": "gzip, deflate",
+}
 
 
 class ModelSyncError(RuntimeError):
@@ -85,6 +89,13 @@ def _dedupe_strings(values: Iterable[str]) -> list[str]:
         seen.add(normalized)
         result.append(normalized)
     return result
+
+
+def _remote_json_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str]:
+    headers = dict(REMOTE_JSON_HEADERS)
+    if extra_headers:
+        headers.update(extra_headers)
+    return headers
 
 
 def _nested_lookup(payload: dict[str, Any], *keys: str) -> Any:
@@ -166,19 +177,13 @@ def _is_google_text_candidate(model: dict) -> bool:
     return "generateContent" in methods
 
 
-def _guess_capabilities(model_id: str, *, base_capabilities: Iterable[str] | None = None) -> list[str]:
-    capabilities = list(base_capabilities or ["text"])
-    model_lower = model_id.lower()
-
-    if any(marker in model_lower for marker in ("vision", "image", "4o", "gpt-5", "grok-4", "claude")):
+def _capabilities_from_input_modalities(input_modalities: Iterable[Any]) -> list[str]:
+    capabilities = ["text"]
+    modalities = {str(modality).strip().lower() for modality in input_modalities if str(modality).strip()}
+    if "image" in modalities:
         capabilities.append("vision")
-    if any(marker in model_lower for marker in ("reason", "thinking", "gpt-5", "o1", "o3", "o4", "opus")):
-        capabilities.append("reasoning")
-    if any(marker in model_lower for marker in ("code", "codex", "coder")):
-        capabilities.append("coding")
-    if "function" in model_lower or "gpt-" in model_lower or "grok" in model_lower:
-        capabilities.append("function_calling")
-
+    if "audio" in modalities:
+        capabilities.append("audio")
     return _dedupe_strings(capabilities)
 
 
@@ -316,7 +321,7 @@ class ModelSyncService:
         if not self.config.OPENROUTER_API_KEY:
             raise ModelSyncError("OpenRouter API key not configured (OPENROUTER_API_KEY).")
 
-        headers = {"Authorization": f"Bearer {self.config.OPENROUTER_API_KEY}"}
+        headers = _remote_json_headers({"Authorization": f"Bearer {self.config.OPENROUTER_API_KEY}"})
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 OPENROUTER_MODELS_URL,
@@ -336,19 +341,13 @@ class ModelSyncService:
             pricing = model.get("pricing", {}) or {}
             architecture = model.get("architecture", {}) or {}
             input_modalities = architecture.get("input_modalities", []) or []
-            capabilities = ["text"]
-            if "image" in input_modalities:
-                capabilities.append("vision")
-            if "audio" in input_modalities:
-                capabilities.append("audio")
-            if any(marker in model_id.lower() for marker in ("code", "coder", "instruct")):
-                capabilities.append("coding")
+            capabilities = _capabilities_from_input_modalities(input_modalities)
 
             context_length = _context_length_from_remote(model)
             top_provider = model.get("top_provider", {}) or {}
             output_tokens = _output_length_from_remote(
                 top_provider,
-                fallback=max(context_length // 4, 4096) if context_length else 4096,
+                fallback=max(context_length // 4, 8192) if context_length else 8192,
             )
 
             remote_models.append(
@@ -384,7 +383,7 @@ class ModelSyncService:
         if not self.config.XAI_API_KEY:
             raise ModelSyncError("xAI API key not configured (XAI_API_KEY).")
 
-        headers = {"Authorization": f"Bearer {self.config.XAI_API_KEY}"}
+        headers = _remote_json_headers({"Authorization": f"Bearer {self.config.XAI_API_KEY}"})
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 XAI_LANGUAGE_MODELS_URL,
@@ -411,9 +410,8 @@ class ModelSyncService:
                 output_tokens = _safe_int(local_template.get("output_tokens"), max(context_length // 4, 16384))
 
             input_modalities = model.get("input_modalities", []) or []
-            capabilities = _guess_capabilities(model_id, base_capabilities=input_modalities or local_template.get("capabilities", ["text"]))
-            if "text" not in capabilities:
-                capabilities.insert(0, "text")
+            capabilities = _capabilities_from_input_modalities(input_modalities)
+            needs_review = not bool(input_modalities)
 
             remote_models.append(
                 {
@@ -433,7 +431,7 @@ class ModelSyncService:
                     },
                     "capabilities": capabilities,
                     "supported": True,
-                    "needs_review": False,
+                    "needs_review": needs_review,
                     "sync_mode": "full",
                     "source": f"https://docs.x.ai/developers/models/{model_id}",
                     "remote_created_at": _iso_from_unix_timestamp(model.get("created")),
@@ -449,7 +447,7 @@ class ModelSyncService:
         if not self.config.OPENAI_API_KEY:
             raise ModelSyncError("OpenAI API key not configured (OPENAI_KEY / OPENAI_API_KEY).")
 
-        headers = {"Authorization": f"Bearer {self.config.OPENAI_API_KEY}"}
+        headers = _remote_json_headers({"Authorization": f"Bearer {self.config.OPENAI_API_KEY}"})
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 OPENAI_MODEL_LIST_URL,
@@ -483,10 +481,12 @@ class ModelSyncService:
         if not self.config.ANTHROPIC_API_KEY:
             raise ModelSyncError("Anthropic API key not configured (ANTHROPIC_API_KEY).")
 
-        headers = {
-            "x-api-key": self.config.ANTHROPIC_API_KEY,
-            "anthropic-version": ANTHROPIC_API_VERSION,
-        }
+        headers = _remote_json_headers(
+            {
+                "x-api-key": self.config.ANTHROPIC_API_KEY,
+                "anthropic-version": ANTHROPIC_API_VERSION,
+            }
+        )
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 ANTHROPIC_MODEL_LIST_URL,
@@ -523,7 +523,7 @@ class ModelSyncService:
             raise ModelSyncError("GOOGLE_API_KEY / GEMINI_KEY not configured.")
 
         current_specs = self._get_provider_specs(self.load_specs(), "google")
-        headers = {"x-goog-api-key": api_key}
+        headers = _remote_json_headers({"x-goog-api-key": api_key})
         all_models: list[dict[str, Any]] = []
 
         async with aiohttp.ClientSession() as session:
@@ -574,7 +574,7 @@ class ModelSyncService:
                     break
 
         self.logger.info("Fetched %d text-generation models from Google API", len(all_models))
-        return self._merge_remote_with_local("google", all_models)
+        return all_models
 
     def _build_discovery_entry(
         self,
@@ -589,9 +589,7 @@ class ModelSyncService:
         existing = current_provider_specs.get(model_id)
         template = existing or self._find_best_local_template(provider, model_id, current_provider_specs)
         existing_sync_meta = dict(existing.get("sync_metadata", {}) or {}) if existing else {}
-        capabilities = list(template.get("capabilities", [])) if template else []
-        if not capabilities:
-            capabilities = _guess_capabilities(model_id)
+        capabilities = list(existing.get("capabilities", [])) if existing else ["text"]
         suggested = not bool(existing)
         needs_review = bool(existing_sync_meta.get("needs_review")) if existing else True
 
@@ -1005,7 +1003,7 @@ class ModelSyncService:
         if context_window <= 0:
             context_window = input_tokens
         if output_tokens <= 0:
-            output_tokens = max(context_window // 4, 4096) if context_window else 4096
+            output_tokens = max(context_window // 4, 8192) if context_window else 8192
 
         pricing = model.get("pricing") or {}
         capabilities = model.get("capabilities") or current_spec.get("capabilities") or ["text"]
@@ -1055,36 +1053,54 @@ class ModelSyncService:
         return new_spec
 
     def _collect_model_identifiers(self, specs: dict[str, Any]) -> set[str]:
-        identifiers: set[str] = set()
+        return set(self._collect_model_identifier_states(specs))
+
+    def _collect_model_identifier_states(self, specs: dict[str, Any]) -> dict[str, bool]:
+        identifiers: dict[str, bool] = {}
         for provider_models in (specs.get("model_specifications", {}) or {}).values():
             for key, model in (provider_models or {}).items():
-                identifiers.add(str(key))
+                enabled = model.get("enabled", True) is not False
+                key_text = str(key)
+                identifiers[key_text] = identifiers.get(key_text, False) or enabled
                 model_id = model.get("model_id")
                 if model_id:
-                    identifiers.add(str(model_id))
+                    model_id_text = str(model_id)
+                    identifiers[model_id_text] = identifiers.get(model_id_text, False) or enabled
         return identifiers
 
     def _validate_model_references(self, specs: dict[str, Any]) -> None:
-        identifiers = self._collect_model_identifiers(specs)
+        identifier_states = self._collect_model_identifier_states(specs)
         missing_references: list[str] = []
+        disabled_references: list[str] = []
+
+        def _validate_reference(path: str, model_name: str) -> None:
+            if model_name not in identifier_states:
+                missing_references.append(f"{path} -> {model_name}")
+            elif not identifier_states[model_name]:
+                disabled_references.append(f"{path} -> {model_name}")
 
         defaults = specs.get("default_models", {}) or {}
         for key, value in defaults.items():
-            if isinstance(value, str) and value and value not in identifiers:
-                missing_references.append(f"default_models.{key} -> {value}")
+            if isinstance(value, str) and value:
+                _validate_reference(f"default_models.{key}", value)
             elif isinstance(value, list):
                 for index, model_name in enumerate(value):
-                    if model_name and model_name not in identifiers:
-                        missing_references.append(f"default_models.{key}[{index}] -> {model_name}")
+                    if model_name:
+                        _validate_reference(f"default_models.{key}[{index}]", model_name)
 
         for alias, target in (specs.get("aliases", {}) or {}).items():
-            if target and target not in identifiers:
-                missing_references.append(f"aliases.{alias} -> {target}")
+            if target:
+                _validate_reference(f"aliases.{alias}", target)
 
-        if missing_references:
+        if missing_references or disabled_references:
+            details = []
+            if missing_references:
+                details.append("missing: " + "; ".join(missing_references))
+            if disabled_references:
+                details.append("disabled: " + "; ".join(disabled_references))
             raise ModelSyncError(
                 "Sync blocked because it would leave invalid model references: "
-                + "; ".join(missing_references)
+                + " | ".join(details)
             )
 
     def _create_backup(self) -> Path:

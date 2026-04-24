@@ -9,7 +9,6 @@ Functions tested:
 - _build_validation_payload(): Build validation request payload
 - _extract_json_blob(): Extract JSON from raw output
 - _normalise_issues(): Convert raw issues to PreflightIssue
-- _analyze_word_count_conflicts(): Detect word count conflicts
 - run_preflight_validation(): Main validation function
 """
 
@@ -25,10 +24,10 @@ from preflight_validator import (
     _extract_json_blob,
     _normalise_issues,
     _parse_validator_response,
-    _analyze_word_count_conflicts,
+    resolve_preflight_model,
     run_preflight_validation,
 )
-from models import ContentRequest, QALayer, PreflightIssue, PreflightResult
+from models import ContentRequest, QALayer, PreflightIssue
 
 
 # ============================================================================
@@ -398,96 +397,6 @@ class TestNormaliseIssues:
 
 
 # ============================================================================
-# Tests: _analyze_word_count_conflicts (5 tests)
-# ============================================================================
-
-class TestAnalyzeWordCountConflicts:
-    """Tests for _analyze_word_count_conflicts() function."""
-
-    def test_no_word_limits_returns_no_conflicts(self, minimal_request):
-        """Given: No word limits, Then: No conflicts detected."""
-        result = _analyze_word_count_conflicts(minimal_request)
-
-        assert result["enable_algorithmic_word_count"] is False
-        assert result["duplicate_layers_to_remove"] == []
-        assert "No word count enforcement" in result["analysis_reason"]
-
-    def test_word_limits_without_enforcement_no_conflicts(self):
-        """Given: Word limits but no enforcement, Then: No conflicts."""
-        request = ContentRequest(
-            prompt="Test prompt with enough characters for validation",
-            content_type="article",
-            generator_model="gpt-4o",
-            min_words=500,
-            max_words=1000,
-            word_count_enforcement={"enabled": False},
-            qa_layers=[],
-            qa_models=[],
-        )
-        result = _analyze_word_count_conflicts(request)
-
-        assert result["enable_algorithmic_word_count"] is False
-
-    def test_detects_word_count_related_layers(self, request_with_word_count):
-        """Given: Word count layer with enforcement, Then: Conflict detected."""
-        result = _analyze_word_count_conflicts(request_with_word_count)
-
-        assert result["enable_algorithmic_word_count"] is True
-        assert "Word Count Check" in result["duplicate_layers_to_remove"]
-        assert len(result["conflicting_layers_found"]) == 1
-
-    def test_detects_length_related_keywords(self):
-        """Given: Layer with length-related criteria, Then: Detected."""
-        request = ContentRequest(
-            prompt="Test prompt with enough characters for validation",
-            content_type="article",
-            generator_model="gpt-4o",
-            min_words=500,
-            max_words=1000,
-            word_count_enforcement={"enabled": True, "flexibility_percent": 10},
-            qa_layers=[
-                QALayer(
-                    name="Brevity Check",
-                    description="Ensure content is not too long",
-                    criteria="Keep the length under control",
-                    min_score=7.0,
-                    order=1,
-                )
-            ],
-            qa_models=["gpt-4o"],
-        )
-        result = _analyze_word_count_conflicts(request)
-
-        assert result["enable_algorithmic_word_count"] is True
-        assert "Brevity Check" in result["duplicate_layers_to_remove"]
-
-    def test_non_word_count_layers_not_removed(self):
-        """Given: Non-word-count layers, Then: Not flagged for removal."""
-        request = ContentRequest(
-            prompt="Test prompt with enough characters for validation",
-            content_type="article",
-            generator_model="gpt-4o",
-            min_words=500,
-            max_words=1000,
-            word_count_enforcement={"enabled": True, "flexibility_percent": 10},
-            qa_layers=[
-                QALayer(
-                    name="Accuracy",
-                    description="Check factual accuracy",
-                    criteria="All facts must be correct",
-                    min_score=8.0,
-                    order=1,
-                )
-            ],
-            qa_models=["gpt-4o"],
-        )
-        result = _analyze_word_count_conflicts(request)
-
-        assert result["enable_algorithmic_word_count"] is False
-        assert result["duplicate_layers_to_remove"] == []
-
-
-# ============================================================================
 # Tests: _parse_validator_response
 # ============================================================================
 
@@ -506,6 +415,12 @@ class TestParseValidatorResponse:
         result = _parse_validator_response("not valid json")
         assert result is None
 
+    @pytest.mark.parametrize("raw_output", ['[{}]', '"ok"', '123', 'true'])
+    def test_valid_non_object_json_returns_none(self, raw_output):
+        """Given: Valid JSON that is not an object, Then: Returns None."""
+        result = _parse_validator_response(raw_output)
+        assert result is None
+
     def test_empty_returns_none(self):
         """Given: Empty string, Then: Returns None."""
         result = _parse_validator_response("")
@@ -516,12 +431,82 @@ class TestParseValidatorResponse:
 # Tests: run_preflight_validation (3 tests)
 # ============================================================================
 
+class TestResolvePreflightModel:
+    """Tests for resolve_preflight_model() model selection."""
+
+    def test_prefers_configured_preflight_model(self, minimal_request):
+        """Given: Explicit preflight model, Then: Uses it first."""
+        minimal_request.arbiter_model = "arbiter-model"
+
+        with patch("preflight_validator.config") as mock_config:
+            mock_config.PREFLIGHT_VALIDATION_MODEL = "preflight-model"
+
+            assert resolve_preflight_model(minimal_request) == "preflight-model"
+
+    def test_falls_back_to_arbiter_then_gran_sabio(self, minimal_request):
+        """Given: No preflight model, Then: Uses Arbiter before GranSabio."""
+        minimal_request.arbiter_model = "arbiter-model"
+        minimal_request.gran_sabio_model = "gran-sabio-model"
+
+        with patch("preflight_validator.config") as mock_config:
+            mock_config.PREFLIGHT_VALIDATION_MODEL = ""
+
+            assert resolve_preflight_model(minimal_request) == "arbiter-model"
+
+        minimal_request.arbiter_model = ""
+
+        with patch("preflight_validator.config") as mock_config:
+            mock_config.PREFLIGHT_VALIDATION_MODEL = ""
+
+            assert resolve_preflight_model(minimal_request) == "gran-sabio-model"
+
+
 class TestRunPreflightValidation:
     """Tests for run_preflight_validation() async function."""
 
     @pytest.mark.asyncio
-    async def test_no_model_configured_returns_proceed(self, minimal_request, mock_ai_service):
-        """Given: No preflight model configured, Then: Returns proceed."""
+    async def test_no_preflight_model_uses_arbiter_model(self, minimal_request, mock_ai_service):
+        """Given: No preflight model configured, Then: Uses Arbiter model."""
+        minimal_request.arbiter_model = "arbiter-preflight-model"
+
+        with patch("preflight_validator.config") as mock_config:
+            mock_config.PREFLIGHT_VALIDATION_MODEL = None
+            mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
+
+            result = await run_preflight_validation(
+                ai_service=mock_ai_service,
+                request=minimal_request,
+            )
+
+            assert result.decision == "proceed"
+            mock_ai_service.generate_content.assert_awaited_once()
+            assert mock_ai_service.generate_content.await_args.kwargs["model"] == "arbiter-preflight-model"
+
+    @pytest.mark.asyncio
+    async def test_no_preflight_or_arbiter_model_uses_gran_sabio(self, minimal_request, mock_ai_service):
+        """Given: No preflight/Arbiter model, Then: Uses GranSabio model."""
+        minimal_request.arbiter_model = ""
+        minimal_request.gran_sabio_model = "gran-sabio-preflight-model"
+
+        with patch("preflight_validator.config") as mock_config:
+            mock_config.PREFLIGHT_VALIDATION_MODEL = ""
+            mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
+
+            result = await run_preflight_validation(
+                ai_service=mock_ai_service,
+                request=minimal_request,
+            )
+
+            assert result.decision == "proceed"
+            mock_ai_service.generate_content.assert_awaited_once()
+            assert mock_ai_service.generate_content.await_args.kwargs["model"] == "gran-sabio-preflight-model"
+
+    @pytest.mark.asyncio
+    async def test_no_available_preflight_model_rejects_without_llm_call(self, minimal_request, mock_ai_service):
+        """Given: No available model, Then: Rejects and does not call AI."""
+        minimal_request.arbiter_model = ""
+        minimal_request.gran_sabio_model = ""
+
         with patch("preflight_validator.config") as mock_config:
             mock_config.PREFLIGHT_VALIDATION_MODEL = None
 
@@ -530,8 +515,9 @@ class TestRunPreflightValidation:
                 request=minimal_request,
             )
 
-            assert result.decision == "proceed"
-            assert "disabled" in result.user_feedback.lower() or "skipped" in result.summary.lower()
+            assert result.decision == "reject"
+            assert result.issues[0].code == "preflight_model_unavailable"
+            mock_ai_service.generate_content.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_successful_validation_returns_result(self, minimal_request, mock_ai_service):
@@ -554,8 +540,8 @@ class TestRunPreflightValidation:
             assert result.confidence == 0.95
 
     @pytest.mark.asyncio
-    async def test_ai_error_returns_proceed_fallback(self, minimal_request, mock_ai_service):
-        """Given: AI service error, Then: Returns proceed as fallback."""
+    async def test_ai_error_returns_reject(self, minimal_request, mock_ai_service):
+        """Given: AI service error, Then: Rejects fail-closed."""
         mock_ai_service.generate_content = AsyncMock(
             side_effect=Exception("API Error")
         )
@@ -569,12 +555,13 @@ class TestRunPreflightValidation:
                 request=minimal_request,
             )
 
-            assert result.decision == "proceed"
-            assert "unavailable" in result.user_feedback.lower()
+            assert result.decision == "reject"
+            assert result.issues[0].code == "preflight_llm_call_failed"
+            assert "gpt-4o" in result.user_feedback
 
     @pytest.mark.asyncio
-    async def test_unparseable_response_returns_proceed(self, minimal_request, mock_ai_service):
-        """Given: Unparseable AI response, Then: Returns proceed as fallback."""
+    async def test_unparseable_response_returns_reject(self, minimal_request, mock_ai_service):
+        """Given: Unparseable AI response, Then: Rejects fail-closed."""
         mock_ai_service.generate_content = AsyncMock(
             return_value="This is not valid JSON at all"
         )
@@ -588,8 +575,47 @@ class TestRunPreflightValidation:
                 request=minimal_request,
             )
 
-            assert result.decision == "proceed"
-            assert "unexpected" in result.user_feedback.lower()
+            assert result.decision == "reject"
+            assert result.issues[0].code == "preflight_invalid_response"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("raw_output", ['[{}]', '"ok"', '123', 'true'])
+    async def test_valid_non_object_json_response_returns_reject(
+        self, minimal_request, mock_ai_service, raw_output
+    ):
+        """Given: Valid non-object JSON response, Then: Rejects fail-closed."""
+        mock_ai_service.generate_content = AsyncMock(return_value=raw_output)
+
+        with patch("preflight_validator.config") as mock_config:
+            mock_config.PREFLIGHT_VALIDATION_MODEL = "gpt-4o"
+            mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
+
+            result = await run_preflight_validation(
+                ai_service=mock_ai_service,
+                request=minimal_request,
+            )
+
+            assert result.decision == "reject"
+            assert result.issues[0].code == "preflight_invalid_response"
+
+    @pytest.mark.asyncio
+    async def test_invalid_decision_returns_reject(self, minimal_request, mock_ai_service):
+        """Given: JSON with invalid decision, Then: Rejects fail-closed."""
+        mock_ai_service.generate_content = AsyncMock(
+            return_value='{"decision": "maybe", "summary": "Unsure"}'
+        )
+
+        with patch("preflight_validator.config") as mock_config:
+            mock_config.PREFLIGHT_VALIDATION_MODEL = "gpt-4o"
+            mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
+
+            result = await run_preflight_validation(
+                ai_service=mock_ai_service,
+                request=minimal_request,
+            )
+
+            assert result.decision == "reject"
+            assert result.issues[0].code == "preflight_invalid_decision"
 
     @pytest.mark.asyncio
     async def test_reject_decision_parsed_correctly(self, minimal_request, mock_ai_service):
@@ -613,10 +639,12 @@ class TestRunPreflightValidation:
             assert result.issues[0].code == "contradiction"
 
     @pytest.mark.asyncio
-    async def test_word_count_analysis_parsed(self, minimal_request, mock_ai_service):
-        """Given: AI returns word count analysis, Then: Parsed correctly."""
+    async def test_word_count_without_llm_analysis_does_not_use_heuristic(
+        self, request_with_word_count, mock_ai_service
+    ):
+        """Given: LLM omits word count analysis, Then: No heuristic fallback runs."""
         mock_ai_service.generate_content = AsyncMock(
-            return_value='{"decision": "proceed", "summary": "OK", "user_feedback": "Approved", "word_count_analysis": {"conflicting_layers": ["Word Count"], "recommended_removals": ["Word Count"], "analysis_reason": "Redundant layer"}}'
+            return_value='{"decision": "proceed", "summary": "OK", "user_feedback": "Approved"}'
         )
 
         with patch("preflight_validator.config") as mock_config:
@@ -625,12 +653,36 @@ class TestRunPreflightValidation:
 
             result = await run_preflight_validation(
                 ai_service=mock_ai_service,
-                request=minimal_request,
+                request=request_with_word_count,
+            )
+
+            assert result.word_count_analysis is None
+            assert result.enable_algorithmic_word_count is False
+            assert result.duplicate_word_count_layers_to_remove == []
+            assert [layer.name for layer in request_with_word_count.qa_layers] == ["Word Count Check"]
+
+    @pytest.mark.asyncio
+    async def test_word_count_analysis_parsed(self, request_with_word_count, mock_ai_service):
+        """Given: AI returns word count analysis, Then: Parsed and applied."""
+        mock_ai_service.generate_content = AsyncMock(
+            return_value='{"decision": "proceed", "summary": "OK", "user_feedback": "Approved", "word_count_analysis": {"conflicting_layers": ["Word Count Check"], "recommended_removals": ["Word Count Check"], "analysis_reason": "Redundant layer"}}'
+        )
+
+        with patch("preflight_validator.config") as mock_config:
+            mock_config.PREFLIGHT_VALIDATION_MODEL = "gpt-4o"
+            mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
+
+            result = await run_preflight_validation(
+                ai_service=mock_ai_service,
+                request=request_with_word_count,
             )
 
             assert result.word_count_analysis is not None
-            assert result.word_count_analysis.conflicting_layers == ["Word Count"]
-            assert result.word_count_analysis.recommended_removals == ["Word Count"]
+            assert result.word_count_analysis.conflicting_layers == ["Word Count Check"]
+            assert result.word_count_analysis.recommended_removals == ["Word Count Check"]
+            assert result.enable_algorithmic_word_count is True
+            assert result.duplicate_word_count_layers_to_remove == ["Word Count Check"]
+            assert request_with_word_count.qa_layers == []
 
 
 # ============================================================================

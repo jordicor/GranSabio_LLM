@@ -1,7 +1,1 @@
-{
-  "approved": false,
-  "reason": "GranSabio-Dumb CONFIRMA que el deal-breaker es valido. El contenido tiene problemas reales que requieren iteracion.",
-  "modifications_made": false,
-  "final_content": null,
-  "final_score": 4.0
-}
+{"decision": "REJECTED", "reason": "GranSabio-Dumb confirms the deal-breaker is valid. Content has real problems that require iteration.", "score": 4.0, "modifications_made": false, "final_content": null}

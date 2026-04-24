@@ -178,7 +178,13 @@ def _ensure_services():
         ai_service = get_ai_service()
         qa_engine = QAEngine(ai_service=ai_service)
         consensus_engine = ConsensusEngine(ai_service=ai_service)
-        gran_sabio = GranSabioEngine(ai_service=ai_service)
+        # GranSabioEngine is a process-wide singleton, so session context is
+        # not available at construction time. Pass ``tool_event_callback=None``
+        # here — the feature degrades gracefully (no live ``/stream/project``
+        # events for GranSabio tool-loop turns). Per-session wiring would
+        # require constructing a fresh engine per request, which is out of
+        # scope for this change.
+        gran_sabio = GranSabioEngine(ai_service=ai_service, tool_event_callback=None)
 
 # Active sessions storage
 active_sessions: Dict[str, Dict] = {}
@@ -655,6 +661,13 @@ async def unsubscribe_project_phase(project_id: str, phase: str, queue: asyncio.
             project_phase_streams.pop(project_id, None)
 
 
+# Maximum byte size for the ``data`` field carried by project/phase events.
+# Events exceeding this size are degraded to a preview to avoid blowing up
+# SSE subscribers or the queue. Keep in sync with the docstring of
+# ``publish_project_phase_chunk``.
+_PROJECT_PHASE_DATA_MAX_BYTES = 8192
+
+
 def _build_project_phase_event(
     *,
     event: str,
@@ -676,8 +689,18 @@ def _build_project_phase_event(
     qa_model: Optional[str] = None,
     # Smart-edit specific fields
     edit_data: Optional[Dict[str, Any]] = None,
+    # Free-form structured telemetry payload (e.g. tool-loop turn details).
+    data: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Create a JSON event string for project/phase streams."""
+    """Create a JSON event string for project/phase streams.
+
+    The ``data`` field carries free-form structured telemetry (e.g. tool-loop
+    turn events from QA / Arbiter / GranSabio). If the serialized payload
+    exceeds ``_PROJECT_PHASE_DATA_MAX_BYTES``, the field is replaced by a
+    degraded ``{"truncated": True, "preview_keys": [...], "size_bytes": N}``
+    summary and a warning is logged. The full payload is still available via
+    the debugger DB (when ``debug_event_callback`` is bound at the caller).
+    """
     obj: Dict[str, Any] = {
         "type": event,
         "phase": phase,
@@ -714,6 +737,46 @@ def _build_project_phase_event(
     # Smart-edit data
     if edit_data is not None:
         obj["edit_data"] = edit_data
+    # Free-form telemetry data (size-guarded).
+    if data is not None:
+        try:
+            serialized = json.dumps(data, ensure_ascii=True)
+            size_bytes = len(serialized)
+        except Exception:
+            # If the payload cannot be serialized at all, degrade to a neutral
+            # stub so telemetry never crashes the publisher.
+            logger.warning(
+                "publish_project_phase_chunk: data payload not JSON-serializable "
+                "for phase=%s event=%s; degrading to stub",
+                phase,
+                event,
+            )
+            obj["data"] = {
+                "truncated": True,
+                "preview_keys": [],
+                "size_bytes": 0,
+            }
+        else:
+            if size_bytes <= _PROJECT_PHASE_DATA_MAX_BYTES:
+                obj["data"] = data
+            else:
+                try:
+                    preview_keys = list(data.keys())[:10]
+                except AttributeError:
+                    preview_keys = []
+                logger.warning(
+                    "publish_project_phase_chunk: data payload size %d bytes "
+                    "exceeds %d limit for phase=%s event=%s; emitting preview",
+                    size_bytes,
+                    _PROJECT_PHASE_DATA_MAX_BYTES,
+                    phase,
+                    event,
+                )
+                obj["data"] = {
+                    "truncated": True,
+                    "preview_keys": preview_keys,
+                    "size_bytes": size_bytes,
+                }
     return json.dumps(obj, ensure_ascii=True)
 
 
@@ -740,12 +803,17 @@ async def publish_project_phase_chunk(
     qa_model: Optional[str] = None,
     # Smart-edit specific fields
     edit_data: Optional[Dict[str, Any]] = None,
+    # Free-form structured telemetry payload (size-guarded).
+    data: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Broadcast a live event to all subscribers of a project/phase stream.
 
     - If end_stream=True, a sentinel is sent after the event to close the stream.
     - If the queue is full, the event is dropped to avoid blocking producers.
+    - Events with ``data`` > 8KB are truncated to a summary preview; the full
+      payload is available via the debugger DB (when ``debug_event_callback``
+      is bound at the caller site).
     """
     if not project_id:
         return
@@ -783,6 +851,7 @@ async def publish_project_phase_chunk(
         qa_layer=qa_layer,
         qa_model=qa_model,
         edit_data=edit_data,
+        data=data,
     )
 
     for q in targets:
@@ -958,6 +1027,28 @@ def update_session_status(
     phase: Optional[str] = None,
 ) -> None:
     """Set session status (and optional phase) and trigger project status hook."""
+    final_status_values = {
+        GenerationStatus.COMPLETED.value,
+        GenerationStatus.REJECTED.value,
+        GenerationStatus.FAILED.value,
+        GenerationStatus.CANCELLED.value,
+    }
+    current_status = session.get("status")
+    if isinstance(current_status, GenerationStatus):
+        current_value = current_status.value
+    elif current_status is None:
+        current_value = None
+    else:
+        current_value = str(current_status)
+    next_value = status.value if isinstance(status, GenerationStatus) else str(status)
+    if current_value in final_status_values and next_value != current_value:
+        logger.debug(
+            "Ignoring status transition for terminal session %s: %s -> %s",
+            session_id,
+            current_value,
+            next_value,
+        )
+        return
     session["status"] = status
     if phase is not None:
         session["current_phase"] = phase
@@ -1023,6 +1114,24 @@ def update_consensus_result(
     queue_project_status_event(session, session_id)
 
 
+def cleanup_session_sidecars(session_id: str) -> None:
+    """Release per-session auxiliary state after the session is removed."""
+    try:
+        get_tracker().clear_session(session_id)
+    except Exception as exc:
+        logger.warning("Failed to clear deal-breaker tracker state for session %s: %s", session_id, exc)
+
+    try:
+        if qa_engine is not None:
+            clear_state = getattr(qa_engine, "clear_session_state", None)
+            if callable(clear_state):
+                clear_state(session_id)
+            else:
+                getattr(qa_engine, "_qa_failure_tracker", {}).pop(session_id, None)
+    except Exception as exc:
+        logger.warning("Failed to clear QA runtime state for session %s: %s", session_id, exc)
+
+
 async def perform_session_cleanup() -> None:
     """Remove expired sessions and trim verbose logs respecting configuration."""
     lock = active_sessions_lock
@@ -1065,11 +1174,13 @@ async def perform_session_cleanup() -> None:
         _cleanup_sessions(list(active_sessions.items()))
         for session_id in expired_sessions:
             active_sessions.pop(session_id, None)
+            cleanup_session_sidecars(session_id)
     else:
         async with lock:
             _cleanup_sessions(list(active_sessions.items()))
             for session_id in expired_sessions:
                 active_sessions.pop(session_id, None)
+                cleanup_session_sidecars(session_id)
 
     if expired_sessions:
         logger.info('Cleaned up %d expired session(s): %s', len(expired_sessions), ', '.join(expired_sessions))

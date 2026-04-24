@@ -67,15 +67,8 @@ class GranSabioGenerationRejected(GranSabioClientError):
         self.details = details or {}
 
 
-# Backward compatibility alias
-BioAIClientError = GranSabioClientError
-
 from .sync_client import GranSabioClient
 from .async_client import AsyncGranSabioClient
-
-# Backward compatibility aliases
-BioAIClient = GranSabioClient
-AsyncBioAIClient = AsyncGranSabioClient
 
 __all__ = [
     "GranSabioClient",
@@ -84,10 +77,6 @@ __all__ = [
     "TransientGranSabioError",
     "GranSabioGenerationCancelled",
     "GranSabioGenerationRejected",
-    # Backward compatibility
-    "BioAIClient",
-    "AsyncBioAIClient",
-    "BioAIClientError",
 ]
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"

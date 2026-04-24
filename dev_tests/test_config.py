@@ -805,7 +805,7 @@ class TestGetModelInfo:
                 cfg = Config()
                 info = cfg.get_model_info("minimal-model")
                 assert info["input_tokens"] == 100000  # default
-                assert info["output_tokens"] == 4000  # default
+                assert info["output_tokens"] == 8192  # default
                 assert info["capabilities"] == []  # default
 
     def test_validate_api_keys_method(self, minimal_model_specs, mock_env_vars):

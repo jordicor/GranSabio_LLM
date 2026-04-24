@@ -18,9 +18,21 @@ from deal_breaker_tracker import get_tracker
 from feedback_memory import get_feedback_manager
 from gran_sabio import GranSabioInvocationError, GranSabioProcessCancelled
 from gran_sabio_supervisor import GranSabioSupervisor
-from models import ContentRequest, QALayer, GenerationStatus, ImageRef, ImageData
-from deterministic_validation import has_active_generation_validators, validate_generation_candidate
-from preflight_validator import run_preflight_validation
+from models import (
+    ContentRequest,
+    QALayer,
+    GenerationStatus,
+    ImageRef,
+    ImageData,
+    is_json_output_requested,
+)
+from deterministic_validation import (
+    DraftValidationResult,
+    has_active_generation_validators,
+    validate_generation_candidate,
+)
+from tool_loop_models import OutputContract
+from preflight_validator import resolve_preflight_model
 from .prompt_templates import build_json_validation_error_prompt, build_deal_breaker_awareness_prompt
 from qa_engine import QAProcessCancelled, QAModelUnavailableError
 from qa_result_utils import (
@@ -29,7 +41,7 @@ from qa_result_utils import (
     is_technical_qa_failure,
     semantic_deal_breakers,
 )
-from ai_service import AccentGuardError, AIRequestError, StreamChunk
+from ai_service import AccentGuardError, AIRequestError, AIService, StreamChunk
 from llm_accent_prompts import ACCENT_SYSTEM_PROMPT_SNIPPET
 from model_aliasing import ModelAliasRegistry, PromptPart, get_evaluator_alias, to_prompt_safe_data
 from evidence_grounding import get_effective_order
@@ -50,7 +62,12 @@ from services.attachment_manager import (
     AttachmentValidationError,
     ResolvedAttachment,
 )
-from tools.ai_json_cleanroom import validate_ai_json, ValidationResult
+from tools.ai_json_cleanroom import (
+    ValidationResult,
+    make_loose_json_validate_options,
+    validate_ai_json,
+    validate_loose_json,
+)
 from usage_tracking import UsageTracker, inject_costs_into_json_payload, merge_costs_into_json_string
 from word_count_utils import build_word_count_instructions, count_words, prepare_qa_layers_with_word_count
 from json_field_utils import try_extract_json_from_content, prepare_content_for_qa, reconstruct_json
@@ -103,6 +120,61 @@ from .qa_decision_engine import (
     _check_minority_deal_breakers,
     _evaluate_layer_based_approval,
 )
+
+
+def _run_json_post_guard(
+    content: str,
+    *,
+    schema: Optional[Dict[str, Any]] = None,
+    expectations: Optional[List[Dict[str, Any]]] = None,
+) -> ValidationResult:
+    """Validate generated JSON using the same loose/structured split as tools."""
+
+    if schema is not None:
+        return validate_ai_json(content, schema=schema, expectations=expectations)
+    return validate_loose_json(content, expectations=expectations)
+
+
+def _json_guard_data_to_content(result: ValidationResult) -> Optional[str]:
+    """Serialize the parsed JSON payload after a successful guard pass."""
+
+    if result.data is None:
+        return None
+    return json.dumps(result.data, ensure_ascii=False)
+
+
+def _generation_was_truncated(session: Dict[str, Any]) -> bool:
+    """Return True when provider metadata says the output hit token limit."""
+
+    finish_metadata = session.get("generation_finish_metadata") or {}
+    if isinstance(finish_metadata, dict) and finish_metadata.get("output_truncated"):
+        return True
+    tool_metadata = session.get("generation_tool_metadata")
+    if isinstance(tool_metadata, dict) and tool_metadata.get("output_truncated"):
+        return True
+    if hasattr(tool_metadata, "output_truncated"):
+        return bool(getattr(tool_metadata, "output_truncated"))
+    return False
+
+
+def _build_truncation_failure_reason(session: Dict[str, Any], request: ContentRequest) -> str:
+    """Build a user/actionable reason for output-token truncation."""
+
+    finish_metadata = session.get("generation_finish_metadata") or {}
+    stop_reason = None
+    if isinstance(finish_metadata, dict):
+        stop_reason = finish_metadata.get("finish_reason") or finish_metadata.get("provider_stop_reason")
+    max_tokens = getattr(request, "max_tokens", None)
+    details = []
+    if stop_reason:
+        details.append(f"stop_reason={stop_reason}")
+    if max_tokens:
+        details.append(f"max_tokens={max_tokens}")
+    suffix = f" ({', '.join(details)})" if details else ""
+    return (
+        "Generation output was truncated because the provider exhausted the "
+        f"output token budget{suffix}. Regenerate a shorter response or increase max_tokens."
+    )
 
 
 class _ServiceProxy:
@@ -419,7 +491,7 @@ def _attach_usage_metadata(session: Dict[str, Any], final_result: Dict[str, Any]
     prompt_safe_summary = to_prompt_safe_data(summary, alias_registry)
     final_result["costs"] = prompt_safe_summary
     content_value = final_result.get("content")
-    json_output_requested = getattr(request, "json_output", False) or getattr(request, "content_type", None) == "json"
+    json_output_requested = is_json_output_requested(request)
 
     if json_output_requested:
         if isinstance(content_value, dict):
@@ -434,7 +506,7 @@ def _attach_usage_metadata(session: Dict[str, Any], final_result: Dict[str, Any]
 
 def _attach_json_guard_metadata(session: Dict[str, Any], final_result: Dict[str, Any], request: ContentRequest) -> None:
     """Attach JSON guard metadata to the final result when applicable."""
-    if getattr(request, "content_type", None) != "json":
+    if not is_json_output_requested(request):
         _attach_usage_metadata(session, final_result, request)
         return
 
@@ -474,6 +546,37 @@ def _set_last_generated_content_metrics(session: Dict[str, Any], content: str) -
     session["last_generated_content"] = content
     session["last_generated_content_length"] = len(content)
     session["last_generated_content_word_count"] = count_words(content) if content else 0
+
+
+def _make_gran_sabio_tool_event_callback(session_id: str, session: Dict[str, Any]):
+    """Build a pre-bound tool-loop event callback for a GranSabio invocation.
+
+    Forwards live tool-loop events to ``/stream/project`` under the
+    ``gran_sabio`` phase. Returns ``None`` if the session lacks a
+    ``project_id`` (tool-loop telemetry is optional — degrades gracefully).
+    """
+
+    project_id = session.get("project_id")
+    if not project_id:
+        return None
+    request_name = session.get("request_name")
+
+    async def _gran_sabio_tool_event_callback(event_type: str, payload: Dict[str, Any]) -> None:
+        try:
+            await publish_project_phase_chunk(
+                project_id,
+                "gran_sabio",
+                None,
+                session_id=session_id,
+                request_name=request_name,
+                event=str(event_type) if event_type else "tool_event",
+                data=payload,
+            )
+        except Exception:
+            # Telemetry failures must never break GranSabio execution.
+            return
+
+    return _gran_sabio_tool_event_callback
 
 
 def _build_smart_edit_marker_config(content: str, request: ContentRequest) -> Dict[str, Any]:
@@ -558,12 +661,20 @@ def _record_accent_fail_open(session: Dict[str, Any], *, path: str, reason: str)
     session["accent_fail_open_paths"].append(path)
 
 
-def _merge_accent_fail_open_into_session(session: Dict[str, Any], tool_metadata: Optional[Dict[str, Any]]) -> None:
-    """Merge envelope deltas from tool_metadata into session accumulators (§5.12)."""
+def _merge_accent_fail_open_into_session(session: Dict[str, Any], tool_metadata: Any) -> None:
+    """Merge envelope deltas from tool_metadata into session accumulators (§5.12).
+
+    Accepts either a legacy dict or a ``ToolLoopEnvelope`` (Pydantic) — the
+    fields live in the envelope's open extras after the Phase 1 refactor.
+    """
     if not tool_metadata:
         return
-    delta_count = int(tool_metadata.get("accent_fail_open_delta_count", 0) or 0)
-    delta_paths = list(tool_metadata.get("accent_fail_open_delta_paths", []) or [])
+    if hasattr(tool_metadata, "get"):
+        delta_count = int(tool_metadata.get("accent_fail_open_delta_count", 0) or 0)
+        delta_paths = list(tool_metadata.get("accent_fail_open_delta_paths", []) or [])
+    else:
+        delta_count = int(getattr(tool_metadata, "accent_fail_open_delta_count", 0) or 0)
+        delta_paths = list(getattr(tool_metadata, "accent_fail_open_delta_paths", []) or [])
     if delta_count == 0 and not delta_paths:
         return
     session.setdefault("accent_fail_open_count", 0)
@@ -600,11 +711,9 @@ def _should_use_generation_tools(request: ContentRequest) -> bool:
     supported_providers = {"openai", "claude", "anthropic", "gemini", "google", "xai", "openrouter"}
     supported = provider_key in supported_providers
 
-    if provider_key == "openai" and any(marker in model_id for marker in ["o3-pro", "gpt-5-pro"]):
+    if provider_key == "openai" and AIService._is_openai_responses_api_model(model_id):
         supported = False
 
-    if tools_mode == "always":
-        return True
     return supported
 
 def _get_final_content(session: Dict[str, Any], raw_content: str, request: ContentRequest, is_gran_sabio: bool = False) -> Any:
@@ -624,7 +733,7 @@ def _get_final_content(session: Dict[str, Any], raw_content: str, request: Conte
         Either the parsed JSON object or the raw content string
     """
     # Check if we should use parsed JSON
-    json_output_requested = getattr(request, "json_output", False) or getattr(request, "content_type", None) == "json"
+    json_output_requested = is_json_output_requested(request)
 
     if json_output_requested:
         # Check for Gran Sabio parsed content if applicable
@@ -734,6 +843,7 @@ async def _generate_full_content(
         Generated content as string
     """
     content_chunks = []
+    session.pop("generation_finish_metadata", None)
 
     # Detect thinking/reasoning models and prepare thinking status tracking
     is_thinking_model = False
@@ -788,14 +898,29 @@ async def _generate_full_content(
             session_id,
             f"[Tools] Generator validation tools enabled ({tool_rounds} internal rounds max)"
         )
+        json_schema = getattr(request, "json_schema", None)
+        json_expectations = getattr(request, "json_expectations", None)
+        json_options_for_loop = (
+            make_loose_json_validate_options()
+            if json_output_requested and json_schema is None
+            else None
+        )
+        output_contract = OutputContract.FREE_TEXT
+        response_format = None
+        if json_output_requested:
+            if json_schema is None:
+                output_contract = OutputContract.JSON_LOOSE
+            else:
+                output_contract = OutputContract.JSON_STRUCTURED
+                response_format = json_schema
 
-        def _validate_draft_tool(candidate: str) -> Dict[str, Any]:
-            report = validate_generation_candidate(
+        def _validate_draft_tool(candidate: str) -> DraftValidationResult:
+            return validate_generation_candidate(
                 candidate,
                 request,
                 include_json_validation=json_output_requested or bool(getattr(request, "target_field", None)),
+                json_options=json_options_for_loop,
             )
-            return report.to_tool_payload(request=request)
 
         # Accent guard gating (Cambio 1 v5, §5.8)
         accent_mode = request.llm_accent_guard.mode
@@ -809,7 +934,7 @@ async def _generate_full_content(
         enable_validate_draft = has_active_generation_validators(request)
 
         try:
-            content, tool_metadata = await ai_service.generate_content_with_validation_tools(
+            content, tool_metadata = await ai_service.call_ai_with_validation_tools(
                 prompt=final_prompt,
                 model=request.generator_model,
                 validation_callback=_validate_draft_tool,
@@ -820,8 +945,9 @@ async def _generate_full_content(
                 reasoning_effort=reasoning_effort_value,
                 thinking_budget_tokens=thinking_budget_value,
                 content_type=request.content_type,
-                json_output=json_output_requested,
-                json_schema=getattr(request, 'json_schema', None),
+                output_contract=output_contract,
+                response_format=response_format,
+                json_expectations=json_expectations,
                 usage_callback=usage_tracker.create_callback(
                     phase="generation",
                     role="generator",
@@ -830,7 +956,7 @@ async def _generate_full_content(
                 ) if usage_tracker else None,
                 phase_logger=phase_logger,
                 images=images,
-                max_rounds=tool_rounds,
+                max_tool_rounds=tool_rounds,
                 accent_guard=accent_guard_for_call,
                 extra_system_instructions=accent_snippet,
                 enable_validate_draft=enable_validate_draft,
@@ -901,27 +1027,53 @@ async def _generate_full_content(
         except Exception:
             raise
         else:
-            _merge_accent_fail_open_into_session(session, tool_metadata)
-            session["generation_tool_metadata"] = tool_metadata
-            await _debug_record_event(
-                session_id,
-                "generator_tool_loop_completed",
-                {
-                    "iteration": iteration + 1,
-                    "model": request.generator_model,
-                    "metadata": tool_metadata,
-                    "content": content,
-                },
-            )
+            # Proposal §3.7: ``call_ai_with_validation_tools`` may return an
+            # envelope with ``tools_skipped_reason`` set when it consciously
+            # bypassed the tool loop (Responses API / no tool support) or hit
+            # a fail-fast gate (context_too_large). Inspect before treating
+            # any returned tuple as a successful generation.
+            skipped_reason = getattr(tool_metadata, "tools_skipped_reason", None)
+            if skipped_reason == "context_too_large":
+                # Fail-fast: no automatic recovery. The prompt does not fit
+                # the selected model's context window.
+                raise ValueError(
+                    f"Generator prompt exceeds model context window "
+                    f"(model={request.generator_model})"
+                )
+            if skipped_reason in {"responses_api", "no_tool_support"}:
+                # Centralised provider fallback: let execution continue into
+                # the standard streaming generation path below.
+                await add_verbose_log(
+                    session_id,
+                    f"[Tools] Tool loop skipped ({skipped_reason}); falling back to standard generation."
+                )
+            else:
+                if not content:
+                    raise ValueError(
+                        f"Tool loop returned empty content with no tools_skipped_reason "
+                        f"(model={request.generator_model})"
+                    )
+                _merge_accent_fail_open_into_session(session, tool_metadata)
+                session["generation_tool_metadata"] = tool_metadata
+                await _debug_record_event(
+                    session_id,
+                    "generator_tool_loop_completed",
+                    {
+                        "iteration": iteration + 1,
+                        "model": request.generator_model,
+                        "metadata": tool_metadata,
+                        "content": content,
+                    },
+                )
 
-            word_count = len(content.split())
-            await add_verbose_log(
-                session_id,
-                f"[Tools] Content generated after {tool_metadata.get('turns', 0)} internal validation round(s): {word_count} words"
-            )
+                word_count = len(content.split())
+                await add_verbose_log(
+                    session_id,
+                    f"[Tools] Content generated after {getattr(tool_metadata, 'turns', 0)} internal validation round(s): {word_count} words"
+                )
 
-            session["smart_edit_consecutive"] = 0
-            return content
+                session["smart_edit_consecutive"] = 0
+                return content
 
     # Streaming retry configuration
     max_stream_attempts = config.MAX_RETRIES if config.RETRY_STREAMING_AFTER_PARTIAL else 1
@@ -932,6 +1084,7 @@ async def _generate_full_content(
         content_chunks = []
         session["generation_content"] = ""
         session["partial_content"] = ""
+        session.pop("generation_finish_metadata", None)
         received_first_chunk = False
         generation_start_time = time.time()
         last_thinking_update = generation_start_time
@@ -985,10 +1138,22 @@ async def _generate_full_content(
                 if isinstance(chunk, StreamChunk):
                     chunk_text = chunk.text
                     is_thinking = chunk.is_thinking
+                    chunk_metadata = getattr(chunk, "metadata", {}) or {}
                 else:
                     # Other providers return plain strings
                     chunk_text = chunk
                     is_thinking = False
+                    chunk_metadata = {}
+
+                if chunk_metadata:
+                    session["generation_finish_metadata"] = dict(chunk_metadata)
+                    if chunk_metadata.get("output_truncated"):
+                        await add_verbose_log(
+                            session_id,
+                            "[Tokens] Provider stopped because the output token budget was exhausted."
+                        )
+                    if not chunk_text:
+                        continue
 
                 # Mark that we've received the first content chunk (AI finished thinking)
                 # Note: thinking chunks don't count as "first chunk" - we wait for actual content
@@ -1111,6 +1276,7 @@ async def _generate_full_content(
             "content": content,
             "elapsed_seconds": int(time.time() - generation_start_time),
             "chunks": len(content_chunks),
+            "finish_metadata": session.get("generation_finish_metadata"),
         },
     )
 
@@ -1695,12 +1861,6 @@ def _has_valid_layer_scores(layer_results: Dict[str, Any]) -> bool:
     )
 
 
-_TECHNICAL_QA_FAILURE_REASONS = frozenset({
-    "technical error during evaluation",
-    "timeout during evaluation",
-})
-
-
 def _is_technical_qa_failure(evaluation: Any) -> bool:
     """Return True for local/provider failures represented as QA placeholders."""
     return is_technical_qa_failure(evaluation)
@@ -1790,10 +1950,12 @@ def _extract_proposed_edits_from_layer_results(
     max_edits: int = 12
 ) -> List["ProposedEdit"]:
     """
-    Extract ProposedEdit objects from QA results, preserving source model.
+    Extract ProposedEdit objects from QA results, preserving the evaluator alias.
 
-    This function is used by Arbiter to know which model proposed each edit,
+    This function is used by Arbiter to know which evaluator proposed each edit,
     enabling intelligent conflict resolution and distribution classification.
+    Only the blind evaluator alias is propagated; real model identities stay in
+    routing/usage layers.
 
     Filters out evaluations that marked deal_breaker=true, as deal-breakers
     require full regeneration, not incremental edits.
@@ -1803,7 +1965,7 @@ def _extract_proposed_edits_from_layer_results(
         max_edits: Maximum number of edits to return
 
     Returns:
-        List of ProposedEdit objects with source_model preserved
+        List of ProposedEdit objects with source_evaluator preserved
     """
     from smart_edit import TextEditRange
     from arbiter import ProposedEdit
@@ -1811,21 +1973,19 @@ def _extract_proposed_edits_from_layer_results(
     all_proposed: List["ProposedEdit"] = []
 
     for model_name, evaluation in layer_results.items():
-        real_model_value = getattr(evaluation, "model", model_name)
-        real_model = real_model_value if isinstance(real_model_value, str) and real_model_value.strip() else model_name
         # Skip evaluations that marked deal_breaker - those require regeneration, not edits
         if getattr(evaluation, 'deal_breaker', False):
             logger.debug(f"Skipping edit proposals from {model_name} - marked as deal_breaker")
             continue
         score = getattr(evaluation, 'score', 0.0)
+        evaluator_alias = get_evaluator_alias(evaluation, fallback=model_name)
         if hasattr(evaluation, 'identified_issues') and evaluation.identified_issues:
             for issue in evaluation.identified_issues:
                 if isinstance(issue, TextEditRange):
                     paragraph_key = _get_paragraph_key(issue)
                     all_proposed.append(ProposedEdit(
                         edit=issue,
-                        source_model=real_model,
-                        source_alias=get_evaluator_alias(evaluation, fallback=model_name),
+                        source_evaluator=evaluator_alias,
                         source_score=score,
                         paragraph_key=paragraph_key
                     ))
@@ -1888,6 +2048,7 @@ async def _process_single_layer_with_edits(
     stream_callback: Optional[Any] = None,
     images_for_qa: Optional[List["ImageData"]] = None,
     iteration: int = 1,
+    qa_tool_event_callback: Optional[Any] = None,
 ) -> tuple:
     """
     Process a single QA layer with iterative smart-edit.
@@ -1979,11 +2140,13 @@ async def _process_single_layer_with_edits(
             input_images=images_for_qa,
             content_for_bypass=(
                 current_content
-                if getattr(request, "json_output", False) or getattr(request, "target_field", None)
+                if is_json_output_requested(request) or getattr(request, "target_field", None)
                 else None
             ),
             edit_history=edit_history_for_qa,
             model_alias_registry=getattr(request, "_model_alias_registry", None),
+            project_id=session.get("project_id"),
+            tool_event_callback=qa_tool_event_callback,
         )
 
     # Track rounds for this layer
@@ -2152,6 +2315,7 @@ async def _process_single_layer_with_edits(
                     cancel_callback=cancel_callback,
                     usage_tracker=usage_tracker,
                     phase_logger=phase_logger,
+                    tool_event_callback=_make_gran_sabio_tool_event_callback(session_id or "unknown", session),
                 )
             except GranSabioProcessCancelled:
                 if not escalation_completed:
@@ -2408,6 +2572,7 @@ async def _process_single_layer_with_edits(
                 gran_sabio_model=getattr(request, 'gran_sabio_model', None),
                 qa_model_count=len(qa_model_names),
                 model_alias_registry=getattr(request, "_model_alias_registry", None),
+                arbiter_tools_mode=getattr(request, 'arbiter_tools_mode', 'auto'),
             )
 
             # Call Arbiter for intelligent conflict resolution
@@ -2425,27 +2590,14 @@ async def _process_single_layer_with_edits(
             )
 
             # Update layer history with this round's record
-            if arbiter_result.round_record:
-                from arbiter import EditRoundRecord, ArbiterEditDecision, ArbiterDecision
-                # Convert round_record dict to EditRoundRecord
+            arbiter_decisions = getattr(arbiter_result, "edit_decisions", None)
+            if arbiter_decisions:
+                from arbiter import EditRoundRecord
                 round_record = EditRoundRecord(
                     round_number=round_num + 1,
                     proposed_edits=proposed_edits,
                     conflicts_detected=[],  # Simplified - full info in arbiter_result
-                    decisions=[
-                        ArbiterEditDecision(
-                            edit=pe.edit,
-                            decision=ArbiterDecision.APPLY if pe.edit in arbiter_result.edits_to_apply else ArbiterDecision.DISCARD,
-                            reason=next(
-                                (d.get('reason', '') for d in arbiter_result.edits_discarded
-                                 if d.get('source_model') == pe.source_model),
-                                "Approved by Arbiter"
-                            ),
-                            source_model=pe.source_model,
-                            source_alias=pe.source_alias,
-                        )
-                        for pe in proposed_edits
-                    ]
+                    decisions=arbiter_decisions,
                 )
                 layer_history.add_round(round_record)
 
@@ -2686,14 +2838,69 @@ async def _process_all_layers_with_edits(
         # Create Arbiter for intelligent conflict resolution between QA evaluators
         from arbiter import Arbiter
 
+        async def _arbiter_debug_event(event_type: str, payload: Dict[str, Any]) -> None:
+            """Persist Arbiter lifecycle events to the debugger DB, pre-bound to session_id."""
+            await _debug_record_event(session_id, event_type, payload)
+
+        _arbiter_project_id = session.get("project_id")
+        _arbiter_request_name = session.get("request_name")
+
+        async def _arbiter_tool_event_callback(event_type: str, payload: Dict[str, Any]) -> None:
+            """Forward Arbiter tool-loop events to the project stream under phase="arbiter"."""
+            if not _arbiter_project_id:
+                return
+            try:
+                await publish_project_phase_chunk(
+                    _arbiter_project_id,
+                    "arbiter",
+                    None,
+                    session_id=session_id,
+                    request_name=_arbiter_request_name,
+                    event=str(event_type) if event_type else "tool_event",
+                    data=payload,
+                )
+            except Exception:
+                # Never let telemetry failures break Arbiter execution.
+                return
+
         arbiter = Arbiter(
             ai_service=ai_service,
             model=getattr(request, 'arbiter_model', None),
             stream_callback=arbiter_stream_callback,
+            debug_event_callback=_arbiter_debug_event,
+            tool_event_callback=_arbiter_tool_event_callback,
         )
         logger.info(f"Arbiter initialized with model: {arbiter.model}")
     else:
         logger.info("Long Text Mode active: per-layer QA will stay evaluate-only and skip Arbiter mutation.")
+
+    # QA tool-loop event callback, pre-bound to the session/project so the
+    # evaluator service can surface tool-loop telemetry to ``/stream/project``
+    # without importing ``app_state``.
+    _qa_project_id = session.get("project_id")
+    _qa_request_name = session.get("request_name")
+
+    async def _qa_tool_event_callback(event_type: str, payload: Dict[str, Any]) -> None:
+        """Forward QA tool-loop events to the project stream under phase="qa".
+
+        The structured payload is forwarded via the ``data`` kwarg; oversized
+        payloads are degraded to a preview by the publisher.
+        """
+        if not _qa_project_id:
+            return
+        try:
+            await publish_project_phase_chunk(
+                _qa_project_id,
+                "qa",
+                None,
+                session_id=session_id,
+                request_name=_qa_request_name,
+                event=str(event_type) if event_type else "tool_event",
+                data=payload,
+            )
+        except Exception:
+            # Never let telemetry failures break QA execution.
+            return
 
     for layer_idx, layer in enumerate(sorted_layers):
         layer_name = layer.name
@@ -2729,6 +2936,7 @@ async def _process_all_layers_with_edits(
             stream_callback=stream_callback,
             images_for_qa=images_for_qa,
             iteration=iteration,
+            qa_tool_event_callback=_qa_tool_event_callback,
         )
 
         # Update content with edited version
@@ -2854,6 +3062,432 @@ def _get_evaluated_layers_for_approval(
     evaluated_names = set(layers_summary.keys())
     evaluated_layers = [layer for layer in configured_layers if layer.name in evaluated_names]
     return evaluated_layers or configured_layers
+
+
+def _clone_request_for_final_verification(request: ContentRequest) -> ContentRequest:
+    """Create a transient request clone that forces read-only QA evaluation."""
+
+    cloned_request = request.model_copy(deep=True)
+    cloned_request.smart_editing_mode = "never"
+    cloned_request._generation_mode = "final_verification"
+    cloned_request._smart_edit_metadata = None
+    if hasattr(request, "_model_alias_registry"):
+        cloned_request._model_alias_registry = getattr(request, "_model_alias_registry", None)
+    return cloned_request
+
+
+def _resolve_final_verification_trigger(
+    request: ContentRequest,
+    *,
+    pre_qa_content_snapshot: str,
+    final_content_snapshot: str,
+    has_effective_qa_contract: bool,
+) -> Dict[str, Any]:
+    """Resolve whether final QA verification should run for this iteration."""
+
+    mode = getattr(request, "qa_final_verification_mode", "disabled")
+    strategy = getattr(request, "qa_final_verification_strategy", "full_parallel")
+    content_modified_by_qa = final_content_snapshot != pre_qa_content_snapshot
+
+    if mode == "disabled":
+        return {
+            "triggered": False,
+            "mode": mode,
+            "strategy": strategy,
+            "trigger_reason": "disabled",
+            "content_modified_by_qa": content_modified_by_qa,
+        }
+
+    if not has_effective_qa_contract:
+        return {
+            "triggered": False,
+            "mode": mode,
+            "strategy": strategy,
+            "trigger_reason": "no_qa_layers",
+            "content_modified_by_qa": content_modified_by_qa,
+        }
+
+    if mode == "after_modifications" and not content_modified_by_qa:
+        return {
+            "triggered": False,
+            "mode": mode,
+            "strategy": strategy,
+            "trigger_reason": "content_unchanged",
+            "content_modified_by_qa": content_modified_by_qa,
+        }
+
+    return {
+        "triggered": True,
+        "mode": mode,
+        "strategy": strategy,
+        "trigger_reason": "content_modified_by_qa" if content_modified_by_qa else "always",
+        "content_modified_by_qa": content_modified_by_qa,
+    }
+
+
+def _prepare_content_for_final_verification(
+    content: str,
+    request: ContentRequest,
+) -> Tuple[str, Optional[str], Optional[Dict[str, Any]]]:
+    """Prepare semantic QA and deterministic bypass content for final verification."""
+
+    json_context, text_for_processing = try_extract_json_from_content(
+        content=content,
+        json_output=is_json_output_requested(request),
+        target_field=getattr(request, "target_field", None),
+        max_recursion_depth=config.MAX_JSON_RECURSION_DEPTH,
+    )
+    qa_content = prepare_content_for_qa(
+        content,
+        json_context,
+        getattr(request, "target_field_only", False),
+    )
+    bypass_content = text_for_processing if json_context else None
+    return qa_content, bypass_content, json_context
+
+
+def _build_final_verification_layer_lookup(layers: List[QALayer]) -> Dict[str, QALayer]:
+    return {layer.name: layer for layer in layers if layer}
+
+
+async def _adjudicate_final_verification_deal_breakers(
+    *,
+    content: str,
+    qa_results: Dict[str, Dict[str, Any]],
+    evaluated_layers: List[QALayer],
+    request: ContentRequest,
+    session: Dict[str, Any],
+    session_id: str,
+    usage_tracker: Optional["UsageTracker"],
+    phase_logger: Optional[Any],
+    cancel_callback: Optional[Any],
+) -> List[Dict[str, Any]]:
+    """Sequentially ask GranSabio to suppress minority/tie final-verification false positives."""
+
+    if not gran_sabio:
+        return []
+
+    layer_lookup = _build_final_verification_layer_lookup(evaluated_layers)
+    decisions: List[Dict[str, Any]] = []
+    session_limit = getattr(request, "gran_sabio_call_limit_per_session", -1)
+    tracker = get_tracker()
+
+    async def final_verification_gran_sabio_stream_callback(chunk: str, model: str, operation: str):
+        await add_to_session_field(session_id, "gransabio_content", chunk)
+        project_id = session.get("project_id")
+        if project_id and chunk:
+            await publish_project_phase_chunk(
+                project_id,
+                "gran_sabio",
+                chunk,
+                session_id=session_id,
+                request_name=session.get("request_name"),
+            )
+
+    for layer_name, layer_results in qa_results.items():
+        layer = layer_lookup.get(layer_name)
+        if layer is None:
+            continue
+
+        deal_breakers = semantic_deal_breakers(layer_results)
+        if not deal_breakers:
+            continue
+
+        consensus_counts = build_qa_counts(layer_results, len(request.qa_models) or len(layer_results))
+        total_models = consensus_counts["valid"]
+        deal_breaker_count = len(deal_breakers)
+        is_tie = total_models > 0 and total_models % 2 == 0 and deal_breaker_count * 2 == total_models
+        is_minority = total_models > 0 and 0 < deal_breaker_count < (total_models / 2)
+        if not (is_tie or is_minority):
+            continue
+
+        can_escalate = (
+            session_limit == -1
+            or session.get("gran_sabio_escalation_count", 0) < session_limit
+        )
+        if not can_escalate:
+            decisions.append(
+                {
+                    "layer": layer_name,
+                    "decision": "skipped_limit_reached",
+                    "deal_breaker_count": deal_breaker_count,
+                    "total_models": total_models,
+                }
+            )
+            continue
+
+        session["gran_sabio_escalation_count"] = session.get("gran_sabio_escalation_count", 0) + 1
+        escalation_type = "final_verification_50_50_tie" if is_tie else "final_verification_minority_deal_breaker"
+        first_deal_breaker = deal_breakers[0]
+        escalation_id = tracker.record_escalation(
+            session_id=session_id or "unknown",
+            iteration=getattr(request, "_current_iteration", 0),
+            layer_name=layer.name,
+            trigger_type=escalation_type,
+            triggering_model=first_deal_breaker.model,
+            deal_breaker_reason=first_deal_breaker.deal_breaker_reason or first_deal_breaker.reason or "",
+            total_models=total_models,
+            deal_breaker_count=deal_breaker_count,
+            gran_sabio_model=getattr(request, "gran_sabio_model", None),
+            deal_breaker_evaluations=deal_breakers,
+        )
+
+        minority_data = {
+            "has_minority_deal_breakers": True,
+            "deal_breaker_count": deal_breaker_count,
+            "total_evaluations": total_models,
+            "total_models_configured": len(request.qa_models) or len(layer_results),
+            "qa_quorum": consensus_counts,
+            "details": [
+                {
+                    "layer": layer.name,
+                    "model": eval.model,
+                    "evaluator": get_evaluator_alias(eval, fallback=eval.model),
+                    "reason": eval.deal_breaker_reason or eval.reason or "",
+                    "score_given": getattr(eval, "score", None),
+                    "layer_criteria": getattr(layer, "criteria", None),
+                    "layer_min_score": getattr(layer, "min_score", None),
+                    "layer_deal_breaker_criteria": getattr(layer, "deal_breaker_criteria", None),
+                }
+                for eval in deal_breakers
+            ],
+            "qa_configuration": {
+                "layer_name": layer.name,
+                "description": getattr(layer, "description", None),
+                "criteria": getattr(layer, "criteria", None),
+                "min_score": getattr(layer, "min_score", None),
+                "deal_breaker_criteria": getattr(layer, "deal_breaker_criteria", None),
+                "concise_on_pass": getattr(layer, "concise_on_pass", None),
+                "order": getattr(layer, "order", None),
+                "is_deal_breaker": getattr(layer, "is_deal_breaker", None),
+                "is_mandatory": getattr(layer, "is_mandatory", None),
+            },
+            "summary": f"{deal_breaker_count} deal-breakers from {total_models} evaluations in {layer.name}",
+        }
+
+        await _debug_record_event(
+            session_id,
+            "final_verification_gran_sabio_review_started",
+            {
+                "layer": layer.name,
+                "trigger_type": escalation_type,
+                "deal_breaker_count": deal_breaker_count,
+                "total_models": total_models,
+            },
+        )
+
+        try:
+            gs_result = await gran_sabio.review_minority_deal_breakers(
+                session_id=session_id or "unknown",
+                content=content,
+                minority_deal_breakers=minority_data,
+                original_request=request,
+                stream_callback=final_verification_gran_sabio_stream_callback,
+                cancel_callback=cancel_callback,
+                usage_tracker=usage_tracker,
+                phase_logger=phase_logger,
+                tool_event_callback=_make_gran_sabio_tool_event_callback(session_id or "unknown", session),
+            )
+        except GranSabioProcessCancelled:
+            tracker.complete_escalation(
+                escalation_id=escalation_id,
+                decision="cancelled",
+                reasoning="Cancelled by user request",
+                was_real=None,
+            )
+            raise
+        except Exception as exc:
+            tracker.complete_escalation(
+                escalation_id=escalation_id,
+                decision="error",
+                reasoning=str(exc),
+                was_real=None,
+            )
+            decisions.append({"layer": layer.name, "decision": "error", "error": str(exc)})
+            continue
+
+        if getattr(gs_result, "error", None):
+            tracker.complete_escalation(
+                escalation_id=escalation_id,
+                decision="error",
+                reasoning=gs_result.error,
+                was_real=None,
+            )
+            decisions.append({"layer": layer.name, "decision": "error", "error": gs_result.error})
+            continue
+
+        if gs_result.approved and not getattr(gs_result, "modifications_made", False):
+            for eval in deal_breakers:
+                original_reason = eval.deal_breaker_reason or eval.reason or ""
+                apply_gran_sabio_false_positive_override(
+                    eval,
+                    final_score=getattr(gs_result, "final_score", None),
+                    layer_min_score=getattr(layer, "min_score", 0.0),
+                    original_reason=original_reason,
+                )
+            tracker.complete_escalation(
+                escalation_id=escalation_id,
+                decision="false_positive",
+                reasoning=gs_result.reason,
+                was_real=False,
+            )
+            decision = "false_positive"
+        elif gs_result.approved:
+            tracker.complete_escalation(
+                escalation_id=escalation_id,
+                decision="requires_modification",
+                reasoning=gs_result.reason,
+                was_real=True,
+            )
+            decision = "requires_modification_read_only"
+        else:
+            tracker.complete_escalation(
+                escalation_id=escalation_id,
+                decision="real",
+                reasoning=gs_result.reason,
+                was_real=True,
+            )
+            decision = "real"
+
+        decision_payload = {
+            "layer": layer.name,
+            "decision": decision,
+            "reason": gs_result.reason,
+            "score": getattr(gs_result, "final_score", None),
+        }
+        decisions.append(decision_payload)
+        await _debug_record_event(
+            session_id,
+            "final_verification_gran_sabio_review_completed",
+            decision_payload,
+        )
+
+    return decisions
+
+
+async def _maybe_run_final_verification(
+    *,
+    content: str,
+    pre_qa_content_snapshot: str,
+    qa_layers_to_use: List[QALayer],
+    grounding_config: Optional[Any],
+    normalized_qa_models: List[Any],
+    request: ContentRequest,
+    session: Dict[str, Any],
+    session_id: str,
+    iteration: int,
+    usage_tracker: Optional["UsageTracker"],
+    phase_logger: Optional[Any],
+    progress_callback: Optional[Any],
+    stream_callback: Optional[Any],
+    cancel_callback: Optional[Any],
+    qa_input_images: Optional[List["ImageData"]],
+    context_prompt: str,
+) -> Dict[str, Any]:
+    """Run final QA verification when enabled and return status plus results."""
+
+    grounding_enabled = bool(grounding_config and getattr(grounding_config, "enabled", False))
+    trigger = _resolve_final_verification_trigger(
+        request,
+        pre_qa_content_snapshot=pre_qa_content_snapshot,
+        final_content_snapshot=content,
+        has_effective_qa_contract=bool(qa_layers_to_use or grounding_enabled),
+    )
+
+    if not trigger["triggered"]:
+        await _debug_record_event(session_id, "final_verification_skipped", trigger)
+        return trigger
+
+    strategy = trigger["strategy"]
+    await add_verbose_log(
+        session_id,
+        f"Final QA verification started ({strategy}, {trigger['trigger_reason']})",
+    )
+    await _debug_record_event(session_id, "final_verification_started", trigger)
+
+    verification_request = _clone_request_for_final_verification(request)
+    verification_content, bypass_content, verification_json_context = _prepare_content_for_final_verification(
+        content,
+        request,
+    )
+    marker_config = _build_smart_edit_marker_config(verification_content, verification_request)
+
+    qa_payload = await qa_engine.evaluate_final_verification(
+        content=verification_content,
+        content_for_bypass=bypass_content,
+        layers=qa_layers_to_use,
+        qa_models=normalized_qa_models,
+        strategy=strategy,
+        progress_callback=progress_callback,
+        original_request=verification_request,
+        stream_callback=stream_callback,
+        session_id=session_id,
+        cancel_callback=cancel_callback,
+        usage_tracker=usage_tracker,
+        iteration=iteration,
+        phase_logger=phase_logger,
+        marker_mode=marker_config.get("mode", "phrase"),
+        marker_length=marker_config.get("phrase_length"),
+        word_map_formatted=marker_config.get("word_map_formatted"),
+        draft_map_formatted=marker_config.get("draft_map_formatted"),
+        input_images=qa_input_images,
+        evidence_grounding_config=grounding_config,
+        context_for_grounding=_build_grounding_context(request, context_prompt),
+        model_alias_registry=getattr(request, "_model_alias_registry", None),
+    )
+
+    evaluated_layers = qa_payload.get("evaluated_layers") or qa_layers_to_use
+    gran_sabio_decisions = await _adjudicate_final_verification_deal_breakers(
+        content=content,
+        qa_results=qa_payload.get("qa_results", {}),
+        evaluated_layers=evaluated_layers,
+        request=request,
+        session=session,
+        session_id=session_id,
+        usage_tracker=usage_tracker,
+        phase_logger=phase_logger,
+        cancel_callback=cancel_callback,
+    )
+
+    if gran_sabio_decisions:
+        qa_payload["gran_sabio_adjudication"] = gran_sabio_decisions
+        summary = qa_payload.setdefault("summary", {})
+        summary["gran_sabio_adjudication"] = gran_sabio_decisions
+        summary["has_deal_breakers"] = any(
+            bool(getattr(evaluation, "deal_breaker", False))
+            for layer_results in qa_payload.get("qa_results", {}).values()
+            for evaluation in layer_results.values()
+        )
+        summary["deal_breakers_count"] = sum(
+            1
+            for layer_results in qa_payload.get("qa_results", {}).values()
+            for evaluation in layer_results.values()
+            if bool(getattr(evaluation, "deal_breaker", False))
+        )
+
+    result = {
+        **trigger,
+        "approval_contract": qa_payload.get("approval_contract"),
+        "qa_results": qa_payload.get("qa_results", {}),
+        "qa_comprehensive_result": qa_payload,
+        "evaluated_layers": evaluated_layers,
+        "json_context_detected": bool(verification_json_context),
+        "gran_sabio_adjudication": gran_sabio_decisions,
+    }
+
+    await _debug_record_event(
+        session_id,
+        "final_verification_completed",
+        {
+            "mode": trigger["mode"],
+            "strategy": strategy,
+            "trigger_reason": trigger["trigger_reason"],
+            "approval_contract": result["approval_contract"],
+            "summary": qa_payload.get("summary", {}),
+            "gran_sabio_adjudication": gran_sabio_decisions,
+        },
+    )
+    return result
 
 
 def _split_layers_around_grounding(
@@ -3486,7 +4120,7 @@ async def process_content_generation(
     if model_alias_registry is None:
         model_alias_registry = ModelAliasRegistry.from_request(
             request,
-            preflight_model=getattr(config, "PREFLIGHT_VALIDATION_MODEL", None),
+            preflight_model=resolve_preflight_model(request),
         )
         session["model_alias_registry"] = model_alias_registry
         session["model_alias_map_internal"] = model_alias_registry.internal_snapshot()
@@ -3597,7 +4231,7 @@ async def process_content_generation(
         """Helper to reuse session cancellation checks across phases."""
         return await check_session_cancelled(session_id)
 
-    json_output_requested = request.json_output or request.content_type == "json"
+    json_output_requested = is_json_output_requested(request)
 
     await _debug_record_event(
         session_id,
@@ -3799,6 +4433,18 @@ ITERATION CONTEXT:
                 del session["last_json_error"]
                 # Do NOT add iteration_feedback_context or rejected_content_context
                 # when JSON retry is active to avoid contradictory instructions
+            elif "last_generation_error" in session:
+                generation_error = session["last_generation_error"]
+                error_context = f"""
+PREVIOUS GENERATION FAILED:
+{generation_error.get('message', 'The previous generation failed.')}
+
+Generate a shorter, more compact response that still satisfies the user request.
+If JSON is requested, reduce verbosity inside string fields and keep the JSON complete and closed.
+"""
+                prompt_sections.append(error_context)
+                prompt_safety_parts.append(PromptPart(error_context, "system_generated", "generation.truncation_feedback"))
+                del session["last_generation_error"]
             else:
                 # Only add QA feedback and rejected content if NOT retrying JSON
                 if iteration_feedback_context:
@@ -3916,6 +4562,75 @@ ITERATION CONTEXT:
                     phase_logger._exit_phase(Phase.GENERATION)
                     return
 
+            if _generation_was_truncated(session):
+                failure_reason = _build_truncation_failure_reason(session, request)
+                session["last_generation_error"] = {
+                    "reason": "output_token_limit",
+                    "message": failure_reason,
+                    "failed_content": content,
+                }
+                await add_verbose_log(session_id, failure_reason)
+                await _debug_record_event(
+                    session_id,
+                    "generation_output_truncated",
+                    {
+                        "iteration": iteration + 1,
+                        "finish_metadata": session.get("generation_finish_metadata"),
+                        "failure_reason": failure_reason,
+                    },
+                )
+
+                if iteration + 1 >= request.max_iterations:
+                    if request.gran_sabio_fallback:
+                        await add_verbose_log(session_id, f"Iterations exhausted: {failure_reason}")
+                        await add_verbose_log(session_id, "Gran Sabio fallback enabled - moving to fallback...")
+                        phase_logger._exit_phase(Phase.GENERATION)
+                        fallback_reason = failure_reason
+                        break
+
+                    final_result = {
+                        "content": content,
+                        "final_iteration": iteration + 1,
+                        "final_score": 0.0,
+                        "approved": False,
+                        "failure_reason": failure_reason,
+                        "evidence_grounding": None,
+                        "generated_at": datetime.now().isoformat()
+                    }
+                    _attach_json_guard_metadata(session, final_result, request)
+                    _store_final_result(
+                        session,
+                        final_result,
+                        session_id,
+                        final_status=GenerationStatus.FAILED.value,
+                    )
+                    session["error"] = failure_reason
+                    update_session_status(session, session_id, GenerationStatus.FAILED)
+                    await _debug_record_event(
+                        session_id,
+                        "session_failed",
+                        {
+                            "reason": "output_token_limit",
+                            "iteration": iteration + 1,
+                            "failure_reason": failure_reason,
+                            "final_result": final_result,
+                        },
+                    )
+                    await _debug_update_status(
+                        session_id,
+                        status=GenerationStatus.FAILED.value,
+                        final_payload=final_result,
+                    )
+                    phase_logger._exit_phase(Phase.GENERATION)
+                    return
+
+                await add_verbose_log(
+                    session_id,
+                    f"Retrying with a shorter response requirement (iteration {iteration + 2}/{request.max_iterations})..."
+                )
+                phase_logger._exit_phase(Phase.GENERATION)
+                continue
+
             # CRITICAL: Validate that content is not empty (even if QA is bypassed)
             if not content or not content.strip():
                 error_msg = f"Content generation failed - empty content returned by {request.generator_model}"
@@ -3990,10 +4705,10 @@ ITERATION CONTEXT:
                     expectations = getattr(request, 'json_expectations', None)
 
                     # Validate JSON with schema/expectations
-                    json_guard_result: ValidationResult = validate_ai_json(
+                    json_guard_result: ValidationResult = _run_json_post_guard(
                         content,
                         schema=schema,
-                        expectations=expectations
+                        expectations=expectations,
                     )
                     json_guard_result_dict = json_guard_result.to_dict()
                     session["json_guard_history"].append({
@@ -4100,9 +4815,16 @@ ITERATION CONTEXT:
                                     if isinstance(chunk, StreamChunk):
                                         chunk_text = chunk.text
                                         is_thinking = chunk.is_thinking
+                                        chunk_metadata = getattr(chunk, "metadata", {}) or {}
                                     else:
                                         chunk_text = chunk
                                         is_thinking = False
+                                        chunk_metadata = {}
+
+                                    if chunk_metadata:
+                                        session["generation_finish_metadata"] = dict(chunk_metadata)
+                                        if not chunk_text:
+                                            continue
 
                                     if is_thinking:
                                         # Thinking: stream live but don't accumulate
@@ -4215,6 +4937,11 @@ ITERATION CONTEXT:
                         # Store the parsed JSON payload for later use
                         if json_guard_result.data is not None:
                             session["json_parsed_content"] = json_guard_result.data
+                            normalized_json_content = _json_guard_data_to_content(json_guard_result)
+                            if normalized_json_content is not None:
+                                content = normalized_json_content
+                                _set_generation_content_metrics(session, content)
+                                _set_last_generated_content_metrics(session, content)
 
                 # If JSON validation ultimately failed, continue to next iteration
                 if not json_validation_success:
@@ -4493,7 +5220,7 @@ ITERATION CONTEXT:
             if smart_edit_enabled or explicit_target_field:
                 json_context, text_for_processing = try_extract_json_from_content(
                     content=content,
-                    json_output=getattr(request, 'json_output', False),
+                    json_output=is_json_output_requested(request),
                     target_field=explicit_target_field,
                     max_recursion_depth=config.MAX_JSON_RECURSION_DEPTH
                 )
@@ -4576,7 +5303,7 @@ ITERATION CONTEXT:
             qa_input_images = None
             if getattr(request, 'qa_with_vision', False) and images_for_generation:
                 qa_input_images = images_for_generation
-                if extra_verbose:
+                if getattr(request, "extra_verbose", False):
                     logger.info(
                         f"Session {session_id}: QA vision enabled with {len(qa_input_images)} images"
                     )
@@ -4602,6 +5329,11 @@ ITERATION CONTEXT:
                 layers_summary = {}
                 deal_breaker_info = None
                 processed_text = text_for_processing
+                pre_qa_content_snapshot = content
+                consensus_layers_to_use = qa_layers_to_use
+                qa_edit_pass_results = None
+                qa_edit_pass_comprehensive_result = None
+                final_verification_status = None
 
                 before_grounding_layers, after_grounding_layers = _split_layers_around_grounding(
                     qa_layers_to_use,
@@ -4760,6 +5492,36 @@ ITERATION CONTEXT:
                     f"Per-layer QA complete: {passed_count}/{len(layers_summary)} layers passed, avg score: {avg_score:.2f}"
                 )
 
+                final_verification_status = await _maybe_run_final_verification(
+                    content=content,
+                    pre_qa_content_snapshot=pre_qa_content_snapshot,
+                    qa_layers_to_use=qa_layers_to_use,
+                    grounding_config=grounding_config,
+                    normalized_qa_models=normalized_qa_models,
+                    request=request,
+                    session=session,
+                    session_id=session_id,
+                    iteration=iteration + 1,
+                    usage_tracker=usage_tracker,
+                    phase_logger=phase_logger,
+                    progress_callback=qa_progress_callback,
+                    stream_callback=qa_stream_callback,
+                    cancel_callback=cancellation_requested,
+                    qa_input_images=qa_input_images,
+                    context_prompt=context_prompt,
+                )
+
+                if final_verification_status.get("triggered"):
+                    qa_edit_pass_results = qa_results
+                    qa_edit_pass_comprehensive_result = qa_comprehensive_result
+                    qa_results = final_verification_status["qa_results"]
+                    qa_comprehensive_result = final_verification_status["qa_comprehensive_result"]
+                    consensus_layers_to_use = final_verification_status.get("evaluated_layers") or qa_layers_to_use
+                    await add_verbose_log(
+                        session_id,
+                        "Final QA verification results are now authoritative for approval.",
+                    )
+
             except QAProcessCancelled:
                 await add_verbose_log(session_id, "QA evaluation cancelled by user request")
                 phase_logger._exit_phase(Phase.QA)
@@ -4891,7 +5653,7 @@ ITERATION CONTEXT:
             consensus_result = await consensus_engine.calculate_consensus(
                 content=content,
                 qa_results=qa_results,
-                layers=qa_layers_to_use,
+                layers=consensus_layers_to_use,
                 original_request=request,
                 phase_logger=phase_logger,
             )
@@ -4919,6 +5681,7 @@ ITERATION CONTEXT:
                     "iteration": iteration + 1,
                     "consensus": consensus_result,
                     "deal_breaker_found": deal_breaker_found_flag,
+                    "final_verification": final_verification_status,
                 },
             )
 
@@ -4959,7 +5722,7 @@ ITERATION CONTEXT:
                     "is_mandatory": getattr(layer, "is_mandatory", None),
                     "concise_on_pass": getattr(layer, "concise_on_pass", None),
                 }
-                for layer in qa_layers_to_use
+                for layer in consensus_layers_to_use
             ]
 
             content_word_count = len(content.split())
@@ -5000,6 +5763,9 @@ ITERATION CONTEXT:
                 "generation_tool_metadata": session.get("generation_tool_metadata"),
                 "qa_layers_config": qa_layers_config,
                 "qa_results": qa_results,
+                "qa_edit_pass_results": qa_edit_pass_results,
+                "qa_edit_pass_comprehensive_result": qa_edit_pass_comprehensive_result,
+                "final_verification": final_verification_status,
                 "consensus": consensus_result,
                 "deal_breaker_found": deal_breaker_found_flag,
                 "timestamp": datetime.now().isoformat(),
@@ -5080,7 +5846,7 @@ ITERATION CONTEXT:
 
             # Step 4: New layer-based approval logic
             evaluated_qa_layers = _get_evaluated_layers_for_approval(
-                qa_layers_to_use,
+                consensus_layers_to_use,
                 qa_comprehensive_result,
             )
             approval_result = _evaluate_layer_based_approval(
@@ -5092,6 +5858,22 @@ ITERATION CONTEXT:
                 evaluated_qa_layers,
                 qa_comprehensive_result,
             )
+            if final_verification_status and final_verification_status.get("triggered"):
+                final_verification_status["passed"] = approval_result["approved"]
+                final_verification_status["approval_reason"] = approval_result.get("reason")
+                await _debug_record_event(
+                    session_id,
+                    "final_verification_approval_completed"
+                    if approval_result["approved"]
+                    else "final_verification_failed",
+                    {
+                        "iteration": iteration + 1,
+                        "mode": final_verification_status.get("mode"),
+                        "strategy": final_verification_status.get("strategy"),
+                        "passed": approval_result["approved"],
+                        "reason": approval_result.get("reason"),
+                    },
+                )
             iteration_data["approved"] = approval_result["approved"]
             iteration_data["approval_reason"] = approval_result.get("reason")
             
@@ -5265,6 +6047,7 @@ ITERATION CONTEXT:
             )
 
             previous_attempts = [iteration.get("content", "") for iteration in session["iterations"]]
+            pre_gran_sabio_content_snapshot = previous_attempts[-1] if previous_attempts else content
 
             # Create Gran Sabio stream callback for content regeneration
             async def gran_sabio_stream_callback(chunk: str, model: str, operation: str):
@@ -5285,9 +6068,12 @@ ITERATION CONTEXT:
                     session_id=session_id,
                     original_request=request,
                     previous_attempts=previous_attempts,
+                    images=images_for_generation,
                     stream_callback=gran_sabio_stream_callback,
                     cancel_callback=cancellation_requested,
                     usage_tracker=usage_tracker,
+                    tool_event_callback=_make_gran_sabio_tool_event_callback(session_id, session),
+                    fallback_reason=fallback_reason,
                 )
             except GranSabioProcessCancelled:
                 await add_verbose_log(session_id, "Gran Sabio regeneration cancelled by user request")
@@ -5338,7 +6124,11 @@ ITERATION CONTEXT:
                 proceed_with_qa = True
                 gran_sabio_json_guard_dict: Optional[Dict[str, Any]] = None
                 if json_output_requested:
-                    gran_sabio_json_guard: ValidationResult = validate_ai_json(gran_sabio_content)
+                    gran_sabio_json_guard: ValidationResult = _run_json_post_guard(
+                        gran_sabio_content,
+                        schema=getattr(request, "json_schema", None),
+                        expectations=getattr(request, "json_expectations", None),
+                    )
                     gran_sabio_json_guard_dict = gran_sabio_json_guard.to_dict()
                     session["json_guard_history"].append({
                         "iteration": "gran_sabio_regeneration",
@@ -5381,6 +6171,11 @@ ITERATION CONTEXT:
                         # Store the Gran Sabio parsed JSON payload for later use
                         if gran_sabio_json_guard.data is not None:
                             session["gran_sabio_json_parsed_content"] = gran_sabio_json_guard.data
+                            normalized_json_content = _json_guard_data_to_content(gran_sabio_json_guard)
+                            if normalized_json_content is not None:
+                                gran_sabio_content = normalized_json_content
+                                _set_generation_content_metrics(session, gran_sabio_content)
+                                _set_last_generated_content_metrics(session, gran_sabio_content)
 
                 # Initialize before conditional branches (same pattern as proceed_with_qa)
                 qa_evaluation_success_gs = False
@@ -5508,7 +6303,7 @@ ITERATION CONTEXT:
                     # Extract JSON from Gran Sabio content if needed (for QA preparation)
                     gs_json_context, gs_text_for_processing = try_extract_json_from_content(
                         content=gran_sabio_content,
-                        json_output=getattr(request, 'json_output', False),
+                        json_output=is_json_output_requested(request),
                         target_field=getattr(request, 'target_field', None),
                         max_recursion_depth=config.MAX_JSON_RECURSION_DEPTH
                     )
@@ -5550,6 +6345,31 @@ ITERATION CONTEXT:
                             )
 
                             qa_results = qa_comprehensive_result["qa_results"]
+                            gran_sabio_consensus_layers = qa_layers_to_use
+                            gran_sabio_final_verification = await _maybe_run_final_verification(
+                                content=gran_sabio_content,
+                                pre_qa_content_snapshot=pre_gran_sabio_content_snapshot,
+                                qa_layers_to_use=qa_layers_to_use,
+                                grounding_config=getattr(request, 'evidence_grounding', None),
+                                normalized_qa_models=normalized_qa_models_gs,
+                                request=request,
+                                session=session,
+                                session_id=session_id,
+                                iteration=request.max_iterations + 1,
+                                usage_tracker=usage_tracker,
+                                phase_logger=phase_logger,
+                                progress_callback=qa_progress_callback,
+                                stream_callback=qa_stream_callback_gran_sabio,
+                                cancel_callback=cancellation_requested,
+                                qa_input_images=qa_input_images,
+                                context_prompt=context_prompt,
+                            )
+                            if gran_sabio_final_verification.get("triggered"):
+                                qa_results = gran_sabio_final_verification["qa_results"]
+                                qa_comprehensive_result = gran_sabio_final_verification["qa_comprehensive_result"]
+                                gran_sabio_consensus_layers = (
+                                    gran_sabio_final_verification.get("evaluated_layers") or qa_layers_to_use
+                                )
 
                             await _debug_record_event(
                                 session_id,
@@ -5557,6 +6377,7 @@ ITERATION CONTEXT:
                                 {
                                     "qa_summary": qa_comprehensive_result.get("summary"),
                                     "qa_results": qa_results,
+                                    "final_verification": gran_sabio_final_verification,
                                 },
                             )
 
@@ -5568,7 +6389,7 @@ ITERATION CONTEXT:
                             consensus_result = await consensus_engine.calculate_consensus(
                                 content=gran_sabio_content,
                                 qa_results=qa_results,
-                                layers=qa_layers_to_use,
+                                layers=gran_sabio_consensus_layers,
                                 original_request=request
                             )
 
@@ -5588,6 +6409,7 @@ ITERATION CONTEXT:
                                 "iteration": "Gran Sabio",
                                 "content": gran_sabio_content,
                                 "qa_results": qa_results,
+                                "final_verification": gran_sabio_final_verification,
                                 "consensus": consensus_result,
                                 "deal_breaker_found": qa_comprehensive_result["summary"]["has_deal_breakers"],
                                 "timestamp": datetime.now().isoformat(),
@@ -5610,11 +6432,27 @@ ITERATION CONTEXT:
                                 session_id,
                                 request.max_iterations + 1,
                                 _get_evaluated_layers_for_approval(
-                                    qa_layers_to_use,
+                                    gran_sabio_consensus_layers,
                                     qa_comprehensive_result,
                                 ),
                                 qa_comprehensive_result,
                             )
+                            if gran_sabio_final_verification and gran_sabio_final_verification.get("triggered"):
+                                gran_sabio_final_verification["passed"] = approval_result["approved"]
+                                gran_sabio_final_verification["approval_reason"] = approval_result.get("reason")
+                                await _debug_record_event(
+                                    session_id,
+                                    "final_verification_approval_completed"
+                                    if approval_result["approved"]
+                                    else "final_verification_failed",
+                                    {
+                                        "iteration": "Gran Sabio",
+                                        "mode": gran_sabio_final_verification.get("mode"),
+                                        "strategy": gran_sabio_final_verification.get("strategy"),
+                                        "passed": approval_result["approved"],
+                                        "reason": approval_result.get("reason"),
+                                    },
+                                )
 
                             if approval_result["approved"]:
                                 separator = "=" * 80
@@ -5785,6 +6623,7 @@ ITERATION CONTEXT:
                     cancel_callback=cancellation_requested,
                     usage_tracker=usage_tracker,
                     phase_logger=phase_logger,
+                    tool_event_callback=_make_gran_sabio_tool_event_callback(session_id, session),
                 )
                 phase_logger._exit_phase(Phase.GRAN_SABIO)
             except GranSabioProcessCancelled:
@@ -5814,6 +6653,7 @@ ITERATION CONTEXT:
                     cancel_callback=cancellation_requested,
                     usage_tracker=usage_tracker,
                     phase_logger=phase_logger,
+                    tool_event_callback=_make_gran_sabio_tool_event_callback(session_id, session),
                 )
                 phase_logger._exit_phase(Phase.GRAN_SABIO)
             except GranSabioProcessCancelled:
@@ -5844,6 +6684,7 @@ ITERATION CONTEXT:
                     cancel_callback=cancellation_requested,
                     usage_tracker=usage_tracker,
                     phase_logger=phase_logger,
+                    tool_event_callback=_make_gran_sabio_tool_event_callback(session_id, session),
                 )
                 phase_logger._exit_phase(Phase.GRAN_SABIO)
             except GranSabioProcessCancelled:
@@ -5906,7 +6747,11 @@ ITERATION CONTEXT:
 
             gran_sabio_review_guard_dict: Optional[Dict[str, Any]] = None
             if json_output_requested:
-                gran_sabio_review_guard: ValidationResult = validate_ai_json(gran_sabio_result.final_content or "")
+                gran_sabio_review_guard: ValidationResult = _run_json_post_guard(
+                    gran_sabio_result.final_content or "",
+                    schema=getattr(request, "json_schema", None),
+                    expectations=getattr(request, "json_expectations", None),
+                )
                 gran_sabio_review_guard_dict = gran_sabio_review_guard.to_dict()
                 session["json_guard_history"].append({
                     "iteration": "gran_sabio_review",
@@ -5974,6 +6819,11 @@ ITERATION CONTEXT:
                     )
                 else:
                     await add_verbose_log(session_id, "Gran Sabio review JSON guard validation passed.")
+                if gran_sabio_review_guard.data is not None:
+                    session["gran_sabio_json_parsed_content"] = gran_sabio_review_guard.data
+                    normalized_json_content = _json_guard_data_to_content(gran_sabio_review_guard)
+                    if normalized_json_content is not None:
+                        gran_sabio_result.final_content = normalized_json_content
 
             # Enter COMPLETION phase for Gran Sabio final decision
             phase_logger._enter_phase(Phase.COMPLETION)

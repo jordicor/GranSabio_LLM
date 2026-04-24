@@ -74,7 +74,7 @@ result = client.generate(
     content_type="article",         # article, creative, json, etc.
     generator_model="gpt-4o",       # AI model to use
     temperature=0.7,                # Creativity (0.0-2.0)
-    max_tokens=4000,
+    max_tokens=12000,               # Optional; omit to use model max from server specs
 
     # QA Configuration
     qa_models=["gpt-4o-mini"],
@@ -180,17 +180,38 @@ client = GranSabioClient(
 ## Error Handling
 
 ```python
-from client import GranSabioClient, GranSabioClientError
+from client import GranSabioClient, GranSabioClientError, TransientGranSabioError
 
 client = GranSabioClient()
 
 try:
     result = client.generate(prompt="...")
+except TransientGranSabioError as e:
+    print(f"Temporary network error: {e}")
 except GranSabioClientError as e:
     print(f"Error: {e}")
     print(f"Status code: {e.status_code}")
     print(f"Details: {e.details}")
 ```
+
+## Retry & Error Classes
+
+`GranSabioClientError` is the base exception for client-side failures, HTTP
+errors, rejected generations, and malformed responses.
+
+`TransientGranSabioError` is raised for temporary transport failures such as
+connection drops, timeouts, truncated chunked bodies, or compressed-body decode
+errors. `wait_for_result()` retries these failures for idempotent polling GETs
+(`get_status` and `get_result`) using the shared backoff curve:
+
+```python
+(5, 10, 20, 40, 60, 60, 60, 60, 60, 60)
+```
+
+The retry sleeps count against the caller's `max_wait` budget. Non-idempotent
+POST operations, including `generate`, project start/stop, session stop, and
+attachment uploads, are not automatically retried because the server may have
+accepted the operation before the response body failed.
 
 ## Polling and Callbacks
 

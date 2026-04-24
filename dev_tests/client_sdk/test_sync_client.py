@@ -404,6 +404,22 @@ class TestGenerate:
         assert payload["max_words"] == 1000
         assert payload["json_output"] is True
         assert payload["reasoning_effort"] == "high"
+        assert "max_tokens" not in payload
+
+    def test_generate_includes_explicit_max_tokens(self, client, mock_requests, mock_response):
+        """Given: max_tokens provided, Then: Included in payload."""
+        mock_response.json.return_value = {"session_id": "sess-1", "status": "started"}
+        mock_requests.request.return_value = mock_response
+
+        client.generate(
+            prompt="Test",
+            max_tokens=12000,
+            qa_layers=[],
+            wait_for_completion=False
+        )
+
+        payload = mock_requests.request.call_args[1]["json"]
+        assert payload["max_tokens"] == 12000
 
     def test_get_status_success(self, client, mock_requests, mock_response):
         """Given: Valid session_id, Then: Returns status."""
@@ -769,16 +785,122 @@ class TestConvenienceMethods:
 
 
 # ==============================================================================
-# Backward Compatibility Tests
+# Body-read transient-error handling (retry coverage for get_status / get_result)
 # ==============================================================================
 
-class TestBackwardCompatibility:
-    """Tests for backward compatibility aliases."""
+class TestSyncBodyReadTransient:
+    """get_status / get_result must convert mid-read requests errors to
+    TransientGranSabioError so `_call_with_retry` can retry idempotent GET polls.
+    """
 
-    def test_bioai_client_alias(self):
-        """Given: BioAIClient import, Then: Same as GranSabioClient."""
-        from client import GranSabioClient, BioAIClient
-        assert BioAIClient is GranSabioClient
+    def test_get_status_converts_chunked_encoding_error(self, client):
+        from requests import exceptions as req_exc
+        from client import TransientGranSabioError
+
+        response = Mock()
+        response.status_code = 200
+        response.json.side_effect = req_exc.ChunkedEncodingError("truncated chunked body")
+        client._request = Mock(return_value=response)
+
+        with pytest.raises(TransientGranSabioError) as exc_info:
+            client.get_status("sess-123")
+
+        assert "transient protocol error" in str(exc_info.value).lower()
+        assert "/status/sess-123" in str(exc_info.value)
+
+    def test_get_result_converts_content_decoding_error(self, client):
+        from requests import exceptions as req_exc
+        from client import TransientGranSabioError
+
+        response = Mock()
+        response.status_code = 200
+        response.json.side_effect = req_exc.ContentDecodingError("truncated gzip")
+        client._request = Mock(return_value=response)
+
+        with pytest.raises(TransientGranSabioError):
+            client.get_result("sess-xyz")
+
+    def test_get_status_converts_json_decode_error(self, client):
+        from client import TransientGranSabioError
+
+        response = Mock()
+        response.status_code = 200
+        response.json.side_effect = ValueError("unterminated JSON")
+        client._request = Mock(return_value=response)
+
+        with pytest.raises(TransientGranSabioError):
+            client.get_status("sess-json")
+
+    def test_get_status_error_path_text_read_fails_fast(self, client):
+        """HTTP error responses must not become retryable when their body is unreadable."""
+        from requests import exceptions as req_exc
+        from client import GranSabioClientError
+
+        class BrokenTextResponse:
+            status_code = 500
+
+            @property
+            def text(self):
+                raise req_exc.ChunkedEncodingError("body truncated")
+
+        client._request = Mock(return_value=BrokenTextResponse())
+
+        with pytest.raises(GranSabioClientError) as exc_info:
+            client.get_status("sess-timeout")
+
+        assert exc_info.value.status_code == 500
+        assert "<body unreadable>" in str(exc_info.value)
+
+    def test_call_with_retry_retries_body_read_failure(self, client):
+        """End-to-end: _call_with_retry must retry a body-read ChunkedEncodingError."""
+        from requests import exceptions as req_exc
+
+        response_fail = Mock()
+        response_fail.status_code = 200
+        response_fail.json.side_effect = req_exc.ChunkedEncodingError("truncated")
+
+        response_ok = Mock()
+        response_ok.status_code = 200
+        response_ok.json.return_value = {"status": "completed"}
+
+        client._request = Mock(side_effect=[response_fail, response_ok])
+
+        with patch("time.sleep"):
+            result = client._call_with_retry(
+                op_name="get_status",
+                session_id="sess-retry",
+                func=lambda: client.get_status("sess-retry"),
+                start_time=time.monotonic(),
+                max_wait=60.0,
+            )
+
+        assert result == {"status": "completed"}
+        assert client._request.call_count == 2
+
+    def test_fetch_result_polling_non_retryable_status_body_read_fails_fast(self, client):
+        """A truncated 500 body must not become a retryable polling failure."""
+        from requests import exceptions as req_exc
+        from client import GranSabioClientError
+
+        response = Mock()
+        response.status_code = 500
+        response.json.side_effect = req_exc.ChunkedEncodingError("truncated")
+        response.text = "server error"
+        client._request = Mock(return_value=response)
+
+        with pytest.raises(GranSabioClientError) as exc_info:
+            client._fetch_result_polling("sess-500", timeout_seconds=1, poll_interval=0)
+
+        assert exc_info.value.status_code == 500
+        assert client._request.call_count == 1
+
+
+# ==============================================================================
+# Module-Level Helpers
+# ==============================================================================
+
+class TestCreateClientHelper:
+    """Tests for the module-level create_client() convenience function."""
 
     def test_create_client_function(self):
         """Given: create_client(), Then: Returns GranSabioClient."""
@@ -818,8 +940,3 @@ class TestGranSabioClientError:
         error = GranSabioClientError("Error", details=details)
 
         assert error.details == details
-
-    def test_bioai_client_error_alias(self):
-        """Given: BioAIClientError import, Then: Same as GranSabioClientError."""
-        from client import GranSabioClientError, BioAIClientError
-        assert BioAIClientError is GranSabioClientError

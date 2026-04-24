@@ -26,6 +26,14 @@ RESULT_POLL_GRACE_SECONDS = 120
 RESULT_POLL_INTERVAL_SECONDS = 5.0
 STREAM_ACTIVITY_CHECK_SECONDS = 30.0
 
+# Exponential backoff curve for transient polling errors in wait_for_result.
+# Applied only to idempotent GETs (get_status / get_result). Ten attempts
+# totalling ~7 minutes, enough to ride out VPN flaps, brief DNS failures, and
+# momentary server overload without abandoning a session the server is still
+# working on. POST /generate is not retried here because retrying it would start
+# duplicate sessions.
+POLL_RETRY_BACKOFF_SECONDS: Tuple[int, ...] = (5, 10, 20, 40, 60, 60, 60, 60, 60, 60)
+
 # Timeouts for reasoning models - significantly increased for multi-iteration reasoning.
 # These models can iterate many times and take hours to complete.
 REASONING_TIMEOUT_MAP: Dict[str, int] = {

@@ -56,6 +56,31 @@ def test_tracker_completes_escalation_for_each_evaluator(tmp_path):
     assert tracker.get_model_stats("model-b").confirmed_false_positive == 1
 
 
+def test_tracker_clear_session_releases_in_memory_session_state(tmp_path):
+    tracker = _tracker(tmp_path)
+    escalation_id = tracker.record_escalation(
+        session_id="session-1",
+        iteration=1,
+        layer_name="Accuracy",
+        trigger_type="minority_deal_breaker",
+        triggering_model="model-a",
+        deal_breaker_reason="fabricated",
+        total_models=3,
+        deal_breaker_count=1,
+        gran_sabio_model="gran-sabio",
+        deal_breaker_evaluations=[_deal_breaker("model-a", slot_id="qa:0")],
+    )
+    tracker.record_model_benched("session-1", "Accuracy", "model-a")
+    tracker.record_model_benched("session-2", "Accuracy", "model-b")
+
+    tracker.clear_session("session-1")
+
+    assert tracker.get_session_events("session-1") == []
+    assert tracker.get_session_escalations("session-1") == []
+    assert escalation_id not in tracker.escalation_event_links
+    assert tracker.get_session_events("session-2")
+
+
 def test_supervisor_flags_two_false_positives_same_layer(tmp_path):
     tracker = _tracker(tmp_path)
     for i in range(2):

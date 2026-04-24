@@ -31,7 +31,6 @@ from ai_service import AIService, get_ai_service, AIRequestError
 from qa_evaluation_service import QAEvaluationService, QAResponseParseError
 from qa_result_utils import (
     apply_gran_sabio_false_positive_override,
-    build_deal_breaker_consensus,
     build_qa_counts,
     is_technical_qa_failure,
     semantic_deal_breakers,
@@ -183,6 +182,10 @@ class QAEngine:
         self.grounding_engine = GroundingEngine(self.ai_service)
         self._qa_failure_tracker: Dict[str, Dict[str, int]] = defaultdict(dict)
 
+    def clear_session_state(self, session_id: str) -> None:
+        """Release QA runtime state scoped to an expired session."""
+        self._qa_failure_tracker.pop(session_id, None)
+
     def _should_request_edit_info(
         self,
         mode: str,
@@ -203,14 +206,6 @@ class QAEngine:
 
         # Auto mode: only for narrative content
         return content_type in EDITABLE_CONTENT_TYPES
-
-    def _feedback_suggests_edits(self, feedback: str) -> bool:
-        """
-        Kept for backward compatibility. Not used in the simplified flow.
-        """
-        if not feedback:
-            return False
-        return False
 
     def _increment_model_failure(self, session_id: Optional[str], model_name: str) -> int:
         if not session_id:
@@ -237,6 +232,22 @@ class QAEngine:
         except Exception:
             return 5
 
+    def _estimate_fast_global_tokens(self, text: str) -> int:
+        """Estimate prompt tokens conservatively enough for fast_global guardrails."""
+        if not text:
+            return 1
+        byte_estimate = (len(text.encode("utf-8")) + 2) // 3
+        char_estimate = (len(text) + 2) // 3
+        word_estimate = int((len(text.split()) * 3 + 1) // 2)
+        return max(1, byte_estimate, char_estimate, word_estimate)
+
+    def _fast_global_token_limit(self) -> int:
+        try:
+            limit = int(getattr(config, "QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS", 12000))
+            return limit if limit > 0 else 12000
+        except Exception:
+            return 12000
+
     async def evaluate_content(
         self,
         content: str,
@@ -255,6 +266,9 @@ class QAEngine:
         input_images: Optional[List["ImageData"]] = None,
         edit_history: Optional[str] = None,
         model_alias_registry: Optional[ModelAliasRegistry] = None,
+        session_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
     ) -> QAEvaluation:
         """
         Evaluate content using a specific QA layer and AI model
@@ -333,6 +347,11 @@ class QAEngine:
                 input_images=images_for_eval,
                 edit_history=edit_history,
                 model_alias_registry=model_alias_registry,
+                layer=layer,
+                bypass_engine=self.bypass_engine,
+                session_id=session_id,
+                project_id=project_id,
+                tool_event_callback=tool_event_callback,
             )
         except Exception as e:
             logger.error(f"QA evaluation failed for layer {layer.name} with model {model_config.model}: {str(e)}")
@@ -510,6 +529,8 @@ class QAEngine:
         context_for_grounding: Optional[str] = None,
         content_for_bypass: Optional[str] = None,
         model_alias_registry: Optional[ModelAliasRegistry] = None,
+        project_id: Optional[str] = None,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
     ) -> Dict[str, Dict[str, QAEvaluation]]:
         """
         Evaluate content through all QA layers with detailed progress tracking.
@@ -659,6 +680,8 @@ class QAEngine:
                 input_images=input_images,
                 content_for_bypass=content_for_bypass,
                 model_alias_registry=model_alias_registry,
+                project_id=project_id,
+                tool_event_callback=tool_event_callback,
             )
 
             # If majority deal-breaker detected, stop immediately
@@ -951,6 +974,8 @@ class QAEngine:
         context_for_grounding: Optional[str] = None,
         content_for_bypass: Optional[str] = None,
         model_alias_registry: Optional[ModelAliasRegistry] = None,
+        project_id: Optional[str] = None,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """
         Comprehensive content evaluation with progress tracking
@@ -998,6 +1023,8 @@ class QAEngine:
             context_for_grounding=context_for_grounding,
             content_for_bypass=content_for_bypass,
             model_alias_registry=model_alias_registry,
+            project_id=project_id,
+            tool_event_callback=tool_event_callback,
         )
 
         if isinstance(qa_results, dict) and qa_results.get("summary", {}).get("force_iteration"):
@@ -1044,6 +1071,321 @@ class QAEngine:
                 "duration_seconds": evaluation_time,
                 "total_evaluations": len(layers) * len(qa_models)
             }
+        }
+
+    def _build_fast_global_verification_layer(
+        self,
+        source_layers: List[QALayer],
+        original_request: Optional[Any],
+    ) -> QALayer:
+        """Build one synthetic global QA layer from the configured semantic layers."""
+
+        ordered_layers = sorted(source_layers, key=lambda layer: getattr(layer, "order", 0))
+        source_blocks = []
+        deal_breaker_blocks = []
+
+        for index, layer in enumerate(ordered_layers, start=1):
+            deal_breaker_criteria = getattr(layer, "deal_breaker_criteria", None)
+            if deal_breaker_criteria:
+                deal_breaker_blocks.append(f"- {layer.name}: {deal_breaker_criteria}")
+
+            source_blocks.append(
+                "\n".join(
+                    [
+                        f"Source layer {index}: {layer.name}",
+                        f"Description: {getattr(layer, 'description', '')}",
+                        f"Criteria: {getattr(layer, 'criteria', '')}",
+                        f"Minimum score: {getattr(layer, 'min_score', None)}",
+                        f"Mandatory: {getattr(layer, 'is_mandatory', False)}",
+                        f"Deal-breaker criteria: {deal_breaker_criteria or 'None'}",
+                    ]
+                )
+            )
+
+        min_global_score = float(getattr(original_request, "min_global_score", 8.0) or 8.0)
+        criteria = f"""
+Perform a read-only final global QA verification of the content.
+
+This is a fast global verification pass, not a per-layer re-evaluation. Check
+whether the final content satisfies the whole semantic QA contract in one global
+review. Use the source layer definitions below as the contract.
+
+Approval threshold:
+- Give one global score from 0 to 10.
+- The content passes this synthetic global review only when the score is at
+  least {min_global_score:.2f}.
+- Do not request or propose edits.
+- Do not claim that each source layer passed individually. Report any concerns
+  by mapping them back to the relevant source layer names.
+
+Source QA layers:
+{chr(10).join(source_blocks)}
+""".strip()
+
+        deal_breaker_criteria = None
+        if deal_breaker_blocks:
+            deal_breaker_criteria = (
+                "Any issue that truly satisfies one of these source deal-breaker criteria:\n"
+                + "\n".join(deal_breaker_blocks)
+            )
+
+        synthetic_layer = QALayer(
+            name="Final Global QA Verification",
+            description="Fast global read-only verification across all semantic QA criteria",
+            criteria=criteria,
+            min_score=min_global_score,
+            is_mandatory=True,
+            deal_breaker_criteria=deal_breaker_criteria,
+            concise_on_pass=True,
+            order=max((getattr(layer, "order", 0) for layer in ordered_layers), default=0) + 1,
+            include_input_images=any(getattr(layer, "include_input_images", False) for layer in ordered_layers),
+        )
+        estimated_tokens = self._estimate_fast_global_tokens(
+            "\n".join(
+                value
+                for value in [synthetic_layer.criteria, synthetic_layer.deal_breaker_criteria]
+                if value
+            )
+        )
+        token_limit = self._fast_global_token_limit()
+        if estimated_tokens > token_limit:
+            raise ValueError(
+                "fast_global final verification synthetic criteria exceeds "
+                f"the safe token budget ({estimated_tokens} estimated tokens > {token_limit}). "
+                "Use full_parallel or full_sequential for this QA contract."
+            )
+
+        return synthetic_layer
+
+    def _resolve_final_verification_layers(
+        self,
+        layers: List[QALayer],
+        strategy: str,
+        original_request: Optional[Any],
+    ) -> Tuple[List[QALayer], List[QALayer], str]:
+        """Resolve real/synthetic layers and approval contract for final verification."""
+
+        if strategy != "fast_global":
+            return list(layers), list(layers), "per_layer"
+
+        deterministic_layers: List[QALayer] = []
+        semantic_layers: List[QALayer] = []
+        for layer in layers:
+            if self.bypass_engine.can_bypass_layer(layer, original_request):
+                deterministic_layers.append(layer)
+            else:
+                semantic_layers.append(layer)
+
+        final_layers = list(deterministic_layers)
+        if semantic_layers:
+            final_layers.append(
+                self._build_fast_global_verification_layer(semantic_layers, original_request)
+            )
+
+        return final_layers, semantic_layers, "fast_global"
+
+    async def evaluate_final_verification(
+        self,
+        content: str,
+        layers: List[QALayer],
+        qa_models: List[Any],
+        *,
+        strategy: str,
+        progress_callback: Optional[callable] = None,
+        original_request: Optional[Any] = None,
+        stream_callback: Optional[callable] = None,
+        session_id: Optional[str] = None,
+        cancel_callback: CancelCallback = None,
+        usage_tracker: Optional[UsageTracker] = None,
+        iteration: Optional[int] = None,
+        phase_logger: Optional["PhaseLogger"] = None,
+        marker_mode: str = "phrase",
+        marker_length: Optional[int] = None,
+        word_map_formatted: Optional[str] = None,
+        draft_map_formatted: Optional[str] = None,
+        input_images: Optional[List["ImageData"]] = None,
+        evidence_grounding_config: Optional[EvidenceGroundingConfig] = None,
+        context_for_grounding: Optional[str] = None,
+        content_for_bypass: Optional[str] = None,
+        model_alias_registry: Optional[ModelAliasRegistry] = None,
+    ) -> Dict[str, Any]:
+        """
+        Run a read-only final QA verification pass.
+
+        Unlike the normal comprehensive path, this method collects all layer
+        results before approval. It never asks QA for smart-edit ranges because
+        callers pass a request clone with smart_editing_mode='never'.
+        """
+
+        from models import QAModelConfig
+
+        def get_model_name(model: Any) -> str:
+            return model.model if isinstance(model, QAModelConfig) else model
+
+        async def _abort_if_cancelled(message: str) -> None:
+            if cancel_callback and await cancel_callback():
+                if progress_callback:
+                    await progress_callback(message)
+                raise QAProcessCancelled()
+
+        strategy = strategy if strategy in {"full_parallel", "full_sequential", "fast_global"} else "full_parallel"
+        qa_model_names = [get_model_name(model) for model in qa_models]
+        evaluation_layers, source_semantic_layers, approval_contract = self._resolve_final_verification_layers(
+            layers,
+            strategy,
+            original_request,
+        )
+        ordered_layers = sorted(evaluation_layers, key=lambda layer: getattr(layer, "order", 0))
+        start_time = datetime.now()
+
+        async def evaluate_grounding() -> Tuple[str, Dict[str, QAEvaluation], Optional[EvidenceGroundingResult]]:
+            await _abort_if_cancelled("Cancelled before final evidence grounding.")
+            grounding_config = evidence_grounding_config
+            if not grounding_config or not grounding_config.enabled:
+                return "Evidence Grounding", {}, None
+            if progress_callback:
+                await progress_callback("Final verification: Evidence Grounding")
+            qa_eval, full_result = await self._evaluate_evidence_grounding(
+                content=content,
+                context=context_for_grounding or getattr(original_request, "prompt", ""),
+                grounding_config=grounding_config,
+                progress_callback=progress_callback,
+                stream_callback=stream_callback,
+                usage_tracker=usage_tracker,
+                extra_verbose=getattr(original_request, "extra_verbose", False) if original_request else False,
+                phase_logger=phase_logger,
+            )
+            return "Evidence Grounding", {"evidence_grounding_logprobs": qa_eval}, full_result
+
+        async def evaluate_layer(layer: QALayer) -> Tuple[str, Dict[str, QAEvaluation], Optional[Any]]:
+            await _abort_if_cancelled(f"Cancelled before final verification layer {layer.name}.")
+            if progress_callback:
+                await progress_callback(f"Final verification: {layer.name}")
+            layer_results, majority_deal_breaker = await self._evaluate_single_semantic_layer(
+                content=content,
+                layer=layer,
+                qa_models=qa_models,
+                qa_model_names=qa_model_names,
+                progress_callback=progress_callback,
+                original_request=original_request,
+                stream_callback=stream_callback,
+                session_id=session_id,
+                cancel_callback=cancel_callback,
+                usage_tracker=usage_tracker,
+                iteration=iteration,
+                phase_logger=phase_logger,
+                marker_mode=marker_mode,
+                marker_length=marker_length,
+                word_map_formatted=word_map_formatted,
+                draft_map_formatted=draft_map_formatted,
+                input_images=input_images,
+                content_for_bypass=content_for_bypass,
+                model_alias_registry=model_alias_registry,
+            )
+            return layer.name, layer_results, majority_deal_breaker
+
+        execution_items: List[Tuple[str, Any]] = [("layer", layer) for layer in ordered_layers]
+        if evidence_grounding_config and evidence_grounding_config.enabled:
+            execution_items.append(("evidence_grounding", None))
+
+        results: Dict[str, Dict[str, QAEvaluation]] = {}
+        majority_deal_breakers: List[Dict[str, Any]] = []
+        evidence_grounding_result: Optional[EvidenceGroundingResult] = None
+
+        if strategy == "full_parallel":
+            max_requests = max(1, int(getattr(config, "MAX_CONCURRENT_REQUESTS", 10) or 10))
+            models_per_layer = max(1, len(qa_model_names))
+            max_layer_concurrency = max(1, max_requests // models_per_layer)
+            semaphore = asyncio.Semaphore(max_layer_concurrency)
+
+            async def run_item(item: Tuple[str, Any]) -> Tuple[str, Dict[str, QAEvaluation], Optional[Any]]:
+                async with semaphore:
+                    item_type, payload = item
+                    if item_type == "evidence_grounding":
+                        return await evaluate_grounding()
+                    return await evaluate_layer(payload)
+
+            item_results = await asyncio.gather(*(run_item(item) for item in execution_items))
+        else:
+            item_results = []
+            for item_type, payload in execution_items:
+                if item_type == "evidence_grounding":
+                    item_results.append(await evaluate_grounding())
+                else:
+                    item_results.append(await evaluate_layer(payload))
+
+        for name, layer_results, extra in item_results:
+            if layer_results:
+                results[name] = layer_results
+            if name == "Evidence Grounding":
+                evidence_grounding_result = extra
+            elif extra:
+                majority_deal_breakers.append({"layer": name, "info": extra})
+
+        summary = self._calculate_summary(results, evaluation_layers)
+        layers_summary: Dict[str, Dict[str, Any]] = {}
+        for layer in evaluation_layers:
+            layer_results = results.get(layer.name, {})
+            scores = [
+                evaluation.score
+                for evaluation in layer_results.values()
+                if getattr(evaluation, "score", None) is not None
+            ]
+            average_score = sum(scores) / len(scores) if scores else 0.0
+            layers_summary[layer.name] = {
+                "passed": bool(scores) and average_score >= layer.min_score,
+                "score": average_score,
+                "min_score": layer.min_score,
+                "deal_breaker": any(
+                    bool(getattr(evaluation, "deal_breaker", False))
+                    for evaluation in layer_results.values()
+                ),
+                "order": getattr(layer, "order", 0),
+            }
+
+        if "Evidence Grounding" in results:
+            grounding_eval = results["Evidence Grounding"].get("evidence_grounding_logprobs")
+            layers_summary["Evidence Grounding"] = {
+                "passed": bool(getattr(evidence_grounding_result, "passed", True)) if evidence_grounding_result else True,
+                "score": getattr(grounding_eval, "score", 0.0) if grounding_eval else 0.0,
+                "min_score": None,
+                "deal_breaker": bool(getattr(grounding_eval, "deal_breaker", False)) if grounding_eval else False,
+                "order": get_effective_order(evidence_grounding_config) if evidence_grounding_config else 0,
+            }
+
+        summary.update(
+            {
+                "final_verification": True,
+                "strategy": strategy,
+                "approval_contract": approval_contract,
+                "layers_summary": layers_summary,
+                "force_iteration": bool(majority_deal_breakers)
+                or bool(
+                    evidence_grounding_result
+                    and not evidence_grounding_result.passed
+                    and evidence_grounding_result.triggered_action in ("deal_breaker", "regenerate")
+                ),
+                "majority_deal_breakers": majority_deal_breakers,
+            }
+        )
+
+        end_time = datetime.now()
+        return {
+            "qa_results": results,
+            "summary": summary,
+            "critical_issues": self._identify_critical_issues(results),
+            "layer_statistics": self._calculate_layer_statistics(results, evaluation_layers),
+            "model_statistics": self._calculate_model_statistics(results, qa_model_names),
+            "evidence_grounding": evidence_grounding_result,
+            "evaluated_layers": evaluation_layers,
+            "source_semantic_layers": source_semantic_layers,
+            "approval_contract": approval_contract,
+            "evaluation_metadata": {
+                "start_time": start_time.isoformat(),
+                "end_time": end_time.isoformat(),
+                "duration_seconds": (end_time - start_time).total_seconds(),
+                "total_evaluations": sum(len(layer_results) for layer_results in results.values()),
+            },
         }
     
     def _calculate_summary(self, qa_results: Dict, layers: List[QALayer]) -> Dict[str, Any]:
@@ -1221,54 +1563,6 @@ class QAEngine:
         
         return validation_results
     
-    def _check_deal_breaker_consensus(self, layer_results: Dict[str, Any], total_models: List[str]) -> Dict[str, Any]:
-        """
-        Check if there's a majority consensus for deal-breakers in current evaluations
-        """
-        return build_deal_breaker_consensus(layer_results, total_models)
-    
-    def _create_immediate_stop_result(self, partial_results: Dict[str, Any], consensus_info: Dict[str, Any]) -> Dict[str, Any]:
-        """Create result structure for immediate stop due to deal-breaker consensus"""
-        
-        all_scores = []
-        total_evals = 0
-        
-        for layer_results in partial_results.values():
-            for evaluation in layer_results.values():
-                if hasattr(evaluation, 'score') and evaluation.score is not None:
-                    all_scores.append(evaluation.score)
-                    total_evals += 1
-        
-        return {
-            "qa_results": partial_results,
-            "summary": {
-                "average_score": sum(all_scores) / len(all_scores) if all_scores else 0.0,
-                "min_score": min(all_scores) if all_scores else 0.0,
-                "max_score": max(all_scores) if all_scores else 0.0,
-                "total_evaluations": total_evals,
-                "deal_breakers_count": consensus_info['deal_breaker_count'],
-                "has_deal_breakers": True,
-                "immediate_stop": True,
-                "stop_reason": "majority_deal_breaker_consensus"
-            },
-            "critical_issues": [
-                {
-                    "type": "majority_deal_breaker",
-                    "description": f"Majority consensus ({consensus_info['deal_breaker_count']}/{consensus_info['total_evaluated']}) detected deal-breakers",
-                    "details": consensus_info["deal_breaker_details"]
-                }
-            ],
-            "consensus_info": consensus_info,
-            "layer_statistics": {},
-            "model_statistics": {},
-            "evaluation_metadata": {
-                "start_time": datetime.now().isoformat(),
-                "end_time": datetime.now().isoformat(),
-                "duration_seconds": 0.0,
-                "total_evaluations": total_evals
-            }
-        }
-
     def _resolve_qa_scheduler_policy(self, original_request: Optional[Any], configured_count: int) -> QASchedulerPolicy:
         """Resolve public request knobs into the internal scheduler policy."""
 
@@ -1341,6 +1635,8 @@ class QAEngine:
         input_images: Optional[List["ImageData"]] = None,
         edit_history: Optional[str] = None,
         model_alias_registry: Optional[ModelAliasRegistry] = None,
+        project_id: Optional[str] = None,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
     ) -> QASchedulerResult:
         """Evaluate a semantic QA layer through the shared scheduler primitive."""
 
@@ -1437,6 +1733,9 @@ class QAEngine:
                         input_images=input_images,
                         edit_history=edit_history,
                         model_alias_registry=model_alias_registry,
+                        session_id=session_id,
+                        project_id=project_id,
+                        tool_event_callback=tool_event_callback,
                     ),
                     timeout=slot.timeout_seconds,
                 )
@@ -1456,11 +1755,13 @@ class QAEngine:
                 ) from parse_error
             except AIRequestError as api_err:
                 failure_count = self._increment_model_failure(session_id, slot.model_name)
+                cause = getattr(api_err, "cause", None)
                 logger.error(
                     "QA model %s failed due to provider error in layer %s: %s",
                     slot.model_name,
                     layer.name,
                     api_err,
+                    exc_info=True,
                 )
                 if phase_logger:
                     phase_logger.info(
@@ -1483,6 +1784,9 @@ class QAEngine:
                         "attempts": getattr(api_err, "attempts", None),
                         "provider": getattr(api_err, "provider", None),
                         "failure_count": failure_count,
+                        "exception_class": type(api_err).__name__,
+                        "cause_class": type(cause).__name__ if cause is not None else None,
+                        "cause_message": str(cause)[:500] if cause is not None else None,
                     },
                     original_exception=api_err,
                 ) from api_err
@@ -1636,6 +1940,8 @@ class QAEngine:
         content_for_bypass: Optional[str] = None,
         edit_history: Optional[str] = None,
         model_alias_registry: Optional[ModelAliasRegistry] = None,
+        project_id: Optional[str] = None,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
     ) -> Tuple[Dict[str, QAEvaluation], Optional[Dict[str, Any]]]:
         """
         Evaluate a single semantic QA layer.
@@ -1786,6 +2092,8 @@ class QAEngine:
                 input_images=input_images,
                 edit_history=edit_history,
                 model_alias_registry=model_alias_registry,
+                project_id=project_id,
+                tool_event_callback=tool_event_callback,
             )
             layer_results = scheduler_result.layer_results
             if scheduler_result.majority_deal_breaker:

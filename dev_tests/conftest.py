@@ -186,24 +186,20 @@ def mock_anthropic_response():
 
 @pytest.fixture
 def gran_sabio_approve_response():
-    """Gran Sabio approval response template."""
-    return """
-[DECISION]APPROVED[/DECISION]
-[SCORE]8.5[/SCORE]
-[REASON]Content meets all quality criteria[/REASON]
-[MODIFICATIONS_MADE]false[/MODIFICATIONS_MADE]
-"""
+    """Gran Sabio approval response template (JSON_STRUCTURED contract)."""
+    return (
+        '{"decision": "APPROVED", "reason": "Content meets all quality criteria", '
+        '"score": 8.5, "modifications_made": false, "final_content": null}'
+    )
 
 
 @pytest.fixture
 def gran_sabio_reject_response():
-    """Gran Sabio rejection response template."""
-    return """
-[DECISION]REJECTED[/DECISION]
-[SCORE]4.0[/SCORE]
-[REASON]Critical factual errors detected[/REASON]
-[MODIFICATIONS_MADE]false[/MODIFICATIONS_MADE]
-"""
+    """Gran Sabio rejection response template (JSON_STRUCTURED contract)."""
+    return (
+        '{"decision": "REJECTED", "reason": "Critical factual errors detected", '
+        '"score": 4.0, "modifications_made": false, "final_content": null}'
+    )
 
 
 @pytest.fixture

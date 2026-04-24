@@ -9,6 +9,7 @@ import re
 import json as json_stdlib
 from typing import Any, Dict, List, Optional, Tuple
 from models import ContentRequest, QALayer
+from phrase_frequency_config import is_phrase_frequency_active
 import logging
 
 logger = logging.getLogger(__name__)
@@ -521,7 +522,10 @@ def prepare_qa_layers_with_word_count(request: ContentRequest, preflight_result=
                     request.lexical_diversity.metrics,
                 )
 
-    if request.phrase_frequency and request.phrase_frequency.enabled:
+    if is_phrase_frequency_active(
+        request.phrase_frequency,
+        context="synthetic phrase-frequency layer injection",
+    ):
         existing_names = {layer.name for layer in qa_layers}
         if "Phrase Frequency Guard" not in existing_names:
             try:
@@ -542,7 +546,10 @@ def prepare_qa_layers_with_word_count(request: ContentRequest, preflight_result=
                 )
 
     # Inject cumulative repetition layer if cumulative context is provided
-    if request.cumulative_text and request.phrase_frequency and request.phrase_frequency.enabled:
+    if request.cumulative_text and is_phrase_frequency_active(
+        request.phrase_frequency,
+        context="synthetic cumulative repetition layer injection",
+    ):
         existing_names = {layer.name for layer in qa_layers}
         if "Cumulative Repetition Guard" not in existing_names:
             cumulative_layer = QALayer(

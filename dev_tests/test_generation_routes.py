@@ -1,7 +1,9 @@
 """Unit tests for generation route helpers."""
 
+from types import SimpleNamespace
+
 from models import ContentRequest
-from core.generation_routes import _estimate_tokens_for_word_target
+from core.generation_routes import _estimate_tokens_for_word_target, _model_default_max_tokens
 
 
 class TestEstimateTokensForWordTarget:
@@ -39,3 +41,19 @@ class TestEstimateTokensForWordTarget:
         )
 
         assert _estimate_tokens_for_word_target(request) == 8000
+
+
+class TestModelDefaultMaxTokens:
+    """Tests for model-spec default generation budgets."""
+
+    def test_uses_model_output_tokens_from_specs(self, monkeypatch):
+        fake_config = SimpleNamespace(get_model_info=lambda _model: {"output_tokens": 32000})
+        monkeypatch.setattr("core.generation_routes.config", fake_config)
+
+        assert _model_default_max_tokens("claude-opus-4-7") == 32000
+
+    def test_falls_back_to_8192_when_specs_have_no_output_limit(self, monkeypatch):
+        fake_config = SimpleNamespace(get_model_info=lambda _model: {})
+        monkeypatch.setattr("core.generation_routes.config", fake_config)
+
+        assert _model_default_max_tokens("unknown-output-model") == 8192

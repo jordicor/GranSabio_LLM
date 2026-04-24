@@ -402,6 +402,28 @@ class TestAsyncProjectManagement:
             await client.reserve_project()
 
     @pytest.mark.asyncio
+    async def test_reserve_project_success_body_read_failure_raises_client_error(self, client):
+        """Given: Reserve succeeds but JSON body is truncated, Then: Raises GranSabioClientError."""
+        from client import GranSabioClientError
+
+        response = AsyncMock()
+        response.status = 200
+        response.json = AsyncMock(
+            side_effect=aiohttp.ClientPayloadError("truncated response body")
+        )
+        response.text = AsyncMock(return_value="")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+
+        client._session.request = AsyncMock(return_value=response)
+
+        with pytest.raises(GranSabioClientError) as exc:
+            await client.reserve_project()
+
+        assert "Failed to read JSON response from /project/new" in str(exc.value)
+        assert client._session.request.call_count == 1
+
+    @pytest.mark.asyncio
     async def test_start_project(self, client, mock_response):
         """Given: Valid project_id, Then: Starts project."""
         mock_response.json.return_value = {"status": "started"}
@@ -412,6 +434,28 @@ class TestAsyncProjectManagement:
         assert result["status"] == "started"
 
     @pytest.mark.asyncio
+    async def test_start_project_success_body_read_failure_raises_client_error(self, client):
+        """Given: Project start succeeds but JSON body is truncated, Then: Raises GranSabioClientError."""
+        from client import GranSabioClientError
+
+        response = AsyncMock()
+        response.status = 200
+        response.json = AsyncMock(
+            side_effect=aiohttp.ClientPayloadError("truncated response body")
+        )
+        response.text = AsyncMock(return_value="")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+
+        client._session.request = AsyncMock(return_value=response)
+
+        with pytest.raises(GranSabioClientError) as exc:
+            await client.start_project("proj-1")
+
+        assert "Failed to read JSON response from /project/start/proj-1" in str(exc.value)
+        assert client._session.request.call_count == 1
+
+    @pytest.mark.asyncio
     async def test_stop_project(self, client, mock_response):
         """Given: Active project, Then: Stops project."""
         mock_response.json.return_value = {"status": "stopped"}
@@ -420,6 +464,28 @@ class TestAsyncProjectManagement:
         result = await client.stop_project("proj-1")
 
         assert result["status"] == "stopped"
+
+    @pytest.mark.asyncio
+    async def test_stop_project_success_body_read_failure_raises_client_error(self, client):
+        """Given: Project stop succeeds but JSON body is truncated, Then: Raises GranSabioClientError."""
+        from client import GranSabioClientError
+
+        response = AsyncMock()
+        response.status = 200
+        response.json = AsyncMock(
+            side_effect=aiohttp.ClientPayloadError("truncated response body")
+        )
+        response.text = AsyncMock(return_value="")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+
+        client._session.request = AsyncMock(return_value=response)
+
+        with pytest.raises(GranSabioClientError) as exc:
+            await client.stop_project("proj-1")
+
+        assert "Failed to read JSON response from /project/stop/proj-1" in str(exc.value)
+        assert client._session.request.call_count == 1
 
 
 # ==============================================================================
@@ -473,6 +539,87 @@ class TestAsyncGenerate:
         assert "No session_id" in str(exc.value)
 
     @pytest.mark.asyncio
+    async def test_generate_success_body_read_failure_raises_client_error(self, client):
+        """Given: POST /generate succeeds but JSON body is truncated, Then: Raises GranSabioClientError."""
+        from client import GranSabioClientError
+
+        response = AsyncMock()
+        response.status = 200
+        response.json = AsyncMock(
+            side_effect=aiohttp.ClientPayloadError("truncated response body")
+        )
+        response.text = AsyncMock(return_value="")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+
+        client._session.request = AsyncMock(return_value=response)
+
+        with pytest.raises(GranSabioClientError) as exc:
+            await client.generate(prompt="Test", qa_layers=[], wait_for_completion=False)
+
+        assert "Failed to read JSON response from /generate" in str(exc.value)
+        assert client._session.request.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_generate_omits_max_tokens_when_not_provided(self, client, mock_response):
+        """Given: max_tokens omitted, Then: Payload lets server choose model default."""
+        mock_response.json.return_value = {"session_id": "sess-1", "status": "started"}
+        client._session.request = AsyncMock(return_value=mock_response)
+
+        await client.generate(
+            prompt="Test",
+            qa_layers=[],
+            wait_for_completion=False
+        )
+
+        payload = client._session.request.call_args[1]["json"]
+        assert "max_tokens" not in payload
+
+    @pytest.mark.asyncio
+    async def test_generate_includes_explicit_max_tokens(self, client, mock_response):
+        """Given: max_tokens provided, Then: Included in payload."""
+        mock_response.json.return_value = {"session_id": "sess-1", "status": "started"}
+        client._session.request = AsyncMock(return_value=mock_response)
+
+        await client.generate(
+            prompt="Test",
+            max_tokens=12000,
+            qa_layers=[],
+            wait_for_completion=False
+        )
+
+        payload = client._session.request.call_args[1]["json"]
+        assert payload["max_tokens"] == 12000
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status_code", "read_error"),
+        [
+            (500, aiohttp.ClientPayloadError("truncated response body")),
+            (422, asyncio.TimeoutError()),
+        ],
+    )
+    async def test_generate_error_body_uses_read_error_text(self, client, status_code, read_error):
+        """Given: POST /generate error body read fails, Then: Degrades without leaking aiohttp read errors."""
+        from client import GranSabioClientError
+
+        response = AsyncMock()
+        response.status = status_code
+        response.json = AsyncMock(return_value={})
+        response.text = AsyncMock(side_effect=read_error)
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+
+        client._session.request = AsyncMock(return_value=response)
+
+        with pytest.raises(GranSabioClientError) as exc:
+            await client.generate(prompt="Test", qa_layers=[])
+
+        assert "<body unreadable>" in str(exc.value)
+        assert exc.value.status_code == status_code
+        assert response.text.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_get_status_success(self, client, mock_response):
         """Given: Valid session_id, Then: Returns status."""
         mock_response.json.return_value = {
@@ -515,6 +662,28 @@ class TestAsyncGenerate:
         result = await client.stop_session("sess-1")
 
         assert result["status"] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_stop_session_success_body_read_failure_raises_client_error(self, client):
+        """Given: Session stop succeeds but JSON body is truncated, Then: Raises GranSabioClientError."""
+        from client import GranSabioClientError
+
+        response = AsyncMock()
+        response.status = 200
+        response.json = AsyncMock(
+            side_effect=aiohttp.ClientPayloadError("truncated response body")
+        )
+        response.text = AsyncMock(return_value="")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+
+        client._session.request = AsyncMock(return_value=response)
+
+        with pytest.raises(GranSabioClientError) as exc:
+            await client.stop_session("sess-1")
+
+        assert "Failed to read JSON response from /stop/sess-1" in str(exc.value)
+        assert client._session.request.call_count == 1
 
 
 # ==============================================================================
@@ -766,6 +935,56 @@ class TestAsyncAttachments:
             await client.upload_attachment("user", b"content", "file.txt")
 
     @pytest.mark.asyncio
+    async def test_upload_attachment_success_body_read_failure_raises_client_error(self, client):
+        """Given: Multipart upload succeeds but JSON body is truncated, Then: Raises GranSabioClientError."""
+        from client import GranSabioClientError
+
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(
+            side_effect=aiohttp.ClientPayloadError("truncated response body")
+        )
+        mock_response.text = AsyncMock(return_value="")
+
+        mock_cm = MagicMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_cm.__aexit__ = AsyncMock(return_value=None)
+
+        client._session.post = MagicMock(return_value=mock_cm)
+
+        with pytest.raises(GranSabioClientError) as exc:
+            await client.upload_attachment("user", b"content", "file.txt")
+
+        assert "Failed to read JSON response from /attachments" in str(exc.value)
+        assert client._session.post.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_upload_attachment_base64_success_body_read_failure_raises_client_error(self, client):
+        """Given: Base64 upload succeeds but JSON body is truncated, Then: Raises GranSabioClientError."""
+        from client import GranSabioClientError
+
+        response = AsyncMock()
+        response.status = 200
+        response.json = AsyncMock(
+            side_effect=aiohttp.ClientPayloadError("truncated response body")
+        )
+        response.text = AsyncMock(return_value="")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+
+        client._session.request = AsyncMock(return_value=response)
+
+        with pytest.raises(GranSabioClientError) as exc:
+            await client.upload_attachment_base64(
+                username="test-user",
+                content_base64="SGVsbG8=",
+                filename="test.txt",
+            )
+
+        assert "Failed to read JSON response from /attachments/base64" in str(exc.value)
+        assert client._session.request.call_count == 1
+
+    @pytest.mark.asyncio
     async def test_upload_attachment_base64(self, client, mock_response):
         """Given: Base64 content, Then: Uploads via JSON."""
         mock_response.json.return_value = {"upload_id": "att-456"}
@@ -920,16 +1139,11 @@ class TestAsyncConvenienceMethods:
 
 
 # ==============================================================================
-# Backward Compatibility Tests
+# Module-Level Helpers
 # ==============================================================================
 
-class TestAsyncBackwardCompatibility:
-    """Tests for backward compatibility aliases."""
-
-    def test_async_bioai_client_alias(self):
-        """Given: AsyncBioAIClient import, Then: Same as AsyncGranSabioClient."""
-        from client import AsyncGranSabioClient, AsyncBioAIClient
-        assert AsyncBioAIClient is AsyncGranSabioClient
+class TestAsyncCreateClientHelper:
+    """Tests for the module-level async create_client() convenience function."""
 
     @pytest.mark.asyncio
     async def test_create_client_function(self):
@@ -997,9 +1211,25 @@ class TestAsyncBodyReadTransient:
             await client.get_result("sess-xyz")
 
     @pytest.mark.asyncio
-    async def test_get_status_error_path_text_read_converts_timeout(self, client):
-        """When the error-path text() itself times out, also convert to transient."""
+    async def test_get_status_converts_json_decode_error(self, client):
         from client import TransientGranSabioError
+
+        response = AsyncMock()
+        response.status = 200
+        response.json = AsyncMock(side_effect=ValueError("unterminated JSON"))
+        response.text = AsyncMock(return_value="")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+
+        client._request = AsyncMock(return_value=response)
+
+        with pytest.raises(TransientGranSabioError):
+            await client.get_status("sess-json")
+
+    @pytest.mark.asyncio
+    async def test_get_status_error_path_text_read_fails_fast(self, client):
+        """HTTP error responses must not become retryable when their body is unreadable."""
+        from client import GranSabioClientError
 
         response = AsyncMock()
         response.status = 500  # triggers the error path that reads text
@@ -1010,8 +1240,10 @@ class TestAsyncBodyReadTransient:
 
         client._request = AsyncMock(return_value=response)
 
-        with pytest.raises(TransientGranSabioError):
+        with pytest.raises(GranSabioClientError) as exc_info:
             await client.get_status("sess-timeout")
+        assert exc_info.value.status_code == 500
+        assert "<body unreadable>" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_call_with_retry_retries_body_read_failure(self, client):
@@ -1049,3 +1281,27 @@ class TestAsyncBodyReadTransient:
             )
         assert result == {"status": "completed"}
         assert client._request.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_fetch_result_polling_non_retryable_status_body_read_fails_fast(self, client):
+        """A truncated 500 body must not become a retryable polling failure."""
+        from client import GranSabioClientError
+
+        response = AsyncMock()
+        response.status = 500
+        response.json = AsyncMock(side_effect=aiohttp.ClientPayloadError("truncated"))
+        response.text = AsyncMock(return_value="server error")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+
+        client._request = AsyncMock(return_value=response)
+
+        with pytest.raises(GranSabioClientError) as exc_info:
+            await client._fetch_result_polling(
+                "sess-500",
+                timeout_seconds=1,
+                poll_interval=0,
+            )
+
+        assert exc_info.value.status_code == 500
+        assert client._request.call_count == 1

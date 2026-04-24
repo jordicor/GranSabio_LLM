@@ -1,5 +1,6 @@
 """Focused regression tests for model identity blinding."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -101,6 +102,57 @@ def test_model_alias_registry_uses_slots_not_real_model_identity():
     internal_snapshot = json.dumps(registry.internal_snapshot(), ensure_ascii=True)
     assert "real-qa-model" in internal_snapshot
     assert "real-generator-model" in internal_snapshot
+
+
+def test_disabled_catalog_model_raises_in_from_request_and_register_slot():
+    fake_config = SimpleNamespace(
+        model_specs={
+            "model_specifications": {
+                "openai": {
+                    "disabled-model": {
+                        "model_id": "disabled-model",
+                        "enabled": False,
+                    }
+                }
+            },
+            "aliases": {},
+        }
+    )
+    request = ContentRequest(
+        prompt="Write about software testing.",
+        content_type="article",
+        generator_model="disabled-model",
+        qa_models=[],
+        qa_layers=[],
+    )
+
+    with patch("config.config", fake_config):
+        with pytest.raises(RuntimeError, match=r"Model 'disabled-model' is disabled"):
+            ModelAliasRegistry.from_request(request)
+
+        registry = ModelAliasRegistry()
+        with pytest.raises(RuntimeError, match=r"Model 'disabled-model' is disabled"):
+            registry.register_slot(
+                slot_id="generator:0",
+                role="generator",
+                real_model="disabled-model",
+                alias="Generator",
+            )
+
+
+def test_gpt_mocklang_outside_catalog_is_not_classified_as_fake():
+    registry = ModelAliasRegistry()
+
+    slot = registry.register_slot(
+        slot_id="generator:0",
+        role="generator",
+        real_model="gpt-mocklang",
+        alias="Generator",
+    )
+
+    assert slot.model_id is None
+    assert slot.provider is None
+    assert registry.internal_snapshot()["slots"][0]["provider"] is None
 
 
 def test_prompt_guard_blocks_only_system_generated_identity_leaks():
@@ -276,15 +328,13 @@ def test_arbiter_prompt_uses_evaluator_aliases_for_edits_and_conflicts():
     edits = [
         ProposedEdit(
             edit=_Edit("delete", "critical"),
-            source_model="real-qa-model",
-            source_alias="Evaluator A",
+            source_evaluator="Evaluator A",
             source_score=4.0,
             paragraph_key="p1",
         ),
         ProposedEdit(
             edit=_Edit("replace", "minor"),
-            source_model="real-qa-model",
-            source_alias="Evaluator B",
+            source_evaluator="Evaluator B",
             source_score=5.0,
             paragraph_key="p1",
         ),
@@ -397,7 +447,6 @@ def test_prompt_safe_data_rewrites_identity_fields_without_public_both_mode():
     registry = ModelAliasRegistry.from_request(request)
     payload = {
         "model": "generator:0",
-        "source_model": "qa:0",
         "qa_models": ["real-qa-model", "real-qa-model"],
         "usage": {"model_name": "qa:1"},
     }
@@ -406,7 +455,6 @@ def test_prompt_safe_data_rewrites_identity_fields_without_public_both_mode():
     safe_text = json.dumps(safe, ensure_ascii=True)
 
     assert safe["evaluator"] == "Generator"
-    assert safe["source_evaluator"] == "Evaluator A"
     assert safe["qa_evaluators"] == ["Evaluator A", "Evaluator B"]
     assert safe["usage"]["evaluator"] == "Evaluator B"
     assert "real-qa-model" not in safe_text

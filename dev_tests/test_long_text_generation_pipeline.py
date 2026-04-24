@@ -124,13 +124,13 @@ class FakeLongTextAIService:
         payload = self.stream_payloads.pop(0)
         yield payload
 
-    async def generate_content_with_validation_tools(self, *args, **kwargs):
+    async def call_ai_with_validation_tools(self, *args, **kwargs):
         if not self.stream_payloads:
-            raise AssertionError("Unexpected generate_content_with_validation_tools call")
+            raise AssertionError("Unexpected call_ai_with_validation_tools call")
         payload = self.stream_payloads.pop(0)
         validation_callback = kwargs["validation_callback"]
         validation_result = validation_callback(payload)
-        assert validation_result["valid"] is True
+        assert validation_result.approved is True
         return payload, {"rounds": 1, "validation": validation_result}
 
 

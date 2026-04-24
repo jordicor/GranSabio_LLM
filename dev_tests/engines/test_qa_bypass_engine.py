@@ -134,7 +134,8 @@ def mock_phrase_frequency_config():
     """Create a mock phrase frequency config."""
     config = Mock()
     config.enabled = True
-    config.to_settings = Mock(return_value=Mock(rules=[]))
+    config.rules = [Mock()]
+    config.to_settings = Mock(return_value=Mock(rules=[Mock()]))
     config.build_layer = Mock(return_value=QALayer(
         name="Phrase Frequency Guard",
         description="Checks for phrase repetition",
@@ -689,6 +690,24 @@ class TestBypassWordCountEvaluation:
 
         assert "content" in result["gpt-4o"].feedback
         assert "JSON extraction" in result["gpt-4o"].feedback
+
+    @patch('qa_bypass_engine.evaluate_word_count_check')
+    def test_content_type_json_alias_skips_bypass_when_no_text_field_exists(
+        self, mock_check, bypass_engine, word_count_layer, mock_request_with_word_count
+    ):
+        mock_request_with_word_count.json_output = False
+        mock_request_with_word_count.content_type = "json"
+        mock_request_with_word_count.target_field = None
+
+        result = bypass_engine._bypass_word_count_evaluation(
+            '{"ids": [1, 2, 3]}',
+            word_count_layer,
+            ["gpt-4o"],
+            mock_request_with_word_count,
+        )
+
+        assert result == {}
+        mock_check.assert_not_called()
 
     @patch('qa_bypass_engine.evaluate_word_count_check')
     def test_evaluation_has_correct_layer_name(

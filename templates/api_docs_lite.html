@@ -25,7 +25,7 @@
 <section id="generate" class="docs-section">
   <h2 class="docs-subheading">Generate Content</h2>
   <p>Initiates content generation with multi-layer QA evaluation. Returns a session ID for tracking progress.</p>
-  <p>JSON Retry Mode: When json_retry_without_iteration is true, JSON validation errors trigger automatic retries that do not consume the main iteration count. The number of retries is controlled by the MAX_JSON_RETRY_ATTEMPTS env...</p>
+  <p>JSON output uses explicit contracts: schema-free requests use JSON_LOOSE (extract and validate the first top-level object or array from common AI wrappers), while non-empty object schemas use JSON_STRUCTURED. JSON retry without iteration applies only to standard non-tool-loop generation paths.</p>
   <div class="parameter-table">
     <div class="param-row">
       <div class="param-name required">prompt</div>
@@ -40,32 +40,32 @@
     <div class="param-row">
       <div class="param-name">content_type</div>
       <div class="param-type">string</div>
-      <div class="param-desc">Type of content: biography, script, novel, article, essay, technical, creative</div>
+      <div class="param-desc">Type of content: biography, script, novel, article, essay, technical, creative, or json. content_type="json" is a legacy alias for JSON output.</div>
     </div>
     <div class="param-row">
       <div class="param-name">json_output</div>
       <div class="param-type">boolean</div>
-      <div class="param-desc">Set to true to request JSON-formatted output (with guard validation) while keeping the declared content_type</div>
+      <div class="param-desc">Set to true to request JSON output while keeping the declared content_type. Without json_schema, JSON_LOOSE extracts the first object or array from common AI wrappers, unwraps code fences, applies conservative repairs, and rejects missing JSON, unrecoverable truncation, expectation failures, and top-level scalars.</div>
     </div>
     <div class="param-row">
       <div class="param-name">json_retry_without_iteration</div>
       <div class="param-type">boolean</div>
-      <div class="param-desc">When true, JSON validation errors trigger retries that do NOT consume main iterations. Controlled by MAX_JSON_RETRY_ATTEMPTS env var (default: 2 retries)</div>
+      <div class="param-desc">When true, JSON validation errors on standard non-tool-loop generation trigger retries that do NOT consume main iterations. Tool-loop JSON contract errors fail fast. Controlled by MAX_JSON_RETRY_ATTEMPTS env var (default: 2 retries)</div>
     </div>
     <div class="param-row">
       <div class="param-name">json_schema</div>
       <div class="param-type">object</div>
-      <div class="param-desc">Optional JSON Schema for structured outputs with 100% format guarantee (requires json_output=true). Supported by Grok, Gemini, Claude 4.5/Opus 4.1, GPT-4o, GPT-5, O1/O3, Mistral.</div>
+      <div class="param-desc">Optional non-empty top-level object JSON Schema for JSON_STRUCTURED outputs (requires json_output=true or content_type="json"). json_schema={} is rejected; omit it or pass null for flexible JSON.</div>
     </div>
     <div class="param-row">
       <div class="param-name">json_expectations</div>
       <div class="param-type">array</div>
-      <div class="param-desc">Optional path-based validation rules for specific JSON fields (requires json_output=true). Validates only specified fields without defining complete structure.</div>
+      <div class="param-desc">Optional path-based validation rules for specific JSON fields (requires json_output=true or content_type="json"). Validates only specified fields without defining complete structure.</div>
     </div>
     <div class="param-row">
       <div class="param-name">target_field</div>
       <div class="param-type">string | array</div>
-      <div class="param-desc">Path(s) to primary text field(s) in JSON output using jmespath notation. Examples: "generated_text", "data.content", ["chapter", "notes"]. Smart Edit, QA, and algorithmic guards operate on these fields automatically. Auto-detects if not specified.</div>
+      <div class="param-desc">Path(s) to primary text field(s) in JSON output using jmespath notation. Required only when text validators or QA need a specific string field; pure JSON object/array validation does not require extractable text.</div>
     </div>
     <div class="param-row">
       <div class="param-name">target_field_only</div>
@@ -95,7 +95,7 @@
     <div class="param-row">
       <div class="param-name">max_tokens</div>
       <div class="param-type">integer</div>
-      <div class="param-desc">Maximum tokens for generation (default: 4000, ignored if max_tokens_percentage is specified)</div>
+      <div class="param-desc">Maximum tokens for generation. If omitted, defaults to the selected model's max output from model_specs.json (fallback: 8192). Ignored if max_tokens_percentage is specified.</div>
     </div>
     <div class="param-row">
       <div class="param-name">max_tokens_percentage</div>
@@ -1075,8 +1075,8 @@
 
 <section id="json-schema-structured-outputs" class="docs-section">
   <h2 class="docs-subheading">JSON Schema Structured Outputs</h2>
-  <p>Enables 100% format-compliant JSON outputs via json_schema and provider-native structured-output mechanisms.</p>
-  <p>Supports Grok, Gemini, Claude 4.5/Opus 4.1, GPT-4o, GPT-5, O1/O3, Mistral, with provider-specific wiring under the hood.</p>
+  <p>Enables JSON_STRUCTURED outputs via a non-empty top-level object json_schema and provider-native structured-output mechanisms where available.</p>
+  <p>For schema-free JSON, omit json_schema or pass null to use JSON_LOOSE. JSON_LOOSE extracts and validates top-level objects or arrays; JSON_STRUCTURED currently requires a top-level object schema.</p>
 </section>
 
 <section id="json-validation-comparison" class="docs-section">
@@ -1087,7 +1087,7 @@
     <div class="param-row">
       <div class="param-name">json_schema</div>
       <div class="param-type">object</div>
-      <div class="param-desc">Full JSON Schema sent to the model to constrain generation and used for full-structure validation.</div>
+      <div class="param-desc">Non-empty top-level object JSON Schema sent to the model to constrain generation and used for full-structure validation. json_schema={} is rejected.</div>
     </div>
     <div class="param-row">
       <div class="param-name">json_expectations</div>
@@ -1139,8 +1139,8 @@
 
 <section id="json-retry" class="docs-section">
   <h2 class="docs-subheading">JSON Retry Mode</h2>
-  <p>Automatic JSON error recovery without consuming your main iteration count.</p>
-  <p>Validation failures can be retried with structural error context up to MAX_JSON_RETRY_ATTEMPTS per iteration.</p>
+  <p>Automatic JSON error recovery without consuming your main iteration count on standard non-tool-loop generation paths.</p>
+  <p>Validation failures can be retried with structural error context up to MAX_JSON_RETRY_ATTEMPTS per iteration. If generator validation tools are active, JSON_LOOSE and JSON_STRUCTURED contract failures are raised directly instead of using external retry.</p>
   <div class="parameter-table">
     <div class="param-row">
       <div class="param-name">json_retry_without_iteration</div>
@@ -1158,7 +1158,7 @@
 <section id="error-handling" class="docs-section">
   <h2 class="docs-subheading">Error Handling</h2>
   <p>Uses standard HTTP codes (200, 400, 404, 500) and a JSON error format with detail field.</p>
-  <p>When json_output is enabled, json_guard_history tracks validation attempts; JSON retry mode modifies iteration consumption semantics.</p>
+  <p>When json_output is enabled on the standard path, json_guard_history tracks validation attempts; JSON retry mode modifies iteration consumption semantics. Tool-loop contract errors fail fast and are not recorded as retry attempts.</p>
 </section>
 
 <section id="examples" class="docs-section">

@@ -19,6 +19,129 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+_PROVIDER_NAME_ALIASES = {
+    "anthropic": "claude",
+    "google": "gemini",
+}
+
+
+def _strip_model_prefix(model_name: str) -> str:
+    """Remove any mechanical provider prefix from a model name."""
+    if "/" in model_name:
+        return model_name.rsplit("/", 1)[-1]
+    return model_name
+
+
+def _split_model_suffix(model_name: str) -> tuple[str, Optional[str]]:
+    """Split a mechanical suffix from a model name."""
+    if ":" not in model_name:
+        return model_name, None
+    base_model, suffix = model_name.rsplit(":", 1)
+    return base_model, suffix or None
+
+
+def resolve_model_catalog_entry(model_name: str, model_specs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Resolve a model against the catalog and aliases without validating API keys.
+
+    The returned payload keeps the original lookup separate from the resolved
+    catalog identity so callers can decide whether to raise for disabled models
+    or missing credentials.
+    """
+    raw_model_name = str(model_name or "").strip()
+    if not raw_model_name:
+        return {
+            "matched": False,
+            "enabled": False,
+            "provider": None,
+            "catalog_provider": None,
+            "model_key": None,
+            "catalog_model_id": None,
+            "model_id": None,
+            "model_name": "",
+            "base_model": "",
+            "suffix": None,
+            "model_data": None,
+            "is_test_model": False,
+        }
+
+    model_specs = model_specs or {}
+    aliases = model_specs.get("aliases", {}) or {}
+    specifications = model_specs.get("model_specifications", {}) or {}
+
+    lookup_name = _strip_model_prefix(raw_model_name)
+    base_model, suffix = _split_model_suffix(lookup_name)
+
+    candidates: List[str] = []
+    for candidate in (raw_model_name, lookup_name, base_model):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+        alias_target = aliases.get(candidate)
+        if isinstance(alias_target, str) and alias_target and alias_target not in candidates:
+            candidates.append(alias_target)
+
+    matched_provider: Optional[str] = None
+    matched_model_key: Optional[str] = None
+    matched_model_data: Optional[Dict[str, Any]] = None
+
+    for provider, models in specifications.items():
+        if not isinstance(models, dict):
+            continue
+        for model_key, model_data in models.items():
+            if not isinstance(model_data, dict):
+                continue
+            catalog_model_id = str(model_data.get("model_id", model_key) or model_key)
+            if any(candidate == model_key or candidate == catalog_model_id for candidate in candidates):
+                matched_provider = provider
+                matched_model_key = model_key
+                matched_model_data = model_data
+                break
+        if matched_model_data is not None:
+            break
+
+    if matched_model_data is None:
+        return {
+            "matched": False,
+            "enabled": False,
+            "provider": None,
+            "catalog_provider": None,
+            "model_key": None,
+            "catalog_model_id": None,
+            "model_id": None,
+            "model_name": raw_model_name,
+            "base_model": base_model,
+            "suffix": suffix,
+            "model_data": None,
+            "is_test_model": False,
+        }
+
+    enabled = matched_model_data.get("enabled", True) is not False
+    is_test_model = matched_provider == "fake" or bool(matched_model_data.get("is_test_model"))
+    provider_name = _PROVIDER_NAME_ALIASES.get(matched_provider, matched_provider)
+    if is_test_model:
+        provider_name = "fake"
+
+    catalog_model_id = str(matched_model_data.get("model_id", matched_model_key) or matched_model_key)
+    model_id = catalog_model_id
+    if is_test_model and suffix and base_model in {matched_model_key, catalog_model_id}:
+        model_id = lookup_name
+
+    return {
+        "matched": True,
+        "enabled": enabled,
+        "provider": provider_name,
+        "catalog_provider": matched_provider,
+        "model_key": matched_model_key,
+        "catalog_model_id": catalog_model_id,
+        "model_id": model_id,
+        "model_name": raw_model_name,
+        "base_model": base_model,
+        "suffix": suffix,
+        "model_data": matched_model_data,
+        "is_test_model": is_test_model,
+    }
+
+
 class AttachmentSettings(BaseModel):
     """Attachment ingestion configuration and limits."""
 
@@ -503,6 +626,11 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         ge=1,
         description="Maximum consecutive QA provider failures allowed before aborting"
     )
+    QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS: int = Field(
+        default=12000,
+        ge=1,
+        description="Maximum estimated prompt tokens allowed for a synthetic fast_global final verification QA layer"
+    )
 
     # JSON retry configuration
     MAX_JSON_RETRY_ATTEMPTS: int = Field(
@@ -603,6 +731,56 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         ge=500,
         le=50000,
         description="Maximum characters for edit history in prompts"
+    )
+
+    # Reusable tool-loop budgets (shared by Generator / QA / Arbiter / GranSabio)
+    QA_MAX_TOOL_ROUNDS: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum tool-loop rounds for QA evaluators using the shared validation tool loop."
+    )
+    ARBITER_MAX_TOOL_ROUNDS: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="Maximum tool-loop rounds for Arbiter arbitration calls using the shared tool loop."
+    )
+    GRAN_SABIO_REGENERATE_MAX_TOOL_ROUNDS: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description="Maximum tool-loop rounds for GranSabio content regeneration."
+    )
+    GRAN_SABIO_DECISION_MAX_TOOL_ROUNDS: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="Maximum tool-loop rounds for GranSabio minority-override decisions."
+    )
+    GRAN_SABIO_ESCALATION_MAX_TOOL_ROUNDS: int = Field(
+        default=4,
+        ge=1,
+        le=10,
+        description="Maximum tool-loop rounds for GranSabio iteration-escalation decisions."
+    )
+    TOOL_LOOP_MAX_PROMPT_CHARS: int = Field(
+        default=200000,
+        ge=10000,
+        le=2000000,
+        description=(
+            "Paranoid hard-cap fallback for the full prompt sent to the provider (system + messages). "
+            "Applied only when the primary context-window estimate via model_specs returns no info."
+        )
+    )
+    VALIDATE_DRAFT_MAX_LENGTH: int = Field(
+        default=200000,
+        ge=1000,
+        le=2000000,
+        description=(
+            "Maximum length of the ``text`` argument passed by the model to the ``validate_draft`` tool. "
+            "Defense in depth for providers that do not enforce schema ``maxLength`` strictly."
+        )
     )
 
     # Session management
@@ -777,6 +955,14 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         self.QA_MODEL_FAILURE_THRESHOLD = int(os.getenv("QA_MODEL_FAILURE_THRESHOLD", "5"))
         if self.QA_MODEL_FAILURE_THRESHOLD < 1:
             self.QA_MODEL_FAILURE_THRESHOLD = 5
+        self.QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS = int(
+            os.getenv(
+                "QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS",
+                str(self.QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS),
+            )
+        )
+        if self.QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS < 1:
+            self.QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS = 12000
 
         # JSON Retry Configuration
         self.MAX_JSON_RETRY_ATTEMPTS = int(os.getenv("MAX_JSON_RETRY_ATTEMPTS", "2"))
@@ -864,6 +1050,38 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             _history_rounds if _history_rounds > 0 else self.MAX_EDIT_ROUNDS_PER_LAYER
         )
         self.EDIT_HISTORY_MAX_CHARS = int(os.getenv("EDIT_HISTORY_MAX_CHARS", "10000"))
+
+        # Reusable tool-loop budgets
+        self.QA_MAX_TOOL_ROUNDS = int(
+            os.getenv("QA_MAX_TOOL_ROUNDS", str(self.QA_MAX_TOOL_ROUNDS))
+        )
+        self.ARBITER_MAX_TOOL_ROUNDS = int(
+            os.getenv("ARBITER_MAX_TOOL_ROUNDS", str(self.ARBITER_MAX_TOOL_ROUNDS))
+        )
+        self.GRAN_SABIO_REGENERATE_MAX_TOOL_ROUNDS = int(
+            os.getenv(
+                "GRAN_SABIO_REGENERATE_MAX_TOOL_ROUNDS",
+                str(self.GRAN_SABIO_REGENERATE_MAX_TOOL_ROUNDS),
+            )
+        )
+        self.GRAN_SABIO_DECISION_MAX_TOOL_ROUNDS = int(
+            os.getenv(
+                "GRAN_SABIO_DECISION_MAX_TOOL_ROUNDS",
+                str(self.GRAN_SABIO_DECISION_MAX_TOOL_ROUNDS),
+            )
+        )
+        self.GRAN_SABIO_ESCALATION_MAX_TOOL_ROUNDS = int(
+            os.getenv(
+                "GRAN_SABIO_ESCALATION_MAX_TOOL_ROUNDS",
+                str(self.GRAN_SABIO_ESCALATION_MAX_TOOL_ROUNDS),
+            )
+        )
+        self.TOOL_LOOP_MAX_PROMPT_CHARS = int(
+            os.getenv("TOOL_LOOP_MAX_PROMPT_CHARS", str(self.TOOL_LOOP_MAX_PROMPT_CHARS))
+        )
+        self.VALIDATE_DRAFT_MAX_LENGTH = int(
+            os.getenv("VALIDATE_DRAFT_MAX_LENGTH", str(self.VALIDATE_DRAFT_MAX_LENGTH))
+        )
 
         # Model Reliability
         self.MODEL_RELIABILITY_MIN_SAMPLES = int(
@@ -1093,21 +1311,9 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             )
 
     def has_model_spec(self, model_name: str) -> bool:
-        """Return whether a model is declared in model_specs.json without requiring API keys."""
-        if not model_name:
-            return False
-
-        base_model = model_name.rsplit(":", 1)[0] if ":" in model_name else model_name
-        if any(marker in base_model.lower() for marker in ["dumb", "fake", "test-ai", "mock"]):
-            return True
-
-        aliases = self.model_specs.get("aliases", {})
-        resolved_name = aliases.get(model_name, model_name)
-        specs = self.model_specs.get("model_specifications", {})
-        for models in specs.values():
-            if resolved_name in models or model_name in models:
-                return True
-        return False
+        """Return whether a model is declared and enabled in model_specs.json."""
+        resolved = resolve_model_catalog_entry(model_name, self.model_specs)
+        return bool(resolved["matched"]) and bool(resolved["enabled"])
 
     def load_model_specifications(self):
         """Load model specifications from JSON file (no fallbacks)."""
@@ -1169,95 +1375,65 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         - No silent fallbacks.
         - Raises RuntimeError if the model is unknown or the provider key is missing.
         """
-        # BYPASS: Fake models don't need to be in model_specs.json
-        # Extract base name if it has :action suffix (e.g., "QA-Dumb:with-edits" -> "QA-Dumb")
-        base_model = model_name.rsplit(":", 1)[0] if ":" in model_name else model_name
+        resolved = resolve_model_catalog_entry(model_name, self.model_specs)
+        if not resolved["matched"]:
+            msg = (
+                f"[CONFIG ERROR] Unknown model '{model_name}'. "
+                "Make sure it is declared under 'model_specifications' or add an alias in 'aliases' within model_specs.json."
+            )
+            print(msg, file=sys.stderr, flush=True)
+            raise RuntimeError(msg)
 
-        if any(marker in base_model.lower() for marker in ["dumb", "fake", "test-ai", "mock"]):
-            return {
-                "provider": "fake",
-                "model_id": model_name,  # Keep full name with :action for fake server
-                "api_key": "fake",
-                "input_tokens": 128000,
-                "output_tokens": 16384,
-                "context_window": 128000,
-                "name": base_model,
-                "description": "Dynamic fake model for testing",
-                "capabilities": ["text"],
-                "pricing": {"input_per_million": 0.0, "output_per_million": 0.0}
-            }
+        model_data = resolved["model_data"] or {}
+        provider = str(resolved["catalog_provider"] or "")
+        provider_name = str(resolved["provider"] or provider)
 
-        aliases = self.model_specs.get("aliases", {})
-        resolved_name = aliases.get(model_name, model_name)
-        
-        specs = self.model_specs.get("model_specifications", {})
-        
-        for provider, models in specs.items():
-            for model_key, model_data in models.items():
-                if model_key == resolved_name or model_key == model_name:
-                    if model_data.get("enabled", True) is False:
-                        return {"provider": "unknown", "error": f"Model '{model_name}' is disabled."}
-                    api_key = ""
-                    if provider == "openai":
-                        api_key = self.OPENAI_API_KEY
-                        provider_name = "openai"
-                        env_hint = "OPENAI_KEY"
-                    elif provider == "anthropic":
-                        api_key = self.ANTHROPIC_API_KEY
-                        provider_name = "claude"
-                        env_hint = "ANTHROPIC_API_KEY"
-                    elif provider == "google":
-                        api_key = self.GOOGLE_API_KEY
-                        provider_name = "gemini"
-                        env_hint = "GEMINI_KEY"
-                    elif provider == "xai":
-                        api_key = self.XAI_API_KEY
-                        provider_name = "xai"
-                        env_hint = "XAI_API_KEY"
-                    elif provider == "openrouter":
-                        api_key = self.OPENROUTER_API_KEY
-                        provider_name = "openrouter"
-                        env_hint = "OPENROUTER_API_KEY"
-                    elif provider == "ollama":
-                        api_key = "ollama"  # Ollama doesn't need an API key
-                        provider_name = "ollama"
-                        env_hint = "OLLAMA_HOST"
-                    elif provider == "fake":
-                        api_key = "fake"  # Fake AI doesn't need an API key
-                        provider_name = "fake"
-                        env_hint = "FAKE_AI_HOST"
-                    else:
-                        provider_name = provider
-                        env_hint = "PROVIDER_API_KEY"
+        if not resolved["enabled"]:
+            msg = f"[CONFIG ERROR] Model '{model_name}' is disabled."
+            print(msg, file=sys.stderr, flush=True)
+            raise RuntimeError(msg)
 
-                    # Ollama and Fake don't require API key validation
-                    if not api_key and provider not in ("ollama", "fake"):
-                        msg = (
-                            f"[CONFIG ERROR] Missing API key for provider '{provider_name}' "
-                            f"while resolving model '{resolved_name}'. Set '{env_hint}' in your environment."
-                        )
-                        print(msg, file=sys.stderr, flush=True)
-                        raise RuntimeError(msg)
+        api_key = ""
+        env_hint = "PROVIDER_API_KEY"
+        if provider == "openai":
+            api_key = self.OPENAI_API_KEY
+            env_hint = "OPENAI_KEY"
+        elif provider == "anthropic":
+            api_key = self.ANTHROPIC_API_KEY
+            env_hint = "ANTHROPIC_API_KEY"
+        elif provider == "google":
+            api_key = self.GOOGLE_API_KEY
+            env_hint = "GEMINI_KEY"
+        elif provider == "xai":
+            api_key = self.XAI_API_KEY
+            env_hint = "XAI_API_KEY"
+        elif provider == "openrouter":
+            api_key = self.OPENROUTER_API_KEY
+            env_hint = "OPENROUTER_API_KEY"
+        elif provider == "ollama":
+            api_key = "ollama"
+        elif provider == "fake" or resolved["is_test_model"]:
+            api_key = "fake"
+        if not api_key and provider not in ("ollama", "fake"):
+            msg = (
+                f"[CONFIG ERROR] Missing API key for provider '{provider_name}' "
+                f"while resolving model '{resolved['model_name']}'. Set '{env_hint}' in your environment."
+            )
+            print(msg, file=sys.stderr, flush=True)
+            raise RuntimeError(msg)
 
-                    return {
-                        "provider": provider_name,
-                        "model_id": model_data.get("model_id", model_key),
-                        "api_key": api_key,
-                        "input_tokens": model_data.get("input_tokens", 100000),
-                        "output_tokens": model_data.get("output_tokens", 4000),
-                        "context_window": model_data.get("context_window", 100000),
-                        "name": model_data.get("name", model_key),
-                        "description": model_data.get("description", ""),
-                        "capabilities": model_data.get("capabilities", []),
-                        "pricing": model_data.get("pricing", {})
-                    }
-        
-        msg = (
-            f"[CONFIG ERROR] Unknown model '{model_name}'. "
-            "Make sure it is declared under 'model_specifications' or add an alias in 'aliases' within model_specs.json."
-        )
-        print(msg, file=sys.stderr, flush=True)
-        raise RuntimeError(msg)
+        return {
+            "provider": provider_name,
+            "model_id": resolved["model_id"],
+            "api_key": api_key,
+            "input_tokens": model_data.get("input_tokens", 100000),
+            "output_tokens": model_data.get("output_tokens", 8192),
+            "context_window": model_data.get("context_window", 100000),
+            "name": model_data.get("name", resolved["model_key"]),
+            "description": model_data.get("description", ""),
+            "capabilities": model_data.get("capabilities", []),
+            "pricing": model_data.get("pricing", {})
+        }
     
     def validate_api_keys(self) -> Dict[str, bool]:
         """Validate that required API keys are present (no fallbacks)."""
@@ -1287,7 +1463,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             max_tokens_percentage: Use X% of model's maximum available tokens (1-100)
         """
         model_info = self.get_model_info(model_name)
-        max_output_tokens = model_info.get("output_tokens", 4000)
+        max_output_tokens = model_info.get("output_tokens", 8192)
         provider = model_info.get("provider", "unknown")
         capabilities = {
             cap.lower() for cap in (model_info.get("capabilities", []) or []) if isinstance(cap, str)
@@ -1675,7 +1851,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             adjusted_budget = max_tokens_limit
 
         # Get model output limits
-        model_output_limit = model_info.get("output_tokens", 4000)
+        model_output_limit = model_info.get("output_tokens", 8192)
         safety_margin = self.model_specs.get("token_validation", {}).get("safety_margin", 0.9)
         safe_max_limit = int(model_output_limit * safety_margin)
 

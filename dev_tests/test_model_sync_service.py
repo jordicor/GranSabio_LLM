@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 import json_utils as json
 
-from services.model_sync import ModelSyncError, ModelSyncService
+from services.model_sync import ModelSyncError, ModelSyncService, _remote_json_headers
 
 
 @pytest.fixture
@@ -153,3 +153,69 @@ def test_sync_provider_blocks_invalid_default_references(service):
                 }
             ],
         )
+
+
+def test_sync_provider_blocks_disabled_default_references(service):
+    bad_specs = service.load_specs()
+    bad_specs["model_specifications"]["openai"]["gpt-4o"]["enabled"] = False
+    service.specs_path.write_text(json.dumps(bad_specs, indent=2), encoding="utf-8")
+
+    with pytest.raises(ModelSyncError, match="disabled"):
+        service.sync_provider(
+            "openrouter",
+            [
+                {
+                    "key": "meta-llama/llama-4-scout",
+                    "model_id": "meta-llama/llama-4-scout",
+                    "name": "Llama 4 Scout",
+                    "context_window": 256000,
+                    "output_tokens": 8192,
+                    "pricing": {"input_per_million": 0.0, "output_per_million": 0.0},
+                    "capabilities": ["text"],
+                }
+            ],
+        )
+
+
+def test_discovery_entry_does_not_infer_capabilities_from_model_name(service):
+    current_specs = service.load_specs()["model_specifications"]["openai"]
+
+    entry = service._build_discovery_entry(
+        provider="openai",
+        model_id="gpt-4o-2026-01-01",
+        display_name="gpt-4o-2026-01-01",
+        remote_created_at=None,
+        current_provider_specs=current_specs,
+    )
+
+    assert entry["capabilities"] == ["text"]
+    assert entry["needs_review"] is True
+
+
+def test_remote_json_headers_do_not_request_brotli():
+    headers = _remote_json_headers({"Authorization": "Bearer test"})
+
+    assert headers["Accept"] == "application/json"
+    assert headers["Accept-Encoding"] == "gzip, deflate"
+    assert "br" not in headers["Accept-Encoding"]
+    assert headers["Authorization"] == "Bearer test"
+
+
+def test_provider_spec_preserves_remote_text_only_capabilities_for_non_reasoning_xai(service):
+    spec = service._build_provider_spec(
+        "xai",
+        {
+            "key": "grok-4-1-fast-non-reasoning",
+            "model_id": "grok-4-1-fast-non-reasoning",
+            "name": "Grok 4.1 Fast Non Reasoning",
+            "context_window": 2_000_000,
+            "input_tokens": 2_000_000,
+            "output_tokens": 128_000,
+            "pricing": {"input_per_million": 0.2, "output_per_million": 0.5},
+            "capabilities": ["text"],
+            "needs_review": True,
+        },
+    )
+
+    assert spec["capabilities"] == ["text"]
+    assert spec["sync_metadata"]["needs_review"] is True

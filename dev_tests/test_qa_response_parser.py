@@ -84,25 +84,3 @@ async def test_evaluate_content_retries_once_without_schema_on_schema_rejection(
     assert fake_ai.calls[0]["json_schema"] is not None
     assert fake_ai.calls[1]["json_output"] is True
     assert fake_ai.calls[1]["json_schema"] is None
-
-
-@pytest.mark.asyncio
-async def test_evaluate_content_technical_error_is_not_deal_breaker():
-    fake_ai = _FakeAIService([RuntimeError("provider transport failed")])
-    service = QAEvaluationService(fake_ai)
-
-    result = await service.evaluate_content(
-        content="Sample content.",
-        criteria="Check quality.",
-        model="fake-model",
-        layer_name="Quality",
-        min_score=8.0,
-        original_request=SimpleNamespace(content_type="analysis", prompt="Analyze this."),
-        request_edit_info=False,
-    )
-
-    assert result.score == 0.0
-    assert result.passes_score is False
-    assert result.deal_breaker is False
-    assert result.deal_breaker_reason is None
-    assert result.reason == "Technical error during evaluation"

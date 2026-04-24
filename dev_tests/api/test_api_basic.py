@@ -585,6 +585,61 @@ class TestGenerateEndpointValidation:
         assert "session_id" in data
         assert data["status"] == "initialized"
 
+    def test_generate_without_qa_still_runs_preflight(
+        self, client, valid_generate_request
+    ):
+        """
+        Given: Valid request without QA layers
+        When: POST /generate is called
+        Then: Preflight still runs instead of being bypassed
+        """
+        from models import PreflightResult
+
+        proceed_result = PreflightResult(
+            decision="proceed",
+            user_feedback="Validation passed",
+            summary="Request validated",
+            confidence=0.95,
+            enable_algorithmic_word_count=False,
+            duplicate_word_count_layers_to_remove=[],
+        )
+
+        with patch(
+            "core.generation_routes.run_preflight_validation",
+            new_callable=AsyncMock,
+            return_value=proceed_result,
+        ) as mock_run:
+            response = client.post("/generate", json=valid_generate_request)
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "initialized"
+        mock_run.assert_awaited_once()
+
+    def test_generate_preflight_non_object_json_returns_rejected(
+        self, client, valid_generate_request
+    ):
+        """
+        Given: Preflight LLM returns valid JSON that is not an object
+        When: POST /generate is called
+        Then: API returns preflight_rejected instead of a server error
+        """
+        from core import generation_routes
+
+        async def invalid_preflight_stream(*args, **kwargs):
+            yield '[{}]'
+
+        with patch.object(
+            generation_routes.ai_service,
+            "generate_content_stream",
+            new=invalid_preflight_stream,
+        ):
+            response = client.post("/generate", json=valid_generate_request)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "preflight_rejected"
+        assert data["preflight_feedback"]["issues"][0]["code"] == "preflight_invalid_response"
+
     def test_generate_valid_request_returns_project_id(
         self, client, valid_generate_request, mock_preflight_proceed
     ):
@@ -669,6 +724,8 @@ class TestGenerateEndpointValidation:
         from models import PreflightResult
 
         valid_generate_request["evidence_grounding"] = {"enabled": True}
+        valid_generate_request["qa_models"] = ["gpt-4o"]
+        valid_generate_request["gran_sabio_model"] = "gpt-5-mini"
         reject_result = PreflightResult(
             decision="reject",
             user_feedback="Grounding model is invalid",

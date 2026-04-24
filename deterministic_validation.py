@@ -6,19 +6,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import logging
-import re
 import statistics
-import traceback
 from typing import Any, Dict, List, Optional
 
 from json_field_utils import try_extract_json_from_content
-from models import WordCountEnforcement
-from tools.ai_json_cleanroom import validate_ai_json
+from models import WordCountEnforcement, is_json_output_requested
+from phrase_frequency_config import is_phrase_frequency_active
+from tool_loop_models import PayloadScope
+from tools.ai_json_cleanroom import ValidateOptions, validate_ai_json
 from tools.lexical_diversity_utils import analyze_text_lexical_diversity
-from tools.phrase_frequency_utils import (
-    analyze_phrase_frequency,
-    compute_top_repeated_ngrams,
-)
+from tools.phrase_frequency_utils import analyze_phrase_frequency
 from tools.string_utils import remove_invisible_control
 from word_count_utils import (
     check_word_count_compliance,
@@ -69,79 +66,121 @@ class DeterministicValidationContext:
     target_field_paths: List[str] = field(default_factory=list)
 
 
-@dataclass
-class DeterministicValidationReport:
-    """Combined validation report used by generation tools and QA bypass."""
+@dataclass(frozen=True)
+class DraftValidationResult:
+    """Combined validation result consumed by the reusable tool loop.
 
-    context: DeterministicValidationContext
-    checks: Dict[str, DeterministicCheckResult]
+    The internal fields (``approved``, ``hard_failed``, ``feedback``) are used
+    by the loop itself for gate/feedback decisions. The ``build_visible_payload``
+    method emits the subset that should travel to the LLM in the ``tool_response``,
+    filtered by the caller's ``PayloadScope``.
+    """
+
     approved: bool
     hard_failed: bool
     score: float
-    issues: List[DeterministicIssue]
+    word_count: int
+    feedback: str
+    issues: List[Dict[str, Any]]
+    metrics: Dict[str, Any]
+    checks: Dict[str, Any]
+    stylistic_metrics: Optional[Dict[str, Any]] = None
+    visible_payload: Dict[str, Any] = field(default_factory=dict)
 
-    @property
-    def word_count(self) -> int:
-        return self.context.word_count
+    def _has_text_measurement(self) -> bool:
+        """Return True when word/text metrics are meaningful for this result."""
 
-    def to_tool_payload(self, max_issues: int = 12, request: Any = None) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "tool": "validate_draft",
-            "approved": self.approved,
-            "hard_failed": self.hard_failed,
-            "score": self.score,
-            "word_count": self.word_count,
-            "feedback": compact_feedback(self),
-            "issues": [
-                {
-                    "code": issue.code,
-                    "severity": issue.severity,
-                    "hard": issue.hard,
-                    "message": issue.message,
-                    "suggestion": issue.suggestion,
-                    "count": issue.count,
-                }
-                for issue in self.issues[:max_issues]
-            ],
-            "metrics": build_metrics_snapshot(self, request=request),
-            "checks": {
-                key: {
-                    "name": check.name,
-                    "score": check.score,
-                    "pass_threshold": check.pass_threshold,
-                    "passed": check.passed,
-                    "deal_breaker": check.deal_breaker,
-                }
-                for key, check in self.checks.items()
-            },
-        }
-        if getattr(request, "include_stylistic_metrics", False):
-            payload["stylistic_metrics"] = build_stylistic_metrics_snapshot(
-                self.context.text_for_validation,
-                request,
-            )
-        return payload
+        return "word_count" in self.metrics
+
+    def build_visible_payload(self, scope: PayloadScope) -> Dict[str, Any]:
+        """Return the dict that should reach the LLM for this ``scope``.
+
+        ``GENERATOR`` returns the full payload (``approved`` / ``hard_failed``
+        act as a gate signal for the iterative creative loop).
+
+        ``MEASUREMENT_ONLY`` omits the gate fields and renames ``feedback``
+        to ``feedback_neutral`` so evaluators see an objective description
+        rather than a corrective order.
+        """
+        if scope == PayloadScope.GENERATOR:
+            payload: Dict[str, Any] = {
+                "tool": "validate_draft",
+                "approved": self.approved,
+                "hard_failed": self.hard_failed,
+                "score": self.score,
+                "feedback": self.feedback,
+                "issues": list(self.issues),
+                "metrics": dict(self.metrics),
+                "checks": dict(self.checks),
+            }
+            if self._has_text_measurement():
+                payload["word_count"] = self.word_count
+            if self.stylistic_metrics is not None:
+                payload["stylistic_metrics"] = dict(self.stylistic_metrics)
+            return payload
+
+        if scope == PayloadScope.MEASUREMENT_ONLY:
+            payload = {
+                "tool": "validate_draft",
+                "score": self.score,
+                "feedback_neutral": self.feedback,
+                "issues": list(self.issues),
+                "metrics": dict(self.metrics),
+                "checks": dict(self.checks),
+            }
+            if self._has_text_measurement():
+                payload["word_count"] = self.word_count
+            if self.stylistic_metrics is not None:
+                payload["stylistic_metrics"] = dict(self.stylistic_metrics)
+            return payload
+
+        raise ValueError(f"Unsupported PayloadScope: {scope!r}")
 
 
 def has_active_generation_validators(request: Any) -> bool:
     """Return True when generation has measurable constraints worth validating."""
 
-    if getattr(request, "json_output", False):
+    if is_json_output_requested(request):
         return True
     if getattr(request, "target_field", None):
         return True
+    if _requires_text_for_validation(request):
+        return True
+    return False
+
+
+def _requires_text_for_validation(request: Any) -> bool:
+    """Return True when active deterministic checks need extracted/plain text."""
+
     if getattr(request, "min_words", None) or getattr(request, "max_words", None):
         return True
+
+    word_count_enforcement = getattr(request, "word_count_enforcement", None)
+    if word_count_enforcement:
+        if isinstance(word_count_enforcement, dict):
+            if word_count_enforcement.get("enabled"):
+                return True
+        elif getattr(word_count_enforcement, "enabled", False):
+            return True
+
     phrase_frequency = getattr(request, "phrase_frequency", None)
-    if phrase_frequency and getattr(phrase_frequency, "enabled", False):
+    phrase_frequency_active = is_phrase_frequency_active(
+        phrase_frequency,
+        context="text validation discovery",
+    )
+    if phrase_frequency_active:
         return True
+
     lexical_diversity = getattr(request, "lexical_diversity", None)
     if lexical_diversity and getattr(lexical_diversity, "enabled", False):
         return True
-    if getattr(request, "cumulative_text", None) and phrase_frequency and getattr(phrase_frequency, "enabled", False):
+
+    if getattr(request, "cumulative_text", None) and phrase_frequency_active:
         return True
+
     if getattr(request, "include_stylistic_metrics", False):
         return True
+
     return False
 
 
@@ -150,6 +189,7 @@ def prepare_validation_context(
     request: Any,
     *,
     include_json_validation: bool = True,
+    json_options: Optional[ValidateOptions] = None,
 ) -> DeterministicValidationContext:
     """Prepare validation text, including JSON extraction when requested."""
 
@@ -157,8 +197,9 @@ def prepare_validation_context(
     json_check: Optional[DeterministicCheckResult] = None
     target_field_paths: List[str] = []
 
-    json_output = bool(getattr(request, "json_output", False))
+    json_output = is_json_output_requested(request)
     target_field = getattr(request, "target_field", None)
+    should_extract_text = bool(target_field) or _requires_text_for_validation(request)
 
     if json_output or target_field:
         if include_json_validation and json_output:
@@ -166,6 +207,7 @@ def prepare_validation_context(
                 raw_content,
                 schema=getattr(request, "json_schema", None),
                 expectations=getattr(request, "json_expectations", None),
+                options=json_options,
             )
             if not validation_result.json_valid:
                 issues = [
@@ -201,109 +243,131 @@ def prepare_validation_context(
                     json_check=json_check,
                     target_field_paths=target_field_paths,
                 )
-
-        try:
-            json_context, extracted_text = try_extract_json_from_content(
-                content=raw_content,
-                json_output=json_output,
-                target_field=target_field,
-            )
-        except Exception as exc:
-            json_check = DeterministicCheckResult(
-                name="JSON Target Field Extraction",
-                score=0.0,
-                pass_threshold=10.0,
-                passed=False,
-                deal_breaker=False,
-                summary=f"Could not extract validation text from JSON payload: {exc}",
-                issues=[
-                    DeterministicIssue(
-                        code="json_target_field_extraction_failed",
-                        severity="critical",
-                        message=f"Could not extract validation text from JSON payload: {exc}",
-                        hard=False,
-                    )
-                ],
-                metadata={"error": str(exc)},
-            )
-            return DeterministicValidationContext(
-                raw_content=raw_content,
-                text_for_validation="",
-                word_count=0,
-                json_check=json_check,
-                target_field_paths=target_field_paths,
-            )
-
-        if json_context and json_context.get("error") == "ambiguous_fields":
-            field_names = json_context.get("candidates", [])
-            json_check = DeterministicCheckResult(
-                name="JSON Target Field Resolution",
-                score=0.0,
-                pass_threshold=10.0,
-                passed=False,
-                deal_breaker=False,
-                summary="Validation could not determine which JSON text field should be measured.",
-                issues=[
-                    DeterministicIssue(
-                        code="json_target_field_ambiguous",
-                        severity="critical",
-                        message=json_context.get("message", "Multiple candidate text fields found."),
-                        hard=False,
-                        metadata={"candidates": field_names},
-                    )
-                ],
-                metadata=json_context,
-            )
-            return DeterministicValidationContext(
-                raw_content=raw_content,
-                text_for_validation="",
-                word_count=0,
-                json_check=json_check,
-                target_field_paths=target_field_paths,
-            )
-
-        if (json_output or target_field) and not json_context:
-            json_check = DeterministicCheckResult(
-                name="JSON Target Field Resolution",
-                score=0.0,
-                pass_threshold=10.0,
-                passed=False,
-                deal_breaker=False,
-                summary="Expected JSON text fields but none could be extracted for validation.",
-                issues=[
-                    DeterministicIssue(
-                        code="json_target_field_missing",
-                        severity="critical",
-                        message="Expected JSON text fields but none could be extracted for validation.",
-                        hard=False,
-                    )
-                ],
-                metadata={},
-            )
-            return DeterministicValidationContext(
-                raw_content=raw_content,
-                text_for_validation="",
-                word_count=0,
-                json_check=json_check,
-                target_field_paths=target_field_paths,
-            )
-
-        text_for_validation = extracted_text
-        if json_context:
-            target_field_paths = list(json_context.get("target_field_paths", []))
             json_check = DeterministicCheckResult(
                 name="JSON Output Contract",
                 score=10.0,
                 pass_threshold=10.0,
                 passed=True,
                 deal_breaker=False,
-                summary="JSON output and target field extraction succeeded.",
+                summary="JSON output satisfies the requested contract.",
                 issues=[],
-                metadata={
+                metadata=validation_result.to_dict(),
+            )
+            if not should_extract_text:
+                return DeterministicValidationContext(
+                    raw_content=raw_content,
+                    text_for_validation="",
+                    word_count=0,
+                    json_check=json_check,
+                    target_field_paths=target_field_paths,
+                )
+
+        if should_extract_text:
+            try:
+                json_context, extracted_text = try_extract_json_from_content(
+                    content=raw_content,
+                    json_output=json_output,
+                    target_field=target_field,
+                )
+            except Exception as exc:
+                json_check = DeterministicCheckResult(
+                    name="JSON Target Field Extraction",
+                    score=0.0,
+                    pass_threshold=10.0,
+                    passed=False,
+                    deal_breaker=False,
+                    summary=f"Could not extract validation text from JSON payload: {exc}",
+                    issues=[
+                        DeterministicIssue(
+                            code="json_target_field_extraction_failed",
+                            severity="critical",
+                            message=f"Could not extract validation text from JSON payload: {exc}",
+                            hard=False,
+                        )
+                    ],
+                    metadata={"error": str(exc)},
+                )
+                return DeterministicValidationContext(
+                    raw_content=raw_content,
+                    text_for_validation="",
+                    word_count=0,
+                    json_check=json_check,
+                    target_field_paths=target_field_paths,
+                )
+
+            if json_context and json_context.get("error") == "ambiguous_fields":
+                field_names = json_context.get("candidates", [])
+                json_check = DeterministicCheckResult(
+                    name="JSON Target Field Resolution",
+                    score=0.0,
+                    pass_threshold=10.0,
+                    passed=False,
+                    deal_breaker=False,
+                    summary="Validation could not determine which JSON text field should be measured.",
+                    issues=[
+                        DeterministicIssue(
+                            code="json_target_field_ambiguous",
+                            severity="critical",
+                            message=json_context.get("message", "Multiple candidate text fields found."),
+                            hard=False,
+                            metadata={"candidates": field_names},
+                        )
+                    ],
+                    metadata=json_context,
+                )
+                return DeterministicValidationContext(
+                    raw_content=raw_content,
+                    text_for_validation="",
+                    word_count=0,
+                    json_check=json_check,
+                    target_field_paths=target_field_paths,
+                )
+
+            if not json_context:
+                json_check = DeterministicCheckResult(
+                    name="JSON Target Field Resolution",
+                    score=0.0,
+                    pass_threshold=10.0,
+                    passed=False,
+                    deal_breaker=False,
+                    summary="Expected JSON text fields but none could be extracted for validation.",
+                    issues=[
+                        DeterministicIssue(
+                            code="json_target_field_missing",
+                            severity="critical",
+                            message="Expected JSON text fields but none could be extracted for validation.",
+                            hard=False,
+                        )
+                    ],
+                    metadata={},
+                )
+                return DeterministicValidationContext(
+                    raw_content=raw_content,
+                    text_for_validation="",
+                    word_count=0,
+                    json_check=json_check,
+                    target_field_paths=target_field_paths,
+                )
+
+            text_for_validation = extracted_text
+            if json_context:
+                target_field_paths = list(json_context.get("target_field_paths", []))
+                metadata = {
                     "target_field_paths": target_field_paths,
                     "target_field_discovered": json_context.get("target_field_discovered", False),
-                },
-            )
+                }
+                if json_check is not None:
+                    metadata["json_validation"] = json_check.metadata
+                json_check = DeterministicCheckResult(
+                    name="JSON Output Contract",
+                    score=10.0,
+                    pass_threshold=10.0,
+                    passed=True,
+                    deal_breaker=False,
+                    summary="JSON output and target field extraction succeeded.",
+                    issues=[],
+                    metadata=metadata,
+                )
 
     return DeterministicValidationContext(
         raw_content=raw_content,
@@ -411,12 +475,7 @@ def evaluate_phrase_frequency_check(text: str, request: Any) -> Optional[Determi
     if not config or not getattr(config, "enabled", False):
         return None
 
-    if not getattr(config, "rules", None):
-        logger.warning(
-            "phrase_frequency config reached check with enabled=True and rules=[]. "
-            "Skipping deterministic phrase-frequency layer. Stack:\n%s",
-            "".join(traceback.format_stack(limit=12)),
-        )
+    if not is_phrase_frequency_active(config, context="deterministic phrase-frequency check"):
         return None
 
     settings = config.to_settings()
@@ -608,18 +667,128 @@ def evaluate_cumulative_repetition_check(text: str, request: Any) -> Optional[De
     )
 
 
+def _compact_feedback(
+    approved: bool,
+    issues: List[DeterministicIssue],
+    checks: Dict[str, DeterministicCheckResult],
+    max_items: int = 6,
+) -> str:
+    """Create a short validator feedback block suitable for model repair prompts."""
+
+    if approved:
+        return "All deterministic checks passed."
+
+    lines: List[str] = []
+    for issue in issues[:max_items]:
+        prefix = "HARD" if issue.hard else issue.severity.upper()
+        suggestion = f" Suggestion: {issue.suggestion}" if issue.suggestion else ""
+        lines.append(f"- [{prefix}] {issue.message}{suggestion}")
+
+    if not lines:
+        for check in checks.values():
+            if not check.passed:
+                lines.append(f"- {check.summary}")
+        if not lines:
+            lines.append("- The draft failed deterministic validation.")
+
+    return "\n".join(lines)
+
+
+def _build_metrics_snapshot(
+    context: DeterministicValidationContext,
+    checks: Dict[str, DeterministicCheckResult],
+    *,
+    request: Any = None,
+    include_stylistic: bool = False,
+) -> Dict[str, Any]:
+    """Return a compact metrics payload for tool responses and debugging."""
+
+    text_measurement_requested = bool(
+        context.text_for_validation
+        or context.target_field_paths
+        or checks.get("word_count")
+        or checks.get("phrase_frequency")
+        or checks.get("lexical_diversity")
+        or checks.get("cumulative_repetition")
+    )
+
+    metrics: Dict[str, Any] = {}
+    if text_measurement_requested:
+        metrics["word_count"] = context.word_count
+        metrics["target_field_paths"] = context.target_field_paths
+
+    word_count_meta = checks.get("word_count")
+    if word_count_meta:
+        metrics["word_count_rule"] = {
+            "score": word_count_meta.score,
+            "actual_count": word_count_meta.metadata.get("actual_count"),
+            "required_min": word_count_meta.metadata.get("required_min"),
+            "required_max": word_count_meta.metadata.get("required_max"),
+            "target_min": word_count_meta.metadata.get("target_min"),
+            "target_max": word_count_meta.metadata.get("target_max"),
+        }
+
+    lexical = checks.get("lexical_diversity")
+    if lexical:
+        metrics["lexical_diversity"] = {
+            "decision": lexical.metadata.get("decision"),
+            "score": lexical.score,
+            "adjusted_grades": lexical.metadata.get("adjusted_grades"),
+        }
+
+    phrase = checks.get("phrase_frequency")
+    if phrase:
+        metrics["phrase_frequency"] = {
+            "issues_count": len(phrase.metadata.get("issues", [])),
+            "rules_total": phrase.metadata.get("rules_total"),
+        }
+
+    cumulative = checks.get("cumulative_repetition")
+    if cumulative:
+        metrics["cumulative_repetition"] = {
+            "issues_count": len(cumulative.metadata.get("issues", [])),
+            "total_word_count": cumulative.metadata.get("total_word_count"),
+        }
+
+    json_output = checks.get("json_output")
+    if json_output:
+        json_metrics = {
+            "passed": json_output.passed,
+        }
+        if context.target_field_paths:
+            json_metrics["target_field_paths"] = context.target_field_paths
+        metrics["json_output"] = json_metrics
+
+    if include_stylistic:
+        metrics["stylistic"] = build_stylistic_metrics_snapshot(
+            context.text_for_validation,
+            request,
+        )
+
+    return metrics
+
+
 def validate_generation_candidate(
     raw_content: str,
     request: Any,
     *,
     include_json_validation: bool = True,
-) -> DeterministicValidationReport:
-    """Run the combined deterministic validation suite for a generated draft."""
+    json_options: Optional[ValidateOptions] = None,
+) -> DraftValidationResult:
+    """Run the combined deterministic validation suite for a generated draft.
+
+    Returns a ``DraftValidationResult`` consumable by the shared tool loop.
+    Gate fields (``approved``, ``hard_failed``) and ``feedback`` are computed
+    here and used internally by the loop; ``visible_payload`` is pre-built
+    for the generator scope so the loop can emit it to the LLM without
+    re-running validation.
+    """
 
     context = prepare_validation_context(
         raw_content,
         request,
         include_json_validation=include_json_validation,
+        json_options=json_options,
     )
 
     checks: Dict[str, DeterministicCheckResult] = {}
@@ -663,302 +832,137 @@ def validate_generation_candidate(
             2,
         )
 
-    return DeterministicValidationReport(
-        context=context,
-        checks=checks,
-        approved=approved,
-        hard_failed=hard_failed,
-        score=average_score,
-        issues=all_issues,
+    include_stylistic = bool(getattr(request, "include_stylistic_metrics", False))
+    metrics_snapshot = _build_metrics_snapshot(
+        context,
+        checks,
+        request=request,
+        include_stylistic=include_stylistic,
     )
+    feedback = _compact_feedback(approved, all_issues, checks)
 
+    # Cap the exported issues list to the same default as the legacy payload
+    # (max_issues=12 in the removed ``to_tool_payload`` helper).
+    max_issues = 12
+    issues_payload: List[Dict[str, Any]] = [
+        {
+            "code": issue.code,
+            "severity": issue.severity,
+            "hard": issue.hard,
+            "message": issue.message,
+            "suggestion": issue.suggestion,
+            "count": issue.count,
+        }
+        for issue in all_issues[:max_issues]
+    ]
 
-def compact_feedback(report: DeterministicValidationReport, max_items: int = 6) -> str:
-    """Create a short validator feedback block suitable for model repair prompts."""
-
-    if report.approved:
-        return "All deterministic checks passed."
-
-    lines = []
-    for issue in report.issues[:max_items]:
-        prefix = "HARD" if issue.hard else issue.severity.upper()
-        suggestion = f" Suggestion: {issue.suggestion}" if issue.suggestion else ""
-        lines.append(f"- [{prefix}] {issue.message}{suggestion}")
-
-    if not lines:
-        for check in report.checks.values():
-            if not check.passed:
-                lines.append(f"- {check.summary}")
-        if not lines:
-            lines.append("- The draft failed deterministic validation.")
-
-    return "\n".join(lines)
-
-
-def build_metrics_snapshot(
-    report: DeterministicValidationReport,
-    *,
-    request: Any = None,
-) -> Dict[str, Any]:
-    """Return a compact metrics payload for tool responses and debugging."""
-
-    metrics: Dict[str, Any] = {
-        "word_count": report.word_count,
-        "target_field_paths": report.context.target_field_paths,
+    checks_payload: Dict[str, Any] = {
+        key: {
+            "name": check.name,
+            "score": check.score,
+            "pass_threshold": check.pass_threshold,
+            "passed": check.passed,
+            "deal_breaker": check.deal_breaker,
+        }
+        for key, check in checks.items()
     }
 
-    word_count_meta = report.checks.get("word_count")
-    if word_count_meta:
-        metrics["word_count_rule"] = {
-            "score": word_count_meta.score,
-            "actual_count": word_count_meta.metadata.get("actual_count"),
-            "required_min": word_count_meta.metadata.get("required_min"),
-            "required_max": word_count_meta.metadata.get("required_max"),
-            "target_min": word_count_meta.metadata.get("target_min"),
-            "target_max": word_count_meta.metadata.get("target_max"),
-        }
-
-    lexical = report.checks.get("lexical_diversity")
-    if lexical:
-        metrics["lexical_diversity"] = {
-            "decision": lexical.metadata.get("decision"),
-            "score": lexical.score,
-            "adjusted_grades": lexical.metadata.get("adjusted_grades"),
-        }
-
-    phrase = report.checks.get("phrase_frequency")
-    if phrase:
-        metrics["phrase_frequency"] = {
-            "issues_count": len(phrase.metadata.get("issues", [])),
-            "rules_total": phrase.metadata.get("rules_total"),
-        }
-
-    cumulative = report.checks.get("cumulative_repetition")
-    if cumulative:
-        metrics["cumulative_repetition"] = {
-            "issues_count": len(cumulative.metadata.get("issues", [])),
-            "total_word_count": cumulative.metadata.get("total_word_count"),
-        }
-
-    json_output = report.checks.get("json_output")
-    if json_output:
-        metrics["json_output"] = {
-            "passed": json_output.passed,
-            "target_field_paths": report.context.target_field_paths,
-        }
-
-    if getattr(request, "include_stylistic_metrics", False):
-        metrics["stylistic"] = build_stylistic_metrics_snapshot(
-            report.context.text_for_validation,
+    stylistic_metrics: Optional[Dict[str, Any]] = None
+    if include_stylistic:
+        stylistic_metrics = build_stylistic_metrics_snapshot(
+            context.text_for_validation,
             request,
         )
 
-    return metrics
+    result = DraftValidationResult(
+        approved=approved,
+        hard_failed=hard_failed,
+        score=average_score,
+        word_count=context.word_count,
+        feedback=feedback,
+        issues=issues_payload,
+        metrics=metrics_snapshot,
+        checks=checks_payload,
+        stylistic_metrics=stylistic_metrics,
+        visible_payload={},
+    )
+    # Pre-build the generator visible payload so tool-loop tool_responses do
+    # not have to call ``build_visible_payload`` on the hot path.
+    generator_payload = result.build_visible_payload(PayloadScope.GENERATOR)
+    object.__setattr__(result, "visible_payload", generator_payload)
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Stylistic metrics snapshot (Cambio 1 §4.1 — opt-in via include_stylistic_metrics)
+# Surface metrics snapshot (opt-in via include_stylistic_metrics)
 # ---------------------------------------------------------------------------
-
-_STYLISTIC_SENTENCE_SPLIT_RE = re.compile(r"[.!?]+\s+")
-_STYLISTIC_PARAGRAPH_SPLIT_RE = re.compile(r"\n\n+")
-_STYLISTIC_WORD_TOKEN_RE = re.compile(r"\w+(?:['\u2019]\w+)*", re.UNICODE)
-
-
-def _split_sentences_for_stylistic(text: str) -> List[str]:
-    """Split text into sentences using a simple punctuation-plus-space heuristic."""
-    if not text:
-        return []
-    raw_parts = _STYLISTIC_SENTENCE_SPLIT_RE.split(text)
-    return [part.strip() for part in raw_parts if part and part.strip()]
-
-
-def _split_paragraphs_for_stylistic(text: str) -> List[str]:
-    """Split text into paragraphs using blank-line separators."""
-    if not text:
-        return []
-    raw_parts = _STYLISTIC_PARAGRAPH_SPLIT_RE.split(text)
-    return [part.strip() for part in raw_parts if part and part.strip()]
-
-
-def _count_words_stylistic(text: str) -> int:
-    if not text:
-        return 0
-    return len(_STYLISTIC_WORD_TOKEN_RE.findall(text))
-
-
-def _percentile_from_sorted(values_sorted: List[float], percentile: float) -> float:
-    """Linear-interpolation percentile on an already-sorted list."""
-    if not values_sorted:
-        return 0.0
-    if len(values_sorted) == 1:
-        return float(values_sorted[0])
-    rank = (percentile / 100.0) * (len(values_sorted) - 1)
-    lower = int(rank)
-    upper = min(lower + 1, len(values_sorted) - 1)
-    fraction = rank - lower
-    return float(values_sorted[lower] + (values_sorted[upper] - values_sorted[lower]) * fraction)
 
 
 def build_stylistic_metrics_snapshot(text: str, request: Any) -> Dict[str, Any]:
-    """Compute the cadence/openings/n-gram/punctuation stylistic snapshot.
+    """Compute non-semantic surface telemetry for validator traces.
 
-    Opt-in via `request.include_stylistic_metrics=True`. Informational telemetry only.
-    Edge cases match proposal Cambio 1 v5 §4.3.
+    This intentionally avoids semantic heuristics such as sentence-start
+    repetition or keyword/formula detection. The LLM accent judge owns that
+    interpretation when configured.
     """
     # request is accepted so language_hint (or future flags) can be forwarded without
     # touching call sites. Not used today.
     del request
 
     cleaned = remove_invisible_control(text or "")
+    lines = cleaned.splitlines()
+    line_lengths = [len(line) for line in lines]
+    non_empty_line_lengths = [len(line) for line in lines if line.strip()]
+    char_count = len(cleaned)
+    non_whitespace_char_count = sum(1 for char in cleaned if not char.isspace())
 
-    # Cadence ----------------------------------------------------------------
-    sentences = _split_sentences_for_stylistic(cleaned)
-    sentence_lengths = [_count_words_stylistic(sentence) for sentence in sentences]
-    sentence_count = len(sentences)
-
-    if sentence_count == 0:
-        cadence: Dict[str, Any] = {
-            "sentence_count": 0,
-            "avg_sentence_words": 0.0,
-            "sentence_length_stdev": 0.0,
-            "sentence_length_percentiles": {"p10": 0.0, "p50": 0.0, "p90": 0.0},
-            "burstiness_ratio": 0.0,
-            "longest_run_same_length": 0,
-            "repeated_sentence_starts": [],
-        }
-    else:
-        avg_sentence_words = sum(sentence_lengths) / sentence_count
-        if sentence_count == 1:
-            sentence_length_stdev = 0.0
-            percentiles = {
-                "p10": round(avg_sentence_words, 3),
-                "p50": round(avg_sentence_words, 3),
-                "p90": round(avg_sentence_words, 3),
-            }
-            longest_run_same_length = 1
-        else:
-            sentence_length_stdev = statistics.pstdev(sentence_lengths)
-            sorted_lengths = sorted(sentence_lengths)
-            percentiles = {
-                "p10": round(_percentile_from_sorted(sorted_lengths, 10), 3),
-                "p50": round(_percentile_from_sorted(sorted_lengths, 50), 3),
-                "p90": round(_percentile_from_sorted(sorted_lengths, 90), 3),
-            }
-            longest_run_same_length = 1
-            current_run = 1
-            for i in range(1, len(sentence_lengths)):
-                if sentence_lengths[i] == sentence_lengths[i - 1]:
-                    current_run += 1
-                    if current_run > longest_run_same_length:
-                        longest_run_same_length = current_run
-                else:
-                    current_run = 1
-
-        burstiness_ratio = (
-            sentence_length_stdev / avg_sentence_words if avg_sentence_words > 0 else 0.0
-        )
-
-        repeated_sentence_starts: List[Dict[str, Any]] = []
-        if sentence_count >= 6:
-            start_indices: Dict[str, List[int]] = {}
-            for idx, sentence in enumerate(sentences):
-                match = _STYLISTIC_WORD_TOKEN_RE.search(sentence)
-                if not match:
-                    continue
-                first_word = match.group(0).lower()
-                if len(first_word) < 3:
-                    continue
-                start_indices.setdefault(first_word, []).append(idx)
-            filtered_starts = [
-                (word, indices) for word, indices in start_indices.items() if len(indices) >= 3
-            ]
-            filtered_starts.sort(key=lambda item: (-len(item[1]), item[0]))
-            for word, indices in filtered_starts:
-                repeated_sentence_starts.append(
-                    {
-                        "word": word,
-                        "count": len(indices),
-                        "indices": indices[:10],
-                    }
-                )
-
-        cadence = {
-            "sentence_count": sentence_count,
-            "avg_sentence_words": round(avg_sentence_words, 3),
-            "sentence_length_stdev": round(sentence_length_stdev, 3),
-            "sentence_length_percentiles": percentiles,
-            "burstiness_ratio": round(burstiness_ratio, 3),
-            "longest_run_same_length": longest_run_same_length,
-            "repeated_sentence_starts": repeated_sentence_starts,
-        }
-
-    # Openings ---------------------------------------------------------------
-    paragraphs = _split_paragraphs_for_stylistic(cleaned)
-    paragraph_openings: List[Dict[str, Any]] = []
-    for index, paragraph in enumerate(paragraphs[:10]):
-        paragraph_tokens = _STYLISTIC_WORD_TOKEN_RE.findall(paragraph)
-        first_tokens = paragraph_tokens[:5]
-        first_words = " ".join(first_tokens)
-        if len(first_words) > 160:
-            first_words = first_words[:160]
-        paragraph_openings.append(
-            {
-                "index": index,
-                "first_words": first_words,
-                "word_count": len(paragraph_tokens),
-            }
-        )
-
-    openings = {
-        "paragraph_count_total": len(paragraphs),
-        "paragraph_openings": paragraph_openings,
+    punctuation_counts = {
+        "period": cleaned.count("."),
+        "comma": cleaned.count(","),
+        "em_dash": cleaned.count("\u2014"),
+        "en_dash": cleaned.count("\u2013"),
+        "hyphen": cleaned.count("-"),
+        "ellipsis": cleaned.count("\u2026") + cleaned.count("..."),
+        "exclamation": cleaned.count("!"),
+        "question": cleaned.count("?"),
+        "colon": cleaned.count(":"),
+        "semicolon": cleaned.count(";"),
     }
 
-    # Extended n-gram fingerprint --------------------------------------------
-    top_repeated_ngrams = compute_top_repeated_ngrams(cleaned)
-
-    # Punctuation density (per 1000 words) -----------------------------------
-    word_count = _count_words_stylistic(cleaned)
-    em_dash_count = cleaned.count("\u2014")
-    en_dash_count = cleaned.count("\u2013")
-    hyphen_count = cleaned.count("-")
-    ellipsis_count = cleaned.count("\u2026") + cleaned.count("...")
-    exclamation_count = cleaned.count("!")
-    question_count = cleaned.count("?")
-    colon_count = cleaned.count(":")
-    semicolon_count = cleaned.count(";")
-
-    if word_count == 0:
-        punctuation_density = {
-            "em_dash": 0.0,
-            "en_dash": 0.0,
-            "hyphen": 0.0,
-            "ellipsis": 0.0,
-            "exclamation": 0.0,
-            "question": 0.0,
-            "colon": 0.0,
-            "semicolon": 0.0,
-        }
+    if char_count == 0:
+        punctuation_density = {key: 0.0 for key in punctuation_counts}
     else:
-        scale = 1000.0 / word_count
+        scale = 1000.0 / char_count
         punctuation_density = {
-            "em_dash": round(em_dash_count * scale, 3),
-            "en_dash": round(en_dash_count * scale, 3),
-            "hyphen": round(hyphen_count * scale, 3),
-            "ellipsis": round(ellipsis_count * scale, 3),
-            "exclamation": round(exclamation_count * scale, 3),
-            "question": round(question_count * scale, 3),
-            "colon": round(colon_count * scale, 3),
-            "semicolon": round(semicolon_count * scale, 3),
+            key: round(value * scale, 3)
+            for key, value in punctuation_counts.items()
         }
 
-    sentences_with_em_dash = sum(1 for sentence in sentences if "\u2014" in sentence)
+    layout = {
+        "line_count": len(lines),
+        "non_empty_line_count": len(non_empty_line_lengths),
+        "blank_line_count": sum(1 for line in lines if not line.strip()),
+        "paragraph_separator_count": cleaned.count("\n\n"),
+    }
+
+    line_metrics = {
+        "avg_line_chars": round(sum(line_lengths) / len(line_lengths), 3) if line_lengths else 0.0,
+        "line_length_stdev": round(statistics.pstdev(line_lengths), 3) if len(line_lengths) > 1 else 0.0,
+        "max_line_chars": max(line_lengths, default=0),
+        "avg_non_empty_line_chars": (
+            round(sum(non_empty_line_lengths) / len(non_empty_line_lengths), 3)
+            if non_empty_line_lengths
+            else 0.0
+        ),
+    }
 
     return {
-        "cadence": cadence,
-        "openings": openings,
-        "top_repeated_ngrams": top_repeated_ngrams,
-        "punctuation_density": punctuation_density,
-        "sentences_with_em_dash": sentences_with_em_dash,
+        "character_counts": {
+            "total": char_count,
+            "non_whitespace": non_whitespace_char_count,
+        },
+        "layout": layout,
+        "line_metrics": line_metrics,
+        "punctuation_counts": punctuation_counts,
+        "punctuation_density_per_1000_chars": punctuation_density,
     }

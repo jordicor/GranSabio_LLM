@@ -12,6 +12,7 @@ from enum import Enum
 from datetime import datetime
 
 from config import get_default_models, config
+from phrase_frequency_config import normalize_phrase_frequency_config
 from smart_edit import TextEditRange
 
 
@@ -51,6 +52,19 @@ VALID_CONTENT_TYPES = frozenset([
     "report",
     "story"
 ])
+
+
+def is_json_output_requested(request: Any) -> bool:
+    """Return True when a request effectively asks for JSON output.
+
+    ``content_type="json"`` is a legacy alias and remains equivalent to
+    ``json_output=True`` until product explicitly deprecates it.
+    """
+
+    return bool(
+        getattr(request, "json_output", False)
+        or getattr(request, "content_type", None) == "json"
+    )
 
 
 def _default_gran_sabio_model() -> str:
@@ -222,13 +236,10 @@ class PhraseFrequencyConfig(BaseModel):
             raise ValueError("max_n must be greater than or equal to min_n")
         return v
 
-    @field_validator("rules")
-    @classmethod
-    def ensure_rules_when_enabled(cls, v: List[PhraseFrequencyRule], info):
-        enabled = info.data.get("enabled", False)
-        if enabled and not v:
-            raise ValueError("At least one phrase frequency rule is required when enabled")
-        return v
+    @model_validator(mode="after")
+    def disable_when_enabled_without_rules(self):
+        normalize_phrase_frequency_config(self, context="PhraseFrequencyConfig validation")
+        return self
 
     def derive_min_n(self) -> int:
         candidate = [rule.min_length for rule in self.rules if rule.min_length]
@@ -899,7 +910,7 @@ class ContentRequest(BaseModel):
         description="AI model for content generation"
     )
     temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="Generation temperature")
-    max_tokens: Optional[int] = Field(default=4000, gt=0, description="Maximum tokens for generation (ignored if max_tokens_percentage is specified)")
+    max_tokens: Optional[int] = Field(default=None, gt=0, description="Maximum tokens for generation. If omitted at /generate, the server uses the selected model's max output from model_specs.json (fallback: 8192). Ignored if max_tokens_percentage is specified")
     max_tokens_percentage: Optional[float] = Field(
         default=None,
         ge=1.0,
@@ -1007,7 +1018,7 @@ class ContentRequest(BaseModel):
         default=[],
         description=(
             "QA evaluation layers. Use empty list [] to bypass semantic QA layers. "
-            "Preflight still runs when evidence_grounding is enabled."
+            "The LLM preflight gate still runs for every request."
         ),
     )
     qa_with_vision: bool = Field(
@@ -1040,6 +1051,21 @@ class ContentRequest(BaseModel):
             "'never' - Never request edit ranges (for opinion/voting/evaluation scenarios)"
         )
     )
+    qa_final_verification_mode: Literal["disabled", "after_modifications", "always"] = Field(
+        default="disabled",
+        description=(
+            "Optional read-only final QA pass over the final content snapshot. "
+            "'disabled' preserves current behavior, 'after_modifications' runs only when QA/smart-edit changed the content, "
+            "and 'always' runs whenever there is an effective QA contract."
+        )
+    )
+    qa_final_verification_strategy: Literal["full_parallel", "full_sequential", "fast_global"] = Field(
+        default="full_parallel",
+        description=(
+            "Strategy for qa_final_verification_mode: 'full_parallel' re-runs real QA layers concurrently with bounds, "
+            "'full_sequential' re-runs them in order, and 'fast_global' uses deterministic guards plus one global semantic review."
+        )
+    )
     smart_edit_locator_mode: Literal["ids", "legacy"] = Field(
         default="ids",
         description=(
@@ -1048,20 +1074,43 @@ class ContentRequest(BaseModel):
             "'legacy' - use the previous phrase-marker mode with automatic word-index fallback."
         )
     )
-    generation_tools_mode: Literal["auto", "always", "never"] = Field(
+    generation_tools_mode: Literal["auto", "never"] = Field(
         default="auto",
         description=(
             "Control generator tool usage for deterministic checks such as word count or lexical guards: "
             "'auto' - enable tools only when the selected model/provider supports them and measurable checks are active, "
-            "'always' - attempt tool-assisted generation first and fall back if unsupported, "
             "'never' - disable generator tool calls."
+        )
+    )
+    qa_tools_mode: Literal["auto", "never"] = Field(
+        default="auto",
+        description=(
+            "Control QA tool-loop usage for deterministic-measurement injection: "
+            "'auto' - enable tools for QA evaluators when measurable request-level validators are active, "
+            "'never' - disable QA tool calls."
+        )
+    )
+    arbiter_tools_mode: Literal["auto", "never"] = Field(
+        default="auto",
+        description=(
+            "Control Arbiter tool-loop usage for deterministic-measurement injection: "
+            "'auto' - enable tools for arbitration when the provider supports tool calling, "
+            "'never' - disable Arbiter tool calls."
+        )
+    )
+    gransabio_tools_mode: Literal["auto", "never"] = Field(
+        default="auto",
+        description=(
+            "Control GranSabio tool-loop usage for deterministic-measurement injection: "
+            "'auto' - enable tools for GranSabio review/regenerate/escalation when the provider supports them, "
+            "'never' - disable GranSabio tool calls."
         )
     )
     include_stylistic_metrics: bool = Field(
         default=False,
         description=(
-            "When true, include cadence/openings/n-gram/punctuation telemetry in validate_draft tool payload "
-            "(Cambio 1 v5, §4). Informational metrics; does not gate generation alone."
+            "When true, include non-semantic surface telemetry in validate_draft tool payload "
+            "(characters, layout, line lengths, and punctuation). Informational metrics; does not gate generation alone."
         )
     )
 
@@ -1224,6 +1273,32 @@ class ContentRequest(BaseModel):
         return v
 
     @model_validator(mode="after")
+    def _validate_json_schema_not_empty_when_requested(self):
+        """Reject empty schema dicts for effective JSON requests."""
+        if (
+            is_json_output_requested(self)
+            and self.json_schema is not None
+            and not self.json_schema
+        ):
+            raise ValueError(
+                "json_schema={} is invalid when JSON output is requested "
+                "(json_output=True or content_type='json'). "
+                "Omit json_schema or pass null for flexible JSON output, "
+                "or provide a non-empty object schema for structured outputs."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_json_schema_requires_json_output(self):
+        """Reject schemas that would otherwise be ignored by free-text routing."""
+        if self.json_schema is not None and not is_json_output_requested(self):
+            raise ValueError(
+                "json_schema requires an effective JSON request. "
+                "Set json_output=True or content_type='json', or omit json_schema."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _validate_min_max_words_ordering(self):
         """Ensure min_words does not exceed max_words when both are provided."""
         if self.min_words and self.max_words and self.min_words > self.max_words:
@@ -1279,6 +1354,8 @@ class ContentRequest(BaseModel):
             except Exception:
                 model_info = None
             if model_info is not None:
+                from ai_service import AIService
+
                 provider_key = str(model_info.get("provider") or "").lower()
                 model_id_lc = str(model_info.get("model_id") or "").lower()
                 supported_providers = {
@@ -1286,7 +1363,10 @@ class ContentRequest(BaseModel):
                 }
                 if (
                     provider_key not in supported_providers
-                    or any(marker in model_id_lc for marker in ("o3-pro", "gpt-5-pro"))
+                    or (
+                        provider_key == "openai"
+                        and AIService._is_openai_responses_api_model(model_id_lc)
+                    )
                 ):
                     raise ValueError(
                         "llm_accent_guard inline mode requires a provider with tool-calling "
@@ -1326,7 +1406,6 @@ class ContentRequest(BaseModel):
                 "json_output": False,
                 "generator_model": "gpt-4o",
                 "temperature": 0.7,
-                "max_tokens": 4000,
                 "min_words": 800,
                 "max_words": 1200,
                 "reasoning_effort": "medium",
@@ -1494,7 +1573,7 @@ class GranSabioResult(BaseModel):
     """Result of Gran Sabio review"""
     approved: bool = Field(..., description="Whether Gran Sabio approves the content")
     final_content: str = Field(..., description="Final content (original or modified)")
-    final_score: float = Field(..., description="Gran Sabio's final score")
+    final_score: Optional[float] = Field(..., description="Gran Sabio's final score when available")
     reason: str = Field(..., description="Explanation of the decision")
     modifications_made: bool = Field(default=False, description="Whether content was modified")
     error: Optional[str] = Field(default=None, description="Error message when Gran Sabio could not complete the review")

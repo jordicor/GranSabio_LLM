@@ -16,7 +16,6 @@ Functions tested:
 - QAEngine.evaluate_content(): Single evaluation
 - QAEngine.evaluate_all_layers(): Non-progress evaluation
 - QAEngine.evaluate_all_layers_with_progress(): Progress-tracked evaluation
-- QAEngine._check_deal_breaker_consensus(): Consensus checking
 - QAEngine._create_iteration_stop_result(): Iteration stop result
 - QAEngine._create_gran_sabio_modified_result(): Modified content result
 - QAEngine._calculate_summary(): Summary statistics
@@ -563,6 +562,116 @@ class TestFailureTracking:
 # Test: Evaluate Content
 # ============================================================================
 
+
+class TestFinalVerificationLayerResolution:
+    """Tests for final verification layer planning."""
+
+    def test_fast_global_layer_resolution_keeps_deterministic_guards_separate(self, qa_engine):
+        """
+        Given: fast_global with one deterministic guard and one semantic layer
+        When: final verification layers are resolved
+        Then: deterministic guard remains separate and semantic QA becomes one global layer
+        """
+        deterministic_layer = QALayer(
+            name="Word Count Enforcement",
+            description="word count",
+            criteria="count words",
+            min_score=8.0,
+            order=1,
+        )
+        semantic_layer = QALayer(
+            name="Narrative Quality",
+            description="quality",
+            criteria="check quality",
+            min_score=9.0,
+            order=2,
+            deal_breaker_criteria="missing required story beats",
+        )
+        qa_engine.bypass_engine.can_bypass_layer = Mock(
+            side_effect=lambda layer, request: layer.name == "Word Count Enforcement"
+        )
+        request = MagicMock()
+        request.min_global_score = 8.25
+
+        resolved_layers, source_layers, approval_contract = qa_engine._resolve_final_verification_layers(
+            [deterministic_layer, semantic_layer],
+            "fast_global",
+            request,
+        )
+
+        assert approval_contract == "fast_global"
+        assert [layer.name for layer in resolved_layers] == [
+            "Word Count Enforcement",
+            "Final Global QA Verification",
+        ]
+        assert source_layers == [semantic_layer]
+        synthetic_layer = resolved_layers[1]
+        assert synthetic_layer.min_score == 8.25
+        assert synthetic_layer.is_mandatory is True
+        assert "Narrative Quality" in synthetic_layer.criteria
+        assert "missing required story beats" in (synthetic_layer.deal_breaker_criteria or "")
+
+    def test_full_strategy_layer_resolution_preserves_real_layers(self, qa_engine):
+        """
+        Given: full_sequential strategy
+        When: final verification layers are resolved
+        Then: the real layer list is preserved for per-layer approval
+        """
+        layers = [
+            QALayer(name="A", description="A", criteria="A", min_score=7.0, order=1),
+            QALayer(name="B", description="B", criteria="B", min_score=8.0, order=2),
+        ]
+
+        resolved_layers, source_layers, approval_contract = qa_engine._resolve_final_verification_layers(
+            layers,
+            "full_sequential",
+            None,
+        )
+
+        assert approval_contract == "per_layer"
+        assert resolved_layers == layers
+        assert source_layers == layers
+
+    def test_fast_global_layer_resolution_fails_closed_when_synthetic_prompt_is_too_large(
+        self,
+        qa_engine,
+        monkeypatch,
+    ):
+        """
+        Given: fast_global would produce an oversized synthetic criteria prompt
+        When: final verification layers are resolved
+        Then: the strategy fails closed instead of silently risking truncation
+        """
+        layer = QALayer(
+            name="Large Semantic Contract",
+            description="large",
+            criteria="A" * 200,
+            min_score=8.0,
+            order=1,
+        )
+        qa_engine.bypass_engine.can_bypass_layer = Mock(return_value=False)
+        monkeypatch.setattr(
+            "qa_engine.config.QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS",
+            1,
+            raising=False,
+        )
+
+        with pytest.raises(ValueError, match="fast_global final verification"):
+            qa_engine._resolve_final_verification_layers(
+                [layer],
+                "fast_global",
+                MagicMock(min_global_score=8.0),
+            )
+
+    def test_fast_global_token_estimate_is_conservative_for_multibyte_text(self, qa_engine):
+        """Multibyte criteria should not be underestimated by character count alone."""
+        text = "criterio " + ("ñ" * 30)
+
+        estimate = qa_engine._estimate_fast_global_tokens(text)
+
+        assert estimate >= len(text.encode("utf-8")) // 3
+
+
 class TestEvaluateContent:
     """Tests for QAEngine.evaluate_content()."""
 
@@ -727,170 +836,6 @@ class TestEvaluateContent:
 
             call_kwargs = qa_engine.qa_evaluator.evaluate_content.call_args.kwargs
             assert call_kwargs["input_images"] is None
-
-
-# ============================================================================
-# Test: Deal-Breaker Consensus
-# ============================================================================
-
-class TestDealBreakerConsensus:
-    """Tests for _check_deal_breaker_consensus()."""
-
-    def test_no_deal_breakers_no_stop(self, qa_engine):
-        """
-        Given: No deal-breakers in results
-        When: _check_deal_breaker_consensus() is called
-        Then: Returns immediate_stop=False
-        """
-        layer_results = {
-            "gpt-4o": QAEvaluation(
-                model="gpt-4o", layer="Test", score=8.0,
-                feedback="Good", deal_breaker=False, passes_score=True
-            ),
-            "claude-sonnet-4": QAEvaluation(
-                model="claude-sonnet-4", layer="Test", score=7.5,
-                feedback="OK", deal_breaker=False, passes_score=True
-            )
-        }
-
-        result = qa_engine._check_deal_breaker_consensus(
-            layer_results, ["gpt-4o", "claude-sonnet-4"]
-        )
-
-        assert result["immediate_stop"] is False
-        assert result["deal_breaker_count"] == 0
-
-    def test_minority_deal_breakers_no_stop(self, qa_engine):
-        """
-        Given: Minority of models have deal-breakers (1/3)
-        When: _check_deal_breaker_consensus() is called
-        Then: Returns immediate_stop=False
-        """
-        layer_results = {
-            "gpt-4o": QAEvaluation(
-                model="gpt-4o", layer="Test", score=3.0,
-                feedback="Bad", deal_breaker=True,
-                deal_breaker_reason="Error", passes_score=False
-            ),
-            "claude-sonnet-4": QAEvaluation(
-                model="claude-sonnet-4", layer="Test", score=7.5,
-                feedback="OK", deal_breaker=False, passes_score=True
-            ),
-            "gemini-pro": QAEvaluation(
-                model="gemini-pro", layer="Test", score=8.0,
-                feedback="Good", deal_breaker=False, passes_score=True
-            )
-        }
-
-        result = qa_engine._check_deal_breaker_consensus(
-            layer_results, ["gpt-4o", "claude-sonnet-4", "gemini-pro"]
-        )
-
-        assert result["immediate_stop"] is False
-        assert result["deal_breaker_count"] == 1
-
-    def test_majority_deal_breakers_stops(self, qa_engine):
-        """
-        Given: Majority of models have deal-breakers (2/3)
-        When: _check_deal_breaker_consensus() is called
-        Then: Returns immediate_stop=True
-        """
-        layer_results = {
-            "gpt-4o": QAEvaluation(
-                model="gpt-4o", layer="Test", score=3.0,
-                feedback="Bad", deal_breaker=True,
-                deal_breaker_reason="Error 1", passes_score=False
-            ),
-            "claude-sonnet-4": QAEvaluation(
-                model="claude-sonnet-4", layer="Test", score=2.0,
-                feedback="Bad", deal_breaker=True,
-                deal_breaker_reason="Error 2", passes_score=False
-            ),
-            "gemini-pro": QAEvaluation(
-                model="gemini-pro", layer="Test", score=8.0,
-                feedback="Good", deal_breaker=False, passes_score=True
-            )
-        }
-
-        result = qa_engine._check_deal_breaker_consensus(
-            layer_results, ["gpt-4o", "claude-sonnet-4", "gemini-pro"]
-        )
-
-        assert result["immediate_stop"] is True
-        assert result["deal_breaker_count"] == 2
-        assert len(result["deal_breaker_details"]) == 2
-
-    def test_all_deal_breakers_stops(self, qa_engine):
-        """
-        Given: All models have deal-breakers
-        When: _check_deal_breaker_consensus() is called
-        Then: Returns immediate_stop=True
-        """
-        layer_results = {
-            "gpt-4o": QAEvaluation(
-                model="gpt-4o", layer="Test", score=2.0,
-                feedback="Bad", deal_breaker=True,
-                deal_breaker_reason="Error 1", passes_score=False
-            ),
-            "claude-sonnet-4": QAEvaluation(
-                model="claude-sonnet-4", layer="Test", score=1.0,
-                feedback="Bad", deal_breaker=True,
-                deal_breaker_reason="Error 2", passes_score=False
-            )
-        }
-
-        result = qa_engine._check_deal_breaker_consensus(
-            layer_results, ["gpt-4o", "claude-sonnet-4"]
-        )
-
-        assert result["immediate_stop"] is True
-        assert result["deal_breaker_count"] == 2
-
-    def test_tie_with_even_models_no_stop(self, qa_engine):
-        """
-        Given: 50/50 tie (1/2 deal-breakers)
-        When: _check_deal_breaker_consensus() is called
-        Then: Returns immediate_stop=False (tie doesn't stop)
-        """
-        layer_results = {
-            "gpt-4o": QAEvaluation(
-                model="gpt-4o", layer="Test", score=3.0,
-                feedback="Bad", deal_breaker=True,
-                deal_breaker_reason="Error", passes_score=False
-            ),
-            "claude-sonnet-4": QAEvaluation(
-                model="claude-sonnet-4", layer="Test", score=7.5,
-                feedback="OK", deal_breaker=False, passes_score=True
-            )
-        }
-
-        result = qa_engine._check_deal_breaker_consensus(
-            layer_results, ["gpt-4o", "claude-sonnet-4"]
-        )
-
-        assert result["immediate_stop"] is False  # Tie doesn't stop
-        assert result["deal_breaker_count"] == 1
-        assert result["majority_threshold"] == 1.0
-
-    def test_returns_deal_breaker_details(self, qa_engine):
-        """
-        Given: Deal-breakers in results
-        When: _check_deal_breaker_consensus() is called
-        Then: Returns details with model and reason
-        """
-        layer_results = {
-            "gpt-4o": QAEvaluation(
-                model="gpt-4o", layer="Test", score=3.0,
-                feedback="Bad", deal_breaker=True,
-                deal_breaker_reason="Contains fabricated info", passes_score=False
-            )
-        }
-
-        result = qa_engine._check_deal_breaker_consensus(layer_results, ["gpt-4o"])
-
-        assert len(result["deal_breaker_details"]) == 1
-        assert result["deal_breaker_details"][0]["model"] == "gpt-4o"
-        assert result["deal_breaker_details"][0]["reason"] == "Contains fabricated info"
 
 
 # ============================================================================

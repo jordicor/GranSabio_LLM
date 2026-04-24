@@ -5,8 +5,9 @@ Unified model admin and provider sync routes for Gran Sabio LLM.
 from __future__ import annotations
 
 import asyncio
+from urllib.parse import urlparse
 
-from fastapi import Depends, Query, Request
+from fastapi import Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from services.model_sync import ModelSyncError, ModelSyncService, SUPPORTED_SYNC_PROVIDERS
@@ -15,6 +16,45 @@ from .app_state import app, config, logger, templates
 from .security import require_internal_ip
 
 _specs_write_lock = asyncio.Lock()
+
+
+def _default_port(scheme: str) -> int | None:
+    if scheme == "http":
+        return 80
+    if scheme == "https":
+        return 443
+    return None
+
+
+def require_admin_same_origin(request: Request) -> None:
+    """Reject browser-originated admin mutations from a different origin."""
+    origin = request.headers.get("origin")
+    referer = request.headers.get("referer")
+    source = origin or referer
+    if not source:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin mutation rejected: missing Origin/Referer",
+        )
+
+    parsed = urlparse(source)
+    request_url = request.url
+    if not parsed.scheme or not parsed.hostname or parsed.scheme not in {"http", "https"}:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin mutation rejected: invalid Origin/Referer",
+        )
+
+    source_port = parsed.port or _default_port(parsed.scheme)
+    request_port = request_url.port or _default_port(request_url.scheme)
+    if (
+        parsed.scheme == request_url.scheme
+        and parsed.hostname == request_url.hostname
+        and source_port == request_port
+    ):
+        return
+
+    raise HTTPException(status_code=403, detail="Admin mutation rejected: cross-origin request")
 
 
 def _get_model_sync_service() -> ModelSyncService:
@@ -97,6 +137,7 @@ async def sync_provider_models(
     provider: str,
     request: Request,
     _client_ip: str = Depends(require_internal_ip),
+    _same_origin: None = Depends(require_admin_same_origin),
 ):
     """Persist selected models for the provider into model_specs.json."""
     service = _get_model_sync_service()
@@ -124,6 +165,7 @@ async def delete_catalog_model(
     provider: str,
     model_id: str = Query(..., description="Model ID to delete"),
     _client_ip: str = Depends(require_internal_ip),
+    _same_origin: None = Depends(require_admin_same_origin),
 ):
     """Remove a single model from the local catalog."""
     service = _get_model_sync_service()
@@ -147,6 +189,7 @@ async def toggle_catalog_model(
     model_id: str = Query(..., description="Model ID to toggle"),
     enabled: bool = Query(..., description="Enable or disable the model"),
     _client_ip: str = Depends(require_internal_ip),
+    _same_origin: None = Depends(require_admin_same_origin),
 ):
     """Enable or disable a model in the local catalog."""
     service = _get_model_sync_service()
@@ -168,6 +211,7 @@ async def toggle_catalog_model(
 async def sync_all_providers(
     request: Request,
     _client_ip: str = Depends(require_internal_ip),
+    _same_origin: None = Depends(require_admin_same_origin),
 ):
     """Sync multiple providers in a single atomic operation."""
     service = _get_model_sync_service()
@@ -225,6 +269,7 @@ async def get_openrouter_models(
 async def sync_openrouter_models(
     request: Request,
     _client_ip: str = Depends(require_internal_ip),
+    _same_origin: None = Depends(require_admin_same_origin),
 ):
     """Backwards-compatible OpenRouter sync endpoint."""
     service = _get_model_sync_service()

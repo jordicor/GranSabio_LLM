@@ -542,7 +542,8 @@
           "text",
           "reasoning",
           "function_calling",
-          "vision"
+          "vision",
+          "responses_api"
         ],
         "special_features": [
           "elevated_reasoning_effort",
@@ -585,7 +586,8 @@
           "text",
           "vision",
           "reasoning",
-          "advanced_analysis"
+          "advanced_analysis",
+          "responses_api"
         ],
         "special_features": [
           "reasoning_effort",
@@ -1278,7 +1280,8 @@
           "text",
           "reasoning",
           "function_calling",
-          "vision"
+          "vision",
+          "responses_api"
         ],
         "verified_at": "2026-04-16T05:26:01.681653+00:00",
         "source": "https://developers.openai.com/api/reference/resources/models/methods/list",
@@ -1990,7 +1993,8 @@
           "text",
           "vision",
           "reasoning",
-          "advanced_analysis"
+          "advanced_analysis",
+          "responses_api"
         ],
         "verified_at": "2026-04-16T05:26:01.681653+00:00",
         "source": "https://developers.openai.com/api/reference/resources/models/methods/list",
@@ -3691,11 +3695,7 @@
           "output_per_million": 0.5
         },
         "capabilities": [
-          "text",
-          "image",
-          "vision",
-          "reasoning",
-          "function_calling"
+          "text"
         ],
         "special_features": [
           "unified_architecture",
@@ -3713,7 +3713,7 @@
           "sync_mode": "full",
           "last_synced_at": "2026-04-16T05:31:24.481558+00:00",
           "remote_created_at": "2025-11-19T00:00:00+00:00",
-          "needs_review": false
+          "needs_review": true
         }
       },
       "grok-4-1-fast-reasoning": {
@@ -14043,6 +14043,7 @@
         "capabilities": [
           "text"
         ],
+        "is_test_model": true,
         "verified_at": "2025-01-17T00:00:00+00:00",
         "source": "local_testing"
       },
@@ -14060,6 +14061,7 @@
         "capabilities": [
           "text"
         ],
+        "is_test_model": true,
         "verified_at": "2025-01-17T00:00:00+00:00",
         "source": "local_testing"
       },
@@ -14077,6 +14079,7 @@
         "capabilities": [
           "text"
         ],
+        "is_test_model": true,
         "verified_at": "2025-01-17T00:00:00+00:00",
         "source": "local_testing"
       },
@@ -14094,6 +14097,43 @@
         "capabilities": [
           "text"
         ],
+        "is_test_model": true,
+        "verified_at": "2025-01-17T00:00:00+00:00",
+        "source": "local_testing"
+      },
+      "SmartEdit-Gen-Dumb": {
+        "model_id": "SmartEdit-Gen-Dumb",
+        "name": "SmartEdit Gen Dumb",
+        "description": "Fake model for testing smart-edit generation flows",
+        "input_tokens": 128000,
+        "output_tokens": 16384,
+        "context_window": 128000,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text"
+        ],
+        "is_test_model": true,
+        "verified_at": "2025-01-17T00:00:00+00:00",
+        "source": "local_testing"
+      },
+      "SmartEdit-QA-Dumb": {
+        "model_id": "SmartEdit-QA-Dumb",
+        "name": "SmartEdit QA Dumb",
+        "description": "Fake model for testing smart-edit QA flows",
+        "input_tokens": 128000,
+        "output_tokens": 16384,
+        "context_window": 128000,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text"
+        ],
+        "is_test_model": true,
         "verified_at": "2025-01-17T00:00:00+00:00",
         "source": "local_testing"
       }
@@ -14121,7 +14161,7 @@
     "safety_margin": 0.95,
     "fallback_limits": {
       "input": 50000,
-      "output": 4000
+      "output": 8192
     }
   }
 }

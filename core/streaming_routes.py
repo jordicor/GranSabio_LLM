@@ -19,6 +19,8 @@ from services.project_stream import ProjectStreamManager, parse_phases, Subscrip
 
 from word_count_utils import build_word_count_instructions
 
+from config import config
+
 from .app_state import (
     _ensure_services,
     app,
@@ -27,6 +29,24 @@ from .app_state import (
 )
 from ai_service import StreamChunk
 from .generation_processor import build_context_prompt, ai_service
+
+DEFAULT_MODEL_MAX_TOKENS_FALLBACK = 8192
+
+
+def _model_default_max_tokens(model_name: str) -> int:
+    """Return model max output tokens from specs, falling back to 8192."""
+
+    try:
+        model_info = config.get_model_info(model_name)
+    except Exception:
+        return DEFAULT_MODEL_MAX_TOKENS_FALLBACK
+
+    value = model_info.get("output_tokens")
+    try:
+        tokens = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MODEL_MAX_TOKENS_FALLBACK
+    return tokens if tokens > 0 else DEFAULT_MODEL_MAX_TOKENS_FALLBACK
 
 
 @app.get("/stream-content-direct/{session_id}")
@@ -71,12 +91,17 @@ async def stream_content_direct_v2(session_id: str):
             if word_instructions:
                 prompt_sections.append(word_instructions)
             final_prompt = "\n\n".join(section.strip() for section in prompt_sections if section)
+            requested_max_tokens = getattr(request_data, 'max_tokens', None)
+            if requested_max_tokens is None:
+                requested_max_tokens = _model_default_max_tokens(
+                    getattr(request_data, 'generator_model', '')
+                )
 
             async for chunk in ai_service.generate_content_stream(
                 prompt=final_prompt,
                 model=request_data.generator_model,
                 temperature=request_data.temperature,
-                max_tokens=getattr(request_data, 'max_tokens', 4000),
+                max_tokens=requested_max_tokens,
                 reasoning_effort=getattr(request_data, 'reasoning_effort', None),
                 thinking_budget_tokens=getattr(request_data, 'thinking_budget_tokens', None),
                 content_type=getattr(request_data, 'content_type', 'biography')

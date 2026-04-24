@@ -50,19 +50,14 @@ from ._common import (
     RESULT_POLL_GRACE_SECONDS,
     RESULT_POLL_INTERVAL_SECONDS,
     STREAM_ACTIVITY_CHECK_SECONDS,
+    POLL_RETRY_BACKOFF_SECONDS,
     PROVIDER_KEY_ENV_MAP,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# Exponential backoff curve for transient polling errors in wait_for_result.
-# Applied only to idempotent GETs (get_status / get_result). Ten attempts
-# totalling ~6 minutes, enough to ride out VPN flaps, brief DNS failures, and
-# momentary server overload without abandoning a session the server is still
-# working on. POST /generate is NOT retried here: retrying it would start
-# duplicate sessions.
-_POLL_RETRY_BACKOFF_SECONDS: Tuple[int, ...] = (5, 10, 20, 40, 60, 60, 60, 60, 60, 60)
+_POLL_RETRY_BACKOFF_SECONDS = POLL_RETRY_BACKOFF_SECONDS
 
 # Generic return type for _call_with_retry so it can wrap any idempotent GET
 # (requests.Response, parsed JSON dict, etc.).
@@ -194,6 +189,52 @@ class GranSabioClient:
         except requests_exceptions.RequestException as e:
             raise GranSabioClientError(f"Request failed: {e}") from e
 
+    def _read_json(self, response: requests.Response, endpoint: str) -> Any:
+        """Read JSON body, converting transient mid-read failures to TransientGranSabioError."""
+        try:
+            return response.json()
+        except (
+            requests_exceptions.ChunkedEncodingError,
+            requests_exceptions.ContentDecodingError,
+            requests_exceptions.ConnectionError,
+            requests_exceptions.Timeout,
+            json.JSONDecodeError,
+            ValueError,
+        ) as exc:
+            raise TransientGranSabioError(
+                f"Transient protocol error reading JSON from {endpoint}: {exc}"
+            ) from exc
+
+    def _read_json_no_retry(self, response: requests.Response, endpoint: str) -> Any:
+        """Read JSON body for non-idempotent requests without making it retryable."""
+        try:
+            return response.json()
+        except (
+            requests_exceptions.ChunkedEncodingError,
+            requests_exceptions.ContentDecodingError,
+            requests_exceptions.ConnectionError,
+            requests_exceptions.Timeout,
+            json.JSONDecodeError,
+            ValueError,
+        ) as exc:
+            raise GranSabioClientError(
+                f"Failed to read JSON response from {endpoint}; "
+                f"the operation may have been accepted by the server: {exc}"
+            ) from exc
+
+    def _read_error_text(self, response: requests.Response, endpoint: str) -> str:
+        """Read a non-2xx error body without reclassifying HTTP errors as retryable."""
+        try:
+            return response.text
+        except (
+            requests_exceptions.ChunkedEncodingError,
+            requests_exceptions.ContentDecodingError,
+            requests_exceptions.ConnectionError,
+            requests_exceptions.Timeout,
+        ) as exc:
+            logger.warning("Could not read error body from %s: %s", endpoint, exc)
+            return "<body unreadable>"
+
     # =========================================================================
     # Health & Info
     # =========================================================================
@@ -211,7 +252,7 @@ class GranSabioClient:
                 f"Health check failed: {response.status_code}",
                 status_code=response.status_code
             )
-        return response.json()
+        return self._read_json(response, "/health")
 
     def get_models(self) -> Dict[str, Any]:
         """
@@ -226,7 +267,7 @@ class GranSabioClient:
                 f"Failed to get models: {response.status_code}",
                 status_code=response.status_code
             )
-        return response.json()
+        return self._read_json(response, "/models")
 
     def is_available(self) -> bool:
         """Check if the API is reachable and healthy."""
@@ -269,33 +310,38 @@ class GranSabioClient:
         response = self._request("POST", "/project/new", json_data=payload)
 
         if response.status_code not in (200, 201):
+            text = self._read_error_text(response, "/project/new")
             raise GranSabioClientError(
-                f"Failed to reserve project: {response.text}",
+                f"Failed to reserve project: {text}",
                 status_code=response.status_code
             )
 
-        data = response.json()
+        data = self._read_json_no_retry(response, "/project/new")
         return data["project_id"]
 
     def start_project(self, project_id: str) -> Dict[str, Any]:
         """Activate/reactivate a project."""
         response = self._request("POST", f"/project/start/{project_id}")
         if response.status_code not in (200, 201):
+            endpoint = f"/project/start/{project_id}"
+            text = self._read_error_text(response, endpoint)
             raise GranSabioClientError(
-                f"Failed to start project: {response.text}",
+                f"Failed to start project: {text}",
                 status_code=response.status_code
             )
-        return response.json()
+        return self._read_json_no_retry(response, f"/project/start/{project_id}")
 
     def stop_project(self, project_id: str) -> Dict[str, Any]:
         """Cancel a project and all its active sessions."""
         response = self._request("POST", f"/project/stop/{project_id}")
         if response.status_code not in (200, 202):
+            endpoint = f"/project/stop/{project_id}"
+            text = self._read_error_text(response, endpoint)
             raise GranSabioClientError(
-                f"Failed to stop project: {response.text}",
+                f"Failed to stop project: {text}",
                 status_code=response.status_code
             )
-        return response.json()
+        return self._read_json_no_retry(response, f"/project/stop/{project_id}")
 
     # =========================================================================
     # Content Generation
@@ -307,7 +353,7 @@ class GranSabioClient:
         content_type: str = "article",
         generator_model: str = "gpt-4o",
         temperature: float = 0.7,
-        max_tokens: int = 4000,
+        max_tokens: Optional[int] = None,
         min_words: Optional[int] = None,
         max_words: Optional[int] = None,
         qa_models: Optional[List[str]] = None,
@@ -340,7 +386,9 @@ class GranSabioClient:
             content_type: Type of content (article, creative, json, etc.)
             generator_model: AI model to use for generation
             temperature: Creativity level (0.0-2.0)
-            max_tokens: Maximum tokens to generate
+            max_tokens: Maximum tokens to generate. When omitted, the server
+                uses the selected model's max output from model_specs.json
+                (fallback: 8192).
             min_words: Minimum word count (optional)
             max_words: Maximum word count (optional)
             qa_models: Models for QA evaluation (required if qa_layers not empty)
@@ -374,7 +422,6 @@ class GranSabioClient:
             "content_type": content_type,
             "generator_model": generator_model,
             "temperature": temperature,
-            "max_tokens": max_tokens,
             "min_global_score": min_global_score,
             "max_iterations": max_iterations,
             "gran_sabio_model": gran_sabio_model,
@@ -387,6 +434,8 @@ class GranSabioClient:
             payload["min_words"] = min_words
         if max_words is not None:
             payload["max_words"] = max_words
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         if qa_models is not None:
             payload["qa_models"] = qa_models
         if qa_layers is not None:
@@ -417,13 +466,14 @@ class GranSabioClient:
         response = self._request("POST", "/generate", json_data=payload)
 
         if response.status_code != 200:
+            text = self._read_error_text(response, "/generate")
             raise GranSabioClientError(
-                f"Generation request failed: {response.text}",
+                f"Generation request failed: {text}",
                 status_code=response.status_code,
                 details={"payload": payload}
             )
 
-        result = response.json()
+        result = self._read_json_no_retry(response, "/generate")
 
         # Handle preflight rejection
         if result.get("status") in {"preflight_rejected", "rejected"} and result.get("preflight_feedback"):
@@ -453,11 +503,13 @@ class GranSabioClient:
         """Get current status of a generation session."""
         response = self._request("GET", f"/status/{session_id}")
         if response.status_code != 200:
+            endpoint = f"/status/{session_id}"
+            text = self._read_error_text(response, endpoint)
             raise GranSabioClientError(
-                f"Failed to get status: {response.text}",
+                f"Failed to get status: {text}",
                 status_code=response.status_code
             )
-        return response.json()
+        return self._read_json(response, f"/status/{session_id}")
 
     def get_result(self, session_id: str) -> Dict[str, Any]:
         """Get the result of a completed generation session."""
@@ -468,22 +520,26 @@ class GranSabioClient:
             return {"status": "in_progress", "session_id": session_id}
 
         if response.status_code != 200:
+            endpoint = f"/result/{session_id}"
+            text = self._read_error_text(response, endpoint)
             raise GranSabioClientError(
-                f"Failed to get result: {response.text}",
+                f"Failed to get result: {text}",
                 status_code=response.status_code
             )
 
-        return response.json()
+        return self._read_json(response, f"/result/{session_id}")
 
     def stop_session(self, session_id: str) -> Dict[str, Any]:
         """Cancel an active generation session."""
         response = self._request("POST", f"/stop/{session_id}")
         if response.status_code not in (200, 202):
+            endpoint = f"/stop/{session_id}"
+            text = self._read_error_text(response, endpoint)
             raise GranSabioClientError(
-                f"Failed to stop session: {response.text}",
+                f"Failed to stop session: {text}",
                 status_code=response.status_code
             )
-        return response.json()
+        return self._read_json_no_retry(response, f"/stop/{session_id}")
 
     def _call_with_retry(
         self,
@@ -641,7 +697,7 @@ class GranSabioClient:
         content_type: str = "article",
         generator_model: str = "gpt-4o",
         temperature: float = 0.7,
-        max_tokens: int = 4000,
+        max_tokens: Optional[int] = None,
         min_words: Optional[int] = None,
         max_words: Optional[int] = None,
         qa_models: Optional[List[str]] = None,
@@ -679,7 +735,9 @@ class GranSabioClient:
             content_type: Type of content (article, creative, json, etc.).
             generator_model: AI model to use for generation.
             temperature: Creativity level (0.0-2.0).
-            max_tokens: Maximum tokens to generate.
+            max_tokens: Maximum tokens to generate. When omitted, the server
+                uses the selected model's max output from model_specs.json
+                (fallback: 8192).
             min_words: Minimum word count (optional).
             max_words: Maximum word count (optional).
             qa_models: Models for QA evaluation.
@@ -720,7 +778,6 @@ class GranSabioClient:
             "content_type": content_type,
             "generator_model": generator_model,
             "temperature": temperature,
-            "max_tokens": max_tokens,
             "min_global_score": min_global_score,
             "max_iterations": max_iterations,
             "gran_sabio_model": gran_sabio_model,
@@ -732,6 +789,8 @@ class GranSabioClient:
             payload["min_words"] = min_words
         if max_words is not None:
             payload["max_words"] = max_words
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         if qa_models is not None:
             payload["qa_models"] = qa_models
         if qa_layers is not None:
@@ -1042,19 +1101,30 @@ class GranSabioClient:
             )
 
             if response.status_code == 200:
-                return response.json()
+                return self._read_json(response, f"/result/{session_id}")
 
             # Parse detail message for retry detection
             detail_message = ""
+            is_retryable_status = response.status_code in (202, 425, 503, 400)
             try:
                 response_payload = response.json()
                 if isinstance(response_payload, dict):
                     detail_message = str(response_payload.get("detail", ""))
+            except (
+                requests_exceptions.ChunkedEncodingError,
+                requests_exceptions.ContentDecodingError,
+                requests_exceptions.ConnectionError,
+                requests_exceptions.Timeout,
+            ) as exc:
+                if is_retryable_status:
+                    raise TransientGranSabioError(
+                        f"Transient protocol error reading JSON from /result/{session_id}: {exc}"
+                    ) from exc
             except ValueError:
                 pass
 
             should_retry = False
-            if response.status_code in (202, 425, 503, 400):
+            if is_retryable_status:
                 lower_detail = detail_message.lower()
                 if "not finished" in lower_detail or "still in progress" in lower_detail:
                     should_retry = True
@@ -1091,7 +1161,8 @@ class GranSabioClient:
                 continue
 
             raise GranSabioClientError(
-                f"Result retrieval failed: {response.status_code} - {response.text}",
+                f"Result retrieval failed: {response.status_code} - "
+                f"{self._read_error_text(response, f'/result/{session_id}')}",
                 status_code=response.status_code,
             )
 
@@ -1233,11 +1304,12 @@ class GranSabioClient:
 
         response = self._request("POST", "/analysis/lexical-diversity", json_data=payload)
         if response.status_code != 200:
+            text_body = self._read_error_text(response, "/analysis/lexical-diversity")
             raise GranSabioClientError(
-                f"Lexical diversity analysis failed: {response.text}",
+                f"Lexical diversity analysis failed: {text_body}",
                 status_code=response.status_code
             )
-        return response.json()
+        return self._read_json_no_retry(response, "/analysis/lexical-diversity")
 
     def analyze_repetition(
         self,
@@ -1272,11 +1344,12 @@ class GranSabioClient:
 
         response = self._request("POST", "/analysis/repetition", json_data=payload)
         if response.status_code != 200:
+            text_body = self._read_error_text(response, "/analysis/repetition")
             raise GranSabioClientError(
-                f"Repetition analysis failed: {response.text}",
+                f"Repetition analysis failed: {text_body}",
                 status_code=response.status_code
             )
-        return response.json()
+        return self._read_json_no_retry(response, "/analysis/repetition")
 
     # =========================================================================
     # Specialized Repetition Analysis
@@ -1331,12 +1404,13 @@ class GranSabioClient:
 
         response = self._request("POST", "/analysis/repetition", json_data=payload)
         if response.status_code != 200:
+            text_body = self._read_error_text(response, "/analysis/repetition")
             raise GranSabioClientError(
-                f"Unigram analysis failed: {response.text}",
+                f"Unigram analysis failed: {text_body}",
                 status_code=response.status_code,
             )
 
-        data = response.json()
+        data = self._read_json_no_retry(response, "/analysis/repetition")
         counts: Dict[str, int] = {}
         summary = data.get("summary") if isinstance(data, dict) else None
         top_by_count = summary.get("top_by_count") if isinstance(summary, dict) else None
@@ -1412,12 +1486,13 @@ class GranSabioClient:
 
         response = self._request("POST", "/analysis/repetition", json_data=payload)
         if response.status_code != 200:
+            text_body = self._read_error_text(response, "/analysis/repetition")
             raise GranSabioClientError(
-                f"Positional bias analysis failed: {response.text}",
+                f"Positional bias analysis failed: {text_body}",
                 status_code=response.status_code,
             )
 
-        data = response.json()
+        data = self._read_json_no_retry(response, "/analysis/repetition")
         if not isinstance(data, dict):
             return {}
         position_payload = data.get("position_bias")
@@ -1460,11 +1535,12 @@ class GranSabioClient:
         )
 
         if response.status_code != 200:
+            text = self._read_error_text(response, "/attachments")
             raise GranSabioClientError(
-                f"Attachment upload failed: {response.text}",
+                f"Attachment upload failed: {text}",
                 status_code=response.status_code
             )
-        return response.json()
+        return self._read_json_no_retry(response, "/attachments")
 
     def upload_attachment_base64(
         self,
@@ -1494,11 +1570,12 @@ class GranSabioClient:
 
         response = self._request("POST", "/attachments/base64", json_data=payload)
         if response.status_code != 200:
+            text = self._read_error_text(response, "/attachments/base64")
             raise GranSabioClientError(
-                f"Attachment upload failed: {response.text}",
+                f"Attachment upload failed: {text}",
                 status_code=response.status_code
             )
-        return response.json()
+        return self._read_json_no_retry(response, "/attachments/base64")
 
     # =========================================================================
     # Convenience Methods
@@ -1573,10 +1650,6 @@ class GranSabioClient:
             max_iterations=1,
             **kwargs
         )
-
-
-# Backward compatibility alias
-BioAIClient = GranSabioClient
 
 
 # Module-level convenience function

@@ -8,7 +8,7 @@ Provides structured evaluation with scores, feedback, and edit suggestions.
 
 import asyncio
 import logging
-from typing import Dict, Any, Optional, List, Callable, TYPE_CHECKING
+from typing import Awaitable, Dict, Any, Optional, List, Callable, TYPE_CHECKING
 
 # Use optimized JSON (3.6x faster than standard json)
 import json_utils as json
@@ -17,15 +17,28 @@ if TYPE_CHECKING:
     from logging_utils import PhaseLogger
     from models import ImageData
 
-from ai_service import AIRequestError, StreamChunk
+from ai_service import AIRequestError, AIService, StreamChunk
 from config import EDITABLE_CONTENT_TYPES, config
+from deterministic_validation import DraftValidationResult, validate_generation_candidate
 from model_aliasing import ModelAliasRegistry, PromptPart
-from models import QAEvaluation
+from models import QAEvaluation, is_json_output_requested
+from phrase_frequency_config import is_phrase_frequency_active
+from qa_bypass_engine import QABypassEngine
 from qa_response_schemas import QA_SCHEMA_EDITABLE, QA_SCHEMA_SIMPLE
-from tools.ai_json_cleanroom import extract_json_payload
+from tool_loop_models import LoopScope, OutputContract, PayloadScope, ToolLoopEnvelope
+from tools.ai_json_cleanroom import make_loose_json_validate_options, validate_ai_json
+from validation_context_factory import build_measurement_request_for_layer
 
 
 logger = logging.getLogger(__name__)
+
+
+# Providers that support native tool calling in the shared tool loop.
+# Kept in sync with the generator activation logic in
+# ``core/generation_processor._should_use_generation_tools``.
+_TOOL_CAPABLE_PROVIDERS = frozenset(
+    {"openai", "claude", "anthropic", "gemini", "google", "xai", "openrouter"}
+)
 
 
 class MissingScoreTagError(ValueError):
@@ -34,6 +47,90 @@ class MissingScoreTagError(ValueError):
 
 class QAResponseParseError(ValueError):
     """Raised when a QA model response cannot be parsed as QA JSON."""
+
+
+def _has_structured_request_validators(original_request: Any) -> bool:
+    """Return True when the request has at least one request-level measurable validator.
+
+    Decision is based EXCLUSIVELY on structured ``ContentRequest`` fields.
+    NEVER parses ``layer.criteria`` (which is free text). See §3.4.1 of
+    PROPOSAL_TOOLS_FOR_QA_ARBITER_GRANSABIO.md for rationale.
+    """
+    if original_request is None:
+        return False
+    if getattr(original_request, "min_words", None) is not None:
+        return True
+    if getattr(original_request, "max_words", None) is not None:
+        return True
+    pf = getattr(original_request, "phrase_frequency", None)
+    if is_phrase_frequency_active(pf, context="QA tool-loop activation"):
+        return True
+    ld = getattr(original_request, "lexical_diversity", None)
+    if ld is not None and getattr(ld, "enabled", False):
+        return True
+    if is_json_output_requested(original_request):
+        return True
+    if bool(getattr(original_request, "target_field", None)):
+        return True
+    return False
+
+
+def _should_use_qa_tools(
+    request: Any,
+    layer: Any,
+    model: str,
+    *,
+    bypass_engine: Optional[QABypassEngine] = None,
+) -> bool:
+    """Decide whether the QA evaluator should run inside the shared tool loop.
+
+    Fail-closed activation per §3.4.1 of the proposal. Rules (order matters):
+
+    1. ``qa_tools_mode == "never"`` -> False.
+    2. ``request`` missing -> False (the tool loop needs measurable context).
+    3. ``QABypassEngine.can_bypass_layer`` -> False (bypass wins: if a layer
+       can be evaluated algorithmically we do not add an LLM tool round).
+    4. No structured request-level validator present -> False.
+    5. Unsupported provider or OpenAI Responses API model -> False.
+    6. Otherwise True.
+
+    NEVER uses regex over ``layer.criteria`` — the decision is based only on
+    structured request fields.
+    """
+    if request is None:
+        return False
+
+    tools_mode = getattr(request, "qa_tools_mode", "auto")
+    if tools_mode == "never":
+        return False
+
+    engine = bypass_engine if bypass_engine is not None else QABypassEngine()
+    try:
+        if engine.can_bypass_layer(layer, request):
+            return False
+    except Exception:
+        # Defensive: if the bypass engine blows up on an unexpected layer
+        # shape we choose the safer default and do NOT try to run tools
+        # (fail-closed).
+        return False
+
+    if not _has_structured_request_validators(request):
+        return False
+
+    try:
+        model_info = config.get_model_info(model)
+    except Exception:
+        return False
+
+    provider_key = str(model_info.get("provider", "") or "").lower()
+    model_id = str(model_info.get("model_id", "") or "").lower()
+
+    if provider_key not in _TOOL_CAPABLE_PROVIDERS:
+        return False
+    if provider_key == "openai" and AIService._is_openai_responses_api_model(model_id):
+        return False
+
+    return True
 
 
 class QAEvaluationService:
@@ -80,6 +177,11 @@ class QAEvaluationService:
         input_images: Optional[List["ImageData"]] = None,
         edit_history: Optional[str] = None,
         model_alias_registry: Optional[ModelAliasRegistry] = None,
+        layer: Optional[Any] = None,
+        bypass_engine: Optional[QABypassEngine] = None,
+        session_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
     ) -> QAEvaluation:
         """
         Evaluate content quality using specified AI model
@@ -404,9 +506,127 @@ IMPORTANT:
                 ] if edit_history else None,
             )
 
+        # --- Tool-loop activation (§3.4.1, Fase 2) ---
+        # Streaming is disabled when the tool loop is active — the loop drives
+        # its own provider calls turn-by-turn and cannot multiplex a
+        # client-side stream.
+        use_tools = (
+            layer is not None
+            and _should_use_qa_tools(
+                original_request,
+                layer,
+                model,
+                bypass_engine=bypass_engine,
+            )
+        )
+
+        async def _generate_qa_response_via_tool_loop(
+            json_schema: Optional[Dict[str, Any]],
+        ) -> str:
+            """Call the QA model inside the shared ``validate_draft`` tool loop.
+
+            Returns the final JSON text for downstream parsing.
+            """
+            measurement_request = build_measurement_request_for_layer(
+                original_request, layer
+            )
+            if json_schema is None:
+                # Provider rejected the strict schema. Fall back to the
+                # single-shot JSON-mode path so the final QA parser can recover
+                # fenced/basic JSON without violating the JSON_STRUCTURED
+                # tool-loop contract.
+                return await _generate_qa_response(None)
+            if measurement_request is None:
+                # Should not happen — ``_should_use_qa_tools`` already checks
+                # for active validators. Defensive fail-closed path falls
+                # through to the single-shot call.
+                return await _generate_qa_response(json_schema)
+
+            def _validation_callback(candidate: str) -> DraftValidationResult:
+                # Evaluators never care about the JSON contract of the
+                # generator response; they only need objective measurements
+                # over the text. ``include_json_validation`` is kept True
+                # because the whitelist carries ``json_output``/``json_schema``
+                # and the validator will only run that sub-check when
+                # ``json_output`` is truthy.
+                json_options = (
+                    make_loose_json_validate_options()
+                    if (
+                        measurement_request.json_output
+                        and measurement_request.json_schema is None
+                    )
+                    else None
+                )
+                return validate_generation_candidate(
+                    candidate,
+                    measurement_request,
+                    include_json_validation=bool(
+                        measurement_request.json_output
+                        or measurement_request.target_field
+                    ),
+                    json_options=json_options,
+                )
+
+            bound_tool_event_callback = tool_event_callback
+            if bound_tool_event_callback is None:
+                async def bound_tool_event_callback(  # type: ignore[misc]
+                    event_type: str, payload: Dict[str, Any]
+                ) -> None:
+                    return None
+
+            loop_content, envelope = await self.ai_service.call_ai_with_validation_tools(
+                prompt=evaluation_prompt,
+                model=model,
+                validation_callback=_validation_callback,
+                output_contract=OutputContract.JSON_STRUCTURED,
+                response_format=json_schema,
+                payload_scope=PayloadScope.MEASUREMENT_ONLY,
+                stop_on_approval=False,
+                loop_scope=LoopScope.QA,
+                retries_enabled=False,
+                max_tool_rounds=config.QA_MAX_TOOL_ROUNDS,
+                initial_measurement_text=content,
+                tool_event_callback=bound_tool_event_callback,
+                temperature=eval_temperature,
+                max_tokens=max_tokens,
+                system_prompt=qa_system_prompt,
+                extra_verbose=extra_verbose,
+                content_type=content_type,
+                reasoning_effort=reasoning_effort,
+                thinking_budget_tokens=thinking_budget_tokens,
+                usage_callback=usage_callback,
+                phase_logger=phase_logger,
+                images=input_images,
+                model_alias_registry=model_alias_registry,
+                prompt_safety_parts=[
+                    PromptPart(
+                        text=edit_history or "",
+                        source="system_generated",
+                        label="qa.edit_history",
+                    )
+                ] if edit_history else None,
+            )
+
+            if isinstance(envelope, ToolLoopEnvelope) and envelope.payload is not None:
+                # JSON_STRUCTURED parsed dict is available — re-serialize for
+                # the downstream parser (which currently consumes the raw
+                # text). Avoids duplicating parse logic.
+                return json.dumps(envelope.payload)
+            return loop_content
+
+        if use_tools:
+            if extra_verbose:
+                logger.info(
+                    f"[QA TOOLS] Activating shared tool loop for layer '{layer_name}' "
+                    f"with model {model} (session_id={session_id or 'N/A'})."
+                )
+            response_generator = _generate_qa_response_via_tool_loop
+        else:
+            response_generator = _generate_qa_response
+
         try:
             try:
-                response = await _generate_qa_response(qa_response_schema)
+                response = await response_generator(qa_response_schema)
             except Exception as exc:
                 if (
                     not streamed_response_started
@@ -419,7 +639,7 @@ IMPORTANT:
                         layer_name,
                         exc,
                     )
-                    response = await _generate_qa_response(None)
+                    response = await response_generator(None)
                 else:
                     raise
 
@@ -441,7 +661,11 @@ IMPORTANT:
                 logger.info("")
 
             # Parse JSON response
-            parsed = self._parse_qa_json_response(response, model, layer_name)
+            parsed = self._parse_qa_json_response(
+                response,
+                model,
+                layer_name,
+            )
 
             logger.info(f"QA evaluation completed: {model} -> {layer_name}: Score {parsed['score']}")
 
@@ -480,63 +704,6 @@ IMPORTANT:
             logger.error(f"Content evaluation failed for {model}: {str(e)}")
             raise
 
-    async def evaluate_content_extended(
-        self,
-        content: str,
-        criteria: str,
-        model: str,
-        layer_name: str,
-        min_score: float,
-        deal_breaker_criteria: Optional[str] = None,
-        output_requirements: Optional[str] = None,
-        concise_on_pass: bool = True,
-        original_request: Optional[Any] = None,
-        extra_verbose: bool = False,
-        stream_callback: Optional[callable] = None,
-        usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-        max_tokens: int = 8000,
-        reasoning_effort: Optional[str] = None,
-        thinking_budget_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
-        return_structured: bool = False,  # Deprecated - structured info now always returned
-        request_edit_info: bool = True,
-        phase_logger: Optional["PhaseLogger"] = None,
-        input_images: Optional[List["ImageData"]] = None,
-    ) -> QAEvaluation:
-        """
-        Extended version of evaluate_content that can return structured information
-        about problematic text ranges.
-
-        Note: This method now simply delegates to evaluate_content which handles
-        structured responses natively via JSON format.
-        """
-        # Call base method (now handles JSON natively)
-        result = await self.evaluate_content(
-            content=content,
-            criteria=criteria,
-            model=model,
-            layer_name=layer_name,
-            min_score=min_score,
-            deal_breaker_criteria=deal_breaker_criteria,
-            output_requirements=output_requirements,
-            concise_on_pass=concise_on_pass,
-            original_request=original_request,
-            extra_verbose=extra_verbose,
-            phase_logger=phase_logger,
-            stream_callback=stream_callback,
-            usage_callback=usage_callback,
-            max_tokens=max_tokens,
-            reasoning_effort=reasoning_effort,
-            thinking_budget_tokens=thinking_budget_tokens,
-            temperature=temperature,
-            request_edit_info=request_edit_info,
-            input_images=input_images,
-        )
-
-        # Structured response already parsed in evaluate_content()
-        # No additional processing needed
-        return result
-
     @staticmethod
     def _is_structured_output_schema_error(exc: Exception) -> bool:
         """Return True for provider/local errors caused by schema incompatibility."""
@@ -566,7 +733,13 @@ IMPORTANT:
             )
         )
 
-    def _parse_qa_json_response(self, response: str, model: str, layer_name: str) -> Dict[str, Any]:
+    def _parse_qa_json_response(
+        self,
+        response: str,
+        model: str,
+        layer_name: str,
+        response_schema: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         Parse JSON response from QA evaluation.
 
@@ -575,19 +748,25 @@ IMPORTANT:
                            editable, edit_strategy, edit_groups
         """
         try:
-            payload, extraction_info = extract_json_payload(response)
-            source = extraction_info.get("source") if extraction_info else None
-            if payload is None:
+            validation_result = validate_ai_json(response, schema=response_schema)
+            extraction_info = validation_result.info or {}
+            source = extraction_info.get("source")
+            if not validation_result.json_valid:
+                error_details = "; ".join(
+                    f"{issue.path}: {issue.message}"
+                    for issue in (validation_result.errors or [])
+                ) or "unknown JSON validation error"
                 logger.error(
-                    "No JSON payload found in QA response for %s@%s. "
+                    "Invalid QA JSON response for %s@%s: %s. "
                     "Response preview: %r. Extraction info: %s",
                     model,
                     layer_name,
+                    error_details,
                     response[:500] if isinstance(response, str) else response,
                     extraction_info,
                 )
                 raise QAResponseParseError(
-                    f"No JSON payload found in QA response from {model}@{layer_name}"
+                    f"Invalid JSON payload from {model}@{layer_name}: {error_details}"
                 )
 
             if source and source != "raw":
@@ -599,20 +778,7 @@ IMPORTANT:
                     source,
                 )
 
-            try:
-                data = json.loads(payload)
-            except json.JSONDecodeError as exc:
-                logger.error(
-                    "Failed to json.loads() extracted payload for %s@%s: %s. "
-                    "Payload preview: %r",
-                    model,
-                    layer_name,
-                    exc,
-                    payload[:500],
-                )
-                raise QAResponseParseError(
-                    f"Invalid JSON payload from {model}@{layer_name}: {exc}"
-                ) from exc
+            data = validation_result.data
 
             if not isinstance(data, dict):
                 raise QAResponseParseError(

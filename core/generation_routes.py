@@ -15,6 +15,7 @@ from fastapi import Body, HTTPException
 from fastapi.responses import JSONResponse
 
 from logging_utils import create_phase_logger, Phase
+from ai_service import AIService
 from attachments_router import get_attachment_manager
 from deal_breaker_tracker import get_tracker
 from models import (
@@ -23,11 +24,12 @@ from models import (
     GenerationStatus,
     ImageData,
     PreflightIssue,
-    PreflightResult,
     ProjectInitRequest,
     ProjectInitResponse,
+    is_json_output_requested,
 )
-from preflight_validator import run_preflight_validation
+from phrase_frequency_config import is_phrase_frequency_active
+from preflight_validator import resolve_preflight_model, run_preflight_validation
 from model_aliasing import ModelAliasRegistry
 from services.attachment_manager import (
     AttachmentManager,
@@ -101,7 +103,10 @@ def compute_base_effective_layers(request: "ContentRequest") -> List[str]:
         labels.append("__auto_word_count_enforcement__")
 
     phrase_frequency = getattr(request, "phrase_frequency", None)
-    phrase_frequency_active = bool(phrase_frequency and getattr(phrase_frequency, "enabled", False))
+    phrase_frequency_active = is_phrase_frequency_active(
+        phrase_frequency,
+        context="effective layer computation",
+    )
     if phrase_frequency_active:
         labels.append("__auto_phrase_frequency__")
 
@@ -124,6 +129,7 @@ QA_LAYER_PADDING_SECONDS = 120       # 2 minutes per QA layer
 GRAN_SABIO_PADDING_SECONDS = 600     # 10 minutes buffer if Gran Sabio fallback enabled
 SESSION_TIMEOUT_CAP_SECONDS = 8 * 3600  # Never recommend more than 8 hours
 DEFAULT_WORD_LIMIT_TOKEN_FLOOR = 8000
+DEFAULT_MODEL_MAX_TOKENS_FALLBACK = 8192
 ESTIMATED_TOKENS_PER_WORD = 2.2
 LONG_FORM_TOKEN_BUFFER = 1024
 
@@ -174,6 +180,22 @@ def _estimate_tokens_for_word_target(request: ContentRequest) -> Optional[int]:
     return max(DEFAULT_WORD_LIMIT_TOKEN_FLOOR, estimated_tokens)
 
 
+def _model_default_max_tokens(model_name: str) -> int:
+    """Return model max output tokens from specs, falling back to 8192."""
+
+    try:
+        model_info = config.get_model_info(model_name)
+    except Exception:
+        return DEFAULT_MODEL_MAX_TOKENS_FALLBACK
+
+    value = model_info.get("output_tokens")
+    try:
+        tokens = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MODEL_MAX_TOKENS_FALLBACK
+    return tokens if tokens > 0 else DEFAULT_MODEL_MAX_TOKENS_FALLBACK
+
+
 def _build_advisory(*, code: str, message: str, severity: str = "warning") -> PreflightIssue:
     """Create a non-blocking accepted-path advisory."""
 
@@ -197,7 +219,7 @@ def _supports_long_text_generation_tools(model_name: str) -> bool:
     model_id = str(model_info.get("model_id", "")).lower()
     if provider not in {"openai", "claude", "anthropic", "gemini", "google", "xai", "openrouter"}:
         return False
-    if provider == "openai" and any(marker in model_id for marker in ["o3-pro", "gpt-5-pro"]):
+    if provider == "openai" and AIService._is_openai_responses_api_model(model_id):
         return False
     return True
 
@@ -536,7 +558,9 @@ async def generate_content(request: ContentRequest):
             provider_key = (gen_info.get("provider") or "").lower()
             model_id_lc = str(gen_info.get("model_id") or "").lower()
             supported_providers = {"openai", "claude", "anthropic", "gemini", "google", "xai", "openrouter"}
-            if provider_key not in supported_providers or any(m in model_id_lc for m in ("o3-pro", "gpt-5-pro")):
+            if provider_key not in supported_providers or (
+                provider_key == "openai" and AIService._is_openai_responses_api_model(model_id_lc)
+            ):
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -562,6 +586,22 @@ async def generate_content(request: ContentRequest):
             detail="generator_model is required and must match a model declared in model_specs.json.",
         )
     _ensure_model_known(request.generator_model, "generator_model")
+
+    # If the caller did not provide an output budget, default to the model's
+    # declared max output capacity. This avoids silently capping quality-focused
+    # JSON/multimodal generations at the legacy 4000-token fallback.
+    if (
+        request.max_tokens_percentage is None
+        and (request.max_tokens is None or "max_tokens" not in request_fields_set)
+    ):
+        default_max_tokens = _model_default_max_tokens(request.generator_model)
+        logger.info(
+            "Defaulting max_tokens from model specs for %s: %s -> %s",
+            request.generator_model,
+            request.max_tokens,
+            default_max_tokens,
+        )
+        request.max_tokens = default_max_tokens
 
     # Require QA models when effective QA pipeline is non-empty or accent post/inline_post mode
     qa_required = bool(compute_base_effective_layers(request)) or request.llm_accent_guard.mode in {"post", "inline_post"}
@@ -671,7 +711,7 @@ async def generate_content(request: ContentRequest):
             )
             request.max_tokens = estimated_budget
 
-    json_output_requested = request.json_output or request.content_type == "json"
+    json_output_requested = is_json_output_requested(request)
 
     usage_tracker = UsageTracker(detail_level=getattr(request, "show_query_costs", 0))
 
@@ -730,14 +770,6 @@ async def generate_content(request: ContentRequest):
             raise HTTPException(
                 status_code=400,
                 detail="Long Text Mode manages structural repairs internally and does not accept an explicit arbiter_model.",
-            )
-        if request.generation_tools_mode == "always" and not long_text_tools_supported:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"generation_tools_mode='always' is not supported for generator_model "
-                    f"'{request.generator_model}' in Long Text section drafting."
-                ),
             )
         if request.generation_tools_mode == "auto" and not long_text_tools_supported:
             long_text_advisories.append(
@@ -908,9 +940,10 @@ async def generate_content(request: ContentRequest):
         reasoning_timeout_hint = None
 
     recommended_timeout_seconds = _estimate_session_timeout(request, reasoning_timeout_hint)
+    selected_preflight_model = resolve_preflight_model(request)
     model_alias_registry = ModelAliasRegistry.from_request(
         request,
-        preflight_model=getattr(config, "PREFLIGHT_VALIDATION_MODEL", None),
+        preflight_model=selected_preflight_model,
     )
     request._model_alias_registry = model_alias_registry
 
@@ -947,44 +980,19 @@ async def generate_content(request: ContentRequest):
     grounding_config = getattr(request, "evidence_grounding", None)
     grounding_enabled = bool(grounding_config and grounding_config.enabled)
 
-    # Check if semantic QA is disabled and grounding is not active - bypass preflight if so
-    if not request.qa_layers and not grounding_enabled and request.llm_accent_guard.mode == "off":
-        # No QA layers means no potential contradictions - always proceed
-        from preflight_validator import _analyze_word_count_conflicts
-        from models import PreflightResult
-        word_count_analysis = _analyze_word_count_conflicts(request)
-        preflight_result = PreflightResult(
-            decision="proceed",
-            user_feedback="QA evaluation disabled - proceeding without preflight validation",
-            summary="Bypassed preflight validation due to empty qa_layers",
-            confidence=1.0,
-            enable_algorithmic_word_count=word_count_analysis["enable_algorithmic_word_count"],
-            duplicate_word_count_layers_to_remove=word_count_analysis["duplicate_layers_to_remove"],
+    # Run preflight validation for every request. Requests without semantic QA still
+    # require the LLM preflight gate so model/configuration failures are fail-closed.
+    with preflight_phase_logger.phase(Phase.PREFLIGHT):
+        preflight_result = await run_preflight_validation(
+            ai_service,
+            request,
+            context_documents=preflight_context,
+            image_info=preflight_image_info,
+            stream_callback=preflight_stream_callback,
+            usage_tracker=usage_tracker,
+            phase_logger=preflight_phase_logger,
+            model_alias_registry=model_alias_registry,
         )
-        temp_session["preflight_content"] += "⚡ Preflight validation bypassed - QA evaluation disabled\n"
-        if project_id:
-            asyncio.create_task(
-                publish_project_phase_chunk(
-                    project_id,
-                    "preflight",
-                    "⚡ Preflight validation bypassed - QA evaluation disabled\n",
-                    session_id=session_id,
-                    request_name=request.request_name,
-                )
-            )
-    else:
-        # Run a preflight validation to catch impossible or contradictory requirements early
-        with preflight_phase_logger.phase(Phase.PREFLIGHT):
-            preflight_result = await run_preflight_validation(
-                ai_service,
-                request,
-                context_documents=preflight_context,
-                image_info=preflight_image_info,
-                stream_callback=preflight_stream_callback,
-                usage_tracker=usage_tracker,
-                phase_logger=preflight_phase_logger,
-                model_alias_registry=model_alias_registry,
-            )
 
     if long_text_enabled and not request.qa_layers and not grounding_enabled:
         long_text_advisories.append(
