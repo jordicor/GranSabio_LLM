@@ -12,12 +12,13 @@ Dependencies:
 - orjson (already used in project)
 """
 
-import re
 import copy
-import orjson
-import jmespath
-from typing import Any, Dict, List, Optional, Tuple, Union
 import logging
+import re
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import jmespath
+import orjson
 
 logger = logging.getLogger(__name__)
 

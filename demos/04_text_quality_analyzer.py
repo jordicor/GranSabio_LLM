@@ -24,18 +24,17 @@ Usage:
     python demos/04_text_quality_analyzer.py --clipboard
 """
 
+import argparse
 import asyncio
 import sys
-import argparse
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Any, Dict, List
 
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from client import AsyncGranSabioClient
-from demos.common import run_demo, print_header, print_section, colorize, safe_print
-
+from demos.common import colorize, print_header, run_demo, safe_print
 
 # Sample texts for demonstration
 SAMPLE_AI_TEXT = """

@@ -27,19 +27,18 @@ Usage:
     python demos/08_parallel_generation.py --timeout 30
 """
 
+import argparse
 import asyncio
 import sys
-import argparse
-from pathlib import Path
-from typing import Dict, Any, List
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List
 
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from client import AsyncGranSabioClient
-from demos.common import print_header, print_full_content, colorize, safe_print
-
+from demos.common import colorize, print_full_content, print_header, safe_print
 
 # Content prompts for parallel generation
 CONTENT_PROMPTS = [

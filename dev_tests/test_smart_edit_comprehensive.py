@@ -27,15 +27,15 @@ Usage:
     python dev_tests/test_smart_edit_comprehensive.py --category edge
 """
 
-import sys
-import os
-import asyncio
 import argparse
+import asyncio
+import os
+import sys
 import time
 import traceback
-from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
 from enum import Enum
+from typing import Dict, List, Optional
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -52,18 +52,16 @@ from smart_edit import (
     TargetMode,
     TargetScope,
     TextTarget,
-    OperationType,
-    find_optimal_phrase_length,
     build_word_map,
+    extract_phrase_from_response,
+    find_optimal_phrase_length,
     locate_by_markers,
     locate_by_word_indices,
-    normalize_source_text,
     normalize_for_matching,
+    normalize_source_text,
     parse_counted_phrase,
     validate_counted_phrase_format,
-    extract_phrase_from_response,
 )
-
 
 # =============================================================================
 # TEST RESULT TRACKING

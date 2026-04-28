@@ -9,8 +9,6 @@ Tests error handling throughout the application:
 - API error responses
 """
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 
 
 # Note: Fixtures inherited from conftest.py:

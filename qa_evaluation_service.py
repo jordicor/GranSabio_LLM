@@ -8,7 +8,7 @@ Provides structured evaluation with scores, feedback, and edit suggestions.
 
 import asyncio
 import logging
-from typing import Awaitable, Dict, Any, Optional, List, Callable, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 
 # Use optimized JSON (3.6x faster than standard json)
 import json_utils as json
@@ -28,7 +28,6 @@ from qa_response_schemas import QA_SCHEMA_EDITABLE, QA_SCHEMA_SIMPLE
 from tool_loop_models import LoopScope, OutputContract, PayloadScope, ToolLoopEnvelope
 from tools.ai_json_cleanroom import make_loose_json_validate_options, validate_ai_json
 from validation_context_factory import build_measurement_request_for_layer
-
 
 logger = logging.getLogger(__name__)
 
@@ -458,7 +457,7 @@ IMPORTANT:
                     prompt_safety_parts=[
                         PromptPart(
                             text=edit_history or "",
-                            source="system_generated",
+                            source="user_supplied",
                             label="qa.edit_history",
                         )
                     ] if edit_history else None,
@@ -500,7 +499,7 @@ IMPORTANT:
                 prompt_safety_parts=[
                     PromptPart(
                         text=edit_history or "",
-                        source="system_generated",
+                        source="user_supplied",
                         label="qa.edit_history",
                     )
                 ] if edit_history else None,
@@ -601,7 +600,7 @@ IMPORTANT:
                 prompt_safety_parts=[
                     PromptPart(
                         text=edit_history or "",
-                        source="system_generated",
+                        source="user_supplied",
                         label="qa.edit_history",
                     )
                 ] if edit_history else None,

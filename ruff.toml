@@ -1,0 +1,42 @@
+line-length = 140
+target-version = "py310"
+
+[lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort (import sorting)
+]
+ignore = [
+    "F541",  # f-string without placeholders — 174 instances, cosmetic
+    "F821",  # undefined name — false positives from forward-ref type hints
+    "E402",  # module-level import not at top — intentional conditional imports
+    "E741",  # ambiguous variable name (l, O, I) — only 2 instances, not worth enforcing
+    "E501",  # line too long — handled by formatter, not linter
+    "E701",  # multiple statements on one line (colon) — project style
+    "E702",  # multiple statements on one line (semicolon) — project style
+]
+
+[lint.per-file-ignores]
+"dev_tests/*" = ["F841"]  # unused variables common in test scaffolding
+"gransabio_reimagined/*" = ["F401", "F841"]  # PoC, not production
+"quick_start.py" = ["F401"]  # try-import for dependency availability check
+"ai_service.py" = ["F401"]  # try-import for optional google SDK
+
+[lint.isort]
+known-first-party = [
+    "ai_service",
+    "config",
+    "models",
+    "json_utils",
+    "model_aliasing",
+    "qa_engine",
+    "gran_sabio",
+    "consensus_engine",
+    "arbiter",
+    "smart_edit",
+    "long_text",
+    "core",
+    "evidence_grounding",
+]

@@ -2,8 +2,8 @@
 
 from types import SimpleNamespace
 
-from models import ContentRequest
 from core.generation_routes import _estimate_tokens_for_word_target, _model_default_max_tokens
+from models import ContentRequest
 
 
 class TestEstimateTokensForWordTarget:

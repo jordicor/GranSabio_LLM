@@ -8,11 +8,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import os
+
 os.environ["FAKE_AI_HOST"] = "http://localhost:8989"
 
 from ai_service import get_ai_service
-from qa_evaluation_service import QAEvaluationService
 from models import QALayer
+from qa_evaluation_service import QAEvaluationService
 
 
 async def test_qa_dumb_direct():

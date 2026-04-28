@@ -7,8 +7,8 @@ avoiding expensive AI model calls for predictable criteria violations.
 """
 
 import logging
-from typing import List, Dict, Any, Optional
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from deterministic_validation import (
     evaluate_cumulative_repetition_check,
@@ -17,13 +17,12 @@ from deterministic_validation import (
     evaluate_word_count_check,
     prepare_validation_context,
 )
-from models import QALayer, QAEvaluation, is_json_output_requested
+from models import QAEvaluation, QALayer, is_json_output_requested
 from phrase_frequency_config import is_phrase_frequency_active
 from word_count_utils import (
     count_words,
     is_word_count_enforcement_enabled,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -78,12 +77,12 @@ def _get_validation_text_for_bypass(
 class QABypassEngine:
     """
     Algorithmic QA Bypass Engine
-    
+
     This engine handles predictable deal-breaker scenarios without requiring
     expensive AI model calls. Currently supports:
     - Word count enforcement with deal-breaker severity
     """
-    
+
     def __init__(self):
         """Initialize the bypass engine"""
         # The Arithmoi - mathematical entities that can multiply to enforce numerical rules
@@ -115,7 +114,7 @@ class QABypassEngine:
             "CumulGuard-Delta",
             "CumulGuard-Epsilon",
         ]
-    
+
     def can_bypass_layer(self, layer: QALayer, original_request: Any) -> bool:
         """
         Determine if a QA layer can be bypassed algorithmically
@@ -161,11 +160,11 @@ class QABypassEngine:
             return True
 
         return False
-    
+
     def bypass_layer_evaluation(
-        self, 
-        content: str, 
-        layer: QALayer, 
+        self,
+        content: str,
+        layer: QALayer,
         qa_models: List[str],
         original_request: Any,
         *,
@@ -173,13 +172,13 @@ class QABypassEngine:
     ) -> Dict[str, QAEvaluation]:
         """
         Perform algorithmic bypass evaluation for a layer
-        
+
         Args:
             content: Content to evaluate
             layer: QA layer configuration
             qa_models: List of QA models that would normally evaluate
             original_request: Original content request
-            
+
         Returns:
             Dictionary of {model: QAEvaluation} simulating normal QA results
         """
@@ -219,7 +218,7 @@ class QABypassEngine:
         # Fallback - should not happen if can_bypass_layer is correct
         logger.warning(f"Attempted bypass for unsupported layer: {layer.name}")
         return {}
-    
+
     def _bypass_word_count_evaluation(
         self,
         content: str,
@@ -815,25 +814,25 @@ class QABypassEngine:
         )
 
     def should_bypass_qa_layer(
-        self, 
-        layer: QALayer, 
+        self,
+        layer: QALayer,
         original_request: Any,
         extra_verbose: bool = False
     ) -> bool:
         """
         Determine if QA evaluation should be bypassed for this layer
-        
+
         Args:
             layer: QA layer to check
             original_request: Original content request
             extra_verbose: Whether extra verbose logging is enabled
-            
+
         Returns:
             True if QA should be bypassed algorithmically
         """
         should_bypass = self.can_bypass_layer(layer, original_request)
-        
+
         if should_bypass and extra_verbose:
             logger.info(f"QA Bypass Engine: Layer '{layer.name}' will be evaluated algorithmically")
-        
+
         return should_bypass

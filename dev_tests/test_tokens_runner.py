@@ -19,12 +19,12 @@ Environment Variables:
     API_BASE=http://...     - Override API base URL (default: http://localhost:8000)
 """
 
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import subprocess
-from typing import List
 
 
 def print_header(title: str):

@@ -1,12 +1,12 @@
 from types import SimpleNamespace
 
-from deterministic_validation import prepare_validation_context, validate_generation_candidate
 from core.generation_processor import _locate_edit_segment
+from deterministic_validation import prepare_validation_context, validate_generation_candidate
 from smart_edit import build_segment_map
 from smart_edit.models import TextEditRange
 from smart_edit.qa_integration import parse_qa_edit_groups
-from tools.ai_json_cleanroom import make_loose_json_validate_options
 from tool_loop_models import PayloadScope
+from tools.ai_json_cleanroom import make_loose_json_validate_options
 from word_count_utils import create_word_count_qa_layer
 
 

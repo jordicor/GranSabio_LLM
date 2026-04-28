@@ -7,8 +7,8 @@ This script:
 3. Checks if Gran Sabio escalation is triggered correctly
 """
 
-import sqlite3
 import json
+import sqlite3
 from pathlib import Path
 
 DB_PATH = Path(__file__).parent.parent / "debugger_history.db"

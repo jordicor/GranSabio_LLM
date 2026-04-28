@@ -16,17 +16,15 @@ Usage:
 """
 
 import asyncio
-import sys
-import os
 import json
+import os
+import sys
 from datetime import datetime
 
 # Add repository root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from ai_service import AIService
-import config
-
 
 # Test configuration
 MODEL_ID = "gemini-3-pro-preview"

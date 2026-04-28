@@ -18,23 +18,23 @@ Usage:
   python dev_tests/test_grounding_model_comparison.py [--extraction-only] [--scoring-only] [--quick]
 """
 
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import argparse
 import asyncio
 import time
-import argparse
-from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 # Import project modules
 from ai_service import get_ai_service
-from evidence_grounding.claim_extractor import ClaimExtractor
 from evidence_grounding.budget_scorer import BudgetScorer
-from models import ExtractedClaim, EvidenceSpan, SpanType
-
+from evidence_grounding.claim_extractor import ClaimExtractor
+from models import EvidenceSpan, ExtractedClaim, SpanType
 
 # =============================================================================
 # Model Configuration

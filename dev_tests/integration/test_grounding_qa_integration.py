@@ -14,24 +14,20 @@ Tests verify:
 All tests use mocked AI responses to avoid API calls.
 """
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-import math
 
-from qa_engine import QAEngine
+import pytest
+
+from evidence_grounding import get_effective_order
 from models import (
+    ClaimBudgetResult,
     EvidenceGroundingConfig,
     EvidenceGroundingResult,
     ExtractedClaim,
-    ClaimBudgetResult,
-    EvidenceSpan,
-    SpanType,
-    QALayer,
     QAEvaluation,
-    ContentRequest,
+    QALayer,
 )
-from evidence_grounding import get_effective_order
-
+from qa_engine import QAEngine
 
 # =============================================================================
 # Test Fixtures

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import ipaddress
+import json as std_json
 import logging
 import mimetypes
 import re
@@ -14,11 +15,10 @@ import socket
 import time
 import unicodedata
 import uuid
-import json as std_json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Set
+from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
@@ -27,7 +27,6 @@ from pydantic import BaseModel, Field, ValidationError
 
 import json_utils as json
 from config import AttachmentSettings
-
 
 try:
     import magic  # type: ignore
@@ -570,6 +569,7 @@ class AttachmentManager:
                 "Pillow is required for image processing. Install with: pip install Pillow"
             ) from exc
         import io
+
         from config import config
 
         # Check if auto_resize is disabled

@@ -11,11 +11,7 @@ Note: SSE streams keep connections open indefinitely. Tests verify
 initial response headers and status codes without waiting for content.
 """
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 import threading
-import time
-
 
 # Note: Fixtures inherited from conftest.py:
 # - bypass_ip_filter (autouse)

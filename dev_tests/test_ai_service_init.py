@@ -7,11 +7,12 @@ client initialization, and provider routing logic.
 Target: 30 tests
 """
 
-import pytest
-from unittest.mock import MagicMock, patch, AsyncMock
-import threading
-import sys
 import os
+import sys
+import threading
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

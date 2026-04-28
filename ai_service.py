@@ -7,20 +7,21 @@ Provides unified interface for content generation across different models.
 """
 
 import asyncio
-import aiohttp
 import hashlib
-import time
 import logging
 import random
 import threading
 from datetime import datetime
-from typing import Dict, Any, Optional, List, Tuple, Callable, TYPE_CHECKING, TypeVar, Awaitable, Literal, Set
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional, Set, Tuple, TypeVar
+
+import aiohttp
 
 if TYPE_CHECKING:
     from logging_utils import PhaseLogger
     from models import ImageData, LlmAccentGuard
-import openai
 import anthropic
+import openai
+
 try:
     from google import genai as google_genai
     GOOGLE_NEW_SDK = True
@@ -37,32 +38,27 @@ except ImportError:
 
 # Use optimized JSON (3.6x faster than standard json)
 import json_utils as json
-
 from config import config, get_model_parameter_requirements
 from deterministic_validation import DraftValidationResult
-from models import QAEvaluation
+from llm_accent_prompts import (
+    build_accent_criteria_block,
+    build_inline_accent_prompt,
+)
+from model_aliasing import PromptPart, PromptSource, assert_prompt_is_model_blind
 from schema_utils import json_schema_to_pydantic
 from tool_loop_models import (
     JsonContractError,
     LoopScope,
     OutputContract,
     PayloadScope,
-    ToolLoopContractError,
     ToolLoopContextOverflow,
+    ToolLoopContractError,
     ToolLoopEnvelope,
     ToolLoopSchemaViolationError,
     ToolLoopTraceEntry,
     ValidationToolInputTooLarge,
 )
 from tools.string_utils import escape_xml_delimiters, remove_invisible_control
-from llm_accent_prompts import (
-    DEFAULT_ACCENT_RUBRIC,
-    INLINE_ACCENT_OUTPUT_DIRECTIVE,
-    build_accent_criteria_block,
-    build_inline_accent_prompt,
-)
-from model_aliasing import PromptPart, assert_prompt_is_model_blind
-
 
 logger = logging.getLogger(__name__)
 
@@ -327,7 +323,7 @@ async def call_ai_with_validation_tools(*args: Any, **kwargs: Any):
 
 class AIService:
     """Unified AI service for multiple providers"""
-    
+
     def __init__(self):
         """Initialize AI service with API clients"""
         self.openai_client = None
@@ -338,7 +334,7 @@ class AIService:
         self.openrouter_client = None
         self.ollama_client = None
         self.fake_client = None
-        
+
         # Configure optimized HTTP connector for better performance
         self.http_connector = aiohttp.TCPConnector(
             limit=200,              # Total connection pool size
@@ -348,7 +344,7 @@ class AIService:
             ttl_dns_cache=3600,     # Cache DNS lookups for 1 hour
             use_dns_cache=True
         )
-        
+
         self._initialize_clients()
 
     def _assert_model_blind_prompt(
@@ -356,6 +352,10 @@ class AIService:
         *,
         prompt: str,
         system_prompt: Optional[str],
+        # Callers forwarding request.system_prompt must pass
+        # system_prompt_source="user_supplied" when the user actually provided
+        # one, so the guard skips legitimate user-authored content.
+        system_prompt_source: "PromptSource" = "system_generated",
         model_alias_registry: Optional[Any],
         prompt_safety_parts: Optional[List[Any]],
         boundary: str,
@@ -367,7 +367,7 @@ class AIService:
 
         parts: List[Any] = []
         if system_prompt:
-            parts.append(PromptPart(text=system_prompt, source="system_generated", label=f"{boundary}.system_prompt"))
+            parts.append(PromptPart(text=system_prompt, source=system_prompt_source, label=f"{boundary}.system_prompt"))
         if prompt_safety_parts is not None:
             parts.extend(prompt_safety_parts)
         elif not system_prompt:
@@ -376,7 +376,7 @@ class AIService:
             parts.append(PromptPart(text=prompt, source="user_supplied", label=f"{boundary}.prompt"))
 
         assert_prompt_is_model_blind(parts, model_alias_registry)
-    
+
     def _initialize_clients(self):
         """Initialize API clients for each provider"""
         # Initialize OpenAI client with optimized HTTP settings
@@ -394,7 +394,7 @@ class AIService:
             )
         else:
             logger.warning("OpenAI API key not found")
-        
+
         # Initialize Anthropic client with updated version and beta features
         if config.ANTHROPIC_API_KEY:
             # Add beta headers for extended thinking and other Claude 4 features
@@ -411,7 +411,7 @@ class AIService:
             logger.info("Anthropic client initialized with updated SDK and beta headers for thinking mode")
         else:
             logger.warning("Anthropic API key not found")
-        
+
         # Initialize Google AI client
         if config.GOOGLE_API_KEY:
             if GOOGLE_NEW_SDK and google_genai:
@@ -440,7 +440,7 @@ class AIService:
                 logger.error("No Google SDK available")
         else:
             logger.warning("Google AI API key not found")
-        
+
         # Initialize xAI client (using OpenAI SDK with custom base_url)
         if config.XAI_API_KEY:
             self.xai_client = openai.AsyncOpenAI(
@@ -936,6 +936,7 @@ class AIService:
             List of Gemini Part objects ready for the API
         """
         import base64 as b64
+
         from google.genai import types
 
         parts = []
@@ -1324,6 +1325,7 @@ class AIService:
         images: Optional[List["ImageData"]] = None,
         model_alias_registry: Optional[Any] = None,
         prompt_safety_parts: Optional[List[Any]] = None,
+        system_prompt_source: "PromptSource" = "system_generated",
     ) -> str:
         """
         Generate content using specified AI model
@@ -1468,20 +1470,23 @@ class AIService:
             else:
                 system_prompt = config.GENERATOR_SYSTEM_PROMPT
 
+        # Guard runs BEFORE lang/date concatenation so hardcoded scaffolding
+        # is not included in the scan (it never contains model identity).
+        self._assert_model_blind_prompt(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            system_prompt_source=system_prompt_source,
+            model_alias_registry=model_alias_registry,
+            prompt_safety_parts=prompt_safety_parts,
+            boundary="generate_content",
+        )
+
         # Add language instruction and current date to system prompt (not user message)
         # This avoids prompt contamination where models confuse system instructions with user content
         current_date = datetime.now().strftime("%Y/%m/%d")
         language_instruction = "\n\nIMPORTANT: Always respond in the same language as the user's request, regardless of the language used in these instructions."
         date_instruction = f"\n\nCurrent date: {current_date}"
         system_prompt = system_prompt + language_instruction + date_instruction
-
-        self._assert_model_blind_prompt(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            model_alias_registry=model_alias_registry,
-            prompt_safety_parts=prompt_safety_parts,
-            boundary="generate_content",
-        )
 
         async def _single_attempt() -> str:
             # Log vision request if images provided
@@ -5769,9 +5774,13 @@ class AIService:
         phase_logger: Optional["PhaseLogger"] = None,
         images: Optional[List["ImageData"]] = None,
         accent_guard: Optional["LlmAccentGuard"] = None,
+        # CONSTRAINT: extra_system_instructions must remain hardcoded scaffolding
+        # with no user/model-derived content. If a future change introduces such
+        # content, move it into prompt_safety_parts (tagged user_supplied) instead.
         extra_system_instructions: Optional[str] = None,
         enable_validate_draft: bool = True,
         min_global_score: Optional[float] = None,
+        system_prompt_source: "PromptSource" = "system_generated",
     ) -> Tuple[str, ToolLoopEnvelope]:
         """Reusable entry point for the shared ``validate_draft`` tool loop.
 
@@ -5912,6 +5921,19 @@ class AIService:
             else:
                 system_prompt = config.GENERATOR_SYSTEM_PROMPT
 
+        # Guard runs BEFORE all concatenations (lang/date/json/extra/initial_measurement)
+        # so hardcoded scaffolding and measurement-derived JSON are excluded from
+        # the scan. The scaffolding never contains model identity; the measurement
+        # JSON derives from the user's draft and is not system-generated.
+        self._assert_model_blind_prompt(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            system_prompt_source=system_prompt_source,
+            model_alias_registry=model_alias_registry,
+            prompt_safety_parts=prompt_safety_parts,
+            boundary="call_ai_with_validation_tools",
+        )
+
         current_date = datetime.now().strftime("%Y/%m/%d")
         language_instruction = "\n\nIMPORTANT: Always respond in the same language as the user's request, regardless of the language used in these instructions."
         date_instruction = f"\n\nCurrent date: {current_date}"
@@ -5960,14 +5982,6 @@ class AIService:
                 "word_count": initial_result.word_count,
                 "hard_failed": initial_result.hard_failed,
             }
-
-        self._assert_model_blind_prompt(
-            prompt=prompt,
-            system_prompt=effective_system_prompt,
-            model_alias_registry=model_alias_registry,
-            prompt_safety_parts=prompt_safety_parts,
-            boundary="call_ai_with_validation_tools",
-        )
 
         # ----- Context-budget fail-fast (§3.2.5) -----------------------------
         prompt_chars = len(effective_system_prompt or "") + len(prompt or "")
@@ -6900,6 +6914,7 @@ class AIService:
         cancel_callback: Optional[Callable[[], Awaitable[bool]]] = None,
         model_alias_registry: Optional[Any] = None,
         prompt_safety_parts: Optional[List[Any]] = None,
+        system_prompt_source: "PromptSource" = "system_generated",
     ):
         """
         Generate content with streaming support
@@ -7032,20 +7047,23 @@ class AIService:
             else:
                 system_prompt = config.GENERATOR_SYSTEM_PROMPT
 
+        # Guard runs BEFORE lang/date concatenation so hardcoded scaffolding
+        # is not included in the scan (it never contains model identity).
+        self._assert_model_blind_prompt(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            system_prompt_source=system_prompt_source,
+            model_alias_registry=model_alias_registry,
+            prompt_safety_parts=prompt_safety_parts,
+            boundary="generate_content_stream",
+        )
+
         # Add language instruction and current date to system prompt (not user message)
         # This avoids prompt contamination where models confuse system instructions with user content
         current_date = datetime.now().strftime("%Y/%m/%d")
         language_instruction = "\n\nIMPORTANT: Always respond in the same language as the user's request, regardless of the language used in these instructions."
         date_instruction = f"\n\nCurrent date: {current_date}"
         system_prompt = system_prompt + language_instruction + date_instruction
-
-        self._assert_model_blind_prompt(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            model_alias_registry=model_alias_registry,
-            prompt_safety_parts=prompt_safety_parts,
-            boundary="generate_content_stream",
-        )
 
         async def _dispatch_stream():
             # Log vision request if images provided
@@ -7213,7 +7231,7 @@ class AIService:
 
         assert last_exception is not None
         raise AIRequestError(provider, model_id, max_attempts, max_attempts, last_exception) from last_exception
-    
+
     async def _generate_claude(
         self,
         prompt: str,
@@ -7650,7 +7668,7 @@ class AIService:
             "claude-4",
             "claude-sonnet-4",
             "claude-opus-4",
-            "claude-opus-4-1",  
+            "claude-opus-4-1",
             "claude-opus-4-1-20250805",
         )
         return any(marker in model_lower for marker in thinking_markers)
@@ -7712,7 +7730,7 @@ class AIService:
         if not details:
             return 0
         return int(details.get("default_tokens", 0))
-    
+
     async def _generate_xai(
         self,
         prompt: str,
@@ -7871,7 +7889,7 @@ class AIService:
     async def health_check(self) -> Dict[str, bool]:
         """Check health of all AI service providers"""
         health_status = {}
-        
+
         # Test OpenAI
         try:
             if self.openai_client:
@@ -7886,7 +7904,7 @@ class AIService:
         except Exception as e:
             logger.error(f"OpenAI health check failed: {str(e)}")
             health_status["openai"] = False
-        
+
         # Test Claude
         try:
             if self.anthropic_client:
@@ -7901,7 +7919,7 @@ class AIService:
         except Exception as e:
             logger.error(f"Claude health check failed: {str(e)}")
             health_status["claude"] = False
-        
+
         # Test Gemini
         try:
             if self.genai_client:
@@ -7913,7 +7931,7 @@ class AIService:
         except Exception as e:
             logger.error(f"Gemini health check failed: {str(e)}")
             health_status["gemini"] = False
-        
+
         # Test xAI
         try:
             if self.xai_client:
@@ -7928,9 +7946,9 @@ class AIService:
         except Exception as e:
             logger.error(f"xAI health check failed: {str(e)}")
             health_status["xai"] = False
-        
+
         return health_status
-    
+
     async def _stream_openai(
         self,
         prompt: str,
@@ -7979,13 +7997,13 @@ class AIService:
                 {"role": "system", "content": effective_system_prompt},
                 {"role": "user", "content": prompt}
             ]
-        
+
         # Log streaming start if extra_verbose is enabled
         if extra_verbose:
             logger.info(f"[EXTRA_VERBOSE] Starting streaming generation for model {model_id}")
             logger.info(f"[EXTRA_VERBOSE] Reasoning effort: {reasoning_effort}")
             logger.info(f"[EXTRA_VERBOSE] Max tokens: {max_tokens}")
-        
+
         try:
             # Handle O3-pro models (no streaming support, fallback to regular generation)
             if "o3-pro" in model_id.lower():
@@ -8201,7 +8219,7 @@ class AIService:
         except Exception as e:
             logger.error(f"OpenAI streaming error: {e}")
             raise
-    
+
 
     async def _stream_claude(
         self,
@@ -8378,7 +8396,7 @@ class AIService:
             logger.error(f"Claude streaming error: {e}")
             raise
 
-    
+
     async def _stream_gemini(
         self,
         prompt: str,
@@ -8695,7 +8713,7 @@ class AIService:
                 max_tokens=max_tokens,
             ),
         )
-    
+
     async def _stream_xai(
         self,
         prompt: str,

@@ -4,9 +4,9 @@ Shared deterministic validation helpers for generation and QA bypass.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import logging
 import statistics
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from json_field_utils import try_extract_json_from_content
@@ -23,7 +23,6 @@ from word_count_utils import (
     create_word_count_qa_layer,
     word_count_config_to_dict,
 )
-
 
 logger = logging.getLogger(__name__)
 

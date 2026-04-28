@@ -9,12 +9,15 @@ Tests the internal conversion between:
 Does NOT make real API calls - tests config logic only.
 """
 
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from typing import Any, Dict, Optional
+
 import pytest
-from typing import Dict, Any, Optional
+
 import config
 
 

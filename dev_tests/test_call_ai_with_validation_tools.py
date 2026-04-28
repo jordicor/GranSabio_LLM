@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any, Dict
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -40,7 +40,6 @@ from tool_loop_models import (
     ToolLoopSchemaViolationError,
     ValidationToolInputTooLarge,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -763,7 +762,6 @@ async def test_call_ai_raises_on_schema_violation():
 def test_project_phase_event_includes_small_data_payload():
     """Finding #1: small ``data`` payloads are embedded verbatim."""
     import json_utils
-
     from core.app_state import _build_project_phase_event
 
     payload = {"event": "validate_draft", "turn": 2, "approved": True}
@@ -779,7 +777,6 @@ def test_project_phase_event_includes_small_data_payload():
 def test_project_phase_event_truncates_oversized_data_payload():
     """Finding #1: oversized ``data`` payloads are replaced by a preview."""
     import json_utils
-
     from core.app_state import _build_project_phase_event
 
     # Build a payload that exceeds the 8KB guard.
@@ -798,7 +795,6 @@ def test_project_phase_event_truncates_oversized_data_payload():
 def test_project_phase_event_omits_data_when_none():
     """``data=None`` (the default) must not appear in the event JSON."""
     import json_utils
-
     from core.app_state import _build_project_phase_event
 
     event = _build_project_phase_event(event="tool_event", phase="qa")

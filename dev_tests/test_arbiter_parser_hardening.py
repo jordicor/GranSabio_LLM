@@ -20,11 +20,9 @@ from arbiter import (
     ArbiterContext,
     ArbiterDecision,
     ArbiterParseError,
-    ConflictInfo,
     LayerEditHistory,
     ProposedEdit,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers

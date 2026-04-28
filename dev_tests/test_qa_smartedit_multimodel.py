@@ -16,21 +16,20 @@ Run:
 """
 
 import asyncio
-import sys
-from pathlib import Path
-from datetime import datetime
 import json
+import sys
+from datetime import datetime
+from pathlib import Path
 
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
-from config import config
 from ai_service import get_ai_service
 from smart_edit.qa_integration import build_qa_edit_prompt, parse_qa_edit_groups
-
 
 # Content with intentional issues to trigger edits
 BAD_CONTENT = """Marie Curie was born Maria Sklodowska on November 7, 1867, in Warsaw, Poland. She was very much interested in academics and science from a very young age.

@@ -1,9 +1,9 @@
 """
 Quick test to reproduce JSON schema error with minimal prompt
 """
-import json
-import requests
 import time
+
+import requests
 
 API_BASE = "http://localhost:8000"
 

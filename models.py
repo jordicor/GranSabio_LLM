@@ -6,12 +6,13 @@ Pydantic models for request/response handling and internal data structures.
 """
 
 import os
-from pydantic import BaseModel, Field, field_validator, AliasChoices, model_validator
-from typing import List, Dict, Any, Optional, Literal, Tuple, Union
-from enum import Enum
 from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Literal, Optional, Union
 
-from config import get_default_models, config
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
+
+from config import config, get_default_models
 from phrase_frequency_config import normalize_phrase_frequency_config
 from smart_edit import TextEditRange
 
@@ -475,7 +476,6 @@ class LexicalDiversityConfig(BaseModel):
     def to_settings(self) -> "LexicalDiversitySettings":
         from tools.lexical_diversity_utils import (
             LexicalDiversityDecisionPolicy,
-            LexicalDiversityScorePolicy,
             LexicalDiversitySettings,
         )
 
@@ -824,6 +824,33 @@ class LlmAccentGuard(BaseModel):
     )
 
 
+class AutoQAConfig(BaseModel):
+    """Configuration for AI-assisted QA layer planning."""
+
+    enabled: bool = Field(
+        default=False,
+        description="When true, GranSabio plans semantic QA layers before preflight.",
+    )
+    rigor: Literal["light", "strict", "max"] = Field(
+        default="strict",
+        description="Controls Auto-QA scope and strictness: light, strict, or max.",
+    )
+    allow_request_overrides: bool = Field(
+        default=True,
+        description="Allow Auto-QA to tune approved request-level QA controls when the user did not explicitly set them.",
+    )
+    max_semantic_layers: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=6,
+        description="Optional cap for generated semantic QA layers; cannot exceed the rigor cap.",
+    )
+    manual_layer_policy: Literal["reject", "replace", "merge"] = Field(
+        default="reject",
+        description="Policy when Auto-QA is enabled and manual qa_layers are also supplied.",
+    )
+
+
 class ProjectInitRequest(BaseModel):
     """Optional payload used when allocating or reserving a project identifier."""
 
@@ -928,15 +955,15 @@ class ContentRequest(BaseModel):
         default=None,
         description="Language hint for generation and QA modules (ISO 639-1 or locale code, e.g., 'es', 'en-US')",
     )
-    
+
     # Reasoning/Thinking tokens configuration
     reasoning_effort: Optional[str] = Field(
         default=None,
         description="Reasoning effort level for GPT-5 models (none, low, medium, high)"
     )
     thinking_budget_tokens: Optional[int] = Field(
-        default=None, 
-        ge=1024, 
+        default=None,
+        ge=1024,
         description="Budget tokens for thinking/reasoning (minimum 1024, for Claude 3.7 and GPT-5 reasoning models)"
     )
 
@@ -958,6 +985,10 @@ class ContentRequest(BaseModel):
     )
 
     # QA configuration
+    auto_qa: AutoQAConfig = Field(
+        default_factory=AutoQAConfig,
+        description="AI-assisted QA layer planning configuration.",
+    )
     qa_models: Union[List[str], List[QAModelConfig]] = Field(
         default=["gpt-5-mini", "claude-sonnet-4-20250514", "gemini-2.5-flash"],
         description="AI models for QA evaluation (strings for simple config, QAModelConfig objects for advanced)"
@@ -1025,10 +1056,10 @@ class ContentRequest(BaseModel):
         default=False,
         description="Enable vision support in QA evaluation. When true, input images are passed to QA layers that have include_input_images=True. Only works when images are provided in the request."
     )
-    
+
     # Scoring configuration
     min_global_score: float = Field(default=8.0, ge=0.0, le=10.0, description="Minimum global average score")
-    
+
     # Iteration configuration
     max_iterations: int = Field(default=5, gt=0, le=999, description="Maximum generation iterations")
     json_retry_without_iteration: bool = Field(
@@ -1749,6 +1780,14 @@ class GenerationInitResponse(BaseModel):
         default=None,
         description="Accepted-path warnings or informational notes that do not block generation.",
     )
+    auto_qa_plan: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Prompt-safe summary of the Auto-QA plan that was applied before preflight.",
+    )
+    auto_qa_feedback: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Feedback returned when Auto-QA rejects before generation starts.",
+    )
 
 
 class ProjectInitResponse(BaseModel):
@@ -1771,7 +1810,7 @@ class ContentResponse(BaseModel):
         default=None,
         description="Token usage and cost summary when requested by the client",
     )
-    
+
     # Optional Gran Sabio fields
     gran_sabio_reason: Optional[str] = Field(None, description="Gran Sabio's reasoning if applicable")
     modifications_made: Optional[bool] = Field(None, description="Whether Gran Sabio modified content")

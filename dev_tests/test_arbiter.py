@@ -15,25 +15,23 @@ Run tests with:
     python -m pytest dev_tests/test_arbiter.py -v
 """
 
+
 import pytest
-from typing import List
 
 # Phase 1 imports - data models
 from arbiter import (
-    ConflictType,
+    Arbiter,
+    ArbiterContext,
     ArbiterDecision,
-    EditDistribution,
-    ProposedEdit,
-    ConflictInfo,
     ArbiterEditDecision,
+    ArbiterResult,
+    ConflictInfo,
+    ConflictType,
+    EditDistribution,
     EditRoundRecord,
     LayerEditHistory,
-    ArbiterResult,
-    ArbiterContext,
-    Arbiter,
-    _get_paragraph_key_for_history,
+    ProposedEdit,
 )
-
 
 # =============================================================================
 # PHASE 1 TESTS: Data Models and Structure
@@ -699,9 +697,10 @@ class TestExtractProposedEditsFromLayerResults:
 
     def test_extracts_edits_with_source_evaluator(self):
         """Should extract edits preserving evaluator alias information."""
-        from core.generation_processor import _extract_proposed_edits_from_layer_results
-        from smart_edit import TextEditRange, SeverityLevel, OperationType
         from unittest.mock import MagicMock
+
+        from core.generation_processor import _extract_proposed_edits_from_layer_results
+        from smart_edit import OperationType, SeverityLevel, TextEditRange
 
         # Create mock evaluations with identified issues
         issue1 = TextEditRange(
@@ -755,9 +754,10 @@ class TestExtractProposedEditsFromLayerResults:
 
     def test_sorts_by_severity_and_confidence(self):
         """Should sort edits by severity (higher first) then confidence."""
-        from core.generation_processor import _extract_proposed_edits_from_layer_results
-        from smart_edit import TextEditRange, SeverityLevel, OperationType
         from unittest.mock import MagicMock
+
+        from core.generation_processor import _extract_proposed_edits_from_layer_results
+        from smart_edit import OperationType, SeverityLevel, TextEditRange
 
         critical_issue = TextEditRange(
             marker_mode="phrase",
@@ -799,9 +799,10 @@ class TestExtractProposedEditsFromLayerResults:
 
     def test_respects_max_edits_limit(self):
         """Should respect max_edits parameter."""
-        from core.generation_processor import _extract_proposed_edits_from_layer_results
-        from smart_edit import TextEditRange, SeverityLevel, OperationType
         from unittest.mock import MagicMock
+
+        from core.generation_processor import _extract_proposed_edits_from_layer_results
+        from smart_edit import OperationType, SeverityLevel, TextEditRange
 
         issues = [
             TextEditRange(
@@ -847,7 +848,7 @@ class TestArbiterIntegration:
     def test_proposed_edit_paragraph_key_generation(self):
         """ProposedEdit should have correct paragraph_key."""
         from arbiter import ProposedEdit
-        from smart_edit import TextEditRange, SeverityLevel, OperationType
+        from smart_edit import OperationType, SeverityLevel, TextEditRange
 
         edit = TextEditRange(
             marker_mode="phrase",
@@ -874,8 +875,9 @@ class TestArbiterIntegration:
     @pytest.mark.asyncio
     async def test_arbiter_result_contains_expected_fields(self):
         """ArbiterResult should contain all expected fields after arbitration."""
-        from arbiter import Arbiter, ArbiterContext, LayerEditHistory, ArbiterResult
         from unittest.mock import AsyncMock, MagicMock
+
+        from arbiter import Arbiter, ArbiterContext, ArbiterResult, LayerEditHistory
 
         # Create mock AI service
         mock_ai_service = MagicMock()

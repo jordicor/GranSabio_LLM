@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """CLI tool to find optimal phrase length for smart-edit uniqueness."""
-import sys
 import argparse
+import sys
 from pathlib import Path
 
 # Add parent directory to path for imports

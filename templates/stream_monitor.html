@@ -933,7 +933,7 @@
             margin-left: 3px;
         }
 
-        /* Analysis Filter Pills (Preflight/Consensus toggle in header) */
+        /* Analysis Filter Pills (Auto-QA/Preflight/Consensus toggle in header) */
         .analysis-filter-pills {
             display: flex;
             gap: 4px;
@@ -1959,11 +1959,12 @@
                 </div>
             </div>
 
-            <!-- Analysis (combined Preflight + Consensus with filter pills) -->
+            <!-- Analysis (combined Auto-QA + Preflight + Consensus with filter pills) -->
             <div class="stream-panel" data-phase="analysis">
                 <div class="stream-header">
                     <span class="stream-title">Analysis</span>
                     <div class="analysis-filter-pills">
+                        <span class="analysis-pill" data-filter="auto_qa" title="Show only Auto-QA planning">Auto-QA</span>
                         <span class="analysis-pill" data-filter="preflight" title="Show only preflight analysis">Preflight</span>
                         <span class="analysis-pill" data-filter="consensus" title="Show only consensus scoring">Consensus</span>
                     </div>

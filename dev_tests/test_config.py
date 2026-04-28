@@ -14,11 +14,11 @@ Test Areas:
 Total: ~70 tests
 """
 
-import pytest
 import os
 import sys
-from unittest.mock import patch, MagicMock, mock_open
-from io import StringIO
+from unittest.mock import mock_open, patch
+
+import pytest
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1284,6 +1284,7 @@ class TestModuleLevelFunctions:
         with patch("builtins.open", mock_open(read_data=specs_json)):
             # Need to reload to get fresh config
             import importlib
+
             import config as config_module
             importlib.reload(config_module)
 
@@ -1298,6 +1299,7 @@ class TestModuleLevelFunctions:
 
         with patch("builtins.open", mock_open(read_data=specs_json)):
             import importlib
+
             import config as config_module
             importlib.reload(config_module)
 
@@ -1315,6 +1317,7 @@ class TestModuleLevelFunctions:
 
         with patch("builtins.open", mock_open(read_data=specs_json)):
             import importlib
+
             import config as config_module
             importlib.reload(config_module)
 
@@ -1356,6 +1359,7 @@ class TestModuleLevelFunctions:
 
         with patch("builtins.open", mock_open(read_data=specs_json)):
             import importlib
+
             import config as config_module
             importlib.reload(config_module)
 
@@ -1369,6 +1373,7 @@ class TestModuleLevelFunctions:
 
         with patch("builtins.open", mock_open(read_data=specs_json)):
             import importlib
+
             import config as config_module
             importlib.reload(config_module)
 
@@ -1382,6 +1387,7 @@ class TestModuleLevelFunctions:
 
         with patch("builtins.open", mock_open(read_data=specs_json)):
             import importlib
+
             import config as config_module
             importlib.reload(config_module)
 
@@ -1396,6 +1402,7 @@ class TestModuleLevelFunctions:
 
         with patch("builtins.open", mock_open(read_data=specs_json)):
             import importlib
+
             import config as config_module
             importlib.reload(config_module)
 

@@ -15,16 +15,17 @@ Benchmarks cover:
 4. Scaling with max_claims parameter
 """
 
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import pytest
-import time
 import statistics
-import asyncio
-from typing import Dict, Any, List, Optional
+import time
 from dataclasses import dataclass
+from typing import Any, Dict, List
+
+import pytest
 
 # Check if we should skip expensive tests
 SKIP_EXPENSIVE = os.environ.get("SKIP_EXPENSIVE_TESTS", "0") == "1"
@@ -379,7 +380,7 @@ class TestBudgetScoringPerformance:
         Benchmark: Score a single claim.
         Expected: < 3 seconds per claim with gpt-4o-mini.
         """
-        from models import ExtractedClaim, EvidenceSpan, SpanType
+        from models import EvidenceSpan, ExtractedClaim, SpanType
 
         budget_scorer = create_budget_scorer()
         claim = ExtractedClaim(
@@ -428,7 +429,7 @@ class TestBudgetScoringPerformance:
         Benchmark: Score multiple claims in sequence.
         Measures per-claim overhead.
         """
-        from models import ExtractedClaim, EvidenceSpan, SpanType
+        from models import EvidenceSpan, ExtractedClaim, SpanType
 
         budget_scorer = create_budget_scorer()
         claims = [
@@ -731,7 +732,7 @@ class TestEvidenceMatchingPerformance:
 
     def test_match_claims_to_spans(self, benchmark_runner):
         """Benchmark claim-to-span matching."""
-        from evidence_grounding.evidence_matcher import spanize_context, match_claims_to_spans
+        from evidence_grounding.evidence_matcher import match_claims_to_spans, spanize_context
         from models import ExtractedClaim
 
         spans = spanize_context(MEDIUM_CONTEXT)

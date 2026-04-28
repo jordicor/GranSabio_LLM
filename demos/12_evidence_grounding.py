@@ -34,17 +34,17 @@ Usage:
     python demos/12_evidence_grounding.py --mode warn
 """
 
+import argparse
 import asyncio
 import sys
-import argparse
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict
 
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from client import AsyncGranSabioClient, GranSabioClientError
-from demos.common import run_demo, print_header, colorize, safe_print
+from demos.common import colorize, print_header, run_demo, safe_print
 
 
 def print_grounding_result(result: Dict[str, Any], title: str):

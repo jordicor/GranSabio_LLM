@@ -67,8 +67,8 @@ class GranSabioGenerationRejected(GranSabioClientError):
         self.details = details or {}
 
 
-from .sync_client import GranSabioClient
 from .async_client import AsyncGranSabioClient
+from .sync_client import GranSabioClient
 
 __all__ = [
     "GranSabioClient",

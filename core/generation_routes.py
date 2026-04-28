@@ -14,10 +14,17 @@ from typing import Any, Dict, List, Optional
 from fastapi import Body, HTTPException
 from fastapi.responses import JSONResponse
 
-from logging_utils import create_phase_logger, Phase
 from ai_service import AIService
 from attachments_router import get_attachment_manager
+from auto_qa_planner import (
+    AutoQAPlanningError,
+    apply_auto_qa_plan,
+    run_auto_qa_planning,
+    validate_auto_qa_effective_contract,
+)
 from deal_breaker_tracker import get_tracker
+from logging_utils import Phase, create_phase_logger
+from model_aliasing import ModelAliasRegistry
 from models import (
     ContentRequest,
     GenerationInitResponse,
@@ -30,10 +37,9 @@ from models import (
 )
 from phrase_frequency_config import is_phrase_frequency_active
 from preflight_validator import resolve_preflight_model, run_preflight_validation
-from model_aliasing import ModelAliasRegistry
 from services.attachment_manager import (
-    AttachmentManager,
     AttachmentError,
+    AttachmentManager,
     AttachmentNotFoundError,
     AttachmentValidationError,
     ResolvedAttachment,
@@ -51,22 +57,21 @@ from .app_state import (
     _debug_record_event,
     _debug_session_start,
     _debug_update_status,
-    _ensure_services,
     _is_project_cancelled,
     _is_project_reserved,
     _reserve_project_id,
-    publish_project_phase_chunk,
     _start_project,
     _stop_project,
     _store_final_result,
-    active_sessions,
     app,
     config,
+    get_project_status,
     logger,
     mutate_session,
     pop_session,
+    publish_project_phase_chunk,
+    publish_project_session_end,
     register_session,
-    get_project_status,
     update_session_status,
 )
 from .generation_processor import (
@@ -74,9 +79,9 @@ from .generation_processor import (
     _build_final_result,
     _get_final_content,
     add_verbose_log,
+    ai_service,
     process_content_generation,
     resolve_images_for_generation,
-    ai_service,
 )
 
 
@@ -603,18 +608,37 @@ async def generate_content(request: ContentRequest):
         )
         request.max_tokens = default_max_tokens
 
-    # Require QA models when effective QA pipeline is non-empty or accent post/inline_post mode
-    qa_required = bool(compute_base_effective_layers(request)) or request.llm_accent_guard.mode in {"post", "inline_post"}
+    auto_qa_config = getattr(request, "auto_qa", None)
+    auto_qa_requested = bool(auto_qa_config and auto_qa_config.enabled)
+    if (
+        auto_qa_requested
+        and request.qa_layers
+        and getattr(auto_qa_config, "manual_layer_policy", "reject") == "reject"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Auto-QA is enabled and the request also includes manual qa_layers. "
+                "Use auto_qa.manual_layer_policy='replace'/'merge' or disable Auto-QA."
+            ),
+        )
+
+    # Require QA models when the effective QA pipeline is non-empty, accent post mode can run, or Auto-QA can create layers.
+    qa_required = (
+        bool(compute_base_effective_layers(request))
+        or request.llm_accent_guard.mode in {"post", "inline_post"}
+        or auto_qa_requested
+    )
     if qa_required:
         if "qa_models" not in request_fields_set:
             raise HTTPException(
                 status_code=400,
-                detail="qa_models is required when QA layers are provided.",
+                detail="qa_models is required when QA is enabled or Auto-QA is enabled.",
             )
         if not request.qa_models:
             raise HTTPException(
                 status_code=400,
-                detail="qa_models cannot be empty when QA layers are provided.",
+                detail="qa_models cannot be empty when QA is enabled or Auto-QA is enabled.",
             )
         qa_model_names: List[str] = []
         for model_entry in request.qa_models:
@@ -687,11 +711,11 @@ async def generate_content(request: ContentRequest):
         is_valid, error_msg = validate_word_count_config(request.word_count_enforcement)
         if not is_valid:
             raise HTTPException(status_code=400, detail=f"Invalid word count enforcement configuration: {error_msg}")
-        
+
         # Check that word limits are provided when enforcement is enabled
         if not request.min_words and not request.max_words:
             raise HTTPException(status_code=400, detail="Word count enforcement is enabled but no min_words or max_words specified")
-    
+
     # When word targets are present and the caller did not set an explicit token budget,
     # auto-raise the default generation budget so long-form requests are not silently capped.
     if (
@@ -939,7 +963,6 @@ async def generate_content(request: ContentRequest):
         logger.debug("Could not preview reasoning timeout for %s: %s", request.generator_model, exc)
         reasoning_timeout_hint = None
 
-    recommended_timeout_seconds = _estimate_session_timeout(request, reasoning_timeout_hint)
     selected_preflight_model = resolve_preflight_model(request)
     model_alias_registry = ModelAliasRegistry.from_request(
         request,
@@ -950,17 +973,98 @@ async def generate_content(request: ContentRequest):
     # session_id was already generated earlier (before project_id handling)
     # Register temp session for preflight streaming
     temp_session = {
+        "auto_qa_content": "",
         "preflight_content": "",
-        "current_phase": "preflight_validation"
+        "current_phase": "auto_qa_planning" if auto_qa_requested else "preflight_validation"
     }
     await register_session(session_id, temp_session)
 
-    # Create phase_logger for preflight validation
+    # Create phase_logger for Auto-QA planning and preflight validation
     preflight_phase_logger = create_phase_logger(
         session_id=session_id,
         verbose=request.verbose,
         extra_verbose=request.extra_verbose
     )
+
+    auto_qa_plan_payload: Optional[Dict[str, Any]] = None
+
+    def auto_qa_stream_callback(chunk: str):
+        temp_session["auto_qa_content"] += chunk
+        if project_id and chunk:
+            asyncio.create_task(
+                publish_project_phase_chunk(
+                    project_id,
+                    "auto_qa",
+                    chunk,
+                    session_id=session_id,
+                    request_name=request.request_name,
+                )
+            )
+
+    if auto_qa_requested:
+        try:
+            await _debug_record_event(
+                session_id,
+                "auto_qa_started",
+                {
+                    "rigor": request.auto_qa.rigor,
+                    "manual_layer_policy": request.auto_qa.manual_layer_policy,
+                },
+            )
+            with preflight_phase_logger.phase(Phase.AUTO_QA):
+                auto_qa_plan = await run_auto_qa_planning(
+                    ai_service,
+                    request,
+                    context_documents=preflight_context,
+                    image_info=preflight_image_info,
+                    model_alias_registry=model_alias_registry,
+                    stream_callback=auto_qa_stream_callback,
+                    usage_callback=usage_tracker.create_callback(
+                        phase="auto_qa",
+                        role="gran_sabio",
+                        operation="auto_qa_planning",
+                    ),
+                    phase_logger=preflight_phase_logger,
+                )
+            await _debug_record_event(
+                session_id,
+                "auto_qa_completed",
+                {
+                    "layer_count": len(auto_qa_plan.qa_layers),
+                    "layer_names": list(auto_qa_plan.generated_layer_names),
+                    "warnings": list(auto_qa_plan.warnings),
+                },
+            )
+            apply_auto_qa_plan(
+                request,
+                auto_qa_plan,
+                request_fields_set=request_fields_set,
+            )
+            auto_qa_plan_payload = auto_qa_plan.public_dict()
+            await _debug_record_event(
+                session_id,
+                "auto_qa_plan_applied",
+                auto_qa_plan_payload,
+            )
+            temp_session["current_phase"] = "preflight_validation"
+        except AutoQAPlanningError as exc:
+            feedback = exc.to_feedback()
+            await _debug_record_event(session_id, "auto_qa_failed", feedback)
+            await publish_project_session_end(
+                project_id,
+                session_id,
+                "auto_qa_rejected",
+                request_name=getattr(request, "request_name", None),
+            )
+            await pop_session(session_id)
+            return GenerationInitResponse(
+                status="auto_qa_rejected",
+                session_id=None,
+                project_id=project_id,
+                request_name=getattr(request, "request_name", None),
+                auto_qa_feedback=feedback,
+                auto_qa_plan=auto_qa_plan_payload,
+            )
 
     # Define preflight streaming callback
     def preflight_stream_callback(chunk: str):
@@ -1006,6 +1110,21 @@ async def generate_content(request: ContentRequest):
         )
 
     if preflight_result.decision != "proceed":
+        if auto_qa_requested and auto_qa_plan_payload is not None:
+            await _debug_record_event(
+                session_id,
+                "auto_qa_plan_rejected_by_preflight",
+                {
+                    "preflight_decision": preflight_result.decision,
+                    "auto_qa_plan": auto_qa_plan_payload,
+                },
+            )
+        await publish_project_session_end(
+            project_id,
+            session_id,
+            "preflight_rejected",
+            request_name=getattr(request, "request_name", None),
+        )
         # Clean up session on rejection
         await pop_session(session_id)
         return GenerationInitResponse(
@@ -1014,7 +1133,50 @@ async def generate_content(request: ContentRequest):
             project_id=project_id,
             request_name=getattr(request, "request_name", None),
             preflight_feedback=preflight_result,
+            auto_qa_plan=auto_qa_plan_payload,
         )
+
+    if auto_qa_requested:
+        try:
+            validate_auto_qa_effective_contract(
+                request,
+                preflight_result=preflight_result,
+            )
+            removed_auto_qa_layers = getattr(request, "_auto_qa_removed_by_preflight", []) or []
+            if removed_auto_qa_layers and auto_qa_plan_payload is not None:
+                auto_qa_plan_payload["removed_by_preflight"] = list(removed_auto_qa_layers)
+        except AutoQAPlanningError as exc:
+            feedback = exc.to_feedback()
+            removed_auto_qa_layers = getattr(request, "_auto_qa_removed_by_preflight", []) or []
+            if removed_auto_qa_layers and auto_qa_plan_payload is not None:
+                auto_qa_plan_payload["removed_by_preflight"] = list(removed_auto_qa_layers)
+            await _debug_record_event(
+                session_id,
+                "auto_qa_plan_rejected_by_preflight",
+                {
+                    "feedback": feedback,
+                    "removed_layers": list(removed_auto_qa_layers),
+                    "auto_qa_plan": auto_qa_plan_payload,
+                },
+            )
+            await publish_project_session_end(
+                project_id,
+                session_id,
+                "auto_qa_rejected",
+                request_name=getattr(request, "request_name", None),
+            )
+            await pop_session(session_id)
+            return GenerationInitResponse(
+                status="auto_qa_rejected",
+                session_id=None,
+                project_id=project_id,
+                request_name=getattr(request, "request_name", None),
+                preflight_feedback=preflight_result,
+                auto_qa_feedback=feedback,
+                auto_qa_plan=auto_qa_plan_payload,
+            )
+
+    recommended_timeout_seconds = _estimate_session_timeout(request, reasoning_timeout_hint)
 
     # Extract QA layer names for status tracking (respect processing order)
     if request.qa_layers:
@@ -1041,6 +1203,8 @@ async def generate_content(request: ContentRequest):
         "generation_content_length": 0,
         "generation_content_word_count": 0,
         "qa_content": "",
+        "auto_qa_content": temp_session.get("auto_qa_content", ""),
+        "auto_qa_plan": auto_qa_plan_payload,
         "preflight_content": temp_session.get("preflight_content", ""),
         "current_phase": "initializing",  # initializing, generating, qa_evaluation, consensus, completed, failed
         # Store preflight analysis for later use
@@ -1123,6 +1287,7 @@ async def generate_content(request: ContentRequest):
         request_name=getattr(request, "request_name", None),
         recommended_timeout_seconds=recommended_timeout_seconds,
         advisories=(long_text_advisories or None),
+        auto_qa_plan=auto_qa_plan_payload,
     )
 
 

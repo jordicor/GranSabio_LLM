@@ -31,11 +31,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import os
+
 os.environ["FAKE_AI_HOST"] = "http://localhost:8989"
 
 # Now import after setting env
-from config import config
 from ai_service import get_ai_service
+from config import config
 
 
 async def test_fake_generate():

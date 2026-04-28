@@ -18,14 +18,14 @@ import asyncio
 import os
 import sys
 import time
-from typing import Any, Optional, Dict
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 # Add parent directory to path for json_utils import
 sys.path.insert(0, str(Path(__file__).parent.parent))
-import json_utils as json
-
 import httpx
+
+import json_utils as json
 
 # Configuration (same as MCP server)
 GRANSABIO_API_URL = os.getenv("GRANSABIO_API_URL", "http://localhost:8000")

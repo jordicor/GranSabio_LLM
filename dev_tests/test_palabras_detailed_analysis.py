@@ -6,11 +6,11 @@ helping understand if increasing max_n is worthwhile.
 """
 
 import os
+import re
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Any, Optional
-import re
+from typing import Any, Dict, List
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 

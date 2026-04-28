@@ -45,7 +45,7 @@ def _format_layer_feedback_lines(layer_entries: Any, qa_results: Dict[str, Dict[
             for model_entry in entry.get("model_feedback", []) or []:
                 if not isinstance(model_entry, dict):
                     continue
-                model_name = model_entry.get("evaluator") or model_entry.get("model", "Evaluator")
+                model_name = model_entry.get("evaluator") or "Evaluator"
                 text = (model_entry.get("deal_breaker_reason") or model_entry.get("feedback") or "").strip()
                 if text:
                     detail_lines.append(f"  - {model_name}: {text}")
@@ -63,7 +63,7 @@ def _format_layer_feedback_lines(layer_entries: Any, qa_results: Dict[str, Dict[
     for layer_name, model_results in qa_results.items():
         fallback_lines.append(f"- {layer_name}")
         for model_name, evaluation in model_results.items():
-            evaluator_name = get_evaluator_alias(evaluation, fallback=model_name)
+            evaluator_name = get_evaluator_alias(evaluation, fallback=None)
             text = (
                 _safe_get_evaluation_attr(evaluation, "deal_breaker_reason")
                 or _safe_get_evaluation_attr(evaluation, "reason")
@@ -84,7 +84,7 @@ def _fallback_actionable_feedback(qa_results: Dict[str, Dict[str, Any]]) -> List
 
     for layer_name, model_results in qa_results.items():
         for model_name, evaluation in model_results.items():
-            evaluator_name = get_evaluator_alias(evaluation, fallback=model_name)
+            evaluator_name = get_evaluator_alias(evaluation, fallback=None)
             text = (
                 _safe_get_evaluation_attr(evaluation, "deal_breaker_reason")
                 or _safe_get_evaluation_attr(evaluation, "reason")
@@ -268,7 +268,7 @@ def _extract_deal_breaker_details(qa_results: Dict[str, Dict[str, Any]]) -> str:
 
     for layer_name, model_results in qa_results.items():
         for model_name, evaluation in model_results.items():
-            evaluator_name = get_evaluator_alias(evaluation, fallback=model_name)
+            evaluator_name = get_evaluator_alias(evaluation, fallback=None)
             # Only process evaluations that flagged deal-breaker
             if not _safe_get_evaluation_attr(evaluation, "deal_breaker"):
                 continue

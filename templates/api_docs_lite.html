@@ -193,9 +193,14 @@
       <div class="param-desc">Per-model QA configuration by model name: {"model": { "reasoning_effort": "...", "max_tokens": ...}}.</div>
     </div>
     <div class="param-row">
+      <div class="param-name">auto_qa</div>
+      <div class="param-type">object</div>
+      <div class="param-desc">Optional Auto-QA planner configuration. Set enabled=true and rigor to "light", "strict", or "max". Supports manual_layer_policy ("reject", "replace", "merge"), allow_request_overrides, and max_semantic_layers. Requires explicit qa_models and gran_sabio_model.</div>
+    </div>
+    <div class="param-row">
       <div class="param-name required">qa_layers</div>
       <div class="param-type">array</div>
-      <div class="param-desc">QA evaluation layers configuration. Use [] to bypass QA and preflight validation completely.</div>
+      <div class="param-desc">QA evaluation layers configuration. Use [] to bypass semantic QA when Auto-QA is disabled; with Auto-QA enabled, [] lets the planner build the QA contract.</div>
     </div>
     <div class="param-row">
       <div class="param-name">min_global_score</div>
@@ -326,11 +331,16 @@
     <div class="param-row">
       <div class="param-name">phases</div>
       <div class="param-type">string</div>
-      <div class="param-desc">CSV of phases to subscribe: preflight, generation, qa, consensus, gransabio/gran_sabio, status, or "all" (default).</div>
+      <div class="param-desc">CSV of phases to subscribe: auto_qa, preflight, generation, qa, consensus, gransabio/gran_sabio, status, or "all" (default).</div>
     </div>
   </div>
   <h3>Available Phases</h3>
   <div class="parameter-table">
+    <div class="param-row">
+      <div class="param-name">auto_qa</div>
+      <div class="param-type">phase</div>
+      <div class="param-desc">Auto-QA planning chunks</div>
+    </div>
     <div class="param-row">
       <div class="param-name">preflight</div>
       <div class="param-type">phase</div>

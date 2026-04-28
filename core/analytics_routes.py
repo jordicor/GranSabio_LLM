@@ -3,16 +3,16 @@ Analytics, documentation, and auxiliary API routes.
 """
 
 from __future__ import annotations
-from datetime import datetime
-from typing import Optional
 
-from fastapi import Depends, HTTPException, Query, Request
+from datetime import datetime
+
+from fastapi import Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from deal_breaker_tracker import get_tracker
 from version import BUILD_VERSION_INFO
 
-from .app_state import app, config, templates, _ensure_services, active_sessions, logger
+from .app_state import _ensure_services, active_sessions, app, logger, templates
 from .security import require_internal_ip
 
 
@@ -113,14 +113,14 @@ async def get_model_info(model_name: str):
     """Get detailed information about a specific model"""
     from config import config
     model_info = config.get_model_info(model_name)
-    
+
     if model_info["provider"] == "unknown":
         raise HTTPException(status_code=404, detail="Model not found")
-    
+
     # Remove sensitive information before returning
     safe_model_info = {k: v for k, v in model_info.items() if k != "api_key"}
     safe_model_info["has_api_key"] = bool(model_info.get("api_key"))
-    
+
     return safe_model_info
 
 
@@ -147,23 +147,23 @@ async def get_qa_models():
     from config import config
     all_models = config.get_available_models()
     defaults = config.model_specs.get("default_models", {}) or {}
-    
+
     qa_suitable_models = []
-    
+
     # Add models from each provider with QA suitability info
     for provider, models in all_models.items():
         for model in models:
             # Determine if model is good for QA based on capabilities and cost
             is_qa_suitable = True
             qa_priority = "standard"
-            
+
             # Prioritize models based on speed/cost for QA tasks
             model_key = model["key"]
             if "haiku" in model_key.lower() or "mini" in model_key.lower() or "flash" in model_key.lower():
                 qa_priority = "fast"
             elif "opus" in model_key.lower() or "gpt-4o" == model_key or "gpt-5" in model_key:
                 qa_priority = "premium"
-            
+
             qa_suitable_models.append({
                 "key": model_key,
                 "name": model["name"],
@@ -173,11 +173,11 @@ async def get_qa_models():
                 "output_tokens": model["output_tokens"],
                 "pricing": model["pricing"]
             })
-    
+
     # Sort by QA priority (fast first, then standard, then premium)
     priority_order = {"fast": 1, "standard": 2, "premium": 3}
     qa_suitable_models.sort(key=lambda x: (priority_order.get(x["qa_priority"], 2), x["name"]))
-    
+
     return {
         "qa_models": qa_suitable_models,
         "recommendations": {

@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from core.app_state import app
 import core.openrouter_routes as openrouter_routes
+from core.app_state import app
 
 
 @pytest.fixture

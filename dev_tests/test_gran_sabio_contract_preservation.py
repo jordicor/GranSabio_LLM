@@ -33,12 +33,11 @@ import pytest
 
 from gran_sabio import (
     GranSabioEngine,
+    _GranSabioPayloadError,
     _parse_escalation_payload,
     _parse_minority_payload,
-    _GranSabioPayloadError,
 )
 from models import ContentRequest
-
 
 # ============================================================================
 # Shared fixtures
@@ -373,6 +372,7 @@ class TestRow7NotApplicable:
         regressions."""
 
         import inspect
+
         from gran_sabio import GranSabioEngine
 
         source = inspect.getsource(GranSabioEngine.regenerate_content)

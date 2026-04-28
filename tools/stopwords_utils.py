@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import json_utils as json
 import logging
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Set
+
+import json_utils as json
 
 logger = logging.getLogger(__name__)
 

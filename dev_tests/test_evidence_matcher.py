@@ -11,21 +11,20 @@ import pytest
 
 from evidence_grounding.evidence_matcher import (
     EvidenceMatcher,
-    spanize_context,
-    classify_span,
-    match_claims_to_spans,
-    scrub_spans,
-    find_matching_spans,
-    format_spans_for_prompt,
-    _is_question,
-    _is_instruction,
     _is_empty,
-    _word_overlap_ratio,
+    _is_instruction,
+    _is_question,
     _sequence_similarity,
     _split_into_sentences,
+    _word_overlap_ratio,
+    classify_span,
+    find_matching_spans,
+    format_spans_for_prompt,
+    match_claims_to_spans,
+    scrub_spans,
+    spanize_context,
 )
 from models import EvidenceSpan, ExtractedClaim, SpanType
-
 
 # =============================================================================
 # Tests for classify_span and helpers

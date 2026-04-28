@@ -13,13 +13,15 @@ Tests cover:
 - Convenience methods
 """
 
-import pytest
-from unittest.mock import Mock, MagicMock, patch
-import time
+import os
 
 # Import after mocking requests
 import sys
-import os
+import time
+from unittest.mock import Mock, patch
+
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
@@ -157,6 +159,7 @@ class TestRequest:
     def test_connection_error_raises_client_error(self, client, mock_requests):
         """Given: ConnectionError, Then: Raises GranSabioClientError."""
         from requests import exceptions as req_exc
+
         from client import GranSabioClientError
 
         mock_requests.request.side_effect = req_exc.ConnectionError("Connection refused")
@@ -169,6 +172,7 @@ class TestRequest:
     def test_timeout_error_raises_client_error(self, client, mock_requests):
         """Given: Timeout, Then: Raises GranSabioClientError."""
         from requests import exceptions as req_exc
+
         from client import GranSabioClientError
 
         mock_requests.request.side_effect = req_exc.Timeout("Request timeout")
@@ -181,6 +185,7 @@ class TestRequest:
     def test_request_exception_raises_client_error(self, client, mock_requests):
         """Given: Generic RequestException, Then: Raises GranSabioClientError."""
         from requests import exceptions as req_exc
+
         from client import GranSabioClientError
 
         mock_requests.request.side_effect = req_exc.RequestException("Network error")
@@ -369,6 +374,23 @@ class TestGenerate:
             client.generate(prompt="Test", qa_layers=[])
 
         assert "rejected by preflight" in str(exc.value)
+
+    def test_generate_raises_on_auto_qa_rejection(self, client, mock_requests, mock_response):
+        """Given: Auto-QA rejects, Then: Raises GranSabioClientError with feedback."""
+        from client import GranSabioClientError
+
+        mock_response.json.return_value = {
+            "status": "auto_qa_rejected",
+            "auto_qa_feedback": {
+                "message": "Planner could not build a non-contradictory QA contract"
+            },
+        }
+        mock_requests.request.return_value = mock_response
+
+        with pytest.raises(GranSabioClientError) as exc:
+            client.generate(prompt="Test", qa_layers=[])
+
+        assert "rejected by Auto-QA" in str(exc.value)
 
     def test_generate_raises_on_missing_session_id(self, client, mock_requests, mock_response):
         """Given: No session_id in response, Then: Raises GranSabioClientError."""
@@ -795,6 +817,7 @@ class TestSyncBodyReadTransient:
 
     def test_get_status_converts_chunked_encoding_error(self, client):
         from requests import exceptions as req_exc
+
         from client import TransientGranSabioError
 
         response = Mock()
@@ -810,6 +833,7 @@ class TestSyncBodyReadTransient:
 
     def test_get_result_converts_content_decoding_error(self, client):
         from requests import exceptions as req_exc
+
         from client import TransientGranSabioError
 
         response = Mock()
@@ -834,6 +858,7 @@ class TestSyncBodyReadTransient:
     def test_get_status_error_path_text_read_fails_fast(self, client):
         """HTTP error responses must not become retryable when their body is unreadable."""
         from requests import exceptions as req_exc
+
         from client import GranSabioClientError
 
         class BrokenTextResponse:
@@ -880,6 +905,7 @@ class TestSyncBodyReadTransient:
     def test_fetch_result_polling_non_retryable_status_body_read_fails_fast(self, client):
         """A truncated 500 body must not become a retryable polling failure."""
         from requests import exceptions as req_exc
+
         from client import GranSabioClientError
 
         response = Mock()

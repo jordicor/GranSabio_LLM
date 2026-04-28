@@ -7,12 +7,11 @@ These fixtures handle:
 - Preflight validation mocking
 """
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 import ipaddress
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
-
 
 # ============================================================================
 # IP Filter Bypass

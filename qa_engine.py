@@ -17,17 +17,24 @@ Changes (2025-11-06):
 import asyncio
 import logging
 from collections import defaultdict
-from typing import List, Dict, Any, Optional, Callable, Awaitable, Tuple, TYPE_CHECKING
 from datetime import datetime
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 if TYPE_CHECKING:
     from logging_utils import PhaseLogger
     from models import ImageData
 
-from ai_service import AIService, get_ai_service, AIRequestError
+from ai_service import AIRequestError, AIService, get_ai_service
+from config import EDITABLE_CONTENT_TYPES, config
+from evidence_grounding import GroundingEngine, get_effective_order
+from gran_sabio import GranSabioInvocationError, GranSabioProcessCancelled
+from model_aliasing import ModelAliasRegistry, get_evaluator_alias
+from models import EvidenceGroundingConfig, EvidenceGroundingResult, QAEvaluation, QALayer
+from qa_bypass_engine import QABypassEngine
 from qa_evaluation_service import QAEvaluationService, QAResponseParseError
 from qa_result_utils import (
     apply_gran_sabio_false_positive_override,
@@ -44,13 +51,6 @@ from qa_scheduler import (
     QASchedulerUnavailableError,
 )
 from usage_tracking import UsageTracker
-from models import QALayer, QAEvaluation, EvidenceGroundingConfig, EvidenceGroundingResult
-from config import EDITABLE_CONTENT_TYPES, config
-from model_aliasing import ModelAliasRegistry, get_evaluator_alias
-from qa_bypass_engine import QABypassEngine
-from gran_sabio import GranSabioInvocationError, GranSabioProcessCancelled
-from evidence_grounding import GroundingEngine, get_effective_order
-
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +137,6 @@ def calculate_comprehensive_qa_timeout(
     """
     Calculate total timeout for comprehensive QA evaluation.
     """
-    from models import QAModelConfig
 
     # Calculate the max timeout needed per layer (models run in parallel)
     max_timeout_per_layer = 0.0
@@ -173,7 +172,7 @@ def calculate_comprehensive_qa_timeout(
 
 class QAEngine:
     """Multi-layer Quality Assurance Engine"""
-    
+
     def __init__(self, ai_service: Optional[AIService] = None, bypass_engine: Optional[QABypassEngine] = None):
         """Initialize QA Engine with optional shared AI service and bypass engine."""
         self.ai_service = ai_service if ai_service is not None else get_ai_service()
@@ -723,7 +722,7 @@ class QAEngine:
                         "deal_breaker_details": [
                             {
                                 "model": eval.model,
-                                "evaluator": get_evaluator_alias(eval, fallback=eval.model),
+                                "evaluator": get_evaluator_alias(eval, fallback=None),
                                 "reason": eval.deal_breaker_reason or eval.reason or "",
                             }
                             for eval in deal_breakers
@@ -787,7 +786,7 @@ class QAEngine:
                                 {
                                     "layer": layer.name,
                                     "model": eval.model,
-                                    "evaluator": get_evaluator_alias(eval, fallback=eval.model),
+                                    "evaluator": get_evaluator_alias(eval, fallback=None),
                                     "reason": eval.deal_breaker_reason or eval.reason or "",
                                     "score_given": getattr(eval, "score", None),
                                     "layer_criteria": getattr(layer, "criteria", None),
@@ -950,7 +949,7 @@ class QAEngine:
             # ===== END =====
 
         return results
-    
+
     async def evaluate_content_comprehensive(
         self,
         content: str,
@@ -1387,12 +1386,12 @@ Source QA layers:
                 "total_evaluations": sum(len(layer_results) for layer_results in results.values()),
             },
         }
-    
+
     def _calculate_summary(self, qa_results: Dict, layers: List[QALayer]) -> Dict[str, Any]:
         """Calculate summary statistics from QA results"""
         all_scores = []
         deal_breakers = []
-        
+
         for layer_name, layer_results in qa_results.items():
             for model, evaluation in layer_results.items():
                 if evaluation.score is not None:
@@ -1403,7 +1402,7 @@ Source QA layers:
                         "model": model,
                         "reason": evaluation.reason
                     })
-        
+
         return {
             "average_score": sum(all_scores) / len(all_scores) if all_scores else 0.0,
             "min_score": min(all_scores) if all_scores else 0.0,
@@ -1413,11 +1412,11 @@ Source QA layers:
             "deal_breakers": deal_breakers,
             "has_deal_breakers": len(deal_breakers) > 0
         }
-    
+
     def _identify_critical_issues(self, qa_results: Dict) -> List[Dict[str, Any]]:
         """Identify critical issues from QA results"""
         critical_issues = []
-        
+
         for layer_name, layer_results in qa_results.items():
             invalid_models = [model for model, evaluation in layer_results.items() if evaluation.score is None]
             if invalid_models:
@@ -1433,7 +1432,7 @@ Source QA layers:
                 continue
 
             layer_avg = sum(layer_scores) / len(layer_scores)
-            
+
             if layer_avg < 4.0:
                 critical_issues.append({
                     "type": "low_layer_score",
@@ -1441,7 +1440,7 @@ Source QA layers:
                     "average_score": layer_avg,
                     "description": f"Layer {layer_name} average score is critically low: {layer_avg:.2f}"
                 })
-            
+
             if len(layer_scores) > 1:
                 score_range = max(layer_scores) - min(layer_scores)
                 if score_range > 5.0:
@@ -1451,7 +1450,7 @@ Source QA layers:
                         "score_range": score_range,
                         "description": f"Models disagree significantly in {layer_name}: range of {score_range:.2f} points"
                     })
-            
+
             deal_breaker_models = [model for model, eval in layer_results.items() if eval.deal_breaker]
             if deal_breaker_models:
                 critical_issues.append({
@@ -1460,13 +1459,13 @@ Source QA layers:
                     "models": deal_breaker_models,
                     "description": f"Deal-breaker detected in {layer_name} by: {', '.join(deal_breaker_models)}"
                 })
-        
+
         return critical_issues
-    
+
     def _calculate_layer_statistics(self, qa_results: Dict, layers: List[QALayer]) -> Dict[str, Dict]:
         """Calculate statistics for each layer"""
         layer_stats: Dict[str, Dict[str, Any]] = {}
-        
+
         for layer in layers:
             layer_name = layer.name
             if layer_name in qa_results:
@@ -1474,7 +1473,7 @@ Source QA layers:
                 scores = [evaluation.score for evaluation in layer_results.values() if evaluation.score is not None]
                 invalid_models = [model for model, evaluation in layer_results.items() if evaluation.score is None]
                 average_score = sum(scores) / len(scores) if scores else None
-                
+
                 layer_stats[layer_name] = {
                     "average_score": average_score,
                     "min_score": min(scores) if scores else None,
@@ -1487,18 +1486,18 @@ Source QA layers:
                     "deal_breaker_count": sum(1 for eval in layer_results.values() if eval.deal_breaker),
                     "is_deal_breaker_layer": layer.is_deal_breaker
                 }
-        
+
         return layer_stats
-    
+
     def _calculate_model_statistics(self, qa_results: Dict, qa_models: List[str]) -> Dict[str, Dict]:
         """Calculate statistics for each model"""
         model_stats: Dict[str, Dict[str, Any]] = {}
-        
+
         for model in qa_models:
             model_scores = []
             model_deal_breakers = 0
             invalid_layers = []
-            
+
             for layer_name, layer_results in qa_results.items():
                 if model in layer_results:
                     evaluation = layer_results[model]
@@ -1508,7 +1507,7 @@ Source QA layers:
                         invalid_layers.append(layer_name)
                     if evaluation.deal_breaker:
                         model_deal_breakers += 1
-            
+
             evaluation_count = len(model_scores)
             reliability = (
                 (evaluation_count - model_deal_breakers) / evaluation_count
@@ -1525,9 +1524,9 @@ Source QA layers:
                     "invalid_layers": invalid_layers,
                     "reliability": reliability
                 }
-        
+
         return model_stats
-    
+
     async def validate_layers(self, layers: List[QALayer]) -> Dict[str, Any]:
         """
         Validate QA layer configuration
@@ -1537,32 +1536,32 @@ Source QA layers:
             "warnings": [],
             "errors": []
         }
-        
+
         if not layers:
             validation_results["is_valid"] = False
             validation_results["errors"].append("No QA layers provided")
             return validation_results
-        
+
         layer_names = [layer.name for layer in layers]
         if len(layer_names) != len(set(layer_names)):
             validation_results["is_valid"] = False
             validation_results["errors"].append("Duplicate layer names found")
-        
+
         layer_orders = [layer.order for layer in layers]
         if len(layer_orders) != len(set(layer_orders)):
             validation_results["warnings"].append("Duplicate layer orders found - execution order may be unpredictable")
-        
+
         for layer in layers:
             if layer.min_score < 0 or layer.min_score > 10:
                 validation_results["errors"].append(f"Layer {layer.name} has invalid min_score: {layer.min_score}")
                 validation_results["is_valid"] = False
-        
+
         deal_breaker_layers = [layer for layer in layers if layer.is_deal_breaker]
         if not deal_breaker_layers:
             validation_results["warnings"].append("No deal-breaker layers configured - content quality may be inconsistent")
-        
+
         return validation_results
-    
+
     def _resolve_qa_scheduler_policy(self, original_request: Optional[Any], configured_count: int) -> QASchedulerPolicy:
         """Resolve public request knobs into the internal scheduler policy."""
 
@@ -2058,7 +2057,7 @@ Source QA layers:
                         model_name = get_model_name(model)
                         result_key = _qa_model_result_key(model_name, index, qa_model_names, model_alias_registry)
                         evaluation = layer_results[result_key]
-                        evaluator_label = get_evaluator_alias(evaluation, fallback=model_name)
+                        evaluator_label = get_evaluator_alias(evaluation, fallback=None)
                         if evaluation.score is not None:
                             await progress_callback(f"{evaluator_label}: {evaluation.score:.1f}/10")
                         else:
@@ -2107,16 +2106,16 @@ Source QA layers:
 
     def _create_iteration_stop_result(self, partial_results: Dict[str, Any], consensus_info: Dict[str, Any]) -> Dict[str, Any]:
         """Create result structure for stopping QA to force iteration due to majority deal-breakers"""
-        
+
         all_scores = []
         total_evals = 0
-        
+
         for layer_results in partial_results.values():
             for evaluation in layer_results.values():
                 if hasattr(evaluation, 'score') and evaluation.score is not None:
                     all_scores.append(evaluation.score)
                     total_evals += 1
-        
+
         return {
             "qa_results": partial_results,
             "summary": {

@@ -10,24 +10,24 @@ Tests cover:
 - QA content preparation
 """
 
-import pytest
-import sys
 import os
+import sys
+
+import pytest
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from json_field_utils import (
-    try_extract_json_from_content,
-    reconstruct_json,
-    validate_target_field,
-    prepare_content_for_qa,
     _extract_json_from_markdown,
     _find_all_string_fields,
     _parse_jmespath_for_set,
     _set_by_jmespath,
+    prepare_content_for_qa,
+    reconstruct_json,
+    try_extract_json_from_content,
+    validate_target_field,
 )
-
 
 # =============================================================================
 # Path Validation Tests

@@ -17,12 +17,12 @@ Covers:
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import deterministic_validation as deterministic_validation_module
 import pytest
 
+import deterministic_validation as deterministic_validation_module
 from gran_sabio import (
     GRAN_SABIO_ESCALATION_SCHEMA,
     GRAN_SABIO_MINORITY_OVERRIDE_SCHEMA,

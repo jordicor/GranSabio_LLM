@@ -18,6 +18,11 @@ import re
 import time
 from typing import TYPE_CHECKING, Callable, List, Literal, Optional, Tuple, Union
 
+from .locators import (
+    build_word_map,
+    locate_by_markers,
+    locate_by_word_indices,
+)
 from .models import (
     ChangeDetail,
     EditOperation,
@@ -25,17 +30,11 @@ from .models import (
     FormatType,
     OperationType,
     TargetMode,
-    TargetScope,
     TargetSpec,
     TextTarget,
 )
 from .prompts import build_edit_prompt, get_operation_instruction
 from .text_utils import clean_edited_text, remove_common_ai_artifacts
-from .locators import (
-    locate_by_markers,
-    locate_by_word_indices,
-    build_word_map,
-)
 
 if TYPE_CHECKING:
     from ai_service import AIService

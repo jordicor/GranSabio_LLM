@@ -5,12 +5,13 @@ Word Count Utilities for Gran Sabio LLM Engine
 Utilities for word count validation and enforcement.
 """
 
-import re
 import json as json_stdlib
+import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
+
 from models import ContentRequest, QALayer
 from phrase_frequency_config import is_phrase_frequency_active
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -133,65 +134,65 @@ def count_words(text: str) -> int:
 def validate_word_count_config(config: Any) -> Tuple[bool, str]:
     """
     Validate word count enforcement configuration
-    
+
     Args:
         config: Word count enforcement configuration
-        
+
     Returns:
         (is_valid, error_message)
     """
     config_dict = word_count_config_to_dict(config)
     if config_dict is None:
         return False, "word_count_enforcement must be dict-like or a Pydantic model"
-    
+
     # Required fields
     if not config_dict.get("enabled", False):
         return False, "enabled must be True to use word count enforcement"
-    
+
     # Validate flexibility_percent
     flexibility = config_dict.get("flexibility_percent")
     if flexibility is None:
         return False, "flexibility_percent is required when enabled=True"
-    
+
     if not isinstance(flexibility, (int, float)) or flexibility < 0 or flexibility > 100:
         return False, "flexibility_percent must be a number between 0 and 100"
-    
+
     # Validate direction
     direction = config_dict.get("direction", "both")
     valid_directions = ["both", "more", "less"]
     if direction not in valid_directions:
         return False, f"direction must be one of: {valid_directions}"
-    
+
     # Validate severity
     severity = config_dict.get("severity", "important")
     valid_severities = ["important", "deal_breaker"]
     if severity not in valid_severities:
         return False, f"severity must be one of: {valid_severities}"
-    
+
     return True, ""
 
 
-def calculate_word_count_range(min_words: Optional[int], max_words: Optional[int], 
+def calculate_word_count_range(min_words: Optional[int], max_words: Optional[int],
                              flexibility_percent: float, direction: str) -> Tuple[int, int]:
     """
     Calculate the acceptable word count range based on target and flexibility
-    
+
     Args:
         min_words: Minimum target words (from ContentRequest)
-        max_words: Maximum target words (from ContentRequest) 
+        max_words: Maximum target words (from ContentRequest)
         flexibility_percent: Allowed flexibility percentage
         direction: Direction of flexibility ("both", "more", "less")
-        
+
     Returns:
         (absolute_min, absolute_max) word counts
     """
     # If no word limits specified, we can't enforce
     if not min_words and not max_words:
         return 0, float('inf')
-    
+
     # Calculate flexibility multiplier
     flexibility_factor = flexibility_percent / 100.0
-    
+
     # Determine base range
     if min_words and max_words:
         # Both limits specified - use the range
@@ -202,10 +203,10 @@ def calculate_word_count_range(min_words: Optional[int], max_words: Optional[int
         base_min = min_words
         base_max = min_words * 1.5  # 50% buffer if no max specified
     else:
-        # Only max specified - assume min is max - some reasonable buffer  
+        # Only max specified - assume min is max - some reasonable buffer
         base_min = max(1, int(max_words * 0.7))  # 30% buffer if no min specified
         base_max = max_words
-    
+
     # Apply flexibility based on direction
     if direction == "both":
         absolute_min = max(1, int(base_min * (1 - flexibility_factor)))
@@ -216,20 +217,20 @@ def calculate_word_count_range(min_words: Optional[int], max_words: Optional[int
     elif direction == "more":
         absolute_min = base_min
         absolute_max = int(base_max * (1 + flexibility_factor))
-    
+
     return absolute_min, absolute_max
 
 
-def create_word_count_qa_layer(min_words: Optional[int], max_words: Optional[int], 
+def create_word_count_qa_layer(min_words: Optional[int], max_words: Optional[int],
                               config: Any) -> QALayer:
     """
     Create a QA layer for word count enforcement
-    
+
     Args:
         min_words: Minimum target words
         max_words: Maximum target words
         config: Word count enforcement configuration
-        
+
     Returns:
         QALayer for word count validation
     """
@@ -240,10 +241,10 @@ def create_word_count_qa_layer(min_words: Optional[int], max_words: Optional[int
     flexibility = config_dict["flexibility_percent"]
     direction = config_dict["direction"]
     severity = config_dict["severity"]
-    
+
     # Calculate acceptable range
     abs_min, abs_max = calculate_word_count_range(min_words, max_words, flexibility, direction)
-    
+
     # Create descriptive criteria
     if min_words and max_words:
         target_desc = f"{min_words}-{max_words} words"
@@ -251,13 +252,13 @@ def create_word_count_qa_layer(min_words: Optional[int], max_words: Optional[int
         target_desc = f"at least {min_words} words"
     else:
         target_desc = f"at most {max_words} words"
-    
+
     flexibility_desc = {
         "both": f"{flexibility}% more or less",
         "more": f"{flexibility}% more",
         "less": f"{flexibility}% less"
     }[direction]
-    
+
     # Build criteria text
     criteria = (
         f"Count the words in the content and verify it falls within the acceptable range. "
@@ -267,7 +268,7 @@ def create_word_count_qa_layer(min_words: Optional[int], max_words: Optional[int
         "Also reject content that includes meta commentary about the draft, the prompt, "
         "planned revisions, or word-count compliance instead of only returning the requested content."
     )
-    
+
     # Deal breaker criteria
     deal_breaker_criteria = None
     if severity == "deal_breaker":
@@ -276,7 +277,7 @@ def create_word_count_qa_layer(min_words: Optional[int], max_words: Optional[int
             "or the content includes meta commentary about its own draft status, prompt, "
             "planned revisions, or word-count compliance"
         )
-    
+
     return QALayer(
         name="Word Count Enforcement",
         description=f"Validates content has {target_desc} (±{flexibility}% {direction})",

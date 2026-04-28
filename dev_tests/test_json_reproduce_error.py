@@ -3,15 +3,17 @@ Reproduce the JSON schema error from session 0097ba67-ce49-462d-ae26-e8741e0bcce
 Test with multiple models and Gran Sabio fallback
 """
 import sqlite3
-import requests
 import sys
 from pathlib import Path
 
+import requests
+
 # Add parent directory to path for json_utils import
 sys.path.insert(0, str(Path(__file__).parent.parent))
-import json_utils as json
 import time
 from pathlib import Path
+
+import json_utils as json
 
 DB_PATH = Path(__file__).parent.parent / "debugger_history.db"
 SESSION_ID = "0097ba67-ce49-462d-ae26-e8741e0bcce9"

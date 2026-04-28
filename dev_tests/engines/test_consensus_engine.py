@@ -13,12 +13,12 @@ Functions tested:
 - _safe_get_evaluation_attr(): Safe attribute getter
 """
 
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
 
 from consensus_engine import ConsensusEngine
-from models import QALayer, QAEvaluation, ConsensusResult
-
+from models import QAEvaluation, QALayer
 
 # ============================================================================
 # Fixtures

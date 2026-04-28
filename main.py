@@ -27,17 +27,9 @@ from core.app_state import (
     FILE_LOGGING_ENV_VAR,
     FORCE_EXTRA_VERBOSE_ENV_VAR,
     FORCE_VERBOSE_ENV_VAR,
-    TRUTHY_ENV_VALUES,
-    app,
     config,
     logger,
 )
-from core.qa_decision_engine import (
-    _check_50_50_tie_deal_breakers,
-    _check_minority_deal_breakers,
-)
-from word_count_utils import prepare_qa_layers_with_word_count
-
 
 if __name__ == "__main__":
     from file_logger import activate_file_logging

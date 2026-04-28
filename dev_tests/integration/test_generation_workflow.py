@@ -9,8 +9,6 @@ Tests the complete lifecycle:
 - Cancellation flows
 """
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 
 
 # Note: Fixtures are inherited from conftest.py:

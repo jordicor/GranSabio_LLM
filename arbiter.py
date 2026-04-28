@@ -13,9 +13,11 @@ The actual Arbiter class implementation will be added in Phase 2.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, Tuple, Callable, Awaitable, TYPE_CHECKING
 from enum import Enum
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
+
 from pydantic import BaseModel, Field
+
 from model_aliasing import PromptPart
 
 if TYPE_CHECKING:
@@ -1265,7 +1267,6 @@ class Arbiter:
         Returns:
             Parsed AI response as dict
         """
-        from config import config
 
         prompt = self._build_arbiter_prompt(context, conflicts, distribution)
         prompt_safety_parts = None
@@ -1284,7 +1285,7 @@ class Arbiter:
                             self._format_conflicts_for_prompt(conflicts),
                         ]
                     ),
-                    source="system_generated",
+                    source="user_supplied",
                     label="arbiter.evaluator_context",
                 )
             ]
@@ -1350,11 +1351,6 @@ class Arbiter:
         so ``envelope.payload`` arrives already parsed and schema-validated.
         """
         from config import config
-        from tool_loop_models import (
-            LoopScope,
-            OutputContract,
-            PayloadScope,
-        )
 
         # A neutral validation callback is required by the tool loop signature.
         # The Arbiter does not iterate on draft metrics — it arbitrates edits.
@@ -1362,6 +1358,11 @@ class Arbiter:
         # deterministic picture before making a decision; subsequent turns
         # only happen if the model chooses to call ``validate_draft`` again.
         from deterministic_validation import DraftValidationResult
+        from tool_loop_models import (
+            LoopScope,
+            OutputContract,
+            PayloadScope,
+        )
         from word_count_utils import count_words
 
         def _neutral_validation_callback(text: str) -> DraftValidationResult:

@@ -20,18 +20,20 @@ Options:
     --providers   Comma-separated list of providers to sync (default: meta-llama,mistralai,deepseek,qwen)
 """
 
+import argparse
 import os
 import sys
-import argparse
 
 # Add parent directory to path for json_utils import
 sys.path.insert(0, str(Path(__file__).parent.parent))
-import json_utils as json
-import requests
-from typing import Dict, List, Set, Any
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List
+
+import requests
 from dotenv import load_dotenv
+
+import json_utils as json
 
 # Load environment variables
 load_dotenv()

@@ -13,14 +13,17 @@ IMPORTANT: These tests make real API calls and incur costs.
 Set SKIP_EXPENSIVE_TESTS=1 to skip API tests.
 """
 
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import pytest
-import httpx
-from typing import Dict, Any, List, Optional, Tuple
 import time
+from typing import Any, Dict, Optional
+
+import httpx
+import pytest
+
 import config
 
 # Skip expensive API tests unless explicitly enabled

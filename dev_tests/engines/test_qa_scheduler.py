@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from models import QAEvaluation, ContentRequest
+from models import ContentRequest, QAEvaluation
 from qa_result_utils import required_valid_qa_models
 from qa_scheduler import (
     QAScheduler,

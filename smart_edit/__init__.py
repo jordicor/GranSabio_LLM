@@ -45,65 +45,65 @@ QA Integration (for evaluation systems):
 Version: 2.0.0 (Self-contained module with QA integration)
 """
 
-from .models import (
-    # Core operation types
-    EditOperation,
-    EditResult,
-    TextTarget,
-    TargetMode,
-    TargetScope,
-    OperationType,
-    ChangeDetail,
-    FormatType,
-    TargetSpec,
-    # Backward compatibility alias
-    EditType,
-    # QA integration models
-    SeverityLevel,
-    MarkerMode,
-    EditBaseModel,
-    MarkerConfig,
-    TextEditRange,
-    EditContext,
-    EditDecision,
-    QAEvaluationWithRanges,
-)
-from .operations import SmartTextEditor
-from .locators import (
-    find_optimal_phrase_length,
-    build_word_map,
-    locate_by_markers,
-    locate_by_word_indices,
-    validate_marker_uniqueness,
-    analyze_text_for_markers,
-    # Text normalization
-    normalize_source_text,
-    normalize_for_matching,
-    # Counted phrase format support
-    parse_counted_phrase,
-    validate_counted_phrase_format,
-    extract_phrase_from_response,
-)
-from .segment_map import (
-    TextNode,
-    TargetSpan,
-    TargetResolution,
-    SegmentMap,
-    build_segment_map,
-)
 from .analyzer import (
     TextAnalyzer,
     calculate_stats,
 )
+from .locators import (
+    analyze_text_for_markers,
+    build_word_map,
+    extract_phrase_from_response,
+    find_optimal_phrase_length,
+    locate_by_markers,
+    locate_by_word_indices,
+    normalize_for_matching,
+    # Text normalization
+    normalize_source_text,
+    # Counted phrase format support
+    parse_counted_phrase,
+    validate_counted_phrase_format,
+    validate_marker_uniqueness,
+)
+from .models import (
+    ChangeDetail,
+    EditBaseModel,
+    EditContext,
+    EditDecision,
+    # Core operation types
+    EditOperation,
+    EditResult,
+    # Backward compatibility alias
+    EditType,
+    FormatType,
+    MarkerConfig,
+    MarkerMode,
+    OperationType,
+    QAEvaluationWithRanges,
+    # QA integration models
+    SeverityLevel,
+    TargetMode,
+    TargetScope,
+    TargetSpec,
+    TextEditRange,
+    TextTarget,
+)
+from .operations import SmartTextEditor
 from .qa_integration import (
-    build_qa_edit_prompt,
-    parse_qa_edit_groups,
-    get_operation_type,
     OPERATION_TYPE_MAP,
     QA_EDIT_FORMAT_ID_MODE,
     QA_EDIT_FORMAT_PHRASE_MODE,
     QA_EDIT_FORMAT_WORD_INDEX_MODE,
     QA_SIMPLE_FORMAT,
+    build_qa_edit_prompt,
+    get_operation_type,
+    parse_qa_edit_groups,
+)
+from .segment_map import (
+    SegmentMap,
+    TargetResolution,
+    TargetSpan,
+    TextNode,
+    build_segment_map,
 )
 
 __all__ = [

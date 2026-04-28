@@ -29,7 +29,7 @@ section_mappings = {
         "end": ["generate"]
     },
     "endpoints.html": {
-        "start": "generate", 
+        "start": "generate",
         "end": ["analysis-lexical-diversity"]
     },
     "analysis.html": {
@@ -62,33 +62,33 @@ section_mappings = {
 for filename, mapping in section_mappings.items():
     start_pattern = rf'<section id="{mapping["start"]}"'
     end_patterns = [rf'<section id="{eid}"' for eid in mapping["end"]]
-    
+
     # Find start position
     start_match = re.search(start_pattern, original_content)
     if not start_match:
         print(f"Could not find start section: {mapping['start']}")
         continue
-    
+
     start_pos = start_match.start()
-    
+
     # Find end position
     end_pos = len(original_content)
     for end_pattern in end_patterns:
         end_match = re.search(end_pattern, original_content[start_pos + 1:])
         if end_match:
             end_pos = min(end_pos, start_pos + 1 + end_match.start())
-    
+
     # Also check for </main> as end marker
     main_end = original_content.find("</main>", start_pos)
     if main_end != -1:
         end_pos = min(end_pos, main_end)
-    
+
     section_content = original_content[start_pos:end_pos].strip()
-    
+
     filepath = os.path.join(DOCS_DIR, filename)
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(section_content)
-    
+
     size_kb = len(section_content) / 1024
     print(f"Created {filename}: {size_kb:.1f} KB")
 

@@ -16,10 +16,11 @@ Expected behavior:
 """
 
 import asyncio
-import aiohttp
 import os
 import sys
 from pathlib import Path
+
+import aiohttp
 
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))

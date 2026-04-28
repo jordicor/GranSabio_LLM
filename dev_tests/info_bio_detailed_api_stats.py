@@ -2,11 +2,11 @@
 Detailed analysis of API calls to AI models for a specific project
 Extracts information from payload_json to count actual model API calls
 """
-import sqlite3
 import json
+import sqlite3
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
-from collections import Counter, defaultdict
 
 # Project ID to analyze
 PROJECT_ID = "ed8e20631f714ec5b9017aaa268d21e1"

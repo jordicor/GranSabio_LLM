@@ -7,10 +7,9 @@ types of content generation requests.
 """
 
 import asyncio
-import aiohttp
-import time
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
+import aiohttp
 
 API_BASE_URL = "http://localhost:8000"
 
@@ -31,7 +30,7 @@ async def reserve_project_id(session: aiohttp.ClientSession, project_id: Optiona
 
 async def test_biography_generation():
     """Test biography generation with comprehensive QA layers"""
-    
+
     # Biography request with comprehensive QA layers
     request_data = {
         "prompt": "Write a complete biography of Marie Curie of approximately 1500 words, covering her personal life, scientific discoveries, and her impact on modern science.",
@@ -79,13 +78,13 @@ async def test_biography_generation():
         "gran_sabio_model": "claude-opus",
         "verbose": True
     }
-    
+
     print("🧬 Testing Biography Generation...")
     print(f"📝 Prompt: {request_data['prompt']}")
     print(f"🎯 Target: {request_data['min_global_score']} global score")
     print(f"🔄 Max iterations: {request_data['max_iterations']}")
     print()
-    
+
     # Start generation
     async with aiohttp.ClientSession() as session:
         # Reserve a project identifier before the pipeline begins
@@ -105,7 +104,7 @@ async def test_biography_generation():
                 error = await response.text()
                 print(f"❌ Failed to start generation: {error}")
                 return
-        
+
         # Monitor progress
         print("\n📊 Monitoring progress...")
         while True:
@@ -113,17 +112,17 @@ async def test_biography_generation():
                 if response.status == 200:
                     status = await response.json()
                     print(f"Status: {status['status']} | Iteration: {status['current_iteration']}/{status['max_iterations']}")
-                    
+
                     # Show verbose log
                     if status.get('verbose_log'):
                         for log_entry in status['verbose_log'][-3:]:  # Show last 3 entries
                             print(f"  📋 {log_entry}")
-                    
+
                     if status['status'] in ['completed', 'failed']:
                         break
-                
+
                 await asyncio.sleep(2)  # Check every 2 seconds
-        
+
         # Get final result
         if status['status'] == 'completed':
             async with session.get(f"{API_BASE_URL}/result/{session_id}") as response:
@@ -136,7 +135,7 @@ async def test_biography_generation():
                         print(f"📁 Project: {final_result['project_id']}")
                     print(f"\n📝 Generated content (first 500 chars):")
                     print(f"{final_result['content'][:500]}...")
-                    
+
                     if 'gran_sabio_reason' in final_result:
                         print(f"\n🧙‍♂️ Gran Sabio intervention: {final_result['gran_sabio_reason']}")
         else:
@@ -147,11 +146,11 @@ async def test_biography_generation():
 
 async def test_script_generation():
     """Test script generation with format-specific QA layers"""
-    
+
     request_data = {
         "prompt": "Escribe el primer acto de un guión cinematográfico de drama sobre un científico que descubre algo que podría cambiar el mundo, pero debe decidir si revelarlo. Incluye diálogos naturales y descripciones de escena.",
         "content_type": "script",
-        "generator_model": "claude-sonnet-4-20250514", 
+        "generator_model": "claude-sonnet-4-20250514",
         "temperature": 0.8,
         "max_tokens": 3000,
         "qa_models": ["gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash"],
@@ -186,14 +185,14 @@ async def test_script_generation():
         "gran_sabio_model": "claude-opus",
         "verbose": True
     }
-    
+
     print("🎬 Testing Script Generation...")
     await _run_generation_test(request_data, "Script")
 
 
 async def test_simple_article():
     """Test simple article generation with minimal QA"""
-    
+
     request_data = {
         "prompt": "Escribe un artículo de divulgación científica sobre la inteligencia artificial explicando qué es, cómo funciona, y sus aplicaciones actuales. Hazlo accesible para el público general.",
         "content_type": "article",
@@ -223,19 +222,19 @@ async def test_simple_article():
         "max_iterations": 2,
         "verbose": True
     }
-    
+
     print("📰 Testing Article Generation...")
     await _run_generation_test(request_data, "Article")
 
 
 async def _run_generation_test(request_data: Dict[str, Any], content_type: str):
     """Helper function to run a generation test"""
-    
+
     print(f"📝 Prompt: {request_data['prompt'][:100]}...")
     print(f"🎯 Target: {request_data['min_global_score']} global score")
     print(f"🔄 Max iterations: {request_data['max_iterations']}")
     print()
-    
+
     async with aiohttp.ClientSession() as session:
         # Submit request
         async with session.post(f"{API_BASE_URL}/generate", json=request_data) as response:
@@ -243,14 +242,14 @@ async def _run_generation_test(request_data: Dict[str, Any], content_type: str):
                 error = await response.text()
                 print(f"❌ Failed to start generation: {error}")
                 return
-            
+
             result = await response.json()
             session_id = result["session_id"]
             print(f"✅ Generation started. Session ID: {session_id}")
             project_id = result.get("project_id")
             if project_id:
                 print(f"📁 Project: {project_id}")
-        
+
         # Monitor progress
         print("\n📊 Monitoring progress...")
         while True:
@@ -258,12 +257,12 @@ async def _run_generation_test(request_data: Dict[str, Any], content_type: str):
                 if response.status == 200:
                     status = await response.json()
                     print(f"Status: {status['status']} | Iteration: {status['current_iteration']}/{status['max_iterations']}")
-                    
+
                     if status['status'] in ['completed', 'failed']:
                         break
-                
+
                 await asyncio.sleep(1)
-        
+
         # Show results
         if status['status'] == 'completed':
             async with session.get(f"{API_BASE_URL}/result/{session_id}") as response:
@@ -281,7 +280,7 @@ async def _run_generation_test(request_data: Dict[str, Any], content_type: str):
 async def test_health_check():
     """Test API health and service availability"""
     print("🏥 Testing API Health...")
-    
+
     async with aiohttp.ClientSession() as session:
         # Test root endpoint
         async with session.get(f"{API_BASE_URL}/") as response:
@@ -291,7 +290,7 @@ async def test_health_check():
             else:
                 print(f"❌ API not responding: {response.status}")
                 return False
-        
+
         # Test health endpoint
         async with session.get(f"{API_BASE_URL}/health") as response:
             if response.status == 200:
@@ -301,7 +300,7 @@ async def test_health_check():
             else:
                 print(f"❌ Health check failed: {response.status}")
                 return False
-    
+
     return True
 
 
@@ -309,35 +308,35 @@ async def main():
     """Run all tests"""
     print("Gran Sabio LLM - API Testing Suite")
     print("=" * 50)
-    
+
     # Test API availability first
     if not await test_health_check():
         print("❌ API not available. Please start the server first.")
         print("Run: python -m uvicorn main:app --reload")
         return
-    
+
     print("\n" + "=" * 50)
-    
+
     # Run content generation tests
     tests = [
         ("Biography Generation", test_biography_generation),
-        ("Script Generation", test_script_generation), 
+        ("Script Generation", test_script_generation),
         ("Article Generation", test_simple_article)
     ]
-    
+
     for test_name, test_func in tests:
         print(f"\n🧪 Running {test_name}...")
         print("-" * 30)
-        
+
         try:
             await test_func()
             print(f"✅ {test_name} completed")
         except Exception as e:
             print(f"❌ {test_name} failed: {str(e)}")
-        
+
         print("\n" + "=" * 50)
         await asyncio.sleep(1)  # Brief pause between tests
-    
+
     print("\n🎯 All tests completed!")
 
 

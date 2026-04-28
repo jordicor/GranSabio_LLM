@@ -7,24 +7,21 @@ verification pipeline and integrates with the QA engine.
 Tests use mocked AI responses to avoid API calls.
 """
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime
+
+import pytest
 
 from evidence_grounding.grounding_engine import (
     GroundingEngine,
-    run_grounding_check,
     get_effective_order,
+    run_grounding_check,
 )
 from models import (
+    ClaimBudgetResult,
     EvidenceGroundingConfig,
     EvidenceGroundingResult,
     ExtractedClaim,
-    ClaimBudgetResult,
-    EvidenceSpan,
-    SpanType,
 )
-
 
 # =============================================================================
 # Tests for get_effective_order

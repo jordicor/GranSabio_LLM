@@ -8,25 +8,25 @@ These tests verify:
 4. Integration with SmartTextEditor.locate()
 """
 
-import pytest
 import sys
 from pathlib import Path
+
+import pytest
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from smart_edit import (
     SmartTextEditor,
-    TextTarget,
     TargetMode,
-    find_optimal_phrase_length,
+    TextTarget,
+    analyze_text_for_markers,
     build_word_map,
+    find_optimal_phrase_length,
     locate_by_markers,
     locate_by_word_indices,
     validate_marker_uniqueness,
-    analyze_text_for_markers,
 )
-
 
 # =============================================================================
 # TEST DATA

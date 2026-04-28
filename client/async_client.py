@@ -17,12 +17,12 @@ For synchronous usage, use GranSabioClient instead.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import time
-import asyncio
-import logging
-from typing import Any, Awaitable, Callable, Coroutine, Dict, List, Optional, Sequence, Tuple, TypeVar
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 import aiohttp
 
@@ -36,27 +36,22 @@ except ImportError:
 # Import shared exceptions from package
 from . import (
     GranSabioClientError,
-    GranSabioGenerationCancelled,
-    GranSabioGenerationRejected,
     TransientGranSabioError,
 )
 
 # Import shared utilities from _common
 from ._common import (
-    ActivityMonitor,
-    is_heartbeat,
-    normalize_reasoning_effort,
-    compute_generation_timeout,
-    compute_token_budgets,
-    resolve_model_token_fallback,
-    validate_result,
-    DEFAULT_STREAM_TIMEOUT_SECONDS,
-    STREAM_TIMEOUT_GRACE_SECONDS,
+    POLL_RETRY_BACKOFF_SECONDS,
+    PROVIDER_KEY_ENV_MAP,
     RESULT_POLL_GRACE_SECONDS,
     RESULT_POLL_INTERVAL_SECONDS,
     STREAM_ACTIVITY_CHECK_SECONDS,
-    POLL_RETRY_BACKOFF_SECONDS,
-    PROVIDER_KEY_ENV_MAP,
+    ActivityMonitor,
+    compute_generation_timeout,
+    compute_token_budgets,
+    is_heartbeat,
+    resolve_model_token_fallback,
+    validate_result,
 )
 
 logger = logging.getLogger(__name__)
@@ -514,6 +509,13 @@ class AsyncGranSabioClient:
             raise GranSabioClientError(
                 f"Request rejected by preflight: {feedback.get('user_feedback', 'Unknown reason')}",
                 details={"preflight_feedback": feedback}
+            )
+
+        if result.get("status") == "auto_qa_rejected" and result.get("auto_qa_feedback"):
+            feedback = result.get("auto_qa_feedback", {})
+            raise GranSabioClientError(
+                f"Request rejected by Auto-QA: {feedback.get('message', 'Unknown reason')}",
+                details={"auto_qa_feedback": feedback}
             )
 
         session_id = result.get("session_id")

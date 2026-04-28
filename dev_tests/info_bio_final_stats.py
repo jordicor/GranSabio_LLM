@@ -2,11 +2,11 @@
 Final comprehensive analysis of API calls and usage for a specific project
 Combines session data, events, and usage_json for complete statistics
 """
-import sqlite3
 import json
+import sqlite3
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
-from collections import Counter, defaultdict
 
 # Project ID to analyze
 PROJECT_ID = "ed8e20631f714ec5b9017aaa268d21e1"

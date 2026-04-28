@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+
 @pytest.fixture
 def client():
     """Return a TestClient with generation background work disabled."""

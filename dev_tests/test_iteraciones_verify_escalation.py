@@ -8,12 +8,12 @@ and verifies that the code path is correct.
 import asyncio
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models import QAEvaluation, QALayer
+from models import QAEvaluation
 
 
 def test_minority_detection_logic():

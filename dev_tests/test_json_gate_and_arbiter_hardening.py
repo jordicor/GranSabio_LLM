@@ -1,7 +1,7 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
-from types import SimpleNamespace
 
 from ai_service import AIService
 from arbiter import (

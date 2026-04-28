@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, patch
 
 import pytest
-import json_utils as json
 
+import json_utils as json
 from long_text.controller import (
     LongTextGenerationError,
     LongTextProcessCancelled,

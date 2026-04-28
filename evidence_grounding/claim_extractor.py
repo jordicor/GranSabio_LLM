@@ -10,11 +10,10 @@ This is Phase 2 of the Strawberry Integration.
 
 import logging
 import re
-from typing import List, Optional, Dict, Any, Callable
+from typing import Any, Callable, Dict, List, Optional
 
 # Use optimized JSON (3.6x faster than standard json)
 import json_utils as json
-
 from config import config
 from models import ExtractedClaim
 

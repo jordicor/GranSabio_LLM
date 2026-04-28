@@ -8,10 +8,11 @@ IMPORTANT: No emojis in console output (Windows encoding issues).
 
 import logging
 import time
-from typing import Optional, Dict, Any
 from contextlib import contextmanager
 from datetime import datetime
-from colorama import Fore, Back, Style, init
+from typing import Any, Dict, Optional
+
+from colorama import Fore, Style, init
 
 # Initialize colorama for Windows
 init(autoreset=True)
@@ -19,6 +20,7 @@ init(autoreset=True)
 # Phase definitions
 class Phase:
     """Phase constants for the generation pipeline"""
+    AUTO_QA = "AUTO_QA_PLANNING"
     PREFLIGHT = "PREFLIGHT_VALIDATION"
     GENERATION = "CONTENT_GENERATION"
     SMART_EDIT = "SMART_EDIT"
@@ -29,6 +31,7 @@ class Phase:
 
 # Phase colors
 PHASE_COLORS = {
+    Phase.AUTO_QA: Fore.CYAN + Style.BRIGHT,
     Phase.PREFLIGHT: Fore.CYAN,
     Phase.GENERATION: Fore.GREEN,
     Phase.SMART_EDIT: Fore.YELLOW,
@@ -40,6 +43,7 @@ PHASE_COLORS = {
 
 # Phase icons (text-based, no emojis for Windows)
 PHASE_ICONS = {
+    Phase.AUTO_QA: "[AQA]",
     Phase.PREFLIGHT: "[PRE]",
     Phase.GENERATION: "[GEN]",
     Phase.SMART_EDIT: "[EDT]",
@@ -51,6 +55,7 @@ PHASE_ICONS = {
 
 # Phase labels for prompts/responses
 PHASE_LABELS = {
+    Phase.AUTO_QA: "AUTO_QA",
     Phase.PREFLIGHT: "PREFLIGHT",
     Phase.GENERATION: "GENERATION",
     Phase.SMART_EDIT: "SMART_EDIT",

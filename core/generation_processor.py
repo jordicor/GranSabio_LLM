@@ -11,40 +11,23 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from logging_utils import create_phase_logger, Phase
+import json_utils as json
+from ai_service import AccentGuardError, AIRequestError, AIService, StreamChunk
 from attachments_router import get_attachment_manager
-from config import Config, EDITABLE_CONTENT_TYPES, config
+from config import EDITABLE_CONTENT_TYPES, config
 from deal_breaker_tracker import get_tracker
-from feedback_memory import get_feedback_manager
-from gran_sabio import GranSabioInvocationError, GranSabioProcessCancelled
-from gran_sabio_supervisor import GranSabioSupervisor
-from models import (
-    ContentRequest,
-    QALayer,
-    GenerationStatus,
-    ImageRef,
-    ImageData,
-    is_json_output_requested,
-)
 from deterministic_validation import (
     DraftValidationResult,
     has_active_generation_validators,
     validate_generation_candidate,
 )
-from tool_loop_models import OutputContract
-from preflight_validator import resolve_preflight_model
-from .prompt_templates import build_json_validation_error_prompt, build_deal_breaker_awareness_prompt
-from qa_engine import QAProcessCancelled, QAModelUnavailableError
-from qa_result_utils import (
-    apply_gran_sabio_false_positive_override,
-    build_qa_counts,
-    is_technical_qa_failure,
-    semantic_deal_breakers,
-)
-from ai_service import AccentGuardError, AIRequestError, AIService, StreamChunk
-from llm_accent_prompts import ACCENT_SYSTEM_PROMPT_SNIPPET
-from model_aliasing import ModelAliasRegistry, PromptPart, get_evaluator_alias, to_prompt_safe_data
 from evidence_grounding import get_effective_order
+from feedback_memory import get_feedback_manager
+from gran_sabio import GranSabioProcessCancelled
+from gran_sabio_supervisor import GranSabioSupervisor
+from json_field_utils import prepare_content_for_qa, reconstruct_json, try_extract_json_from_content
+from llm_accent_prompts import ACCENT_SYSTEM_PROMPT_SNIPPET
+from logging_utils import Phase, create_phase_logger
 from long_text.controller import (
     LongTextGenerationError,
     LongTextProcessCancelled,
@@ -55,13 +38,43 @@ from long_text.models import (
     coerce_long_text_state,
     coerce_resolved_long_text_mode,
 )
+from model_aliasing import ModelAliasRegistry, PromptPart, get_evaluator_alias, to_prompt_safe_data
+from models import (
+    ContentRequest,
+    GenerationStatus,
+    ImageData,
+    QALayer,
+    is_json_output_requested,
+)
+from preflight_validator import resolve_preflight_model
+from qa_engine import QAModelUnavailableError, QAProcessCancelled
+from qa_result_utils import (
+    apply_gran_sabio_false_positive_override,
+    build_qa_counts,
+    is_technical_qa_failure,
+    semantic_deal_breakers,
+)
 from services.attachment_manager import (
-    AttachmentManager,
     AttachmentError,
+    AttachmentManager,
     AttachmentNotFoundError,
     AttachmentValidationError,
     ResolvedAttachment,
 )
+
+# Smart Edit imports (standalone module)
+from smart_edit import (
+    EditResult,
+    SmartTextEditor,
+    TargetMode,
+    TargetScope,
+    TextTarget,
+    build_segment_map,
+    locate_by_markers,
+    locate_by_word_indices,
+    normalize_source_text,
+)
+from tool_loop_models import OutputContract
 from tools.ai_json_cleanroom import (
     ValidationResult,
     make_loose_json_validate_options,
@@ -70,21 +83,6 @@ from tools.ai_json_cleanroom import (
 )
 from usage_tracking import UsageTracker, inject_costs_into_json_payload, merge_costs_into_json_string
 from word_count_utils import build_word_count_instructions, count_words, prepare_qa_layers_with_word_count
-from json_field_utils import try_extract_json_from_content, prepare_content_for_qa, reconstruct_json
-import json_utils as json
-
-# Smart Edit imports (standalone module)
-from smart_edit import (
-    SmartTextEditor,
-    TextTarget,
-    TargetMode,
-    TargetScope,
-    EditResult,
-    build_segment_map,
-    locate_by_markers,
-    locate_by_word_indices,
-    normalize_source_text,
-)
 
 from . import app_state
 from .app_state import (
@@ -94,12 +92,10 @@ from .app_state import (
     _ensure_services,
     _serialize_for_debug,
     _store_final_result,
-    queue_project_session_end,
-    publish_project_phase_chunk,
-    active_sessions,
     get_session,
     logger,
     mutate_session,
+    publish_project_phase_chunk,
     update_consensus_result,
     update_qa_evaluation_completed,
     update_qa_evaluation_started,
@@ -113,8 +109,8 @@ from .feedback_formatter import (
     _extract_deal_breaker_details,
     _fallback_actionable_feedback,
     _format_layer_feedback_lines,
-    create_user_friendly_reason,
 )
+from .prompt_templates import build_deal_breaker_awareness_prompt, build_json_validation_error_prompt
 from .qa_decision_engine import (
     _check_50_50_tie_deal_breakers,
     _check_minority_deal_breakers,
@@ -372,8 +368,9 @@ async def resolve_images_for_generation(
 
         # 4. Get dimensions AFTER resize for accurate token estimation
         try:
-            from PIL import Image
             import io
+
+            from PIL import Image
             with Image.open(io.BytesIO(image_bytes)) as img:
                 width, height = img.size
         except Exception:
@@ -941,6 +938,7 @@ async def _generate_full_content(
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
                 system_prompt=request.system_prompt,
+                system_prompt_source="user_supplied" if request.system_prompt is not None else "system_generated",
                 extra_verbose=getattr(request, 'extra_verbose', False),
                 reasoning_effort=reasoning_effort_value,
                 thinking_budget_tokens=thinking_budget_value,
@@ -1115,6 +1113,7 @@ async def _generate_full_content(
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
                 system_prompt=request.system_prompt,
+                system_prompt_source="user_supplied" if request.system_prompt is not None else "system_generated",
                 extra_verbose=getattr(request, 'extra_verbose', False),
                 reasoning_effort=reasoning_effort_value,
                 thinking_budget_tokens=thinking_budget_value,
@@ -1638,7 +1637,6 @@ def _build_combined_instruction(
         - instruction: String for AI (always provided as fallback)
         - direct_op: Dict with direct operation info, or None if AI needed
     """
-    from smart_edit import OperationType
 
     # Case: Single edit that can potentially be direct
     if len(edits) == 1:
@@ -1759,8 +1757,7 @@ def _apply_direct_operation(
     Returns:
         EditResult from the operation
     """
-    from smart_edit import OperationType
-    from smart_edit import EditResult, TextTarget, TargetMode
+    from smart_edit import EditResult, OperationType, TargetMode, TextTarget
 
     edit_type = direct_op["edit_type"]
     exact_fragment = direct_op["exact_fragment"]
@@ -1967,8 +1964,8 @@ def _extract_proposed_edits_from_layer_results(
     Returns:
         List of ProposedEdit objects with source_evaluator preserved
     """
-    from smart_edit import TextEditRange
     from arbiter import ProposedEdit
+    from smart_edit import TextEditRange
 
     all_proposed: List["ProposedEdit"] = []
 
@@ -1978,7 +1975,7 @@ def _extract_proposed_edits_from_layer_results(
             logger.debug(f"Skipping edit proposals from {model_name} - marked as deal_breaker")
             continue
         score = getattr(evaluation, 'score', 0.0)
-        evaluator_alias = get_evaluator_alias(evaluation, fallback=model_name)
+        evaluator_alias = get_evaluator_alias(evaluation, fallback=None)
         if hasattr(evaluation, 'identified_issues') and evaluation.identified_issues:
             for issue in evaluation.identified_issues:
                 if isinstance(issue, TextEditRange):
@@ -2087,7 +2084,7 @@ async def _process_single_layer_with_edits(
         - passed: Whether the layer passed min_score
         - deal_breaker_info: Dict with deal-breaker info if triggered, else None
     """
-    from arbiter import LayerEditHistory, ArbiterContext
+    from arbiter import ArbiterContext, LayerEditHistory
 
     min_score = layer.min_score or 7.0
     layer_name = layer.name
@@ -2257,7 +2254,7 @@ async def _process_single_layer_with_edits(
                     {
                         "layer": layer.name,
                         "model": eval.model,
-                        "evaluator": get_evaluator_alias(eval, fallback=eval.model),
+                        "evaluator": get_evaluator_alias(eval, fallback=None),
                         "reason": eval.deal_breaker_reason or eval.reason or "",
                         "score_given": getattr(eval, "score", None),
                         "layer_criteria": getattr(layer, "criteria", None),
@@ -3242,7 +3239,7 @@ async def _adjudicate_final_verification_deal_breakers(
                 {
                     "layer": layer.name,
                     "model": eval.model,
-                    "evaluator": get_evaluator_alias(eval, fallback=eval.model),
+                    "evaluator": get_evaluator_alias(eval, fallback=None),
                     "reason": eval.deal_breaker_reason or eval.reason or "",
                     "score_given": getattr(eval, "score", None),
                     "layer_criteria": getattr(layer, "criteria", None),
@@ -3538,7 +3535,7 @@ def _analyze_edit_strategy(
     Returns:
         EditDecision with strategy recommendation
     """
-    from smart_edit import EditDecision, TextEditRange, SeverityLevel
+    from smart_edit import EditDecision, TextEditRange
 
     word_count = len(content.split())
 
@@ -4261,7 +4258,7 @@ async def process_content_generation(
         # Check cancellation before starting
         if await cancellation_requested():
             return
-            
+
         update_session_status(session, session_id, GenerationStatus.GENERATING, "generating")
         if json_output_requested:
             session.setdefault("json_guard_history", [])
@@ -4282,7 +4279,7 @@ async def process_content_generation(
             if await check_session_cancelled(session_id):
                 await add_verbose_log(session_id, "Generation cancelled during iteration")
                 return
-                
+
             update_session_iteration(session, session_id, iteration + 1)
 
             # Send generation restart event if this is not the first iteration
@@ -4410,7 +4407,7 @@ ITERATION CONTEXT:
             prompt_sections.append(request.prompt)
             if deal_breaker_awareness:
                 prompt_sections.append(deal_breaker_awareness)
-                prompt_safety_parts.append(PromptPart(deal_breaker_awareness, "system_generated", "generation.deal_breaker_awareness"))
+                prompt_safety_parts.append(PromptPart(deal_breaker_awareness, "user_supplied", "generation.deal_breaker_awareness"))
             if word_instructions:
                 prompt_sections.append(word_instructions)
                 prompt_safety_parts.append(PromptPart(word_instructions, "system_generated", "generation.word_instructions"))
@@ -4419,7 +4416,7 @@ ITERATION CONTEXT:
                 prompt_safety_parts.append(PromptPart(iteration_context_block, "system_generated", "generation.iteration_context"))
             if iteration_memory_context:
                 prompt_sections.append(iteration_memory_context)
-                prompt_safety_parts.append(PromptPart(iteration_memory_context, "system_generated", "generation.iteration_memory"))
+                prompt_safety_parts.append(PromptPart(iteration_memory_context, "user_supplied", "generation.iteration_memory"))
 
             # Add JSON error context if the previous iteration failed JSON validation
             if "last_json_error" in session:
@@ -4449,12 +4446,12 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                 # Only add QA feedback and rejected content if NOT retrying JSON
                 if iteration_feedback_context:
                     prompt_sections.append(iteration_feedback_context)
-                    prompt_safety_parts.append(PromptPart(iteration_feedback_context, "system_generated", "generation.iteration_feedback"))
+                    prompt_safety_parts.append(PromptPart(iteration_feedback_context, "user_supplied", "generation.iteration_feedback"))
                 if rejected_content_context:
                     prompt_sections.append(rejected_content_context)
 
             final_prompt = "\n\n".join(segment.strip() for segment in prompt_sections if segment)
-            
+
             # Step 1: Generate content based on generation mode
             _set_generation_content_metrics(session, "")  # Reset generation content for new iteration
             session["partial_content"] = ""  # Initialize partial content
@@ -4792,6 +4789,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                                     temperature=request.temperature,
                                     max_tokens=request.max_tokens,
                                     system_prompt=request.system_prompt,
+                                    system_prompt_source="user_supplied" if request.system_prompt is not None else "system_generated",
                                     extra_verbose=getattr(request, 'extra_verbose', False),
                                     reasoning_effort=getattr(request, 'reasoning_effort', None),
                                     thinking_budget_tokens=getattr(request, 'thinking_budget_tokens', None),
@@ -5165,7 +5163,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
             # Initialize QA result variables
             qa_comprehensive_result = None
             qa_results = {}
-            
+
             # Check if we can still escalate (session-level limit)
             session_limit = request.gran_sabio_call_limit_per_session
             can_escalate_in_session = (
@@ -5876,7 +5874,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                 )
             iteration_data["approved"] = approval_result["approved"]
             iteration_data["approval_reason"] = approval_result.get("reason")
-            
+
             if approval_result["approved"]:
                 session["approved"] = True  # Update for project status tracking
                 await add_verbose_log(session_id, f"Content approved! {approval_result['reason']}")
@@ -6566,7 +6564,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
         # Standard Gran Sabio review (when fallback is disabled or after fallback fails)
         update_session_status(session, session_id, GenerationStatus.GRAN_SABIO_REVIEW, "gran_sabio_review")
         session["gransabio_content"] = ""  # Initialize Gran Sabio streaming content
-        
+
         # Check if we have deal-breakers from the last iteration (minority or 50-50 ties)
         last_iteration = session["iterations"][-1] if session["iterations"] else None
         minority_deal_breakers = None
@@ -6691,7 +6689,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                 await add_verbose_log(session_id, "Gran Sabio iteration review cancelled by user request")
                 phase_logger._exit_phase(Phase.GRAN_SABIO)
                 return
-        
+
         if gran_sabio_result.error:
             separator = "=" * 80
             logger.error(separator)
@@ -6925,7 +6923,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                 status=GenerationStatus.REJECTED.value,
                 final_payload=final_payload,
             )
-            
+
             # Console logging for Gran Sabio rejected content
             content_to_log = session.get("last_generated_content", "No content generated")
             logger.warning(f"CONTENT REJECTED BY GRAN SABIO (FINAL) - Session {session_id}")
@@ -6934,7 +6932,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
             logger.warning(f"--- START REJECTED CONTENT ---")
             logger.warning(content_to_log)
             logger.warning(f"--- END REJECTED CONTENT ---")
-    
+
     except Exception as e:
         await add_verbose_log(session_id, f"💥 Error in generation: {str(e)}")
         error_msg = str(e)

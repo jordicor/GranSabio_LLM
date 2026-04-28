@@ -25,19 +25,18 @@ Usage:
     python demos/06_content_with_sources.py --source path/to/document.txt
 """
 
-import asyncio
-import sys
 import argparse
+import asyncio
 import base64
+import sys
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict
 
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from client import AsyncGranSabioClient
-from demos.common import run_demo, print_header, print_generation_result, colorize, safe_print
-
+from demos.common import colorize, print_generation_result, print_header, run_demo, safe_print
 
 # Sample source document
 SAMPLE_RESEARCH_DOCUMENT = """

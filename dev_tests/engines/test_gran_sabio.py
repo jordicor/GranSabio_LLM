@@ -19,19 +19,19 @@ Test areas covered here (smoke/unit level — deeper invariants live in
 6. ``review_iterations`` happy paths, cancellation, fallback notes.
 """
 
-import pytest
-from unittest.mock import AsyncMock, Mock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import pytest
+
+from ai_service import AIRequestError
 from gran_sabio import (
     GranSabioEngine,
     GranSabioProcessCancelled,
-    _is_retryable_streaming_error,
     _extract_error_reason,
     _extract_provider,
+    _is_retryable_streaming_error,
 )
-from ai_service import AIRequestError
 from models import ContentRequest
-
 
 # ============================================================================
 # Fixtures

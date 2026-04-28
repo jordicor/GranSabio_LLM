@@ -11,25 +11,23 @@ Run:
 """
 
 import asyncio
+import logging
 import sys
 from pathlib import Path
-import json
-import logging
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # Enable debug logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-from config import config
 from ai_service import get_ai_service
 from qa_evaluation_service import QAEvaluationService
 from smart_edit.locators import find_optimal_phrase_length
-
 
 # Bad content
 BAD_CONTENT = """Marie Curie was born Maria Sklodowska on November 7, 1867, in Warsaw, Poland. She was very much interested in learning from a very young age. Her family was really really dedicated to education and academic pursuits.

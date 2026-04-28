@@ -25,29 +25,29 @@ Phase 5 Implementation:
 - get_effective_order: Auto-calculates execution order based on on_flag
 """
 
+from .budget_scorer import (
+    ENTAILMENT_SYSTEM_PROMPT,
+    BudgetScorer,
+    build_entailment_prompt,
+    calculate_budget_metrics,
+    extract_yes_probability,
+    kl_bernoulli,
+    score_claims,
+)
 from .claim_extractor import ClaimExtractor, extract_claims
 from .evidence_matcher import (
     EvidenceMatcher,
-    spanize_context,
     classify_span,
-    match_claims_to_spans,
-    scrub_spans,
     find_matching_spans,
     format_spans_for_prompt,
-)
-from .budget_scorer import (
-    BudgetScorer,
-    score_claims,
-    kl_bernoulli,
-    calculate_budget_metrics,
-    extract_yes_probability,
-    build_entailment_prompt,
-    ENTAILMENT_SYSTEM_PROMPT,
+    match_claims_to_spans,
+    scrub_spans,
+    spanize_context,
 )
 from .grounding_engine import (
     GroundingEngine,
-    run_grounding_check,
     get_effective_order,
+    run_grounding_check,
 )
 
 __all__ = [

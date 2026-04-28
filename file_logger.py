@@ -15,13 +15,12 @@ Features:
 Author: Gran Sabio LLM Team
 """
 
-import sys
-import os
 import logging
+import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, TextIO
-import threading
 
 
 class TeeOutput:

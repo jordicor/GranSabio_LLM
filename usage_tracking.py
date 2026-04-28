@@ -9,11 +9,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Any
+from typing import Any, Callable, Dict, List, Optional
 
 # Use optimized JSON helper
 import json_utils as json
-
 from config import config
 
 MILLION = 1_000_000

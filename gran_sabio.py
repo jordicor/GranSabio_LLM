@@ -10,28 +10,26 @@ import asyncio
 import logging
 import re
 from types import SimpleNamespace
-from typing import Dict, List, Any, Optional, Tuple, Callable, Awaitable, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from logging_utils import PhaseLogger
 
-from ai_service import AIService, AIRequestError, get_ai_service, StreamChunk
+from ai_service import AIRequestError, AIService, StreamChunk, get_ai_service
+from config import config, get_default_models
 from deterministic_validation import DraftValidationResult, validate_generation_candidate
-from models import ContentRequest, GranSabioResult, is_json_output_requested
 from model_aliasing import PromptPart, get_evaluator_alias
-from tools.ai_json_cleanroom import make_loose_json_validate_options
+from models import ContentRequest, GranSabioResult, is_json_output_requested
 from tool_loop_models import (
     JsonContractError,
     LoopScope,
     OutputContract,
     PayloadScope,
-    ToolLoopEnvelope,
     parse_json_with_markdown_fences,
 )
+from tools.ai_json_cleanroom import make_loose_json_validate_options
 from usage_tracking import UsageTracker
-from config import config, get_default_models
 from validation_context_factory import MeasurementRequest, build_measurement_request_for_layer
-
 
 logger = logging.getLogger(__name__)
 
@@ -464,7 +462,7 @@ class GranSabioEngine:
         prompt_safety_parts = [
             PromptPart(
                 text=enhanced_db_context,
-                source="system_generated",
+                source="user_supplied",
                 label="gran_sabio.minority_deal_breakers",
             )
         ] if alias_registry else None
@@ -1082,7 +1080,7 @@ CRITICAL INSTRUCTIONS:
                         + self._format_iteration_details(iterations, include_content=False)
                         + "\n"
                         + "\n".join(fallback_notes or []),
-                        source="system_generated",
+                        source="user_supplied",
                         label="gran_sabio.iteration_review",
                     )
                 ]
@@ -1237,7 +1235,7 @@ CRITICAL INSTRUCTIONS:
                     layer_score_trends[layer_name] = []
                 layer_scores: List[float] = []
                 for model, evaluation in layer_results.items():
-                    evaluator_name = get_evaluator_alias(evaluation, fallback=model)
+                    evaluator_name = get_evaluator_alias(evaluation, fallback=None)
                     score = evaluation.score
                     if score is None:
                         continue
@@ -1671,7 +1669,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
             return "No deal-breakers reported."
         lines = []
         for db in details:
-            evaluator_name = db.get("evaluator") or db.get("model") or "Evaluator"
+            evaluator_name = db.get("evaluator") or "Evaluator"
             lines.append(
                 (
                     "Deal-breaker reported:\n"

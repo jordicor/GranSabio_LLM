@@ -19,19 +19,19 @@ This is Phase 4 of the Strawberry Integration.
 import logging
 import math
 import time
-from typing import List, Optional, Tuple, Dict, Any, Callable
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from models import (
-    ExtractedClaim,
-    EvidenceSpan,
-    ClaimBudgetResult,
-    EvidenceGroundingConfig,
-)
+from config import config
 from evidence_grounding.evidence_matcher import (
     format_spans_for_prompt,
     scrub_spans,
 )
-from config import config
+from models import (
+    ClaimBudgetResult,
+    EvidenceGroundingConfig,
+    EvidenceSpan,
+    ExtractedClaim,
+)
 
 logger = logging.getLogger(__name__)
 

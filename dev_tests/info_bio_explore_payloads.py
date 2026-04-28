@@ -1,8 +1,8 @@
 """
 Explore payload structure to understand how API call data is stored
 """
-import sqlite3
 import json
+import sqlite3
 from pathlib import Path
 
 # Project ID to analyze

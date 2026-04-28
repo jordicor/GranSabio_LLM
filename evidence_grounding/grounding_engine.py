@@ -17,22 +17,20 @@ on the on_flag setting.
 
 import logging
 import time
-from typing import Optional, Callable, Dict, Any, List
+from typing import Any, Callable, Dict, Optional
 
-from models import (
-    EvidenceGroundingConfig,
-    EvidenceGroundingResult,
-    ExtractedClaim,
-    ClaimBudgetResult,
-)
+from config import config
+from evidence_grounding.budget_scorer import BudgetScorer
 from evidence_grounding.claim_extractor import ClaimExtractor
 from evidence_grounding.evidence_matcher import (
     EvidenceMatcher,
-    spanize_context,
     match_claims_to_spans,
+    spanize_context,
 )
-from evidence_grounding.budget_scorer import BudgetScorer
-from config import config
+from models import (
+    EvidenceGroundingConfig,
+    EvidenceGroundingResult,
+)
 
 logger = logging.getLogger(__name__)
 

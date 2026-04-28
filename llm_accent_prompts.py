@@ -16,7 +16,6 @@ from typing import Optional
 
 from tools.string_utils import escape_xml_delimiters, remove_invisible_control
 
-
 DEFAULT_ACCENT_RUBRIC = """Judge the draft in its requested language. Evaluate in the draft's own language; do not penalize legitimate idiomatic phrasing of that language.
 
 Fail the draft when it sounds like generic assistant prose, includes meta preambles or assistant self-commentary, leans on formulaic symmetry (contrast frames such as "not X but Y"), filler transitions, decorative lists, or canned phrasing. Formulaic contrast frames materially lower the score when used as a central cadence rather than a necessary argument move.

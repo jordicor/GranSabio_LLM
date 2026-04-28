@@ -15,7 +15,6 @@ import aiohttp
 
 import json_utils as json
 
-
 MODEL_SPECS_PATH = Path(__file__).resolve().parent.parent / "model_specs.json"
 MODEL_SPECS_BACKUP_DIR = Path(__file__).resolve().parent.parent / "backups"
 SUPPORTED_SYNC_PROVIDERS = ("openrouter", "xai", "openai", "anthropic", "google")

@@ -15,12 +15,12 @@ Functions tested:
 - should_bypass_qa_layer(): Wrapper for bypass determination
 """
 
-import pytest
-from unittest.mock import Mock, MagicMock, patch
-from datetime import datetime
+from unittest.mock import Mock, patch
 
+import pytest
+
+from models import QALayer
 from qa_bypass_engine import QABypassEngine
-from models import QALayer, QAEvaluation
 
 
 def make_check_result(

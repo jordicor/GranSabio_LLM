@@ -13,11 +13,11 @@ Test Categories:
 Total: 40 tests
 """
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-from fastapi.testclient import TestClient
 import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+from fastapi.testclient import TestClient
 
 # Default headers to simulate internal IP for bypassing IP filter middleware
 INTERNAL_IP_HEADERS = {"X-Real-IP": "127.0.0.1"}

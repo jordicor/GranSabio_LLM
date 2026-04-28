@@ -524,6 +524,10 @@ class GranSabioInterface {
             this.addQALayer();
         });
 
+        document.getElementById('autoQaEnabled')?.addEventListener('change', () => {
+            this.toggleAutoQAOptions();
+        });
+
         // Copy content buttons
         document.getElementById('copyContent')?.addEventListener('click', () => {
             this.copyGeneratedContent();
@@ -778,6 +782,19 @@ class GranSabioInterface {
         document.getElementById(layerId).remove();
     }
 
+    toggleAutoQAOptions() {
+        const enabled = document.getElementById('autoQaEnabled')?.checked === true;
+        const options = document.getElementById('autoQaOptions');
+        const manualLayers = document.getElementById('manualQaLayers');
+
+        if (options) {
+            options.style.display = enabled ? 'flex' : 'none';
+        }
+        if (manualLayers) {
+            manualLayers.style.display = enabled ? 'none' : 'block';
+        }
+    }
+
     setupFormValidation() {
         const form = document.getElementById('generationForm');
         const inputs = form.querySelectorAll('input[required], textarea[required], select[required]');
@@ -875,6 +892,7 @@ class GranSabioInterface {
         
         // Collect QA models from the new interface
         const qaModels = this.getSelectedQAModels();
+        const autoQaEnabled = formData.has('autoQaEnabled');
 
         // Collect QA layers
         const qaLayers = [];
@@ -901,7 +919,7 @@ class GranSabioInterface {
             generator_model: formData.get('generatorModel'),
             temperature: parseFloat(formData.get('temperature')),
             qa_models: qaModels,
-            qa_layers: qaLayers,
+            qa_layers: autoQaEnabled ? [] : qaLayers,
             min_global_score: parseFloat(formData.get('minGlobalScore')),
             max_iterations: parseInt(formData.get('maxIterations')),
             gran_sabio_model: formData.get('granSabioModel'),
@@ -909,6 +927,13 @@ class GranSabioInterface {
             verbose: formData.has('verbose'),
             extra_verbose: formData.has('extra_verbose') && formData.has('verbose')
         };
+
+        if (autoQaEnabled) {
+            requestData.auto_qa = {
+                enabled: true,
+                rigor: formData.get('autoQaRigor') || 'strict'
+            };
+        }
 
         // Add word limits if specified
         const minWords = formData.get('minWords');
@@ -963,7 +988,7 @@ class GranSabioInterface {
     validateFormData(data) {
         if (!data.prompt || data.prompt.trim() === '') return false;
         if (data.qa_models.length === 0) return false;
-        if (data.qa_layers.length === 0) return false;
+        if (!data.auto_qa?.enabled && data.qa_layers.length === 0) return false;
         
         for (const layer of data.qa_layers) {
             if (!layer.name || !layer.description || !layer.criteria) {
@@ -1324,6 +1349,7 @@ class GranSabioInterface {
         this.stopProgressTracking();
         document.getElementById('resultsPanel').style.display = 'none';
         this.loadDefaultQALayers();
+        this.toggleAutoQAOptions();
         
         // Reset sliders
         document.querySelector('label[for="temperature"] + .slider-container .slider-value').textContent = '0.7';

@@ -12,7 +12,7 @@ import logging
 import re
 from copy import deepcopy
 from difflib import SequenceMatcher
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from models import EvidenceSpan, ExtractedClaim, SpanType
 

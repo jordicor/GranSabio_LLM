@@ -10,9 +10,9 @@ from pathlib import Path
 
 # Add repository root to path for json_utils import
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-import json_utils as json
-
 import openai
+
+import json_utils as json
 
 
 async def run_fake_stream() -> None:

@@ -3,8 +3,8 @@ Monitor API routes for Gran Sabio LLM.
 Provides endpoints for listing active projects and sessions.
 """
 
-from typing import List, Dict, Any, Optional
 from datetime import datetime
+from typing import Dict, List
 
 from fastapi import APIRouter
 
@@ -51,6 +51,7 @@ async def list_active_connections():
             project_id = session.get("project_id")
             status_enum = session.get("status")
             status_str = status_enum.value if hasattr(status_enum, "value") else str(status_enum)
+            phase = session.get("current_phase", "unknown")
 
             if project_id:
                 # Group by project
@@ -67,7 +68,10 @@ async def list_active_connections():
                 proj["session_count"] += 1
 
                 # Count active
-                if status_str in ("generating", "qa_evaluation", "consensus", "initializing", "running"):
+                if (
+                    status_str in ("generating", "qa_evaluation", "consensus", "gran_sabio_review", "initializing", "running")
+                    or phase in ("inline_deal_breaker_review", "gran_sabio_review", "gran_sabio_regeneration")
+                ):
                     proj["active_sessions"] += 1
                     proj["status"] = "running"
                 elif status_str == "completed" and proj["status"] != "running":
@@ -92,7 +96,7 @@ async def list_active_connections():
                     "session_id": session_id,
                     "request_name": session.get("request_name"),
                     "status": status_str,
-                    "phase": session.get("current_phase", "unknown"),
+                    "phase": phase,
                     "created_at": created.isoformat() if isinstance(created, datetime) else str(created) if created else None
                 })
 

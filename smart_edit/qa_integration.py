@@ -32,14 +32,14 @@ Usage (in a QA service):
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from .locators import extract_phrase_from_response
 from .models import (
     OperationType,
     SeverityLevel,
     TextEditRange,
 )
-from .locators import extract_phrase_from_response
 
 if TYPE_CHECKING:
     pass

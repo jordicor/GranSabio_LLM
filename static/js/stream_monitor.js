@@ -5,12 +5,55 @@
 
 // Direct connection - no proxy needed
 const STREAM_BASE = '';
-// UI panels (note: 'analysis' combines preflight+consensus, 'smartedit' is placeholder)
+// UI panels (note: 'analysis' combines Auto-QA, preflight, and consensus)
 const PHASES = ['generation', 'qa', 'arbiter', 'smartedit', 'analysis', 'gransabio', 'status', 'everything'];
 // Phases that can be hard-switched (excluded from subscription)
-// 'analysis' controls both 'preflight' and 'consensus' server-side subscriptions
-// 'smartedit' maps to 'smart_edit' on the server side
 const HARD_SWITCHABLE_PHASES = ['generation', 'qa', 'arbiter', 'smartedit', 'analysis', 'gransabio', 'status'];
+const REQUEST_PANEL_PHASES = ['generation', 'qa', 'arbiter', 'analysis', 'gransabio', 'smartedit'];
+const ITERATION_CONTENT_KEYS = ['auto_qa', 'preflight', 'generation', 'qa', 'arbiter', 'consensus', 'gransabio'];
+const ANALYSIS_CONTENT_KEYS = ['auto_qa', 'preflight', 'consensus'];
+const SERVER_PHASES_BY_PANEL = {
+    analysis: ['auto_qa', 'preflight', 'consensus'],
+    smartedit: ['smart_edit'],
+    gransabio: ['gran_sabio'],
+};
+const TERMINAL_STATUSES = new Set([
+    'completed',
+    'rejected',
+    'failed',
+    'error',
+    'cancelled',
+    'auto_qa_rejected',
+    'preflight_rejected',
+]);
+const ACTIVE_SESSION_STATUSES = new Set([
+    'initializing',
+    'running',
+    'generating',
+    'qa_evaluation',
+    'consensus',
+    'gran_sabio_review',
+]);
+const GRAN_SABIO_PHASES = new Set([
+    'inline_deal_breaker_review',
+    'gran_sabio_review',
+    'gran_sabio_regeneration',
+]);
+const KNOWN_STRUCTURED_EVENTS = new Set([
+    'retry_start',
+    'retry',
+    'error',
+    'project_end',
+    'project_cancelled',
+    'validate_draft_oversize',
+    'context_overflow_midloop',
+    'force_finalize',
+    'tool_call_start',
+    'tool_call_result',
+    'tool_call_error',
+    'tool_loop_error',
+    'tool_loop_complete',
+]);
 
 // State
 let eventSource = null;
@@ -21,6 +64,47 @@ let lastProjectData = null;  // Cache for re-rendering dashboard
 // Helper to check if we're in Overview mode
 function isOverviewMode() {
     return viewState.selectedRequestId === null;
+}
+
+function normalizePhaseName(phase, fallback = 'generation') {
+    if (!phase) {
+        return fallback;
+    }
+    if (phase === 'gran_sabio') {
+        return 'gransabio';
+    }
+    if (phase === 'smart_edit') {
+        return 'smartedit';
+    }
+    return phase;
+}
+
+function getDisplayPhase(phase) {
+    const normalized = normalizePhaseName(phase, 'status');
+    if (ANALYSIS_CONTENT_KEYS.includes(normalized)) {
+        return 'analysis';
+    }
+    if (PHASES.includes(normalized) && normalized !== 'everything') {
+        return normalized;
+    }
+    return 'status';
+}
+
+function getServerPhasesForPanel(panelPhase) {
+    return SERVER_PHASES_BY_PANEL[panelPhase] || [panelPhase];
+}
+
+function isTerminalStatus(status) {
+    return TERMINAL_STATUSES.has((status || '').toLowerCase());
+}
+
+function isActiveSessionStatus(status) {
+    return ACTIVE_SESSION_STATUSES.has((status || '').toLowerCase());
+}
+
+function isRequestActiveStatus(status) {
+    const normalized = (status || '').toLowerCase();
+    return normalized === 'active' || isActiveSessionStatus(normalized);
 }
 
 // Panel toggle states: 'on' | 'soft' | 'hard'
@@ -61,8 +145,7 @@ const qaFilterState = {
     model: null    // null = show all, string = filter by this model
 };
 
-// Analysis Filter state - for filtering Analysis panel (preflight/consensus)
-// null = show both, 'preflight' = only preflight, 'consensus' = only consensus
+// Analysis Filter state: null | 'auto_qa' | 'preflight' | 'consensus'
 let analysisFilterState = null;
 
 // ============================================
@@ -128,17 +211,11 @@ function updatePanelVisual(phase, state) {
 
 function getActivePhases() {
     // Return server-side phases that are NOT in 'hard' state
-    // Note: 'analysis' UI panel maps to 'preflight' and 'consensus' server phases
     const serverPhases = [];
 
     HARD_SWITCHABLE_PHASES.forEach(phase => {
         if (panelStates[phase] !== 'hard') {
-            if (phase === 'analysis') {
-                // 'analysis' panel controls both preflight and consensus subscriptions
-                serverPhases.push('preflight', 'consensus');
-            } else {
-                serverPhases.push(phase);
-            }
+            serverPhases.push(...getServerPhasesForPanel(phase));
         }
     });
 
@@ -286,6 +363,47 @@ function setBadge(phase, status) {
     } else if (status === 'receiving') {
         badge.classList.add('receiving');
     }
+}
+
+function resetPanelContent(phase, options = {}) {
+    const contentEl = document.getElementById(`content-${phase}`);
+    if (contentEl) {
+        if (options.overviewMode) {
+            contentEl.dataset.overviewMode = 'true';
+        } else if (options.clearOverviewMode) {
+            delete contentEl.dataset.overviewMode;
+        }
+        if (options.clearText !== false) {
+            contentEl.textContent = '';
+        }
+    }
+
+    if (options.resetStats !== false) {
+        const chunksEl = document.getElementById(`chunks-${phase}`);
+        const bytesEl = document.getElementById(`bytes-${phase}`);
+        if (chunksEl) chunksEl.textContent = options.statsText ?? '0';
+        if (bytesEl) bytesEl.textContent = options.statsText ?? '0';
+    }
+    if (options.resetBadge !== false) {
+        setBadge(phase, options.badge || 'idle');
+    }
+}
+
+function getAnalysisStats(iterData) {
+    return ANALYSIS_CONTENT_KEYS.reduce((total, phase) => {
+        const phaseStats = iterData?.stats?.[phase] || { chunks: 0, bytes: 0 };
+        total.chunks += phaseStats.chunks || 0;
+        total.bytes += phaseStats.bytes || 0;
+        return total;
+    }, { chunks: 0, bytes: 0 });
+}
+
+function updateAnalysisStats(iterData) {
+    const totals = getAnalysisStats(iterData);
+    const analysisChunksEl = document.getElementById('chunks-analysis');
+    const analysisBytesEl = document.getElementById('bytes-analysis');
+    if (analysisChunksEl) analysisChunksEl.textContent = totals.chunks;
+    if (analysisBytesEl) analysisBytesEl.textContent = totals.bytes;
 }
 
 function appendContent(phase, text) {
@@ -440,12 +558,8 @@ function processRequestFromEvent(data) {
             viewState.selectedRequestId = sessionId;
 
             // Clear overview mode flag and prepare panels for content
-            ['preflight', 'generation', 'qa', 'consensus', 'gransabio'].forEach(phase => {
-                const contentEl = document.getElementById(`content-${phase}`);
-                if (contentEl) {
-                    delete contentEl.dataset.overviewMode;
-                    contentEl.textContent = '';  // Start fresh
-                }
+            REQUEST_PANEL_PHASES.forEach(phase => {
+                resetPanelContent(phase, { clearOverviewMode: true });
             });
 
             // Update dashboard for this specific session
@@ -469,23 +583,16 @@ function processRequestFromEvent(data) {
  */
 function initializeIteration(request, iteration) {
     if (!request.iterations[iteration]) {
+        const content = {};
+        const phaseStats = {};
+        ITERATION_CONTENT_KEYS.forEach(phase => {
+            content[phase] = '';
+            phaseStats[phase] = { chunks: 0, bytes: 0 };
+        });
+
         request.iterations[iteration] = {
-            content: {
-                preflight: '',
-                generation: '',
-                qa: '',
-                arbiter: '',
-                consensus: '',
-                gransabio: ''
-            },
-            stats: {
-                preflight: { chunks: 0, bytes: 0 },
-                generation: { chunks: 0, bytes: 0 },
-                qa: { chunks: 0, bytes: 0 },
-                arbiter: { chunks: 0, bytes: 0 },
-                consensus: { chunks: 0, bytes: 0 },
-                gransabio: { chunks: 0, bytes: 0 }
-            },
+            content: content,
+            stats: phaseStats,
             // QA filter structures - indexed content for filtering
             qaByLayer: {},       // { "Layer Name": "accumulated content..." }
             qaByModel: {},       // { "model-name": "accumulated content..." }
@@ -597,11 +704,13 @@ function toggleAutoFollow() {
             viewState.selectedRequestId = latestSessionId;
 
             // Clear overview mode and load content
-            ['preflight', 'generation', 'qa', 'consensus', 'gransabio'].forEach(phase => {
-                const contentEl = document.getElementById(`content-${phase}`);
-                if (contentEl) {
-                    delete contentEl.dataset.overviewMode;
-                }
+            REQUEST_PANEL_PHASES.forEach(phase => {
+                resetPanelContent(phase, {
+                    clearOverviewMode: true,
+                    clearText: false,
+                    resetBadge: false,
+                    resetStats: false,
+                });
             });
 
             loadRequestContent(latestSessionId);
@@ -700,6 +809,33 @@ function ensureTabVisible(sessionId) {
     // else: tab is already visible, no change needed
 }
 
+function getRequestTabState(request) {
+    const status = (request.status || 'active').toLowerCase();
+
+    if (status === 'completed') {
+        return {
+            icon: '+',
+            className: 'completed',
+            infoText: request.finalScore !== null && request.finalScore !== undefined
+                ? request.finalScore.toFixed(1)
+                : 'done',
+        };
+    }
+    if (status === 'pending') {
+        return { icon: 'o', className: 'pending', infoText: 'pending' };
+    }
+    if (isTerminalStatus(status)) {
+        const label = status.replace(/_/g, ' ');
+        return { icon: status === 'cancelled' ? '-' : '!', className: 'failed', infoText: label };
+    }
+
+    return {
+        icon: '*',
+        className: 'active',
+        infoText: `iter ${request.currentIteration}/${request.maxIterations}`,
+    };
+}
+
 function createRequestTab(request) {
     const tab = document.createElement('div');
     tab.className = 'request-tab';
@@ -711,33 +847,7 @@ function createRequestTab(request) {
     }
 
     // Determine icon and status text
-    let statusIcon, statusClass, infoText;
-    switch (request.status) {
-        case 'completed':
-            statusIcon = '+';
-            statusClass = 'completed';
-            infoText = request.finalScore ? request.finalScore.toFixed(1) : 'done';
-            break;
-        case 'rejected':
-            statusIcon = '!';
-            statusClass = 'failed';
-            infoText = 'rejected';
-            break;
-        case 'failed':
-            statusIcon = 'x';
-            statusClass = 'failed';
-            infoText = 'failed';
-            break;
-        case 'pending':
-            statusIcon = 'o';
-            statusClass = 'pending';
-            infoText = 'pending';
-            break;
-        default:  // active
-            statusIcon = '*';
-            statusClass = 'active';
-            infoText = `iter ${request.currentIteration}/${request.maxIterations}`;
-    }
+    const tabState = getRequestTabState(request);
 
     // Truncate name if needed
     const shortName = request.requestName.length > 14
@@ -746,10 +856,10 @@ function createRequestTab(request) {
 
     tab.innerHTML = `
         <div class="tab-header">
-            <span class="tab-status-icon ${statusClass}">[${statusIcon}]</span>
+            <span class="tab-status-icon ${tabState.className}">[${tabState.icon}]</span>
             <span class="tab-name">${escapeHtml(shortName)}</span>
         </div>
-        <div class="tab-info">${infoText}</div>
+        <div class="tab-info">${tabState.infoText}</div>
         <div class="tab-close-zone">
             <span class="tab-close-btn" title="Close tab">&times;</span>
         </div>
@@ -786,7 +896,7 @@ function createOverviewTab() {
 
     // Count active sessions for display
     const activeCount = Object.values(requestsData.requests)
-        .filter(r => r.status === 'active').length;
+        .filter(r => isRequestActiveStatus(r.status)).length;
     const totalCount = requestsData.orderedRequestIds.length;
 
     tab.innerHTML = `
@@ -829,20 +939,9 @@ function selectOverview() {
  * Clear streaming panels when in Overview mode
  */
 function clearStreamingPanelsForOverview() {
-    ['preflight', 'generation', 'qa', 'consensus', 'gransabio'].forEach(phase => {
-        const contentEl = document.getElementById(`content-${phase}`);
-        if (contentEl) {
-            contentEl.textContent = '';
-            contentEl.dataset.overviewMode = 'true';
-        }
-
+    REQUEST_PANEL_PHASES.forEach(phase => {
         // Show dashes for stats in overview mode
-        const chunksEl = document.getElementById(`chunks-${phase}`);
-        const bytesEl = document.getElementById(`bytes-${phase}`);
-        if (chunksEl) chunksEl.textContent = '-';
-        if (bytesEl) bytesEl.textContent = '-';
-
-        setBadge(phase, 'idle');
+        resetPanelContent(phase, { overviewMode: true, statsText: '-' });
     });
 }
 
@@ -866,11 +965,13 @@ function selectRequest(sessionId) {
     loadRequestContent(sessionId);
 
     // Clear overview mode flag from content elements
-    ['preflight', 'generation', 'qa', 'consensus', 'gransabio'].forEach(phase => {
-        const contentEl = document.getElementById(`content-${phase}`);
-        if (contentEl) {
-            delete contentEl.dataset.overviewMode;
-        }
+    REQUEST_PANEL_PHASES.forEach(phase => {
+        resetPanelContent(phase, {
+            clearOverviewMode: true,
+            clearText: false,
+            resetBadge: false,
+            resetStats: false,
+        });
     });
 
     // Render dashboard filtered to only this session
@@ -925,22 +1026,15 @@ function loadRequestContent(sessionId) {
 
     if (!iterData) {
         // No data for this iteration - clear panels
-        // Note: preflight and consensus are combined into 'analysis' panel
-        ['generation', 'qa', 'gransabio', 'analysis'].forEach(phase => {
-            const contentEl = document.getElementById(`content-${phase}`);
-            if (contentEl) contentEl.textContent = '';
-
-            const chunksEl = document.getElementById(`chunks-${phase}`);
-            const bytesEl = document.getElementById(`bytes-${phase}`);
-            if (chunksEl) chunksEl.textContent = '0';
-            if (bytesEl) bytesEl.textContent = '0';
+        REQUEST_PANEL_PHASES.forEach(phase => {
+            resetPanelContent(phase);
         });
         return;
     }
 
     // Load content into each phase panel (except status, everything, and analysis)
-    // Note: preflight and consensus data still stored separately but displayed in combined 'analysis' panel
-    ['generation', 'qa', 'gransabio'].forEach(phase => {
+    // Note: analysis data is stored separately but displayed in the combined panel
+    ['generation', 'qa', 'arbiter', 'gransabio'].forEach(phase => {
         const contentEl = document.getElementById(`content-${phase}`);
         if (contentEl) {
             contentEl.textContent = iterData.content[phase] || '';
@@ -948,23 +1042,16 @@ function loadRequestContent(sessionId) {
         }
 
         // Update stats display
-        const phaseStats = iterData.stats[phase];
+        const phaseStats = iterData.stats[phase] || { chunks: 0, bytes: 0 };
         const chunksEl = document.getElementById(`chunks-${phase}`);
         const bytesEl = document.getElementById(`bytes-${phase}`);
         if (chunksEl) chunksEl.textContent = phaseStats.chunks;
         if (bytesEl) bytesEl.textContent = phaseStats.bytes;
     });
 
-    // Render combined Analysis panel (preflight + consensus)
+    // Render combined Analysis panel (Auto-QA + preflight + consensus)
     renderFilteredAnalysisContent(request);
-
-    // Update stats for analysis panel (sum of preflight + consensus)
-    const preflightStats = iterData.stats.preflight || { chunks: 0, bytes: 0 };
-    const consensusStats = iterData.stats.consensus || { chunks: 0, bytes: 0 };
-    const analysisChunksEl = document.getElementById('chunks-analysis');
-    const analysisBytesEl = document.getElementById('bytes-analysis');
-    if (analysisChunksEl) analysisChunksEl.textContent = preflightStats.chunks + consensusStats.chunks;
-    if (analysisBytesEl) analysisBytesEl.textContent = preflightStats.bytes + consensusStats.bytes;
+    updateAnalysisStats(iterData);
 
     // Update history mode visual indicators
     updateHistoryModeIndicators(request);
@@ -977,7 +1064,7 @@ function updateRequestInfoBar() {
     // Overview mode
     if (isOverviewMode()) {
         const activeCount = Object.values(requestsData.requests)
-            .filter(r => r.status === 'active').length;
+            .filter(r => isRequestActiveStatus(r.status)).length;
         const totalCount = requestsData.orderedRequestIds.length;
 
         if (nameEl) nameEl.textContent = 'All Sessions';
@@ -1022,17 +1109,10 @@ function renderOverflowMenu(overflowRequests) {
         item.className = 'tabs-overflow-item';
         item.title = `${request.requestName}\nSession: ${sessionId}`;
 
-        let statusIcon;
-        switch (request.status) {
-            case 'completed': statusIcon = '[+]'; break;
-            case 'rejected': statusIcon = '[!]'; break;
-            case 'failed': statusIcon = '[x]'; break;
-            case 'pending': statusIcon = '[o]'; break;
-            default: statusIcon = '[*]';
-        }
+        const tabState = getRequestTabState(request);
 
         item.innerHTML = `
-            <span class="overflow-status">${statusIcon}</span>
+            <span class="overflow-status">[${tabState.icon}]</span>
             <span class="overflow-name">${escapeHtml(request.requestName)}</span>
         `;
 
@@ -1164,17 +1244,13 @@ function renderSessionCard(session) {
     const status = session.status || 'unknown';
     const statusClass = status.toLowerCase().replace(/\s+/g, '_');
 
-    // Determine phase states
-    const phases = ['initializing', 'generating', 'qa_evaluation', 'consensus', 'completed'];
-    const currentPhaseIndex = phases.indexOf(session.phase || session.status || '');
-
     card.innerHTML = `
         <div class="session-card-header">
             <div class="session-id-label">SESSION: <span>${sessionIdShort}</span></div>
             <div class="session-status-badge ${statusClass}">${status}</div>
         </div>
         <div class="session-card-body">
-            ${renderPhaseTracker(session, phases, currentPhaseIndex)}
+            ${renderPhaseTracker(session)}
             ${renderIterationProgress(session)}
             ${renderGenerationInfo(session)}
             ${renderQASection(session)}
@@ -1186,23 +1262,50 @@ function renderSessionCard(session) {
     return card;
 }
 
-function renderPhaseTracker(session, phases, currentIndex) {
-    const phaseLabels = {
-        'initializing': 'INIT',
-        'generating': 'GEN',
-        'qa_evaluation': 'QA',
-        'consensus': 'CONS',
-        'completed': 'DONE'
-    };
+function getTrackerStage(session) {
+    const status = (session.status || '').toLowerCase();
+    const phase = (session.phase || '').toLowerCase();
+
+    if (isTerminalStatus(status)) {
+        return status === 'completed' ? 'completed' : 'terminal';
+    }
+    if (phase === 'generating' || status === 'generating') return 'generating';
+    if (phase === 'qa_evaluation' || status === 'qa_evaluation') return 'qa_evaluation';
+    if (phase === 'consensus' || status === 'consensus') return 'consensus';
+    if (GRAN_SABIO_PHASES.has(phase) || status === 'gran_sabio_review') return 'gran_sabio';
+    if (phase === 'initializing' || status === 'initializing' || status === 'running') return 'initializing';
+    return phase || status || 'initializing';
+}
+
+function renderPhaseTracker(session) {
+    const stages = [
+        ['initializing', 'INIT'],
+        ['generating', 'GEN'],
+        ['qa_evaluation', 'QA'],
+        ['consensus', 'CONS'],
+        ['gran_sabio', 'GS'],
+        ['completed', 'DONE'],
+    ];
+    const currentStage = getTrackerStage(session);
+    const knownStage = stages.some(([stage]) => stage === currentStage);
+    const terminalFailed = currentStage === 'terminal';
 
     let html = '<div class="phase-tracker">';
-    phases.forEach((phase, index) => {
+    stages.forEach(([phase, label]) => {
         let stateClass = 'pending';
-        if (index < currentIndex) stateClass = 'completed';
-        else if (index === currentIndex) stateClass = 'active';
+        if (terminalFailed) {
+            stateClass = 'terminal';
+        } else if (currentStage === 'completed') {
+            stateClass = 'completed';
+        } else if (phase === currentStage) {
+            stateClass = 'active';
+        }
 
-        html += `<span class="phase-pill ${stateClass}">${phaseLabels[phase] || phase}</span>`;
+        html += `<span class="phase-pill ${stateClass}">${label}</span>`;
     });
+    if (!knownStage && !terminalFailed) {
+        html += `<span class="phase-pill active">${escapeHtml(currentStage.toUpperCase())}</span>`;
+    }
     html += '</div>';
     return html;
 }
@@ -1621,12 +1724,12 @@ function resetQAFilters() {
 }
 
 // ============================================
-// ANALYSIS FILTER (PREFLIGHT/CONSENSUS)
+// ANALYSIS FILTER (AUTO-QA/PREFLIGHT/CONSENSUS)
 // ============================================
 
 /**
  * Render Analysis content based on current filter state
- * Combines preflight and consensus content with optional filtering
+     * Combines Auto-QA, preflight, and consensus content with optional filtering
  * @param {Object} request - The request object
  */
 function renderFilteredAnalysisContent(request) {
@@ -1641,22 +1744,18 @@ function renderFilteredAnalysisContent(request) {
 
     let content = '';
 
-    if (analysisFilterState === 'preflight') {
-        // Only preflight
-        content = iter.content?.preflight || '';
-    } else if (analysisFilterState === 'consensus') {
-        // Only consensus
-        content = iter.content?.consensus || '';
+    if (ANALYSIS_CONTENT_KEYS.includes(analysisFilterState)) {
+        content = iter.content?.[analysisFilterState] || '';
     } else {
-        // Both (default) - with separator when both have content
-        const preflight = iter.content?.preflight || '';
-        const consensus = iter.content?.consensus || '';
+        const sections = [
+            ['AUTO-QA', iter.content?.auto_qa || ''],
+            ['PREFLIGHT', iter.content?.preflight || ''],
+            ['CONSENSUS', iter.content?.consensus || ''],
+        ].filter(([, sectionContent]) => Boolean(sectionContent));
 
-        if (preflight && consensus) {
-            content = preflight + '\n\n--- CONSENSUS ---\n\n' + consensus;
-        } else {
-            content = preflight || consensus;
-        }
+        content = sections
+            .map(([label, sectionContent]) => `--- ${label} ---\n\n${sectionContent}`)
+            .join('\n\n');
     }
 
     contentEl.textContent = content;
@@ -1729,13 +1828,206 @@ function escapeHtmlAttr(text) {
 // MESSAGE HANDLING (PROJECT MODE)
 // ============================================
 
+function summarizeStructuredPayload(payload) {
+    if (!payload || typeof payload !== 'object') {
+        return '';
+    }
+    if (payload.truncated) {
+        const keys = Array.isArray(payload.preview_keys) ? payload.preview_keys.join(',') : '';
+        return `truncated=true size_bytes=${payload.size_bytes ?? '?'} preview_keys=${keys}`;
+    }
+
+    const interestingKeys = [
+        'turn',
+        'tool_name',
+        'score',
+        'hard_failed',
+        'decision',
+        'status',
+        'reason',
+        'error',
+        'claims_count',
+        'grounded_claims',
+        'unsupported_claims',
+    ];
+    const parts = [];
+    interestingKeys.forEach(key => {
+        if (payload[key] !== undefined && payload[key] !== null) {
+            parts.push(`${key}=${String(payload[key])}`);
+        }
+    });
+
+    if (parts.length > 0) {
+        return parts.join(' ');
+    }
+
+    return `keys=${Object.keys(payload).slice(0, 6).join(',')}`;
+}
+
+function parseGroundingPayload(data) {
+    if (!data.content) {
+        return data.data || {};
+    }
+    try {
+        return JSON.parse(data.content);
+    } catch (error) {
+        return { preview: String(data.content).slice(0, 240) };
+    }
+}
+
+function formatStructuredEventLine(data) {
+    const eventType = data.type || 'unknown';
+    const payloadSummary = summarizeStructuredPayload(data.data);
+
+    if (eventType === 'retry_start' || eventType === 'retry') {
+        const attempt = data.attempt !== undefined ? `attempt ${data.attempt}/${data.max_attempts || '?'}` : 'attempt ?';
+        const provider = data.provider ? ` provider=${data.provider}` : '';
+        const retryIn = data.retry_in_seconds !== undefined ? ` retry_in=${data.retry_in_seconds}s` : '';
+        const reason = data.reason ? ` reason=${data.reason}` : '';
+        return `[RETRY] ${attempt}${provider}${retryIn}${reason}\n`;
+    }
+
+    if (eventType === 'error') {
+        const label = data.phase === 'generation' ? 'RETRY_ERROR' : 'ERROR';
+        const reason = data.reason || data.message || payloadSummary || 'unknown';
+        return `[${label}] phase=${data.phase || 'status'} ${reason}\n`;
+    }
+
+    if (eventType === 'project_end') {
+        return `[PROJECT_END] status=${data.status || 'unknown'} phase=${data.phase || 'unknown'}\n`;
+    }
+
+    if (eventType === 'project_cancelled') {
+        return `[PROJECT_CANCELLED] project=${data.project_id || currentProjectId || '?'}\n`;
+    }
+
+    if (eventType.startsWith('grounding_')) {
+        const groundingPayload = parseGroundingPayload(data);
+        const groundingSummary = summarizeStructuredPayload(groundingPayload);
+        return `[GROUNDING] ${eventType}${groundingSummary ? ' ' + groundingSummary : ''}\n`;
+    }
+
+    const group = eventType.startsWith('tool_') || eventType === 'force_finalize'
+        || eventType === 'validate_draft_oversize'
+        || eventType === 'context_overflow_midloop'
+        ? 'TOOL'
+        : 'EVENT';
+    return `[${group}] ${eventType}${payloadSummary ? ' ' + payloadSummary : ''}\n`;
+}
+
+function appendStructuredEventForRequest(data, line, displayPhase) {
+    const request = processRequestFromEvent(data);
+
+    if (request && displayPhase !== 'status') {
+        const iteration = request.currentIteration || 1;
+        initializeIteration(request, iteration);
+        const iterData = request.iterations[iteration];
+        const contentKey = normalizePhaseName(data.phase, displayPhase);
+
+        if (iterData.content.hasOwnProperty(contentKey)) {
+            iterData.content[contentKey] += line;
+            iterData.stats[contentKey].chunks++;
+            iterData.stats[contentKey].bytes += line.length;
+        }
+    }
+
+    if (request) {
+        if (isOverviewMode()) {
+            showReceiving(displayPhase);
+            return;
+        }
+        if (request.sessionId !== viewState.selectedRequestId) {
+            showReceiving(displayPhase);
+            return;
+        }
+        if (request.viewingIteration !== request.currentIteration) {
+            showLiveActivityIndicator(request.currentIteration);
+            return;
+        }
+    }
+
+    if (displayPhase === 'analysis' && request) {
+        renderFilteredAnalysisContent(request);
+        updateAnalysisStats(request.iterations[request.currentIteration]);
+        showReceiving('analysis');
+    } else if (displayPhase === 'qa' && request && (qaFilterState.layer || qaFilterState.model)) {
+        renderFilteredQAContent(request);
+        showReceiving('qa');
+    } else {
+        appendContent(displayPhase, line);
+    }
+}
+
+function markRequestTerminal(sessionId, status) {
+    if (!sessionId) return null;
+    const request = requestsData.requests[sessionId];
+    if (!request) return null;
+
+    request.status = status || 'completed';
+    request.autoFollowIteration = false;
+    const iterData = request.iterations[request.currentIteration];
+    if (iterData) {
+        iterData.timestampEnd = Date.now();
+        iterData.status = request.status === 'completed' ? 'approved' : 'rejected';
+    }
+    return request;
+}
+
+function handleSessionEnd(data) {
+    const request = processRequestFromEvent(data);
+    const status = data.status || 'completed';
+    markRequestTerminal(data.session_id, status);
+
+    log(`Session ${data.session_id?.slice(0, 8) || '?'} ended with ${status}`, 'warn');
+    appendContent('status', `[SESSION_END] session=${data.session_id || '?'} status=${status}\n`);
+
+    if (request && request.sessionId === viewState.selectedRequestId) {
+        renderIterationTimeline();
+    }
+    renderRequestTabs();
+}
+
+function handleProjectTerminalEvent(data) {
+    const status = data.status || (data.type === 'project_cancelled' ? 'cancelled' : undefined);
+    if (status === 'cancelled') {
+        Object.values(requestsData.requests).forEach(request => {
+            if (!isTerminalStatus(request.status)) {
+                markRequestTerminal(request.sessionId, 'cancelled');
+            }
+        });
+        setConnectionStatus('disconnected', 'CANCELLED');
+        renderRequestTabs();
+        renderIterationTimeline();
+    }
+}
+
+function handleStructuredEvent(data) {
+    const eventType = data.type || 'unknown';
+    let displayPhase = getDisplayPhase(data.phase);
+
+    if (eventType === 'project_end' || eventType === 'project_cancelled') {
+        displayPhase = 'status';
+    } else if (eventType.startsWith('grounding_')) {
+        displayPhase = 'qa';
+    } else if (eventType === 'error' && data.phase !== 'generation') {
+        displayPhase = 'status';
+    }
+
+    if (eventType === 'project_end' || eventType === 'project_cancelled') {
+        handleProjectTerminalEvent(data);
+    }
+
+    const line = formatStructuredEventLine(data);
+    appendStructuredEventForRequest(data, line, displayPhase);
+}
+
 function handleMessage(rawData) {
     // Always append raw data to "everything" panel (unfiltered)
     appendContent('everything', rawData + '\n');
 
     try {
         const data = JSON.parse(rawData);
-        const eventType = data.type;
+        const eventType = data.type || 'unknown';
         const phase = data.phase || 'status';
 
         // Log event type (except chunks to avoid spam)
@@ -1762,8 +2054,7 @@ function handleMessage(rawData) {
                 break;
 
             case 'session_end':
-                log(`Session ${data.session_id?.slice(0, 8) || '?'} ended`, 'warn');
-                appendContent('status', `[SESSION_END] ${JSON.stringify(data, null, 2)}\n`);
+                handleSessionEnd(data);
                 break;
 
             case 'stream_end':
@@ -1785,9 +2076,13 @@ function handleMessage(rawData) {
                 break;
 
             default:
-                // Unknown event type - show in status panel
-                log(`Unknown event type: ${eventType}`, 'warn');
-                appendContent('status', `[${eventType}] ${JSON.stringify(data, null, 2)}\n`);
+                if (KNOWN_STRUCTURED_EVENTS.has(eventType) || eventType.startsWith('grounding_')) {
+                    handleStructuredEvent(data);
+                } else {
+                    // Unknown event type - show in status panel
+                    log(`Unknown event type: ${eventType} (phase: ${phase})`, 'warn');
+                    appendContent('status', `[UNKNOWN] type=${eventType} phase=${phase} ${JSON.stringify(data, null, 2)}\n`);
+                }
         }
 
     } catch (parseError) {
@@ -1801,8 +2096,8 @@ function handleChunk(data) {
     // Process and track by request
     const request = processRequestFromEvent(data);
 
-    // Normalize phase name: gran_sabio -> gransabio (match HTML element IDs)
-    let phase = normalizePhaseName(data.phase, 'generation');
+    const phase = normalizePhaseName(data.phase, 'generation');
+    const displayPhase = getDisplayPhase(data.phase);
     const content = data.content || '';
 
     if (!content) return;
@@ -1853,10 +2148,6 @@ function handleChunk(data) {
         }
     }
 
-    // Determine which panel to show activity for
-    // preflight and consensus are combined into 'analysis' panel
-    const displayPhase = (phase === 'preflight' || phase === 'consensus') ? 'analysis' : phase;
-
     // In Overview mode: don't display in panels, but show generic activity
     if (isOverviewMode()) {
         if (request) {
@@ -1873,26 +2164,21 @@ function handleChunk(data) {
             if (phase === 'qa' && (qaFilterState.layer || qaFilterState.model)) {
                 // QA with filter active - re-render filtered content
                 renderFilteredQAContent(request);
-            } else if (phase === 'preflight' || phase === 'consensus') {
-                // Preflight/Consensus - render to combined Analysis panel with filter
+            } else if (ANALYSIS_CONTENT_KEYS.includes(phase)) {
+                // Analysis phases render to a combined panel with filter
                 if (analysisFilterState === null || analysisFilterState === phase) {
                     renderFilteredAnalysisContent(request);
                 }
                 // Update stats for analysis panel
                 const iterData = request.iterations[request.currentIteration];
                 if (iterData) {
-                    const preflightStats = iterData.stats.preflight || { chunks: 0, bytes: 0 };
-                    const consensusStats = iterData.stats.consensus || { chunks: 0, bytes: 0 };
-                    const analysisChunksEl = document.getElementById('chunks-analysis');
-                    const analysisBytesEl = document.getElementById('bytes-analysis');
-                    if (analysisChunksEl) analysisChunksEl.textContent = preflightStats.chunks + consensusStats.chunks;
-                    if (analysisBytesEl) analysisBytesEl.textContent = preflightStats.bytes + consensusStats.bytes;
+                    updateAnalysisStats(iterData);
                 }
                 // Flash the analysis badge
                 showReceiving('analysis');
             } else {
                 // Normal append behavior
-                appendContent(phase, content);
+                appendContent(displayPhase, content);
             }
         } else {
             // Viewing history - show activity indicator that live data is coming
@@ -1900,7 +2186,7 @@ function handleChunk(data) {
         }
     } else if (!request) {
         // No session_id in data - still show (legacy behavior)
-        if (phase === 'preflight' || phase === 'consensus') {
+        if (ANALYSIS_CONTENT_KEYS.includes(phase)) {
             // For legacy mode, append to analysis panel with separator
             const analysisEl = document.getElementById('content-analysis');
             if (analysisEl) {
@@ -1910,7 +2196,7 @@ function handleChunk(data) {
                 }
             }
         } else {
-            appendContent(phase, content);
+            appendContent(displayPhase, content);
         }
     }
 
@@ -1918,20 +2204,13 @@ function handleChunk(data) {
     // before this function is called, so it remains unfiltered
 }
 
-function normalizePhaseName(phase, fallback) {
-    if (!phase) {
-        return fallback;
-    }
-    if (phase === 'gran_sabio') {
-        return 'gransabio';
-    }
-    return phase;
-}
-
 function handleStatusSnapshot(data) {
     log('Received status snapshot', 'info');
     const project = data.project || {};
     const summary = project.summary || {};
+    const totalSessions = summary.total_sessions ?? summary.total ?? 0;
+    const activeSessions = summary.active_sessions ?? summary.active ?? 0;
+    const completedSessions = summary.completed_sessions ?? summary.completed ?? 0;
 
     // Render visual dashboard
     renderProjectStatus(project);
@@ -1940,7 +2219,7 @@ function handleStatusSnapshot(data) {
     const statusText = `[STATUS SNAPSHOT]
 Project: ${project.project_id || '?'}
 Status: ${project.status || '?'}
-Sessions: ${summary.total || 0} total, ${summary.active || 0} active, ${summary.completed || 0} completed
+Sessions: ${totalSessions} total, ${activeSessions} active, ${completedSessions} completed
 `;
     appendContent('status', statusText);
 
@@ -1994,6 +2273,9 @@ function handleStatusChange(data) {
         // Update request state
         if (sessionData.status) {
             request.status = sessionData.status;
+            if (isTerminalStatus(sessionData.status)) {
+                markRequestTerminal(sessionId, sessionData.status);
+            }
         }
         if (sessionData.max_iterations) {
             request.maxIterations = sessionData.max_iterations;
@@ -2009,7 +2291,7 @@ function handleStatusChange(data) {
         }
 
         // Update final score for completed sessions
-        if (sessionData.status === 'completed' && sessionData.consensus) {
+        if (sessionData.status === 'completed' && sessionData.consensus && sessionData.consensus.last_score !== null && sessionData.consensus.last_score !== undefined) {
             request.finalScore = sessionData.consensus.last_score;
         }
     });
@@ -2025,7 +2307,9 @@ function handleStatusChange(data) {
     appendContent('status', `[STATUS_CHANGE] Triggered by session ${triggeredBy}\n`);
 
     if (project.summary) {
-        appendContent('status', `  Active: ${project.summary.active || 0}, Completed: ${project.summary.completed || 0}\n`);
+        const activeSessions = project.summary.active_sessions ?? project.summary.active ?? 0;
+        const completedSessions = project.summary.completed_sessions ?? project.summary.completed ?? 0;
+        appendContent('status', `  Active: ${activeSessions}, Completed: ${completedSessions}\n`);
     }
 }
 
@@ -2075,16 +2359,8 @@ function handleIterationChange(request, oldIteration, newIteration, sessionData)
  * Clear all streaming panels when starting a new iteration
  */
 function clearPanelsForNewIteration() {
-    ['preflight', 'generation', 'qa', 'consensus', 'gransabio'].forEach(phase => {
-        const contentEl = document.getElementById(`content-${phase}`);
-        if (contentEl) {
-            contentEl.textContent = '';
-        }
-        // Reset stats display
-        const chunksEl = document.getElementById(`chunks-${phase}`);
-        const bytesEl = document.getElementById(`bytes-${phase}`);
-        if (chunksEl) chunksEl.textContent = '0';
-        if (bytesEl) bytesEl.textContent = '0';
+    REQUEST_PANEL_PHASES.forEach(phase => {
+        resetPanelContent(phase);
     });
 }
 
@@ -2286,8 +2562,7 @@ function updateIterationNavButtons(request) {
 function updateHistoryModeIndicators(request) {
     const isHistoryMode = request.viewingIteration !== request.currentIteration;
 
-    // Note: 'analysis' panel combines preflight+consensus, 'smartedit' is placeholder for future
-    ['generation', 'qa', 'analysis', 'gransabio'].forEach(phase => {
+    REQUEST_PANEL_PHASES.forEach(phase => {
         const panel = document.querySelector(`.stream-panel[data-phase="${phase}"]`);
         if (!panel) return;
 
@@ -2418,10 +2693,31 @@ const smartEditState = {
     animationSpeed: 1.0,  // Multiplier for animation timing
 };
 
+function shouldRenderRequestScopedPanelEvent(data, panelPhase) {
+    const request = processRequestFromEvent(data);
+    if (!request) {
+        return true;
+    }
+    showReceiving(panelPhase);
+    if (isOverviewMode()) {
+        return false;
+    }
+    if (request.sessionId !== viewState.selectedRequestId) {
+        return false;
+    }
+    if (request.viewingIteration !== request.currentIteration) {
+        showLiveActivityIndicator(request.currentIteration);
+        return false;
+    }
+    return true;
+}
+
 /**
  * Handle smart edit start event - show paragraph with fragment highlighted
  */
 function handleSmartEditStart(data) {
+    if (!shouldRenderRequestScopedPanelEvent(data, 'smartedit')) return;
+
     const editData = data.edit_data;
     if (!editData) return;
 
@@ -2485,6 +2781,8 @@ function handleSmartEditStart(data) {
  * Handle smart edit complete event - animate transition and show result
  */
 function handleSmartEditComplete(data) {
+    if (!shouldRenderRequestScopedPanelEvent(data, 'smartedit')) return;
+
     const editData = data.edit_data;
     if (!editData) return;
 
@@ -2537,6 +2835,8 @@ function handleSmartEditComplete(data) {
  * Handle smart edit error event
  */
 function handleSmartEditError(data) {
+    if (!shouldRenderRequestScopedPanelEvent(data, 'smartedit')) return;
+
     const editData = data.edit_data;
     if (!editData) return;
 

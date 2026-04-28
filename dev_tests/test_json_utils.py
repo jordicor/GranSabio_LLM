@@ -7,14 +7,15 @@ using orjson for 3.6x performance improvement.
 Sub-phase 1.1: 25 tests
 """
 
-import pytest
 import uuid
 from io import StringIO
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
+
+import orjson
+import pytest
 
 # Import the module under test
 import json_utils as json
-import orjson
 
 
 class TestDumps:

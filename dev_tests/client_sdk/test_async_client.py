@@ -14,13 +14,14 @@ Tests cover:
 - Convenience methods (generate_json, generate_fast, generate_parallel)
 """
 
-import pytest
-from unittest.mock import Mock, MagicMock, AsyncMock, patch
 import asyncio
-import aiohttp
-
-import sys
 import os
+import sys
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import aiohttp
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
@@ -524,6 +525,24 @@ class TestAsyncGenerate:
             await client.generate(prompt="Test", qa_layers=[])
 
         assert "rejected by preflight" in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_generate_raises_on_auto_qa_rejection(self, client, mock_response):
+        """Given: Auto-QA rejects, Then: Raises GranSabioClientError with feedback."""
+        from client import GranSabioClientError
+
+        mock_response.json.return_value = {
+            "status": "auto_qa_rejected",
+            "auto_qa_feedback": {
+                "message": "Planner could not build a non-contradictory QA contract"
+            },
+        }
+        client._session.request = AsyncMock(return_value=mock_response)
+
+        with pytest.raises(GranSabioClientError) as exc:
+            await client.generate(prompt="Test", qa_layers=[])
+
+        assert "rejected by Auto-QA" in str(exc.value)
 
     @pytest.mark.asyncio
     async def test_generate_raises_on_missing_session_id(self, client, mock_response):
@@ -1111,7 +1130,6 @@ class TestAsyncConvenienceMethods:
     @pytest.mark.asyncio
     async def test_generate_parallel_returns_exceptions(self, client):
         """Given: Some prompts fail, Then: Returns exceptions in results."""
-        from client import GranSabioClientError
 
         success_response = AsyncMock()
         success_response.status = 200
@@ -1248,7 +1266,6 @@ class TestAsyncBodyReadTransient:
     @pytest.mark.asyncio
     async def test_call_with_retry_retries_body_read_failure(self, client):
         """End-to-end: _call_with_retry must retry a body-read ClientPayloadError."""
-        from client import TransientGranSabioError
 
         # First response raises ClientPayloadError on json(); second succeeds.
         response_fail = AsyncMock()

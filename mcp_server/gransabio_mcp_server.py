@@ -28,16 +28,17 @@ import time
 
 # Add parent directory to path for json_utils import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import json_utils as json
-from typing import Any, Optional, List, Dict
+from typing import Any, Dict, Optional
 
 import httpx
+
+import json_utils as json
 
 # MCP SDK imports
 try:
     from mcp.server import Server
     from mcp.server.stdio import stdio_server
-    from mcp.types import Tool, TextContent
+    from mcp.types import TextContent, Tool
 except ImportError:
     print(
         "Error: MCP SDK not installed. Install with: pip install mcp",

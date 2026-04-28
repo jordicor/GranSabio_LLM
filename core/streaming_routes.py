@@ -5,21 +5,20 @@ Streaming endpoints for Gran Sabio LLM.
 from __future__ import annotations
 
 import asyncio
-import json_utils as json
 import time
 from typing import List
 
 from fastapi import HTTPException, Query
 from fastapi.responses import StreamingResponse
 
+import json_utils as json
+from ai_service import StreamChunk
 from attachments_router import get_attachment_manager
+from config import config
 from models import GenerationStatus
 from services.attachment_manager import AttachmentError
-from services.project_stream import ProjectStreamManager, parse_phases, SubscriptionError
-
+from services.project_stream import ProjectStreamManager, SubscriptionError, parse_phases
 from word_count_utils import build_word_count_instructions
-
-from config import config
 
 from .app_state import (
     _ensure_services,
@@ -27,8 +26,7 @@ from .app_state import (
     logger,
     mutate_session,
 )
-from ai_service import StreamChunk
-from .generation_processor import build_context_prompt, ai_service
+from .generation_processor import ai_service, build_context_prompt
 
 DEFAULT_MODEL_MAX_TOKENS_FALLBACK = 8192
 
@@ -396,7 +394,7 @@ async def stream_project_unified(
     project_id: str,
     phases: str = Query(
         default="all",
-        description="CSV of phases: preflight, generation, qa, consensus, gransabio/gran_sabio, status, or 'all'"
+        description="CSV of phases: auto_qa, preflight, generation, qa, consensus, gransabio/gran_sabio, status, or 'all'"
     )
 ):
     """
@@ -406,6 +404,7 @@ async def stream_project_unified(
     Receives all phases by default.
 
     **Available phases:**
+    - `auto_qa` - Auto-QA planning chunks
     - `preflight` - Preflight validation chunks
     - `generation` - Content generation chunks
     - `qa` - QA evaluation chunks

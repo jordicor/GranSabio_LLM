@@ -11,15 +11,13 @@ Endpoints:
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from .models import EditResult, OperationType, TargetMode
 from .operations import SmartTextEditor
 
 router = APIRouter(tags=["Smart Edit"])
@@ -346,6 +344,7 @@ async def analyze_text(request: AnalyzeRequest):
     try:
         # Try AI-powered analysis
         from ai_service import get_ai_service
+
         from .analyzer import TextAnalyzer, calculate_stats
 
         ai_service = get_ai_service()

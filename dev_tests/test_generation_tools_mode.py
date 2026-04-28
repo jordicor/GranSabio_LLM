@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from ai_service import AIRequestError, AccentGuardError
+from ai_service import AccentGuardError, AIRequestError
 from core import app_state
 from core.app_state import active_sessions
 from core.generation_processor import (

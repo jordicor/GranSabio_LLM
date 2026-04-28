@@ -15,22 +15,24 @@ Functions tested:
 - prepare_qa_layers_with_word_count(): Layer preparation
 """
 
+from unittest.mock import Mock
+
 import pytest
-from unittest.mock import Mock, MagicMock
+
+from models import ContentRequest, QALayer
 from word_count_utils import (
-    word_count_config_to_dict,
-    is_word_count_enforcement_enabled,
-    extract_target_field,
-    count_words,
-    validate_word_count_config,
+    build_word_count_instructions,
     calculate_word_count_range,
     calculate_word_count_score,
     check_word_count_compliance,
+    count_words,
     create_word_count_qa_layer,
-    build_word_count_instructions,
-    prepare_qa_layers_with_word_count
+    extract_target_field,
+    is_word_count_enforcement_enabled,
+    prepare_qa_layers_with_word_count,
+    validate_word_count_config,
+    word_count_config_to_dict,
 )
-from models import QALayer, ContentRequest
 
 
 class TestWordCountConfigToDict:
@@ -902,7 +904,7 @@ class TestPrepareQALayersWithWordCount:
 
     def test_lexical_diversity_after_word_count(self, base_request):
         """Given: Both word count and lexical diversity, Then: Lexical after word count"""
-        from models import WordCountEnforcement, LexicalDiversityConfig
+        from models import LexicalDiversityConfig, WordCountEnforcement
         base_request.word_count_enforcement = WordCountEnforcement(
             enabled=True,
             flexibility_percent=10,
@@ -940,7 +942,7 @@ class TestPrepareQALayersWithWordCount:
 
     def test_all_layers_combined_ordering(self, base_request):
         """Given: All layer types enabled, Then: Correct ordering"""
-        from models import WordCountEnforcement, LexicalDiversityConfig, PhraseFrequencyConfig, PhraseFrequencyRule
+        from models import LexicalDiversityConfig, PhraseFrequencyConfig, PhraseFrequencyRule, WordCountEnforcement
         base_request.word_count_enforcement = WordCountEnforcement(
             enabled=True,
             flexibility_percent=10,

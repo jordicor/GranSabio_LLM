@@ -14,19 +14,17 @@ Functions tested:
 See SMART_EDIT_PER_LAYER_DESIGN.md for full design documentation.
 """
 
-import pytest
-import asyncio
-from unittest.mock import Mock, MagicMock, AsyncMock, patch
-from datetime import datetime
-from typing import Dict, Any, List, Optional
-
-import sys
 import os
+import sys
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from models import QALayer, QAEvaluation, ContentRequest
-from smart_edit import TextEditRange, SeverityLevel, OperationType as EditType
-
+from models import ContentRequest, QAEvaluation, QALayer
+from smart_edit import OperationType as EditType
+from smart_edit import SeverityLevel, TextEditRange
 
 # ============================================================================
 # Fixtures

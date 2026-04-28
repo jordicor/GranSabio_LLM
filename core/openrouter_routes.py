@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from fastapi import Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from services.model_sync import ModelSyncError, ModelSyncService, SUPPORTED_SYNC_PROVIDERS
+from services.model_sync import SUPPORTED_SYNC_PROVIDERS, ModelSyncError, ModelSyncService
 
 from .app_state import app, config, logger, templates
 from .security import require_internal_ip

@@ -8,13 +8,12 @@ local catalog loader, safe sync path, and reference validation.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-import json_utils as json
 
+import json_utils as json
 from services.model_sync import ModelSyncError, ModelSyncService, _remote_json_headers
 
 

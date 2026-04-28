@@ -12,23 +12,23 @@ Functions tested:
 - run_preflight_validation(): Main validation function
 """
 
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+
 import pytest
-from unittest.mock import Mock, MagicMock, AsyncMock, patch
-from typing import List, Dict, Any
+
+from models import ContentRequest, PreflightIssue, QALayer
 
 # Import functions under test
 from preflight_validator import (
-    _normalize_qa_models,
     _build_validation_payload,
     _build_validator_prompt,
     _extract_json_blob,
     _normalise_issues,
+    _normalize_qa_models,
     _parse_validator_response,
     resolve_preflight_model,
     run_preflight_validation,
 )
-from models import ContentRequest, QALayer, PreflightIssue
-
 
 # ============================================================================
 # Fixtures

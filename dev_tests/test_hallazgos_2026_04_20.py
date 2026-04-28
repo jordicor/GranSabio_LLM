@@ -32,7 +32,6 @@ from tool_loop_models import (
     ValidationToolInputTooLarge,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -406,7 +405,6 @@ def test_all_four_loops_have_conditional_retries():
     unconditional ``return await self._execute_with_retries(...)`` at the
     tail of a loop.
     """
-    import re
     from pathlib import Path
 
     source = Path(__file__).resolve().parent.parent / "ai_service.py"

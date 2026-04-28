@@ -8,8 +8,9 @@ compatibility with standard json library interface.
 orjson is 3.6x faster than standard json based on our benchmarks.
 """
 
-import orjson
 from typing import Any, Optional
+
+import orjson
 
 
 def dumps(
@@ -57,10 +58,10 @@ def dumps(
 def loads(s: str) -> Any:
     """
     Deserialize JSON string to Python object using orjson (optimized)
-    
+
     Args:
         s: JSON string to deserialize
-        
+
     Returns:
         Python object
     """
@@ -76,7 +77,7 @@ def dump(
 ) -> None:
     """
     Serialize obj to JSON and write to file-like object
-    
+
     Args:
         obj: Object to serialize
         fp: File-like object to write to
@@ -96,10 +97,10 @@ def dump(
 def load(fp) -> Any:
     """
     Deserialize JSON from file-like object
-    
+
     Args:
         fp: File-like object to read from
-        
+
     Returns:
         Python object
     """

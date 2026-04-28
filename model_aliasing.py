@@ -7,10 +7,12 @@ prompt builders can use stable role/slot aliases.
 
 from __future__ import annotations
 
+import logging
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence
 
+logger = logging.getLogger(__name__)
 
 PromptSource = Literal["system_generated", "user_supplied"]
 
@@ -189,6 +191,59 @@ def _lookup_catalog_identity(real_model: str) -> tuple[Optional[str], Optional[s
     return resolved["model_id"], resolved["provider"]
 
 
+_PROMPT_SAFE_CAPABILITY_ALIASES: Dict[str, str] = {
+    "text": "text",
+    "vision": "vision",
+    "audio": "audio",
+    "tools": "tools",
+    "tool_calling": "tools",
+    "function_calling": "tools",
+    "reasoning": "reasoning",
+    "advanced_reasoning": "reasoning",
+    "adaptive_reasoning": "reasoning",
+    "reasoning_effort": "reasoning",
+    "streaming": "streaming",
+    "json": "json",
+    "structured_output": "structured_output",
+    "structured_outputs": "structured_output",
+}
+
+
+def _prompt_safe_capabilities_from_catalog(real_model: str) -> List[str]:
+    """Resolve a narrow prompt-safe capability list without provider identity."""
+    from config import config, resolve_model_catalog_entry
+
+    resolved = resolve_model_catalog_entry(real_model, getattr(config, "model_specs", {}) or {})
+    if not resolved["matched"]:
+        logger.warning(
+            "Model '%s' was not found in model_specs while building prompt-safe capabilities.",
+            real_model,
+        )
+        return []
+    if not resolved["enabled"]:
+        msg = f"[CONFIG ERROR] Model '{real_model}' is disabled."
+        print(msg, file=sys.stderr, flush=True)
+        raise RuntimeError(msg)
+
+    model_data = resolved.get("model_data") or {}
+    raw_values: List[Any] = []
+    raw_values.extend(model_data.get("capabilities") or [])
+    raw_values.extend(model_data.get("special_features") or [])
+
+    normalized = {
+        _PROMPT_SAFE_CAPABILITY_ALIASES[value.strip().lower()]
+        for value in raw_values
+        if isinstance(value, str)
+        and value.strip().lower() in _PROMPT_SAFE_CAPABILITY_ALIASES
+    }
+
+    reasoning_effort = model_data.get("reasoning_effort")
+    if isinstance(reasoning_effort, dict) and reasoning_effort.get("supported"):
+        normalized.add("reasoning")
+
+    return sorted(normalized)
+
+
 def get_evaluator_alias(evaluation: Any, fallback: Optional[str] = None) -> str:
     """Resolve a prompt-facing evaluator label from an evaluation-like object."""
 
@@ -253,10 +308,12 @@ class ModelAliasRegistry:
             registry.register_fixed_role("generator", str(generator_model))
 
         for index, qa_model in enumerate(getattr(request, "qa_models", []) or []):
+            real_model = _model_name_from_config(qa_model)
             registry.register_qa_slot(
                 index=index,
-                real_model=_model_name_from_config(qa_model),
+                real_model=real_model,
                 config_fingerprint=_fingerprint_from_config(qa_model),
+                capabilities=_prompt_safe_capabilities_from_catalog(real_model),
             )
 
         gran_sabio_model = getattr(request, "gran_sabio_model", None)
@@ -503,6 +560,40 @@ def prompt_safe_identity(value: Any, registry: Optional[ModelAliasRegistry], *, 
     return registry.alias_for_identity(text, fallback=fallback)
 
 
+def _build_model_identity_set(registry: ModelAliasRegistry) -> set:
+    """Build the set of exact model identity strings from registered slots.
+
+    Only includes ``slot.real_model`` and ``slot.model_id`` — NOT provider
+    names or brand aliases (``openai``, ``anthropic``, ``claude``, etc.),
+    which can legitimately appear as dict keys in user-supplied JSON.
+    """
+    identities: set = set()
+    for slot in registry.slots.values():
+        if slot.real_model:
+            identities.add(slot.real_model)
+        if slot.model_id:
+            identities.add(slot.model_id)
+    return identities
+
+
+def _alias_for_key(key: str, registry: ModelAliasRegistry) -> str:
+    """Resolve a prompt-safe alias for a dict key that matches a model identity.
+
+    When the identity resolves to exactly one slot, returns that slot's alias.
+    When it is ambiguous (matches multiple slots), returns ``"Evaluator"``.
+    """
+    return registry.alias_for_identity(key, fallback="Evaluator")
+
+
+def _deduplicate_alias_key(alias: str, used_aliases: Dict[str, int]) -> str:
+    """Return a collision-safe alias key, appending ``_N`` when needed."""
+    count = used_aliases.get(alias, 0)
+    used_aliases[alias] = count + 1
+    if count == 0:
+        return alias
+    return f"{alias}_{count + 1}"
+
+
 def to_prompt_safe_data(data: Any, registry: Optional[ModelAliasRegistry]) -> Any:
     """Best-effort recursive prompt-safe view for replayable snapshots."""
 
@@ -515,7 +606,15 @@ def to_prompt_safe_data(data: Any, registry: Optional[ModelAliasRegistry]) -> An
             pass
 
     if isinstance(data, dict):
+        # Pre-compute the set of model identities for key sanitization.
+        model_identities: Optional[set] = None
+        if registry is not None:
+            model_identities = _build_model_identity_set(registry)
+
         safe: Dict[str, Any] = {}
+        # Track alias keys already used to handle collisions.
+        used_alias_keys: Dict[str, int] = {}
+
         for key, value in data.items():
             if key in IDENTITY_FIELD_NAMES:
                 alias_key = IDENTITY_FIELD_ALIAS_KEYS.get(key, f"{key}_alias")
@@ -527,7 +626,19 @@ def to_prompt_safe_data(data: Any, registry: Optional[ModelAliasRegistry]) -> An
                     for idx, _ in enumerate(value)
                 ]
                 continue
-            safe[key] = to_prompt_safe_data(value, registry)
+
+            # Dict key sanitization: replace keys that are exact model
+            # identities (real_model / model_id) with their prompt-safe alias.
+            # Provider names and brand aliases are NOT matched.
+            effective_key = key
+            if (
+                model_identities is not None
+                and isinstance(key, str)
+                and key in model_identities
+            ):
+                alias = _alias_for_key(key, registry)
+                effective_key = _deduplicate_alias_key(alias, used_alias_keys)
+            safe[effective_key] = to_prompt_safe_data(value, registry)
         return safe
 
     if isinstance(data, list):

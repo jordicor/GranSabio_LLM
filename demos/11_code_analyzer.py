@@ -49,19 +49,16 @@ Usage:
     python demos/11_code_analyzer.py --file path/to/code.py
 """
 
+import argparse
 import asyncio
 import sys
-import argparse
 from pathlib import Path
-from typing import Dict, Any
 
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import json_utils as json
-
 from client import AsyncGranSabioClient
-from demos.common import run_demo, print_header, safe_print, print_json_content, colorize
-
+from demos.common import colorize, print_header, print_json_content, run_demo, safe_print
 
 # =============================================================================
 # SAMPLE CODE SNIPPETS FOR ANALYSIS

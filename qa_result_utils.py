@@ -7,7 +7,6 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from model_aliasing import get_evaluator_alias
 
-
 TECHNICAL_QA_ERROR_TYPES = frozenset(
     {
         "api_failure",
@@ -203,7 +202,7 @@ def build_deal_breaker_consensus(
             deal_breaker_details.append(
                 {
                     "model": model,
-                    "evaluator": get_evaluator_alias(evaluation, fallback=model),
+                    "evaluator": get_evaluator_alias(evaluation, fallback=None),
                     "reason": getattr(evaluation, "deal_breaker_reason", None),
                 }
             )

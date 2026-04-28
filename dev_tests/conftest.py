@@ -1,9 +1,10 @@
 """Shared pytest fixtures for Gran Sabio LLM Engine tests."""
 
-import pytest
-from unittest.mock import AsyncMock, Mock, patch, MagicMock
 import os
 import sys
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -240,6 +241,7 @@ def preflight_reject_response():
 def test_client():
     """Synchronous FastAPI test client."""
     from fastapi.testclient import TestClient
+
     from main import app
     return TestClient(app)
 
@@ -247,7 +249,8 @@ def test_client():
 @pytest.fixture
 async def async_test_client():
     """Async FastAPI test client."""
-    from httpx import AsyncClient, ASGITransport
+    from httpx import ASGITransport, AsyncClient
+
     from main import app
     async with AsyncClient(
         transport=ASGITransport(app=app),

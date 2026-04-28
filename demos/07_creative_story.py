@@ -28,17 +28,16 @@ Usage:
     python demos/07_creative_story.py --premise "A robot learns to paint"
 """
 
+import argparse
 import asyncio
 import sys
-import argparse
 from pathlib import Path
 
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from client import AsyncGranSabioClient
-from demos.common import run_demo, print_header, print_status, print_generation_result
-
+from demos.common import print_generation_result, print_header, print_status, run_demo
 
 # Story premises by genre
 STORY_PREMISES = {

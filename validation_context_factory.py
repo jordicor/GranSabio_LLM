@@ -32,7 +32,6 @@ from typing import Any, Dict, List, Optional
 from models import is_json_output_requested
 from phrase_frequency_config import is_phrase_frequency_active
 
-
 # ---------------------------------------------------------------------------
 # Whitelist (fail-closed)
 # ---------------------------------------------------------------------------

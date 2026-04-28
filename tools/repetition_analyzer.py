@@ -32,26 +32,26 @@ What's new in 2.3.1
 """
 
 from __future__ import annotations
+
 import argparse
 import math
-
-import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import json_utils as json
-import re
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import hashlib
 import os
 import platform
+import re
 import subprocess
+import sys
 import unicodedata
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Tuple, Optional, Set
 from collections import Counter, defaultdict
-import hashlib
-
+from dataclasses import asdict, dataclass
 from multiprocessing import get_context
+from typing import Any, Dict, List, Optional, Set, Tuple
 
+import json_utils as json
 from tools.stopwords_utils import get_stopwords_for_language, resolve_language_hint
 from tools.string_utils import remove_invisible_control
 

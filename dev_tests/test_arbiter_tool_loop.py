@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -39,7 +39,6 @@ from tool_loop_models import (
     PayloadScope,
     ToolLoopEnvelope,
 )
-
 
 # ---------------------------------------------------------------------------
 # Shared helpers

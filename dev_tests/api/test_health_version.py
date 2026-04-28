@@ -8,11 +8,10 @@ commit and dirty counts vary between runs.
 """
 
 import datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
-
 
 # Default headers to simulate internal IP for bypassing IP filter middleware.
 INTERNAL_IP_HEADERS = {"X-Real-IP": "127.0.0.1"}

@@ -11,16 +11,16 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List, Optional, Literal
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
 # Import analysis tools
 from tools.lexical_diversity_utils import (
-    LexicalDiversitySettings,
     LexicalDiversityDecisionPolicy,
     LexicalDiversityScorePolicy,
+    LexicalDiversitySettings,
     LexicalDiversityWindowPolicy,
     analyze_text_lexical_diversity,
 )

@@ -2,19 +2,19 @@
 Benchmark for _find_optimal_phrase_length with different max_n values.
 
 Tests how computation time scales when increasing max_n from 12 to 48.
-Uses real text files from S:\01.Coding\TESTING\texto-largo
+Uses real text files from S:\01.Coding\\TESTING\texto-largo
 
 Usage:
     python dev_tests/test_palabras_benchmark_phrase_length.py
 """
 
 import os
+import re
+import statistics
 import sys
 import time
-import statistics
 from pathlib import Path
-from typing import Dict, List, Any, Optional
-import re
+from typing import Any, Dict, List, Optional
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))

@@ -2,14 +2,14 @@
 Test script for Ollama integration in Gran Sabio LLM Engine
 """
 import asyncio
-import sys
 import os
+import sys
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from ai_service import get_ai_service
 from config import config
-from ai_service import get_ai_service, StreamChunk
 
 
 async def test_ollama_config():

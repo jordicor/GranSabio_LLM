@@ -37,28 +37,24 @@ Usage:
     python demos/03_youtube_script_generator.py --topic "How to Learn Programming in 2024"
 """
 
+import argparse
 import asyncio
 import sys
-import argparse
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict
 
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import json_utils as json
-
 from client import AsyncGranSabioClient
 from demos.common import (
-    run_demo,
-    print_header,
-    print_json_content,
-    print_full_content,
-    print_multi_phase_summary,
-    display_phase_result,
     colorize,
+    display_phase_result,
+    print_header,
+    print_multi_phase_summary,
+    run_demo,
     safe_print,
 )
-
 
 # JSON Schemas for structured outputs
 # Note: OpenAI Structured Outputs requires ALL properties in 'required'

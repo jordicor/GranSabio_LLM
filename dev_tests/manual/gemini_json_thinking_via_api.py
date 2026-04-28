@@ -13,12 +13,13 @@ Usage:
     python dev_tests/manual/gemini_json_thinking_via_api.py
 """
 
-import requests
-import time
+import io
 import json
 import sys
-import io
+import time
 from datetime import datetime
+
+import requests
 
 
 def _configure_stdout() -> None:

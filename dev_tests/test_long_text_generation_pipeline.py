@@ -7,8 +7,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-import json_utils as json
 
+import json_utils as json
 from core import app_state
 from core.app_state import active_sessions, register_session
 from core.generation_processor import process_content_generation

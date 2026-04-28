@@ -2,7 +2,7 @@ from pathlib import Path
 
 from deal_breaker_tracker import DealBreakerTracker
 from gran_sabio_supervisor import GranSabioSupervisor
-from models import QAEvaluation, ContentRequest
+from models import ContentRequest, QAEvaluation
 
 
 def _deal_breaker(model: str, layer: str = "Accuracy", slot_id: str = "qa:0"):

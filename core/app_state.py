@@ -17,23 +17,22 @@ Author: Gran Sabio LLM Team
 Version: 1.0.0
 """
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Query, Body
-from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from starlette.middleware.gzip import GZipMiddleware
-from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional, AsyncGenerator, Callable, TypeVar, Set
 import asyncio
-import uuid
-import ipaddress
-# Use optimized JSON (3.6x faster than standard json)
-import json_utils as json
-import time
 import logging
 import os
 import sys
+import time
 from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Set, TypeVar
+
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+from starlette.middleware.gzip import GZipMiddleware
+
+# Use optimized JSON (3.6x faster than standard json)
+import json_utils as json
 from debug_logger import (
     DebugLogger,
     get_debug_logger,
@@ -78,51 +77,26 @@ FORCE_EXTRA_VERBOSE_ENV_VAR = "GRANSABIO_FORCE_EXTRA_VERBOSE"
 
 if os.getenv(FILE_LOGGING_ENV_VAR, "").lower() in TRUTHY_ENV_VALUES:
     try:
-        from file_logger import activate_file_logging, TeeOutput
+        from file_logger import TeeOutput, activate_file_logging
         if not isinstance(sys.stdout, TeeOutput):
             activate_file_logging()
     except Exception as exc:
         logger.error(f"Failed to activate file logging in worker process: {exc}")
 
 from ai_service import get_ai_service
-from qa_engine import QAEngine, QAProcessCancelled
-from consensus_engine import ConsensusEngine
-from gran_sabio import GranSabioEngine, GranSabioInvocationError, GranSabioProcessCancelled
-from deal_breaker_tracker import get_tracker
-from preflight_validator import run_preflight_validation
-from attachments_router import router as attachments_router, get_attachment_manager
 from analysis_router import router as analysis_router
-from services.attachment_manager import (
-    AttachmentManager,
-    AttachmentError,
-    AttachmentNotFoundError,
-    AttachmentValidationError,
-    ResolvedAttachment,
-)
-from config import Config, config
-from models import (
-    ContentRequest,
-    QALayer,
-    GenerationStatus,
-    ProgressUpdate,
-    ContentResponse,
-    GenerationInitResponse,
-    ProjectInitRequest,
-    ProjectInitResponse,
-)
-from word_count_utils import (
-    validate_word_count_config, 
-    create_word_count_qa_layer,
-    count_words,
-    word_count_config_to_dict,
-    is_word_count_enforcement_enabled,
-)
-from tools.ai_json_cleanroom import validate_ai_json, ValidationResult
+from attachments_router import router as attachments_router
+from config import config
+from consensus_engine import ConsensusEngine
+from deal_breaker_tracker import get_tracker
 from feedback_memory import get_feedback_manager, initialize_feedback_system, shutdown_feedback_system
-from usage_tracking import (
-    UsageTracker,
-    inject_costs_into_json_payload,
-    merge_costs_into_json_string,
+from gran_sabio import GranSabioEngine
+from models import (
+    GenerationStatus,
+)
+from qa_engine import QAEngine
+from services.attachment_manager import (
+    ResolvedAttachment,
 )
 
 T = TypeVar("T")
@@ -142,6 +116,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 # This provides temporary protection until user authentication is implemented
 # See core/security.py for configuration and allowed networks
 from .security import IPFilterMiddleware
+
 app.add_middleware(IPFilterMiddleware)
 
 # Mount static files
@@ -155,10 +130,12 @@ app.include_router(analysis_router)
 
 # Smart Edit routes
 from smart_edit.router import router as smart_edit_router
+
 app.include_router(smart_edit_router, prefix="/smart-edit")
 
 # Monitor routes
 from .monitor_routes import router as monitor_router
+
 app.include_router(monitor_router)
 
 # Templates
@@ -560,7 +537,7 @@ def _stop_project(project_id: str) -> int:
     cancelled_project_ids.add(project_id)
 
     # Broadcast project_end to all phases and close their streams
-    phases = ["preflight", "generation", "qa", "smart_edit", "consensus", "gran_sabio"]
+    phases = ["auto_qa", "preflight", "generation", "qa", "arbiter", "smart_edit", "consensus", "gran_sabio"]
     for phase in phases:
         # Fire-and-forget; if no loop running, just skip
         try:
@@ -872,7 +849,7 @@ async def publish_project_session_end(
     """Publish a session_end event to all phases for a project."""
     if not project_id:
         return
-    phases = ["preflight", "generation", "qa", "smart_edit", "consensus", "gran_sabio"]
+    phases = ["auto_qa", "preflight", "generation", "qa", "arbiter", "smart_edit", "consensus", "gran_sabio"]
     for phase in phases:
         await publish_project_phase_chunk(
             project_id,
@@ -1251,7 +1228,10 @@ async def get_project_status(project_id: str) -> dict:
             # Count session states
             if status_str in ("completed",):
                 completed_count += 1
-            elif status_str in ("generating", "qa_evaluation", "consensus", "running", "initializing"):
+            elif (
+                status_str in ("generating", "qa_evaluation", "consensus", "gran_sabio_review", "running", "initializing")
+                or phase in ("inline_deal_breaker_review", "gran_sabio_review", "gran_sabio_regeneration")
+            ):
                 active_count += 1
 
             # Get generation info
@@ -1292,7 +1272,10 @@ async def get_project_status(project_id: str) -> dict:
             approved = session.get("approved", False)
 
             # Gran Sabio info
-            gran_sabio_active = phase in ("gran_sabio_review", "gran_sabio_regeneration")
+            gran_sabio_active = (
+                status_str == "gran_sabio_review"
+                or phase in ("inline_deal_breaker_review", "gran_sabio_review", "gran_sabio_regeneration")
+            )
             gran_sabio_model = session.get("gran_sabio_model", "")
             escalation_count = session.get("gran_sabio_escalation_count", 0)
 

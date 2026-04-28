@@ -74,6 +74,9 @@ NDH6SA~M
 # macOS WebDAV metadata (accidentally synced from network drive)
 ._DAV/
 
+# Linter cache
+.ruff_cache/
+
 # pytest-cov coverage data
 .coverage
 htmlcov/

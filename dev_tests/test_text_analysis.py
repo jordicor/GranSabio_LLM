@@ -10,14 +10,14 @@ Functions tested:
 - analyze_text_structure(): Comprehensive analysis
 """
 
-import pytest
+
 from text_analysis import (
+    allocate_word_budget,
+    analyze_text_structure,
+    compute_topic_weights,
+    proportional_split,
     simple_tokenize,
     word_count,
-    compute_topic_weights,
-    allocate_word_budget,
-    proportional_split,
-    analyze_text_structure
 )
 
 

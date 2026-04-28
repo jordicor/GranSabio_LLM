@@ -1,10 +1,11 @@
 """Capture ALL verbose logs to debug Gran Sabio messages."""
 
 import asyncio
-import aiohttp
 import os
 import sys
 from pathlib import Path
+
+import aiohttp
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 os.environ["FAKE_AI_HOST"] = "http://localhost:8989"

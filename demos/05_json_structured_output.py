@@ -25,22 +25,21 @@ Usage:
     python demos/05_json_structured_output.py --text "John Doe, 35, software engineer..."
 """
 
+import argparse
 import asyncio
 import sys
-import argparse
 from pathlib import Path
 
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import json_utils as json
-from typing import Dict, Any
 
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from client import AsyncGranSabioClient
-from demos.common import run_demo, print_header, print_json_content, colorize, safe_print
-
+from demos.common import colorize, print_header, print_json_content, run_demo, safe_print
 
 # Sample unstructured text for extraction
 SAMPLE_RESUME_TEXT = """

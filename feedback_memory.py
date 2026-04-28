@@ -16,21 +16,17 @@ Features:
 
 import asyncio
 import hashlib
-import json_utils as json
 import logging
-import re
-import sqlite3
 import threading
 import time
-import zlib
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Set
-from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import aiosqlite
+
+import json_utils as json
 from ai_service import get_ai_service
-from config import config
 from model_aliasing import ModelAliasRegistry, PromptPart
 
 logger = logging.getLogger(__name__)
@@ -540,7 +536,7 @@ Return ONLY valid JSON, no additional text."""
                 prompt_safety_parts=[
                     PromptPart(
                         text=feedback_text,
-                        source="system_generated",
+                        source="user_supplied",
                         label="feedback_memory.feedback_text",
                     )
                 ] if model_alias_registry else None,

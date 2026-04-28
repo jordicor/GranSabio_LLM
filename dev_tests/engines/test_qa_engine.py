@@ -23,22 +23,21 @@ Functions tested:
 - QAEngine.validate_layers(): Layer validation
 """
 
-import pytest
 import asyncio
-from unittest.mock import Mock, MagicMock, AsyncMock, patch
-from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import pytest
+
+from config import EDITABLE_CONTENT_TYPES
+from models import QAEvaluation, QALayer, QAModelConfig
 from qa_engine import (
     QAEngine,
-    QAProcessCancelled,
     QAModelUnavailableError,
-    calculate_qa_timeout_for_model,
+    QAProcessCancelled,
     calculate_comprehensive_qa_timeout,
+    calculate_qa_timeout_for_model,
 )
 from qa_evaluation_service import QAResponseParseError
-from config import EDITABLE_CONTENT_TYPES
-from models import QALayer, QAEvaluation, QAModelConfig
-
 
 # ============================================================================
 # Fixtures

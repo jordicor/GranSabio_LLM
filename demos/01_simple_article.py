@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from client import AsyncGranSabioClient
-from demos.common import run_demo, print_header, print_generation_result
+from demos.common import print_generation_result, run_demo
 
 
 async def demo_simple_article():

@@ -6,8 +6,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from models import QALayer
 from model_aliasing import get_evaluator_alias
+from models import QALayer
 from qa_result_utils import build_qa_counts, is_valid_semantic_qa_result
 
 from .feedback_formatter import create_user_friendly_reason
@@ -369,7 +369,7 @@ def _evaluate_fast_global_approval(
                     {
                         "layer": layer_name,
                         "model": model_name,
-                        "evaluator": get_evaluator_alias(evaluation, fallback=model_name),
+                        "evaluator": get_evaluator_alias(evaluation, fallback=None),
                         "reason": evaluation.deal_breaker_reason or evaluation.reason or "",
                     }
                 )
@@ -435,7 +435,7 @@ def _check_majority_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
         layer_details = []
         for model, evaluation in model_results.items():
             if is_valid_semantic_qa_result(evaluation) and getattr(evaluation, "deal_breaker", False):
-                evaluator = get_evaluator_alias(evaluation, fallback=model)
+                evaluator = get_evaluator_alias(evaluation, fallback=None)
                 layer_details.append(
                     {
                         "layer": layer_name,
@@ -487,7 +487,7 @@ def _check_minority_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
         layer_db_details = []
         for model, evaluation in model_results.items():
             if is_valid_semantic_qa_result(evaluation) and getattr(evaluation, "deal_breaker", False):
-                evaluator = get_evaluator_alias(evaluation, fallback=model)
+                evaluator = get_evaluator_alias(evaluation, fallback=None)
                 layer_db_details.append(
                     {
                         "layer": layer_name,
@@ -540,7 +540,7 @@ def _check_50_50_tie_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
         for model, evaluation in model_results.items():
             if not is_valid_semantic_qa_result(evaluation):
                 continue
-            evaluator = get_evaluator_alias(evaluation, fallback=model)
+            evaluator = get_evaluator_alias(evaluation, fallback=None)
             if evaluation.deal_breaker:
                 deal_breaker_count += 1
                 layer_details.append(

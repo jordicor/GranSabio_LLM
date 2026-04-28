@@ -9,11 +9,11 @@ Tests the complete attachment lifecycle:
 - Error scenarios
 """
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 import base64
 import io
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
 # Note: Fixtures inherited from conftest.py:
 # - bypass_ip_filter (autouse)
@@ -116,8 +116,9 @@ def attachment_test_client(mock_attachment_manager, mock_rate_limiter, mock_ai_s
          patch('ai_service.get_ai_service', return_value=mock_ai_service), \
          patch('core.app_state._ensure_services'), \
          patch('preflight_validator.run_preflight_validation', AsyncMock(return_value=mock_preflight_proceed)):
-        from main import app
         from fastapi.testclient import TestClient
+
+        from main import app
         client = TestClient(app, headers={"X-Forwarded-For": "127.0.0.1"})
         yield client
 

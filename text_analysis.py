@@ -10,8 +10,7 @@ Author: Claude Code Implementation
 import re
 import unicodedata
 from collections import Counter
-from typing import List, Tuple, Optional
-
+from typing import List, Optional, Tuple
 
 # =========================
 # Generic Text Analysis Functions

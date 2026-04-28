@@ -7,11 +7,11 @@ whether content meets quality standards across all layers.
 """
 
 import logging
-from typing import Dict, List, Any, Optional, Tuple, Set, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from ai_service import AIService, get_ai_service
-from models import QALayer, QAEvaluation, ConsensusResult
 from model_aliasing import ModelAliasRegistry, get_evaluator_alias
+from models import ConsensusResult, QAEvaluation, QALayer
 
 if TYPE_CHECKING:
     from logging_utils import PhaseLogger
@@ -24,11 +24,11 @@ CONSENSUS_EXCLUDED_LAYER_NAMES = {"Evidence Grounding"}
 
 class ConsensusEngine:
     """Consensus calculation and decision engine"""
-    
+
     def __init__(self, ai_service: Optional[AIService] = None):
         """Initialize Consensus Engine with optional shared AI service."""
         self.ai_service = ai_service if ai_service is not None else get_ai_service()
-    
+
     async def calculate_consensus(
         self,
         content: str,
@@ -63,18 +63,18 @@ class ConsensusEngine:
                     layer_averages[layer_name] = 0.0
             else:
                 layer_averages[layer_name] = 0.0
-        
+
         # Calculate model averages
         per_model_averages = self._calculate_model_averages(qa_results)
-        
+
         # Calculate overall average
         all_scores = [
             evaluation.score
             for _, _, evaluation in self._iter_consensus_scored_evaluations(qa_results)
         ]
-        
+
         average_score = sum(all_scores) / len(all_scores) if all_scores else 0.0
-        
+
         # Collect deal-breakers and aggregate feedback for iteration guidance
         deal_breakers: List[str] = []
         alias_registry = getattr(original_request, "_model_alias_registry", None) if original_request else None
@@ -85,7 +85,7 @@ class ConsensusEngine:
                         self._safe_get_evaluation_attr(evaluation, "reason") or "Deal-breaker detected"
                     evaluator_name = get_evaluator_alias(
                         evaluation,
-                        fallback=alias_registry.alias_for_identity(model, fallback=model) if alias_registry else model,
+                        fallback=alias_registry.alias_for_identity(model, fallback="Evaluator") if alias_registry else "Evaluator",
                     )
                     deal_breakers.append(f"{layer_name} ({evaluator_name}): {reason}")
 
@@ -118,17 +118,17 @@ class ConsensusEngine:
             feedback_by_layer=feedback_by_layer,
             actionable_feedback=actionable_feedback
         )
-    
+
     def _calculate_model_averages(self, qa_results: Dict[str, Dict[str, QAEvaluation]]) -> Dict[str, float]:
         """Calculate average scores per model across all layers"""
         model_scores = {}
-        
+
         # Collect scores by model
         for _, model, evaluation in self._iter_consensus_scored_evaluations(qa_results):
             if model not in model_scores:
                 model_scores[model] = []
             model_scores[model].append(evaluation.score)
-        
+
         # Calculate averages
         model_averages = {}
         for model, scores in model_scores.items():
@@ -148,7 +148,7 @@ class ConsensusEngine:
             for model, evaluation in layer_results.items():
                 if evaluation.score is not None:
                     yield layer_name, model, evaluation
-    
+
     async def _determine_approval(
         self,
         content: str,
@@ -161,7 +161,7 @@ class ConsensusEngine:
     ) -> bool:
         """
         Determine if content should be approved based on all criteria
-        
+
         Args:
             content: Original content
             qa_results: QA evaluation results
@@ -169,7 +169,7 @@ class ConsensusEngine:
             layer_averages: Calculated layer averages
             average_score: Overall average score
             deal_breakers: List of deal-breaker issues
-            
+
         Returns:
             Boolean indicating approval status
         """
@@ -222,7 +222,7 @@ class ConsensusEngine:
             for model_name, evaluation in model_results.items():
                 evaluator_name = get_evaluator_alias(
                     evaluation,
-                    fallback=alias_registry.alias_for_identity(model_name, fallback=model_name) if alias_registry else model_name,
+                    fallback=alias_registry.alias_for_identity(model_name, fallback="Evaluator") if alias_registry else "Evaluator",
                 )
                 score = self._safe_get_evaluation_attr(evaluation, "score", 0.0)
                 feedback_text = (self._safe_get_evaluation_attr(evaluation, "feedback", "") or "").strip()

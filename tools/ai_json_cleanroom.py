@@ -86,12 +86,12 @@ New CLI flags:
 
 from __future__ import annotations
 
+import argparse
 import re
 import sys
-import argparse
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union, Iterable, Callable
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 
 def _reject_invalid_constant(value: str):

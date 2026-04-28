@@ -6,7 +6,7 @@ content generation iterations.
 """
 
 import logging
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 # Use optimized JSON helper to align with rest of codebase
 import json_utils as json
@@ -17,10 +17,9 @@ if TYPE_CHECKING:
 from ai_service import StreamChunk
 from config import config
 from model_aliasing import ModelAliasRegistry, PromptPart
-from models import ContentRequest, PreflightResult, PreflightIssue, WordCountAnalysis
+from models import ContentRequest, PreflightIssue, PreflightResult, WordCountAnalysis
 from usage_tracking import UsageTracker
 from word_count_utils import word_count_config_to_dict
-
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +137,8 @@ def _build_validation_payload(
             "min_score": layer_data.get("min_score"),
             "is_mandatory": layer_data.get("is_mandatory") or layer_data.get("is_deal_breaker", False),
             "deal_breaker_criteria": layer_data.get("deal_breaker_criteria"),
+            "concise_on_pass": layer_data.get("concise_on_pass"),
+            "include_input_images": layer_data.get("include_input_images"),
             "order": layer_data.get("order"),
         })
 
@@ -740,6 +741,18 @@ async def run_preflight_validation(
             removed_count = original_layers - len(request.qa_layers)
             if removed_count > 0:
                 logger.info(f"Removed {removed_count} conflicting QA layers: {recommended_removals}")
+                auto_qa_layer_names = set(
+                    getattr(request, "_auto_qa_generated_layer_names", []) or []
+                )
+                if auto_qa_layer_names:
+                    removed_auto_qa = sorted(
+                        auto_qa_layer_names.intersection(str(name) for name in recommended_removals)
+                    )
+                    if removed_auto_qa:
+                        logger.info(
+                            "Preflight removed Auto-QA layer(s) due to word-count conflict: %s",
+                            ", ".join(removed_auto_qa),
+                        )
 
     llm_recommended_removals = (
         word_count_analysis.recommended_removals

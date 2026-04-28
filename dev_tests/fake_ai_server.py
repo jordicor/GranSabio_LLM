@@ -28,20 +28,21 @@ To use with GranSabio LLM:
 
 import asyncio
 import re
+import sys
 import time
 import uuid
-import sys
 from pathlib import Path
 
 # Add parent directory to path for json_utils import
 sys.path.insert(0, str(Path(__file__).parent.parent))
-import json_utils as json
 from typing import Optional, Tuple
 
 import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+
+import json_utils as json
 
 # Configuration
 FAKE_AI_PORT = 8989

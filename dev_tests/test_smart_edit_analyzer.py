@@ -9,8 +9,9 @@ Tests cover:
 - Integration with mock AI service
 """
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 
 class TestAnalyzeBasic:

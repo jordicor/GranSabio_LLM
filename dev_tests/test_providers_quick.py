@@ -4,9 +4,10 @@ Tests one cheap/fast model per provider with empty QA layers.
 """
 
 import asyncio
-import aiohttp
-import time
 import sys
+import time
+
+import aiohttp
 
 API_BASE_URL = "http://localhost:8000"
 

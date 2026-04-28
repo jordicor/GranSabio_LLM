@@ -5,17 +5,18 @@ Tests the new counted phrase format functionality added in Phase 3.1
 to ensure proper parsing and validation.
 """
 
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from smart_edit.locators import (
+    extract_phrase_from_response,
+    locate_by_markers,
+    normalize_for_matching,
+    normalize_source_text,
     parse_counted_phrase,
     validate_counted_phrase_format,
-    extract_phrase_from_response,
-    normalize_source_text,
-    normalize_for_matching,
-    locate_by_markers,
 )
 
 

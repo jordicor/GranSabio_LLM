@@ -10,18 +10,18 @@ This module tests:
 - Temperature and thinking mode policies
 """
 
-import pytest
 import asyncio
-import aiohttp
-from unittest.mock import AsyncMock, Mock, MagicMock, patch
-from typing import Dict, Any
 from types import SimpleNamespace
+from typing import Any, Dict
+from unittest.mock import AsyncMock, Mock, patch
+
+import aiohttp
+import pytest
 
 # Import the module under test
-from ai_service import AIService, AIRequestError, _ensure_aiohttp_compatibility
+from ai_service import AIRequestError, AIService, _ensure_aiohttp_compatibility
 from deterministic_validation import DraftValidationResult
 from tool_loop_models import OutputContract, ToolLoopEnvelope
-
 
 # ============================================================================
 # Fixtures
