@@ -22,6 +22,8 @@ Gran Sabio LLM Engine is a sophisticated content generation API that uses multip
 
 The generation workflow: Client request → **Preflight validation** → Content generation → Multi-layer QA evaluation → **Arbiter** (edit conflict resolution per layer) → Smart-edit application → Consensus calculation → Approval/retry → Gran Sabio escalation (if needed).
 
+**Open source vs SaaS separation**: The GranSabio engine (text generation, QA layers, consensus, arbiter, preflight, etc.) is open source and synced to GitHub. The SaaS layer (`saas/`) — auth, billing, UI, admin, infrastructure — is private, paid code. It is excluded from the GitHub sync (`tools/sync_github/`) but tracked in the local dev repo. There is no BYOK, no custom domains, no marketplace, no white label. Anyone wanting a hosted interface, user management, billing, or ready-to-use infrastructure pays for the SaaS.
+
 ## Development Commands
 
 ```bash

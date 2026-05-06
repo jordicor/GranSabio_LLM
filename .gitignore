@@ -117,6 +117,8 @@ cache/
 !requirements.txt
 !core/trusted_proxies.txt
 !dev_tests/fake_ai/*.txt
+!/docs/
+!/docs/**
 
 # Specific files to exclude
 pgbench_test.ps1

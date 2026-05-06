@@ -98,20 +98,13 @@ def _load_internal_networks() -> List[ipaddress.IPv4Network | ipaddress.IPv6Netw
         networks = [ipaddress.ip_network(cidr) for cidr in DEFAULT_INTERNAL_NETWORK_CIDRS]
     return networks
 
-# Paths that are always allowed (health checks, static files, etc.)
-# These bypass IP filtering even when middleware is active
-PUBLIC_PATHS: Set[str] = {
-    '/health',
-    '/openapi.json',
-    '/docs',
-    '/redoc',
-}
-
-# Path prefixes that are always allowed
-PUBLIC_PATH_PREFIXES: tuple[str, ...] = (
-    '/static/',
-    '/templates/docs/',  # documentation static files
-)
+# Paths/prefixes that bypass IP filtering.
+#
+# Gran Sabio's open-source server is intended for self-hosted/internal use.
+# Keep these empty by default so health checks, API docs, static assets, and
+# every operational endpoint all require an allowed internal client IP.
+PUBLIC_PATHS: Set[str] = set()
+PUBLIC_PATH_PREFIXES: tuple[str, ...] = ()
 
 
 # =============================================================================

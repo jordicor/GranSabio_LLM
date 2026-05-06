@@ -377,6 +377,47 @@ class TestEnvironmentLoading:
                 assert cfg.ATTACHMENTS.max_size_bytes == 20971520
                 assert cfg.ATTACHMENTS.max_files_per_request == 10
 
+    def test_attachment_dedupe_defaults_are_rollout_safe(self, minimal_model_specs):
+        """Given: No dedupe env vars, Then: Dedupe rollout flags are conservative"""
+        import json_utils as json
+        specs_json = json.dumps(minimal_model_specs)
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("builtins.open", mock_open(read_data=specs_json)):
+                from config import Config
+                cfg = Config()
+                assert cfg.ATTACHMENTS.dedupe_read_enabled is False
+                assert cfg.ATTACHMENTS.dedupe_write_enabled is False
+                assert cfg.ATTACHMENTS.legacy_read_fallback_enabled is True
+                assert cfg.ATTACHMENTS.legacy_write_index_enabled is True
+                assert cfg.ATTACHMENTS.blob_gc_enabled is False
+
+    def test_attachment_dedupe_settings_from_env(self, minimal_model_specs):
+        """Given: Dedupe env vars, Then: Config loads paths and booleans"""
+        import json_utils as json
+        specs_json = json.dumps(minimal_model_specs)
+
+        env = {
+            "ATTACHMENTS_DEDUPE_READ_ENABLED": "true",
+            "ATTACHMENTS_DEDUPE_WRITE_ENABLED": "1",
+            "ATTACHMENTS_DEDUPE_DB_PATH": "/tmp/attachments.sqlite3",
+            "ATTACHMENTS_BLOB_BASE_PATH": "/tmp/attachment_blobs",
+            "ATTACHMENTS_LEGACY_READ_FALLBACK_ENABLED": "false",
+            "ATTACHMENTS_LEGACY_WRITE_INDEX_ENABLED": "0",
+            "ATTACHMENTS_BLOB_GC_ENABLED": "yes",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch("builtins.open", mock_open(read_data=specs_json)):
+                from config import Config
+                cfg = Config()
+                assert cfg.ATTACHMENTS.dedupe_read_enabled is True
+                assert cfg.ATTACHMENTS.dedupe_write_enabled is True
+                assert cfg.ATTACHMENTS.dedupe_db_path == "/tmp/attachments.sqlite3"
+                assert cfg.ATTACHMENTS.blob_base_path == "/tmp/attachment_blobs"
+                assert cfg.ATTACHMENTS.legacy_read_fallback_enabled is False
+                assert cfg.ATTACHMENTS.legacy_write_index_enabled is False
+                assert cfg.ATTACHMENTS.blob_gc_enabled is True
+
     def test_attachment_mime_types_from_env(self, minimal_model_specs):
         """Given: ATTACHMENTS_ALLOWED_MIME_TYPES in env, Then: Config parses CSV"""
         import json_utils as json

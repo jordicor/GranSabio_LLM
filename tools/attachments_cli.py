@@ -7,14 +7,15 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import json_utils as json
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import json_utils as json  # noqa: E402
+
 from config import config  # noqa: E402
 from services.attachment_manager import (  # noqa: E402
+    AttachmentError,
     AttachmentManager,
     AttachmentNotFoundError,
     AttachmentValidationError,
@@ -115,40 +116,44 @@ def _command_delete(args: argparse.Namespace) -> int:
     if not args.username:
         raise CLIError("--username is required for deletion operations")
     manager = _resolve_manager()
-    try:
-        resolved = manager.resolve_attachment(username=args.username, upload_id=args.upload_id)
-    except AttachmentNotFoundError as exc:
-        raise CLIError(str(exc)) from exc
-    except AttachmentValidationError as exc:
-        raise CLIError(str(exc)) from exc
-
-    attachment_info = {
-        "upload_id": resolved.record.upload_id,
-        "original_filename": resolved.record.original_filename,
-        "stored_filename": resolved.record.stored_filename,
-        "binary_path": str(resolved.binary_path),
-        "metadata_path": str(resolved.metadata_path),
-        "size_bytes": resolved.record.size_bytes,
-        "created_at": resolved.record.created_at,
-    }
-    print(json.dumps(attachment_info, ensure_ascii=False, indent=2))
 
     if not args.commit:
+        try:
+            resolved = manager.resolve_attachment(username=args.username, upload_id=args.upload_id)
+        except AttachmentNotFoundError as exc:
+            raise CLIError(str(exc)) from exc
+        except AttachmentValidationError as exc:
+            raise CLIError(str(exc)) from exc
+
+        attachment_info = {
+            "upload_id": resolved.record.upload_id,
+            "original_filename": resolved.record.original_filename,
+            "stored_filename": resolved.record.stored_filename,
+            "binary_path": str(resolved.binary_path),
+            "metadata_path": str(resolved.metadata_path),
+            "size_bytes": resolved.record.size_bytes,
+            "created_at": resolved.record.created_at,
+        }
+        print(json.dumps(attachment_info, ensure_ascii=False, indent=2))
         print("\nDry-run mode: no files were removed. Re-run with --commit to delete.")
         return 0
 
-    removed = 0
-    for path in (resolved.binary_path, resolved.metadata_path):
-        try:
-            path.unlink()
-            removed += 1
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            raise CLIError(f"Failed to delete {path}: {exc}") from exc
+    try:
+        result = manager.delete_attachment(
+            username=args.username,
+            upload_id=args.upload_id,
+            reason="attachments_cli delete",
+        )
+    except AttachmentError as exc:
+        raise CLIError(str(exc)) from exc
 
-    manager.run_cleanup(dry_run=False, username=args.username)
-    print(f"Removed {removed} file(s) and rebuilt index for user {args.username}.")
+    if result.get("db_backed"):
+        print(
+            "Deleted logical DB upload; shared blob was left for garbage collection. "
+            f"Removed {result.get('removed_files', 0)} legacy mirror file(s)."
+        )
+    else:
+        print(f"Removed {result.get('removed_files', 0)} file(s) and rebuilt index for user {args.username}.")
     return 0
 
 

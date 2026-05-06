@@ -276,6 +276,34 @@ class AttachmentSettings(BaseModel):
         ge=1,
         description="Days to retain attachments before cleanup removes them",
     )
+    dedupe_read_enabled: bool = Field(
+        default=False,
+        description="Read attachment metadata from the deduplicated SQLite store before legacy files",
+    )
+    dedupe_write_enabled: bool = Field(
+        default=False,
+        description="Persist new attachments through the deduplicated blob store",
+    )
+    dedupe_db_path: str = Field(
+        default="data/attachments/attachments.sqlite3",
+        description="SQLite database path for deduplicated attachment metadata",
+    )
+    blob_base_path: str = Field(
+        default="data/attachment_blobs",
+        description="Base directory for content-addressed attachment blobs",
+    )
+    legacy_read_fallback_enabled: bool = Field(
+        default=True,
+        description="Allow legacy user-scoped file lookup when the dedupe store has no upload row",
+    )
+    legacy_write_index_enabled: bool = Field(
+        default=True,
+        description="Write legacy metadata/index mirrors for DB-backed uploads during rollout",
+    )
+    blob_gc_enabled: bool = Field(
+        default=False,
+        description="Allow physical garbage collection of unreferenced dedupe blobs",
+    )
 
 
 class FeedbackMemorySettings(BaseModel):
@@ -914,6 +942,59 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                     self.ATTACHMENTS.retention_days = parsed
             except ValueError:
                 pass
+
+        dedupe_read_override = os.getenv("ATTACHMENTS_DEDUPE_READ_ENABLED")
+        if dedupe_read_override is not None:
+            self.ATTACHMENTS.dedupe_read_enabled = dedupe_read_override.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+
+        dedupe_write_override = os.getenv("ATTACHMENTS_DEDUPE_WRITE_ENABLED")
+        if dedupe_write_override is not None:
+            self.ATTACHMENTS.dedupe_write_enabled = dedupe_write_override.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+
+        dedupe_db_path_override = os.getenv("ATTACHMENTS_DEDUPE_DB_PATH")
+        if dedupe_db_path_override:
+            self.ATTACHMENTS.dedupe_db_path = dedupe_db_path_override
+
+        blob_base_path_override = os.getenv("ATTACHMENTS_BLOB_BASE_PATH")
+        if blob_base_path_override:
+            self.ATTACHMENTS.blob_base_path = blob_base_path_override
+
+        legacy_read_override = os.getenv("ATTACHMENTS_LEGACY_READ_FALLBACK_ENABLED")
+        if legacy_read_override is not None:
+            self.ATTACHMENTS.legacy_read_fallback_enabled = legacy_read_override.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+
+        legacy_write_override = os.getenv("ATTACHMENTS_LEGACY_WRITE_INDEX_ENABLED")
+        if legacy_write_override is not None:
+            self.ATTACHMENTS.legacy_write_index_enabled = legacy_write_override.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+
+        blob_gc_override = os.getenv("ATTACHMENTS_BLOB_GC_ENABLED")
+        if blob_gc_override is not None:
+            self.ATTACHMENTS.blob_gc_enabled = blob_gc_override.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
 
         debugger_enabled_override = os.getenv("DEBUGGER_ENABLED")
         if debugger_enabled_override:

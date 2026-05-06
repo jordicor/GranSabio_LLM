@@ -12,6 +12,7 @@ import mimetypes
 import re
 import secrets
 import socket
+import tempfile
 import time
 import unicodedata
 import uuid
@@ -27,6 +28,13 @@ from pydantic import BaseModel, Field, ValidationError
 
 import json_utils as json
 from config import AttachmentSettings
+from services.attachment_store import (
+    AttachmentStore,
+    AttachmentStoreConflictError,
+    AttachmentStoreError,
+    AttachmentStoreIntegrityError,
+    AttachmentUploadRow,
+)
 
 try:
     import magic  # type: ignore
@@ -140,7 +148,7 @@ class CleanupReport:
 
 
 class AttachmentManager:
-    """Persist attachments with SPARK-compatible layout and metadata."""
+    """Persist attachments with hashed per-user storage layout and metadata."""
 
     CHUNK_SIZE = 1024 * 1024  # 1 MB per chunk when streaming uploads
     _REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
@@ -164,8 +172,13 @@ class AttachmentManager:
             raise ValueError("PEPPER must be configured before using AttachmentManager")
 
         self.settings = settings
+        if settings.dedupe_write_enabled and not settings.dedupe_read_enabled:
+            raise ValueError("Attachment dedupe writes require dedupe reads to be enabled")
         self.base_path = Path(settings.base_path)
         self.base_path.mkdir(parents=True, exist_ok=True)
+        self.store = AttachmentStore(settings=settings)
+        if settings.dedupe_read_enabled or settings.dedupe_write_enabled:
+            self.store.ensure_schema()
         self.pepper = pepper
         self.index_history_limit = settings.index_history_limit
         self._recent_url_cache: Dict[Tuple[str, str], Tuple[str, str, float]] = {}
@@ -318,10 +331,11 @@ class AttachmentManager:
             raise AttachmentValidationError("URL port is invalid") from exc
         port = self._determine_port(parsed.scheme.lower(), port_value)
 
-        cached = await self._get_cached_url_record(username=username, url=normalized_url)
-        if cached:
-            logger.info("Using cached attachment %s for URL %s", cached.upload_id, normalized_url)
-            return cached
+        if not (self.settings.dedupe_read_enabled or self.settings.dedupe_write_enabled):
+            cached = await self._get_cached_url_record(username=username, url=normalized_url)
+            if cached:
+                logger.info("Using cached attachment %s for URL %s", cached.upload_id, normalized_url)
+                return cached
 
         headers = {"User-Agent": self.settings.url_user_agent}
         timeout = httpx.Timeout(
@@ -419,7 +433,8 @@ class AttachmentManager:
 
                 break
 
-        await self._update_url_cache(username=username, url=normalized_url, record=record)
+        if not (self.settings.dedupe_read_enabled or self.settings.dedupe_write_enabled):
+            await self._update_url_cache(username=username, url=normalized_url, record=record)
         return record
 
     def get_metadata(self, *, username: str, upload_id: str) -> AttachmentRecord:
@@ -430,6 +445,39 @@ class AttachmentManager:
             raise AttachmentValidationError("upload_id is required to fetch attachment metadata")
 
         prefix1, prefix2, user_hash = self.generate_user_hash(username)
+        if self.settings.dedupe_read_enabled:
+            if self.store.deletion_exists(user_hash=user_hash, upload_id=upload_id):
+                raise AttachmentNotFoundError("Attachment metadata not found")
+
+            row = self.store.get_upload(user_hash=user_hash, upload_id=upload_id)
+            if row is not None:
+                if row.status != "active" or row.blob.status != "ready":
+                    raise AttachmentNotFoundError("Attachment is not available")
+                return self._record_from_store_row(row)
+
+            if not self.settings.legacy_read_fallback_enabled:
+                raise AttachmentNotFoundError("Attachment metadata not found")
+
+        return self._get_metadata_legacy(
+            username=username,
+            upload_id=upload_id,
+            prefix1=prefix1,
+            prefix2=prefix2,
+            user_hash=user_hash,
+        )
+
+    def _get_metadata_legacy(
+        self,
+        *,
+        username: str,
+        upload_id: str,
+        prefix1: Optional[str] = None,
+        prefix2: Optional[str] = None,
+        user_hash: Optional[str] = None,
+    ) -> AttachmentRecord:
+        """Retrieve stored metadata from the legacy user-scoped index."""
+        if prefix1 is None or prefix2 is None or user_hash is None:
+            prefix1, prefix2, user_hash = self.generate_user_hash(username)
         user_root = self._user_root(prefix1, prefix2, user_hash)
         index_path = user_root / "uploads" / "index.json"
 
@@ -482,6 +530,37 @@ class AttachmentManager:
         upload_id: str,
     ) -> ResolvedAttachment:
         """Resolve metadata into absolute paths ensuring resources exist."""
+        if self.settings.dedupe_read_enabled:
+            prefix1, prefix2, user_hash = self.generate_user_hash(username)
+            if self.store.deletion_exists(user_hash=user_hash, upload_id=upload_id):
+                raise AttachmentNotFoundError("Attachment metadata not found")
+
+            row = self.store.get_upload(user_hash=user_hash, upload_id=upload_id)
+            if row is not None:
+                if row.status != "active" or row.blob.status != "ready":
+                    raise AttachmentNotFoundError("Attachment is not available")
+                record = self._record_from_store_row(row)
+                binary_path = self.store.blob_path(row.blob.storage_key)
+                if not binary_path.exists():
+                    raise AttachmentNotFoundError("Attachment binary is missing from storage")
+
+                user_root = self._user_root(prefix1, prefix2, user_hash)
+                metadata_path = user_root / Path(record.metadata_path)
+                if not metadata_path.exists():
+                    metadata_path = self.store.db_path
+                if not metadata_path.exists():
+                    raise AttachmentNotFoundError("Attachment metadata file is missing from storage")
+
+                return ResolvedAttachment(
+                    username=username,
+                    record=record,
+                    binary_path=binary_path,
+                    metadata_path=metadata_path,
+                )
+
+            if not self.settings.legacy_read_fallback_enabled:
+                raise AttachmentNotFoundError("Attachment metadata not found")
+
         record = self.get_metadata(username=username, upload_id=upload_id)
         prefix1, prefix2, user_hash = self.generate_user_hash(username)
         user_root = self._user_root(prefix1, prefix2, user_hash)
@@ -500,6 +579,167 @@ class AttachmentManager:
             metadata_path=metadata_path,
         )
 
+    def delete_attachment(self, *, username: str, upload_id: str, reason: str = "manual delete") -> Dict[str, Any]:
+        """Delete a logical attachment without directly unlinking shared DB blobs."""
+        if not username:
+            raise AttachmentValidationError("username is required to delete attachment")
+        if not upload_id:
+            raise AttachmentValidationError("upload_id is required to delete attachment")
+
+        prefix1, prefix2, user_hash = self.generate_user_hash(username)
+        user_root = self._user_root(prefix1, prefix2, user_hash)
+
+        if self.settings.dedupe_read_enabled:
+            if self.store.deletion_exists(user_hash=user_hash, upload_id=upload_id):
+                cleaned = self._cleanup_legacy_upload_files_by_id(user_root=user_root, upload_id=upload_id)
+                if cleaned:
+                    return {
+                        "db_backed": True,
+                        "removed_files": cleaned,
+                        "blob_deleted": False,
+                    }
+                raise AttachmentNotFoundError("Attachment metadata not found")
+
+            row = self.store.get_upload(user_hash=user_hash, upload_id=upload_id)
+            if row is not None:
+                if row.status != "active":
+                    raise AttachmentNotFoundError("Attachment is not available")
+                record = self._record_from_store_row(row)
+                removed_files = self._cleanup_legacy_upload_files(
+                    user_root=user_root,
+                    record=record,
+                    expected_sha256=row.blob.sha256,
+                    expected_size=row.blob.size_bytes,
+                    require_binary_match=True,
+                )
+                try:
+                    deleted = self.store.delete_upload(user_hash=user_hash, upload_id=upload_id, reason=reason)
+                except Exception:
+                    self._restore_legacy_metadata_if_missing(user_root=user_root, record=record)
+                    raise
+                if not deleted:
+                    raise AttachmentNotFoundError("Attachment metadata not found")
+                self._remove_index_entry(user_root / "uploads" / "index.json", upload_id)
+                return {
+                    "db_backed": True,
+                    "removed_files": removed_files,
+                    "blob_deleted": False,
+                }
+
+            if not self.settings.legacy_read_fallback_enabled:
+                raise AttachmentNotFoundError("Attachment metadata not found")
+
+        resolved = self.resolve_attachment(username=username, upload_id=upload_id)
+        removed_files = 0
+        for path in (resolved.binary_path, resolved.metadata_path):
+            try:
+                path.unlink()
+                removed_files += 1
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise AttachmentError(f"Failed to delete {path}: {exc}") from exc
+
+        self.run_cleanup(dry_run=False, username=username)
+        return {
+            "db_backed": False,
+            "removed_files": removed_files,
+            "blob_deleted": True,
+        }
+
+    def _cleanup_legacy_upload_files(
+        self,
+        *,
+        user_root: Path,
+        record: AttachmentRecord,
+        expected_sha256: Optional[str],
+        expected_size: Optional[int],
+        require_binary_match: bool,
+    ) -> int:
+        removed_files = 0
+        binary_path = user_root / Path(record.storage_path)
+        metadata_path = user_root / Path(record.metadata_path)
+
+        if binary_path.exists():
+            if self._relative_path(user_root, binary_path) is None:
+                raise AttachmentError("Refusing to delete legacy binary outside user root")
+            if require_binary_match:
+                checksum, size_bytes = self._compute_file_digest(binary_path)
+                if checksum != expected_sha256 or size_bytes != expected_size:
+                    raise AttachmentError("Refusing to delete legacy binary that no longer matches DB blob")
+            try:
+                binary_path.unlink()
+                removed_files += 1
+            except OSError as exc:
+                raise AttachmentError(f"Failed to delete legacy binary: {exc}") from exc
+
+        if metadata_path.exists():
+            if self._relative_path(user_root, metadata_path) is None:
+                raise AttachmentError("Refusing to delete metadata mirror outside user root")
+            try:
+                metadata_path.unlink()
+                removed_files += 1
+            except OSError as exc:
+                raise AttachmentError(f"Failed to delete metadata mirror: {exc}") from exc
+
+        return removed_files
+
+    def _cleanup_legacy_upload_files_by_id(self, *, user_root: Path, upload_id: str) -> int:
+        uploads_dir = user_root / "uploads"
+        if not uploads_dir.exists():
+            return 0
+        removed_files = 0
+        for metadata_path in sorted(uploads_dir.rglob("metadata.json")):
+            try:
+                with metadata_path.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                record = AttachmentRecord(**payload)
+            except Exception:
+                continue
+            if record.upload_id != upload_id:
+                continue
+            removed_files += self._cleanup_legacy_upload_files(
+                user_root=user_root,
+                record=record,
+                expected_sha256=record.sha256,
+                expected_size=record.size_bytes,
+                require_binary_match=True,
+            )
+        self._remove_index_entry(user_root / "uploads" / "index.json", upload_id)
+        return removed_files
+
+    def _restore_legacy_metadata_if_missing(self, *, user_root: Path, record: AttachmentRecord) -> None:
+        metadata_path = user_root / Path(record.metadata_path)
+        if metadata_path.exists():
+            return
+        if self._relative_path(user_root, metadata_path) is None:
+            return
+        try:
+            self._write_metadata(metadata_path, record)
+            self._update_index(user_root / "uploads" / "index.json", record)
+        except Exception as exc:  # pragma: no cover - best effort rollback aid
+            logger.warning("Failed to restore attachment metadata mirror after DB delete failure: %s", exc)
+
+    def _remove_index_entry(self, index_file: Path, upload_id: str) -> None:
+        if not index_file.exists():
+            return
+        try:
+            with index_file.open("r", encoding="utf-8") as fh:
+                entries: List[Dict[str, Any]] = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return
+        updated = [entry for entry in entries if entry.get("upload_id") != upload_id]
+        if len(updated) == len(entries):
+            return
+        temp_file = index_file.with_suffix(".tmp")
+        try:
+            with temp_file.open("w", encoding="utf-8") as fh:
+                json.dump(updated, fh, ensure_ascii=True, indent=2)
+            temp_file.replace(index_file)
+        except Exception:
+            temp_file.unlink(missing_ok=True)
+            raise
+
     def build_preflight_summary(self, resolved: ResolvedAttachment) -> Dict[str, Any]:
         """Return metadata snapshot safe for validation and logging layers."""
         summary = resolved.summary()
@@ -511,6 +751,32 @@ class AttachmentManager:
             }
         )
         return summary
+
+    def _record_from_store_row(self, row: AttachmentUploadRow) -> AttachmentRecord:
+        """Convert a DB-backed upload row to the public attachment metadata schema."""
+        storage_path = row.legacy_storage_path or f"dedupe/{row.upload_id}/{row.stored_filename}"
+        metadata_path = row.legacy_metadata_path or f"dedupe/{row.upload_id}/metadata.json"
+        return AttachmentRecord(
+            upload_id=row.upload_id,
+            origin=row.origin,
+            intended_usage=row.intended_usage,
+            original_filename=row.original_filename,
+            stored_filename=row.stored_filename,
+            mime_type=row.mime_type,
+            size_bytes=row.blob.size_bytes,
+            declared_size=row.declared_size,
+            declared_mime=row.declared_mime,
+            detected_mime=row.detected_mime,
+            sha256=row.blob.sha256,
+            metadata_signature=row.metadata_signature,
+            original_url=row.original_url,
+            created_at=row.created_at,
+            hash_prefix1=row.hash_prefix1,
+            hash_prefix2=row.hash_prefix2,
+            user_hash=row.user_hash,
+            storage_path=storage_path,
+            metadata_path=metadata_path,
+        )
 
     def load_text_preview(self, resolved: ResolvedAttachment, *, max_bytes: int = 4096) -> Optional[str]:
         """Load a small preview of textual attachments for prompt context."""
@@ -1063,6 +1329,47 @@ class AttachmentManager:
         data_stream: AsyncIterator[bytes],
         source_url: Optional[str],
     ) -> AttachmentRecord:
+        if self.settings.dedupe_write_enabled:
+            return await self._persist_content_dedupe(
+                username=username,
+                sanitized_filename=sanitized_filename,
+                original_filename=original_filename,
+                intended_usage=intended_usage,
+                origin=origin,
+                resolved_mime=resolved_mime,
+                declared_mime=declared_mime,
+                declared_size=declared_size,
+                data_stream=data_stream,
+                source_url=source_url,
+            )
+
+        return await self._persist_content_legacy(
+            username=username,
+            sanitized_filename=sanitized_filename,
+            original_filename=original_filename,
+            intended_usage=intended_usage,
+            origin=origin,
+            resolved_mime=resolved_mime,
+            declared_mime=declared_mime,
+            declared_size=declared_size,
+            data_stream=data_stream,
+            source_url=source_url,
+        )
+
+    async def _persist_content_legacy(
+        self,
+        *,
+        username: str,
+        sanitized_filename: str,
+        original_filename: str,
+        intended_usage: str,
+        origin: str,
+        resolved_mime: str,
+        declared_mime: Optional[str],
+        declared_size: Optional[int],
+        data_stream: AsyncIterator[bytes],
+        source_url: Optional[str],
+    ) -> AttachmentRecord:
         prefix1, prefix2, user_hash = self.generate_user_hash(username)
         user_root = self._user_root(prefix1, prefix2, user_hash)
 
@@ -1162,6 +1469,167 @@ class AttachmentManager:
         await self._update_index_async(user_root / "uploads" / "index.json", record, user_hash)
 
         logger.info("Stored attachment %s for hash %s", upload_id, user_hash)
+        return record
+
+    async def _persist_content_dedupe(
+        self,
+        *,
+        username: str,
+        sanitized_filename: str,
+        original_filename: str,
+        intended_usage: str,
+        origin: str,
+        resolved_mime: str,
+        declared_mime: Optional[str],
+        declared_size: Optional[int],
+        data_stream: AsyncIterator[bytes],
+        source_url: Optional[str],
+    ) -> AttachmentRecord:
+        prefix1, prefix2, user_hash = self.generate_user_hash(username)
+        user_root = self._user_root(prefix1, prefix2, user_hash)
+        now = datetime.utcnow()
+        upload_id = uuid.uuid4().hex
+        created_at = now.replace(microsecond=0).isoformat() + "Z"
+
+        temp_dir = self.store.blob_base_path / "_tmp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_handle = tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix="upload-",
+            suffix=".tmp",
+            dir=temp_dir,
+            delete=False,
+        )
+        temp_path = Path(temp_handle.name)
+        sha256 = hashlib.sha256()
+        total_bytes = 0
+        sample = bytearray()
+
+        try:
+            with temp_handle as destination:
+                async for chunk in data_stream:
+                    if not chunk:
+                        continue
+                    if len(sample) < self.settings.magic_sample_bytes:
+                        needed = self.settings.magic_sample_bytes - len(sample)
+                        sample.extend(chunk[:needed])
+                    total_bytes += len(chunk)
+                    if total_bytes > self.settings.max_size_bytes:
+                        raise AttachmentTooLargeError(
+                            f"Attachment exceeds allowed size of {self.settings.max_size_bytes} bytes"
+                        )
+                    destination.write(chunk)
+                    sha256.update(chunk)
+        except AttachmentTooLargeError:
+            temp_path.unlink(missing_ok=True)
+            raise
+        except Exception as exc:  # pragma: no cover - unexpected I/O failure
+            temp_path.unlink(missing_ok=True)
+            raise AttachmentError("Unable to persist attachment contents") from exc
+
+        try:
+            self._validate_declared_size(actual=total_bytes, declared=declared_size)
+        except AttachmentValidationError:
+            temp_path.unlink(missing_ok=True)
+            raise
+
+        detected_mime = self._detect_mime(bytes(sample), temp_path)
+        final_mime = resolved_mime
+        try:
+            if detected_mime:
+                self._validate_mime(detected_mime, source="detected")
+                if declared_mime and not self._mime_equivalent(detected_mime, declared_mime):
+                    raise AttachmentValidationError(
+                        "Detected MIME does not match declared MIME type"
+                    )
+                if resolved_mime and not self._mime_equivalent(detected_mime, resolved_mime):
+                    raise AttachmentValidationError(
+                        "Detected MIME does not align with file extension"
+                    )
+                final_mime = detected_mime
+            else:
+                self._validate_mime(resolved_mime, source="declared")
+        except AttachmentValidationError:
+            temp_path.unlink(missing_ok=True)
+            raise
+
+        if magic is None:
+            safe_mime = (final_mime or "").lower()
+            if safe_mime not in self._SAFE_MIME_WHEN_MAGIC_MISSING:
+                temp_path.unlink(missing_ok=True)
+                raise AttachmentValidationError("MIME type is not permitted without python-magic")
+
+        blob_kind = self._attachment_kind(final_mime=final_mime, stored_filename=sanitized_filename)
+        relative_dir = Path("uploads") / f"{now.year:04d}" / f"{now.month:02d}" / upload_id
+        if self.settings.legacy_write_index_enabled:
+            public_storage_path = (relative_dir / sanitized_filename).as_posix()
+            public_metadata_path = (relative_dir / "metadata.json").as_posix()
+        else:
+            public_storage_path = f"dedupe/{upload_id}/{sanitized_filename}"
+            public_metadata_path = f"dedupe/{upload_id}/metadata.json"
+
+        record_payload = {
+            "upload_id": upload_id,
+            "origin": origin,
+            "intended_usage": intended_usage,
+            "original_filename": original_filename,
+            "stored_filename": sanitized_filename,
+            "mime_type": final_mime,
+            "detected_mime": detected_mime,
+            "size_bytes": total_bytes,
+            "declared_size": declared_size,
+            "declared_mime": declared_mime,
+            "sha256": sha256.hexdigest(),
+            "original_url": source_url,
+            "created_at": created_at,
+            "hash_prefix1": prefix1,
+            "hash_prefix2": prefix2,
+            "user_hash": user_hash,
+            "storage_path": public_storage_path,
+            "metadata_path": public_metadata_path,
+        }
+        record_payload["metadata_signature"] = self._compute_metadata_signature(record_payload)
+
+        try:
+            row = self.store.create_upload_from_temp(
+                upload_id=upload_id,
+                user_hash=user_hash,
+                hash_prefix1=prefix1,
+                hash_prefix2=prefix2,
+                origin=origin,
+                intended_usage=intended_usage,
+                original_filename=original_filename,
+                stored_filename=sanitized_filename,
+                mime_type=final_mime,
+                declared_size=declared_size,
+                declared_mime=declared_mime,
+                detected_mime=detected_mime,
+                original_url=source_url,
+                sha256=record_payload["sha256"],
+                size_bytes=total_bytes,
+                kind=blob_kind,
+                temp_path=temp_path,
+                metadata_signature=record_payload["metadata_signature"],
+                created_at=created_at,
+                legacy_storage_path=public_storage_path,
+                legacy_metadata_path=public_metadata_path,
+                migrated_from_legacy=False,
+            )
+        except AttachmentStoreConflictError as exc:
+            raise AttachmentValidationError("Attachment upload could not be registered") from exc
+        except (AttachmentStoreIntegrityError, AttachmentStoreError) as exc:
+            raise AttachmentError("Unable to persist attachment contents") from exc
+
+        record = self._record_from_store_row(row)
+
+        if self.settings.legacy_write_index_enabled:
+            try:
+                self._write_metadata(user_root / public_metadata_path, record)
+                await self._update_index_async(user_root / "uploads" / "index.json", record, user_hash)
+            except Exception as exc:  # pragma: no cover - rollout diagnostic mirror failure
+                logger.warning("Failed to write legacy attachment metadata mirror: %s", exc)
+
+        logger.info("Stored deduplicated attachment %s for hash %s", upload_id, user_hash)
         return record
 
 
@@ -1276,6 +1744,20 @@ class AttachmentManager:
             return False
         return record.mime_type.startswith("image/")
 
+    def _attachment_kind(self, *, final_mime: str, stored_filename: str) -> str:
+        """Classify an allowed attachment into a physical dedupe namespace."""
+        normalized_mime = (final_mime or "").lower()
+        extension = Path(stored_filename).suffix.lower()
+        if normalized_mime.startswith("image/"):
+            return "image"
+        if normalized_mime == "application/pdf":
+            return "pdf"
+        if normalized_mime == "application/json" or extension == ".json":
+            return "json"
+        if normalized_mime.startswith("text/") or extension in {".txt", ".md", ".csv"}:
+            return "text"
+        raise AttachmentValidationError("Attachment MIME type is not supported by dedupe storage")
+
     def _validate_declared_size(self, *, actual: int, declared: Optional[int]) -> None:
         if declared is None:
             return
@@ -1369,6 +1851,8 @@ class AttachmentManager:
         candidate = candidate.lstrip('.')
         if not candidate:
             candidate = 'attachment'
+        if candidate.lower() == "metadata.json":
+            candidate = f"attachment_{candidate}"
         return candidate[:120]
 
     def _validate_extension(self, extension: str) -> None:
@@ -1443,8 +1927,7 @@ class AttachmentManager:
                 raise AttachmentValidationError("Download speed below safety threshold")
 
     def generate_user_hash(self, username: str) -> tuple[str, str, str]:
-        """Reproduce SPARK's hashing scheme for per-user storage layout."""
-        # FIXME: deduplicate with SPARK/common.py when projects converge
+        """Hash-based per-user storage layout."""
         data_to_hash = f"{username}{self.pepper}"
         hash_hex = hashlib.sha1(data_to_hash.encode("utf-8")).hexdigest()
         return hash_hex[:3], hash_hex[3:7], hash_hex

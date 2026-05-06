@@ -13,6 +13,7 @@ import signal
 import sys
 
 import core  # noqa: F401  # Ensure route modules are imported for side effects
+from core.app_state import app  # noqa: F401  # Re-export for uvicorn "main:app"
 
 
 def _force_exit(signum, frame):
