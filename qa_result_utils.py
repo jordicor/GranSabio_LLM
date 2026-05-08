@@ -3,17 +3,48 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Iterable, List, Optional
+import hashlib
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from model_aliasing import get_evaluator_alias
 
 TECHNICAL_QA_ERROR_TYPES = frozenset(
     {
         "api_failure",
+        "parse_error",
         "timeout",
         "unexpected",
         "technical_failure",
         "model_unavailable",
+    }
+)
+
+RETRYABLE_PROVIDER_FAILURE_KINDS = frozenset(
+    {
+        "transient_network",
+        "timeout",
+        "rate_limited",
+        "provider_overloaded",
+        "provider_down",
+    }
+)
+
+NON_RETRYABLE_PROVIDER_FAILURE_KINDS = frozenset(
+    {
+        "auth_invalid",
+        "permission_denied",
+        "billing_required",
+        "quota_exhausted",
+        "invalid_request",
+        "unsupported_parameter",
+        "unsupported_model",
+        "schema_invalid",
+        "context_overflow",
+        "content_policy",
+        "malformed_response",
+        "parse_failed",
+        "no_content",
+        "cancelled",
     }
 )
 
@@ -58,6 +89,209 @@ def is_technical_qa_failure(evaluation: Any) -> bool:
         or ""
     )
     return str(reason).strip().lower() in TECHNICAL_QA_FAILURE_REASONS
+
+
+def _stringify_metadata_value(value: Any) -> Optional[str]:
+    """Return a compact stable string for provider/debug metadata fields."""
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _read_mapping_or_attr(source: Any, key: str) -> Any:
+    if source is None:
+        return None
+    if isinstance(source, Mapping):
+        return source.get(key)
+    return getattr(source, key, None)
+
+
+def _provider_failure_from_exception(exc: Any) -> Any:
+    """Best-effort discovery of the future ProviderFailure shape without importing it."""
+
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        provider_failure = getattr(current, "provider_failure", None)
+        if provider_failure is not None:
+            return provider_failure
+        if getattr(current, "kind", None) is not None:
+            return current
+        current = getattr(current, "cause", None) or getattr(current, "__cause__", None)
+    return None
+
+
+def provider_failure_kind(exc: Any) -> Optional[str]:
+    """Return normalized provider failure kind when the new taxonomy is present."""
+
+    provider_failure = _provider_failure_from_exception(exc)
+    kind = _read_mapping_or_attr(provider_failure, "kind")
+    if kind is None:
+        kind = _read_mapping_or_attr(exc, "kind")
+    value = getattr(kind, "value", kind)
+    return _stringify_metadata_value(value)
+
+
+def _extract_provider_request_id(exc: Any) -> Optional[str]:
+    for attr in ("request_id", "response_id", "id", "correlation_id"):
+        value = _stringify_metadata_value(getattr(exc, attr, None))
+        if value:
+            return value
+    response = getattr(exc, "response", None)
+    if response is not None:
+        for attr in ("request_id", "id", "correlation_id"):
+            value = _stringify_metadata_value(getattr(response, attr, None))
+            if value:
+                return value
+    return None
+
+
+def extract_provider_request_id(exc: Any) -> Optional[str]:
+    """Find an upstream request/correlation id from wrappers, causes, or ProviderFailure."""
+
+    provider_failure = _provider_failure_from_exception(exc)
+    for attr in ("request_id", "correlation_id"):
+        value = _stringify_metadata_value(_read_mapping_or_attr(provider_failure, attr))
+        if value:
+            return value
+
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        value = _extract_provider_request_id(current)
+        if value:
+            return value
+        current = getattr(current, "cause", None) or getattr(current, "__cause__", None)
+    return None
+
+
+def derive_qa_correlation_id(
+    *,
+    session_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    layer_name: Optional[str] = None,
+    slot_id: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    error_type: Optional[str] = None,
+    original_exception_class: Optional[str] = None,
+    upstream_request_id: Optional[str] = None,
+) -> str:
+    """Build a deterministic id when no provider request id is available."""
+
+    if upstream_request_id:
+        return upstream_request_id
+    parts = [
+        session_id,
+        project_id,
+        layer_name,
+        slot_id,
+        provider,
+        model,
+        error_type,
+        original_exception_class,
+    ]
+    digest = hashlib.sha256("|".join(str(part or "") for part in parts).encode("utf-8")).hexdigest()
+    return f"qa-{digest[:16]}"
+
+
+def normalize_qa_technical_failure_metadata(
+    *,
+    error_type: str,
+    message: Optional[str] = None,
+    retryable: bool = False,
+    attempts: Optional[int] = None,
+    max_attempts: Optional[int] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    layer_name: Optional[str] = None,
+    slot_id: Optional[str] = None,
+    slot_index: Optional[int] = None,
+    evaluator_alias: Optional[str] = None,
+    configured_count: Optional[int] = None,
+    required_valid: Optional[int] = None,
+    policy: Optional[Any] = None,
+    original_exception: Optional[BaseException] = None,
+    extra: Optional[Dict[str, Any]] = None,
+    session_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return the canonical QA technical-failure/debug metadata payload."""
+
+    provider_failure = _provider_failure_from_exception(original_exception)
+    provider_kind = provider_failure_kind(original_exception)
+    provider = provider or _stringify_metadata_value(
+        _read_mapping_or_attr(provider_failure, "provider")
+        or getattr(original_exception, "provider", None)
+    )
+    model = model or _stringify_metadata_value(
+        _read_mapping_or_attr(provider_failure, "model_id")
+        or _read_mapping_or_attr(provider_failure, "model")
+        or getattr(original_exception, "model", None)
+    )
+    upstream_request_id = extract_provider_request_id(original_exception)
+    original_class = type(original_exception).__name__ if original_exception is not None else None
+
+    if provider_kind in RETRYABLE_PROVIDER_FAILURE_KINDS:
+        retryable = True
+    elif provider_kind in NON_RETRYABLE_PROVIDER_FAILURE_KINDS:
+        retryable = False
+
+    metadata: Dict[str, Any] = {
+        "technical_failure": True,
+        "technical_failure_category": "qa_evaluator_failed",
+        "error_category": "technical",
+        "error_type": error_type,
+        "retryable": bool(retryable),
+        "attempts": attempts,
+        "max_attempts": max_attempts,
+        "provider": provider,
+        "model": model,
+        "layer": layer_name,
+        "slot_id": slot_id,
+        "slot_index": slot_index,
+        "evaluator_alias": evaluator_alias,
+        "configured_count": configured_count,
+        "required_valid": required_valid,
+        "provider_failure_kind": provider_kind,
+        "provider_error_type": _read_mapping_or_attr(provider_failure, "provider_error_type"),
+        "provider_error_code": _read_mapping_or_attr(provider_failure, "provider_error_code"),
+        "provider_error_param": _read_mapping_or_attr(provider_failure, "provider_error_param"),
+        "original_exception_class": original_class,
+        "correlation_id": derive_qa_correlation_id(
+            session_id=session_id,
+            project_id=project_id,
+            layer_name=layer_name,
+            slot_id=slot_id,
+            provider=provider,
+            model=model,
+            error_type=error_type,
+            original_exception_class=original_class,
+            upstream_request_id=upstream_request_id,
+        ),
+        "provider_request_id": upstream_request_id,
+        "debug_event": "qa_evaluator_failed",
+    }
+    if message:
+        metadata["message"] = str(message)[:500]
+    if policy is not None:
+        metadata["scheduler_policy"] = {
+            "execution_mode": getattr(policy, "execution_mode", None),
+            "on_model_unavailable": getattr(policy, "on_model_unavailable", None),
+            "on_timeout": getattr(policy, "on_timeout", None),
+            "min_valid_models": getattr(policy, "min_valid_models", None),
+            "min_valid_model_ratio": getattr(policy, "min_valid_model_ratio", None),
+            "max_concurrency": getattr(policy, "max_concurrency", None),
+            "timeout_retries": getattr(policy, "timeout_retries", None),
+        }
+    if extra:
+        metadata.update(extra)
+
+    return {key: value for key, value in metadata.items() if value is not None}
 
 
 def is_valid_semantic_qa_result(evaluation: Any) -> bool:

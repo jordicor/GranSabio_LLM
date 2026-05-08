@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import debug_logger as debug_logger_module
+import json_utils as json
 from debug_logger import (
     DEFAULT_DEBUGGER_DB_NAME,
     DebugLogger,
@@ -154,3 +155,82 @@ async def test_initialize_does_not_retry_after_terminal_storage_failure(monkeypa
         assert calls == 1
     finally:
         await debug_logger_module.shutdown_debug_logger()
+
+
+@pytest.mark.asyncio
+async def test_update_session_status_persists_nonterminal_transition(tmp_path):
+    """Normal running sessions should not remain stuck in initializing."""
+    logger_instance = DebugLogger(enabled=True, db_path=str(tmp_path / "debugger.db"))
+    await logger_instance.initialize()
+    try:
+        await logger_instance.record_session_start(
+            "session-1",
+            request_payload={"request_name": "debug lifecycle"},
+            status="initializing",
+        )
+
+        await logger_instance.update_session_status("session-1", status="generating")
+
+        details = await logger_instance.get_session_details("session-1")
+        assert details is not None
+        assert details["status"] == "generating"
+    finally:
+        await logger_instance.close()
+
+
+@pytest.mark.asyncio
+async def test_update_session_status_does_not_overwrite_terminal_with_late_nonterminal(tmp_path):
+    """Late queued lifecycle writes must not move terminal sessions backwards."""
+    logger_instance = DebugLogger(enabled=True, db_path=str(tmp_path / "debugger.db"))
+    await logger_instance.initialize()
+    try:
+        await logger_instance.record_session_start(
+            "session-1",
+            request_payload={"request_name": "debug lifecycle"},
+            status="initializing",
+        )
+        await logger_instance.update_session_status(
+            "session-1",
+            status="completed",
+            final_payload={"status": "completed"},
+        )
+
+        await logger_instance.update_session_status("session-1", status="qa_evaluation")
+
+        details = await logger_instance.get_session_details("session-1")
+        assert details is not None
+        assert details["status"] == "completed"
+        assert details["final_json"] is not None
+    finally:
+        await logger_instance.close()
+
+
+@pytest.mark.asyncio
+async def test_update_session_status_does_not_overwrite_terminal_with_different_terminal(tmp_path):
+    """Terminal writes should be idempotent once a final state is stored."""
+    logger_instance = DebugLogger(enabled=True, db_path=str(tmp_path / "debugger.db"))
+    await logger_instance.initialize()
+    try:
+        await logger_instance.record_session_start(
+            "session-1",
+            request_payload={"request_name": "debug lifecycle"},
+            status="initializing",
+        )
+        await logger_instance.update_session_status(
+            "session-1",
+            status="completed",
+            final_payload={"status": "completed"},
+        )
+
+        await logger_instance.update_session_status(
+            "session-1",
+            status="failed",
+            final_payload={"status": "failed"},
+        )
+
+        details = await logger_instance.get_session_details("session-1")
+        assert details is not None
+        assert details["status"] == "completed"
+        assert json.loads(details["final_json"]) == {"status": "completed"}
+    finally:
+        await logger_instance.close()

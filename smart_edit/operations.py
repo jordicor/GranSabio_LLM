@@ -16,7 +16,7 @@ from __future__ import annotations
 import difflib
 import re
 import time
-from typing import TYPE_CHECKING, Callable, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple, Union
 
 from .locators import (
     build_word_map,
@@ -662,6 +662,7 @@ class SmartTextEditor:
         model: Optional[str] = None,
         temperature: float = 0.2,
         usage_callback: Optional[Callable] = None,
+        cancellation_token: Optional[Any] = None,
     ) -> str:
         """
         Call AI service to generate text.
@@ -693,6 +694,7 @@ class SmartTextEditor:
             temperature=temperature,
             max_tokens=4096,
             usage_callback=usage_callback,
+            cancellation_token=cancellation_token,
         )
 
         # generate_content returns the content string directly
@@ -717,6 +719,7 @@ class SmartTextEditor:
         preserve_length: bool = True,
         clean_output: bool = True,
         usage_callback: Optional[Callable] = None,
+        cancellation_token: Optional[Any] = None,
     ) -> EditResult:
         """
         Apply an edit to target text using AI with a specific instruction.
@@ -794,6 +797,7 @@ class SmartTextEditor:
                 model=model,
                 temperature=temperature,
                 usage_callback=usage_callback,
+                cancellation_token=cancellation_token,
             )
 
             # Clean AI response

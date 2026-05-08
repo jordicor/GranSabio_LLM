@@ -20,6 +20,7 @@ from services.attachment_manager import AttachmentError
 from services.project_stream import ProjectStreamManager, SubscriptionError, parse_phases
 from word_count_utils import build_word_count_instructions
 
+from .cancellation import CancellationToken, cancellation_registry
 from .app_state import (
     _ensure_services,
     app,
@@ -54,7 +55,12 @@ async def stream_content_direct_v2(session_id: str):
         session_id,
         lambda session: {
             "request": session.get("request"),
-            "resolved_context": session.get("resolved_context") or []
+            "resolved_context": session.get("resolved_context") or [],
+            "status": session.get("status"),
+            "project_id": session.get("project_id"),
+            "project_epoch": session.get("project_epoch"),
+            "cancelled": session.get("cancelled", False),
+            "hard_cancelled": session.get("hard_cancelled", False),
         }
     )
     if snapshot is None:
@@ -62,6 +68,18 @@ async def stream_content_direct_v2(session_id: str):
 
     request_data = snapshot.get("request")
     resolved_context = snapshot.get("resolved_context") or []
+    project_id = snapshot.get("project_id")
+    project_epoch = snapshot.get("project_epoch")
+
+    if (
+        snapshot.get("cancelled")
+        or snapshot.get("hard_cancelled")
+        or snapshot.get("status") == GenerationStatus.CANCELLED
+        or await cancellation_registry.is_hard_cancelled(session_id)
+    ):
+        raise HTTPException(status_code=409, detail="Session is stopped")
+    if project_id and await cancellation_registry.is_project_cancelled_or_stopping(project_id):
+        raise HTTPException(status_code=409, detail="Project is stopped")
 
     context_prompt = ""
     if resolved_context:
@@ -75,7 +93,23 @@ async def stream_content_direct_v2(session_id: str):
         raise HTTPException(status_code=400, detail="No request data found")
 
     async def direct_content_generator():
+        current_task = asyncio.current_task()
+        registered_task = False
         try:
+            await cancellation_registry.register_current_task(
+                session_id,
+                "direct_content_stream",
+                project_id=project_id,
+                project_epoch=project_epoch,
+            )
+            registered_task = current_task is not None
+            cancellation_token = CancellationToken(
+                session_id=session_id,
+                project_id=project_id,
+                phase="streaming",
+                operation="direct_content_stream",
+                registry=cancellation_registry,
+            )
             _ensure_services()
             prompt = request_data.prompt
             word_instructions = build_word_count_instructions(request_data) if (
@@ -95,6 +129,9 @@ async def stream_content_direct_v2(session_id: str):
                     getattr(request_data, 'generator_model', '')
                 )
 
+            async def direct_stream_cancelled() -> bool:
+                return await cancellation_token.any_cancelled()
+
             async for chunk in ai_service.generate_content_stream(
                 prompt=final_prompt,
                 model=request_data.generator_model,
@@ -102,8 +139,12 @@ async def stream_content_direct_v2(session_id: str):
                 max_tokens=requested_max_tokens,
                 reasoning_effort=getattr(request_data, 'reasoning_effort', None),
                 thinking_budget_tokens=getattr(request_data, 'thinking_budget_tokens', None),
-                content_type=getattr(request_data, 'content_type', 'biography')
+                content_type=getattr(request_data, 'content_type', 'biography'),
+                cancellation_token=cancellation_token,
+                cancel_callback=direct_stream_cancelled,
             ):
+                if await direct_stream_cancelled():
+                    raise asyncio.CancelledError()
                 # Handle StreamChunk (Claude with thinking) vs plain string
                 # In direct streaming, we send EVERYTHING (thinking + content) to client
                 # TODO: Consider adding visual markers for thinking differentiation
@@ -114,9 +155,14 @@ async def stream_content_direct_v2(session_id: str):
                 if chunk_text:
                     yield chunk_text.encode('utf-8')
 
+        except asyncio.CancelledError:
+            logger.info("Direct content stream cancelled for session %s", session_id)
         except Exception as exc:
             error_msg = f"Error in direct streaming: {str(exc)}"
             yield error_msg.encode('utf-8')
+        finally:
+            if registered_task and current_task is not None:
+                await cancellation_registry.unregister_task(session_id, current_task)
 
     return StreamingResponse(
         direct_content_generator(),

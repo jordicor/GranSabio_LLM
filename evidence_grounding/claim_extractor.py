@@ -8,6 +8,7 @@ evidence grounding verification using logprobs.
 This is Phase 2 of the Strawberry Integration.
 """
 
+import asyncio
 import logging
 import re
 from typing import Any, Callable, Dict, List, Optional
@@ -273,6 +274,7 @@ class ClaimExtractor:
         min_importance: float = 0.6,
         extra_verbose: bool = False,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        cancellation_token: Optional[Any] = None,
     ) -> List[ExtractedClaim]:
         """Extract verifiable claims from generated content.
 
@@ -328,7 +330,10 @@ class ClaimExtractor:
                 extra_verbose=extra_verbose,
                 usage_callback=usage_callback,
                 usage_extra={"phase": "evidence_grounding", "subphase": "claim_extraction"},
+                cancellation_token=cancellation_token,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"AI call failed during claim extraction: {e}")
             raise

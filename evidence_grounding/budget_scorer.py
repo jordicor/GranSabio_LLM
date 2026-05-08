@@ -16,6 +16,7 @@ MIT License - See original repository for full license text.
 This is Phase 4 of the Strawberry Integration.
 """
 
+import asyncio
 import logging
 import math
 import time
@@ -296,6 +297,7 @@ class BudgetScorer:
         placeholder: str = "[EVIDENCE REMOVED]",
         extra_verbose: bool = False,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        cancellation_token: Optional[Any] = None,
     ) -> ClaimBudgetResult:
         """Score a single claim for evidence grounding.
 
@@ -331,6 +333,7 @@ class BudgetScorer:
             extra_verbose=extra_verbose,
             usage_callback=usage_callback,
             usage_extra={"subphase": "posterior", "claim_idx": claim.idx},
+            cancellation_token=cancellation_token,
         )
 
         # 3. Scrub cited spans and format for prior
@@ -346,6 +349,7 @@ class BudgetScorer:
             extra_verbose=extra_verbose,
             usage_callback=usage_callback,
             usage_extra={"subphase": "prior", "claim_idx": claim.idx},
+            cancellation_token=cancellation_token,
         )
 
         # 5. Calculate budget metrics
@@ -399,6 +403,7 @@ class BudgetScorer:
         config_obj: EvidenceGroundingConfig,
         extra_verbose: bool = False,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        cancellation_token: Optional[Any] = None,
     ) -> List[ClaimBudgetResult]:
         """Score multiple claims for evidence grounding.
 
@@ -440,8 +445,11 @@ class BudgetScorer:
                     placeholder=config_obj.placeholder_text,
                     extra_verbose=extra_verbose,
                     usage_callback=usage_callback,
+                    cancellation_token=cancellation_token,
                 )
                 results.append(result)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Failed to score claim {claim.idx}: {e}")
                 # Create a failed result - conservative: assume well-grounded to avoid false positives
@@ -469,6 +477,7 @@ class BudgetScorer:
         extra_verbose: bool = False,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
+        cancellation_token: Optional[Any] = None,
     ) -> float:
         """Get P(YES) for an entailment verification prompt.
 
@@ -500,6 +509,7 @@ class BudgetScorer:
                 "phase": "evidence_grounding",
                 **(usage_extra or {}),
             },
+            cancellation_token=cancellation_token,
         )
 
         if extra_verbose:

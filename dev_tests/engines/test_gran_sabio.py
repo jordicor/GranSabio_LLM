@@ -183,9 +183,22 @@ class TestIsRetryableStreamingError:
             model="gpt-4o",
             attempts=3,
             max_attempts=3,
-            cause=Exception("API error"),
+            cause=ConnectionError("API connection failed"),
         )
         assert _is_retryable_streaming_error(exc) is True
+
+    def test_ai_request_error_respects_non_retryable_provider_failure(self):
+        class BadRequest(Exception):
+            status_code = 400
+
+        exc = AIRequestError(
+            provider="openai",
+            model="gpt-4o",
+            attempts=1,
+            max_attempts=1,
+            cause=BadRequest("Invalid request"),
+        )
+        assert _is_retryable_streaming_error(exc) is False
 
     def test_status_429_is_retryable(self):
         exc = Exception("Rate limit")

@@ -302,6 +302,7 @@ class ArbiterContext:
     gran_sabio_model: Optional[str] = None  # Powerful model for difficult cases
     qa_model_count: int = 1                 # Total number of QA models (for distribution calc)
     model_alias_registry: Optional[Any] = None
+    cancellation_token: Optional[Any] = None
 
     # Tool-loop activation knob forwarded from ``ContentRequest.arbiter_tools_mode``.
     # ``"auto"`` lets the Arbiter activate the shared ``call_ai_with_validation_tools``
@@ -1232,7 +1233,7 @@ class Arbiter:
         if provider_key == "openai" and AIService._is_openai_responses_api_model(model_id):
             return False
 
-        if provider_key not in {"openai", "openrouter", "xai", "claude", "gemini"}:
+        if not AIService._supports_tool_calling(provider_key, str(model_id).lower()):
             return False
 
         return True
@@ -1400,6 +1401,7 @@ class Arbiter:
             system_prompt=ARBITER_SYSTEM_PROMPT,
             model_alias_registry=context.model_alias_registry,
             prompt_safety_parts=prompt_safety_parts,
+            cancellation_token=context.cancellation_token,
         )
 
         payload = envelope.payload if envelope is not None else None
@@ -1443,8 +1445,10 @@ class Arbiter:
                 max_tokens=config.ARBITER_MAX_TOKENS,
                 temperature=config.ARBITER_TEMPERATURE,
                 json_output=True,
+                json_schema=ARBITER_RESPONSE_SCHEMA,
                 model_alias_registry=context.model_alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                cancellation_token=context.cancellation_token,
             ):
                 if hasattr(chunk, 'text'):
                     chunk_text = chunk.text
@@ -1465,8 +1469,10 @@ class Arbiter:
                 max_tokens=config.ARBITER_MAX_TOKENS,
                 temperature=config.ARBITER_TEMPERATURE,
                 json_output=True,
+                json_schema=ARBITER_RESPONSE_SCHEMA,
                 model_alias_registry=context.model_alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                cancellation_token=context.cancellation_token,
             )
 
         return parse_json_with_markdown_fences(

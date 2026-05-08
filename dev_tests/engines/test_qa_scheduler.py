@@ -234,3 +234,83 @@ async def test_timeout_retries_then_skips_if_quorum_remains():
     assert attempts["model-0"] == 2
     assert result.counts["technical_failed"] == 1
     assert result.counts["valid"] == 2
+
+
+@pytest.mark.asyncio
+async def test_technical_failure_placeholder_carries_normalized_debug_metadata():
+    upstream_error = RuntimeError("provider rejected request")
+
+    async def evaluate(slot, attempt):
+        if slot.index == 0:
+            raise QASchedulerTechnicalFailure(
+                "api_failure",
+                "provider down",
+                retryable=True,
+                metadata={
+                    "provider": "openai",
+                    "model": slot.model_name,
+                    "max_attempts": 3,
+                },
+                original_exception=upstream_error,
+            )
+        return _eval(slot)
+
+    scheduler = QAScheduler(QASchedulerPolicy(on_model_unavailable="skip_if_quorum"))
+    result = await scheduler.evaluate_layer(
+        layer_name="Style",
+        has_deal_breaker_criteria=False,
+        slots=_slots(3),
+        evaluate_slot=evaluate,
+    )
+
+    metadata = result.layer_results["model-0"].metadata
+    assert metadata["technical_failure"] is True
+    assert metadata["technical_failure_category"] == "qa_evaluator_failed"
+    assert metadata["error_type"] == "api_failure"
+    assert metadata["retryable"] is True
+    assert metadata["attempts"] == 1
+    assert metadata["provider"] == "openai"
+    assert metadata["model"] == "model-0"
+    assert metadata["layer"] == "Style"
+    assert metadata["slot_id"] == "qa:0"
+    assert metadata["slot_index"] == 0
+    assert metadata["configured_count"] == 3
+    assert metadata["required_valid"] == 2
+    assert metadata["original_exception_class"] == "RuntimeError"
+    assert metadata["debug_event"] == "qa_evaluator_failed"
+    assert metadata["correlation_id"].startswith("qa-")
+
+
+@pytest.mark.asyncio
+async def test_unavailable_error_preserves_policy_layer_slot_counts_and_last_failure():
+    async def evaluate(slot, attempt):
+        raise QASchedulerTechnicalFailure(
+            "timeout",
+            "timeout",
+            retryable=True,
+            original_exception=asyncio.TimeoutError(),
+        )
+
+    policy = QASchedulerPolicy(
+        on_timeout="retry_then_fail",
+        timeout_retries=0,
+        max_concurrency=1,
+    )
+    scheduler = QAScheduler(policy)
+
+    with pytest.raises(QASchedulerUnavailableError) as exc_info:
+        await scheduler.evaluate_layer(
+            layer_name="Style",
+            has_deal_breaker_criteria=False,
+            slots=_slots(2),
+            evaluate_slot=evaluate,
+        )
+
+    error = exc_info.value
+    assert error.policy is policy
+    assert error.layer_name == "Style"
+    assert error.slot.model_name == "model-0"
+    assert error.counts["technical_failed"] == 1
+    assert error.counts["required_valid"] == 2
+    assert error.last_failure.error_type == "timeout"
+    assert error.last_failure_metadata["debug_event"] == "qa_evaluator_failed"

@@ -23,7 +23,7 @@ import os
 import sys
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Set, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
@@ -98,6 +98,7 @@ from qa_engine import QAEngine
 from services.attachment_manager import (
     ResolvedAttachment,
 )
+from .cancellation import CancelMode, cancellation_registry
 
 T = TypeVar("T")
 
@@ -167,12 +168,68 @@ def _ensure_services():
 active_sessions: Dict[str, Dict] = {}
 # Initialized during FastAPI startup to bind the lock to the running event loop
 active_sessions_lock: Optional[asyncio.Lock] = None
+_project_hard_stop_completion_tasks: Set[asyncio.Task] = set()
+_project_session_end_tasks: Set[asyncio.Task] = set()
+_debug_status_update_tasks: Set[asyncio.Task] = set()
+_BACKGROUND_DRAIN_TIMEOUT_SECONDS = 2.0
+_DEBUG_STATUS_UPDATE_TIMEOUT_SECONDS = 2.0
+
+
+def _track_background_task(task: asyncio.Task, task_set: Set[asyncio.Task]) -> None:
+    task_set.add(task)
+    task.add_done_callback(task_set.discard)
+
+
+def _log_background_task_result(task: asyncio.Task) -> None:
+    task_name = task.get_name() if hasattr(task, "get_name") else "background-task"
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        logger.debug("Background task was cancelled: %s", task_name)
+    except Exception:
+        logger.exception("Background task failed: %s", task_name)
+
+
+async def _drain_background_tasks(
+    task_set: Set[asyncio.Task],
+    *,
+    label: str,
+    timeout: float = _BACKGROUND_DRAIN_TIMEOUT_SECONDS,
+) -> None:
+    """Give tracked background writes a bounded chance to finish."""
+    pending = [task for task in list(task_set) if not task.done()]
+    if not pending:
+        return
+    done, still_pending = await asyncio.wait(pending, timeout=timeout)
+    for task in done:
+        _log_background_task_result(task)
+    for task in still_pending:
+        task.cancel()
+    if still_pending:
+        await asyncio.gather(*still_pending, return_exceptions=True)
+        logger.warning(
+            "Cancelled %d pending %s task(s) during shutdown after %.1fs",
+            len(still_pending),
+            label,
+            timeout,
+        )
+
+
+def _track_project_hard_stop_task(task: asyncio.Task) -> None:
+    _track_background_task(task, _project_hard_stop_completion_tasks)
+
+
+def _log_project_hard_stop_task_result(task: asyncio.Task) -> None:
+    task_name = task.get_name() if hasattr(task, "get_name") else "project-hard-stop"
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        logger.warning("Detached project hard-stop task was cancelled: %s", task_name)
+    except Exception:
+        logger.exception("Detached project hard-stop task failed: %s", task_name)
 
 # Track project identifiers allocated ahead of generation requests
 reserved_project_ids: Set[str] = set()
-
-# Track project identifiers that have been cancelled (reject new requests)
-cancelled_project_ids: Set[str] = set()
 
 # Project-phase streaming subscribers.
 # For each project and phase we keep a list of asyncio.Queue subscribers.
@@ -317,6 +374,101 @@ async def _debug_record_usage(session_id: str, usage_payload: Any) -> None:
     except Exception:
         logger.exception("Failed to record debugger usage summary for %s", session_id)
 
+
+def _status_to_debug_value(status: Any) -> Optional[str]:
+    """Convert status enum/string values to debugger status text."""
+    if status is None:
+        return None
+    return status.value if isinstance(status, GenerationStatus) else str(status)
+
+
+async def _debug_update_status_with_timeout(
+    session_id: str,
+    *,
+    status: Optional[str] = None,
+    final_payload: Any = None,
+    timeout: float = _DEBUG_STATUS_UPDATE_TIMEOUT_SECONDS,
+) -> None:
+    """Run a debugger status update with a small upper bound."""
+    try:
+        await asyncio.wait_for(
+            _debug_update_status(
+                session_id,
+                status=status,
+                final_payload=final_payload,
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Timed out updating debugger status for %s after %.1fs",
+            session_id,
+            timeout,
+        )
+
+
+async def _debug_record_session_transition(
+    session_id: str,
+    *,
+    status: Optional[str] = None,
+    phase: Optional[str] = None,
+) -> None:
+    """Persist relevant non-terminal lifecycle transitions in the debugger DB."""
+    if status is not None:
+        await _debug_update_status_with_timeout(session_id, status=status)
+    await _debug_record_event(
+        session_id,
+        "session_transition",
+        {
+            "status": status,
+            "phase": phase,
+        },
+    )
+
+
+async def _debug_record_session_cancelled(
+    session_id: str,
+    *,
+    reason: str,
+    cancel_mode: str,
+    final_result: Dict[str, Any],
+) -> None:
+    """Persist terminal cancellation details in the debugger DB."""
+    await _debug_record_event(
+        session_id,
+        "session_cancelled",
+        {
+            "reason": reason,
+            "cancel_mode": cancel_mode,
+            "final_result": final_result,
+        },
+    )
+    await _debug_update_status_with_timeout(
+        session_id,
+        status=GenerationStatus.CANCELLED.value,
+        final_payload=final_result,
+    )
+
+
+def queue_debug_session_transition(
+    session_id: str,
+    *,
+    status: Optional[str] = None,
+    phase: Optional[str] = None,
+) -> None:
+    """Schedule debugger lifecycle persistence for synchronous session mutators."""
+    if not debug_logger or (status is None and phase is None):
+        return
+    try:
+        task = asyncio.create_task(
+            _debug_record_session_transition(session_id, status=status, phase=phase),
+            name=f"debug-session-transition:{session_id}",
+        )
+        _track_background_task(task, _debug_status_update_tasks)
+        task.add_done_callback(_log_background_task_result)
+    except RuntimeError:
+        logger.debug("Unable to schedule debugger session transition (no running loop)")
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize services and background tasks on startup"""
@@ -400,6 +552,18 @@ async def shutdown_event():
     except Exception as e:
         logger.error(f"Error closing feedback memory system: {e}")
 
+    try:
+        await _drain_background_tasks(
+            _project_session_end_tasks,
+            label="project session-end",
+        )
+        await _drain_background_tasks(
+            _debug_status_update_tasks,
+            label="debug status update",
+        )
+    except Exception as e:
+        logger.error(f"Error draining lifecycle background tasks: {e}")
+
     # Shutdown debugger persistence
     try:
         await shutdown_debug_logger()
@@ -412,12 +576,26 @@ async def shutdown_event():
 
 async def register_session(session_id: str, session_data: Dict[str, Any]) -> None:
     """Store or replace a session under the shared lock."""
+    guard = await cancellation_registry.get_session_commit_guard(session_id)
+    session_data["_hard_cancel_event"] = guard.dispatch_sealed_event
+
+    def _store() -> None:
+        existing = active_sessions.get(session_id)
+        if existing is not None and is_terminal_session(existing) and not is_terminal_session(session_data):
+            existing["late_writes_blocked"] = existing.get("late_writes_blocked", 0) + 1
+            logger.debug(
+                "Blocked non-terminal session overwrite after terminal status for session %s",
+                session_id,
+            )
+            return
+        active_sessions[session_id] = session_data
+
     lock = active_sessions_lock
     if lock is None:
-        active_sessions[session_id] = session_data
+        _store()
         return
     async with lock:
-        active_sessions[session_id] = session_data
+        _store()
 
 
 async def mutate_session(session_id: str, mutator: Callable[[Dict[str, Any]], T]) -> Optional[T]:
@@ -435,13 +613,44 @@ async def mutate_session(session_id: str, mutator: Callable[[Dict[str, Any]], T]
         return mutator(session)
 
 
+async def mutate_session_if_not_hard_cancelled(
+    session_id: str,
+    mutator: Callable[[Dict[str, Any]], T],
+) -> Optional[T]:
+    """Run a synchronous session mutation unless the registry hard-stop seal is set."""
+    guard = await cancellation_registry.get_session_commit_guard(session_id)
+    if guard.hard_cancelled():
+        await increment_late_writes_blocked(session_id)
+        return None
+
+    def _guarded(session: Dict[str, Any]) -> Optional[T]:
+        if guard.hard_cancelled() or session.get("hard_cancelled"):
+            session["late_writes_blocked"] = session.get("late_writes_blocked", 0) + 1
+            return None
+        return mutator(session)
+
+    return await mutate_session(session_id, _guarded)
+
+
+async def increment_late_writes_blocked(session_id: str) -> None:
+    """Increment the hard-cancel late-write counter without running arbitrary mutations."""
+    def _increment(session: Dict[str, Any]) -> None:
+        session["late_writes_blocked"] = session.get("late_writes_blocked", 0) + 1
+
+    await mutate_session(session_id, _increment)
+
+
 async def pop_session(session_id: str) -> Optional[Dict[str, Any]]:
     """Remove a session safely and return it if present."""
     lock = active_sessions_lock
     if lock is None:
-        return active_sessions.pop(session_id, None)
-    async with lock:
-        return active_sessions.pop(session_id, None)
+        session = active_sessions.pop(session_id, None)
+    else:
+        async with lock:
+            session = active_sessions.pop(session_id, None)
+    if session is not None:
+        await cancellation_registry.unregister_session(session_id)
+    return session
 
 
 async def session_exists(session_id: str) -> bool:
@@ -462,20 +671,63 @@ async def get_session(session_id: str) -> Optional[Dict[str, Any]]:
         return active_sessions.get(session_id)
 
 
+def _is_hard_cancel_sealed(session: Dict[str, Any]) -> bool:
+    """Return True when the session is hard-cancelled locally or via registry seal."""
+    event = session.get("_hard_cancel_event")
+    event_sealed = bool(event is not None and hasattr(event, "is_set") and event.is_set())
+    return bool(session.get("hard_cancelled") or event_sealed)
+
+
 def _store_final_result(
     session: Dict[str, Any],
     final_result: Dict[str, Any],
     session_id: Optional[str] = None,
     final_status: Optional[str] = None,
+    *,
+    queue_session_end: bool = True,
 ) -> None:
     """Persist the final_result for a session while attaching project metadata."""
+    status_obj = final_status if final_status is not None else final_result.get("status", "")
+    final_status_value = status_obj.value if isinstance(status_obj, GenerationStatus) else str(status_obj)
+    current_status = session.get("status")
+    current_status_value = (
+        current_status.value if isinstance(current_status, GenerationStatus) else str(current_status)
+    )
+    terminal_status_values = {
+        GenerationStatus.COMPLETED.value,
+        GenerationStatus.REJECTED.value,
+        GenerationStatus.FAILED.value,
+        GenerationStatus.CANCELLED.value,
+    }
+    if (
+        session.get("final_result") is not None
+        and current_status_value in terminal_status_values
+        and final_status_value != current_status_value
+        and str(final_result.get("status", "")) != current_status_value
+    ):
+        session["late_writes_blocked"] = session.get("late_writes_blocked", 0) + 1
+        logger.debug(
+            "Blocked final_result overwrite after terminal status for session %s: %s -> %s",
+            session_id or session.get("session_id"),
+            current_status_value,
+            final_status_value,
+        )
+        return
+    if (
+        _is_hard_cancel_sealed(session)
+        and final_status_value != GenerationStatus.CANCELLED.value
+        and final_result.get("status") != GenerationStatus.CANCELLED.value
+    ):
+        session["late_writes_blocked"] = session.get("late_writes_blocked", 0) + 1
+        logger.debug("Blocked final_result overwrite after hard stop for session %s", session_id or session.get("session_id"))
+        return
     project_id = session.get("project_id")
     if project_id:
         final_result.setdefault("project_id", project_id)
     session["final_result"] = final_result
     status = final_result.get("status") or final_status or session.get("status")
     session_identifier = session_id or session.get("session_id")  # session_id not stored; caller should pass when available
-    if status and session_identifier:
+    if queue_session_end and status and session_identifier:
         queue_project_session_end(session, session_identifier, str(status))
 
 
@@ -496,89 +748,376 @@ def _is_project_reserved(project_id: str) -> bool:
     return any(session.get("project_id") == project_id for session in list(active_sessions.values()))
 
 
-def _start_project(project_id: str) -> bool:
-    """
-    Activate a project, removing it from cancelled state if present.
-
-    This should be called when a client wants to start/resume generation
-    for a project that may have been previously cancelled.
-
-    Args:
-        project_id: The project identifier to activate.
-
-    Returns:
-        True if the project was previously cancelled (and is now active),
-        False if it was already active.
-    """
+async def start_project_runtime(project_id: str) -> Dict[str, Any]:
+    """Activate a project runtime for new work."""
     if not project_id:
-        return False
-    was_cancelled = project_id in cancelled_project_ids
-    cancelled_project_ids.discard(project_id)
-    return was_cancelled
+        return {"project_id": project_id, "was_cancelled": False, "project_epoch": 0}
+    _reserve_project_id(project_id)
+    result = await cancellation_registry.clear_project_cancellation(project_id)
+    await publish_project_status_event(project_id, "project", "project_started")
+    return result
 
 
-def _stop_project(project_id: str) -> int:
-    """
-    Cancel a project and mark all its active sessions as cancelled.
+def _build_cancelled_final_result(
+    session: Dict[str, Any],
+    *,
+    reason: str,
+) -> Dict[str, Any]:
+    raw_content = session.get("last_generated_content") or session.get("generation_content") or ""
+    if not raw_content:
+        raw_content = "No content generated before cancellation"
+    original_request = session.get("request")
+    return {
+        "content": raw_content,
+        "final_iteration": session.get("current_iteration", 0),
+        "final_score": 0.0,
+        "approved": False,
+        "failure_reason": reason,
+        "generated_at": datetime.now().isoformat(),
+        "project_id": session.get("project_id"),
+        "status": GenerationStatus.CANCELLED.value,
+        "cancel_mode": session.get("cancel_mode"),
+        "request_name": session.get("request_name"),
+        "content_type": getattr(original_request, "content_type", None) if original_request else None,
+    }
 
-    This should be called when a client wants to stop all generation
-    activity for a project. New requests with this project_id will be
-    rejected until _start_project() is called.
 
-    Args:
-        project_id: The project identifier to cancel.
+def is_terminal_session(session: Dict[str, Any]) -> bool:
+    """Return True when a session has already reached a final status."""
+    status = session.get("status")
+    status_value = status.value if isinstance(status, GenerationStatus) else str(status)
+    return status_value in {
+        GenerationStatus.COMPLETED.value,
+        GenerationStatus.REJECTED.value,
+        GenerationStatus.FAILED.value,
+        GenerationStatus.CANCELLED.value,
+    }
 
-    Returns:
-        Number of active sessions that were cancelled.
-    """
-    if not project_id:
-        return 0
 
-    cancelled_project_ids.add(project_id)
+def apply_session_cancelled_state(
+    session: Dict[str, Any],
+    session_id: str,
+    *,
+    cancel_mode: str,
+    reason: str,
+    hard: bool,
+    queue_events: bool = True,
+) -> Dict[str, Any]:
+    """Force a session into cancelled state and persist a partial final result."""
+    session["cancelled"] = True
+    session["cancel_mode"] = cancel_mode
+    session["cancel_requested_at"] = datetime.now().isoformat()
+    if hard:
+        session["hard_cancelled"] = True
+        session["hard_cancel_reason"] = reason
+    final_result = _build_cancelled_final_result(session, reason=reason)
+    final_result["cancel_mode"] = cancel_mode
+    _store_final_result(
+        session,
+        final_result,
+        session_id,
+        final_status=GenerationStatus.CANCELLED.value,
+        queue_session_end=queue_events,
+    )
+    session["status"] = GenerationStatus.CANCELLED
+    session["current_phase"] = "cancelled"
+    if queue_events:
+        queue_project_status_event(session, session_id, "status_change")
+    return final_result
 
-    # Broadcast project_end to all phases and close their streams
-    phases = ["auto_qa", "preflight", "generation", "qa", "arbiter", "smart_edit", "consensus", "gran_sabio"]
-    for phase in phases:
-        # Fire-and-forget; if no loop running, just skip
+
+async def pause_project_runtime(project_id: str) -> Dict[str, Any]:
+    """Cooperatively pause all current sessions in a project and block new admissions."""
+    snapshot = await cancellation_registry.request_project_soft_cancel(project_id)
+    session_ids = set(snapshot.get("session_ids") or set())
+    cancelled_count = 0
+    cancelled_debug_updates: List[Tuple[str, Dict[str, Any], str, str]] = []
+
+    def _pause_sessions() -> None:
+        nonlocal cancelled_count
+        for session_id, session in active_sessions.items():
+            if session.get("project_id") != project_id:
+                continue
+            if session_ids and session_id not in session_ids:
+                continue
+            if not is_terminal_session(session):
+                final_result = apply_session_cancelled_state(
+                    session,
+                    session_id,
+                    cancel_mode=CancelMode.SOFT.value,
+                    reason="Project paused by user",
+                    hard=False,
+                )
+                cancelled_debug_updates.append(
+                    (
+                        session_id,
+                        final_result,
+                        CancelMode.SOFT.value,
+                        "Project paused by user",
+                    )
+                )
+                cancelled_count += 1
+
+    lock = active_sessions_lock
+    if lock is None:
+        _pause_sessions()
+    else:
+        async with lock:
+            _pause_sessions()
+
+    for session_id, final_result, cancel_mode, reason in cancelled_debug_updates:
+        await _debug_record_session_cancelled(
+            session_id,
+            reason=reason,
+            cancel_mode=cancel_mode,
+            final_result=final_result,
+        )
+
+    await publish_project_status_event(project_id, "project", "project_paused")
+    return {
+        "project_id": project_id,
+        "status": "paused",
+        "sessions_cancelled": cancelled_count,
+        "mode": CancelMode.SOFT.value,
+        "provider_calls_closed": snapshot.get("provider_calls_closed", 0),
+    }
+
+
+async def _hard_stop_project_runtime_impl(project_id: str) -> Dict[str, Any]:
+    """Hard-stop all current sessions in a project."""
+    snapshot = await cancellation_registry.seal_project_for_hard_cancel(project_id)
+    hard_stop_id = snapshot.get("hard_stop_id")
+    snapshot_epoch = snapshot.get("project_epoch")
+    registry_session_ids = set(snapshot.get("session_ids") or set())
+
+    async def _complete_hard_stop() -> Dict[str, Any]:
+        total_tasks_cancelled = 0
+        total_provider_calls_closed = 0
+        cancelled_count = 0
+        cancel_result = {"tasks_cancelled": 0, "provider_calls_closed": 0}
+        session_ids: Set[str] = set(registry_session_ids)
+        pending_session_ids: Set[str] = set(registry_session_ids)
+        cancelled_session_end_events: List[Tuple[str, str, str, Optional[str], Optional[int]]] = []
+        cancelled_debug_updates: List[Tuple[str, Dict[str, Any], str, str]] = []
+        status_stream_closed = False
+
+        async def _request_cancel_for_sessions(cancel_session_ids: Set[str]) -> None:
+            nonlocal total_tasks_cancelled, total_provider_calls_closed
+            if not cancel_session_ids:
+                return
+            ordered_session_ids = sorted(cancel_session_ids)
+            retry_results = await asyncio.gather(
+                *(
+                    cancellation_registry.request_hard_cancel(session_id)
+                    for session_id in ordered_session_ids
+                ),
+                return_exceptions=True,
+            )
+            for session_id, retry_result in zip(ordered_session_ids, retry_results):
+                if isinstance(retry_result, BaseException):
+                    logger.debug("Project hard-stop cleanup failed for session %s: %s", session_id, retry_result)
+                    continue
+                total_tasks_cancelled += int(retry_result.get("tasks_cancelled", 0))
+                total_provider_calls_closed += int(retry_result.get("provider_calls_closed", 0))
+                pending_session_ids.discard(session_id)
+
+        async def _finalize_hard_stop() -> None:
+            nonlocal status_stream_closed
+            try:
+                await _request_cancel_for_sessions(set(pending_session_ids))
+                if not status_stream_closed:
+                    try:
+                        await publish_project_status_event(
+                            project_id,
+                            "project",
+                            "project_cancelled",
+                            expected_project_epoch=snapshot_epoch,
+                        )
+                        await close_project_status_stream(
+                            project_id,
+                            "project_cancelled",
+                            expected_project_epoch=snapshot_epoch,
+                        )
+                        status_stream_closed = True
+                    except Exception:
+                        logger.debug("Unable to close project status stream during hard stop", exc_info=True)
+            finally:
+                await cancellation_registry.finish_project_hard_cancel(
+                    project_id,
+                    hard_stop_id=hard_stop_id,
+                )
+
+        async def _run_finalizer() -> None:
+            finalizer_task = asyncio.create_task(
+                _finalize_hard_stop(),
+                name=f"project-hard-stop-finalize:{project_id}:{hard_stop_id or 'unknown'}",
+            )
+            _track_project_hard_stop_task(finalizer_task)
+            try:
+                await asyncio.shield(finalizer_task)
+            except asyncio.CancelledError:
+                finalizer_task.add_done_callback(_log_project_hard_stop_task_result)
+                raise
+
         try:
-            asyncio.create_task(
-                publish_project_phase_chunk(
+            await _request_cancel_for_sessions(registry_session_ids)
+
+            def _active_project_session_ids() -> Set[str]:
+                return {
+                    session_id
+                    for session_id, session in active_sessions.items()
+                    if session.get("project_id") == project_id
+                    and not is_terminal_session(session)
+                    and session.get("project_epoch") == snapshot_epoch
+                }
+
+            lock = active_sessions_lock
+            if lock is None:
+                active_project_session_ids = _active_project_session_ids()
+            else:
+                async with lock:
+                    active_project_session_ids = _active_project_session_ids()
+
+            session_ids = registry_session_ids | active_project_session_ids
+            pending_session_ids.update(session_ids - registry_session_ids)
+            await _request_cancel_for_sessions(session_ids - registry_session_ids)
+
+            cancel_result = {
+                "tasks_cancelled": total_tasks_cancelled,
+                "provider_calls_closed": total_provider_calls_closed,
+            }
+
+            late_session_ids: Set[str] = set()
+
+            def _cancel_sessions() -> None:
+                nonlocal cancelled_count
+                for session_id, session in active_sessions.items():
+                    if session.get("project_id") != project_id:
+                        continue
+                    if session.get("project_epoch") != snapshot_epoch:
+                        continue
+                    if not is_terminal_session(session):
+                        if session_id not in session_ids:
+                            session_ids.add(session_id)
+                            pending_session_ids.add(session_id)
+                            late_session_ids.add(session_id)
+                        final_result = apply_session_cancelled_state(
+                            session,
+                            session_id,
+                            cancel_mode=CancelMode.HARD.value,
+                            reason="Project hard-stopped by user",
+                            hard=True,
+                            queue_events=False,
+                        )
+                        session["tasks_cancelled"] = cancel_result.get("tasks_cancelled", 0)
+                        session["provider_calls_closed"] = cancel_result.get("provider_calls_closed", 0)
+                        cancelled_session_end_events.append(
+                            (
+                                project_id,
+                                session_id,
+                                GenerationStatus.CANCELLED.value,
+                                session.get("request_name"),
+                                session.get("project_epoch"),
+                            )
+                        )
+                        cancelled_debug_updates.append(
+                            (
+                                session_id,
+                                final_result,
+                                CancelMode.HARD.value,
+                                "Project hard-stopped by user",
+                            )
+                        )
+                        cancelled_count += 1
+
+            if lock is None:
+                _cancel_sessions()
+            else:
+                async with lock:
+                    _cancel_sessions()
+
+            await _request_cancel_for_sessions(late_session_ids)
+
+            for (
+                event_project_id,
+                event_session_id,
+                event_status,
+                event_request_name,
+                event_project_epoch,
+            ) in cancelled_session_end_events:
+                await publish_project_session_end(
+                    event_project_id,
+                    event_session_id,
+                    event_status,
+                    event_request_name,
+                    event_project_epoch,
+                )
+
+            for event_session_id, final_result, cancel_mode, reason in cancelled_debug_updates:
+                await _debug_record_session_cancelled(
+                    event_session_id,
+                    reason=reason,
+                    cancel_mode=cancel_mode,
+                    final_result=final_result,
+                )
+
+            phases = ["auto_qa", "preflight", "generation", "qa", "arbiter", "smart_edit", "consensus", "gran_sabio"]
+            for phase in phases:
+                await publish_project_phase_chunk(
                     project_id,
                     phase,
                     content=None,
+                    project_epoch=snapshot.get("project_epoch"),
                     event="project_end",
                     status="cancelled",
                     end_stream=True,
                 )
+            await publish_project_status_event(
+                project_id,
+                "project",
+                "project_cancelled",
+                expected_project_epoch=snapshot.get("project_epoch"),
             )
-        except RuntimeError:
-            logger.debug("Unable to publish project_end for project %s phase %s (no running loop)", project_id, phase)
+            await close_project_status_stream(
+                project_id,
+                "project_cancelled",
+                expected_project_epoch=snapshot.get("project_epoch"),
+            )
+            status_stream_closed = True
+        finally:
+            await _run_finalizer()
 
-    # Cancel all active sessions belonging to this project
-    # Use defensive copy to avoid RuntimeError if dict changes during iteration
-    cancelled_count = 0
-    for session_id, session in list(active_sessions.items()):
-        if session.get("project_id") == project_id:
-            if not session.get("cancelled"):
-                session["cancelled"] = True
-                update_session_status(session, session_id, GenerationStatus.CANCELLED)
-                cancelled_count += 1
+        return {
+            "project_id": project_id,
+            "status": "cancelled",
+            "mode": CancelMode.HARD.value,
+            "sessions_cancelled": cancelled_count,
+            "tasks_cancelled": cancel_result.get("tasks_cancelled", 0),
+            "provider_calls_closed": cancel_result.get("provider_calls_closed", 0),
+        }
 
-    # Notify status subscribers and close status streams
+    return await _complete_hard_stop()
+
+
+async def hard_stop_project_runtime(project_id: str) -> Dict[str, Any]:
+    """Hard-stop all current sessions in a project."""
+    completion_task = asyncio.create_task(
+        _hard_stop_project_runtime_impl(project_id),
+        name=f"project-hard-stop:{project_id}",
+    )
+    _track_project_hard_stop_task(completion_task)
     try:
-        asyncio.create_task(publish_project_status_event(project_id, "project", "project_cancelled"))
-        asyncio.create_task(close_project_status_stream(project_id, "project_cancelled"))
-    except RuntimeError:
-        logger.debug("Unable to publish project cancelled event (no running loop)")
-
-    return cancelled_count
+        return await asyncio.shield(completion_task)
+    except asyncio.CancelledError:
+        completion_task.add_done_callback(_log_project_hard_stop_task_result)
+        raise
 
 
-def _is_project_cancelled(project_id: str) -> bool:
-    """Check if a project has been cancelled and should reject new requests."""
+async def is_project_cancelled_or_stopping(project_id: str) -> bool:
+    """Return whether project admission should be rejected."""
     if not project_id:
         return False
-    return project_id in cancelled_project_ids
+    return await cancellation_registry.is_project_cancelled_or_stopping(project_id)
 
 
 # --- Project-phase streaming utilities ---
@@ -651,6 +1190,7 @@ def _build_project_phase_event(
     phase: str,
     subphase: Optional[str] = None,
     session_id: Optional[str] = None,
+    project_epoch: Optional[int] = None,
     request_name: Optional[str] = None,
     content: Optional[str] = None,
     status: Optional[str] = None,
@@ -687,6 +1227,8 @@ def _build_project_phase_event(
         obj["subphase"] = subphase
     if session_id:
         obj["session_id"] = session_id
+    if project_epoch is not None:
+        obj["project_epoch"] = project_epoch
     if request_name:
         obj["request_name"] = request_name
     if status:
@@ -764,6 +1306,7 @@ async def publish_project_phase_chunk(
     *,
     subphase: Optional[str] = None,
     session_id: Optional[str] = None,
+    project_epoch: Optional[int] = None,
     request_name: Optional[str] = None,
     event: str = "chunk",
     status: Optional[str] = None,
@@ -795,6 +1338,32 @@ async def publish_project_phase_chunk(
     if not project_id:
         return
 
+    terminal_event = event in {"session_end", "project_end", "stream_end"}
+    try:
+        project_state = await cancellation_registry.get_project_state(project_id)
+        effective_project_epoch = project_epoch
+        if effective_project_epoch is None and session_id:
+            identity = await cancellation_registry.get_session_project_identity(session_id)
+            if identity.get("project_id") and identity.get("project_id") != project_id:
+                return
+            effective_project_epoch = identity.get("project_epoch")
+        if effective_project_epoch is None and session_id:
+            session = active_sessions.get(session_id)
+            if session and session.get("project_id") == project_id:
+                effective_project_epoch = session.get("project_epoch")
+        if effective_project_epoch is None:
+            return
+        if project_state.epoch != effective_project_epoch:
+            return
+        if not terminal_event:
+            if session_id and await cancellation_registry.is_cancelled(session_id):
+                return
+            if project_state.cancelled or project_state.hard_stop_in_progress:
+                return
+    except Exception:
+        logger.debug("Unable to evaluate project/session publish barrier", exc_info=True)
+        return
+
     lock = project_phase_streams_lock
     targets: List[asyncio.Queue[str]] = []
 
@@ -816,6 +1385,7 @@ async def publish_project_phase_chunk(
         phase=phase,
         subphase=subphase,
         session_id=session_id,
+        project_epoch=effective_project_epoch,
         request_name=request_name,
         content=content,
         status=status,
@@ -832,12 +1402,38 @@ async def publish_project_phase_chunk(
     )
 
     for q in targets:
+        if end_stream:
+            event_enqueued = _put_project_phase_queue_item(q, payload)
+            sentinel_enqueued = _put_project_phase_queue_item(q, None)
+            if not event_enqueued or not sentinel_enqueued:
+                logger.debug("Unable to enqueue project-phase close event for project %s phase %s", project_id, phase)
+            continue
         try:
             q.put_nowait(payload)
-            if end_stream:
-                q.put_nowait(None)  # type: ignore[arg-type]
         except asyncio.QueueFull:
             logger.debug("Dropping project-phase event (queue full) for project %s phase %s", project_id, phase)
+
+
+def _put_project_phase_queue_item(q: asyncio.Queue[str], item: Optional[str]) -> bool:
+    """Best-effort queue put that preserves terminal sentinels under backpressure."""
+    try:
+        q.put_nowait(item)  # type: ignore[arg-type]
+        return True
+    except asyncio.QueueFull:
+        try:
+            q.get_nowait()
+        except asyncio.QueueEmpty:
+            return False
+        try:
+            q.put_nowait(item)  # type: ignore[arg-type]
+            return True
+        except asyncio.QueueFull:
+            return False
+
+
+def _put_project_status_queue_item(q: asyncio.Queue[str], item: Optional[str]) -> bool:
+    """Best-effort status queue put that preserves terminal stream_end sentinels."""
+    return _put_project_phase_queue_item(q, item)
 
 
 async def publish_project_session_end(
@@ -845,6 +1441,7 @@ async def publish_project_session_end(
     session_id: str,
     status: str,
     request_name: Optional[str] = None,
+    project_epoch: Optional[int] = None,
 ) -> None:
     """Publish a session_end event to all phases for a project."""
     if not project_id:
@@ -856,6 +1453,7 @@ async def publish_project_session_end(
             phase,
             content=None,
             session_id=session_id,
+            project_epoch=project_epoch,
             request_name=request_name,
             event="session_end",
             status=status,
@@ -869,8 +1467,20 @@ def queue_project_session_end(session: Dict[str, Any], session_id: str, status: 
     if not project_id:
         return
     request_name = session.get("request_name")
+    project_epoch = session.get("project_epoch")
     try:
-        asyncio.create_task(publish_project_session_end(project_id, session_id, status, request_name))
+        task = asyncio.create_task(
+            publish_project_session_end(
+                project_id,
+                session_id,
+                status,
+                request_name,
+                project_epoch,
+            ),
+            name=f"project-session-end:{project_id}:{session_id}",
+        )
+        _track_background_task(task, _project_session_end_tasks)
+        task.add_done_callback(_log_background_task_result)
     except RuntimeError:
         # If no running loop, skip publishing
         logger.debug("Unable to schedule project session end event (no running loop)")
@@ -918,10 +1528,16 @@ async def publish_project_status_event(
     project_id: Optional[str],
     session_id: str,
     event_type: str = "status_change",
+    expected_project_epoch: Optional[int] = None,
 ) -> None:
     """Broadcast a project status update to all subscribers."""
     if not project_id:
         return
+
+    if expected_project_epoch is not None:
+        project_state = await cancellation_registry.get_project_state(project_id)
+        if project_state.epoch != expected_project_epoch:
+            return
 
     lock = project_status_streams_lock
     targets: List[asyncio.Queue[str]] = []
@@ -951,10 +1567,19 @@ async def publish_project_status_event(
             logger.debug("Dropping project status event (queue full) for project %s", project_id)
 
 
-async def close_project_status_stream(project_id: str, reason: str = "project_ended") -> None:
+async def close_project_status_stream(
+    project_id: str,
+    reason: str = "project_ended",
+    expected_project_epoch: Optional[int] = None,
+) -> None:
     """Send stream_end and close all project status subscribers."""
     if not project_id:
         return
+
+    if expected_project_epoch is not None:
+        project_state = await cancellation_registry.get_project_state(project_id)
+        if project_state.epoch != expected_project_epoch:
+            return
 
     lock = project_status_streams_lock
     targets: List[asyncio.Queue[str]] = []
@@ -976,14 +1601,10 @@ async def close_project_status_stream(project_id: str, reason: str = "project_en
     final_str = json.dumps(final_event, ensure_ascii=True)
 
     for q in targets:
-        try:
-            q.put_nowait(final_str)
-            q.put_nowait(None)  # type: ignore[arg-type]
-        except asyncio.QueueFull:
-            try:
-                q.put_nowait(None)  # type: ignore[arg-type]
-            except asyncio.QueueFull:
-                logger.debug("Unable to close status stream queue for project %s (queue full)", project_id)
+        final_enqueued = _put_project_status_queue_item(q, final_str)
+        sentinel_enqueued = _put_project_status_queue_item(q, None)
+        if not final_enqueued or not sentinel_enqueued:
+            logger.debug("Unable to close status stream queue for project %s", project_id)
 
 
 def queue_project_status_event(session: Dict[str, Any], session_id: str, event_type: str = "status_change") -> None:
@@ -991,8 +1612,16 @@ def queue_project_status_event(session: Dict[str, Any], session_id: str, event_t
     project_id = session.get("project_id")
     if not project_id:
         return
+    project_epoch = session.get("project_epoch")
     try:
-        asyncio.create_task(publish_project_status_event(project_id, session_id, event_type))
+        asyncio.create_task(
+            publish_project_status_event(
+                project_id,
+                session_id,
+                event_type,
+                expected_project_epoch=project_epoch,
+            )
+        )
     except RuntimeError:
         logger.debug("Unable to schedule project status event (no running loop)")
 
@@ -1018,6 +1647,15 @@ def update_session_status(
     else:
         current_value = str(current_status)
     next_value = status.value if isinstance(status, GenerationStatus) else str(status)
+    if _is_hard_cancel_sealed(session) and next_value != GenerationStatus.CANCELLED.value:
+        session["late_writes_blocked"] = session.get("late_writes_blocked", 0) + 1
+        logger.debug(
+            "Ignoring status transition after hard stop for session %s: %s -> %s",
+            session_id,
+            current_value,
+            next_value,
+        )
+        return
     if current_value in final_status_values and next_value != current_value:
         logger.debug(
             "Ignoring status transition for terminal session %s: %s -> %s",
@@ -1030,12 +1668,22 @@ def update_session_status(
     if phase is not None:
         session["current_phase"] = phase
     queue_project_status_event(session, session_id)
+    queue_debug_session_transition(
+        session_id,
+        status=next_value,
+        phase=session.get("current_phase"),
+    )
 
 
 def update_session_phase(session: Dict[str, Any], session_id: str, phase: str) -> None:
     """Set current phase and trigger project status hook."""
     session["current_phase"] = phase
     queue_project_status_event(session, session_id)
+    queue_debug_session_transition(
+        session_id,
+        status=_status_to_debug_value(session.get("status")),
+        phase=phase,
+    )
 
 
 def update_session_iteration(session: Dict[str, Any], session_id: str, iteration: int) -> None:
@@ -1159,6 +1807,9 @@ async def perform_session_cleanup() -> None:
                 active_sessions.pop(session_id, None)
                 cleanup_session_sidecars(session_id)
 
+    for session_id in expired_sessions:
+        await cancellation_registry.unregister_session(session_id)
+
     if expired_sessions:
         logger.info('Cleaned up %d expired session(s): %s', len(expired_sessions), ', '.join(expired_sessions))
     if trimmed_logs:
@@ -1198,6 +1849,7 @@ async def get_project_status(project_id: str) -> dict:
     """
     from word_count_utils import count_words  # Avoid circular import
 
+    project_state = await cancellation_registry.get_project_state(project_id)
     sessions_data = []
     active_count = 0
     completed_count = 0
@@ -1323,18 +1975,18 @@ async def get_project_status(project_id: str) -> dict:
 
     # Determine overall project status
     total_sessions = len(sessions_data)
-    if total_sessions == 0:
+    if project_state.hard_stop_in_progress:
+        project_status = "cancelling"
+    elif project_state.cancelled:
+        project_status = "cancelled"
+    elif total_sessions == 0:
         # Check if project is reserved but idle
         if project_id in reserved_project_ids:
             project_status = "idle"
-        elif project_id in cancelled_project_ids:
-            project_status = "cancelled"
         else:
             project_status = "idle"
     elif active_count > 0:
         project_status = "running"
-    elif project_id in cancelled_project_ids:
-        project_status = "cancelled"
     elif last_status == "completed":
         project_status = "completed"
     elif last_status == "rejected":
@@ -1347,6 +1999,8 @@ async def get_project_status(project_id: str) -> dict:
     return {
         "project_id": project_id,
         "status": project_status,
+        "cancel_mode": project_state.cancel_mode,
+        "project_epoch": project_state.epoch,
         "sessions": sessions_data,
         "summary": {
             "total_sessions": total_sessions,

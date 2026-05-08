@@ -86,6 +86,7 @@ from word_count_utils import build_word_count_instructions, count_words, prepare
 
 from . import app_state
 from .app_state import (
+    apply_session_cancelled_state,
     _debug_record_event,
     _debug_record_usage,
     _debug_update_status,
@@ -93,9 +94,13 @@ from .app_state import (
     _serialize_for_debug,
     _store_final_result,
     get_session,
+    is_terminal_session,
     logger,
     mutate_session,
+    mutate_session_if_not_hard_cancelled,
     publish_project_phase_chunk,
+    publish_project_session_end,
+    publish_project_status_event,
     update_consensus_result,
     update_qa_evaluation_completed,
     update_qa_evaluation_started,
@@ -104,6 +109,7 @@ from .app_state import (
     update_session_phase,
     update_session_status,
 )
+from .cancellation import CancellationToken, cancellation_registry
 from .feedback_formatter import (
     _compose_style_feedback_block,
     _extract_deal_breaker_details,
@@ -202,13 +208,144 @@ qa_engine = _ServiceProxy("qa_engine")
 consensus_engine = _ServiceProxy("consensus_engine")
 gran_sabio = _ServiceProxy("gran_sabio")
 
+_TERMINAL_FINALIZATION_TIMEOUT_SECONDS = 5.0
+_TERMINAL_WRITE_TIMEOUT_SECONDS = 2.0
+
 
 async def check_session_cancelled(session_id: str) -> bool:
     """Check if session has been cancelled."""
+    if await cancellation_registry.is_cancelled(session_id):
+        return True
     cancelled = await mutate_session(session_id, lambda session: session.get("cancelled", False))
     if cancelled is None:
         return True
     return bool(cancelled)
+
+
+async def _await_bounded_terminal_write(label: str, awaitable, *, timeout: float = _TERMINAL_WRITE_TIMEOUT_SECONDS) -> None:
+    """Await a terminal side effect with a bounded timeout."""
+    try:
+        await asyncio.wait_for(awaitable, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning("Timed out while writing terminal %s after %.1fs", label, timeout)
+    except Exception:
+        logger.exception("Failed while writing terminal %s", label)
+
+
+async def _finalize_generation_interruption(
+    session_id: str,
+    *,
+    reason: str,
+) -> None:
+    """Idempotently commit a cancelled terminal state after task interruption."""
+    hard_cancelled = await cancellation_registry.is_hard_cancelled(session_id)
+    soft_cancelled = await cancellation_registry.is_soft_cancelled(session_id)
+    cancel_mode = "hard" if hard_cancelled else ("soft" if soft_cancelled else "interrupted")
+    finalized: Dict[str, Any] = {}
+
+    def _commit_cancelled(session: Dict[str, Any]) -> Dict[str, Any]:
+        if is_terminal_session(session):
+            return {
+                "already_terminal": True,
+                "status": session.get("status"),
+                "final_result": session.get("final_result"),
+                "project_id": session.get("project_id"),
+                "request_name": session.get("request_name"),
+                "project_epoch": session.get("project_epoch"),
+            }
+        final_result = apply_session_cancelled_state(
+            session,
+            session_id,
+            cancel_mode=cancel_mode,
+            reason=reason,
+            hard=hard_cancelled,
+            queue_events=False,
+        )
+        return {
+            "already_terminal": False,
+            "status": GenerationStatus.CANCELLED.value,
+            "final_result": final_result,
+            "project_id": session.get("project_id"),
+            "request_name": session.get("request_name"),
+            "project_epoch": session.get("project_epoch"),
+        }
+
+    outcome = await mutate_session(session_id, _commit_cancelled)
+    if outcome is None:
+        return
+    finalized.update(outcome)
+
+    if finalized.get("already_terminal"):
+        return
+
+    final_result = finalized.get("final_result")
+    await _await_bounded_terminal_write(
+        "debug cancellation event",
+        _debug_record_event(
+            session_id,
+            "session_cancelled",
+            {
+                "reason": reason,
+                "cancel_mode": cancel_mode,
+                "final_result": final_result,
+            },
+        ),
+    )
+    await _await_bounded_terminal_write(
+        "debug cancellation status",
+        _debug_update_status(
+            session_id,
+            status=GenerationStatus.CANCELLED.value,
+            final_payload=final_result,
+        ),
+    )
+
+    project_id = finalized.get("project_id")
+    if project_id:
+        await _await_bounded_terminal_write(
+            "project session_end",
+            publish_project_session_end(
+                project_id,
+                session_id,
+                GenerationStatus.CANCELLED.value,
+                finalized.get("request_name"),
+                finalized.get("project_epoch"),
+            ),
+        )
+        await _await_bounded_terminal_write(
+            "project status",
+            publish_project_status_event(
+                project_id,
+                session_id,
+                "status_change",
+                expected_project_epoch=finalized.get("project_epoch"),
+            ),
+        )
+
+
+async def _finalize_generation_interruption_shielded(
+    session_id: str,
+    *,
+    reason: str,
+    timeout: float = _TERMINAL_FINALIZATION_TIMEOUT_SECONDS,
+) -> None:
+    """Give interruption finalization a shielded, bounded chance to finish."""
+    task = asyncio.create_task(
+        _finalize_generation_interruption(session_id, reason=reason),
+        name=f"generation-interruption-finalize:{session_id}",
+    )
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Timed out finalizing interrupted generation session %s after %.1fs",
+            session_id,
+            timeout,
+        )
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    except Exception:
+        logger.exception("Failed finalizing interrupted generation session %s", session_id)
 
 
 def _format_context_block(resolved: ResolvedAttachment, preview: Optional[str]) -> str:
@@ -705,8 +842,7 @@ def _should_use_generation_tools(request: ContentRequest) -> bool:
     provider = model_info.get("provider")
     model_id = str(model_info.get("model_id", "")).lower()
     provider_key = (provider or "").lower()
-    supported_providers = {"openai", "claude", "anthropic", "gemini", "google", "xai", "openrouter"}
-    supported = provider_key in supported_providers
+    supported = AIService._supports_tool_calling(provider_key, model_id)
 
     if provider_key == "openai" and AIService._is_openai_responses_api_model(model_id):
         supported = False
@@ -753,6 +889,9 @@ def _is_retryable_streaming_error(exc: Exception) -> bool:
     # AIRequestError already went through retry logic in ai_service
     # but we want to retry at this level too for partial content scenarios
     if isinstance(exc, AIRequestError):
+        failure = getattr(exc, "provider_failure", None)
+        if failure is not None:
+            return bool(failure.retryable)
         return True
 
     # Check for transient HTTP errors
@@ -829,6 +968,7 @@ async def _generate_full_content(
     phase_logger: Optional[Any] = None,
     images: Optional[List[ImageData]] = None,
     prompt_safety_parts: Optional[List[PromptPart]] = None,
+    cancellation_token: Optional[CancellationToken] = None,
 ) -> str:
     """
     Generate complete content from scratch using AI service.
@@ -875,6 +1015,9 @@ async def _generate_full_content(
     last_thinking_update = generation_start_time
     THINKING_UPDATE_INTERVAL = 10  # Send thinking status every 10 seconds
     received_first_chunk = False
+
+    async def _generation_cancelled() -> bool:
+        return await check_session_cancelled(session_id)
 
     await _debug_record_event(
         session_id,
@@ -961,6 +1104,7 @@ async def _generate_full_content(
                 min_global_score=request.min_global_score,
                 model_alias_registry=getattr(request, "_model_alias_registry", None),
                 prompt_safety_parts=prompt_safety_parts,
+                cancellation_token=cancellation_token,
             )
         except AccentGuardError as accent_exc:
             # Fail-open only applies to technical accent-audit failures. A semantic
@@ -1078,6 +1222,9 @@ async def _generate_full_content(
     stream_delay = config.RETRY_DELAY
 
     for stream_attempt in range(1, max_stream_attempts + 1):
+        if await _generation_cancelled():
+            raise asyncio.CancelledError()
+
         # Reset state for each attempt
         content_chunks = []
         session["generation_content"] = ""
@@ -1130,7 +1277,11 @@ async def _generate_full_content(
                 images=images,
                 model_alias_registry=getattr(request, "_model_alias_registry", None),
                 prompt_safety_parts=prompt_safety_parts,
+                cancellation_token=cancellation_token,
+                cancel_callback=_generation_cancelled,
             ):
+                if await _generation_cancelled():
+                    raise asyncio.CancelledError()
                 # Handle StreamChunk (Claude with thinking) vs plain string (other providers)
                 # StreamChunk allows us to stream thinking content live while keeping it
                 # separate from the final accumulated result.
@@ -1199,6 +1350,8 @@ async def _generate_full_content(
                         last_thinking_update = now
 
             # If we get here, streaming completed successfully
+            if await _generation_cancelled():
+                raise asyncio.CancelledError()
             break  # Exit retry loop
 
         except (AIRequestError, Exception) as stream_error:
@@ -1234,6 +1387,8 @@ async def _generate_full_content(
                     )
 
                 await asyncio.sleep(stream_delay)
+                if await _generation_cancelled():
+                    raise asyncio.CancelledError()
                 continue  # Try again
 
             else:
@@ -1264,6 +1419,8 @@ async def _generate_full_content(
                 raise
 
     # After the retry loop, content_chunks contains the successful result
+    if await _generation_cancelled():
+        raise asyncio.CancelledError()
     content = "".join(content_chunks)
 
     await _debug_record_event(
@@ -1303,6 +1460,7 @@ async def generate_iteration_candidate(
     phase_logger: Optional[Any],
     images: Optional[List[ImageData]],
     prompt_safety_parts: Optional[List[PromptPart]] = None,
+    cancellation_token: Optional[CancellationToken] = None,
 ) -> IterationCandidateResult:
     """Generate the next outer-iteration candidate in standard or Long Text mode."""
 
@@ -1321,6 +1479,7 @@ async def generate_iteration_candidate(
             phase_logger=phase_logger,
             images=images,
             prompt_safety_parts=prompt_safety_parts,
+            cancellation_token=cancellation_token,
         )
         return IterationCandidateResult(
             content=content,
@@ -1342,6 +1501,7 @@ async def generate_iteration_candidate(
         iteration=iteration,
         cancellation_requested=lambda: check_session_cancelled(session_id),
         context_prompt=context_prompt,
+        cancellation_token=cancellation_token,
     )
     return IterationCandidateResult(
         content=controller_result.selected_candidate.public_text,
@@ -2046,6 +2206,7 @@ async def _process_single_layer_with_edits(
     images_for_qa: Optional[List["ImageData"]] = None,
     iteration: int = 1,
     qa_tool_event_callback: Optional[Any] = None,
+    cancellation_token: Optional[CancellationToken] = None,
 ) -> tuple:
     """
     Process a single QA layer with iterative smart-edit.
@@ -2313,6 +2474,7 @@ async def _process_single_layer_with_edits(
                     usage_tracker=usage_tracker,
                     phase_logger=phase_logger,
                     tool_event_callback=_make_gran_sabio_tool_event_callback(session_id or "unknown", session),
+                    cancellation_token=cancellation_token,
                 )
             except GranSabioProcessCancelled:
                 if not escalation_completed:
@@ -2570,6 +2732,7 @@ async def _process_single_layer_with_edits(
                 qa_model_count=len(qa_model_names),
                 model_alias_registry=getattr(request, "_model_alias_registry", None),
                 arbiter_tools_mode=getattr(request, 'arbiter_tools_mode', 'auto'),
+                cancellation_token=cancellation_token,
             )
 
             # Call Arbiter for intelligent conflict resolution
@@ -2668,7 +2831,8 @@ async def _process_single_layer_with_edits(
                 usage_tracker=usage_tracker,
                 session_id=session_id,
                 iteration=iteration,
-                phase_logger=phase_logger
+                phase_logger=phase_logger,
+                cancellation_token=cancellation_token,
             )
             content = edited_content
             logger.info(f"Layer '{layer_name}': Edits applied successfully. Re-evaluating...")
@@ -2766,6 +2930,7 @@ async def _process_all_layers_with_edits(
     stream_callback: Optional[Any] = None,
     images_for_qa: Optional[List["ImageData"]] = None,
     iteration: int = 1,
+    cancellation_token: Optional[CancellationToken] = None,
 ) -> tuple:
     """
     Process all QA layers sequentially with per-layer smart-edit.
@@ -2934,6 +3099,7 @@ async def _process_all_layers_with_edits(
             images_for_qa=images_for_qa,
             iteration=iteration,
             qa_tool_event_callback=_qa_tool_event_callback,
+            cancellation_token=cancellation_token,
         )
 
         # Update content with edited version
@@ -3158,6 +3324,7 @@ async def _adjudicate_final_verification_deal_breakers(
     usage_tracker: Optional["UsageTracker"],
     phase_logger: Optional[Any],
     cancel_callback: Optional[Any],
+    cancellation_token: Optional[CancellationToken] = None,
 ) -> List[Dict[str, Any]]:
     """Sequentially ask GranSabio to suppress minority/tie final-verification false positives."""
 
@@ -3284,6 +3451,7 @@ async def _adjudicate_final_verification_deal_breakers(
                 usage_tracker=usage_tracker,
                 phase_logger=phase_logger,
                 tool_event_callback=_make_gran_sabio_tool_event_callback(session_id or "unknown", session),
+                cancellation_token=cancellation_token,
             )
         except GranSabioProcessCancelled:
             tracker.complete_escalation(
@@ -3380,6 +3548,7 @@ async def _maybe_run_final_verification(
     cancel_callback: Optional[Any],
     qa_input_images: Optional[List["ImageData"]],
     context_prompt: str,
+    cancellation_token: Optional[CancellationToken] = None,
 ) -> Dict[str, Any]:
     """Run final QA verification when enabled and return status plus results."""
 
@@ -3444,6 +3613,7 @@ async def _maybe_run_final_verification(
         usage_tracker=usage_tracker,
         phase_logger=phase_logger,
         cancel_callback=cancel_callback,
+        cancellation_token=cancellation_token,
     )
 
     if gran_sabio_decisions:
@@ -3642,7 +3812,8 @@ async def _generate_smart_edits(
     usage_tracker: Optional[UsageTracker],
     session_id: str,
     iteration: int,
-    phase_logger: Optional[Any] = None
+    phase_logger: Optional[Any] = None,
+    cancellation_token: Optional[CancellationToken] = None,
 ) -> str:
     """
     Generate smart edits for specific paragraphs and apply them to base content.
@@ -3889,6 +4060,7 @@ async def _generate_smart_edits(
                     temperature=edit_temperature,
                     preserve_length=True,
                     usage_callback=usage_callback,
+                    cancellation_token=cancellation_token,
                 )
 
             if result.success:
@@ -4062,6 +4234,9 @@ async def _generate_smart_edits(
 
         return base_content
 
+    except asyncio.CancelledError:
+        logger.info("Generation task cancelled for session %s", session_id)
+        raise
     except Exception as e:
         logger.error(f"Error applying smart edits: {e}")
         await add_verbose_log(
@@ -4112,6 +4287,14 @@ async def process_content_generation(
     if session is None:
         logger.error(f"Session {session_id} not found - cannot process generation")
         return
+    cancellation_token = CancellationToken(
+        session_id=session_id,
+        project_id=session.get("project_id"),
+        phase="generation",
+        operation="process_content_generation",
+        registry=cancellation_registry,
+    )
+    request._cancellation_token = cancellation_token
     usage_tracker: Optional[UsageTracker] = session.get("usage_tracker")
     model_alias_registry = getattr(request, "_model_alias_registry", None) or session.get("model_alias_registry")
     if model_alias_registry is None:
@@ -4135,7 +4318,11 @@ async def process_content_generation(
     # Initialize feedback memory for this session
     feedback_manager = get_feedback_manager()
     try:
-        initial_feedback_info = await feedback_manager.initialize_session(session_id, request)
+        initial_feedback_info = await feedback_manager.initialize_session(
+            session_id,
+            request,
+            cancellation_token=cancellation_token,
+        )
         session["feedback_manager"] = feedback_manager
         session["initial_rules"] = initial_feedback_info.get("initial_rules", [])
         logger.info(f"Feedback memory initialized for session {session_id} with {len(initial_feedback_info.get('initial_rules', []))} initial rules")
@@ -4222,6 +4409,7 @@ async def process_content_generation(
                 session_id,
                 status=GenerationStatus.FAILED.value,
             )
+            await cancellation_registry.unregister_session(session_id)
             return
 
     async def cancellation_requested() -> bool:
@@ -4489,7 +4677,8 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     usage_tracker=usage_tracker,
                     session_id=session_id,
                     iteration=iteration,
-                    phase_logger=phase_logger
+                    phase_logger=phase_logger,
+                    cancellation_token=cancellation_token,
                 )
 
                 # Update session state
@@ -4521,10 +4710,15 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                         phase_logger=phase_logger,
                         images=images_for_generation,
                         prompt_safety_parts=prompt_safety_parts,
+                        cancellation_token=cancellation_token,
                     )
                 except LongTextProcessCancelled:
                     await add_verbose_log(session_id, "Long Text generation cancelled by user request")
                     phase_logger._exit_phase(Phase.GENERATION)
+                    await _finalize_generation_interruption_shielded(
+                        session_id,
+                        reason="Long Text generation cancelled by user request",
+                    )
                     return
                 except LongTextGenerationError as exc:
                     if exc.long_text_state is not None:
@@ -4548,16 +4742,16 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                             "mode": "long_text",
                         } if candidate_result.used_tool_loop else None
 
-                # Update session state
-                _set_generation_content_metrics(session, content)
-                _set_last_generated_content_metrics(session, content)
-                session["partial_content"] = ""
-
-                # Check cancellation after content generation
+                # Check cancellation before committing provider output.
                 if await check_session_cancelled(session_id):
                     await add_verbose_log(session_id, "Generation cancelled after content creation")
                     phase_logger._exit_phase(Phase.GENERATION)
                     return
+
+                # Update session state
+                _set_generation_content_metrics(session, content)
+                _set_last_generated_content_metrics(session, content)
+                session["partial_content"] = ""
 
             if _generation_was_truncated(session):
                 failure_reason = _build_truncation_failure_reason(session, request)
@@ -4808,7 +5002,11 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                                     prompt_safety_parts=[
                                         PromptPart(word_instructions, "system_generated", "json_retry.word_instructions")
                                     ] if word_instructions else None,
+                                    cancellation_token=cancellation_token,
+                                    cancel_callback=cancellation_requested,
                                 ):
+                                    if await cancellation_requested():
+                                        raise asyncio.CancelledError()
                                     # Handle StreamChunk (Claude with thinking) vs plain string
                                     if isinstance(chunk, StreamChunk):
                                         chunk_text = chunk.text
@@ -4840,6 +5038,8 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                                 )
                                 raise
 
+                            if await cancellation_requested():
+                                raise asyncio.CancelledError()
                             content = "".join(content_chunks)
                             _set_generation_content_metrics(session, content)
                             _set_last_generated_content_metrics(session, content)
@@ -5368,6 +5568,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                         stream_callback=qa_stream_callback,
                         images_for_qa=qa_input_images,
                         iteration=iteration + 1,
+                        cancellation_token=cancellation_token,
                     )
 
                     qa_results.update(segment_results)
@@ -5507,6 +5708,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     cancel_callback=cancellation_requested,
                     qa_input_images=qa_input_images,
                     context_prompt=context_prompt,
+                    cancellation_token=cancellation_token,
                 )
 
                 if final_verification_status.get("triggered"):
@@ -5523,6 +5725,10 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
             except QAProcessCancelled:
                 await add_verbose_log(session_id, "QA evaluation cancelled by user request")
                 phase_logger._exit_phase(Phase.QA)
+                await _finalize_generation_interruption_shielded(
+                    session_id,
+                    reason="QA evaluation cancelled by user request",
+                )
                 return
 
             except QAModelUnavailableError as qa_model_err:
@@ -5832,6 +6038,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                             content_snapshot=content[:500],  # First 500 chars as snapshot
                             iteration_num=iteration,
                             model_alias_registry=getattr(request, "_model_alias_registry", None),
+                            cancellation_token=cancellation_token,
                         )
                         session["feedback_prompt"] = feedback_prompt
                         await add_verbose_log(session_id, "📝 Feedback memory updated with iteration results")
@@ -6072,9 +6279,14 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     usage_tracker=usage_tracker,
                     tool_event_callback=_make_gran_sabio_tool_event_callback(session_id, session),
                     fallback_reason=fallback_reason,
+                    cancellation_token=cancellation_token,
                 )
             except GranSabioProcessCancelled:
                 await add_verbose_log(session_id, "Gran Sabio regeneration cancelled by user request")
+                await _finalize_generation_interruption_shielded(
+                    session_id,
+                    reason="Gran Sabio regeneration cancelled by user request",
+                )
                 return
 
             if not gran_sabio_generation.approved:
@@ -6361,6 +6573,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                                 cancel_callback=cancellation_requested,
                                 qa_input_images=qa_input_images,
                                 context_prompt=context_prompt,
+                                cancellation_token=cancellation_token,
                             )
                             if gran_sabio_final_verification.get("triggered"):
                                 qa_results = gran_sabio_final_verification["qa_results"]
@@ -6526,6 +6739,10 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
 
                         except QAProcessCancelled:
                             await add_verbose_log(session_id, "Gran Sabio QA evaluation cancelled by user request")
+                            await _finalize_generation_interruption_shielded(
+                                session_id,
+                                reason="Gran Sabio QA evaluation cancelled by user request",
+                            )
                             return
 
                         except asyncio.TimeoutError:
@@ -6622,11 +6839,16 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     usage_tracker=usage_tracker,
                     phase_logger=phase_logger,
                     tool_event_callback=_make_gran_sabio_tool_event_callback(session_id, session),
+                    cancellation_token=cancellation_token,
                 )
                 phase_logger._exit_phase(Phase.GRAN_SABIO)
             except GranSabioProcessCancelled:
                 await add_verbose_log(session_id, "Gran Sabio tie review cancelled by user request")
                 phase_logger._exit_phase(Phase.GRAN_SABIO)
+                await _finalize_generation_interruption_shielded(
+                    session_id,
+                    reason="Gran Sabio tie review cancelled by user request",
+                )
                 return
         elif minority_deal_breakers and minority_deal_breakers["has_minority_deal_breakers"]:
             separator = "=" * 80
@@ -6652,11 +6874,16 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     usage_tracker=usage_tracker,
                     phase_logger=phase_logger,
                     tool_event_callback=_make_gran_sabio_tool_event_callback(session_id, session),
+                    cancellation_token=cancellation_token,
                 )
                 phase_logger._exit_phase(Phase.GRAN_SABIO)
             except GranSabioProcessCancelled:
                 await add_verbose_log(session_id, "Gran Sabio minority review cancelled by user request")
                 phase_logger._exit_phase(Phase.GRAN_SABIO)
+                await _finalize_generation_interruption_shielded(
+                    session_id,
+                    reason="Gran Sabio minority review cancelled by user request",
+                )
                 return
         else:
             # Standard iteration review
@@ -6683,11 +6910,16 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     usage_tracker=usage_tracker,
                     phase_logger=phase_logger,
                     tool_event_callback=_make_gran_sabio_tool_event_callback(session_id, session),
+                    cancellation_token=cancellation_token,
                 )
                 phase_logger._exit_phase(Phase.GRAN_SABIO)
             except GranSabioProcessCancelled:
                 await add_verbose_log(session_id, "Gran Sabio iteration review cancelled by user request")
                 phase_logger._exit_phase(Phase.GRAN_SABIO)
+                await _finalize_generation_interruption_shielded(
+                    session_id,
+                    reason="Gran Sabio iteration review cancelled by user request",
+                )
                 return
 
         if gran_sabio_result.error:
@@ -6933,6 +7165,15 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
             logger.warning(content_to_log)
             logger.warning(f"--- END REJECTED CONTENT ---")
 
+    except asyncio.CancelledError:
+        logger.info("Generation processor interrupted for session %s", session_id)
+        try:
+            await _finalize_generation_interruption_shielded(
+                session_id,
+                reason="Generation task interrupted before normal terminal completion",
+            )
+        finally:
+            raise
     except Exception as e:
         await add_verbose_log(session_id, f"💥 Error in generation: {str(e)}")
         error_msg = str(e)
@@ -6976,6 +7217,8 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
         logger.error(f"--- START REJECTED CONTENT ---")
         logger.error(content_to_log)
         logger.error(f"--- END REJECTED CONTENT ---")
+    finally:
+        await cancellation_registry.unregister_session(session_id)
 
 
 
@@ -6993,7 +7236,7 @@ async def add_verbose_log(session_id: str, message: str) -> None:
         session["last_activity_at"] = datetime.utcnow()
         return True
 
-    appended = await mutate_session(session_id, _append)
+    appended = await mutate_session_if_not_hard_cancelled(session_id, _append)
     if not appended:
         return
 

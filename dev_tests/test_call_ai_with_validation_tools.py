@@ -146,6 +146,30 @@ async def test_fallback_no_tool_support_envelope():
     assert envelope.tools_skipped_reason == "no_tool_support"
 
 
+@pytest.mark.asyncio
+async def test_fallback_no_tool_support_when_model_capability_is_unconfirmed():
+    """Known provider still skips tools when the model does not advertise them."""
+    service = AIService.__new__(AIService)
+    with patch.object(AIService, "_normalize_tool_loop_provider", return_value="openai"), \
+         patch.object(AIService, "_supports_tool_calling", return_value=False), \
+         patch("ai_service.config") as mock_config:
+        mock_config.validate_token_limits.return_value = {
+            "adjusted_tokens": 512,
+            "adjusted_reasoning_effort": None,
+            "adjusted_thinking_budget_tokens": None,
+            "model_info": {"provider": "openai", "model_id": "unknown-openai-model"},
+            "reasoning_timeout_seconds": None,
+        }
+        content, envelope = await service.call_ai_with_validation_tools(
+            prompt="p",
+            model="unknown-openai-model",
+            validation_callback=lambda _: _approved_result(),
+        )
+
+    assert content == ""
+    assert envelope.tools_skipped_reason == "no_tool_support"
+
+
 # ---------------------------------------------------------------------------
 # estimate_prompt_overflow helper
 # ---------------------------------------------------------------------------

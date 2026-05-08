@@ -296,7 +296,7 @@ class ProjectStreamManager:
                     try:
                         parsed = json.loads(result)
                         event_type = parsed.get("type")
-                        if event_type in ("stream_end", "project_cancelled"):
+                        if event_type in ("stream_end", "project_cancelled", "project_end"):
                             closed_by_status = True
                             close_reason = parsed.get("reason", event_type)
                             should_close = True

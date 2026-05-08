@@ -6,17 +6,21 @@ Handles communication with multiple AI providers (OpenAI, Anthropic, Google).
 Provides unified interface for content generation across different models.
 """
 
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import logging
 import random
 import threading
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional, Set, Tuple, TypeVar
 
 import aiohttp
 
 if TYPE_CHECKING:
+    from core.cancellation import CancellationToken
     from logging_utils import PhaseLogger
     from models import ImageData, LlmAccentGuard
 import anthropic
@@ -45,6 +49,10 @@ from llm_accent_prompts import (
     build_inline_accent_prompt,
 )
 from model_aliasing import PromptPart, PromptSource, assert_prompt_is_model_blind
+from model_capability_registry import model_supports as registry_model_supports
+from model_capability_registry import normalize_provider
+from provider_capabilities import CapabilitySupport
+from provider_errors import ProviderErrorKind, ProviderFailure, classify_provider_exception
 from schema_utils import json_schema_to_pydantic
 from tool_loop_models import (
     JsonContractError,
@@ -187,10 +195,28 @@ class AccentGuardError(Exception):
 class AIRequestError(RuntimeError):
     """Raised when an AI provider keeps failing after retry attempts."""
 
-    def __init__(self, provider: str, model: str, attempts: int, max_attempts: int, cause: Exception):
+    def __init__(
+        self,
+        provider: str,
+        model: str,
+        attempts: int,
+        max_attempts: int,
+        cause: Exception,
+        provider_failure: Optional[ProviderFailure] = None,
+    ):
+        if provider_failure is None:
+            provider_failure = classify_provider_exception(
+                cause,
+                provider=provider,
+                model_id=model,
+                operation="ai_request",
+                attempt=attempts,
+                max_attempts=max_attempts,
+            )
         message = (
             f"AI request failed for {model} via {provider} after "
-            f"{attempts}/{max_attempts} attempts: {cause}"
+            f"{attempts}/{max_attempts} attempts "
+            f"({provider_failure.kind.value}): {provider_failure.message}"
         )
         super().__init__(message)
         self.provider = provider
@@ -198,6 +224,7 @@ class AIRequestError(RuntimeError):
         self.attempts = attempts
         self.max_attempts = max_attempts
         self.cause = cause
+        self.provider_failure = provider_failure
 
 
 class StreamChunk:
@@ -1024,6 +1051,10 @@ class AIService:
 
     @staticmethod
     def _extract_request_id(exc: Exception) -> Optional[str]:
+        if isinstance(exc, AIRequestError):
+            failure = getattr(exc, "provider_failure", None)
+            if failure and failure.request_id:
+                return failure.request_id
         for attr in ("request_id", "response_id", "id"):
             value = getattr(exc, attr, None)
             if value:
@@ -1038,6 +1069,13 @@ class AIService:
 
     @staticmethod
     def _should_retry_exception(exc: Exception) -> bool:
+        if isinstance(exc, AIRequestError):
+            failure = getattr(exc, "provider_failure", None)
+            if failure is not None:
+                return bool(failure.retryable)
+        if isinstance(exc, ProviderFailure):
+            return bool(exc.retryable)
+
         # Network and timeout errors are always retriable
         if isinstance(exc, (asyncio.TimeoutError, aiohttp.ClientError, ConnectionError, OSError)):
             return True
@@ -1073,6 +1111,77 @@ class AIService:
         ]
         return any(marker in message for marker in transient_markers)
 
+    @staticmethod
+    def _classify_provider_failure(
+        exc: Exception,
+        *,
+        provider: str,
+        model_id: str,
+        action: str,
+        attempt: int,
+        max_attempts: int,
+        attempted_feature: Optional[str] = None,
+    ) -> ProviderFailure:
+        if isinstance(exc, AIRequestError):
+            failure = getattr(exc, "provider_failure", None)
+            if failure is not None:
+                return failure
+        return classify_provider_exception(
+            exc,
+            provider=provider,
+            model_id=model_id,
+            operation=action,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            attempted_feature=attempted_feature,
+        )
+
+    @staticmethod
+    def _should_wrap_provider_failure(failure: ProviderFailure) -> bool:
+        """Return True when an exception should be surfaced as an AIRequestError."""
+        return (
+            failure.kind != ProviderErrorKind.UNKNOWN
+            or failure.retryable
+            or failure.status_code is not None
+            or failure.request_id is not None
+            or failure.provider_error_type is not None
+            or failure.provider_error_code is not None
+            or failure.provider_error_param is not None
+        )
+
+    @staticmethod
+    def _attempted_output_feature(
+        provider: str,
+        model_id: str,
+        *,
+        json_output: bool,
+        json_schema: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Return the native output-format parameter that will be sent."""
+        if not json_output:
+            return None
+        provider_key = normalize_provider(provider)
+        if json_schema:
+            if not AIService._supports_structured_outputs(provider_key, model_id):
+                return None
+            if provider_key == "openai":
+                return "text.format.json_schema" if AIService._is_openai_responses_api_model(model_id) else "response_format.json_schema"
+            if provider_key == "claude":
+                return "output_config.format"
+            if provider_key == "gemini":
+                return "response_json_schema"
+            if provider_key in {"openrouter", "xai", "ollama"}:
+                return "response_format.json_schema"
+        if provider_key == "openai" and AIService._is_openai_responses_api_model(model_id):
+            return "text.format.json_schema"
+        if provider_key == "gemini":
+            return "response_mime_type"
+        if provider_key == "openai":
+            return "response_format.json_object"
+        if provider_key in {"openrouter", "xai", "ollama"} and AIService._supports_json_object(provider_key, model_id):
+            return "response_format.json_object"
+        return None
+
     async def _execute_with_retries(
         self,
         operation: Callable[[], Awaitable[T]],
@@ -1080,13 +1189,18 @@ class AIService:
         provider: str,
         model_id: str,
         action: str,
+        attempted_feature: Optional[str] = None,
+        cancellation_token: Optional["CancellationToken"] = None,
     ) -> T:
         max_attempts = self._max_retry_attempts()
         last_exception: Optional[Exception] = None
 
         for attempt in range(1, max_attempts + 1):
             try:
+                await self._raise_if_cancelled(cancellation_token)
                 return await operation()
+            except asyncio.CancelledError:
+                raise
             except AIRequestError:
                 raise
             except AccentGuardError:
@@ -1095,31 +1209,69 @@ class AIService:
                 # Authoritative provider signal — do not retry, surface to caller.
                 raise
             except Exception as exc:
+                if cancellation_token and await cancellation_token.any_cancelled():
+                    raise asyncio.CancelledError() from exc
                 last_exception = exc
-                should_retry = attempt < max_attempts and self._should_retry_exception(exc)
+                failure = self._classify_provider_failure(
+                    exc,
+                    provider=provider,
+                    model_id=model_id,
+                    action=action,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    attempted_feature=attempted_feature,
+                )
+                should_retry = attempt < max_attempts and failure.retryable
 
                 if not should_retry:
-                    raise
+                    if not self._should_wrap_provider_failure(failure):
+                        raise
+                    raise AIRequestError(
+                        provider,
+                        model_id,
+                        attempt,
+                        max_attempts,
+                        exc,
+                        provider_failure=failure,
+                    ) from exc
 
                 delay_seconds = self._calculate_retry_delay(attempt)
-                request_id = self._extract_request_id(exc)
+                request_id = failure.request_id or self._extract_request_id(exc)
                 suffix = f" (request_id={request_id})" if request_id else ""
                 logger.warning(
-                    "AI %s failed for %s via %s on attempt %d/%d%s: %s (retrying in %.1fs)",
+                    "AI %s failed for %s via %s on attempt %d/%d%s [%s]: %s (retrying in %.1fs)",
                     action,
                     model_id,
                     provider,
                     attempt,
                     max_attempts,
                     suffix,
-                    exc,
+                    failure.kind.value,
+                    failure.message,
                     delay_seconds,
                 )
 
                 await asyncio.sleep(delay_seconds)
+                await self._raise_if_cancelled(cancellation_token)
 
         assert last_exception is not None
-        raise AIRequestError(provider, model_id, max_attempts, max_attempts, last_exception) from last_exception
+        failure = self._classify_provider_failure(
+            last_exception,
+            provider=provider,
+            model_id=model_id,
+            action=action,
+            attempt=max_attempts,
+            max_attempts=max_attempts,
+            attempted_feature=attempted_feature,
+        )
+        raise AIRequestError(
+            provider,
+            model_id,
+            max_attempts,
+            max_attempts,
+            last_exception,
+            provider_failure=failure,
+        ) from last_exception
 
     async def _execute_without_retries(
         self,
@@ -1128,11 +1280,16 @@ class AIService:
         provider: str,
         model_id: str,
         action: str,
+        attempted_feature: Optional[str] = None,
+        cancellation_token: Optional["CancellationToken"] = None,
     ) -> T:
         """Run one provider attempt and normalize transient provider failures."""
 
         try:
+            await self._raise_if_cancelled(cancellation_token)
             return await operation()
+        except asyncio.CancelledError:
+            raise
         except AIRequestError:
             raise
         except AccentGuardError:
@@ -1140,21 +1297,42 @@ class AIService:
         except ToolLoopContextOverflow:
             raise
         except Exception as exc:
-            if not self._should_retry_exception(exc):
-                raise
+            if cancellation_token and await cancellation_token.any_cancelled():
+                raise asyncio.CancelledError() from exc
+            failure = self._classify_provider_failure(
+                exc,
+                provider=provider,
+                model_id=model_id,
+                action=action,
+                attempt=1,
+                max_attempts=1,
+                attempted_feature=attempted_feature,
+            )
+            if not failure.retryable:
+                if not self._should_wrap_provider_failure(failure):
+                    raise
+                raise AIRequestError(
+                    provider,
+                    model_id,
+                    1,
+                    1,
+                    exc,
+                    provider_failure=failure,
+                ) from exc
 
-            request_id = self._extract_request_id(exc)
+            request_id = failure.request_id or self._extract_request_id(exc)
             suffix = f" (request_id={request_id})" if request_id else ""
             logger.error(
-                "AI %s failed for %s via %s with retries disabled%s: %s",
+                "AI %s failed for %s via %s with retries disabled%s [%s]: %s",
                 action,
                 model_id,
                 provider,
                 suffix,
-                exc,
+                failure.kind.value,
+                failure.message,
                 exc_info=True,
             )
-            raise AIRequestError(provider, model_id, 1, 1, exc) from exc
+            raise AIRequestError(provider, model_id, 1, 1, exc, provider_failure=failure) from exc
 
     @staticmethod
     def _normalize_usage(usage_obj: Any) -> Optional[Dict[str, Any]]:
@@ -1306,6 +1484,46 @@ class AIService:
         except Exception:
             logger.exception("Usage callback failed for model %s", model_id)
 
+    @asynccontextmanager
+    async def _provider_call_scope(
+        self,
+        cancellation_token: Optional["CancellationToken"],
+        *,
+        provider: str,
+        model_id: str,
+        operation: str,
+    ):
+        """Register a provider call against a session before dispatch."""
+        if cancellation_token is None:
+            yield None
+            return
+        await self._raise_if_cancelled(cancellation_token)
+        from core.cancellation import ProviderCallHandle
+
+        provider_task = asyncio.current_task()
+
+        def _cancel_provider_task() -> None:
+            current_task = asyncio.current_task()
+            if provider_task is not None and provider_task is not current_task and not provider_task.done():
+                provider_task.cancel()
+
+        handle = ProviderCallHandle(
+            call_id="",
+            provider=provider,
+            model_id=model_id,
+            session_id=cancellation_token.session_id,
+            phase=cancellation_token.phase,
+            operation=operation,
+            close=_cancel_provider_task,
+        )
+        async with cancellation_token.registry.begin_provider_call(handle) as registered:
+            yield registered
+
+    @staticmethod
+    async def _raise_if_cancelled(cancellation_token: Optional["CancellationToken"]) -> None:
+        if cancellation_token and await cancellation_token.any_cancelled():
+            raise asyncio.CancelledError()
+
     async def generate_content(
         self,
         prompt: str,
@@ -1326,6 +1544,7 @@ class AIService:
         model_alias_registry: Optional[Any] = None,
         prompt_safety_parts: Optional[List[Any]] = None,
         system_prompt_source: "PromptSource" = "system_generated",
+        cancellation_token: Optional["CancellationToken"] = None,
     ) -> str:
         """
         Generate content using specified AI model
@@ -1405,12 +1624,21 @@ class AIService:
         # same provider-normalized schema that native JSON calls will receive.
         effective_json_schema = json_schema
         if json_output and json_schema:
-            effective_json_schema = self._prepare_structured_output_schema(
-                provider,
-                model_id,
-                json_schema,
-            )
-            self._validate_schema_for_structured_outputs(effective_json_schema, provider, model_id)
+            if self._supports_structured_outputs(provider, model_id):
+                effective_json_schema = self._prepare_structured_output_schema(
+                    provider,
+                    model_id,
+                    json_schema,
+                )
+                self._validate_schema_for_structured_outputs(effective_json_schema, provider, model_id)
+            else:
+                logger.info(
+                    "Model %s via %s does not advertise native JSON Schema; "
+                    "downgrading to JSON mode/prompt with local validation.",
+                    model_id,
+                    provider,
+                )
+                effective_json_schema = None
         elif json_output and not json_schema and provider == "openai" and self._is_openai_responses_api_model(model_id):
             fallback_schema = {"type": "object", "additionalProperties": False, "properties": {}}
             self._validate_schema_for_structured_outputs(fallback_schema, provider, model_id)
@@ -1424,6 +1652,12 @@ class AIService:
         # Use the intelligently adjusted parameters for generation
         reasoning_effort = adjusted_reasoning_effort
         thinking_budget_tokens = adjusted_thinking_budget
+        attempted_feature = self._attempted_output_feature(
+            provider,
+            model_id,
+            json_output=json_output,
+            json_schema=effective_json_schema,
+        )
 
         temperature, thinking_budget_tokens, forced_temperature = self._apply_temperature_policies(
             model_info, temperature, thinking_budget_tokens
@@ -1572,6 +1806,7 @@ class AIService:
                     temperature,
                     adjusted_max_tokens,
                     system_prompt or "",
+                    thinking_budget_tokens=thinking_budget_tokens,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     images=images,
@@ -1605,6 +1840,7 @@ class AIService:
                     temperature,
                     adjusted_max_tokens,
                     system_prompt or "",
+                    request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     images=images,
@@ -1638,6 +1874,7 @@ class AIService:
                     temperature,
                     adjusted_max_tokens,
                     system_prompt or "",
+                    request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     images=images,
@@ -1671,6 +1908,7 @@ class AIService:
                     temperature,
                     adjusted_max_tokens,
                     system_prompt or "",
+                    request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                 )
@@ -1732,12 +1970,48 @@ class AIService:
                 raise ValueError(f"Unsupported model provider: {provider}")
 
         try:
-            return await self._execute_with_retries(
-                _single_attempt,
+            async with self._provider_call_scope(
+                cancellation_token,
                 provider=provider,
                 model_id=model_id,
-                action="generation",
-            )
+                operation="generate_content",
+            ):
+                generated_content = await self._execute_with_retries(
+                    _single_attempt,
+                    provider=provider,
+                    model_id=model_id,
+                    action="generation",
+                    attempted_feature=attempted_feature,
+                    cancellation_token=cancellation_token,
+                )
+                if json_output and json_schema and effective_json_schema is None:
+                    try:
+                        from tools.ai_json_cleanroom import validate_ai_json
+                    except Exception as exc:
+                        raise JsonContractError(
+                            f"validate_ai_json unavailable for schema validation: {exc}"
+                        ) from exc
+                    validation_result = validate_ai_json(
+                        generated_content,
+                        schema=json_schema,
+                    )
+                    if not validation_result.json_valid:
+                        details = "; ".join(
+                            f"{issue.path}: {issue.message}"
+                            for issue in (validation_result.errors or [])
+                        ) or "unknown schema violation"
+                        raise JsonContractError(
+                            f"JSON output failed local schema validation for {model_id}: {details}"
+                        )
+                    if validation_result.data is not None and _should_normalize_json_contract_content(
+                        generated_content,
+                        validation_result,
+                    ):
+                        generated_content = json.dumps(validation_result.data, ensure_ascii=False)
+                return generated_content
+        except asyncio.CancelledError:
+            logger.info("Content generation cancelled for %s", model)
+            raise
         except Exception as e:
             logger.error(f"Content generation failed for {model}: {str(e)}")
             raise
@@ -1754,20 +2028,36 @@ class AIService:
 
     @staticmethod
     def _supports_structured_outputs(provider: str, model_id: str) -> bool:
-        """Return True when the provider/model can enforce JSON through native structured outputs."""
-        provider_key = (provider or "").lower()
-        model_lower = (model_id or "").lower()
-        if provider_key == "openai":
-            return True
-        if provider_key in {"claude", "anthropic"}:
-            return AIService._claude_supports_structured_outputs(model_lower)
-        if provider_key in {"gemini", "google"}:
-            return True
-        if provider_key == "xai":
-            return "grok-" in model_lower
-        if provider_key == "openrouter":
-            return True
-        return False
+        """Return True when the provider/model can enforce JSON Schema natively."""
+        state = registry_model_supports(
+            specs=getattr(config, "model_specs", {}) or {},
+            provider=normalize_provider(provider),
+            model_id=model_id,
+            capability="json_schema",
+        )
+        return state.support == CapabilitySupport.SUPPORTED
+
+    @staticmethod
+    def _supports_json_object(provider: str, model_id: str) -> bool:
+        """Return True when the provider/model supports provider-native JSON mode."""
+        state = registry_model_supports(
+            specs=getattr(config, "model_specs", {}) or {},
+            provider=normalize_provider(provider),
+            model_id=model_id,
+            capability="json_object",
+        )
+        return state.support == CapabilitySupport.SUPPORTED
+
+    @staticmethod
+    def _supports_tool_calling(provider: str, model_id: str) -> bool:
+        """Return True when the provider/model advertises native tool calling."""
+        state = registry_model_supports(
+            specs=getattr(config, "model_specs", {}) or {},
+            provider=normalize_provider(provider),
+            model_id=model_id,
+            capability="tool_calling",
+        )
+        return state.support == CapabilitySupport.SUPPORTED
 
     @staticmethod
     def _effective_json_schema_for_request(
@@ -1912,22 +2202,8 @@ class AIService:
 
     @staticmethod
     def _claude_supports_structured_outputs(model_lower: str) -> bool:
-        """Return True when the Claude model id supports native structured outputs (Sec 5.11)."""
-        parts = (model_lower or "").replace(".", "-").split("-")
-        for index, part in enumerate(parts):
-            if part not in {"sonnet", "opus", "haiku"}:
-                continue
-            if index + 2 >= len(parts) or parts[index + 1] != "4":
-                continue
-            try:
-                minor = int(parts[index + 2])
-            except ValueError:
-                continue
-            if part == "opus" and minor == 1:
-                return True
-            if minor >= 5:
-                return True
-        return False
+        """Return True when official/docs-backed capability says Claude supports JSON Schema."""
+        return AIService._supports_structured_outputs("claude", model_lower)
 
     @staticmethod
     def _audit_model_supports_structured_outputs(provider_key: str, model_id: str) -> bool:
@@ -2253,6 +2529,7 @@ class AIService:
         timeout_seconds: float,
         max_tokens: int,
         on_error: Literal["fail_closed", "fail_open"],
+        cancellation_token: Optional["CancellationToken"] = None,
     ) -> Dict[str, Any]:
         """Call the configured accent-judge model and return a normalized audit payload (Sec 5.4).
 
@@ -2320,10 +2597,14 @@ class AIService:
                 system_prompt=system_prompt,
                 json_output=True,
                 json_schema=accent_schema if use_structured else None,
+                cancellation_token=cancellation_token,
             )
 
         try:
+            await self._raise_if_cancelled(cancellation_token)
             raw = await asyncio.wait_for(_call(), timeout=float(timeout_seconds))
+        except asyncio.CancelledError:
+            raise
         except asyncio.TimeoutError as exc:
             raise AccentGuardError(
                 f"Accent audit timed out after {timeout_seconds}s",
@@ -2489,8 +2770,10 @@ class AIService:
                 "max_tokens": max_tokens,
             }
 
+        native_json_schema = bool(json_schema) and self._supports_structured_outputs(provider_key, model_id)
+        native_json_object = self._supports_json_object(provider_key, model_id)
         if json_output:
-            if json_schema:
+            if native_json_schema:
                 create_params["response_format"] = {
                     "type": "json_schema",
                     "json_schema": {
@@ -2499,19 +2782,39 @@ class AIService:
                         "schema": json_schema,
                     },
                 }
-            else:
+            elif native_json_object:
                 create_params["response_format"] = {"type": "json_object"}
 
         if tools_enabled:
+            supports_tool_choice = provider_key != "openrouter" or registry_model_supports(
+                specs=getattr(config, "model_specs", {}) or {},
+                provider=provider_key,
+                model_id=model_id,
+                capability="tool_choice",
+            ).support == CapabilitySupport.SUPPORTED
+            supports_parallel_tool_calls = provider_key != "openrouter" or registry_model_supports(
+                specs=getattr(config, "model_specs", {}) or {},
+                provider=provider_key,
+                model_id=model_id,
+                capability="parallel_tool_calls",
+            ).support == CapabilitySupport.SUPPORTED
             if tool_schemas is not None:
                 if tool_schemas:
                     create_params["tools"] = list(tool_schemas)
-                    create_params["tool_choice"] = "auto"
+                    if supports_tool_choice:
+                        create_params["tool_choice"] = "auto"
             else:
                 create_params["tools"] = [self._build_openai_validation_tool_schema()]
-                create_params["tool_choice"] = "auto"
-            if "tools" in create_params:
+                if supports_tool_choice:
+                    create_params["tool_choice"] = "auto"
+            if "tools" in create_params and supports_parallel_tool_calls:
                 create_params["parallel_tool_calls"] = False
+
+        if provider_key == "openrouter" and any(
+            key in create_params
+            for key in ("response_format", "tools", "tool_choice", "parallel_tool_calls")
+        ):
+            create_params["extra_body"] = {"provider": {"require_parameters": True}}
 
         return create_params
 
@@ -2636,6 +2939,8 @@ class AIService:
         measurement_feedback_message: Optional[str] = None,
         force_finalize_message: Optional[str] = None,
         retries_enabled: bool = True,
+        attempted_feature: Optional[str] = None,
+        cancellation_token: Optional["CancellationToken"] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on OpenAI-style chat APIs.
 
@@ -3401,19 +3706,29 @@ class AIService:
 
             raise ValueError("Tool loop exhausted without producing a validated draft")
 
-        if retries_enabled:
-            return await self._execute_with_retries(
+        async with self._provider_call_scope(
+            cancellation_token,
+            provider=provider_key,
+            model_id=model_id,
+            operation="tool_loop_generation",
+        ):
+            if retries_enabled:
+                return await self._execute_with_retries(
+                    _single_attempt,
+                    provider=provider_key,
+                    model_id=model_id,
+                    action="tool_loop_generation",
+                    attempted_feature=attempted_feature,
+                    cancellation_token=cancellation_token,
+                )
+            return await self._execute_without_retries(
                 _single_attempt,
                 provider=provider_key,
                 model_id=model_id,
                 action="tool_loop_generation",
+                attempted_feature=attempted_feature,
+                cancellation_token=cancellation_token,
             )
-        return await self._execute_without_retries(
-            _single_attempt,
-            provider=provider_key,
-            model_id=model_id,
-            action="tool_loop_generation",
-        )
 
     async def _run_claude_validation_tool_loop(
         self,
@@ -3445,6 +3760,8 @@ class AIService:
         measurement_feedback_message: Optional[str] = None,
         force_finalize_message: Optional[str] = None,
         retries_enabled: bool = True,
+        attempted_feature: Optional[str] = None,
+        cancellation_token: Optional["CancellationToken"] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on Claude messages API."""
         if not (enable_validate_draft or accent_context is not None):
@@ -3503,7 +3820,12 @@ class AIService:
             self._inject_claude_thinking_params(create_params, model_id, thinking_budget_tokens)
 
             if use_structured_outputs:
-                create_params["output_format"] = {"type": "json_schema", "schema": json_schema}
+                create_params["output_config"] = {
+                    "format": {
+                        "type": "json_schema",
+                        "schema": json_schema,
+                    }
+                }
                 create_params["betas"] = ["structured-outputs-2025-11-13"]
                 return await self.anthropic_client.beta.messages.create(
                     **create_params,
@@ -4170,19 +4492,29 @@ class AIService:
 
             raise ValueError("Tool loop exhausted without producing a validated draft")
 
-        if retries_enabled:
-            return await self._execute_with_retries(
+        async with self._provider_call_scope(
+            cancellation_token,
+            provider=provider_key,
+            model_id=model_id,
+            operation="tool_loop_generation",
+        ):
+            if retries_enabled:
+                return await self._execute_with_retries(
+                    _single_attempt,
+                    provider=provider_key,
+                    model_id=model_id,
+                    action="tool_loop_generation",
+                    attempted_feature=attempted_feature,
+                    cancellation_token=cancellation_token,
+                )
+            return await self._execute_without_retries(
                 _single_attempt,
                 provider=provider_key,
                 model_id=model_id,
                 action="tool_loop_generation",
+                attempted_feature=attempted_feature,
+                cancellation_token=cancellation_token,
             )
-        return await self._execute_without_retries(
-            _single_attempt,
-            provider=provider_key,
-            model_id=model_id,
-            action="tool_loop_generation",
-        )
 
     async def _run_gemini_new_sdk_validation_tool_loop(
         self,
@@ -4212,6 +4544,8 @@ class AIService:
         measurement_feedback_message: Optional[str] = None,
         force_finalize_message: Optional[str] = None,
         retries_enabled: bool = True,
+        attempted_feature: Optional[str] = None,
+        cancellation_token: Optional["CancellationToken"] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on the new Gemini SDK."""
         if not (enable_validate_draft or accent_context is not None):
@@ -4955,19 +5289,29 @@ class AIService:
 
             raise ValueError("Tool loop exhausted without producing a validated draft")
 
-        if retries_enabled:
-            return await self._execute_with_retries(
+        async with self._provider_call_scope(
+            cancellation_token,
+            provider="gemini",
+            model_id=model_id,
+            operation="tool_loop_generation",
+        ):
+            if retries_enabled:
+                return await self._execute_with_retries(
+                    _single_attempt,
+                    provider="gemini",
+                    model_id=model_id,
+                    action="tool_loop_generation",
+                    attempted_feature=attempted_feature,
+                    cancellation_token=cancellation_token,
+                )
+            return await self._execute_without_retries(
                 _single_attempt,
                 provider="gemini",
                 model_id=model_id,
                 action="tool_loop_generation",
+                attempted_feature=attempted_feature,
+                cancellation_token=cancellation_token,
             )
-        return await self._execute_without_retries(
-            _single_attempt,
-            provider="gemini",
-            model_id=model_id,
-            action="tool_loop_generation",
-        )
 
     async def _run_gemini_legacy_sdk_validation_tool_loop(
         self,
@@ -4995,6 +5339,8 @@ class AIService:
         measurement_feedback_message: Optional[str] = None,
         force_finalize_message: Optional[str] = None,
         retries_enabled: bool = True,
+        attempted_feature: Optional[str] = None,
+        cancellation_token: Optional["CancellationToken"] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on the legacy Gemini SDK."""
         if not (enable_validate_draft or accent_context is not None):
@@ -5726,19 +6072,29 @@ class AIService:
 
             raise ValueError("Tool loop exhausted without producing a validated draft")
 
-        if retries_enabled:
-            return await self._execute_with_retries(
+        async with self._provider_call_scope(
+            cancellation_token,
+            provider="gemini",
+            model_id=model_id,
+            operation="tool_loop_generation",
+        ):
+            if retries_enabled:
+                return await self._execute_with_retries(
+                    _single_attempt,
+                    provider="gemini",
+                    model_id=model_id,
+                    action="tool_loop_generation",
+                    attempted_feature=attempted_feature,
+                    cancellation_token=cancellation_token,
+                )
+            return await self._execute_without_retries(
                 _single_attempt,
                 provider="gemini",
                 model_id=model_id,
                 action="tool_loop_generation",
+                attempted_feature=attempted_feature,
+                cancellation_token=cancellation_token,
             )
-        return await self._execute_without_retries(
-            _single_attempt,
-            provider="gemini",
-            model_id=model_id,
-            action="tool_loop_generation",
-        )
 
     async def call_ai_with_validation_tools(
         self,
@@ -5781,6 +6137,7 @@ class AIService:
         enable_validate_draft: bool = True,
         min_global_score: Optional[float] = None,
         system_prompt_source: "PromptSource" = "system_generated",
+        cancellation_token: Optional["CancellationToken"] = None,
     ) -> Tuple[str, ToolLoopEnvelope]:
         """Reusable entry point for the shared ``validate_draft`` tool loop.
 
@@ -5805,6 +6162,8 @@ class AIService:
         wrappers around a JSON object/array; the first valid payload is
         extracted and normalized, but no payload is attached to the envelope.
         """
+
+        await self._raise_if_cancelled(cancellation_token)
 
         # Resolve rounds budget. ``max_tool_rounds`` is the new parameter name;
         # older generator callers passed ``max_rounds`` so we default to the
@@ -5883,6 +6242,15 @@ class AIService:
         # Providers outside the supported matrix: surface a ``no_tool_support``
         # envelope rather than an exception (§3.7).
         if provider_key not in {"openai", "openrouter", "xai", "claude", "gemini"}:
+            envelope = ToolLoopEnvelope(
+                loop_scope=loop_scope,
+                tools_skipped_reason="no_tool_support",
+                turns=0,
+                accepted=False,
+                accepted_via="tools_skipped",
+            )
+            return "", envelope
+        if not self._supports_tool_calling(provider_key, model_id):
             envelope = ToolLoopEnvelope(
                 loop_scope=loop_scope,
                 tools_skipped_reason="no_tool_support",
@@ -6022,16 +6390,25 @@ class AIService:
 
         effective_json_schema = json_schema_arg
         if json_output_flag and json_schema_arg:
-            effective_json_schema = self._prepare_structured_output_schema(
-                provider_key,
-                model_id,
-                json_schema_arg,
-            )
-            self._validate_schema_for_structured_outputs(
-                effective_json_schema,
-                provider,
-                model_id,
-            )
+            if self._supports_structured_outputs(provider_key, model_id):
+                effective_json_schema = self._prepare_structured_output_schema(
+                    provider_key,
+                    model_id,
+                    json_schema_arg,
+                )
+                self._validate_schema_for_structured_outputs(
+                    effective_json_schema,
+                    provider,
+                    model_id,
+                )
+            else:
+                logger.info(
+                    "Tool-loop model %s via %s does not advertise native JSON Schema; "
+                    "downgrading final output to JSON mode/prompt with local validation.",
+                    model_id,
+                    provider_key,
+                )
+                effective_json_schema = None
         elif json_output_flag and not json_schema_arg and provider_key == "openai" and self._is_openai_responses_api_model(model_id):
             fallback_schema = {"type": "object", "additionalProperties": False, "properties": {}}
             self._validate_schema_for_structured_outputs(fallback_schema, provider, model_id)
@@ -6073,6 +6450,13 @@ class AIService:
             "measurement_feedback_message": measurement_feedback_message,
             "force_finalize_message": force_finalize_message,
             "retries_enabled": retries_enabled,
+            "attempted_feature": self._attempted_output_feature(
+                provider_key,
+                model_id,
+                json_output=json_output_flag,
+                json_schema=effective_json_schema,
+            ) or "tools",
+            "cancellation_token": cancellation_token,
         }
 
         try:
@@ -6208,7 +6592,11 @@ class AIService:
                 context_size_estimate=overflow_exc.accumulated_chars_estimate,
             )
             return "", envelope
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
+            if cancellation_token and await cancellation_token.any_cancelled():
+                raise asyncio.CancelledError() from e
             logger.error(
                 "Tool-loop generation failed for %s via %s: %s",
                 model,
@@ -6466,10 +6854,10 @@ class AIService:
                 {"role": "user", "content": effective_prompt}
             ]
 
-        # --- RAZONAMIENTO o3-pro: Responses API ---
-        if "o3-pro" in model_id.lower():
-            if not hasattr(self, 'openai_sync_client') or not self.openai_sync_client:
-                raise ValueError("OpenAI sync client not initialized for O3-pro")
+        # --- Responses API models (o3-pro and catalog-marked variants) ---
+        if self._is_openai_responses_api_model(model_id) and "gpt-5-pro" not in model_id.lower():
+            if not self.openai_client:
+                raise ValueError("OpenAI async client not initialized for O3-pro")
 
             # Build input for Responses API (supports vision)
             if images:
@@ -6518,13 +6906,9 @@ class AIService:
             if extra_verbose:
                 logger.info(f"[EXTRA_VERBOSE] O3-pro responses parameters: {create_params}")
 
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: self.openai_sync_client.responses.create(
-                    **create_params,
-                    **request_kwargs,
-                ),
+            response = await self.openai_client.responses.create(
+                **create_params,
+                **request_kwargs,
             )
 
             # Robust text extraction: 1) output_text; 2) assemble from 'output'
@@ -6561,9 +6945,11 @@ class AIService:
             )
 
         # --- GPT-5 Pro: Responses API ---
-        elif "gpt-5-pro" in model_id.lower():
-            if not hasattr(self, 'openai_sync_client') or not self.openai_sync_client:
-                raise ValueError("OpenAI sync client not initialized for GPT-5 Pro")
+        elif "gpt-5-pro" in model_id.lower() or (
+            self._is_openai_responses_api_model(model_id) and "gpt-5" in model_id.lower()
+        ):
+            if not self.openai_client:
+                raise ValueError("OpenAI async client not initialized for GPT-5 Pro")
 
             # Build input for Responses API (supports vision)
             if images:
@@ -6616,13 +7002,9 @@ class AIService:
             if extra_verbose:
                 logger.info(f"[EXTRA_VERBOSE] GPT-5 Pro responses parameters: {create_params}")
 
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: self.openai_sync_client.responses.create(
-                    **create_params,
-                    **request_kwargs,
-                ),
+            response = await self.openai_client.responses.create(
+                **create_params,
+                **request_kwargs,
             )
 
             # Robust text extraction (same as o3-pro)
@@ -6753,6 +7135,7 @@ class AIService:
         usage_extra: Optional[Dict[str, Any]] = None,
         model_alias_registry: Optional[Any] = None,
         prompt_safety_parts: Optional[List[Any]] = None,
+        cancellation_token: Optional["CancellationToken"] = None,
     ) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
         """
         Generate content and return logprobs for the response tokens.
@@ -6850,8 +7233,20 @@ class AIService:
             client = self.openai_client
 
         try:
-            response = await client.chat.completions.create(**create_params)
+            async with self._provider_call_scope(
+                cancellation_token,
+                provider=provider,
+                model_id=model_id,
+                operation="generate_with_logprobs",
+            ):
+                await self._raise_if_cancelled(cancellation_token)
+                response = await client.chat.completions.create(**create_params)
+                await self._raise_if_cancelled(cancellation_token)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
+            if cancellation_token and await cancellation_token.any_cancelled():
+                raise asyncio.CancelledError() from e
             logger.error(f"Logprobs API call failed for {model_id} ({provider}): {e}")
             raise
 
@@ -6915,6 +7310,7 @@ class AIService:
         model_alias_registry: Optional[Any] = None,
         prompt_safety_parts: Optional[List[Any]] = None,
         system_prompt_source: "PromptSource" = "system_generated",
+        cancellation_token: Optional["CancellationToken"] = None,
     ):
         """
         Generate content with streaming support
@@ -6994,15 +7390,30 @@ class AIService:
         # provider-normalized schema for dict-based native JSON calls.
         effective_json_schema = json_schema
         if json_output and json_schema:
-            effective_json_schema = self._prepare_structured_output_schema(
-                provider,
-                model_id,
-                json_schema,
-            )
-            self._validate_schema_for_structured_outputs(effective_json_schema, provider, model_id)
+            if self._supports_structured_outputs(provider, model_id):
+                effective_json_schema = self._prepare_structured_output_schema(
+                    provider,
+                    model_id,
+                    json_schema,
+                )
+                self._validate_schema_for_structured_outputs(effective_json_schema, provider, model_id)
+            else:
+                logger.info(
+                    "Streaming model %s via %s does not advertise native JSON Schema; "
+                    "downgrading to JSON mode/prompt with local validation.",
+                    model_id,
+                    provider,
+                )
+                effective_json_schema = None
         elif json_output and not json_schema and provider == "openai" and self._is_openai_responses_api_model(model_id):
             fallback_schema = {"type": "object", "additionalProperties": False, "properties": {}}
             self._validate_schema_for_structured_outputs(fallback_schema, provider, model_id)
+        attempted_feature = self._attempted_output_feature(
+            provider,
+            model_id,
+            json_output=json_output,
+            json_schema=effective_json_schema,
+        )
 
         request_timeout = token_validation.get("reasoning_timeout_seconds")
 
@@ -7100,7 +7511,7 @@ class AIService:
                     extra_verbose,
                     thinking_budget_tokens,
                     json_output=json_output,
-                    json_schema=json_schema,
+                    json_schema=effective_json_schema,
                     usage_callback=usage_callback,
                     provider=provider,
                     resolved_model_id=model_id,
@@ -7184,53 +7595,103 @@ class AIService:
         last_exception: Optional[Exception] = None
         attempt = 1
 
-        while attempt <= max_attempts:
+        async def _stream_cancel_requested() -> bool:
+            if cancellation_token and await cancellation_token.any_cancelled():
+                raise asyncio.CancelledError()
             if cancel_callback and await cancel_callback():
+                return True
+            return False
+
+        while attempt <= max_attempts:
+            if await _stream_cancel_requested():
                 return
 
             chunks_emitted = 0
             try:
-                if cancel_callback and await cancel_callback():
-                    return
-                async for chunk in _dispatch_stream():
-                    chunks_emitted += 1
-                    if cancel_callback and await cancel_callback():
+                async with self._provider_call_scope(
+                    cancellation_token,
+                    provider=provider,
+                    model_id=model_id,
+                    operation="generate_content_stream",
+                ):
+                    if await _stream_cancel_requested():
                         return
-                    yield chunk
+                    async for chunk in _dispatch_stream():
+                        chunks_emitted += 1
+                        if await _stream_cancel_requested():
+                            return
+                        yield chunk
                 return
+            except asyncio.CancelledError:
+                raise
             except AIRequestError:
                 raise
             except Exception as exc:
+                if cancellation_token and await cancellation_token.any_cancelled():
+                    raise asyncio.CancelledError() from exc
                 last_exception = exc
+                failure = self._classify_provider_failure(
+                    exc,
+                    provider=provider,
+                    model_id=model_id,
+                    action="streaming",
+                    attempted_feature=attempted_feature,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                )
                 should_retry = (
                     attempt < max_attempts
                     and chunks_emitted == 0
-                    and self._should_retry_exception(exc)
+                    and failure.retryable
                 )
 
                 if not should_retry:
-                    raise
+                    raise AIRequestError(
+                        provider,
+                        model_id,
+                        attempt,
+                        max_attempts,
+                        exc,
+                        provider_failure=failure,
+                    ) from exc
 
                 delay_seconds = self._calculate_retry_delay(attempt)
-                request_id = self._extract_request_id(exc)
+                request_id = failure.request_id or self._extract_request_id(exc)
                 suffix = f" (request_id={request_id})" if request_id else ""
                 logger.warning(
-                    "Streaming failed for %s via %s on attempt %d/%d%s: %s (retrying in %.1fs)",
+                    "Streaming failed for %s via %s on attempt %d/%d%s [%s]: %s (retrying in %.1fs)",
                     model_id,
                     provider,
                     attempt,
                     max_attempts,
                     suffix,
-                    exc,
+                    failure.kind.value,
+                    failure.message,
                     delay_seconds,
                 )
-                if cancel_callback and await cancel_callback():
+                if await _stream_cancel_requested():
                     return
                 await asyncio.sleep(delay_seconds)
                 attempt += 1
 
         assert last_exception is not None
-        raise AIRequestError(provider, model_id, max_attempts, max_attempts, last_exception) from last_exception
+        failure = self._classify_provider_failure(
+            last_exception,
+            provider=provider,
+            model_id=model_id,
+            action="streaming",
+            attempted_feature=attempted_feature,
+            attempt=max_attempts,
+            max_attempts=max_attempts,
+        )
+        raise AIRequestError(
+            provider,
+            model_id,
+            max_attempts,
+            max_attempts,
+            last_exception,
+            provider_failure=failure,
+        ) from last_exception
 
     async def _generate_claude(
         self,
@@ -7310,11 +7771,13 @@ class AIService:
 
         # Add Structured Outputs configuration if using new beta feature
         if use_structured_outputs:
-            # Beta API accepts dict directly when json_schema is already a dict
+            # Anthropic Structured Outputs use output_config.format on supported models.
             request_kwargs: Dict[str, Any] = {}
-            create_params["output_format"] = {
-                "type": "json_schema",
-                "schema": json_schema
+            create_params["output_config"] = {
+                "format": {
+                    "type": "json_schema",
+                    "schema": json_schema,
+                }
             }
             # Add required betas parameter for structured outputs
             create_params["betas"] = ["structured-outputs-2025-11-13"]
@@ -7369,6 +7832,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: str,
+        thinking_budget_tokens: Optional[int] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
@@ -7381,6 +7845,7 @@ class AIService:
                 temperature,
                 max_tokens,
                 system_prompt,
+                thinking_budget_tokens=thinking_budget_tokens,
                 json_output=json_output,
                 json_schema=json_schema,
                 images=images,
@@ -7413,6 +7878,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: str,
+        thinking_budget_tokens: Optional[int] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
@@ -7449,8 +7915,10 @@ class AIService:
             parts.append({"text": prompt})
             contents.append({"role": "user", "parts": parts})
 
-            # Check if model supports thinking
-            thinking_budget = self._get_thinking_budget_for_model(model_id)
+            # Use token validation's adjusted budget when present; otherwise apply model default.
+            thinking_budget = thinking_budget_tokens
+            if thinking_budget is None:
+                thinking_budget = self._get_thinking_budget_for_model(model_id)
 
             # Configure generation with system_instruction in config (not concatenated in user message)
             config_params = {
@@ -7738,6 +8206,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: str,
+        request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
@@ -7784,6 +8253,9 @@ class AIService:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        request_kwargs: Dict[str, Any] = {}
+        if request_timeout and request_timeout > 0:
+            request_kwargs["timeout"] = request_timeout
 
         # Configure JSON output format
         if json_output:
@@ -7798,13 +8270,14 @@ class AIService:
                     }
                 }
                 logger.info(f"Using Grok structured outputs with JSON schema for {model_id}")
-            else:
+            elif self._supports_json_object("xai", model_id):
                 # Use basic JSON mode (flexible structure)
                 request_params["response_format"] = {"type": "json_object"}
                 logger.info(f"Using Grok JSON mode (flexible) for {model_id}")
 
         response = await self.xai_client.chat.completions.create(
-            **request_params
+            **request_params,
+            **request_kwargs,
         )
 
         return response.choices[0].message.content, self._usage_with_finish_metadata(
@@ -7821,6 +8294,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: str,
+        request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
@@ -7856,6 +8330,9 @@ class AIService:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        request_kwargs: Dict[str, Any] = {}
+        if request_timeout and request_timeout > 0:
+            request_kwargs["timeout"] = request_timeout
 
         # Configure JSON output format
         if json_output:
@@ -7869,14 +8346,17 @@ class AIService:
                         "schema": json_schema
                     }
                 }
+                request_kwargs["extra_body"] = {"provider": {"require_parameters": True}}
                 logger.info(f"Using OpenRouter JSON Schema structured outputs for {model_id}")
-            else:
+            elif self._supports_json_object("openrouter", model_id):
                 # Use basic JSON mode (flexible structure)
                 request_params["response_format"] = {"type": "json_object"}
+                request_kwargs["extra_body"] = {"provider": {"require_parameters": True}}
                 logger.info(f"Using OpenRouter JSON mode (flexible) for {model_id}")
 
         response = await self.openrouter_client.chat.completions.create(
-            **request_params
+            **request_params,
+            **request_kwargs,
         )
 
         return response.choices[0].message.content, self._usage_with_finish_metadata(
@@ -8293,10 +8773,12 @@ class AIService:
 
             # Add Structured Outputs configuration if using new beta feature
             if use_structured_outputs:
-                # Claude streaming requires Pydantic model, not dict
-                # Convert JSON schema to Pydantic model dynamically
-                pydantic_model = json_schema_to_pydantic(json_schema)
-                stream_params["output_format"] = pydantic_model
+                stream_params["output_config"] = {
+                    "format": {
+                        "type": "json_schema",
+                        "schema": json_schema,
+                    }
+                }
                 # Add required betas parameter for structured outputs
                 stream_params["betas"] = ["structured-outputs-2025-11-13"]
 
@@ -8748,7 +9230,7 @@ class AIService:
 
         # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
         effective_system = system_prompt or ""
-        if self._should_inject_json_prompt("ollama", model_id, json_output, json_schema):
+        if self._should_inject_json_prompt("xai", model_id, json_output, json_schema):
             json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
             if effective_system:
                 effective_system = f"{effective_system}\n\n{json_instructions}"
@@ -8898,7 +9380,7 @@ class AIService:
 
             # Configure JSON output format (OpenRouter is OpenAI-compatible)
             if json_output:
-                if json_schema:
+                if json_schema and self._supports_structured_outputs("openrouter", model_id):
                     # Use JSON Schema for structured outputs (Mistral, OpenAI models via OpenRouter)
                     create_params["response_format"] = {
                         "type": "json_schema",
@@ -8908,10 +9390,12 @@ class AIService:
                             "schema": json_schema
                         }
                     }
+                    create_params["extra_body"] = {"provider": {"require_parameters": True}}
                     logger.info(f"Using OpenRouter JSON Schema structured outputs (streaming) for {model_id}")
-                else:
+                elif self._supports_json_object("openrouter", model_id):
                     # Use basic JSON mode (flexible structure)
                     create_params["response_format"] = {"type": "json_object"}
+                    create_params["extra_body"] = {"provider": {"require_parameters": True}}
                     logger.info(f"Using OpenRouter JSON mode (streaming, flexible) for {model_id}")
 
             stream = await self.openrouter_client.chat.completions.create(**create_params)
@@ -8968,6 +9452,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: str,
+        request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, Any]:
@@ -8980,7 +9465,7 @@ class AIService:
             max_tokens: Maximum tokens
             system_prompt: System prompt
             json_output: Enable JSON output mode
-            json_schema: Optional JSON schema (Ollama supports basic JSON mode only)
+            json_schema: Optional JSON schema for structured outputs
         """
         if not self.ollama_client:
             raise ValueError("Ollama client not initialized. Set OLLAMA_HOST in your environment.")
@@ -9009,18 +9494,29 @@ class AIService:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        request_kwargs: Dict[str, Any] = {}
+        if request_timeout and request_timeout > 0:
+            request_kwargs["timeout"] = request_timeout
 
-        # Configure JSON output format (Ollama supports basic JSON mode)
+        # Configure JSON output format (Ollama OpenAI-compatible API supports response_format)
         if json_output:
-            # Ollama supports json_object mode but not JSON Schema structured outputs
-            request_params["response_format"] = {"type": "json_object"}
-            if json_schema:
-                logger.info(f"Ollama does not support JSON Schema structured outputs; using basic JSON mode for {model_id}")
-            else:
+            if json_schema and self._supports_structured_outputs("ollama", model_id):
+                request_params["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "structured_output",
+                        "strict": True,
+                        "schema": json_schema,
+                    },
+                }
+                logger.info(f"Using Ollama JSON Schema structured outputs for {model_id}")
+            elif self._supports_json_object("ollama", model_id):
+                request_params["response_format"] = {"type": "json_object"}
                 logger.info(f"Using Ollama JSON mode for {model_id}")
 
         response = await self.ollama_client.chat.completions.create(
-            **request_params
+            **request_params,
+            **request_kwargs,
         )
 
         return response.choices[0].message.content, self._usage_with_finish_metadata(
@@ -9051,7 +9547,7 @@ class AIService:
             max_tokens: Maximum tokens
             system_prompt: System prompt
             json_output: Enable JSON output mode
-            json_schema: Optional JSON schema (Ollama supports basic JSON mode only)
+            json_schema: Optional JSON schema for structured outputs
             usage_callback: Callback for usage tracking
             usage_extra: Extra usage tracking data
         """
@@ -9088,12 +9584,20 @@ class AIService:
             # Include usage stats in streaming response (OpenAI-compatible API)
             create_params.setdefault("stream_options", {})["include_usage"] = True
 
-            # Configure JSON output format (Ollama supports basic JSON mode)
+            # Configure JSON output format (Ollama OpenAI-compatible API supports response_format)
             if json_output:
-                create_params["response_format"] = {"type": "json_object"}
-                if json_schema:
-                    logger.info(f"Ollama does not support JSON Schema; using basic JSON mode (streaming) for {model_id}")
-                else:
+                if json_schema and self._supports_structured_outputs("ollama", model_id):
+                    create_params["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "structured_output",
+                            "strict": True,
+                            "schema": json_schema,
+                        },
+                    }
+                    logger.info(f"Using Ollama JSON Schema structured outputs (streaming) for {model_id}")
+                elif self._supports_json_object("ollama", model_id):
+                    create_params["response_format"] = {"type": "json_object"}
                     logger.info(f"Using Ollama JSON mode (streaming) for {model_id}")
 
             stream = await self.ollama_client.chat.completions.create(**create_params)

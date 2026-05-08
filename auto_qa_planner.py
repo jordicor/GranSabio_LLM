@@ -7,6 +7,7 @@ real provider/model identifiers stay internal to routing and usage tracking.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -598,6 +599,7 @@ async def run_auto_qa_planning(
     stream_callback: Optional[Callable[[str], None]] = None,
     usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     phase_logger: Optional[Any] = None,
+    cancellation_token: Optional[Any] = None,
 ) -> AutoQAPlanResult:
     """Call GranSabio as planner and return a validated Auto-QA plan."""
 
@@ -635,8 +637,11 @@ async def run_auto_qa_planning(
             phase_logger=phase_logger,
             model_alias_registry=model_alias_registry,
             prompt_safety_parts=prompt_safety_parts,
+            cancellation_token=cancellation_token,
         )
     except AutoQAPlanningError:
+        raise
+    except asyncio.CancelledError:
         raise
     except Exception as exc:
         raise AutoQAPlanningError(

@@ -40,6 +40,7 @@ from qa_result_utils import (
     apply_gran_sabio_false_positive_override,
     build_qa_counts,
     is_technical_qa_failure,
+    normalize_qa_technical_failure_metadata,
     semantic_deal_breakers,
 )
 from qa_scheduler import (
@@ -391,6 +392,7 @@ class QAEngine:
         usage_tracker: Optional[UsageTracker] = None,
         extra_verbose: bool = False,
         phase_logger: Optional["PhaseLogger"] = None,
+        cancellation_token: Optional[Any] = None,
     ) -> tuple:
         """
         Run evidence grounding check and convert result to QAEvaluation.
@@ -435,6 +437,7 @@ class QAEngine:
             stream_callback=stream_callback,
             usage_callback=usage_callback,
             extra_verbose=extra_verbose,
+            cancellation_token=cancellation_token,
         )
 
         # Convert to QAEvaluation for consensus integration
@@ -584,6 +587,7 @@ class QAEngine:
         iteration_limit = getattr(original_request, 'gran_sabio_call_limit_per_iteration', -1)
         results: Dict[str, Dict[str, QAEvaluation]] = {}
         extra_verbose = getattr(original_request, 'extra_verbose', False) if original_request else False
+        cancellation_token = getattr(original_request, "_cancellation_token", None) if original_request else None
 
         async def _abort_if_cancelled(message: str) -> None:
             if cancel_callback and await cancel_callback():
@@ -614,6 +618,7 @@ class QAEngine:
                     usage_tracker=usage_tracker,
                     extra_verbose=extra_verbose,
                     phase_logger=phase_logger,
+                    cancellation_token=cancellation_token,
                 )
 
                 grounding_result_holder["result"] = full_result
@@ -1228,6 +1233,7 @@ Source QA layers:
                 raise QAProcessCancelled()
 
         strategy = strategy if strategy in {"full_parallel", "full_sequential", "fast_global"} else "full_parallel"
+        cancellation_token = getattr(original_request, "_cancellation_token", None) if original_request else None
         qa_model_names = [get_model_name(model) for model in qa_models]
         evaluation_layers, source_semantic_layers, approval_contract = self._resolve_final_verification_layers(
             layers,
@@ -1253,6 +1259,7 @@ Source QA layers:
                 usage_tracker=usage_tracker,
                 extra_verbose=getattr(original_request, "extra_verbose", False) if original_request else False,
                 phase_logger=phase_logger,
+                cancellation_token=cancellation_token,
             )
             return "Evidence Grounding", {"evidence_grounding_logprobs": qa_eval}, full_result
 
@@ -1688,6 +1695,56 @@ Source QA layers:
             content_type=content_type,
         )
         extra_verbose = getattr(original_request, 'extra_verbose', False) if original_request else False
+        scheduler_policy = self._resolve_qa_scheduler_policy(original_request, len(slots))
+        scheduler_required_valid = scheduler_policy.required_valid(len(slots))
+
+        def _provider_for_model(model_name: str) -> Optional[str]:
+            try:
+                model_info = config.get_model_info(model_name)
+                provider = model_info.get("provider") if isinstance(model_info, dict) else None
+                return str(provider) if provider else None
+            except Exception:
+                return None
+
+        def _qa_failure_metadata(
+            *,
+            slot: QASchedulerSlot,
+            error_type: str,
+            message: str,
+            retryable: bool = False,
+            attempts: Optional[int] = None,
+            max_attempts: Optional[int] = None,
+            original_exception: Optional[BaseException] = None,
+            extra: Optional[Dict[str, Any]] = None,
+        ) -> Dict[str, Any]:
+            return normalize_qa_technical_failure_metadata(
+                error_type=error_type,
+                message=message,
+                retryable=retryable,
+                attempts=attempts,
+                max_attempts=max_attempts,
+                provider=_provider_for_model(slot.model_name),
+                model=slot.model_name,
+                layer_name=layer.name,
+                slot_id=slot.slot_id,
+                slot_index=slot.index,
+                evaluator_alias=slot.evaluator_label,
+                configured_count=len(slots),
+                required_valid=scheduler_required_valid,
+                policy=scheduler_policy,
+                original_exception=original_exception,
+                extra=extra,
+                session_id=session_id,
+                project_id=project_id,
+            )
+
+        async def _emit_qa_evaluator_failed(metadata: Dict[str, Any]) -> None:
+            if not tool_event_callback:
+                return
+            try:
+                await tool_event_callback("qa_evaluator_failed", dict(metadata))
+            except Exception:
+                logger.debug("Failed to emit qa_evaluator_failed event.", exc_info=True)
 
         async def evaluate_slot(slot: QASchedulerSlot, attempt: int) -> QAEvaluation:
             retry_suffix = f" (retry {attempt})" if attempt > 1 else ""
@@ -1746,10 +1803,19 @@ Source QA layers:
                 )
                 if progress_callback:
                     await progress_callback(f"{slot.evaluator_label}: invalid JSON response. Skipping.")
+                metadata = _qa_failure_metadata(
+                    slot=slot,
+                    error_type="parse_error",
+                    message=str(parse_error),
+                    attempts=attempt,
+                    original_exception=parse_error,
+                    extra={"parse_error": "invalid_json"},
+                )
+                await _emit_qa_evaluator_failed(metadata)
                 raise QASchedulerTechnicalFailure(
                     "parse_error",
                     str(parse_error),
-                    metadata={"parse_error": "invalid_json"},
+                    metadata=metadata,
                     original_exception=parse_error,
                 ) from parse_error
             except AIRequestError as api_err:
@@ -1776,28 +1842,48 @@ Source QA layers:
                     if failure_count >= self._qa_failure_threshold()
                     else "api_failure"
                 )
-                raise QASchedulerTechnicalFailure(
-                    error_type,
-                    str(api_err),
-                    metadata={
-                        "attempts": getattr(api_err, "attempts", None),
-                        "provider": getattr(api_err, "provider", None),
+                metadata = _qa_failure_metadata(
+                    slot=slot,
+                    error_type=error_type,
+                    message=str(api_err),
+                    retryable=True,
+                    attempts=getattr(api_err, "attempts", attempt),
+                    max_attempts=getattr(api_err, "max_attempts", None),
+                    original_exception=api_err,
+                    extra={
                         "failure_count": failure_count,
                         "exception_class": type(api_err).__name__,
                         "cause_class": type(cause).__name__ if cause is not None else None,
                         "cause_message": str(cause)[:500] if cause is not None else None,
                     },
+                )
+                await _emit_qa_evaluator_failed(metadata)
+                raise QASchedulerTechnicalFailure(
+                    error_type,
+                    str(api_err),
+                    retryable=bool(metadata.get("retryable", True)),
+                    metadata=metadata,
                     original_exception=api_err,
                 ) from api_err
             except asyncio.TimeoutError as timeout_error:
                 logger.error("Timeout for %s with %s", layer.name, slot.model_name)
                 if progress_callback:
                     await progress_callback(f"Timeout in {layer.name} with {slot.evaluator_label}")
+                metadata = _qa_failure_metadata(
+                    slot=slot,
+                    error_type="timeout",
+                    message=f"Timeout during evaluation with {slot.model_name}",
+                    retryable=True,
+                    attempts=attempt,
+                    original_exception=timeout_error,
+                    extra={"timeout_seconds": slot.timeout_seconds},
+                )
+                await _emit_qa_evaluator_failed(metadata)
                 raise QASchedulerTechnicalFailure(
                     "timeout",
                     f"Timeout during evaluation with {slot.model_name}",
                     retryable=True,
-                    metadata={"timeout_seconds": slot.timeout_seconds},
+                    metadata=metadata,
                     original_exception=timeout_error,
                 ) from timeout_error
             except Exception as exc:
@@ -1812,10 +1898,19 @@ Source QA layers:
                     await progress_callback(
                         f"Error in {layer.name} with {slot.evaluator_label}: {str(exc)[:50]}"
                     )
+                metadata = _qa_failure_metadata(
+                    slot=slot,
+                    error_type="unexpected",
+                    message=f"Unexpected error during evaluation: {str(exc)}",
+                    attempts=attempt,
+                    original_exception=exc,
+                    extra={"exception_class": type(exc).__name__},
+                )
+                await _emit_qa_evaluator_failed(metadata)
                 raise QASchedulerTechnicalFailure(
                     "unexpected",
                     f"Unexpected error during evaluation: {str(exc)}",
-                    metadata={"exception_class": type(exc).__name__},
+                    metadata=metadata,
                     original_exception=exc,
                 ) from exc
 
@@ -1856,7 +1951,7 @@ Source QA layers:
             )
             return evaluation
 
-        scheduler = QAScheduler(self._resolve_qa_scheduler_policy(original_request, len(slots)))
+        scheduler = QAScheduler(scheduler_policy)
         try:
             scheduler_result = await scheduler.evaluate_layer(
                 layer_name=layer.name,

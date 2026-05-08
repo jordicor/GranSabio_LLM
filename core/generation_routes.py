@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import Body, HTTPException
+from fastapi import Body, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from ai_service import AIService
@@ -57,23 +57,27 @@ from .app_state import (
     _debug_record_event,
     _debug_session_start,
     _debug_update_status,
-    _is_project_cancelled,
     _is_project_reserved,
     _reserve_project_id,
-    _start_project,
-    _stop_project,
     _store_final_result,
+    apply_session_cancelled_state,
     app,
     config,
     get_project_status,
+    hard_stop_project_runtime,
+    is_project_cancelled_or_stopping,
+    is_terminal_session,
     logger,
     mutate_session,
     pop_session,
     publish_project_phase_chunk,
     publish_project_session_end,
     register_session,
+    pause_project_runtime,
+    start_project_runtime,
     update_session_status,
 )
+from .cancellation import CancelMode, CancellationToken, cancellation_registry
 from .generation_processor import (
     _attach_json_guard_metadata,
     _build_final_result,
@@ -83,6 +87,23 @@ from .generation_processor import (
     process_content_generation,
     resolve_images_for_generation,
 )
+
+_session_hard_stop_completion_tasks: set[asyncio.Task] = set()
+
+
+def _track_session_hard_stop_task(task: asyncio.Task) -> None:
+    _session_hard_stop_completion_tasks.add(task)
+    task.add_done_callback(_session_hard_stop_completion_tasks.discard)
+
+
+def _log_session_hard_stop_task_result(task: asyncio.Task) -> None:
+    task_name = task.get_name() if hasattr(task, "get_name") else "session-hard-stop"
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        logger.warning("Detached session hard-stop task was cancelled: %s", task_name)
+    except Exception:
+        logger.exception("Detached session hard-stop task failed: %s", task_name)
 
 
 def compute_base_effective_layers(request: "ContentRequest") -> List[str]:
@@ -435,7 +456,11 @@ async def start_project(project_id: str):
     if not project_id or len(project_id) > 128:
         raise HTTPException(status_code=400, detail="Invalid project_id")
 
-    was_cancelled = _start_project(project_id)
+    try:
+        start_result = await start_project_runtime(project_id)
+    except asyncio.CancelledError as exc:
+        raise HTTPException(status_code=409, detail="Project hard stop is still in progress") from exc
+    was_cancelled = bool(start_result.get("was_cancelled"))
     status = "reactivated" if was_cancelled else "already_active"
 
     logger.info(
@@ -448,11 +473,12 @@ async def start_project(project_id: str):
         "project_id": project_id,
         "status": status,
         "was_cancelled": was_cancelled,
+        "project_epoch": start_result.get("project_epoch"),
     }
 
 
 @app.post("/project/stop/{project_id}")
-async def stop_project(project_id: str):
+async def stop_project(project_id: str, request: Request):
     """
     Cancel a project and all its active generation sessions.
 
@@ -470,20 +496,28 @@ async def stop_project(project_id: str):
     """
     if not project_id or len(project_id) > 128:
         raise HTTPException(status_code=400, detail="Invalid project_id")
+    if "mode" in request.query_params:
+        raise HTTPException(status_code=400, detail="Project stop is always hard; use /project/pause for soft cancellation")
 
-    sessions_cancelled = _stop_project(project_id)
+    result = await hard_stop_project_runtime(project_id)
 
     logger.info(
         "GRANSABIO_MAIN: Project %s cancelled via /project/stop - %d active sessions stopped",
         project_id,
-        sessions_cancelled
+        result.get("sessions_cancelled", 0),
     )
 
-    return {
-        "project_id": project_id,
-        "status": "cancelled",
-        "sessions_cancelled": sessions_cancelled,
-    }
+    return result
+
+
+@app.post("/project/pause/{project_id}")
+async def pause_project(project_id: str, request: Request):
+    """Cooperatively pause a project and block new work until /project/start."""
+    if not project_id or len(project_id) > 128:
+        raise HTTPException(status_code=400, detail="Invalid project_id")
+    if "mode" in request.query_params:
+        raise HTTPException(status_code=400, detail="Project pause is always soft; use /project/stop for hard cancellation")
+    return await pause_project_runtime(project_id)
 
 
 @app.post("/generate", response_model=GenerationInitResponse)
@@ -675,8 +709,8 @@ async def generate_content(request: ContentRequest):
             project_id = candidate
             logger.info(f"GRANSABIO_MAIN: Received EXISTING project_id in request: {project_id}")
 
-            # Check if this project has been cancelled - reject new requests
-            if _is_project_cancelled(project_id):
+            # Check if this project has been stopped/paused - reject new requests
+            if await is_project_cancelled_or_stopping(project_id):
                 logger.warning(
                     "GRANSABIO_MAIN: Rejecting request for CANCELLED project_id: %s "
                     "(client should call /project/start/%s first)",
@@ -705,6 +739,13 @@ async def generate_content(request: ContentRequest):
         _reserve_project_id(project_id)
     request.project_id = project_id
     request_payload["project_id"] = project_id
+    try:
+        project_epoch = await cancellation_registry.begin_project_admission(project_id)
+    except asyncio.CancelledError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Project '{project_id}' is stopped or paused. Call POST /project/start/{project_id} to reactivate it.",
+        ) from exc
 
     # Validate word count enforcement configuration early
     if is_word_count_enforcement_enabled(request.word_count_enforcement):
@@ -972,12 +1013,92 @@ async def generate_content(request: ContentRequest):
 
     # session_id was already generated earlier (before project_id handling)
     # Register temp session for preflight streaming
+    now = datetime.now()
     temp_session = {
+        "status": GenerationStatus.INITIALIZING,
+        "session_id": session_id,
+        "project_id": project_id,
+        "project_epoch": project_epoch,
+        "request": request,
+        "request_name": getattr(request, "request_name", None),
+        "created_at": now,
+        "last_activity_at": now,
+        "iterations": [],
+        "current_iteration": 0,
+        "max_iterations": request.max_iterations,
+        "verbose_log": [],
+        "cancelled": False,
+        "cancel_mode": None,
+        "hard_cancelled": False,
+        "provider_calls_closed": 0,
+        "tasks_cancelled": 0,
+        "late_writes_blocked": 0,
         "auto_qa_content": "",
         "preflight_content": "",
-        "current_phase": "auto_qa_planning" if auto_qa_requested else "preflight_validation"
+        "generation_content": "",
+        "qa_content": "",
+        "current_phase": "auto_qa_planning" if auto_qa_requested else "preflight_validation",
+        "usage_tracker": usage_tracker,
     }
+    try:
+        await cancellation_registry.register_session(session_id, project_id, project_epoch)
+    except asyncio.CancelledError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Project '{project_id}' is stopped or paused. Call POST /project/start/{project_id} to reactivate it.",
+        ) from exc
     await register_session(session_id, temp_session)
+    pre_start_cancellation_token = CancellationToken(
+        session_id=session_id,
+        project_id=project_id,
+        phase="pre_start",
+        operation="generate_admission",
+        registry=cancellation_registry,
+    )
+
+    async def _cancel_before_background_start(
+        reason: str,
+        *,
+        cancel_mode: str = CancelMode.HARD.value,
+        hard: bool = True,
+    ) -> GenerationInitResponse:
+        def _cancel_temp(session: Dict[str, Any]) -> None:
+            if is_terminal_session(session) and session.get("final_result") is not None:
+                return
+            apply_session_cancelled_state(
+                session,
+                session_id,
+                cancel_mode=cancel_mode,
+                reason=reason,
+                hard=hard,
+            )
+
+        await mutate_session(session_id, _cancel_temp)
+        return GenerationInitResponse(
+            status="cancelled",
+            session_id=session_id,
+            project_id=project_id,
+            request_name=getattr(request, "request_name", None),
+        )
+
+    async def _cancel_pre_start_from_token(reason: str) -> GenerationInitResponse:
+        if await cancellation_registry.is_soft_cancelled(session_id):
+            return await _cancel_before_background_start(
+                reason,
+                cancel_mode=CancelMode.SOFT.value,
+                hard=False,
+            )
+        return await _cancel_before_background_start(reason)
+
+    async def _pre_start_cancel_response_if_requested(reason: str) -> Optional[GenerationInitResponse]:
+        if await cancellation_registry.is_cancelled(session_id):
+            return await _cancel_pre_start_from_token(reason)
+        return None
+
+    try:
+        await cancellation_registry.register_current_task(session_id, "generate_pre_start")
+    except asyncio.CancelledError:
+        return await _cancel_pre_start_from_token("Generation cancelled before preflight start")
 
     # Create phase_logger for Auto-QA planning and preflight validation
     preflight_phase_logger = create_phase_logger(
@@ -989,6 +1110,8 @@ async def generate_content(request: ContentRequest):
     auto_qa_plan_payload: Optional[Dict[str, Any]] = None
 
     def auto_qa_stream_callback(chunk: str):
+        if temp_session.get("hard_cancelled"):
+            return
         temp_session["auto_qa_content"] += chunk
         if project_id and chunk:
             asyncio.create_task(
@@ -997,6 +1120,7 @@ async def generate_content(request: ContentRequest):
                     "auto_qa",
                     chunk,
                     session_id=session_id,
+                    project_epoch=project_epoch,
                     request_name=request.request_name,
                 )
             )
@@ -1025,6 +1149,7 @@ async def generate_content(request: ContentRequest):
                         operation="auto_qa_planning",
                     ),
                     phase_logger=preflight_phase_logger,
+                    cancellation_token=pre_start_cancellation_token,
                 )
             await _debug_record_event(
                 session_id,
@@ -1047,14 +1172,22 @@ async def generate_content(request: ContentRequest):
                 auto_qa_plan_payload,
             )
             temp_session["current_phase"] = "preflight_validation"
+        except asyncio.CancelledError:
+            return await _cancel_pre_start_from_token("Generation cancelled during Auto-QA planning")
         except AutoQAPlanningError as exc:
             feedback = exc.to_feedback()
             await _debug_record_event(session_id, "auto_qa_failed", feedback)
+            cancel_response = await _pre_start_cancel_response_if_requested(
+                "Generation cancelled before Auto-QA rejection"
+            )
+            if cancel_response is not None:
+                return cancel_response
             await publish_project_session_end(
                 project_id,
                 session_id,
                 "auto_qa_rejected",
                 request_name=getattr(request, "request_name", None),
+                project_epoch=project_epoch,
             )
             await pop_session(session_id)
             return GenerationInitResponse(
@@ -1068,6 +1201,8 @@ async def generate_content(request: ContentRequest):
 
     # Define preflight streaming callback
     def preflight_stream_callback(chunk: str):
+        if temp_session.get("hard_cancelled"):
+            return
         temp_session["preflight_content"] += chunk
         if project_id and chunk:
             # Fire-and-forget to avoid blocking the sync callback
@@ -1077,6 +1212,7 @@ async def generate_content(request: ContentRequest):
                     "preflight",
                     chunk,
                     session_id=session_id,
+                    project_epoch=project_epoch,
                     request_name=request.request_name,
                 )
             )
@@ -1086,17 +1222,21 @@ async def generate_content(request: ContentRequest):
 
     # Run preflight validation for every request. Requests without semantic QA still
     # require the LLM preflight gate so model/configuration failures are fail-closed.
-    with preflight_phase_logger.phase(Phase.PREFLIGHT):
-        preflight_result = await run_preflight_validation(
-            ai_service,
-            request,
-            context_documents=preflight_context,
-            image_info=preflight_image_info,
-            stream_callback=preflight_stream_callback,
-            usage_tracker=usage_tracker,
-            phase_logger=preflight_phase_logger,
-            model_alias_registry=model_alias_registry,
-        )
+    try:
+        with preflight_phase_logger.phase(Phase.PREFLIGHT):
+            preflight_result = await run_preflight_validation(
+                ai_service,
+                request,
+                context_documents=preflight_context,
+                image_info=preflight_image_info,
+                stream_callback=preflight_stream_callback,
+                usage_tracker=usage_tracker,
+                phase_logger=preflight_phase_logger,
+                model_alias_registry=model_alias_registry,
+                cancellation_token=pre_start_cancellation_token,
+            )
+    except asyncio.CancelledError:
+        return await _cancel_pre_start_from_token("Generation cancelled during preflight validation")
 
     if long_text_enabled and not request.qa_layers and not grounding_enabled:
         long_text_advisories.append(
@@ -1119,11 +1259,17 @@ async def generate_content(request: ContentRequest):
                     "auto_qa_plan": auto_qa_plan_payload,
                 },
             )
+        cancel_response = await _pre_start_cancel_response_if_requested(
+            "Generation cancelled before preflight rejection"
+        )
+        if cancel_response is not None:
+            return cancel_response
         await publish_project_session_end(
             project_id,
             session_id,
             "preflight_rejected",
             request_name=getattr(request, "request_name", None),
+            project_epoch=project_epoch,
         )
         # Clean up session on rejection
         await pop_session(session_id)
@@ -1159,11 +1305,17 @@ async def generate_content(request: ContentRequest):
                     "auto_qa_plan": auto_qa_plan_payload,
                 },
             )
+            cancel_response = await _pre_start_cancel_response_if_requested(
+                "Generation cancelled before Auto-QA contract rejection"
+            )
+            if cancel_response is not None:
+                return cancel_response
             await publish_project_session_end(
                 project_id,
                 session_id,
                 "auto_qa_rejected",
                 request_name=getattr(request, "request_name", None),
+                project_epoch=project_epoch,
             )
             await pop_session(session_id)
             return GenerationInitResponse(
@@ -1185,8 +1337,22 @@ async def generate_content(request: ContentRequest):
         qa_layer_names = []
 
     # Initialize session with preflight content
+    try:
+        await cancellation_registry.validate_project_admission(project_id, project_epoch)
+        if await cancellation_registry.is_hard_cancelled(session_id):
+            raise asyncio.CancelledError()
+    except asyncio.CancelledError:
+        return await _cancel_pre_start_from_token("Generation cancelled before start")
+    if await cancellation_registry.is_soft_cancelled(session_id):
+        return await _cancel_before_background_start(
+            "Generation paused before start",
+            cancel_mode=CancelMode.SOFT.value,
+            hard=False,
+        )
+
     await register_session(session_id, {
         "status": GenerationStatus.INITIALIZING,
+        "session_id": session_id,
         "request": request,
         "request_name": getattr(request, "request_name", None),
         "created_at": datetime.now(),
@@ -1198,6 +1364,11 @@ async def generate_content(request: ContentRequest):
         "context_documents": preflight_context,
         "resolved_context": resolved_attachments,
         "cancelled": False,
+        "cancel_mode": None,
+        "hard_cancelled": False,
+        "provider_calls_closed": 0,
+        "tasks_cancelled": 0,
+        "late_writes_blocked": 0,
         # New fields for separated streams
         "generation_content": "",
         "generation_content_length": 0,
@@ -1219,6 +1390,7 @@ async def generate_content(request: ContentRequest):
         "model_alias_map_prompt": model_alias_registry.prompt_snapshot(),
         "show_query_costs": getattr(request, "show_query_costs", 0),
         "project_id": project_id,
+        "project_epoch": project_epoch,
         # Project status tracking fields
         "qa_models_config": request.qa_models,  # Store original QA models config
         "qa_layer_names": qa_layer_names,  # Store QA layer names
@@ -1271,14 +1443,28 @@ async def generate_content(request: ContentRequest):
     # Note: temp_session is automatically overwritten by register_session above
     # No cleanup needed since we reuse the same session_id
 
-    # Start generation process in background
-    asyncio.create_task(process_content_generation(
+    # Start generation process in background under cancellation registry control.
+    task = await cancellation_registry.create_task(
         session_id,
-        request,
-        resolved_attachments,
-        attachment_manager,
-        resolved_images,
-    ))
+        "process_content_generation",
+        lambda: process_content_generation(
+            session_id,
+            request,
+            resolved_attachments,
+            attachment_manager,
+            resolved_images,
+        ),
+    )
+    if task is None:
+        return GenerationInitResponse(
+            status="cancelled",
+            session_id=session_id,
+            project_id=project_id,
+            request_name=getattr(request, "request_name", None),
+            recommended_timeout_seconds=recommended_timeout_seconds,
+            advisories=(long_text_advisories or None),
+            auto_qa_plan=auto_qa_plan_payload,
+        )
 
     return GenerationInitResponse(
         status="initialized",
@@ -1356,9 +1542,9 @@ async def get_result(session_id: str):
     return payload
 
 
-@app.post("/stop/{session_id}")
-async def stop_session(session_id: str):
-    '''Stop/cancel an active content generation session'''
+async def _hard_stop_session_runtime(session_id: str) -> Dict[str, Any]:
+    seal = await cancellation_registry.seal_session_for_hard_cancel(session_id)
+    cancel_result = await cancellation_registry.request_hard_cancel(session_id)
 
     def _cancel(session: Dict[str, Any]):
         final_states = {
@@ -1367,69 +1553,142 @@ async def stop_session(session_id: str):
             GenerationStatus.FAILED,
             GenerationStatus.CANCELLED,
         }
-        if session.get("status") in final_states:
+        already_terminal = session.get("status") in final_states and not session.get("cancel_mode") == CancelMode.SOFT.value
+        if already_terminal:
+            status = session.get("status")
+            status_value = status.value if hasattr(status, "value") else str(status)
             return {
                 "changed": False,
+                "final_result": session.get("final_result"),
                 "response": {
                     "session_id": session_id,
-                    "message": f"Session already finished with status: {session['status'].value}",
+                    "message": f"Session already finished with status: {status_value}",
                     "stopped": False,
+                    "status": status_value,
+                    "tasks_cancelled": cancel_result.get("tasks_cancelled", 0),
+                    "provider_calls_closed": cancel_result.get("provider_calls_closed", 0),
                 },
             }
 
-        session["cancelled"] = True
-        raw_content = session.get("last_generated_content", "No content generated before cancellation")
+        final_result = apply_session_cancelled_state(
+            session,
+            session_id,
+            cancel_mode=CancelMode.HARD.value,
+            reason="Session hard-stopped by user",
+            hard=True,
+        )
+        session["tasks_cancelled"] = cancel_result.get("tasks_cancelled", 0)
+        session["provider_calls_closed"] = cancel_result.get("provider_calls_closed", 0)
         original_request = session.get("request")
-        final_result = {
-            "content": _get_final_content(session, raw_content, original_request) if original_request else raw_content,
-            "final_iteration": session.get("current_iteration", 0),
-            "final_score": 0.0,
-            "approved": False,
-            "failure_reason": "Session cancelled by user",
-            "generated_at": datetime.now().isoformat(),
-        }
         if original_request:
             _attach_json_guard_metadata(session, final_result, original_request)
-        _store_final_result(
-            session,
-            final_result,
-            session_id,
-            final_status=GenerationStatus.CANCELLED.value,
-        )
-        update_session_status(session, session_id, GenerationStatus.CANCELLED)
-        asyncio.create_task(
-            _debug_record_event(
-                session_id,
-                "session_cancelled",
-                {
-                    "final_result": final_result,
-                },
-            )
-        )
-        asyncio.create_task(
-            _debug_update_status(
-                session_id,
-                status=GenerationStatus.CANCELLED.value,
-                final_payload=final_result,
-            )
-        )
         return {
             "changed": True,
+            "final_result": final_result,
             "response": {
                 "session_id": session_id,
-                "message": "Session stopped successfully",
+                "message": "Session hard-stopped successfully",
                 "stopped": True,
                 "status": GenerationStatus.CANCELLED.value,
+                "cancel_mode": CancelMode.HARD.value,
+                "tasks_cancelled": cancel_result.get("tasks_cancelled", 0),
+                "provider_calls_closed": cancel_result.get("provider_calls_closed", 0),
             },
         }
 
     result = await mutate_session(session_id, _cancel)
     if result is None:
+        if seal.get("tasks") or seal.get("provider_calls"):
+            return {
+                "session_id": session_id,
+                "message": "Session hard-stop requested",
+                "stopped": True,
+                "status": GenerationStatus.CANCELLED.value,
+                "cancel_mode": CancelMode.HARD.value,
+                "tasks_cancelled": cancel_result.get("tasks_cancelled", 0),
+                "provider_calls_closed": cancel_result.get("provider_calls_closed", 0),
+            }
+        await cancellation_registry.unregister_session(session_id)
         raise HTTPException(status_code=404, detail="Session not found")
 
     if result["changed"]:
-        await add_verbose_log(session_id, "Session cancelled by user request")
+        await add_verbose_log(session_id, "Session hard-stopped by user request")
+        await _debug_record_event(
+            session_id,
+            "session_hard_stopped",
+            {"final_result": result["final_result"]},
+        )
+        await _debug_update_status(
+            session_id,
+            status=GenerationStatus.CANCELLED.value,
+            final_payload=result["final_result"],
+        )
     return result["response"]
+
+
+@app.post("/stop/{session_id}")
+async def stop_session(session_id: str, request: Request):
+    """Hard-stop an active content generation session."""
+    if "mode" in request.query_params:
+        raise HTTPException(status_code=400, detail="Stop is always hard; use /pause for soft cancellation")
+
+    completion_task = asyncio.create_task(
+        _hard_stop_session_runtime(session_id),
+        name=f"session-hard-stop:{session_id}",
+    )
+    _track_session_hard_stop_task(completion_task)
+    try:
+        return await asyncio.shield(completion_task)
+    except asyncio.CancelledError:
+        completion_task.add_done_callback(_log_session_hard_stop_task_result)
+        raise
+
+
+@app.post("/pause/{session_id}")
+async def pause_session(session_id: str):
+    """Cooperatively pause an active content generation session."""
+    await cancellation_registry.request_soft_cancel(session_id)
+
+    def _pause(session: Dict[str, Any]):
+        if is_terminal_session(session):
+            status = session.get("status")
+            status_value = status.value if hasattr(status, "value") else str(status)
+            return {
+                "session_id": session_id,
+                "paused": False,
+                "status": status_value,
+                "cancel_mode": session.get("cancel_mode"),
+                "final_result": session.get("final_result"),
+            }
+        if session.get("cancelled") and session.get("cancel_mode") == CancelMode.HARD.value:
+            return {
+                "session_id": session_id,
+                "paused": False,
+                "status": GenerationStatus.CANCELLED.value,
+                "cancel_mode": CancelMode.HARD.value,
+            }
+        final_result = apply_session_cancelled_state(
+            session,
+            session_id,
+            cancel_mode=CancelMode.SOFT.value,
+            reason="Session paused by user",
+            hard=False,
+        )
+        return {
+            "session_id": session_id,
+            "paused": True,
+            "status": GenerationStatus.CANCELLED.value,
+            "cancel_mode": CancelMode.SOFT.value,
+            "final_result": final_result,
+        }
+
+    result = await mutate_session(session_id, _pause)
+    if result is None:
+        await cancellation_registry.unregister_session(session_id)
+        raise HTTPException(status_code=404, detail="Session not found")
+    if result.get("paused"):
+        await add_verbose_log(session_id, "Session paused by user request")
+    return result
 
 
 @app.get("/status/project/{project_id}")

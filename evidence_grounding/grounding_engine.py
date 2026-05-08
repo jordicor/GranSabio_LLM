@@ -15,6 +15,7 @@ executing alongside semantic QA layers with configurable ordering based
 on the on_flag setting.
 """
 
+import asyncio
 import logging
 import time
 from typing import Any, Callable, Dict, Optional
@@ -101,6 +102,7 @@ class GroundingEngine:
         stream_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         extra_verbose: bool = False,
+        cancellation_token: Optional[Any] = None,
     ) -> EvidenceGroundingResult:
         """
         Run complete evidence grounding verification pipeline.
@@ -156,7 +158,10 @@ class GroundingEngine:
                 min_importance=grounding_config.min_claim_importance,
                 extra_verbose=extra_verbose,
                 usage_callback=usage_callback,
+                cancellation_token=cancellation_token,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"[GROUNDING] Claim extraction failed: {e}")
             # Return conservative result on extraction failure
@@ -234,7 +239,10 @@ class GroundingEngine:
                 config_obj=grounding_config,
                 extra_verbose=extra_verbose,
                 usage_callback=usage_callback,
+                cancellation_token=cancellation_token,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"[GROUNDING] Budget scoring failed: {e}")
             return self._create_error_result(

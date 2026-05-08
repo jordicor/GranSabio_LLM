@@ -995,6 +995,50 @@ class TestStreamingRetryBehavior:
     """Tests for streaming retry behavior in generate_content_stream()."""
 
     @pytest.mark.asyncio
+    async def test_streaming_downgrades_schema_when_model_lacks_native_support(
+        self,
+        ai_service_instance,
+        mock_config,
+    ):
+        """Streaming must use the same capability negotiation as non-streaming."""
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "thinking_validation": {},
+                "was_adjusted": False,
+                "model_limit": 8192,
+                "model_info": {"provider": "openai", "model_id": "gpt-4-turbo"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+        mock_config.model_specs = {"model_specifications": {"openai": {}}}
+
+        captured_kwargs = {}
+
+        async def fake_stream_openai(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            yield "ok"
+
+        ai_service_instance._stream_openai = fake_stream_openai
+
+        chunks = [
+            chunk
+            async for chunk in ai_service_instance.generate_content_stream(
+                "Return JSON.",
+                "gpt-4-turbo",
+                json_output=True,
+                json_schema={"type": "object", "properties": {"answer": {"type": "string"}}},
+            )
+        ]
+
+        assert chunks == ["ok"]
+        assert captured_kwargs["json_output"] is True
+        assert captured_kwargs["json_schema"] is None
+
+    @pytest.mark.asyncio
     async def test_retries_before_chunks_emitted(self, ai_service_instance, mock_config):
         """
         Given: Streaming fails before any chunks emitted
@@ -1193,14 +1237,11 @@ class TestExecuteWithRetries:
             )
 
     @pytest.mark.asyncio
-    async def test_raises_original_error_after_max_retries(self, ai_service_instance):
+    async def test_wraps_final_transient_error_after_max_retries(self, ai_service_instance):
         """
         Given: Operation always fails with transient error
         When: _execute_with_retries() exhausts retries
-        Then: Raises the original exception (behavior: re-raises on last attempt)
-
-        Note: The code re-raises the original exception when retries are exhausted,
-        rather than wrapping it in AIRequestError. This preserves the original error.
+        Then: Raises AIRequestError with normalized provider failure metadata
         """
         # Patch the methods directly on the instance
         ai_service_instance._max_retry_attempts = lambda: 2
@@ -1213,7 +1254,7 @@ class TestExecuteWithRetries:
             attempt_count += 1
             raise ConnectionError("Always fails")
 
-        with pytest.raises(ConnectionError, match="Always fails"):
+        with pytest.raises(AIRequestError) as exc_info:
             await ai_service_instance._execute_with_retries(
                 always_failing,
                 provider="openai",
@@ -1223,6 +1264,73 @@ class TestExecuteWithRetries:
 
         # Verify that 2 attempts were made
         assert attempt_count == 2
+        assert exc_info.value.cause.__class__ is ConnectionError
+        assert exc_info.value.provider_failure.kind.value == "transient_network"
+
+    @pytest.mark.asyncio
+    async def test_attempted_feature_classifies_400_as_unsupported_parameter(self, ai_service_instance):
+        """A rejected explicit feature should drive downgrade-capable taxonomy."""
+
+        class ProviderBadRequest(Exception):
+            status_code = 400
+            body = {"error": {"code": "invalid_parameter", "param": "output_config"}}
+
+        ai_service_instance._max_retry_attempts = lambda: 1
+
+        async def failing_operation():
+            raise ProviderBadRequest("bad request")
+
+        with pytest.raises(AIRequestError) as exc_info:
+            await ai_service_instance._execute_with_retries(
+                failing_operation,
+                provider="anthropic",
+                model_id="claude-sonnet-4-20250514",
+                action="generation",
+                attempted_feature="output_config.format",
+            )
+
+        failure = exc_info.value.provider_failure
+        assert failure.kind.value == "unsupported_parameter"
+        assert failure.downgradable is True
+        assert failure.attempted_feature == "output_config.format"
+
+    def test_attempted_output_feature_skips_unsent_openrouter_json_object(self, mock_config):
+        mock_config.model_specs = {
+            "model_specifications": {
+                "openrouter": {
+                    "unknown/model": {
+                        "model_id": "unknown/model",
+                        "supported_parameters": [],
+                    }
+                }
+            }
+        }
+
+        assert AIService._attempted_output_feature(
+            "openrouter",
+            "unknown/model",
+            json_output=True,
+            json_schema=None,
+        ) is None
+
+    def test_attempted_output_feature_tracks_sent_openrouter_json_object(self, mock_config):
+        mock_config.model_specs = {
+            "model_specifications": {
+                "openrouter": {
+                    "json/model": {
+                        "model_id": "json/model",
+                        "supported_parameters": ["response_format"],
+                    }
+                }
+            }
+        }
+
+        assert AIService._attempted_output_feature(
+            "openrouter",
+            "json/model",
+            json_output=True,
+            json_schema=None,
+        ) == "response_format.json_object"
 
     @pytest.mark.asyncio
     async def test_propagates_ai_request_error_immediately(self, ai_service_instance, mock_config):
@@ -1763,6 +1871,16 @@ class TestGenerationToolLoop:
                 "reasoning_timeout_seconds": None,
             }
         )
+        mock_config.model_specs = {
+            "model_specifications": {
+                "openrouter": {
+                    "openrouter/meta-llama-3.3": {
+                        "model_id": "openrouter/meta-llama-3.3",
+                        "supported_parameters": ["tools", "tool_choice"],
+                    }
+                }
+            }
+        }
 
         content, envelope = await ai_service_instance.call_ai_with_validation_tools(
             prompt="Write something long.",

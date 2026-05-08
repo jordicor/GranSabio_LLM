@@ -139,6 +139,16 @@ class TestShouldUseArbiterTools:
         ):
             assert Arbiter._should_use_arbiter_tools("auto", "gpt-4o-mini") is True
 
+    def test_model_without_tool_calling_support_returns_false(self):
+        fake_config = MagicMock()
+        fake_config.get_model_info.return_value = {
+            "provider": "openai", "model_id": "unknown-openai-model",
+        }
+        with patch("config.config", fake_config), patch(
+            "ai_service.AIService._supports_tool_calling", return_value=False
+        ):
+            assert Arbiter._should_use_arbiter_tools("auto", "unknown-openai-model") is False
+
     def test_supported_claude_model_returns_true(self):
         fake_config = MagicMock()
         fake_config.get_model_info.return_value = {
@@ -252,7 +262,34 @@ class TestFallbackSingleShot:
 
         assert [d.decision for d in result.edit_decisions] == [ArbiterDecision.APPLY]
         mock_service.generate_content.assert_awaited()
+        assert mock_service.generate_content.await_args.kwargs["json_schema"] is ARBITER_RESPONSE_SCHEMA
         mock_service.call_ai_with_validation_tools.assert_not_called()
+
+    def test_streaming_single_shot_forwards_arbiter_schema(self):
+        mock_service = MagicMock()
+
+        async def _stream(*args, **kwargs):
+            yield (
+                '{"reasoning": "ok", "decisions": ['
+                '{"edit_index": 0, "decision": "APPLY", "reason": "ok"}], '
+                '"conflicts_resolved": []}'
+            )
+
+        mock_service.generate_content_stream = MagicMock(side_effect=_stream)
+        mock_service.call_ai_with_validation_tools = AsyncMock(
+            side_effect=AssertionError("tool loop must not be called in never mode")
+        )
+        stream_callback = AsyncMock()
+
+        arbiter = Arbiter(ai_service=mock_service, stream_callback=stream_callback)
+        context = _context(arbiter_tools_mode="never")
+        result = asyncio.run(arbiter.arbitrate(context))
+
+        assert [d.decision for d in result.edit_decisions] == [ArbiterDecision.APPLY]
+        stream_kwargs = mock_service.generate_content_stream.call_args.kwargs
+        assert stream_kwargs["json_output"] is True
+        assert stream_kwargs["json_schema"] is ARBITER_RESPONSE_SCHEMA
+        stream_callback.assert_awaited()
 
 
 # ---------------------------------------------------------------------------

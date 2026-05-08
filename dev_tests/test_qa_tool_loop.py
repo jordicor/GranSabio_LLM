@@ -290,6 +290,21 @@ def test_should_use_qa_tools_false_for_unsupported_provider():
         )
 
 
+def test_should_use_qa_tools_false_when_model_lacks_tool_support():
+    request = _make_request()
+    layer = _make_layer()
+    bypass_engine = Mock()
+    bypass_engine.can_bypass_layer = Mock(return_value=False)
+    with _patch_model_info(provider="openai", model_id="unknown-openai-model"), \
+         patch("qa_evaluation_service.AIService._supports_tool_calling", return_value=False):
+        assert (
+            _should_use_qa_tools(
+                request, layer, "unknown-openai-model", bypass_engine=bypass_engine
+            )
+            is False
+        )
+
+
 def test_should_use_qa_tools_true_for_claude():
     request = _make_request()
     layer = _make_layer()
@@ -696,3 +711,80 @@ async def test_evaluate_content_single_shot_when_not_eligible():
     ai_service.call_ai_with_validation_tools.assert_not_awaited()
     assert ai_service.generate_content.await_count == 1
     assert evaluation.score == 8.0
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_tool_skip_falls_back_to_single_shot():
+    request = _make_request(json_output=True, json_schema={"type": "object"})
+    layer = _make_layer()
+    envelope = ToolLoopEnvelope(
+        loop_scope=LoopScope.QA,
+        tools_skipped_reason="no_tool_support",
+        turns=0,
+        accepted=False,
+        accepted_via="tools_skipped",
+        payload=None,
+    )
+    ai_service = Mock()
+    ai_service.call_ai_with_validation_tools = AsyncMock(return_value=("", envelope))
+    ai_service.generate_content = AsyncMock(
+        return_value='{"score": 8.0, "feedback": "Fallback passed", "deal_breaker": false, "deal_breaker_reason": null}'
+    )
+    bypass_engine = Mock()
+    bypass_engine.can_bypass_layer = Mock(return_value=False)
+
+    service = QAEvaluationService(ai_service)
+
+    with _patch_model_info():
+        evaluation = await service.evaluate_content(
+            content="Body.",
+            criteria=layer.criteria,
+            model="gpt-4o",
+            layer_name=layer.name,
+            min_score=layer.min_score,
+            original_request=request,
+            layer=layer,
+            bypass_engine=bypass_engine,
+            request_edit_info=False,
+        )
+
+    ai_service.call_ai_with_validation_tools.assert_awaited_once()
+    ai_service.generate_content.assert_awaited_once()
+    assert evaluation.score == 8.0
+    assert evaluation.feedback == "Fallback passed"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_context_too_large_tool_skip_fails_fast():
+    request = _make_request(json_output=True, json_schema={"type": "object"})
+    layer = _make_layer()
+    envelope = ToolLoopEnvelope(
+        loop_scope=LoopScope.QA,
+        tools_skipped_reason="context_too_large",
+        turns=0,
+        accepted=False,
+        accepted_via="tools_skipped",
+        payload=None,
+    )
+    ai_service = Mock()
+    ai_service.call_ai_with_validation_tools = AsyncMock(return_value=("", envelope))
+    ai_service.generate_content = AsyncMock()
+    bypass_engine = Mock()
+    bypass_engine.can_bypass_layer = Mock(return_value=False)
+
+    service = QAEvaluationService(ai_service)
+
+    with _patch_model_info(), pytest.raises(RuntimeError, match="context too large"):
+        await service.evaluate_content(
+            content="Body.",
+            criteria=layer.criteria,
+            model="gpt-4o",
+            layer_name=layer.name,
+            min_score=layer.min_score,
+            original_request=request,
+            layer=layer,
+            bypass_engine=bypass_engine,
+            request_edit_info=False,
+        )
+
+    ai_service.generate_content.assert_not_awaited()

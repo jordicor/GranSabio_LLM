@@ -11,6 +11,7 @@ from qa_result_utils import (
     build_deal_breaker_consensus,
     build_qa_counts,
     guaranteed_deal_breaker_majority,
+    normalize_qa_technical_failure_metadata,
     required_valid_qa_models,
 )
 
@@ -74,8 +75,14 @@ class QASchedulerTechnicalFailure(Exception):
         self.error_type = error_type
         self.message = message
         self.retryable = retryable
-        self.metadata = dict(metadata or {})
         self.original_exception = original_exception
+        self.metadata = normalize_qa_technical_failure_metadata(
+            error_type=error_type,
+            message=message,
+            retryable=retryable,
+            original_exception=original_exception,
+            extra=dict(metadata or {}),
+        )
 
 
 class QASchedulerUnavailableError(RuntimeError):
@@ -88,11 +95,18 @@ class QASchedulerUnavailableError(RuntimeError):
         slot: Optional[QASchedulerSlot] = None,
         original_exception: Optional[BaseException] = None,
         counts: Optional[Dict[str, int]] = None,
+        policy: Optional[QASchedulerPolicy] = None,
+        layer_name: Optional[str] = None,
+        last_failure: Optional[QASchedulerTechnicalFailure] = None,
     ) -> None:
         super().__init__(message)
         self.slot = slot
         self.original_exception = original_exception
         self.counts = counts or {}
+        self.policy = policy
+        self.layer_name = layer_name
+        self.last_failure = last_failure
+        self.last_failure_metadata = dict(last_failure.metadata) if last_failure else {}
 
 
 EvaluateSlot = Callable[[QASchedulerSlot, int], Awaitable[QAEvaluation]]
@@ -198,6 +212,8 @@ class QAScheduler:
                     f"evaluation(s), below required quorum {required_valid}."
                 ),
                 counts=counts,
+                policy=self.policy,
+                layer_name=layer_name,
             )
 
         return QASchedulerResult(
@@ -260,6 +276,21 @@ class QAScheduler:
         failure: QASchedulerTechnicalFailure,
         attempts: int,
     ) -> QAEvaluation:
+        projected_results = dict(current_results)
+        projected_results[slot.result_key] = self._technical_placeholder(
+            layer_name=layer_name,
+            slot=slot,
+            failure=failure,
+            attempts=attempts,
+            configured_count=configured_count,
+            required_valid=required_valid,
+        )
+        counts = build_qa_counts(
+            projected_results,
+            configured_count,
+            required_valid=required_valid,
+        )
+
         if failure.error_type == "timeout":
             timeout_policy = self.policy.on_timeout
             if timeout_policy in {"fail", "retry_then_fail"}:
@@ -267,26 +298,21 @@ class QAScheduler:
                     f"QA model {slot.model_name} timed out in layer {layer_name}.",
                     slot=slot,
                     original_exception=failure.original_exception,
+                    counts=counts,
+                    policy=self.policy,
+                    layer_name=layer_name,
+                    last_failure=failure,
                 ) from failure.original_exception
         elif self.policy.on_model_unavailable == "fail":
             raise QASchedulerUnavailableError(
                 f"QA model {slot.model_name} unavailable in layer {layer_name}: {failure.message}",
                 slot=slot,
                 original_exception=failure.original_exception,
+                counts=counts,
+                policy=self.policy,
+                layer_name=layer_name,
+                last_failure=failure,
             ) from failure.original_exception
-
-        projected_results = dict(current_results)
-        projected_results[slot.result_key] = self._technical_placeholder(
-            layer_name=layer_name,
-            slot=slot,
-            failure=failure,
-            attempts=attempts,
-        )
-        counts = build_qa_counts(
-            projected_results,
-            configured_count,
-            required_valid=required_valid,
-        )
 
         requires_quorum = (
             self.policy.on_timeout == "retry_then_skip_if_quorum"
@@ -304,6 +330,9 @@ class QAScheduler:
                     slot=slot,
                     original_exception=failure.original_exception,
                     counts=counts,
+                    policy=self.policy,
+                    layer_name=layer_name,
+                    last_failure=failure,
                 ) from failure.original_exception
 
         return projected_results[slot.result_key]
@@ -315,15 +344,31 @@ class QAScheduler:
         slot: QASchedulerSlot,
         failure: QASchedulerTechnicalFailure,
         attempts: int,
+        configured_count: int,
+        required_valid: int,
     ) -> QAEvaluation:
-        metadata = {
-            "technical_failure": True,
-            "error_type": failure.error_type,
-            "attempts": attempts,
-            "slot_id": slot.slot_id,
-            "evaluator_alias": slot.evaluator_label,
-            "config_fingerprint": slot.config_fingerprint,
-        }
+        metadata = normalize_qa_technical_failure_metadata(
+            error_type=failure.error_type,
+            message=failure.message,
+            retryable=failure.retryable,
+            attempts=attempts,
+            max_attempts=failure.metadata.get("max_attempts"),
+            provider=failure.metadata.get("provider"),
+            model=failure.metadata.get("model") or slot.model_name,
+            layer_name=layer_name,
+            slot_id=slot.slot_id,
+            slot_index=slot.index,
+            evaluator_alias=slot.evaluator_label,
+            configured_count=configured_count,
+            required_valid=required_valid,
+            policy=self.policy,
+            original_exception=failure.original_exception,
+            extra={
+                "config_fingerprint": slot.config_fingerprint,
+                **failure.metadata,
+                "attempts": attempts,
+            },
+        )
         metadata.update(failure.metadata)
         return QAEvaluation(
             model=slot.model_name,

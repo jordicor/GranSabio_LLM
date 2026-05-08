@@ -24,20 +24,13 @@ from model_aliasing import ModelAliasRegistry, PromptPart
 from models import QAEvaluation, is_json_output_requested
 from phrase_frequency_config import is_phrase_frequency_active
 from qa_bypass_engine import QABypassEngine
+from qa_result_utils import provider_failure_kind
 from qa_response_schemas import QA_SCHEMA_EDITABLE, QA_SCHEMA_SIMPLE
 from tool_loop_models import LoopScope, OutputContract, PayloadScope, ToolLoopEnvelope
 from tools.ai_json_cleanroom import make_loose_json_validate_options, validate_ai_json
 from validation_context_factory import build_measurement_request_for_layer
 
 logger = logging.getLogger(__name__)
-
-
-# Providers that support native tool calling in the shared tool loop.
-# Kept in sync with the generator activation logic in
-# ``core/generation_processor._should_use_generation_tools``.
-_TOOL_CAPABLE_PROVIDERS = frozenset(
-    {"openai", "claude", "anthropic", "gemini", "google", "xai", "openrouter"}
-)
 
 
 class MissingScoreTagError(ValueError):
@@ -124,7 +117,7 @@ def _should_use_qa_tools(
     provider_key = str(model_info.get("provider", "") or "").lower()
     model_id = str(model_info.get("model_id", "") or "").lower()
 
-    if provider_key not in _TOOL_CAPABLE_PROVIDERS:
+    if not AIService._supports_tool_calling(provider_key, model_id):
         return False
     if provider_key == "openai" and AIService._is_openai_responses_api_model(model_id):
         return False
@@ -207,6 +200,7 @@ class QAEvaluationService:
         """
         # Determine appropriate QA system prompt based on content type and request_edit_info
         content_type = getattr(original_request, 'content_type', 'biography') if original_request else 'biography'
+        cancellation_token = getattr(original_request, "_cancellation_token", None) if original_request else None
 
         # Decide whether to request edit information
         # Smart-edit works in two modes:
@@ -461,6 +455,7 @@ IMPORTANT:
                             label="qa.edit_history",
                         )
                     ] if edit_history else None,
+                    cancellation_token=cancellation_token,
                 ):
                     # Handle StreamChunk (Claude with thinking) vs plain string
                     if isinstance(chunk, StreamChunk):
@@ -503,6 +498,7 @@ IMPORTANT:
                         label="qa.edit_history",
                     )
                 ] if edit_history else None,
+                cancellation_token=cancellation_token,
             )
 
         # --- Tool-loop activation (§3.4.1, Fase 2) ---
@@ -604,6 +600,7 @@ IMPORTANT:
                         label="qa.edit_history",
                     )
                 ] if edit_history else None,
+                cancellation_token=cancellation_token,
             )
 
             if isinstance(envelope, ToolLoopEnvelope) and envelope.payload is not None:
@@ -611,6 +608,24 @@ IMPORTANT:
                 # the downstream parser (which currently consumes the raw
                 # text). Avoids duplicating parse logic.
                 return json.dumps(envelope.payload)
+            skipped_reason = (
+                envelope.tools_skipped_reason
+                if isinstance(envelope, ToolLoopEnvelope)
+                else None
+            )
+            if skipped_reason in {"responses_api", "no_tool_support"}:
+                logger.info(
+                    "QA tool loop skipped for %s@%s (%s); falling back to single-shot QA",
+                    model,
+                    layer_name,
+                    skipped_reason,
+                )
+                return await _generate_qa_response(json_schema)
+            if skipped_reason == "context_too_large":
+                raise RuntimeError(
+                    f"QA tool loop context too large for {model}@{layer_name}; "
+                    "cannot safely fall back without losing validation context."
+                )
             return loop_content
 
         if use_tools:
@@ -706,6 +721,10 @@ IMPORTANT:
     @staticmethod
     def _is_structured_output_schema_error(exc: Exception) -> bool:
         """Return True for provider/local errors caused by schema incompatibility."""
+        normalized_kind = provider_failure_kind(exc)
+        if normalized_kind in {"unsupported_parameter", "schema_invalid"}:
+            return True
+
         messages = [str(exc)]
         cause = getattr(exc, "cause", None)
         if cause is not None:

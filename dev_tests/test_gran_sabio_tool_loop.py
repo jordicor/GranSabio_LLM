@@ -150,6 +150,11 @@ class TestShouldUseGransabioTools:
         request = ContentRequest(prompt="Test prompt content", gransabio_tools_mode="auto")
         assert _should_use_gransabio_tools(request, "claude-sonnet-4-20250514") is True
 
+    def test_auto_mode_returns_false_when_model_lacks_tool_support(self, tool_loop_config):
+        request = ContentRequest(prompt="Test prompt content", gransabio_tools_mode="auto")
+        with patch("gran_sabio.AIService._supports_tool_calling", return_value=False):
+            assert _should_use_gransabio_tools(request, "claude-sonnet-4-20250514") is False
+
     def test_unsupported_provider_returns_false(self, tool_loop_config):
         tool_loop_config.get_model_info.return_value = {
             "provider": "some_other_provider",
@@ -322,6 +327,55 @@ class TestRegenerateContentUsesToolLoop:
         assert draft_report.approved is True
 
     @pytest.mark.asyncio
+    async def test_json_regeneration_tool_skip_fallback_preserves_json_contract(
+        self, tool_loop_config
+    ):
+        request = ContentRequest(
+            prompt="Generate a JSON payload for testing.",
+            content_type="article",
+            json_output=True,
+            generator_model="gpt-4o",
+            gran_sabio_model="claude-sonnet-4-20250514",
+            qa_layers=[],
+            qa_models=[],
+            gransabio_tools_mode="auto",
+        )
+        service = MagicMock()
+        service.call_ai_with_validation_tools = AsyncMock(
+            return_value=(
+                "",
+                ToolLoopEnvelope(
+                    loop_scope=LoopScope.GRAN_SABIO,
+                    trace=[],
+                    output_schema_valid=False,
+                    tools_skipped_reason="no_tool_support",
+                    turns=0,
+                    accepted=False,
+                    accepted_via="",
+                    payload=None,
+                ),
+            )
+        )
+        service.generate_content = AsyncMock(return_value='```json\n{"ok": true}\n```')
+        service.generate_content_stream = AsyncMock()
+
+        with patch(
+            "gran_sabio.get_default_models",
+            return_value={"gran_sabio": "claude-sonnet-4-20250514"},
+        ):
+            engine = GranSabioEngine(ai_service=service)
+            result = await engine.regenerate_content(
+                session_id="sess",
+                original_request=request,
+            )
+
+        assert result.final_content == '{"ok":true}'
+        service.generate_content.assert_awaited_once()
+        fallback_kwargs = service.generate_content.call_args.kwargs
+        assert fallback_kwargs["json_output"] is True
+        assert fallback_kwargs["json_schema"] is None
+
+    @pytest.mark.asyncio
     async def test_json_regeneration_with_stream_callback_keeps_tool_loop_and_streams_final_content(
         self, tool_loop_config
     ):
@@ -485,6 +539,49 @@ class TestReviewIterationsUsesToolLoop:
         assert call_kwargs["loop_scope"] == LoopScope.GRAN_SABIO
         assert call_kwargs["max_tool_rounds"] == tool_loop_config.GRAN_SABIO_ESCALATION_MAX_TOOL_ROUNDS
         assert call_kwargs["initial_measurement_text"] == "BEST_CONTENT"
+
+    @pytest.mark.asyncio
+    async def test_streaming_single_shot_preserves_json_schema_contract(
+        self, request_with_tools, tool_loop_config
+    ):
+        service = MagicMock()
+        service.call_ai_with_validation_tools = AsyncMock()
+
+        async def _stream(*args, **kwargs):
+            yield '{"decision":"APPROVE","reason":"Good",'
+            yield '"score":8.0,"modifications_made":false,"final_content":null}'
+
+        service.generate_content_stream = MagicMock(side_effect=_stream)
+        stream_callback = AsyncMock()
+        iterations = [
+            {
+                "iteration": 1,
+                "content": "BEST_CONTENT",
+                "consensus": {"average_score": 9.0},
+                "qa_results": {},
+                "qa_layers_config": [],
+            }
+        ]
+
+        with patch(
+            "gran_sabio.get_default_models",
+            return_value={"gran_sabio": "claude-sonnet-4-20250514"},
+        ):
+            engine = GranSabioEngine(ai_service=service)
+            result = await engine.review_iterations(
+                session_id="sess",
+                iterations=iterations,
+                original_request=request_with_tools,
+                stream_callback=stream_callback,
+            )
+
+        assert result.approved is True
+        assert result.final_content == "BEST_CONTENT"
+        service.call_ai_with_validation_tools.assert_not_called()
+        stream_kwargs = service.generate_content_stream.call_args.kwargs
+        assert stream_kwargs["json_output"] is True
+        assert stream_kwargs["json_schema"] == GRAN_SABIO_ESCALATION_SCHEMA
+        assert stream_kwargs["content_type"] == request_with_tools.content_type
 
     @pytest.mark.asyncio
     async def test_measurement_validator_uses_loose_json_measurement_request(

@@ -5,6 +5,7 @@ Runs a lightweight feasibility analysis before starting expensive
 content generation iterations.
 """
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -518,6 +519,7 @@ async def run_preflight_validation(
     usage_tracker: Optional[UsageTracker] = None,
     phase_logger: Optional["PhaseLogger"] = None,
     model_alias_registry: Optional[ModelAliasRegistry] = None,
+    cancellation_token: Optional[Any] = None,
 ) -> PreflightResult:
     """Run the preflight validator and return a structured decision.
 
@@ -614,6 +616,7 @@ async def run_preflight_validation(
                 phase_logger=phase_logger,
                 model_alias_registry=model_alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                cancellation_token=cancellation_token,
             ):
                 # Handle StreamChunk (Claude with thinking) vs plain string
                 if isinstance(chunk, StreamChunk):
@@ -643,6 +646,7 @@ async def run_preflight_validation(
                 phase_logger=phase_logger,
                 model_alias_registry=model_alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                cancellation_token=cancellation_token,
             )
 
         # Log response if phase_logger is available
@@ -654,6 +658,8 @@ async def run_preflight_validation(
         else:
             logger.info(f"Preflight validator raw output: {raw_output}")
 
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         logger.error("Preflight validation request failed: %s", exc, exc_info=True)
         return _build_preflight_failure_result(

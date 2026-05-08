@@ -63,7 +63,7 @@ def _accepted_envelope() -> ToolLoopEnvelope:
 
 
 class _FakeFeedbackManager:
-    async def initialize_session(self, session_id, request):
+    async def initialize_session(self, session_id, request, **kwargs):
         return {"initial_rules": []}
 
 
@@ -113,6 +113,18 @@ def test_auto_mode_supports_non_openai_tool_loop_providers():
     with patch("core.generation_processor.has_active_generation_validators", return_value=True), \
          patch("core.generation_processor.config", Mock(get_model_info=Mock(return_value={"provider": "claude", "model_id": "claude-sonnet-4-5"}))):
         assert _should_use_generation_tools(request) is True
+
+
+def test_auto_mode_rejects_models_without_tool_calling_support():
+    request = SimpleNamespace(
+        generation_tools_mode="auto",
+        generator_model="unknown-openai-model",
+    )
+
+    with patch("core.generation_processor.has_active_generation_validators", return_value=True), \
+         patch("core.generation_processor.config", Mock(get_model_info=Mock(return_value={"provider": "openai", "model_id": "unknown-openai-model"}))), \
+         patch("core.generation_processor.AIService._supports_tool_calling", return_value=False):
+        assert _should_use_generation_tools(request) is False
 
 
 def test_auto_mode_rejects_openai_responses_api_models():
@@ -311,16 +323,22 @@ async def test_generate_full_content_standard_streaming_keeps_retry_without_tool
         mock_config.RETRY_STREAMING_AFTER_PARTIAL = True
         mock_config.RETRY_DELAY = 0
 
-        content = await _generate_full_content(
-            final_prompt="Write JSON.",
-            request=request,
-            ai_service=ai_service,
-            usage_tracker=None,
-            session_id="session-standard-retry",
-            session={},
-            iteration=0,
-            json_output_requested=is_json_output_requested(request),
-        )
+        session_id = "session-standard-retry"
+        session = {"session_id": session_id, "cancelled": False, "verbose_log": []}
+        await app_state.register_session(session_id, session)
+        try:
+            content = await _generate_full_content(
+                final_prompt="Write JSON.",
+                request=request,
+                ai_service=ai_service,
+                usage_tracker=None,
+                session_id=session_id,
+                session=session,
+                iteration=0,
+                json_output_requested=is_json_output_requested(request),
+            )
+        finally:
+            await app_state.pop_session(session_id)
 
     assert content == '{"ok": true}'
     assert len(attempts) == 2

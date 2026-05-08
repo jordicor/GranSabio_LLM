@@ -1201,6 +1201,51 @@ class TestEvaluateAllLayersWithProgress:
         assert results["Test Quality"]["gemini-pro"].score == 8.5
 
     @pytest.mark.asyncio
+    async def test_qa_evaluator_failure_emits_normalized_debug_event(
+        self, qa_engine, sample_qa_layer, sample_qa_evaluation
+    ):
+        """
+        Given: One QA evaluator fails technically
+        When: a tool event callback is available
+        Then: qa_evaluator_failed receives normalized diagnostic metadata
+        """
+        events = []
+        call_count = [0]
+
+        async def mock_evaluate(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise QAResponseParseError("Invalid JSON")
+            return sample_qa_evaluation
+
+        async def tool_event_callback(event_type, payload):
+            events.append((event_type, payload))
+
+        qa_engine.qa_evaluator.evaluate_content = AsyncMock(side_effect=mock_evaluate)
+
+        with patch('qa_engine.calculate_qa_timeout_for_model', return_value=60):
+            await qa_engine.evaluate_all_layers_with_progress(
+                content="Test content",
+                layers=[sample_qa_layer],
+                qa_models=["gpt-4o", "claude-sonnet-4", "gemini-pro"],
+                session_id="session-1",
+                project_id="project-1",
+                tool_event_callback=tool_event_callback,
+            )
+
+        assert events[0][0] == "qa_evaluator_failed"
+        payload = events[0][1]
+        assert payload["technical_failure"] is True
+        assert payload["technical_failure_category"] == "qa_evaluator_failed"
+        assert payload["error_type"] == "parse_error"
+        assert payload["model"] == "gpt-4o"
+        assert payload["layer"] == "Test Quality"
+        assert payload["configured_count"] == 3
+        assert payload["required_valid"] == 2
+        assert payload["original_exception_class"] == "QAResponseParseError"
+        assert payload["correlation_id"].startswith("qa-")
+
+    @pytest.mark.asyncio
     async def test_majority_deal_breaker_stops_early(
         self, qa_engine, sample_qa_layer
     ):

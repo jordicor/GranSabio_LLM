@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 from ai_service import AIRequestError, AIService, StreamChunk, get_ai_service
 from config import config, get_default_models
 from deterministic_validation import DraftValidationResult, validate_generation_candidate
+from json_utils import dumps as json_dumps
 from model_aliasing import PromptPart, get_evaluator_alias
 from models import ContentRequest, GranSabioResult, is_json_output_requested
 from tool_loop_models import (
@@ -27,7 +28,7 @@ from tool_loop_models import (
     PayloadScope,
     parse_json_with_markdown_fences,
 )
-from tools.ai_json_cleanroom import make_loose_json_validate_options
+from tools.ai_json_cleanroom import make_loose_json_validate_options, validate_ai_json
 from usage_tracking import UsageTracker
 from validation_context_factory import MeasurementRequest, build_measurement_request_for_layer
 
@@ -98,10 +99,7 @@ def _should_use_gransabio_tools(request: ContentRequest, model: str) -> bool:
     provider = model_info.get("provider")
     model_id = str(model_info.get("model_id", "")).lower()
     provider_key = (provider or "").lower()
-    supported_providers = {
-        "openai", "claude", "anthropic", "gemini", "google", "xai", "openrouter",
-    }
-    if provider_key not in supported_providers:
+    if not AIService._supports_tool_calling(provider_key, model_id):
         return False
 
     if provider_key == "openai" and AIService._is_openai_responses_api_model(model_id):
@@ -180,11 +178,41 @@ def _parse_escalation_payload(payload: Dict[str, Any]) -> Tuple[str, float, str,
     return decision, score, reason, modifications_made, final_content
 
 
+def _format_json_validation_errors(errors: List[Any]) -> str:
+    return "; ".join(
+        f"{getattr(issue, 'path', '$')}: {getattr(issue, 'message', str(issue))}"
+        for issue in (errors or [])
+    ) or "unknown JSON validation error"
+
+
+def _normalize_regeneration_json_output(
+    raw_content: str,
+    original_request: ContentRequest,
+    *,
+    json_options: Optional[Any] = None,
+) -> str:
+    """Validate and canonicalize JSON regeneration fallback output."""
+
+    validation = validate_ai_json(
+        raw_content or "",
+        schema=getattr(original_request, "json_schema", None),
+        expectations=getattr(original_request, "json_expectations", None),
+        options=json_options,
+    )
+    if not validation.json_valid or validation.data is None:
+        details = _format_json_validation_errors(validation.errors)
+        raise ValueError(f"Gran Sabio regeneration JSON output failed validation: {details}")
+    return json_dumps(validation.data, ensure_ascii=False)
+
+
 # --- Streaming Retry Helpers ---
 
 def _is_retryable_streaming_error(exc: Exception) -> bool:
     """Determine if a streaming error should trigger a retry."""
     if isinstance(exc, AIRequestError):
+        failure = getattr(exc, "provider_failure", None)
+        if failure is not None:
+            return bool(failure.retryable)
         return True
 
     status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
@@ -424,6 +452,7 @@ class GranSabioEngine:
         usage_tracker: Optional[UsageTracker] = None,
         phase_logger: Optional["PhaseLogger"] = None,
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        cancellation_token: Optional[Any] = None,
     ) -> GranSabioResult:
         """
         Review content when a MINORITY of QA evaluators flagged deal-breakers.
@@ -569,6 +598,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 cancel_callback=cancel_callback,
                 abort_stage="minority_review_stream",
                 tool_event_callback=tool_event_callback,
+                cancellation_token=cancellation_token,
             )
             await _abort_if_cancelled("minority_review_after_generation")
 
@@ -654,6 +684,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
         usage_tracker: Optional[UsageTracker] = None,
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
         fallback_reason: Optional[str] = None,
+        cancellation_token: Optional[Any] = None,
     ) -> GranSabioResult:
         """
         Final fallback: generate new content from scratch when iterations are exhausted.
@@ -808,6 +839,14 @@ CRITICAL INSTRUCTIONS:
             max_stream_attempts = config.MAX_RETRIES if config.RETRY_STREAMING_AFTER_PARTIAL else 1
             stream_delay = config.RETRY_DELAY
 
+            json_schema = getattr(original_request, "json_schema", None)
+            json_options_for_loop = (
+                make_loose_json_validate_options()
+                if json_output_effective
+                and json_schema is None
+                else None
+            )
+
             # §3.4.3 streaming escape: non-JSON regeneration keeps live
             # streaming when a callback is provided. JSON regeneration must
             # still route through the shared loop so the final payload is
@@ -820,13 +859,6 @@ CRITICAL INSTRUCTIONS:
 
             if tool_loop_enabled:
                 await _abort_if_cancelled("regeneration_before_tool_loop")
-                json_schema = getattr(original_request, "json_schema", None)
-                json_options_for_loop = (
-                    make_loose_json_validate_options()
-                    if json_output_effective
-                    and json_schema is None
-                    else None
-                )
                 output_contract = OutputContract.FREE_TEXT
                 response_format = None
                 if json_output_effective:
@@ -869,6 +901,7 @@ CRITICAL INSTRUCTIONS:
                         images=images,
                         model_alias_registry=model_alias_registry,
                         prompt_safety_parts=prompt_safety_parts,
+                        cancellation_token=cancellation_token,
                     )
                 except Exception:
                     raise
@@ -886,11 +919,20 @@ CRITICAL INSTRUCTIONS:
                         extra_verbose=getattr(original_request, "extra_verbose", False),
                         reasoning_effort=reasoning_effort,
                         thinking_budget_tokens=thinking_tokens,
+                        json_output=json_output_effective,
+                        json_schema=json_schema,
                         usage_callback=usage_callback,
                         images=images,
                         model_alias_registry=model_alias_registry,
                         prompt_safety_parts=prompt_safety_parts,
+                        cancellation_token=cancellation_token,
                     )
+                    if json_output_effective:
+                        generated_content = _normalize_regeneration_json_output(
+                            generated_content,
+                            original_request,
+                            json_options=json_options_for_loop,
+                        )
                 if stream_callback is not None and generated_content:
                     await stream_callback(
                         generated_content,
@@ -919,10 +961,13 @@ CRITICAL INSTRUCTIONS:
                             extra_verbose=getattr(original_request, "extra_verbose", False),
                             reasoning_effort=reasoning_effort,
                             thinking_budget_tokens=thinking_tokens,
+                            json_output=json_output_effective,
+                            json_schema=json_schema,
                             usage_callback=usage_callback,
                             images=images,
                             model_alias_registry=model_alias_registry,
                             prompt_safety_parts=prompt_safety_parts,
+                            cancellation_token=cancellation_token,
                         ):
                             # Handle StreamChunk (Claude with thinking) vs plain string
                             if isinstance(chunk, StreamChunk):
@@ -964,6 +1009,13 @@ CRITICAL INSTRUCTIONS:
                             )
                             raise
 
+                if json_output_effective:
+                    generated_content = _normalize_regeneration_json_output(
+                        generated_content,
+                        original_request,
+                        json_options=json_options_for_loop,
+                    )
+
             else:
                 await _abort_if_cancelled("regeneration_before_generation")
                 generated_content = await self.ai_service.generate_content(
@@ -974,11 +1026,20 @@ CRITICAL INSTRUCTIONS:
                     extra_verbose=getattr(original_request, "extra_verbose", False),
                     reasoning_effort=reasoning_effort,
                     thinking_budget_tokens=thinking_tokens,
+                    json_output=json_output_effective,
+                    json_schema=json_schema,
                     usage_callback=usage_callback,
                     images=images,
                     model_alias_registry=model_alias_registry,
                     prompt_safety_parts=prompt_safety_parts,
+                    cancellation_token=cancellation_token,
                 )
+                if json_output_effective:
+                    generated_content = _normalize_regeneration_json_output(
+                        generated_content,
+                        original_request,
+                        json_options=json_options_for_loop,
+                    )
             await _abort_if_cancelled("regeneration_after_generation")
 
             # Log full Gran Sabio response if extra_verbose is enabled
@@ -1037,6 +1098,7 @@ CRITICAL INSTRUCTIONS:
         usage_tracker: Optional[UsageTracker] = None,
         phase_logger: Optional["PhaseLogger"] = None,
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        cancellation_token: Optional[Any] = None,
     ) -> GranSabioResult:
         """
         Review all iterations when max iterations are reached without consensus.
@@ -1144,6 +1206,7 @@ CRITICAL INSTRUCTIONS:
                 cancel_callback=cancel_callback,
                 abort_stage="iterations_review_stream",
                 tool_event_callback=tool_event_callback,
+                cancellation_token=cancellation_token,
             )
 
             await _abort_if_cancelled("iterations_review_after_generation")
@@ -1438,6 +1501,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
         cancel_callback: CancelCallback,
         abort_stage: str,
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        cancellation_token: Optional[Any] = None,
     ) -> Tuple[Dict[str, Any], str]:
         """Run a GranSabio JSON_STRUCTURED call with tool-loop or single-shot fallback.
 
@@ -1506,6 +1570,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 phase_logger=phase_logger,
                 model_alias_registry=alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                cancellation_token=cancellation_token,
             )
 
             if envelope.tools_skipped_reason is None and envelope.payload is not None:
@@ -1533,10 +1598,14 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 system_prompt=system_prompt,
                 reasoning_effort=reasoning_effort,
                 thinking_budget_tokens=thinking_tokens,
+                content_type=request.content_type,
+                json_output=True,
+                json_schema=response_schema,
                 usage_callback=usage_callback,
                 phase_logger=phase_logger,
                 model_alias_registry=alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                cancellation_token=cancellation_token,
             ):
                 if isinstance(chunk, StreamChunk):
                     chunk_text = chunk.text
@@ -1565,6 +1634,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 phase_logger=phase_logger,
                 model_alias_registry=alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                cancellation_token=cancellation_token,
             )
 
         parsed = self._parse_single_shot_json(response_text, response_schema)

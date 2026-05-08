@@ -189,10 +189,10 @@ class FakeConsensusEngine:
 class FakeFeedbackManager:
     """Minimal feedback manager stub."""
 
-    async def initialize_session(self, session_id, request):
+    async def initialize_session(self, session_id, request, **kwargs):
         return {"initial_rules": []}
 
-    async def add_iteration_feedback(self, session_id, feedback_text, content_snapshot, iteration_num):
+    async def add_iteration_feedback(self, session_id, feedback_text, content_snapshot, iteration_num, **kwargs):
         return feedback_text
 
     async def complete_session(self, session_id, success=True):

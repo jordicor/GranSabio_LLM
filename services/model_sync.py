@@ -340,6 +340,7 @@ class ModelSyncService:
             pricing = model.get("pricing", {}) or {}
             architecture = model.get("architecture", {}) or {}
             input_modalities = architecture.get("input_modalities", []) or []
+            supported_parameters = _dedupe_strings(model.get("supported_parameters") or [])
             capabilities = _capabilities_from_input_modalities(input_modalities)
 
             context_length = _context_length_from_remote(model)
@@ -366,6 +367,7 @@ class ModelSyncService:
                         "output_per_million": _price_per_million_from_token_price(pricing.get("completion")),
                     },
                     "capabilities": _dedupe_strings(capabilities),
+                    "supported_parameters": supported_parameters,
                     "supported": True,
                     "needs_review": False,
                     "sync_mode": "full",
@@ -757,6 +759,7 @@ class ModelSyncService:
             "context_window",
             "pricing",
             "capabilities",
+            "supported_parameters",
             "source",
         )
         has_changes = any(local_spec.get(field) != generated_spec.get(field) for field in relevant_fields)
@@ -1006,6 +1009,9 @@ class ModelSyncService:
 
         pricing = model.get("pricing") or {}
         capabilities = model.get("capabilities") or current_spec.get("capabilities") or ["text"]
+        supported_parameters = model.get("supported_parameters")
+        if supported_parameters is None:
+            supported_parameters = current_spec.get("supported_parameters")
         sync_mode = self.get_sync_mode(provider)
         sync_meta = dict(current_spec.get("sync_metadata", {}) or {})
         sync_meta.update(
@@ -1037,6 +1043,7 @@ class ModelSyncService:
                     "output_per_million": round(_safe_float(pricing.get("output_per_million")), 4),
                 },
                 "capabilities": _dedupe_strings(capabilities or ["text"]),
+                "supported_parameters": _dedupe_strings(supported_parameters or []),
                 "verified_at": _utc_now_iso(),
                 "source": _nested_lookup(model, "source", "url") or current_spec.get("source"),
                 "sync_metadata": sync_meta,

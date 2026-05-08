@@ -1515,8 +1515,28 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "name": model_data.get("name", resolved["model_key"]),
             "description": model_data.get("description", ""),
             "capabilities": model_data.get("capabilities", []),
+            "special_features": model_data.get("special_features", []),
+            "provider_capabilities": model_data.get("provider_capabilities", {}),
+            "supported_parameters": model_data.get("supported_parameters", []),
+            "sync_metadata": model_data.get("sync_metadata", {}),
+            "reasoning_effort": model_data.get("reasoning_effort", {}),
+            "thinking_budget": model_data.get("thinking_budget", {}),
             "pricing": model_data.get("pricing", {})
         }
+
+    def model_supports(self, model_name: str, capability: str) -> bool:
+        """Return whether a model has a fine-grained provider capability."""
+        from model_capability_registry import model_supports
+
+        model_info = self.get_model_info(model_name)
+        state = model_supports(
+            specs=self.model_specs,
+            provider=model_info["provider"],
+            model_id=model_info["model_id"],
+            capability=capability,
+            model_data=model_info,
+        )
+        return state.supported
 
     def validate_api_keys(self) -> Dict[str, bool]:
         """Validate that required API keys are present (no fallbacks)."""

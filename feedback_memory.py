@@ -27,6 +27,7 @@ import aiosqlite
 
 import json_utils as json
 from ai_service import get_ai_service
+from core.cancellation import ProviderCallHandle
 from model_aliasing import ModelAliasRegistry, PromptPart
 
 logger = logging.getLogger(__name__)
@@ -498,6 +499,7 @@ class FeedbackProcessor:
         self,
         feedback_text: str,
         model_alias_registry: Optional[ModelAliasRegistry] = None,
+        cancellation_token: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Extract structured analysis from feedback text using AI"""
 
@@ -533,6 +535,7 @@ Return ONLY valid JSON, no additional text."""
                 temperature=self.config.analysis_temperature,
                 json_output=True,
                 model_alias_registry=model_alias_registry,
+                cancellation_token=cancellation_token,
                 prompt_safety_parts=[
                     PromptPart(
                         text=feedback_text,
@@ -576,11 +579,21 @@ Return ONLY valid JSON, no additional text."""
             'one_liner': sentences[0] if sentences else "Feedback provided"
         }
 
-    async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
+    async def get_embeddings(
+        self,
+        texts: List[str],
+        cancellation_token: Optional[Any] = None,
+    ) -> List[List[float]]:
         """Get embeddings for text list"""
-        try:
-            # Use the AI service to get embeddings
-            response = await self.ai_service._make_request(
+        current_task = asyncio.current_task()
+
+        async def close_provider_task() -> None:
+            if current_task is None or current_task.done() or current_task is asyncio.current_task():
+                return
+            current_task.cancel()
+
+        async def request_embeddings() -> Any:
+            return await self.ai_service._make_request(
                 'POST',
                 'https://api.openai.com/v1/embeddings',
                 json={
@@ -588,6 +601,27 @@ Return ONLY valid JSON, no additional text."""
                     'input': texts
                 }
             )
+
+        try:
+            if cancellation_token and await cancellation_token.any_cancelled():
+                raise asyncio.CancelledError()
+
+            if cancellation_token:
+                handle = ProviderCallHandle(
+                    call_id="",
+                    provider="openai",
+                    model_id=self.config.embedding_model,
+                    session_id=cancellation_token.session_id,
+                    phase=cancellation_token.phase,
+                    operation="feedback_embeddings",
+                    close=close_provider_task,
+                )
+                async with cancellation_token.registry.begin_provider_call(handle):
+                    response = await request_embeddings()
+                    if await cancellation_token.any_cancelled():
+                        raise asyncio.CancelledError()
+            else:
+                response = await request_embeddings()
 
             if response and 'data' in response:
                 return [item['embedding'] for item in response['data']]
@@ -597,7 +631,11 @@ Return ONLY valid JSON, no additional text."""
 
         return [[] for _ in texts]  # Return empty embeddings on failure
 
-    async def synthesize_normative_rules(self, categories: List[Dict]) -> List[str]:
+    async def synthesize_normative_rules(
+        self,
+        categories: List[Dict],
+        cancellation_token: Optional[Any] = None,
+    ) -> List[str]:
         """Synthesize normative rules from repeated patterns"""
 
         if not categories:
@@ -627,7 +665,8 @@ Return ONLY valid JSON."""
                 prompt=prompt,
                 model=self.config.analysis_model,
                 temperature=0.0,
-                json_output=True
+                json_output=True,
+                cancellation_token=cancellation_token,
             )
 
             if isinstance(response, str):
@@ -680,7 +719,12 @@ class FeedbackMemoryManager:
         ]
         return sha1_hash('|'.join(key_parts))
 
-    async def initialize_session(self, session_id: str, request: Any) -> Dict[str, Any]:
+    async def initialize_session(
+        self,
+        session_id: str,
+        request: Any,
+        cancellation_token: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         """Initialize feedback memory for a new session"""
 
         # Ensure initialized
@@ -702,7 +746,10 @@ class FeedbackMemoryManager:
         if similar_sessions:
             common_patterns = await self._extract_common_patterns(similar_sessions)
             if common_patterns:
-                initial_rules = await self.processor.synthesize_normative_rules(common_patterns)
+                initial_rules = await self.processor.synthesize_normative_rules(
+                    common_patterns,
+                    cancellation_token=cancellation_token,
+                )
 
         # Initialize cache entry
         self.memory_cache[session_id] = {
@@ -758,6 +805,7 @@ class FeedbackMemoryManager:
         content_snapshot: str,
         iteration_num: int,
         model_alias_registry: Optional[ModelAliasRegistry] = None,
+        cancellation_token: Optional[Any] = None,
     ) -> str:
         """Process and store feedback for an iteration"""
 
@@ -765,6 +813,7 @@ class FeedbackMemoryManager:
         analysis = await self.processor.extract_feedback_analysis(
             feedback_text,
             model_alias_registry=model_alias_registry,
+            cancellation_token=cancellation_token,
         )
 
         summaries = analysis['tiered_summaries']
@@ -779,7 +828,12 @@ class FeedbackMemoryManager:
 
         # Process issues and update categories
         if issues:
-            await self._process_issues(session_id, issues, iteration_num)
+            await self._process_issues(
+                session_id,
+                issues,
+                iteration_num,
+                cancellation_token=cancellation_token,
+            )
 
         # Update cache
         if session_id in self.memory_cache:
@@ -787,9 +841,15 @@ class FeedbackMemoryManager:
             self.memory_cache[session_id]['iteration_count'] = iteration_num + 1
 
         # Build and return the iteration prompt
-        return await self.build_iteration_prompt(session_id)
+        return await self.build_iteration_prompt(session_id, cancellation_token=cancellation_token)
 
-    async def _process_issues(self, session_id: str, issues: List[Dict], iteration_num: int):
+    async def _process_issues(
+        self,
+        session_id: str,
+        issues: List[Dict],
+        iteration_num: int,
+        cancellation_token: Optional[Any] = None,
+    ):
         """Process issues, detect similarities, and update categories"""
 
         # Get embeddings for all issues
@@ -797,7 +857,10 @@ class FeedbackMemoryManager:
             f"{issue.get('type', 'general')}::{issue.get('canonical_label', '')}"
             for issue in issues
         ]
-        embeddings = await self.processor.get_embeddings(issue_texts)
+        embeddings = await self.processor.get_embeddings(
+            issue_texts,
+            cancellation_token=cancellation_token,
+        )
 
         # Get existing categories for similarity comparison
         existing_categories = await self.db.get_categories(session_id)
@@ -844,7 +907,11 @@ class FeedbackMemoryManager:
         await self.db._pool.commit()
         asyncio.create_task(self.db._maybe_piggyback_cleanup())
 
-    async def build_iteration_prompt(self, session_id: str) -> str:
+    async def build_iteration_prompt(
+        self,
+        session_id: str,
+        cancellation_token: Optional[Any] = None,
+    ) -> str:
         """Build the iteration feedback prompt with temporal decay"""
 
         # Get recent iterations
@@ -861,7 +928,10 @@ class FeedbackMemoryManager:
 
         # Get or synthesize normative rules
         if categories:
-            rules = await self.processor.synthesize_normative_rules(categories)
+            rules = await self.processor.synthesize_normative_rules(
+                categories,
+                cancellation_token=cancellation_token,
+            )
             await self.db.save_normative_rules(
                 session_id, rules,
                 [cat['canonical_label'] for cat in categories[:10]]

@@ -22,8 +22,12 @@ class TestJsonPromptGate:
         assert AIService._should_inject_json_prompt("openai", "gpt-4o", True, schema) is False
         assert AIService._should_inject_json_prompt("gemini", "gemini-2.5-pro", True, schema) is False
         assert AIService._should_inject_json_prompt("claude", "claude-sonnet-4-5", True, schema) is False
-        assert AIService._should_inject_json_prompt("openrouter", "mistralai/mistral-large", True, schema) is False
         assert AIService._should_inject_json_prompt("xai", "grok-2-1212", True, schema) is False
+
+    def test_openrouter_unknown_capabilities_keep_prompt_instructions(self):
+        schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+
+        assert AIService._should_inject_json_prompt("openrouter", "mistralai/mistral-large", True, schema) is True
 
     def test_skips_prompt_instructions_for_openai_responses_models_with_effective_schema(self):
         assert AIService._should_inject_json_prompt("openai", "o3-pro", True, None) is False
@@ -31,7 +35,9 @@ class TestJsonPromptGate:
 
     def test_keeps_prompt_instructions_for_json_mode_without_native_schema(self):
         assert AIService._should_inject_json_prompt("openai", "gpt-4o", True, None) is True
-        assert AIService._should_inject_json_prompt("ollama", "llama3.1", True, {"type": "object"}) is True
+
+    def test_ollama_native_schema_skips_prompt_instructions(self):
+        assert AIService._should_inject_json_prompt("ollama", "llama3.1", True, {"type": "object"}) is False
 
     def test_distinguishes_effective_schema_from_absent_schema(self):
         assert AIService._uses_native_structured_outputs("openai", "gpt-5-pro", None) is False
@@ -44,7 +50,7 @@ class TestJsonPromptGate:
     def test_audit_supports_structured_outputs_matches_openai_responses_models(self):
         assert AIService._audit_model_supports_structured_outputs("openai", "o3-pro") is True
         assert AIService._audit_model_supports_structured_outputs("openai", "gpt-5-pro") is True
-        assert AIService._audit_model_supports_structured_outputs("openrouter", "mistralai/mistral-large") is True
+        assert AIService._audit_model_supports_structured_outputs("openrouter", "mistralai/mistral-large") is False
         assert AIService._audit_model_supports_structured_outputs("xai", "grok-2-1212") is True
 
 
