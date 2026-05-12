@@ -3230,12 +3230,28 @@ def _get_evaluated_layers_for_approval(
 def _clone_request_for_final_verification(request: ContentRequest) -> ContentRequest:
     """Create a transient request clone that forces read-only QA evaluation."""
 
-    cloned_request = request.model_copy(deep=True)
+    values = {name: getattr(request, name) for name in ContentRequest.model_fields}
+    values["smart_editing_mode"] = "never"
+    fields_set = set(getattr(request, "model_fields_set", set()))
+    fields_set.add("smart_editing_mode")
+
+    # Do not use model_copy here. The live request carries runtime-only objects
+    # such as CancellationToken -> CancellationRegistry -> asyncio.Task sets.
+    # Some Pydantic/runtime combinations can still traverse that graph while
+    # copying, which breaks final verification after QA has already passed.
+    cloned_request = ContentRequest.model_construct(
+        _fields_set=fields_set,
+        **values,
+    )
+    cloned_request._current_iteration = getattr(request, "_current_iteration", None)
+    cloned_request._total_iterations = getattr(request, "_total_iterations", None)
     cloned_request.smart_editing_mode = "never"
     cloned_request._generation_mode = "final_verification"
     cloned_request._smart_edit_metadata = None
-    if hasattr(request, "_model_alias_registry"):
-        cloned_request._model_alias_registry = getattr(request, "_model_alias_registry", None)
+    cloned_request._resolved_long_text_mode = getattr(request, "_resolved_long_text_mode", None)
+    for runtime_attr in ("_model_alias_registry", "_cancellation_token"):
+        if hasattr(request, runtime_attr):
+            setattr(cloned_request, runtime_attr, getattr(request, runtime_attr, None))
     return cloned_request
 
 
@@ -4343,12 +4359,41 @@ async def process_content_generation(
         # Update request with adjusted tokens
         request.max_tokens = token_validation["adjusted_tokens"]
 
+        token_floor_adjustment = config.apply_external_generation_min_tokens(
+            request.generator_model,
+            request.max_tokens,
+            getattr(request, 'reasoning_effort', None),
+            getattr(request, 'thinking_budget_tokens', None),
+        )
+        if token_floor_adjustment.get("was_adjusted"):
+            request.max_tokens = token_floor_adjustment["adjusted_tokens"]
+            request._external_generation_min_tokens_adjustment = token_floor_adjustment
+            logger.info(
+                "Raised percentage-based external generation max_tokens for %s: %s -> %s "
+                "(floor=%s, source=%s, safe_limit=%s)",
+                request.generator_model,
+                token_floor_adjustment.get("original_tokens"),
+                token_floor_adjustment.get("adjusted_tokens"),
+                token_floor_adjustment.get("min_tokens"),
+                token_floor_adjustment.get("source"),
+                token_floor_adjustment.get("safe_limit"),
+            )
+
         # Log the percentage-based adjustment if verbose
         if request.verbose:
             await add_verbose_log(
                 session_id,
                 f"💡 Using {request.max_tokens_percentage}% of model's maximum: {request.max_tokens} tokens"
             )
+            if token_floor_adjustment.get("was_adjusted"):
+                await add_verbose_log(
+                    session_id,
+                    (
+                        "External generation token floor applied: "
+                        f"{token_floor_adjustment.get('original_tokens')} -> "
+                        f"{token_floor_adjustment.get('adjusted_tokens')} tokens"
+                    ),
+                )
 
     resolved_context = resolved_attachments or []
     manager = attachment_manager or (get_attachment_manager() if resolved_context else None)

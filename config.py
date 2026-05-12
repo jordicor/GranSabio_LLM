@@ -1538,6 +1538,323 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         )
         return state.supported
 
+    @staticmethod
+    def _parse_bool_config_value(value: Any, default: bool = False) -> bool:
+        """Parse a boolean from JSON/env configuration values."""
+
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        normalized = str(value).strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        return default
+
+    @staticmethod
+    def _parse_positive_int_config_value(value: Any) -> Optional[int]:
+        """Parse a positive integer from JSON/env configuration values."""
+
+        if value is None or value == "":
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _parse_model_min_tokens_config(
+        self,
+        value: Any,
+        *,
+        fallback_tokens: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Parse per-model min token overrides from JSON objects/lists or env strings."""
+
+        model_mins: Dict[str, int] = {}
+
+        def add_entry(name: Any, tokens_value: Any = None) -> None:
+            model_name = str(name or "").strip()
+            if not model_name:
+                return
+            parsed_tokens = self._parse_positive_int_config_value(tokens_value)
+            if parsed_tokens is None:
+                parsed_tokens = fallback_tokens
+            if parsed_tokens is None:
+                return
+            model_mins[model_name] = parsed_tokens
+
+        if isinstance(value, dict):
+            for model_name, tokens_value in value.items():
+                add_entry(model_name, tokens_value)
+            return model_mins
+
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    model_name = item.get("model") or item.get("name") or item.get("model_id")
+                    tokens_value = (
+                        item.get("min_tokens")
+                        or item.get("min")
+                        or item.get("value")
+                        or item.get("tokens")
+                    )
+                    add_entry(model_name, tokens_value)
+                else:
+                    add_entry(item)
+            return model_mins
+
+        if isinstance(value, str):
+            raw_value = value.strip()
+            if not raw_value:
+                return model_mins
+            if raw_value.startswith("{") or raw_value.startswith("["):
+                try:
+                    parsed_json = json.loads(raw_value)
+                except Exception:
+                    parsed_json = None
+                if parsed_json is not None:
+                    return self._parse_model_min_tokens_config(
+                        parsed_json,
+                        fallback_tokens=fallback_tokens,
+                    )
+
+            for item in raw_value.split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                separator = ":" if ":" in item else "=" if "=" in item else None
+                if separator:
+                    model_name, tokens_value = item.rsplit(separator, 1)
+                    add_entry(model_name, tokens_value)
+                else:
+                    add_entry(item)
+
+        return model_mins
+
+    @staticmethod
+    def _first_present_env(*names: str) -> Optional[str]:
+        """Return the first environment variable that is present, even if empty."""
+
+        for name in names:
+            if name in os.environ:
+                return os.environ.get(name)
+        return None
+
+    def resolve_external_generation_min_tokens(self, model_name: str) -> Dict[str, Any]:
+        """
+        Resolve the configured minimum output budget for public /generate calls.
+
+        This policy is intentionally separate from generic token validation so
+        internal low-token calls such as health checks and logprob scoring keep
+        their explicit budgets.
+        """
+
+        token_validation = self.model_specs.get("token_validation", {}) or {}
+        policy = (
+            token_validation.get("external_generation_min_tokens")
+            or token_validation.get("minimum_external_generation_max_tokens")
+            or {}
+        )
+        if not isinstance(policy, dict):
+            policy = {}
+
+        enabled = self._parse_bool_config_value(policy.get("enabled"), default=False)
+        default_min_tokens = self._parse_positive_int_config_value(
+            policy.get("default_min_tokens")
+            or policy.get("default")
+            or policy.get("global_min_tokens")
+            or policy.get("value")
+        )
+        reasoning_min_tokens = self._parse_positive_int_config_value(
+            policy.get("reasoning_min_tokens") or policy.get("reasoning_default")
+        )
+        apply_to_all = self._parse_bool_config_value(
+            policy.get("apply_to_all_models") or policy.get("global"),
+            default=False,
+        )
+        if apply_to_all and default_min_tokens is None:
+            default_min_tokens = self._parse_positive_int_config_value(
+                policy.get("global_min_tokens") or policy.get("value")
+            )
+
+        model_min_tokens = self._parse_model_min_tokens_config(
+            policy.get("models"),
+            fallback_tokens=default_min_tokens or reasoning_min_tokens,
+        )
+
+        enabled_env = self._first_present_env("EXTERNAL_GENERATION_MIN_TOKENS_ENABLED")
+        if enabled_env is not None:
+            enabled = self._parse_bool_config_value(enabled_env, default=enabled)
+
+        apply_all_env = self._first_present_env("EXTERNAL_GENERATION_MIN_TOKENS_APPLY_TO_ALL")
+        if apply_all_env is not None:
+            apply_to_all = self._parse_bool_config_value(apply_all_env, default=apply_to_all)
+
+        default_env = self._first_present_env(
+            "EXTERNAL_GENERATION_MIN_TOKENS_DEFAULT",
+            "EXTERNAL_GENERATION_MIN_TOKENS_VALUE",
+        )
+        if default_env is not None:
+            default_min_tokens = self._parse_positive_int_config_value(default_env)
+
+        reasoning_env = self._first_present_env(
+            "EXTERNAL_GENERATION_MIN_TOKENS_REASONING",
+            "EXTERNAL_GENERATION_REASONING_MIN_TOKENS",
+        )
+        if reasoning_env is not None:
+            reasoning_min_tokens = self._parse_positive_int_config_value(reasoning_env)
+
+        if apply_to_all and default_min_tokens is None:
+            default_min_tokens = reasoning_min_tokens
+
+        models_env = self._first_present_env("EXTERNAL_GENERATION_MIN_TOKENS_MODELS")
+        if models_env is not None:
+            model_min_tokens = self._parse_model_min_tokens_config(
+                models_env,
+                fallback_tokens=default_min_tokens or reasoning_min_tokens,
+            )
+
+        if not enabled:
+            return {"enabled": False, "min_tokens": None, "source": "disabled"}
+
+        resolved = resolve_model_catalog_entry(model_name, self.model_specs)
+        if not resolved.get("matched") or not resolved.get("enabled"):
+            return {"enabled": True, "min_tokens": None, "source": "unknown_model"}
+        model_data = resolved.get("model_data") or {}
+        capabilities = {
+            cap.lower() for cap in (model_data.get("capabilities", []) or []) if isinstance(cap, str)
+        }
+
+        raw_model_name = str(model_name or "").strip()
+        lookup_name = _strip_model_prefix(raw_model_name)
+        base_model, _suffix = _split_model_suffix(lookup_name)
+        aliases = self.model_specs.get("aliases", {}) or {}
+        candidates: List[str] = []
+        for candidate in (
+            raw_model_name,
+            lookup_name,
+            base_model,
+            aliases.get(raw_model_name),
+            aliases.get(lookup_name),
+            aliases.get(base_model),
+            resolved.get("model_key"),
+            resolved.get("catalog_model_id"),
+            resolved.get("model_id"),
+        ):
+            if candidate and str(candidate) not in candidates:
+                candidates.append(str(candidate))
+
+        model_min_lookup = {name.lower(): tokens for name, tokens in model_min_tokens.items()}
+        for candidate in candidates:
+            candidate_key = candidate.lower()
+            if candidate_key in model_min_lookup:
+                return {
+                    "enabled": True,
+                    "min_tokens": model_min_lookup[candidate_key],
+                    "source": "model",
+                    "matched_model": candidate,
+                }
+
+        if "reasoning" in capabilities and reasoning_min_tokens is not None:
+            return {
+                "enabled": True,
+                "min_tokens": reasoning_min_tokens,
+                "source": "reasoning",
+                "matched_model": resolved.get("model_key") or raw_model_name,
+            }
+
+        if default_min_tokens is not None:
+            return {
+                "enabled": True,
+                "min_tokens": default_min_tokens,
+                "source": "default",
+                "matched_model": resolved.get("model_key") or raw_model_name,
+            }
+
+        return {"enabled": True, "min_tokens": None, "source": "no_match"}
+
+    def apply_external_generation_min_tokens(
+        self,
+        model_name: str,
+        max_tokens: Optional[int],
+        reasoning_effort: Optional[str] = None,
+        thinking_budget_tokens: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Raise a public generation token budget to the configured floor if needed.
+
+        The returned payload is informational; callers decide whether to write
+        the adjusted value back to a request object.
+        """
+
+        try:
+            requested_tokens = int(max_tokens) if max_tokens is not None else None
+        except (TypeError, ValueError):
+            requested_tokens = None
+
+        policy = self.resolve_external_generation_min_tokens(model_name)
+        if requested_tokens is None or requested_tokens <= 0:
+            return {
+                **policy,
+                "was_adjusted": False,
+                "original_tokens": max_tokens,
+                "adjusted_tokens": max_tokens,
+                "reason": "missing_or_invalid_request",
+            }
+
+        min_tokens = self._parse_positive_int_config_value(policy.get("min_tokens"))
+        if not policy.get("enabled") or min_tokens is None:
+            return {
+                **policy,
+                "was_adjusted": False,
+                "original_tokens": requested_tokens,
+                "adjusted_tokens": requested_tokens,
+                "reason": policy.get("source", "disabled"),
+            }
+
+        if requested_tokens >= min_tokens:
+            return {
+                **policy,
+                "was_adjusted": False,
+                "original_tokens": requested_tokens,
+                "adjusted_tokens": requested_tokens,
+                "reason": "already_above_floor",
+            }
+
+        resolved = resolve_model_catalog_entry(model_name, self.model_specs)
+        model_data = resolved.get("model_data") or {}
+        max_output_tokens = self._parse_positive_int_config_value(model_data.get("output_tokens")) or 8192
+        safety_margin = self.model_specs.get("token_validation", {}).get("safety_margin", 0.95)
+        try:
+            safe_limit = int(max_output_tokens * float(safety_margin))
+        except (TypeError, ValueError):
+            safe_limit = int(max_output_tokens * 0.95)
+        adjusted_tokens = min(min_tokens, safe_limit)
+        if adjusted_tokens <= requested_tokens:
+            return {
+                **policy,
+                "was_adjusted": False,
+                "original_tokens": requested_tokens,
+                "adjusted_tokens": requested_tokens,
+                "min_tokens": min_tokens,
+                "safe_limit": safe_limit,
+                "reason": "floor_not_above_request_after_cap",
+            }
+
+        return {
+            **policy,
+            "was_adjusted": True,
+            "original_tokens": requested_tokens,
+            "adjusted_tokens": adjusted_tokens,
+            "min_tokens": min_tokens,
+            "safe_limit": safe_limit,
+            "model_limit": max_output_tokens,
+            "reason": "raised_to_external_generation_floor",
+        }
+
     def validate_api_keys(self) -> Dict[str, bool]:
         """Validate that required API keys are present (no fallbacks)."""
         return {

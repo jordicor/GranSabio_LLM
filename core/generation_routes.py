@@ -222,6 +222,33 @@ def _model_default_max_tokens(model_name: str) -> int:
     return tokens if tokens > 0 else DEFAULT_MODEL_MAX_TOKENS_FALLBACK
 
 
+def _apply_external_generation_min_tokens(request: ContentRequest) -> Optional[Dict[str, Any]]:
+    """Apply the public-generation min token floor to a request, if configured."""
+
+    adjustment = config.apply_external_generation_min_tokens(
+        request.generator_model,
+        request.max_tokens,
+        getattr(request, "reasoning_effort", None),
+        getattr(request, "thinking_budget_tokens", None),
+    )
+    if not adjustment.get("was_adjusted"):
+        return None
+
+    request.max_tokens = int(adjustment["adjusted_tokens"])
+    request._external_generation_min_tokens_adjustment = adjustment
+    logger.info(
+        "Raised external generation max_tokens for %s: %s -> %s "
+        "(floor=%s, source=%s, safe_limit=%s)",
+        request.generator_model,
+        adjustment.get("original_tokens"),
+        adjustment.get("adjusted_tokens"),
+        adjustment.get("min_tokens"),
+        adjustment.get("source"),
+        adjustment.get("safe_limit"),
+    )
+    return adjustment
+
+
 def _build_advisory(*, code: str, message: str, severity: str = "warning") -> PreflightIssue:
     """Create a non-blocking accepted-path advisory."""
 
@@ -775,6 +802,22 @@ async def generate_content(request: ContentRequest):
                 request.max_words,
             )
             request.max_tokens = estimated_budget
+
+    if request.max_tokens_percentage is None:
+        token_floor_adjustment = _apply_external_generation_min_tokens(request)
+        if token_floor_adjustment:
+            long_text_advisories.append(
+                _build_advisory(
+                    code="external_generation_min_tokens_applied",
+                    message=(
+                        f"max_tokens was raised from {token_floor_adjustment.get('original_tokens')} "
+                        f"to {token_floor_adjustment.get('adjusted_tokens')} for "
+                        f"{request.generator_model} because the configured external generation "
+                        "minimum is higher than the requested budget."
+                    ),
+                    severity="info",
+                )
+            )
 
     json_output_requested = is_json_output_requested(request)
 

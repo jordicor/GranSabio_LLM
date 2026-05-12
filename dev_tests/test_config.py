@@ -539,6 +539,104 @@ class TestModelSpecsLoading:
             token_val = cfg.model_specs.get("token_validation", {})
             assert token_val.get("safety_margin") == 0.95
 
+    def test_resolves_external_generation_reasoning_floor(self, minimal_model_specs):
+        """Given: reasoning floor policy, Then: reasoning models get the floor."""
+        import json_utils as json
+
+        specs = json.loads(json.dumps(minimal_model_specs))
+        specs["model_specifications"]["openai"]["gpt-5.5"] = {
+            "model_id": "gpt-5.5",
+            "name": "GPT-5.5",
+            "description": "Reasoning test model",
+            "input_tokens": 272000,
+            "output_tokens": 128000,
+            "context_window": 400000,
+            "capabilities": ["text", "reasoning"],
+            "pricing": {"input_per_million": 1.0, "output_per_million": 10.0},
+        }
+        specs["token_validation"]["external_generation_min_tokens"] = {
+            "enabled": True,
+            "default_min_tokens": None,
+            "reasoning_min_tokens": 4096,
+            "models": {},
+        }
+        specs_json = json.dumps(specs)
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("builtins.open", mock_open(read_data=specs_json)):
+                from config import Config
+                cfg = Config()
+                result = cfg.resolve_external_generation_min_tokens("gpt-5.5")
+                adjustment = cfg.apply_external_generation_min_tokens("gpt-5.5", 200)
+
+        assert result["enabled"] is True
+        assert result["min_tokens"] == 4096
+        assert result["source"] == "reasoning"
+        assert adjustment["was_adjusted"] is True
+        assert adjustment["adjusted_tokens"] == 4096
+
+    def test_external_generation_model_floor_overrides_reasoning_default(self, minimal_model_specs):
+        """Given: per-model floor policy, Then: exact model value wins."""
+        import json_utils as json
+
+        specs = json.loads(json.dumps(minimal_model_specs))
+        specs["model_specifications"]["openai"]["gpt-5.5"] = {
+            "model_id": "gpt-5.5",
+            "name": "GPT-5.5",
+            "description": "Reasoning test model",
+            "input_tokens": 272000,
+            "output_tokens": 128000,
+            "context_window": 400000,
+            "capabilities": ["text", "reasoning"],
+            "pricing": {"input_per_million": 1.0, "output_per_million": 10.0},
+        }
+        specs["token_validation"]["external_generation_min_tokens"] = {
+            "enabled": True,
+            "default_min_tokens": None,
+            "reasoning_min_tokens": 4096,
+            "models": {"gpt-5.5": 8192},
+        }
+        specs_json = json.dumps(specs)
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("builtins.open", mock_open(read_data=specs_json)):
+                from config import Config
+                cfg = Config()
+                result = cfg.resolve_external_generation_min_tokens("gpt-5.5")
+
+        assert result["min_tokens"] == 8192
+        assert result["source"] == "model"
+
+    def test_external_generation_env_models_override_specs(self, minimal_model_specs):
+        """Given: env model floor, Then: env takes precedence over specs."""
+        import json_utils as json
+
+        specs = json.loads(json.dumps(minimal_model_specs))
+        specs["token_validation"]["external_generation_min_tokens"] = {
+            "enabled": False,
+            "default_min_tokens": None,
+            "reasoning_min_tokens": None,
+            "models": {},
+        }
+        specs_json = json.dumps(specs)
+
+        with patch.dict(
+            os.environ,
+            {
+                "EXTERNAL_GENERATION_MIN_TOKENS_ENABLED": "true",
+                "EXTERNAL_GENERATION_MIN_TOKENS_MODELS": "gpt-4o:2048",
+            },
+            clear=True,
+        ):
+            with patch("builtins.open", mock_open(read_data=specs_json)):
+                from config import Config
+                cfg = Config()
+                result = cfg.resolve_external_generation_min_tokens("gpt-4o")
+
+        assert result["enabled"] is True
+        assert result["min_tokens"] == 2048
+        assert result["source"] == "model"
+
     def test_setup_legacy_models_openai(self, minimal_model_specs):
         """Given: OpenAI models in specs, Then: OPENAI_MODELS populated"""
         import json_utils as json

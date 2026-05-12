@@ -2,7 +2,11 @@
 
 from types import SimpleNamespace
 
-from core.generation_routes import _estimate_tokens_for_word_target, _model_default_max_tokens
+from core.generation_routes import (
+    _apply_external_generation_min_tokens,
+    _estimate_tokens_for_word_target,
+    _model_default_max_tokens,
+)
 from models import ContentRequest
 
 
@@ -57,3 +61,57 @@ class TestModelDefaultMaxTokens:
         monkeypatch.setattr("core.generation_routes.config", fake_config)
 
         assert _model_default_max_tokens("unknown-output-model") == 8192
+
+
+class TestExternalGenerationMinTokens:
+    """Tests for request-level external generation token floors."""
+
+    def test_applies_configured_floor_to_request(self, monkeypatch):
+        request = ContentRequest(
+            prompt="Write a substantial analysis.",
+            generator_model="gpt-5.5",
+            max_tokens=200,
+            qa_layers=[],
+            qa_models=[],
+        )
+        fake_config = SimpleNamespace(
+            apply_external_generation_min_tokens=lambda *_args: {
+                "was_adjusted": True,
+                "original_tokens": 200,
+                "adjusted_tokens": 4096,
+                "min_tokens": 4096,
+                "source": "reasoning",
+                "safe_limit": 121600,
+            }
+        )
+        monkeypatch.setattr("core.generation_routes.config", fake_config)
+
+        adjustment = _apply_external_generation_min_tokens(request)
+
+        assert adjustment["was_adjusted"] is True
+        assert request.max_tokens == 4096
+        assert request._external_generation_min_tokens_adjustment["source"] == "reasoning"
+
+    def test_leaves_request_unchanged_when_policy_does_not_adjust(self, monkeypatch):
+        request = ContentRequest(
+            prompt="Write a short answer.",
+            generator_model="gpt-4o-mini",
+            max_tokens=200,
+            qa_layers=[],
+            qa_models=[],
+        )
+        fake_config = SimpleNamespace(
+            apply_external_generation_min_tokens=lambda *_args: {
+                "was_adjusted": False,
+                "original_tokens": 200,
+                "adjusted_tokens": 200,
+                "source": "disabled",
+            }
+        )
+        monkeypatch.setattr("core.generation_routes.config", fake_config)
+
+        adjustment = _apply_external_generation_min_tokens(request)
+
+        assert adjustment is None
+        assert request.max_tokens == 200
+        assert not hasattr(request, "_external_generation_min_tokens_adjustment")

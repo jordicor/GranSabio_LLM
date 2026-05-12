@@ -1,5 +1,9 @@
 """Tests for QA final verification request configuration and trigger logic."""
 
+import asyncio
+
+import pytest
+
 from core.generation_processor import (
     _clone_request_for_final_verification,
     _resolve_final_verification_trigger,
@@ -86,12 +90,46 @@ def test_final_verification_trigger_always_requires_qa_contract():
 def test_final_verification_request_clone_forces_read_only_qa():
     request = ContentRequest(
         prompt="Write a test article about QA final verification.",
+        model="gpt-4o-mini",
         smart_editing_mode="always",
+        text_field_path="chapter.body",
+        text_field_only=True,
     )
+    alias_registry = object()
+    request._current_iteration = 3
+    request._total_iterations = 5
+    request._generation_mode = "smart_edit"
+    request._smart_edit_metadata = {"runtime_task": object()}
+    request._resolved_long_text_mode = {"enabled": True, "mode": "chaptered"}
+    request._model_alias_registry = alias_registry
 
     cloned = _clone_request_for_final_verification(request)
 
     assert request.smart_editing_mode == "always"
     assert cloned.smart_editing_mode == "never"
+    assert cloned.generator_model == "gpt-4o-mini"
+    assert cloned.target_field == "chapter.body"
+    assert cloned.target_field_only is True
+    assert cloned._current_iteration == 3
+    assert cloned._total_iterations == 5
     assert cloned._generation_mode == "final_verification"
+    assert cloned._smart_edit_metadata is None
+    assert cloned._resolved_long_text_mode == {"enabled": True, "mode": "chaptered"}
+    assert cloned._model_alias_registry is alias_registry
+
+
+@pytest.mark.asyncio
+async def test_final_verification_request_clone_keeps_runtime_task_without_deepcopy():
+    request = ContentRequest(prompt="Write a test article about QA final verification.")
+    runtime_task = asyncio.create_task(asyncio.sleep(0))
+    request._cancellation_token = runtime_task
+    request._smart_edit_metadata = {"runtime_task": runtime_task}
+
+    try:
+        cloned = _clone_request_for_final_verification(request)
+    finally:
+        await runtime_task
+
+    assert cloned._cancellation_token is runtime_task
+    assert cloned.smart_editing_mode == "never"
     assert cloned._smart_edit_metadata is None

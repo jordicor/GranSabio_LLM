@@ -66,6 +66,15 @@ def sample_model_specs():
             "gran_sabio": "gpt-4o",
             "arbiter": "gpt-4o",
         },
+        "token_validation": {
+            "safety_margin": 0.95,
+            "external_generation_min_tokens": {
+                "enabled": True,
+                "default_min_tokens": None,
+                "reasoning_min_tokens": 4096,
+                "models": {"gpt-4o": 2048},
+            },
+        },
     }
 
 
@@ -130,6 +139,12 @@ def test_sync_provider_reloads_config_and_creates_backup(service):
     updated = json.loads(service.specs_path.read_text(encoding="utf-8"))
     assert "openrouter" in updated["model_specifications"]
     assert "meta-llama/llama-4-scout" in updated["model_specifications"]["openrouter"]
+    assert updated["token_validation"]["external_generation_min_tokens"] == {
+        "enabled": True,
+        "default_min_tokens": None,
+        "reasoning_min_tokens": 4096,
+        "models": {"gpt-4o": 2048},
+    }
 
 
 def test_sync_provider_blocks_invalid_default_references(service):

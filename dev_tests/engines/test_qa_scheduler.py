@@ -237,6 +237,60 @@ async def test_timeout_retries_then_skips_if_quorum_remains():
 
 
 @pytest.mark.asyncio
+async def test_parse_error_retries_before_marking_technical_failure():
+    attempts = {}
+
+    async def evaluate(slot, attempt):
+        attempts[slot.model_name] = attempts.get(slot.model_name, 0) + 1
+        if slot.index == 0 and attempt == 1:
+            raise QASchedulerTechnicalFailure(
+                "parse_error",
+                "invalid QA JSON",
+                retryable=True,
+            )
+        return _eval(slot)
+
+    scheduler = QAScheduler(QASchedulerPolicy(on_model_unavailable="skip_if_quorum"))
+    result = await scheduler.evaluate_layer(
+        layer_name="Style",
+        has_deal_breaker_criteria=False,
+        slots=_slots(3),
+        evaluate_slot=evaluate,
+    )
+
+    assert attempts["model-0"] == 2
+    assert result.counts["technical_failed"] == 0
+    assert result.counts["valid"] == 3
+
+
+@pytest.mark.asyncio
+async def test_parse_error_skips_after_retry_when_quorum_remains():
+    attempts = {}
+
+    async def evaluate(slot, attempt):
+        attempts[slot.model_name] = attempts.get(slot.model_name, 0) + 1
+        if slot.index == 0:
+            raise QASchedulerTechnicalFailure(
+                "parse_error",
+                "invalid QA JSON",
+                retryable=True,
+            )
+        return _eval(slot)
+
+    scheduler = QAScheduler(QASchedulerPolicy(on_model_unavailable="skip_if_quorum"))
+    result = await scheduler.evaluate_layer(
+        layer_name="Style",
+        has_deal_breaker_criteria=False,
+        slots=_slots(3),
+        evaluate_slot=evaluate,
+    )
+
+    assert attempts["model-0"] == 2
+    assert result.counts["technical_failed"] == 1
+    assert result.counts["valid"] == 2
+
+
+@pytest.mark.asyncio
 async def test_technical_failure_placeholder_carries_normalized_debug_metadata():
     upstream_error = RuntimeError("provider rejected request")
 

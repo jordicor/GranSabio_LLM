@@ -578,6 +578,37 @@ class TestPrepareStructuredOutputSchema:
             and "type" in edit_strategy
         )
 
+    def test_claude_schema_sets_additional_properties_false(self):
+        """
+        Given: A Claude structured-output schema with nested object properties
+        When: Preparing schema for Anthropic output_format
+        Then: Object schemas declare additionalProperties: false before the provider call
+        """
+        schema = {
+            "type": "object",
+            "properties": {
+                "decision": {"type": "string"},
+                "notes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                    },
+                },
+            },
+            "required": ["decision"],
+        }
+
+        result = AIService._prepare_structured_output_schema(
+            "claude",
+            "claude-opus-4-6",
+            schema,
+        )
+
+        assert result["additionalProperties"] is False
+        note_ref = result["properties"]["notes"]["items"]["$ref"].rsplit("/", 1)[-1]
+        assert result["$defs"][note_ref]["additionalProperties"] is False
+
     @pytest.mark.parametrize(
         ("provider", "model_id"),
         [
@@ -586,19 +617,35 @@ class TestPrepareStructuredOutputSchema:
             ("openrouter", "openai/gpt-4o-mini"),
         ],
     )
-    def test_openai_compatible_schemas_are_left_unchanged(self, provider, model_id):
-        """OpenAI-compatible providers use the schema shape as supplied."""
+    def test_openai_compatible_schemas_are_normalized_for_strict_mode(self, provider, model_id):
+        """OpenAI-compatible providers receive strict structured-output schemas."""
         schema = {
             "type": "object",
-            "properties": {"decision": {"type": "string"}},
+            "properties": {
+                "decision": {"type": "string"},
+                "notes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                    },
+                },
+            },
             "required": ["decision"],
         }
 
-        assert AIService._prepare_structured_output_schema(
+        result = AIService._prepare_structured_output_schema(
             provider,
             model_id,
             schema,
-        ) is schema
+        )
+
+        assert result is not schema
+        assert result["additionalProperties"] is False
+        assert result["required"] == ["decision", "notes"]
+        note_schema = result["properties"]["notes"]["items"]
+        assert note_schema["additionalProperties"] is False
+        assert note_schema["required"] == ["text"]
 
 
 class TestValidateSchemaForStructuredOutputs:
@@ -651,10 +698,39 @@ class TestValidateSchemaForStructuredOutputs:
         schema = {
             "type": "object",
             "properties": {"name": {"type": "string"}},
+            "required": ["name"],
             "additionalProperties": False
         }
         # Should not raise
         AIService._validate_schema_for_structured_outputs(schema, "openai", "gpt-4o")
+
+    def test_raises_on_missing_additional_properties_false_for_openai(self):
+        """
+        Given: Object schema missing additionalProperties: false for OpenAI
+        When: _validate_schema_for_structured_outputs() is called
+        Then: Raises a local ValueError before the provider rejects the request
+        """
+        schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        }
+        with pytest.raises(ValueError, match="additionalProperties: false"):
+            AIService._validate_schema_for_structured_outputs(schema, "openai", "gpt-4o")
+
+    def test_raises_on_missing_required_property_for_openai(self):
+        """
+        Given: Object schema with a property omitted from required for OpenAI
+        When: _validate_schema_for_structured_outputs() is called
+        Then: Raises a local ValueError before the provider rejects the request
+        """
+        schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "additionalProperties": False,
+        }
+        with pytest.raises(ValueError, match="every property"):
+            AIService._validate_schema_for_structured_outputs(schema, "openai", "gpt-4o")
 
     def test_passes_valid_schema_for_claude(self):
         """
@@ -683,7 +759,9 @@ class TestValidateSchemaForStructuredOutputs:
                     "properties": {"name": {"type": "string"}},
                     "additionalProperties": True
                 }
-            }
+            },
+            "required": ["user"],
+            "additionalProperties": False,
         }
         with pytest.raises(ValueError, match="do not allow 'additionalProperties: true'"):
             AIService._validate_schema_for_structured_outputs(schema, "openai", "gpt-4o")
@@ -813,6 +891,93 @@ class TestSupportsClaudeThinking:
         Then: Returns False
         """
         assert AIService._supports_claude_thinking(None) is False
+
+
+class TestOpenRouterTemperatureParams:
+    """Tests for OpenRouter model-specific temperature compatibility."""
+
+    def test_claude_opus_47_omits_temperature(self):
+        assert AIService._openrouter_accepts_temperature("anthropic/claude-opus-4.7") is False
+
+    def test_claude_opus_47_thinking_alias_omits_temperature(self):
+        assert AIService._openrouter_accepts_temperature("anthropic/claude-opus-4.7:thinking") is False
+
+    def test_claude_sonnet_46_omits_temperature(self):
+        assert AIService._openrouter_accepts_temperature("anthropic/claude-sonnet-4.6") is False
+
+    def test_other_openrouter_models_keep_temperature(self):
+        assert AIService._openrouter_accepts_temperature("google/gemini-3.1-pro-preview") is True
+        assert AIService._openrouter_accepts_temperature("x-ai/grok-4-fast") is True
+
+    @pytest.mark.asyncio
+    async def test_generate_openrouter_does_not_send_temperature_for_opus_47(self, ai_service_instance):
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+                usage=None,
+            )
+        )
+        ai_service_instance.openrouter_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        content, _usage = await ai_service_instance._generate_openrouter(
+            prompt="Hello",
+            model_id="anthropic/claude-opus-4.7",
+            temperature=0.4,
+            max_tokens=64,
+            system_prompt="System",
+        )
+
+        assert content == "ok"
+        request_kwargs = create.await_args.kwargs
+        assert request_kwargs["model"] == "anthropic/claude-opus-4.7"
+        assert request_kwargs["max_tokens"] == 64
+        assert "temperature" not in request_kwargs
+
+
+class TestClaudeStructuredOutputsParams:
+    """Tests Anthropic SDK structured-output parameter wiring."""
+
+    @pytest.mark.asyncio
+    async def test_generate_claude_uses_output_format_not_output_config(self, ai_service_instance):
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                content=[SimpleNamespace(type="text", text='{"ok": true}')],
+                usage=None,
+                stop_reason="end_turn",
+            )
+        )
+        ai_service_instance.anthropic_client = SimpleNamespace(
+            beta=SimpleNamespace(messages=SimpleNamespace(create=create)),
+            messages=SimpleNamespace(create=AsyncMock()),
+        )
+
+        content, _usage = await ai_service_instance._generate_claude(
+            prompt="Return JSON",
+            model_id="claude-opus-4-6",
+            temperature=0.7,
+            max_tokens=128,
+            system_prompt="System",
+            json_output=True,
+            json_schema={
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+            },
+        )
+
+        assert content == '{"ok": true}'
+        request_kwargs = create.await_args.kwargs
+        assert request_kwargs["output_format"] == {
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+            },
+        }
+        assert "output_config" not in request_kwargs
 
 
 class TestInjectClaudeThinkingParams:
@@ -1273,7 +1438,7 @@ class TestExecuteWithRetries:
 
         class ProviderBadRequest(Exception):
             status_code = 400
-            body = {"error": {"code": "invalid_parameter", "param": "output_config"}}
+            body = {"error": {"code": "invalid_parameter", "param": "output_format"}}
 
         ai_service_instance._max_retry_attempts = lambda: 1
 
@@ -1286,13 +1451,13 @@ class TestExecuteWithRetries:
                 provider="anthropic",
                 model_id="claude-sonnet-4-20250514",
                 action="generation",
-                attempted_feature="output_config.format",
+                attempted_feature="output_format",
             )
 
         failure = exc_info.value.provider_failure
         assert failure.kind.value == "unsupported_parameter"
         assert failure.downgradable is True
-        assert failure.attempted_feature == "output_config.format"
+        assert failure.attempted_feature == "output_format"
 
     def test_attempted_output_feature_skips_unsent_openrouter_json_object(self, mock_config):
         mock_config.model_specs = {

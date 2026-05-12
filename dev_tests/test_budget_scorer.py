@@ -289,6 +289,25 @@ class TestExtractYesProbability:
         result = extract_yes_probability(logprobs_content)
         assert abs(result - 0.75) < 0.01
 
+    def test_duplicate_normalized_yes_tokens_keep_highest_probability(self):
+        """
+        Given: Multiple top-logprob tokens normalize to YES
+        When: extract_yes_probability is called
+        Then: Uses the highest-probability YES token
+        """
+        logprobs_content = [
+            {
+                "token": "YES",
+                "logprob": math.log(0.90),
+                "top_logprobs": [
+                    {"token": "YES", "logprob": math.log(0.90)},
+                    {"token": " YES", "logprob": math.log(0.01)},
+                ]
+            }
+        ]
+        result = extract_yes_probability(logprobs_content)
+        assert abs(result - 0.90) < 0.01
+
 
 # =============================================================================
 # Tests for normalize_yes_no_unsure
@@ -328,6 +347,29 @@ class TestNormalizeYesNoUnsure:
         assert abs(p_yes - 0.33) < 0.02
         assert abs(p_no - 0.33) < 0.02
         assert abs(p_unsure - 0.34) < 0.02
+
+    def test_duplicate_normalized_tokens_keep_highest_probability(self):
+        """
+        Given: Multiple tokens normalize to the same answer
+        When: normalize_yes_no_unsure is called
+        Then: Normalization uses the strongest token for each answer
+        """
+        logprobs_content = [
+            {
+                "token": "YES",
+                "logprob": math.log(0.90),
+                "top_logprobs": [
+                    {"token": "YES", "logprob": math.log(0.90)},
+                    {"token": " YES", "logprob": math.log(0.01)},
+                    {"token": "NO", "logprob": math.log(0.09)},
+                    {"token": "UNSURE", "logprob": math.log(0.01)},
+                ]
+            }
+        ]
+        p_yes, p_no, p_unsure = normalize_yes_no_unsure(logprobs_content)
+        assert p_yes > 0.85
+        assert p_no < 0.10
+        assert p_unsure < 0.02
 
 
 # =============================================================================

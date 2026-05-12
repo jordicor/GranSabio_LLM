@@ -678,6 +678,82 @@ class AIService:
         return result
 
     @staticmethod
+    def _normalize_openai_strict_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Return a strict JSON Schema copy for OpenAI-compatible structured outputs.
+
+        Chat Completions strict structured output requires every object schema to
+        declare ``additionalProperties: false`` and to list all declared
+        properties as required. This mirrors the provider contract before the
+        request is sent, while still allowing the validator to reject schemas
+        that explicitly ask for ``additionalProperties: true``.
+        """
+        if not isinstance(schema, dict):
+            return schema
+
+        result: Dict[str, Any] = {}
+        properties = schema.get("properties")
+
+        for key, value in schema.items():
+            if key == "properties" and isinstance(value, dict):
+                result[key] = {
+                    prop_name: AIService._normalize_openai_strict_schema(prop_schema)
+                    for prop_name, prop_schema in value.items()
+                }
+            elif key == "items":
+                if isinstance(value, dict):
+                    result[key] = AIService._normalize_openai_strict_schema(value)
+                elif isinstance(value, list):
+                    result[key] = [
+                        AIService._normalize_openai_strict_schema(item)
+                        if isinstance(item, dict)
+                        else item
+                        for item in value
+                    ]
+                else:
+                    result[key] = value
+            elif key in ("allOf", "anyOf", "oneOf") and isinstance(value, list):
+                result[key] = [
+                    AIService._normalize_openai_strict_schema(item)
+                    if isinstance(item, dict)
+                    else item
+                    for item in value
+                ]
+            elif key in ("definitions", "$defs") and isinstance(value, dict):
+                result[key] = {
+                    def_name: AIService._normalize_openai_strict_schema(def_schema)
+                    for def_name, def_schema in value.items()
+                }
+            elif isinstance(value, dict):
+                result[key] = AIService._normalize_openai_strict_schema(value)
+            elif isinstance(value, list):
+                result[key] = [
+                    AIService._normalize_openai_strict_schema(item)
+                    if isinstance(item, dict)
+                    else item
+                    for item in value
+                ]
+            else:
+                result[key] = value
+
+        is_object_schema = (
+            schema.get("type") == "object"
+            or isinstance(properties, dict)
+        )
+        if is_object_schema and result.get("additionalProperties") is not True:
+            result["additionalProperties"] = False
+
+        if isinstance(properties, dict):
+            declared = list(properties.keys())
+            existing_required = [
+                item for item in result.get("required", []) if isinstance(item, str)
+            ]
+            required = list(dict.fromkeys([*existing_required, *declared]))
+            result["required"] = required
+
+        return result
+
+    @staticmethod
     def _prepare_structured_output_schema(
         provider: str,
         model_id: str,
@@ -695,12 +771,16 @@ class AIService:
             effective_schema = AIService._strip_additional_properties(json_schema)
             return AIService._convert_nullable_to_gemini_format(effective_schema)
 
+        if provider_key in {"openai", "openrouter", "xai", "ollama"}:
+            return AIService._normalize_openai_strict_schema(json_schema)
+
         if (
             provider_key in {"claude", "anthropic"}
             and AIService._claude_supports_structured_outputs(model_lower)
         ):
             try:
-                return json_schema_to_pydantic(json_schema).model_json_schema()
+                claude_schema = json_schema_to_pydantic(json_schema).model_json_schema()
+                return AIService._normalize_openai_strict_schema(claude_schema)
             except Exception as exc:  # noqa: BLE001 - normalize schema errors
                 raise ValueError(
                     f"Schema validation error for {model_id}: failed to normalize "
@@ -773,9 +853,32 @@ class AIService:
                         f"do not allow 'additionalProperties: true'. Set it to false or remove it. "
                         "See https://docs.anthropic.com/en/docs/build-with-claude/structured-outputs"
                     )
+                if provider_key in {"openai", "openrouter", "xai", "ollama"}:
+                    is_object_schema = schema_type == "object" or isinstance(
+                        node.get("properties"), dict
+                    )
+                    if is_object_schema and node.get("additionalProperties") is not False:
+                        raise ValueError(
+                            f"Schema validation error at '{path}': strict structured outputs "
+                            f"for {model_id} require 'additionalProperties: false' on every object."
+                        )
 
             properties = node.get("properties")
             if isinstance(properties, dict):
+                if provider_key in {"openai", "openrouter", "xai", "ollama"}:
+                    required = node.get("required")
+                    missing_required = [
+                        prop_name
+                        for prop_name in properties
+                        if not isinstance(required, list) or prop_name not in required
+                    ]
+                    if missing_required:
+                        missing = ", ".join(sorted(missing_required))
+                        raise ValueError(
+                            f"Schema validation error at '{path}': strict structured outputs "
+                            f"for {model_id} require every property to be listed in 'required'. "
+                            f"Missing: {missing}"
+                        )
                 for prop_name, prop_schema in properties.items():
                     _check(prop_schema, f"{path}.properties.{prop_name}")
 
@@ -1167,7 +1270,7 @@ class AIService:
             if provider_key == "openai":
                 return "text.format.json_schema" if AIService._is_openai_responses_api_model(model_id) else "response_format.json_schema"
             if provider_key == "claude":
-                return "output_config.format"
+                return "output_format"
             if provider_key == "gemini":
                 return "response_json_schema"
             if provider_key in {"openrouter", "xai", "ollama"}:
@@ -3820,11 +3923,9 @@ class AIService:
             self._inject_claude_thinking_params(create_params, model_id, thinking_budget_tokens)
 
             if use_structured_outputs:
-                create_params["output_config"] = {
-                    "format": {
-                        "type": "json_schema",
-                        "schema": json_schema,
-                    }
+                create_params["output_format"] = {
+                    "type": "json_schema",
+                    "schema": json_schema,
                 }
                 create_params["betas"] = ["structured-outputs-2025-11-13"]
                 return await self.anthropic_client.beta.messages.create(
@@ -7771,13 +7872,11 @@ class AIService:
 
         # Add Structured Outputs configuration if using new beta feature
         if use_structured_outputs:
-            # Anthropic Structured Outputs use output_config.format on supported models.
+            # Anthropic Structured Outputs use output_format on the installed SDK.
             request_kwargs: Dict[str, Any] = {}
-            create_params["output_config"] = {
-                "format": {
-                    "type": "json_schema",
-                    "schema": json_schema,
-                }
+            create_params["output_format"] = {
+                "type": "json_schema",
+                "schema": json_schema,
             }
             # Add required betas parameter for structured outputs
             create_params["betas"] = ["structured-outputs-2025-11-13"]
@@ -8141,6 +8240,18 @@ class AIService:
         )
         return any(marker in model_lower for marker in thinking_markers)
 
+    @staticmethod
+    def _openrouter_accepts_temperature(model_id: str) -> bool:
+        """Return False for OpenRouter models documented to reject sampling params."""
+        normalized = (model_id or "").strip().lower().split(":", 1)[0]
+        no_temperature_models = (
+            "anthropic/claude-opus-4.7",
+            "anthropic/claude-sonnet-4.6",
+            "~anthropic/claude-opus-latest",
+            "~anthropic/claude-sonnet-latest",
+        )
+        return not any(normalized == marker for marker in no_temperature_models)
+
     def _get_thinking_budget_details(self, model_id: str) -> Optional[Dict[str, int]]:
         """Fetch full thinking budget configuration for a model if available."""
         try:
@@ -8327,9 +8438,10 @@ class AIService:
         request_params = {
             "model": model_id,  # Format: "provider/model-name" (e.g., "meta-llama/llama-3.3-70b-instruct")
             "messages": messages,
-            "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if self._openrouter_accepts_temperature(model_id):
+            request_params["temperature"] = temperature
         request_kwargs: Dict[str, Any] = {}
         if request_timeout and request_timeout > 0:
             request_kwargs["timeout"] = request_timeout
@@ -8773,11 +8885,9 @@ class AIService:
 
             # Add Structured Outputs configuration if using new beta feature
             if use_structured_outputs:
-                stream_params["output_config"] = {
-                    "format": {
-                        "type": "json_schema",
-                        "schema": json_schema,
-                    }
+                stream_params["output_format"] = {
+                    "type": "json_schema",
+                    "schema": json_schema,
                 }
                 # Add required betas parameter for structured outputs
                 stream_params["betas"] = ["structured-outputs-2025-11-13"]
@@ -9370,10 +9480,11 @@ class AIService:
             create_params = {
                 "model": model_id,  # Format: "provider/model-name" (e.g., "meta-llama/llama-3.3-70b-instruct")
                 "messages": messages,
-                "temperature": temperature,
                 "max_tokens": max_tokens,
                 "stream": True
             }
+            if self._openrouter_accepts_temperature(model_id):
+                create_params["temperature"] = temperature
 
             # Include usage stats in streaming response (OpenAI-compatible API)
             create_params.setdefault("stream_options", {})["include_usage"] = True

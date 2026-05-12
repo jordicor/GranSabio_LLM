@@ -41,6 +41,7 @@ class QASchedulerPolicy:
     min_valid_model_ratio: Optional[float] = None
     max_concurrency: int = 10
     timeout_retries: int = 2
+    parse_error_retries: int = 1
 
     def required_valid(self, configured_count: int) -> int:
         return required_valid_qa_models(
@@ -246,6 +247,7 @@ class QAScheduler:
         max_timeout_attempts = 1
         if self.policy.on_timeout in {"retry_then_fail", "retry_then_skip_if_quorum"}:
             max_timeout_attempts += max(0, self.policy.timeout_retries)
+        max_parse_attempts = 1 + max(0, self.policy.parse_error_retries)
 
         while True:
             attempts += 1
@@ -254,6 +256,8 @@ class QAScheduler:
                 return evaluation
             except QASchedulerTechnicalFailure as failure:
                 if failure.error_type == "timeout" and attempts < max_timeout_attempts:
+                    continue
+                if failure.error_type == "parse_error" and attempts < max_parse_attempts:
                     continue
                 return self._handle_technical_failure(
                     layer_name=layer_name,

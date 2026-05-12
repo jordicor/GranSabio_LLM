@@ -195,11 +195,13 @@ def extract_yes_probability(
         min_logprob = min(min_logprob, logprob)
 
         if token == "YES":
-            yes_logprob = logprob
+            yes_logprob = logprob if yes_logprob is None else max(yes_logprob, logprob)
         elif token == "NO":
-            no_logprob = logprob
+            no_logprob = logprob if no_logprob is None else max(no_logprob, logprob)
         elif token == "UNSURE":
-            unsure_logprob = logprob
+            unsure_logprob = (
+                logprob if unsure_logprob is None else max(unsure_logprob, logprob)
+            )
 
     # If YES found directly, convert logprob to probability
     if yes_logprob is not None:
@@ -244,7 +246,7 @@ def normalize_yes_no_unsure(
         logprob = item.get("logprob", float('-inf'))
 
         if token in probs:
-            probs[token] = math.exp(logprob)
+            probs[token] = max(probs[token], math.exp(logprob))
 
     # Normalize
     total = sum(probs.values())

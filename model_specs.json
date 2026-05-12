@@ -15166,6 +15166,12 @@
     "fallback_limits": {
       "input": 50000,
       "output": 8192
+    },
+    "external_generation_min_tokens": {
+      "enabled": true,
+      "default_min_tokens": null,
+      "reasoning_min_tokens": 4096,
+      "models": {}
     }
   }
 }

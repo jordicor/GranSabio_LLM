@@ -1802,12 +1802,21 @@ Source QA layers:
                     layer.name,
                 )
                 if progress_callback:
-                    await progress_callback(f"{slot.evaluator_label}: invalid JSON response. Skipping.")
+                    if attempt <= max(0, scheduler_policy.parse_error_retries):
+                        await progress_callback(
+                            f"{slot.evaluator_label}: invalid JSON response. Retrying."
+                        )
+                    else:
+                        await progress_callback(
+                            f"{slot.evaluator_label}: invalid JSON response. Skipping."
+                        )
                 metadata = _qa_failure_metadata(
                     slot=slot,
                     error_type="parse_error",
                     message=str(parse_error),
+                    retryable=attempt <= max(0, scheduler_policy.parse_error_retries),
                     attempts=attempt,
+                    max_attempts=1 + max(0, scheduler_policy.parse_error_retries),
                     original_exception=parse_error,
                     extra={"parse_error": "invalid_json"},
                 )
