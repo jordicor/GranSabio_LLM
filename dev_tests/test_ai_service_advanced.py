@@ -939,6 +939,40 @@ class TestOpenRouterTemperatureParams:
 class TestClaudeStructuredOutputsParams:
     """Tests Anthropic SDK structured-output parameter wiring."""
 
+    def test_claude_structured_outputs_prefer_output_config_when_available(self, ai_service_instance):
+        """Current Anthropic SDKs expose output_config.format for structured outputs."""
+
+        async def create_with_output_config(*, output_config=None, **kwargs):
+            return None
+
+        ai_service_instance.anthropic_client = SimpleNamespace(
+            messages=SimpleNamespace(create=create_with_output_config),
+        )
+        request_kwargs = {}
+
+        use_beta = ai_service_instance._configure_claude_structured_output_params(
+            request_kwargs,
+            {
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+            },
+        )
+
+        assert use_beta is False
+        assert request_kwargs["output_config"] == {
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"],
+                },
+            }
+        }
+        assert "output_format" not in request_kwargs
+        assert "betas" not in request_kwargs
+
     @pytest.mark.asyncio
     async def test_generate_claude_uses_output_format_not_output_config(self, ai_service_instance):
         create = AsyncMock(
@@ -978,6 +1012,87 @@ class TestClaudeStructuredOutputsParams:
             },
         }
         assert "output_config" not in request_kwargs
+
+    @pytest.mark.asyncio
+    async def test_stream_claude_structured_outputs_uses_create_stream_true(self, ai_service_instance):
+        """Streaming with raw JSON Schema must bypass Anthropic's parsed stream helper."""
+
+        class FakeAsyncStream:
+            def __init__(self):
+                self.events = [
+                    SimpleNamespace(
+                        type="message_start",
+                        message=SimpleNamespace(
+                            usage=SimpleNamespace(input_tokens=3),
+                        ),
+                    ),
+                    SimpleNamespace(
+                        type="content_block_delta",
+                        delta=SimpleNamespace(type="text_delta", text='{"ok": true}'),
+                    ),
+                    SimpleNamespace(
+                        type="message_delta",
+                        delta=SimpleNamespace(stop_reason="end_turn"),
+                        usage=SimpleNamespace(output_tokens=4),
+                    ),
+                ]
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, exc_tb):
+                return None
+
+            def __aiter__(self):
+                async def iterator():
+                    for event in self.events:
+                        yield event
+
+                return iterator()
+
+        create = AsyncMock(return_value=FakeAsyncStream())
+        parsed_stream_helper = Mock(side_effect=AssertionError("parsed stream helper should not be used"))
+        ai_service_instance.anthropic_client = SimpleNamespace(
+            beta=SimpleNamespace(
+                messages=SimpleNamespace(
+                    create=create,
+                    stream=parsed_stream_helper,
+                ),
+            ),
+            messages=SimpleNamespace(stream=Mock()),
+        )
+
+        chunks = [
+            chunk
+            async for chunk in ai_service_instance._stream_claude(
+                prompt="Return JSON",
+                model_id="claude-opus-4-7",
+                temperature=1.0,
+                max_tokens=128,
+                system_prompt="System",
+                extra_verbose=False,
+                json_output=True,
+                json_schema={
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"],
+                },
+            )
+        ]
+
+        assert [chunk.text for chunk in chunks] == ['{"ok": true}', ""]
+        request_kwargs = create.await_args.kwargs
+        assert request_kwargs["stream"] is True
+        assert request_kwargs["output_format"] == {
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+            },
+        }
+        assert request_kwargs["betas"] == ["structured-outputs-2025-11-13"]
+        parsed_stream_helper.assert_not_called()
 
 
 class TestInjectClaudeThinkingParams:

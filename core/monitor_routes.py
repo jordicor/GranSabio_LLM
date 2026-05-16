@@ -6,13 +6,17 @@ Provides endpoints for listing active projects and sessions.
 from datetime import datetime
 from typing import Dict, List
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 router = APIRouter(prefix="/monitor", tags=["monitor"])
 
 
 @router.get("/active")
-async def list_active_connections():
+async def list_active_connections(
+    status: str = "running",
+    include_reserved: bool = False,
+    limit: int = 100,
+):
     """
     List all active projects and standalone sessions for the monitor UI.
 
@@ -40,6 +44,17 @@ async def list_active_connections():
         }
     """
     from .app_state import active_sessions, active_sessions_lock, reserved_project_ids
+
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
+
+    requested_status = (status or "running").lower()
+    valid_filters = {"running", "terminal", "idle", "all"}
+    if requested_status not in valid_filters:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status filter '{status}'. Valid values: {sorted(valid_filters)}",
+        )
 
     projects_map: Dict[str, Dict] = {}
     standalone: List[Dict] = []
@@ -84,11 +99,11 @@ async def list_active_connections():
                     proj["status"] = "cancelled"
 
                 # Track last activity
-                created = session.get("created_at")
-                if created:
-                    created_iso = created.isoformat() if isinstance(created, datetime) else str(created)
-                    if proj["last_activity"] is None or created_iso > proj["last_activity"]:
-                        proj["last_activity"] = created_iso
+                activity = session.get("last_activity_at") or session.get("created_at")
+                if activity:
+                    activity_iso = activity.isoformat() if isinstance(activity, datetime) else str(activity)
+                    if proj["last_activity"] is None or activity_iso > proj["last_activity"]:
+                        proj["last_activity"] = activity_iso
             else:
                 # Standalone session (no project_id)
                 created = session.get("created_at")
@@ -106,19 +121,41 @@ async def list_active_connections():
         async with lock:
             _process_sessions(list(active_sessions.items()))
 
-    # Also include reserved projects that might be idle (no active sessions yet)
-    for pid in reserved_project_ids:
-        if pid not in projects_map:
-            projects_map[pid] = {
-                "project_id": pid,
-                "status": "idle",
-                "session_count": 0,
-                "active_sessions": 0,
-                "last_activity": None
-            }
+    # Reserved ids can be useful for manual connection, but they are noisy for
+    # the default active-only operator view.
+    if include_reserved:
+        for pid in reserved_project_ids:
+            if pid not in projects_map:
+                projects_map[pid] = {
+                    "project_id": pid,
+                    "status": "idle",
+                    "session_count": 0,
+                    "active_sessions": 0,
+                    "last_activity": None
+                }
+
+    terminal_statuses = {"completed", "rejected", "failed", "error", "cancelled"}
+
+    def _matches_filter(project: Dict) -> bool:
+        project_status = str(project.get("status") or "idle")
+        if requested_status == "all":
+            return True
+        if requested_status == "running":
+            return project_status == "running" or int(project.get("active_sessions") or 0) > 0
+        if requested_status == "terminal":
+            return project_status in terminal_statuses
+        if requested_status == "idle":
+            return project_status == "idle"
+        return False
+
+    projects = [project for project in projects_map.values() if _matches_filter(project)]
+    projects.sort(key=lambda project: project.get("last_activity") or "", reverse=True)
+    projects.sort(key=lambda project: project.get("status") != "running")
 
     return {
-        "projects": list(projects_map.values()),
+        "projects": projects[:limit],
         "standalone_sessions": standalone,
+        "filter": requested_status,
+        "include_reserved": include_reserved,
         "timestamp": datetime.utcnow().isoformat()
     }

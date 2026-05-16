@@ -112,8 +112,6 @@ cache/
 *.md
 *.pdf
 !**/README.md
-!CLAUDE.md
-!SYNC_GITHUB.md
 !requirements.txt
 !core/trusted_proxies.txt
 !dev_tests/fake_ai/*.txt

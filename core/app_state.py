@@ -1182,6 +1182,40 @@ async def unsubscribe_project_phase(project_id: str, phase: str, queue: asyncio.
 # SSE subscribers or the queue. Keep in sync with the docstring of
 # ``publish_project_phase_chunk``.
 _PROJECT_PHASE_DATA_MAX_BYTES = 8192
+_MONITOR_CONTENT_SNAPSHOT_MAX_CHARS = 50000
+
+
+def _build_monitor_text_snapshot(value: Any) -> Optional[Dict[str, Any]]:
+    """Return a bounded text snapshot for late `/monitor` connections."""
+    if not isinstance(value, str) or not value:
+        return None
+    omitted = max(0, len(value) - _MONITOR_CONTENT_SNAPSHOT_MAX_CHARS)
+    text = value[-_MONITOR_CONTENT_SNAPSHOT_MAX_CHARS:] if omitted else value
+    return {
+        "text": text,
+        "truncated": bool(omitted),
+        "omitted_chars": omitted,
+    }
+
+
+def _build_monitor_content_snapshot(session: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Collect bounded per-phase text already accumulated in the session."""
+    generation_text = session.get("generation_content") or session.get("last_generated_content")
+    phase_values = {
+        "auto_qa": session.get("auto_qa_content"),
+        "preflight": session.get("preflight_content"),
+        "generation": generation_text,
+        "qa": session.get("qa_content"),
+        "arbiter": session.get("arbiter_content"),
+        "gran_sabio": session.get("gransabio_content"),
+    }
+
+    snapshot: Dict[str, Dict[str, Any]] = {}
+    for phase, value in phase_values.items():
+        text_snapshot = _build_monitor_text_snapshot(value)
+        if text_snapshot is not None:
+            snapshot[phase] = text_snapshot
+    return snapshot
 
 
 def _build_project_phase_event(
@@ -1835,7 +1869,7 @@ async def session_cleanup_loop() -> None:
 
 # --- Project Status Utilities ---
 
-async def get_project_status(project_id: str) -> dict:
+async def get_project_status(project_id: str, *, include_content_snapshot: bool = False) -> dict:
     """
     Retrieve the status of all sessions belonging to a project.
 
@@ -1853,13 +1887,14 @@ async def get_project_status(project_id: str) -> dict:
     sessions_data = []
     active_count = 0
     completed_count = 0
+    cancelled_count = 0
     last_status: Optional[str] = None
     last_activity: Optional[datetime] = None
 
     lock = active_sessions_lock
 
     def _extract_session_data(items):
-        nonlocal active_count, completed_count, last_status, last_activity
+        nonlocal active_count, completed_count, cancelled_count, last_status, last_activity
         for session_id, session in items:
             if session.get("project_id") != project_id:
                 continue
@@ -1880,6 +1915,8 @@ async def get_project_status(project_id: str) -> dict:
             # Count session states
             if status_str in ("completed",):
                 completed_count += 1
+            elif status_str == "cancelled":
+                cancelled_count += 1
             elif (
                 status_str in ("generating", "qa_evaluation", "consensus", "gran_sabio_review", "running", "initializing")
                 or phase in ("inline_deal_breaker_review", "gran_sabio_review", "gran_sabio_regeneration")
@@ -1965,6 +2002,10 @@ async def get_project_status(project_id: str) -> dict:
                     "escalation_count": escalation_count,
                 },
             }
+            if include_content_snapshot:
+                content_snapshot = _build_monitor_content_snapshot(session)
+                if content_snapshot:
+                    session_info["content_snapshot"] = content_snapshot
             sessions_data.append(session_info)
 
     if lock is None:
@@ -1993,6 +2034,8 @@ async def get_project_status(project_id: str) -> dict:
         project_status = "rejected"
     elif last_status in ("failed", "error"):
         project_status = "failed"
+    elif last_status == "cancelled":
+        project_status = "cancelled"
     else:
         project_status = "idle"
 
@@ -2006,5 +2049,6 @@ async def get_project_status(project_id: str) -> dict:
             "total_sessions": total_sessions,
             "active_sessions": active_count,
             "completed_sessions": completed_count,
+            "cancelled_sessions": cancelled_count,
         },
     }

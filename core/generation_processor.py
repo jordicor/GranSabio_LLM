@@ -713,6 +713,34 @@ def _make_gran_sabio_tool_event_callback(session_id: str, session: Dict[str, Any
     return _gran_sabio_tool_event_callback
 
 
+def _make_generation_tool_event_callback(session_id: str, session: Dict[str, Any]):
+    """Forward generator validation-tool telemetry to the monitor generation phase."""
+
+    project_id = session.get("project_id")
+    if not project_id:
+        return None
+    request_name = session.get("request_name")
+    project_epoch = session.get("project_epoch")
+
+    async def _generation_tool_event_callback(event_type: str, payload: Dict[str, Any]) -> None:
+        try:
+            await publish_project_phase_chunk(
+                project_id,
+                "generation",
+                None,
+                session_id=session_id,
+                project_epoch=project_epoch,
+                request_name=request_name,
+                event=str(event_type) if event_type else "tool_event",
+                data=payload,
+            )
+        except Exception:
+            # Monitoring telemetry must not affect generation.
+            return
+
+    return _generation_tool_event_callback
+
+
 def _build_smart_edit_marker_config(content: str, request: ContentRequest) -> Dict[str, Any]:
     """Build the active smart-edit locator config for the current draft."""
 
@@ -1072,6 +1100,7 @@ async def _generate_full_content(
         accent_snippet = ACCENT_SYSTEM_PROMPT_SNIPPET if prose_mode else None
         accent_guard_for_call = request.llm_accent_guard if accent_mode != "off" else None
         enable_validate_draft = has_active_generation_validators(request)
+        generation_tool_event_callback = _make_generation_tool_event_callback(session_id, session)
 
         try:
             content, tool_metadata = await ai_service.call_ai_with_validation_tools(
@@ -1104,6 +1133,7 @@ async def _generate_full_content(
                 min_global_score=request.min_global_score,
                 model_alias_registry=getattr(request, "_model_alias_registry", None),
                 prompt_safety_parts=prompt_safety_parts,
+                tool_event_callback=generation_tool_event_callback,
                 cancellation_token=cancellation_token,
             )
         except AccentGuardError as accent_exc:
@@ -1213,6 +1243,18 @@ async def _generate_full_content(
                     session_id,
                     f"[Tools] Content generated after {getattr(tool_metadata, 'turns', 0)} internal validation round(s): {word_count} words"
                 )
+
+                project_id = session.get("project_id")
+                if project_id and content:
+                    await publish_project_phase_chunk(
+                        project_id,
+                        "generation",
+                        content,
+                        subphase="tool_loop_final",
+                        session_id=session_id,
+                        project_epoch=session.get("project_epoch"),
+                        request_name=session.get("request_name"),
+                    )
 
                 session["smart_edit_consecutive"] = 0
                 return content

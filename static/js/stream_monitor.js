@@ -54,6 +54,8 @@ const KNOWN_STRUCTURED_EVENTS = new Set([
     'tool_loop_error',
     'tool_loop_complete',
 ]);
+const DEFAULT_PANEL_MAX_CHARS = 80000;
+const EVERYTHING_PANEL_MAX_CHARS = 40000;
 
 // State
 let eventSource = null;
@@ -243,7 +245,7 @@ function reconnectWithActivePhases() {
     // Use 'all' when all UI phases are active (none hard-muted)
     const allPhasesActive = HARD_SWITCHABLE_PHASES.every(phase => panelStates[phase] !== 'hard');
     const phasesParam = allPhasesActive ? 'all' : activePhases.join(',');
-    const streamUrl = `${STREAM_BASE}/stream/project/${currentProjectId}?phases=${phasesParam}`;
+    const streamUrl = `${STREAM_BASE}/stream/project/${encodeURIComponent(currentProjectId)}?phases=${encodeURIComponent(phasesParam)}`;
 
     log(`Reconnecting with phases: ${phasesParam}`, 'info');
     setConnectionStatus('connecting', 'RECONNECTING...');
@@ -375,6 +377,7 @@ function resetPanelContent(phase, options = {}) {
         }
         if (options.clearText !== false) {
             contentEl.textContent = '';
+            delete contentEl.dataset.omittedChars;
         }
     }
 
@@ -428,6 +431,7 @@ function appendContent(phase, text) {
     }
 
     content.textContent += text;
+    trimPanelContent(phase, content);
     content.scrollTop = content.scrollHeight;
 
     // Update stats
@@ -441,6 +445,23 @@ function appendContent(phase, text) {
 
     // Show receiving state with pulse - debounced return to active
     showReceiving(phase);
+}
+
+function getPanelMaxChars(phase) {
+    return phase === 'everything' ? EVERYTHING_PANEL_MAX_CHARS : DEFAULT_PANEL_MAX_CHARS;
+}
+
+function trimPanelContent(phase, contentEl) {
+    const maxChars = getPanelMaxChars(phase);
+    const currentText = contentEl.textContent || '';
+    if (currentText.length <= maxChars) return;
+
+    const previousOmitted = Number(contentEl.dataset.omittedChars || 0);
+    const overflow = currentText.length - maxChars;
+    const omitted = previousOmitted + overflow;
+    const retained = currentText.slice(-maxChars);
+    contentEl.dataset.omittedChars = String(omitted);
+    contentEl.textContent = `[... ${omitted.toLocaleString()} chars omitted from this panel ...]\n${retained}`;
 }
 
 // Debounce timers for each phase
@@ -1511,17 +1532,27 @@ function updateUrl(projectId) {
 async function loadRecentProjects() {
     const listEl = document.getElementById('recentList');
     const countEl = document.getElementById('recentCount');
+    const filterEl = document.getElementById('recentStatusFilter');
+    const filter = filterEl?.value || 'running';
+    const includeReserved = filter === 'all' || filter === 'idle';
 
     try {
-        const response = await fetch('/monitor/active');
+        const params = new URLSearchParams({
+            status: filter,
+            include_reserved: includeReserved ? 'true' : 'false',
+        });
+        const response = await fetch(`/monitor/active?${params.toString()}`);
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
         const data = await response.json();
 
         const projects = data.projects || [];
 
-        countEl.textContent = `${projects.length} projects`;
+        countEl.textContent = `${projects.length} ${filter} projects`;
 
         if (projects.length === 0) {
-            listEl.innerHTML = '<div class="empty-message">No active projects</div>';
+            listEl.innerHTML = `<div class="empty-message">No ${escapeHtml(filter)} projects</div>`;
             return;
         }
 
@@ -1531,27 +1562,40 @@ async function loadRecentProjects() {
         projects.forEach(project => {
             const item = document.createElement('div');
             item.className = 'recent-item';
+            if (project.status !== 'running') {
+                item.classList.add('no-project');
+            }
 
-            const statusClass = project.status === 'running' ? 'active' : '';
+            const info = document.createElement('div');
+            info.className = 'recent-info';
 
-            item.innerHTML = `
-                <div class="recent-info">
-                    <div class="recent-name">${escapeHtml(project.project_id)}</div>
-                    <div class="recent-meta">
-                        Sessions: ${project.session_count} |
-                        Active: ${project.active_sessions} |
-                        Status: ${project.status}
-                    </div>
-                    <div class="recent-project-id">${project.project_id}</div>
-                </div>
-                <button class="btn btn-connect btn-small" onclick="connectToProject('${escapeHtml(project.project_id)}')">
-                    Connect
-                </button>
-            `;
+            const name = document.createElement('div');
+            name.className = 'recent-name';
+            name.textContent = project.project_id || '';
+
+            const meta = document.createElement('div');
+            meta.className = 'recent-meta';
+            meta.textContent = `Sessions: ${project.session_count} | Active: ${project.active_sessions} | Status: ${project.status}`;
+
+            const projectId = document.createElement('div');
+            projectId.className = 'recent-project-id';
+            projectId.textContent = project.project_id || '';
+
+            info.appendChild(name);
+            info.appendChild(meta);
+            info.appendChild(projectId);
+
+            const button = document.createElement('button');
+            button.className = 'btn btn-connect btn-small';
+            button.textContent = 'Connect';
+            button.addEventListener('click', () => connectToProject(project.project_id || ''));
+
+            item.appendChild(info);
+            item.appendChild(button);
             listEl.appendChild(item);
         });
 
-        log(`Loaded ${projects.length} projects`, 'success');
+        log(`Loaded ${projects.length} ${filter} projects`, 'success');
 
     } catch (error) {
         log(`Failed to load active connections: ${error.message}`, 'error');
@@ -1591,7 +1635,7 @@ function connect() {
     // Check if all UI phases are active (none hard-muted) to use 'all' param
     const allPhasesActive = HARD_SWITCHABLE_PHASES.every(phase => panelStates[phase] !== 'hard');
     const phasesParam = allPhasesActive ? 'all' : activePhases.join(',');
-    const streamUrl = `${STREAM_BASE}/stream/project/${currentProjectId}?phases=${phasesParam}`;
+    const streamUrl = `${STREAM_BASE}/stream/project/${encodeURIComponent(currentProjectId)}?phases=${encodeURIComponent(phasesParam)}`;
 
     log(`Connecting to project stream: ${streamUrl}`, 'info');
     updateUrl(inputValue);
@@ -1996,6 +2040,10 @@ function handleProjectTerminalEvent(data) {
             }
         });
         setConnectionStatus('disconnected', 'CANCELLED');
+        if (eventSource) {
+            eventSource.close();
+            eventSource = null;
+        }
         renderRequestTabs();
         renderIterationTimeline();
     }
@@ -2061,6 +2109,10 @@ function handleMessage(rawData) {
                 log(`Stream ended: ${data.reason}`, 'warn');
                 appendContent('status', `[STREAM_END] Reason: ${data.reason}\n`);
                 setConnectionStatus('disconnected', 'STREAM ENDED');
+                if (eventSource) {
+                    eventSource.close();
+                    eventSource = null;
+                }
                 break;
 
             case 'edit_start':
@@ -2204,6 +2256,111 @@ function handleChunk(data) {
     // before this function is called, so it remains unfiltered
 }
 
+function getSnapshotTextEntry(entry) {
+    if (!entry) return null;
+    if (typeof entry === 'string') {
+        return { text: entry, truncated: false, omitted_chars: 0 };
+    }
+    if (typeof entry === 'object') {
+        return {
+            text: entry.text || '',
+            truncated: Boolean(entry.truncated),
+            omitted_chars: entry.omitted_chars || 0,
+        };
+    }
+    return null;
+}
+
+function upsertRequestFromSessionSnapshot(sessionData) {
+    const sessionId = sessionData.session_id;
+    if (!sessionId) return null;
+
+    let request = requestsData.requests[sessionId];
+    if (!request) {
+        const iteration = sessionData.iteration || 1;
+        request = {
+            sessionId: sessionId,
+            requestName: sessionData.request_name || 'unknown',
+            status: sessionData.status || 'active',
+            currentIteration: iteration,
+            viewingIteration: iteration,
+            autoFollowIteration: true,
+            maxIterations: sessionData.max_iterations || 5,
+            finalScore: null,
+            iterations: {}
+        };
+        requestsData.requests[sessionId] = request;
+        requestsData.orderedRequestIds.push(sessionId);
+        initializeIteration(request, iteration);
+    }
+
+    const iteration = sessionData.iteration || request.currentIteration || 1;
+    request.currentIteration = iteration;
+    if (!request.viewingIteration || request.autoFollowIteration) {
+        request.viewingIteration = iteration;
+    }
+    request.status = sessionData.status || request.status;
+    request.requestName = sessionData.request_name || request.requestName;
+    request.maxIterations = sessionData.max_iterations || request.maxIterations;
+    initializeIteration(request, iteration);
+
+    const iterData = request.iterations[iteration];
+    const snapshot = sessionData.content_snapshot || {};
+    Object.entries(snapshot).forEach(([serverPhase, entry]) => {
+        const snapshotEntry = getSnapshotTextEntry(entry);
+        if (!snapshotEntry || !snapshotEntry.text) return;
+
+        const phase = normalizePhaseName(serverPhase, serverPhase);
+        if (!iterData.content.hasOwnProperty(phase)) return;
+
+        const prefix = snapshotEntry.truncated
+            ? `[... ${(snapshotEntry.omitted_chars || 0).toLocaleString()} chars omitted before monitor connection ...]\n`
+            : '';
+        const text = `${prefix}${snapshotEntry.text}`;
+        iterData.content[phase] = text;
+        iterData.stats[phase].chunks = 1;
+        iterData.stats[phase].bytes = text.length;
+    });
+
+    if (sessionData.consensus && sessionData.consensus.last_score !== null && sessionData.consensus.last_score !== undefined) {
+        iterData.score = sessionData.consensus.last_score;
+        iterData.approved = sessionData.consensus.approved || false;
+    }
+    if (isTerminalStatus(request.status)) {
+        markRequestTerminal(sessionId, request.status);
+    }
+    return request;
+}
+
+function hydrateRequestsFromProjectSnapshot(project) {
+    const sessions = project.sessions || [];
+    if (sessions.length === 0) return;
+
+    sessions.forEach(sessionData => upsertRequestFromSessionSnapshot(sessionData));
+
+    if (viewState.autoFollow && viewState.selectedRequestId === null) {
+        const activeSession = [...sessions].reverse().find(session => isRequestActiveStatus(session.status));
+        const selected = activeSession || sessions[sessions.length - 1];
+        if (selected?.session_id) {
+            viewState.selectedRequestId = selected.session_id;
+            REQUEST_PANEL_PHASES.forEach(phase => {
+                resetPanelContent(phase, {
+                    clearOverviewMode: true,
+                    clearText: false,
+                    resetBadge: false,
+                    resetStats: false,
+                });
+            });
+        }
+    }
+
+    renderRequestTabs();
+    renderIterationTimeline();
+    if (!isOverviewMode()) {
+        loadRequestContent(viewState.selectedRequestId);
+    }
+}
+
 function handleStatusSnapshot(data) {
     log('Received status snapshot', 'info');
     const project = data.project || {};
@@ -2211,6 +2368,8 @@ function handleStatusSnapshot(data) {
     const totalSessions = summary.total_sessions ?? summary.total ?? 0;
     const activeSessions = summary.active_sessions ?? summary.active ?? 0;
     const completedSessions = summary.completed_sessions ?? summary.completed ?? 0;
+
+    hydrateRequestsFromProjectSnapshot(project);
 
     // Render visual dashboard
     renderProjectStatus(project);

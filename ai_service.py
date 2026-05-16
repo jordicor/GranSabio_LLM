@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import logging
 import random
 import threading
@@ -2309,6 +2310,43 @@ class AIService:
         return AIService._supports_structured_outputs("claude", model_lower)
 
     @staticmethod
+    def _callable_has_keyword(callable_obj: Any, keyword: str) -> bool:
+        """Return True when an SDK callable explicitly exposes a keyword parameter."""
+        try:
+            return keyword in inspect.signature(callable_obj).parameters
+        except (TypeError, ValueError):
+            return False
+
+    def _configure_claude_structured_output_params(
+        self,
+        request_params: Dict[str, Any],
+        json_schema: Dict[str, Any],
+    ) -> bool:
+        """
+        Attach Claude structured-output params.
+
+        Returns True when the installed SDK needs the beta messages endpoint.
+        Current Anthropic SDKs prefer `output_config.format`; older SDKs only
+        expose the beta `output_format` parameter.
+        """
+        output_format = {
+            "type": "json_schema",
+            "schema": json_schema,
+        }
+        regular_create = getattr(
+            getattr(self.anthropic_client, "messages", None),
+            "create",
+            None,
+        )
+        if regular_create and self._callable_has_keyword(regular_create, "output_config"):
+            request_params["output_config"] = {"format": output_format}
+            return False
+
+        request_params["output_format"] = output_format
+        request_params["betas"] = ["structured-outputs-2025-11-13"]
+        return True
+
+    @staticmethod
     def _audit_model_supports_structured_outputs(provider_key: str, model_id: str) -> bool:
         """Return True when the audit model's provider supports native JSON-schema constrained output (Sec 5.11).
 
@@ -3923,15 +3961,16 @@ class AIService:
             self._inject_claude_thinking_params(create_params, model_id, thinking_budget_tokens)
 
             if use_structured_outputs:
-                create_params["output_format"] = {
-                    "type": "json_schema",
-                    "schema": json_schema,
-                }
-                create_params["betas"] = ["structured-outputs-2025-11-13"]
-                return await self.anthropic_client.beta.messages.create(
-                    **create_params,
-                    **request_kwargs,
+                use_beta_structured_outputs = self._configure_claude_structured_output_params(
+                    create_params,
+                    json_schema,
                 )
+                create = (
+                    self.anthropic_client.beta.messages.create
+                    if use_beta_structured_outputs
+                    else self.anthropic_client.messages.create
+                )
+                return await create(**create_params, **request_kwargs)
 
             return await self.anthropic_client.messages.create(
                 **create_params,
@@ -7870,25 +7909,26 @@ class AIService:
         # Structured outputs + thinking is supported; Claude ignores thinking tokens for tool calls
         self._inject_claude_thinking_params(create_params, model_id, thinking_budget_tokens)
 
-        # Add Structured Outputs configuration if using new beta feature
+        # Add Structured Outputs configuration when supported by the target SDK.
+        use_beta_structured_outputs = False
+        request_kwargs: Dict[str, Any] = {}
         if use_structured_outputs:
-            # Anthropic Structured Outputs use output_format on the installed SDK.
-            request_kwargs: Dict[str, Any] = {}
-            create_params["output_format"] = {
-                "type": "json_schema",
-                "schema": json_schema,
-            }
-            # Add required betas parameter for structured outputs
-            create_params["betas"] = ["structured-outputs-2025-11-13"]
-        else:
-            request_kwargs: Dict[str, Any] = {}
+            use_beta_structured_outputs = self._configure_claude_structured_output_params(
+                create_params,
+                json_schema,
+            )
 
         if request_timeout and request_timeout > 0:
             request_kwargs["timeout"] = request_timeout
 
         # Use beta API when using structured outputs
         if use_structured_outputs:
-            response = await self.anthropic_client.beta.messages.create(
+            create = (
+                self.anthropic_client.beta.messages.create
+                if use_beta_structured_outputs
+                else self.anthropic_client.messages.create
+            )
+            response = await create(
                 **create_params,
                 **request_kwargs,
             )
@@ -8883,21 +8923,27 @@ class AIService:
             # Add thinking mode for Claude models that support it (structured outputs compatible)
             self._inject_claude_thinking_params(stream_params, model_id, thinking_budget_tokens, log_context="Streaming: ")
 
-            # Add Structured Outputs configuration if using new beta feature
+            # Add Structured Outputs configuration when supported by the target SDK.
+            use_beta_structured_outputs = False
             if use_structured_outputs:
-                stream_params["output_format"] = {
-                    "type": "json_schema",
-                    "schema": json_schema,
-                }
-                # Add required betas parameter for structured outputs
-                stream_params["betas"] = ["structured-outputs-2025-11-13"]
+                use_beta_structured_outputs = self._configure_claude_structured_output_params(
+                    stream_params,
+                    json_schema,
+                )
 
-            # Use beta API when using structured outputs, regular API otherwise
-            stream_context = (
-                self.anthropic_client.beta.messages.stream(**stream_params)
-                if use_structured_outputs
-                else self.anthropic_client.messages.stream(**stream_params)
-            )
+            # Use create(stream=True) for native structured outputs. Older
+            # Anthropic SDK streaming helpers run raw JSON Schema dicts through
+            # pydantic.TypeAdapter and raise `TypeError: unhashable type: 'dict'`.
+            if use_structured_outputs:
+                stream_params["stream"] = True
+                create = (
+                    self.anthropic_client.beta.messages.create
+                    if use_beta_structured_outputs
+                    else self.anthropic_client.messages.create
+                )
+                stream_context = await create(**stream_params)
+            else:
+                stream_context = self.anthropic_client.messages.stream(**stream_params)
 
             async with stream_context as stream:
                 final_usage = None

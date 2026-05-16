@@ -125,7 +125,10 @@ class ProjectStreamManager:
 
             # 3. Status snapshot (only if status requested)
             if "status" in self.phases:
-                snapshot = await get_project_status(self.project_id)
+                snapshot = await get_project_status(
+                    self.project_id,
+                    include_content_snapshot=True,
+                )
                 snapshot_event = {
                     "type": "status_snapshot",
                     "phase": "status",

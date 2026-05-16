@@ -296,6 +296,21 @@
             color: var(--gray);
         }
 
+        .recent-filter {
+            background: var(--bg-dark);
+            border: 1px solid var(--border);
+            color: var(--cyan);
+            font-family: inherit;
+            font-size: 10px;
+            padding: 5px 8px;
+            border-radius: 3px;
+        }
+
+        .recent-filter:focus {
+            outline: none;
+            border-color: var(--green);
+        }
+
         .recent-list {
             padding: 10px;
             max-height: 200px;
@@ -1811,6 +1826,12 @@
             <div class="recent-header">
                 <span class="recent-header-title">// Active Connections</span>
                 <div style="display: flex; gap: 10px; align-items: center;">
+                    <select id="recentStatusFilter" class="recent-filter" onchange="loadRecentProjects()" title="Filter projects shown in this list">
+                        <option value="running" selected>Running</option>
+                        <option value="terminal">Finished</option>
+                        <option value="idle">Idle</option>
+                        <option value="all">All</option>
+                    </select>
                     <span class="recent-header-count" id="recentCount">Loading...</span>
                     <button class="btn btn-connect btn-small" onclick="loadRecentProjects()">Refresh</button>
                 </div>
