@@ -102,9 +102,6 @@ def _should_use_gransabio_tools(request: ContentRequest, model: str) -> bool:
     if not AIService._supports_tool_calling(provider_key, model_id):
         return False
 
-    if provider_key == "openai" and AIService._is_openai_responses_api_model(model_id):
-        return False
-
     return True
 
 
@@ -907,8 +904,8 @@ CRITICAL INSTRUCTIONS:
                     raise
 
                 if envelope.tools_skipped_reason or not generated_content:
-                    # Tool loop unavailable (Responses API, no_tool_support,
-                    # or context_too_large). Fall back to a single-shot call
+                    # Tool loop unavailable (no_tool_support or
+                    # context_too_large). Fall back to a single-shot call
                     # rather than returning an empty draft.
                     await _abort_if_cancelled("regeneration_before_single_shot_fallback")
                     generated_content = await self.ai_service.generate_content(
@@ -1576,7 +1573,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
             if envelope.tools_skipped_reason is None and envelope.payload is not None:
                 return envelope.payload, content
 
-            # Tools skipped (responses_api / no_tool_support / context_too_large):
+            # Tools skipped (no_tool_support / context_too_large):
             # fall back to a single-shot JSON call rather than returning an
             # empty envelope payload.
             logger.info(

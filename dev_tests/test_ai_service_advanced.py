@@ -16,12 +16,13 @@ from typing import Any, Dict
 from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
+import json_utils as json
 import pytest
 
 # Import the module under test
 from ai_service import AIRequestError, AIService, _ensure_aiohttp_compatibility
 from deterministic_validation import DraftValidationResult
-from tool_loop_models import OutputContract, ToolLoopEnvelope
+from tool_loop_models import LoopScope, OutputContract, ToolLoopEnvelope
 
 # ============================================================================
 # Fixtures
@@ -63,6 +64,82 @@ def mock_config():
         # Default: unknown model → estimate_prompt_overflow falls back to hard cap.
         mock_cfg.get_model_info = Mock(side_effect=RuntimeError("unknown model for tests"))
         yield mock_cfg
+
+
+class _FakeClaudeStream:
+    def __init__(self, events, final_response=None):
+        self._events = list(events)
+        self._final_response = final_response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def __aiter__(self):
+        self._iter = iter(self._events)
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._iter)
+        except StopIteration:
+            raise StopAsyncIteration
+
+    async def get_final_response(self):
+        if self._final_response is None:
+            raise RuntimeError("no final response")
+        return self._final_response
+
+
+def _claude_message_delta(stop_reason: str):
+    return SimpleNamespace(
+        type="message_delta",
+        delta=SimpleNamespace(stop_reason=stop_reason),
+        usage=SimpleNamespace(output_tokens=12),
+    )
+
+
+def _claude_stream_for_response(response, *, stop_reason="tool_use"):
+    events = [
+        SimpleNamespace(
+            type="message_start",
+            message=SimpleNamespace(usage=SimpleNamespace(input_tokens=10)),
+        )
+    ]
+    for index, block in enumerate(response.content):
+        events.append(
+            SimpleNamespace(
+                type="content_block_start",
+                index=index,
+                content_block=block,
+            )
+        )
+        if getattr(block, "type", None) == "text":
+            text = getattr(block, "text", "")
+            if text:
+                events.append(
+                    SimpleNamespace(
+                        type="content_block_delta",
+                        index=index,
+                        delta=SimpleNamespace(type="text_delta", text=text),
+                    )
+                )
+        elif getattr(block, "type", None) == "tool_use":
+            raw_input = json.dumps(getattr(block, "input", {}) or {}, sort_keys=True)
+            midpoint = max(1, len(raw_input) // 2)
+            for chunk in (raw_input[:midpoint], raw_input[midpoint:]):
+                events.append(
+                    SimpleNamespace(
+                        type="content_block_delta",
+                        index=index,
+                        delta=SimpleNamespace(type="input_json_delta", partial_json=chunk),
+                    )
+                )
+        events.append(SimpleNamespace(type="content_block_stop", index=index))
+    events.extend([_claude_message_delta(stop_reason), SimpleNamespace(type="message_stop")])
+    return _FakeClaudeStream(events, response)
 
 
 # ============================================================================
@@ -1094,6 +1171,746 @@ class TestClaudeStructuredOutputsParams:
         assert request_kwargs["betas"] == ["structured-outputs-2025-11-13"]
         parsed_stream_helper.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_openai_tool_turn_stream_accumulates_text_and_tool_deltas(self, ai_service_instance):
+        """Chat Completions tool-loop streaming returns the aggregate message shape."""
+
+        class FakeAsyncStream:
+            def __aiter__(self):
+                async def iterator():
+                    yield SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content="Draft "),
+                                finish_reason=None,
+                            )
+                        ],
+                        usage=None,
+                    )
+                    yield SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(
+                                    content=None,
+                                    tool_calls=[
+                                        SimpleNamespace(
+                                            index=0,
+                                            id="call_1",
+                                            type="function",
+                                            function=SimpleNamespace(
+                                                name="validate_draft",
+                                                arguments='{"text":"Draft ',
+                                            ),
+                                        )
+                                    ],
+                                ),
+                                finish_reason=None,
+                            )
+                        ],
+                        usage=None,
+                    )
+                    yield SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(
+                                    content=None,
+                                    tool_calls=[
+                                        SimpleNamespace(
+                                            index=0,
+                                            id=None,
+                                            type=None,
+                                            function=SimpleNamespace(
+                                                name=None,
+                                                arguments='text"}',
+                                            ),
+                                        )
+                                    ],
+                                ),
+                                finish_reason="tool_calls",
+                            )
+                        ],
+                        usage=SimpleNamespace(total_tokens=12),
+                    )
+
+                return iterator()
+
+        create = AsyncMock(return_value=FakeAsyncStream())
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        events = []
+
+        async def on_event(event_type, payload):
+            events.append((event_type, payload))
+
+        message, usage, finish_reason = await ai_service_instance._stream_openai_compatible_tool_turn(
+            client,
+            {"model": "gpt-5.4-mini", "messages": []},
+            {},
+            provider_key="openai",
+            model_id="gpt-5.4-mini",
+            turn=1,
+            loop_scope=LoopScope.GENERATOR,
+            tool_event_callback=on_event,
+            cancellation_token=None,
+        )
+
+        assert message.content == "Draft "
+        assert len(message.tool_calls) == 1
+        assert message.tool_calls[0].function.name == "validate_draft"
+        assert message.tool_calls[0].function.arguments == '{"text":"Draft text"}'
+        assert usage.total_tokens == 12
+        assert finish_reason == "tool_calls"
+        assert any(event_type == "assistant_delta" for event_type, _ in events)
+        assert any(event_type == "tool_call_delta" for event_type, _ in events)
+        assert any(event_type == "tool_call_ready" for event_type, _ in events)
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_tool_turn_stream_accumulates_function_call(self, ai_service_instance):
+        """Responses API streaming is adapted into the shared tool-call shape."""
+
+        class FakeResponsesStream:
+            def __aiter__(self):
+                async def iterator():
+                    yield SimpleNamespace(
+                        type="response.output_item.added",
+                        output_index=0,
+                        item=SimpleNamespace(
+                            type="function_call",
+                            id="fc_1",
+                            call_id="call_1",
+                            name="validate_draft",
+                            arguments="",
+                        ),
+                    )
+                    yield SimpleNamespace(
+                        type="response.function_call_arguments.delta",
+                        output_index=0,
+                        item_id="fc_1",
+                        delta='{"text":"hello',
+                    )
+                    yield SimpleNamespace(
+                        type="response.function_call_arguments.delta",
+                        output_index=0,
+                        item_id="fc_1",
+                        delta=' world"}',
+                    )
+                    yield SimpleNamespace(
+                        type="response.function_call_arguments.done",
+                        output_index=0,
+                        item_id="fc_1",
+                        call_id="call_1",
+                        name="validate_draft",
+                        arguments='{"text":"hello world"}',
+                    )
+                    yield SimpleNamespace(
+                        type="response.completed",
+                        response=SimpleNamespace(
+                            status="completed",
+                            usage=SimpleNamespace(total_tokens=9),
+                        ),
+                    )
+
+                return iterator()
+
+        create = AsyncMock(return_value=FakeResponsesStream())
+        ai_service_instance.openai_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create)
+        )
+        events = []
+
+        async def on_event(event_type, payload):
+            events.append((event_type, payload))
+
+        message, usage, finish_reason = await ai_service_instance._stream_openai_responses_tool_turn(
+            {"model": "gpt-5-pro", "input": []},
+            {},
+            model_id="gpt-5-pro",
+            turn=1,
+            loop_scope=LoopScope.GENERATOR,
+            tool_event_callback=on_event,
+            cancellation_token=None,
+        )
+
+        assert message.content == ""
+        assert len(message.tool_calls) == 1
+        assert message.tool_calls[0].id == "fc_1"
+        assert message.tool_calls[0].call_id == "call_1"
+        assert message.tool_calls[0].function.name == "validate_draft"
+        assert message.tool_calls[0].function.arguments == '{"text":"hello world"}'
+        assert usage.total_tokens == 9
+        assert finish_reason == "completed"
+        assert any(event_type == "tool_call_delta" for event_type, _ in events)
+        assert any(event_type == "tool_call_ready" for event_type, _ in events)
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_tool_turn_missing_terminal_raises_before_tool_ready(self, ai_service_instance):
+        """Responses streams must end with response.completed before tool calls are usable."""
+
+        class FakeResponsesStream:
+            def __aiter__(self):
+                async def iterator():
+                    yield SimpleNamespace(
+                        type="response.output_item.added",
+                        output_index=0,
+                        item=SimpleNamespace(
+                            type="function_call",
+                            id="fc_1",
+                            call_id="call_1",
+                            name="validate_draft",
+                            arguments="",
+                        ),
+                    )
+                    yield SimpleNamespace(
+                        type="response.function_call_arguments.delta",
+                        output_index=0,
+                        item_id="fc_1",
+                        delta='{"text":"partial',
+                    )
+
+                return iterator()
+
+        create = AsyncMock(return_value=FakeResponsesStream())
+        ai_service_instance.openai_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create)
+        )
+        events = []
+
+        async def on_event(event_type, payload):
+            events.append((event_type, payload))
+
+        with pytest.raises(RuntimeError, match="without response.completed"):
+            await ai_service_instance._stream_openai_responses_tool_turn(
+                {"model": "gpt-5-pro", "input": []},
+                {},
+                model_id="gpt-5-pro",
+                turn=1,
+                loop_scope=LoopScope.GENERATOR,
+                tool_event_callback=on_event,
+                cancellation_token=None,
+            )
+
+        assert any(event_type == "tool_loop_provider_terminal" for event_type, _ in events)
+        assert not any(event_type == "tool_call_ready" for event_type, _ in events)
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_tool_turn_nonstream_accumulates_function_call(self, ai_service_instance):
+        """Responses models without streaming still produce tool calls without stream=True."""
+
+        response = SimpleNamespace(
+            status="completed",
+            usage=SimpleNamespace(total_tokens=11),
+            output=[
+                SimpleNamespace(
+                    type="function_call",
+                    id="fc_1",
+                    call_id="call_1",
+                    name="validate_draft",
+                    arguments='{"text":"hello world"}',
+                )
+            ],
+        )
+        create = AsyncMock(return_value=response)
+        ai_service_instance.openai_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create)
+        )
+        events = []
+
+        async def on_event(event_type, payload):
+            events.append((event_type, payload))
+
+        message, usage, finish_reason = await ai_service_instance._run_openai_responses_tool_turn(
+            {"model": "gpt-5-pro", "input": []},
+            {},
+            model_id="gpt-5-pro",
+            turn=1,
+            loop_scope=LoopScope.GENERATOR,
+            tool_event_callback=on_event,
+            cancellation_token=None,
+        )
+
+        assert create.await_args.kwargs.get("stream") is None
+        assert message.content == ""
+        assert len(message.tool_calls) == 1
+        assert message.tool_calls[0].id == "fc_1"
+        assert message.tool_calls[0].call_id == "call_1"
+        assert message.tool_calls[0].function.name == "validate_draft"
+        assert message.tool_calls[0].function.arguments == '{"text":"hello world"}'
+        assert usage.total_tokens == 11
+        assert finish_reason == "completed"
+        assert any(event_type == "tool_call_ready" for event_type, _ in events)
+        assert not any(event_type == "tool_call_delta" for event_type, _ in events)
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_tool_turn_incomplete_raises_before_tool_ready(self, ai_service_instance):
+        """Incomplete Responses turns must not execute partial tool-call arguments."""
+
+        class FakeResponsesStream:
+            def __aiter__(self):
+                async def iterator():
+                    yield SimpleNamespace(
+                        type="response.output_item.added",
+                        output_index=0,
+                        item=SimpleNamespace(
+                            type="function_call",
+                            id="fc_1",
+                            call_id="call_1",
+                            name="validate_draft",
+                            arguments="",
+                        ),
+                    )
+                    yield SimpleNamespace(
+                        type="response.function_call_arguments.delta",
+                        output_index=0,
+                        item_id="fc_1",
+                        delta='{"text":"partial',
+                    )
+                    yield SimpleNamespace(
+                        type="response.incomplete",
+                        response=SimpleNamespace(
+                            status="incomplete",
+                            incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+                        ),
+                    )
+
+                return iterator()
+
+        create = AsyncMock(return_value=FakeResponsesStream())
+        ai_service_instance.openai_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create)
+        )
+        events = []
+
+        async def on_event(event_type, payload):
+            events.append((event_type, payload))
+
+        with pytest.raises(RuntimeError, match="Responses stream ended"):
+            await ai_service_instance._stream_openai_responses_tool_turn(
+                {"model": "gpt-5-pro", "input": []},
+                {},
+                model_id="gpt-5-pro",
+                turn=1,
+                loop_scope=LoopScope.GENERATOR,
+                tool_event_callback=on_event,
+                cancellation_token=None,
+            )
+
+        assert any(event_type == "tool_loop_provider_terminal" for event_type, _ in events)
+        assert not any(event_type == "tool_call_ready" for event_type, _ in events)
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_tool_turn_nonstream_incomplete_raises_before_tool_ready(self, ai_service_instance):
+        """Non-streaming incomplete Responses turns must not execute partial tool calls."""
+
+        response = SimpleNamespace(
+            status="incomplete",
+            incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+            output=[
+                SimpleNamespace(
+                    type="function_call",
+                    id="fc_1",
+                    call_id="call_1",
+                    name="validate_draft",
+                    arguments='{"text":"partial',
+                )
+            ],
+        )
+        create = AsyncMock(return_value=response)
+        ai_service_instance.openai_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create)
+        )
+        events = []
+
+        async def on_event(event_type, payload):
+            events.append((event_type, payload))
+
+        with pytest.raises(RuntimeError, match="Responses turn ended"):
+            await ai_service_instance._run_openai_responses_tool_turn(
+                {"model": "gpt-5-pro", "input": []},
+                {},
+                model_id="gpt-5-pro",
+                turn=1,
+                loop_scope=LoopScope.GENERATOR,
+                tool_event_callback=on_event,
+                cancellation_token=None,
+            )
+
+        assert create.await_args.kwargs.get("stream") is None
+        assert any(event_type == "tool_loop_provider_terminal" for event_type, _ in events)
+        assert not any(event_type == "tool_call_ready" for event_type, _ in events)
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_tool_loop_uses_nonstream_for_gpt5_pro(self, ai_service_instance):
+        """Responses-only Pro models avoid stream=True inside the tool loop."""
+
+        response = SimpleNamespace(
+            status="completed",
+            usage=SimpleNamespace(total_tokens=11),
+            output=[
+                SimpleNamespace(
+                    type="function_call",
+                    id="fc_1",
+                    call_id="call_1",
+                    name="validate_draft",
+                    arguments='{"text":"validated draft"}',
+                )
+            ],
+        )
+        create = AsyncMock(return_value=response)
+        ai_service_instance.openai_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create)
+        )
+
+        content, metadata = await ai_service_instance._run_openai_compatible_validation_tool_loop(
+            provider="openai",
+            model_id="gpt-5-pro",
+            prompt="Write.",
+            validation_callback=lambda candidate: _result_for_target(candidate, "validated draft"),
+            temperature=0.7,
+            max_tokens=128,
+            system_prompt="system",
+            request_timeout=None,
+            reasoning_effort=None,
+            json_output=False,
+            json_schema=None,
+            usage_callback=None,
+            usage_extra=None,
+            images=None,
+            max_rounds=1,
+            retries_enabled=False,
+        )
+
+        assert content == "validated draft"
+        assert metadata["accepted"] == "validated_tool_argument"
+        assert create.await_args.kwargs.get("stream") is None
+        assert create.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_openai_chat_tool_turn_missing_terminal_raises_before_tool_ready(self, ai_service_instance):
+        """Chat streams must include an explicit usable finish_reason."""
+
+        class FakeAsyncStream:
+            def __aiter__(self):
+                async def iterator():
+                    yield SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(
+                                    content=None,
+                                    tool_calls=[
+                                        SimpleNamespace(
+                                            index=0,
+                                            id="call_1",
+                                            type="function",
+                                            function=SimpleNamespace(
+                                                name="validate_draft",
+                                                arguments='{"text":"partial',
+                                            ),
+                                        )
+                                    ],
+                                ),
+                                finish_reason=None,
+                            )
+                        ],
+                        usage=None,
+                    )
+
+                return iterator()
+
+        create = AsyncMock(return_value=FakeAsyncStream())
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        events = []
+
+        async def on_event(event_type, payload):
+            events.append((event_type, payload))
+
+        with pytest.raises(RuntimeError, match="Chat Completions stream ended"):
+            await ai_service_instance._stream_openai_compatible_tool_turn(
+                client,
+                {"model": "gpt-5.4-mini", "messages": []},
+                {},
+                provider_key="openai",
+                model_id="gpt-5.4-mini",
+                turn=1,
+                loop_scope=LoopScope.GENERATOR,
+                tool_event_callback=on_event,
+                cancellation_token=None,
+            )
+
+        assert any(event_type == "tool_loop_provider_terminal" for event_type, _ in events)
+        assert not any(event_type == "tool_call_ready" for event_type, _ in events)
+
+    @pytest.mark.asyncio
+    async def test_openai_chat_tool_turn_length_raises_before_tool_ready(self, ai_service_instance):
+        """Chat Completions length stops must not execute partial tool calls."""
+
+        class FakeAsyncStream:
+            def __aiter__(self):
+                async def iterator():
+                    yield SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(
+                                    content=None,
+                                    tool_calls=[
+                                        SimpleNamespace(
+                                            index=0,
+                                            id="call_1",
+                                            type="function",
+                                            function=SimpleNamespace(
+                                                name="validate_draft",
+                                                arguments='{"text":"partial',
+                                            ),
+                                        )
+                                    ],
+                                ),
+                                finish_reason="length",
+                            )
+                        ],
+                        usage=None,
+                    )
+
+                return iterator()
+
+        create = AsyncMock(return_value=FakeAsyncStream())
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        events = []
+
+        async def on_event(event_type, payload):
+            events.append((event_type, payload))
+
+        with pytest.raises(RuntimeError, match="Chat Completions stream ended"):
+            await ai_service_instance._stream_openai_compatible_tool_turn(
+                client,
+                {"model": "gpt-5.4-mini", "messages": []},
+                {},
+                provider_key="openai",
+                model_id="gpt-5.4-mini",
+                turn=1,
+                loop_scope=LoopScope.GENERATOR,
+                tool_event_callback=on_event,
+                cancellation_token=None,
+            )
+
+        assert any(event_type == "tool_loop_provider_terminal" for event_type, _ in events)
+        assert not any(event_type == "tool_call_ready" for event_type, _ in events)
+
+    @pytest.mark.asyncio
+    async def test_openrouter_chat_tool_turn_rejects_non_stream_response(self, ai_service_instance):
+        """OpenRouter tool-loop observability must not silently downgrade to non-streaming."""
+
+        message = SimpleNamespace(content="", tool_calls=[])
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=message, finish_reason="stop")],
+            usage=None,
+        )
+        create = AsyncMock(return_value=response)
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        events = []
+
+        async def on_event(event_type, payload):
+            events.append((event_type, payload))
+
+        with pytest.raises(RuntimeError, match="OpenRouter Chat Completions stream"):
+            await ai_service_instance._stream_openai_compatible_tool_turn(
+                client,
+                {"model": "vendor/tool-model", "messages": []},
+                {},
+                provider_key="openrouter",
+                model_id="vendor/tool-model",
+                turn=1,
+                loop_scope=LoopScope.GENERATOR,
+                tool_event_callback=on_event,
+                cancellation_token=None,
+            )
+
+        assert create.await_args.kwargs["stream"] is True
+        assert any(
+            event_type == "tool_loop_provider_terminal"
+            and payload.get("status") == "non_stream_response"
+            for event_type, payload in events
+        )
+        assert not any(event_type == "tool_call_ready" for event_type, _ in events)
+
+    @pytest.mark.asyncio
+    async def test_openrouter_chat_tool_turn_stream_error_raises_before_tool_ready(self, ai_service_instance):
+        """OpenRouter SSE error chunks must be terminal and must not execute tools."""
+
+        class FakeAsyncStream:
+            def __aiter__(self):
+                async def iterator():
+                    yield SimpleNamespace(
+                        error={"message": "provider stream failed"},
+                        choices=[],
+                        usage=None,
+                    )
+
+                return iterator()
+
+        create = AsyncMock(return_value=FakeAsyncStream())
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        events = []
+
+        async def on_event(event_type, payload):
+            events.append((event_type, payload))
+
+        with pytest.raises(RuntimeError, match="stream error"):
+            await ai_service_instance._stream_openai_compatible_tool_turn(
+                client,
+                {"model": "vendor/tool-model", "messages": []},
+                {},
+                provider_key="openrouter",
+                model_id="vendor/tool-model",
+                turn=1,
+                loop_scope=LoopScope.GENERATOR,
+                tool_event_callback=on_event,
+                cancellation_token=None,
+            )
+
+        assert any(
+            event_type == "tool_loop_provider_terminal"
+            and payload.get("status") == "error"
+            and "provider stream failed" in payload.get("detail", "")
+            for event_type, payload in events
+        )
+        assert not any(event_type == "tool_call_ready" for event_type, _ in events)
+
+    def test_openai_responses_params_convert_chat_tool_transcript(self, ai_service_instance):
+        """Responses params preserve function-call ids and tool outputs."""
+
+        params = ai_service_instance._build_openai_responses_tool_params(
+            model_id="gpt-5-pro",
+            current_messages=[
+                {"role": "system", "content": "System"},
+                {"role": "user", "content": "Write"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "fc_1",
+                            "call_id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "validate_draft",
+                                "arguments": '{"text":"Write"}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": '{"approved":true}'},
+            ],
+            max_tokens=128,
+            reasoning_effort="low",
+            json_output=False,
+            json_schema=None,
+            tools_enabled=True,
+            tool_schemas=[ai_service_instance._build_openai_validation_tool_schema()],
+        )
+
+        assert params["instructions"] == "System"
+        assert params["input"][0] == {"role": "user", "content": "Write"}
+        assert params["input"][1]["type"] == "function_call"
+        assert params["input"][1]["call_id"] == "call_1"
+        assert params["input"][2]["type"] == "function_call_output"
+        assert params["input"][2]["call_id"] == "call_1"
+        assert params["tools"][0]["name"] == "validate_draft"
+        assert params["tool_choice"] == "auto"
+
+    def test_openai_responses_json_loose_does_not_force_empty_schema(self, ai_service_instance):
+        """JSON_LOOSE over Responses relies on prompt/local parsing, not a strict empty schema."""
+
+        params = ai_service_instance._build_openai_responses_tool_params(
+            model_id="gpt-5-pro",
+            current_messages=[{"role": "user", "content": "Return JSON"}],
+            max_tokens=128,
+            reasoning_effort=None,
+            json_output=True,
+            json_schema=None,
+            tools_enabled=False,
+        )
+
+        assert "text" not in params
+        assert AIService._should_inject_json_prompt("openai", "gpt-5-pro", True, None) is True
+
+    def test_openai_responses_params_use_responses_text_format_shape(self, ai_service_instance):
+        """Responses API text.format does not use Chat Completions json_schema nesting."""
+
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["decision"],
+            "properties": {"decision": {"type": "string"}},
+        }
+        params = ai_service_instance._build_openai_responses_tool_params(
+            model_id="gpt-5-pro",
+            current_messages=[{"role": "user", "content": "Return a decision"}],
+            max_tokens=128,
+            reasoning_effort=None,
+            json_output=True,
+            json_schema=schema,
+            tools_enabled=False,
+        )
+
+        assert params["text"] == {
+            "format": {
+                "type": "json_schema",
+                "name": "structured_output",
+                "strict": True,
+                "schema": schema,
+            }
+        }
+        assert "json_schema" not in params["text"]["format"]
+
+    @pytest.mark.asyncio
+    async def test_generate_openai_responses_paths_use_responses_text_format_shape(self, ai_service_instance):
+        """Non-tool-loop Responses calls use the same direct text.format contract."""
+
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["decision"],
+            "properties": {"decision": {"type": "string"}},
+        }
+        captured_params = []
+
+        async def create(**kwargs):
+            captured_params.append(kwargs)
+            return SimpleNamespace(output_text='{"decision":"ok"}', usage=None)
+
+        ai_service_instance.openai_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create)
+        )
+
+        await ai_service_instance._generate_openai(
+            prompt="Return a decision",
+            model_id="o3-pro",
+            temperature=0.7,
+            max_tokens=128,
+            system_prompt="system",
+            json_output=True,
+            json_schema=schema,
+        )
+        await ai_service_instance._generate_openai(
+            prompt="Return a decision",
+            model_id="gpt-5-pro",
+            temperature=0.7,
+            max_tokens=128,
+            system_prompt="system",
+            json_output=True,
+            json_schema=schema,
+        )
+
+        assert len(captured_params) == 2
+        for params in captured_params:
+            assert params["text"] == {
+                "format": {
+                    "type": "json_schema",
+                    "name": "structured_output",
+                    "strict": True,
+                    "schema": schema,
+                }
+            }
+            assert "json_schema" not in params["text"]["format"]
+
 
 class TestInjectClaudeThinkingParams:
     """Tests for _inject_claude_thinking_params() method."""
@@ -2108,34 +2925,52 @@ class TestGenerationToolLoop:
     ):
         """
         Given: An OpenRouter model using the validation tool loop
-        When: The model calls validate_draft with an approved draft
-        Then: The OpenRouter client is used and the validated draft is returned
+        When: The model streams validate_draft with an approved draft
+        Then: The OpenRouter client is used with real streaming and the validated draft is returned
         """
+
+        class FakeAsyncStream:
+            def __aiter__(self):
+                async def iterator():
+                    yield SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(
+                                    content=None,
+                                    tool_calls=[
+                                        SimpleNamespace(
+                                            index=0,
+                                            id="call-1",
+                                            type="function",
+                                            function=SimpleNamespace(
+                                                name="validate_draft",
+                                                arguments='{"text":"validated via openrouter"}',
+                                            ),
+                                        )
+                                    ],
+                                ),
+                                finish_reason="tool_calls",
+                            )
+                        ],
+                        usage=None,
+                    )
+
+                return iterator()
 
         async def passthrough(operation, **kwargs):
             return await operation()
 
-        message = SimpleNamespace(
-            content="",
-            tool_calls=[
-                SimpleNamespace(
-                    id="call-1",
-                    function=SimpleNamespace(
-                        name="validate_draft",
-                        arguments='{"text":"validated via openrouter"}',
-                    ),
-                )
-            ],
-        )
-        response = SimpleNamespace(
-            choices=[SimpleNamespace(message=message)],
-            usage=None,
-        )
+        events = []
+
+        async def tool_event_callback(event_type: str, payload: Dict[str, Any]) -> None:
+            events.append((event_type, payload))
 
         ai_service_instance.openrouter_client = Mock()
         ai_service_instance.openrouter_client.chat = Mock()
         ai_service_instance.openrouter_client.chat.completions = Mock()
-        ai_service_instance.openrouter_client.chat.completions.create = AsyncMock(return_value=response)
+        ai_service_instance.openrouter_client.chat.completions.create = AsyncMock(
+            return_value=FakeAsyncStream()
+        )
         ai_service_instance.openai_client = Mock()
         ai_service_instance.openai_client.chat = Mock()
         ai_service_instance.openai_client.chat.completions = Mock()
@@ -2167,6 +3002,7 @@ class TestGenerationToolLoop:
             model="or-meta",
             validation_callback=lambda _: _approved_result(),
             max_tool_rounds=2,
+            tool_event_callback=tool_event_callback,
         )
 
         assert content == "validated via openrouter"
@@ -2174,6 +3010,184 @@ class TestGenerationToolLoop:
         assert envelope.accepted is True
         ai_service_instance.openrouter_client.chat.completions.create.assert_awaited_once()
         ai_service_instance.openai_client.chat.completions.create.assert_not_called()
+        request_kwargs = ai_service_instance.openrouter_client.chat.completions.create.await_args.kwargs
+        assert request_kwargs["stream"] is True
+        assert request_kwargs["stream_options"] == {"include_usage": True}
+        assert request_kwargs["extra_body"] == {"provider": {"require_parameters": True}}
+        event_types = [event_type for event_type, _payload in events]
+        assert "tool_call_delta" in event_types
+        assert "tool_call_ready" in event_types
+        assert any(
+            payload.get("provider") == "openrouter"
+            and payload.get("api_surface") == "chat_completions"
+            and payload.get("tool_calls") == 1
+            for event_type, payload in events
+            if event_type == "tool_loop_turn_done"
+        )
+
+    @pytest.mark.asyncio
+    async def test_openrouter_tool_loop_skips_model_without_tools(
+        self, ai_service_instance, mock_config
+    ):
+        """
+        Given: An OpenRouter model without a tools supported_parameter
+        When: The validation tool loop is requested
+        Then: The loop is skipped before any provider call
+        """
+
+        ai_service_instance.openrouter_client = Mock()
+        ai_service_instance.openrouter_client.chat = Mock()
+        ai_service_instance.openrouter_client.chat.completions = Mock()
+        ai_service_instance.openrouter_client.chat.completions.create = AsyncMock()
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "model_info": {"provider": "openrouter", "model_id": "vendor/no-tools"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+        mock_config.model_specs = {
+            "model_specifications": {
+                "openrouter": {
+                    "vendor/no-tools": {
+                        "model_id": "vendor/no-tools",
+                        "supported_parameters": ["temperature"],
+                    }
+                }
+            }
+        }
+
+        content, envelope = await ai_service_instance.call_ai_with_validation_tools(
+            prompt="Write something long.",
+            model="or-no-tools",
+            validation_callback=lambda _: _approved_result(),
+            max_tool_rounds=2,
+        )
+
+        assert content == ""
+        assert isinstance(envelope, ToolLoopEnvelope)
+        assert envelope.tools_skipped_reason == "no_tool_support"
+        ai_service_instance.openrouter_client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_xai_tool_loop_streams_tool_call_deltas(
+        self, ai_service_instance, mock_config
+    ):
+        """
+        Given: A Grok model using the validation tool loop
+        When: xAI streams an OpenAI-compatible tool call
+        Then: The turn uses real streaming and the validated draft is returned
+        """
+
+        class FakeAsyncStream:
+            def __aiter__(self):
+                async def iterator():
+                    yield SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content="Checking draft..."),
+                                finish_reason=None,
+                            )
+                        ],
+                        usage=None,
+                    )
+                    yield SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(
+                                    content=None,
+                                    tool_calls=[
+                                        SimpleNamespace(
+                                            index=0,
+                                            id="call-xai-1",
+                                            type="function",
+                                            function=SimpleNamespace(
+                                                name="validate_draft",
+                                                arguments='{"text":"validated via xai stream"}',
+                                            ),
+                                        )
+                                    ],
+                                ),
+                                finish_reason="tool_calls",
+                            )
+                        ],
+                        usage=SimpleNamespace(total_tokens=42),
+                    )
+
+                return iterator()
+
+        async def passthrough(operation, **kwargs):
+            return await operation()
+
+        events = []
+
+        async def tool_event_callback(event_type: str, payload: Dict[str, Any]) -> None:
+            events.append((event_type, payload))
+
+        create = AsyncMock(return_value=FakeAsyncStream())
+        ai_service_instance.xai_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+        ai_service_instance.openai_client = Mock()
+        ai_service_instance.openai_client.chat = Mock()
+        ai_service_instance.openai_client.chat.completions = Mock()
+        ai_service_instance.openai_client.chat.completions.create = AsyncMock()
+        ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "model_info": {"provider": "xai", "model_id": "grok-4-fast-non-reasoning"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+        mock_config.model_specs = {
+            "model_specifications": {
+                "xai": {
+                    "grok-4-fast-non-reasoning": {
+                        "model_id": "grok-4-fast-non-reasoning",
+                        "capabilities": ["text"],
+                    }
+                }
+            }
+        }
+
+        content, envelope = await ai_service_instance.call_ai_with_validation_tools(
+            prompt="Write something long.",
+            model="grok-4-fast-non-reasoning",
+            validation_callback=lambda _: _approved_result(),
+            max_tool_rounds=2,
+            tool_event_callback=tool_event_callback,
+        )
+
+        assert content == "validated via xai stream"
+        assert isinstance(envelope, ToolLoopEnvelope)
+        assert envelope.accepted is True
+        create.assert_awaited_once()
+        request_kwargs = create.await_args.kwargs
+        assert request_kwargs["stream"] is True
+        assert request_kwargs["stream_options"] == {"include_usage": True}
+        assert request_kwargs["model"] == "grok-4-fast-non-reasoning"
+        assert ai_service_instance.openai_client.chat.completions.create.await_count == 0
+
+        event_types = [event_type for event_type, _payload in events]
+        assert "assistant_delta" in event_types
+        assert "tool_call_delta" in event_types
+        assert "tool_call_ready" in event_types
+        assert "tool_loop_turn_done" in event_types
+        assert event_types.index("tool_call_delta") < event_types.index("tool_call_ready")
+        assert any(
+            payload.get("provider") == "xai"
+            and payload.get("api_surface") == "chat_completions"
+            and payload.get("tool_calls") == 1
+            for event_type, payload in events
+            if event_type == "tool_loop_turn_done"
+        )
 
     @pytest.mark.asyncio
     async def test_claude_tool_loop_handles_tool_use_blocks(
@@ -2202,7 +3216,10 @@ class TestGenerationToolLoop:
 
         ai_service_instance.anthropic_client = Mock()
         ai_service_instance.anthropic_client.messages = Mock()
-        ai_service_instance.anthropic_client.messages.create = AsyncMock(return_value=response)
+        ai_service_instance.anthropic_client.messages.stream = Mock(
+            return_value=_claude_stream_for_response(response)
+        )
+        ai_service_instance.anthropic_client.messages.create = AsyncMock()
         ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
 
         mock_config.validate_token_limits = Mock(
@@ -2225,7 +3242,228 @@ class TestGenerationToolLoop:
         assert content == "validated via claude"
         assert isinstance(envelope, ToolLoopEnvelope)
         assert envelope.accepted is True
+        ai_service_instance.anthropic_client.messages.stream.assert_called_once()
+        ai_service_instance.anthropic_client.messages.create.assert_not_awaited()
+        sent_tool = ai_service_instance.anthropic_client.messages.stream.call_args.kwargs["tools"][0]
+        assert sent_tool["eager_input_streaming"] is True
+
+    @pytest.mark.asyncio
+    async def test_claude_tool_loop_streams_text_and_tool_argument_deltas(
+        self, ai_service_instance, mock_config
+    ):
+        """
+        Given: Claude streams visible text and tool input JSON deltas
+        When: The local validator approves the tool payload
+        Then: Monitor telemetry includes real assistant/tool deltas before tool execution
+        """
+
+        async def passthrough(operation, **kwargs):
+            return await operation()
+
+        response = SimpleNamespace(
+            content=[
+                SimpleNamespace(type="text", text="I will validate this."),
+                SimpleNamespace(
+                    type="tool_use",
+                    id="toolu_stream",
+                    name="validate_draft",
+                    input={"text": "validated via claude stream"},
+                ),
+            ],
+            usage=None,
+            stop_reason="tool_use",
+        )
+        events = []
+
+        async def tool_event_callback(event_type, payload):
+            events.append((event_type, payload))
+
+        ai_service_instance.anthropic_client = Mock()
+        ai_service_instance.anthropic_client.messages = Mock()
+        ai_service_instance.anthropic_client.messages.stream = Mock(
+            return_value=_claude_stream_for_response(response)
+        )
+        ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "model_info": {"provider": "claude", "model_id": "claude-sonnet-4-5"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+
+        content, envelope = await ai_service_instance.call_ai_with_validation_tools(
+            prompt="Write something long.",
+            model="claude-sonnet-4-5",
+            validation_callback=lambda _: _approved_result(),
+            max_tool_rounds=2,
+            tool_event_callback=tool_event_callback,
+        )
+
+        assert content == "validated via claude stream"
+        assert envelope.accepted is True
+        event_types = [event_type for event_type, _payload in events]
+        assert "assistant_delta" in event_types
+        assert "tool_call_delta" in event_types
+        assert "tool_call_ready" in event_types
+        assert event_types.index("tool_call_delta") < event_types.index("tool_call_ready")
+        assert any(
+            payload.get("api_surface") == "messages" and payload.get("streaming") is True
+            for event_type, payload in events
+            if event_type == "tool_loop_turn_done"
+        )
+
+    @pytest.mark.asyncio
+    async def test_claude_tool_loop_does_not_execute_partial_tool_input_on_max_tokens(
+        self, ai_service_instance
+    ):
+        """
+        Given: Claude streams partial tool input but ends with max_tokens
+        When: The stream closes
+        Then: The local validator is not called with truncated arguments
+        """
+
+        partial_events = [
+            SimpleNamespace(
+                type="message_start",
+                message=SimpleNamespace(usage=SimpleNamespace(input_tokens=10)),
+            ),
+            SimpleNamespace(
+                type="content_block_start",
+                index=0,
+                content_block=SimpleNamespace(
+                    type="tool_use",
+                    id="toolu_partial",
+                    name="validate_draft",
+                    input={},
+                ),
+            ),
+            SimpleNamespace(
+                type="content_block_delta",
+                index=0,
+                delta=SimpleNamespace(
+                    type="input_json_delta",
+                    partial_json='{"text": "unfinished',
+                ),
+            ),
+            SimpleNamespace(type="content_block_stop", index=0),
+            _claude_message_delta("max_tokens"),
+            SimpleNamespace(type="message_stop"),
+        ]
+        events = []
+
+        async def tool_event_callback(event_type, payload):
+            events.append((event_type, payload))
+
+        ai_service_instance.anthropic_client = Mock()
+        ai_service_instance.anthropic_client.messages = Mock()
+        ai_service_instance.anthropic_client.messages.stream = Mock(
+            return_value=_FakeClaudeStream(partial_events)
+        )
+
+        with pytest.raises(RuntimeError, match="malformed|unusable"):
+            await ai_service_instance._run_claude_validation_tool_loop(
+                provider="claude",
+                model_id="claude-sonnet-4-5",
+                prompt="Write something long.",
+                validation_callback=Mock(side_effect=AssertionError("must not validate")),
+                temperature=0.2,
+                max_tokens=512,
+                system_prompt="",
+                request_timeout=None,
+                thinking_budget_tokens=None,
+                json_output=False,
+                json_schema=None,
+                usage_callback=None,
+                usage_extra=None,
+                images=None,
+                max_rounds=1,
+                retries_enabled=False,
+                tool_event_callback=tool_event_callback,
+            )
+
+        event_types = [event_type for event_type, _payload in events]
+        assert "tool_call_ready" not in event_types
+        assert "tool_loop_provider_terminal" in event_types
+
+    @pytest.mark.asyncio
+    async def test_claude_structured_tool_loop_streams_via_create_stream(
+        self, ai_service_instance, mock_config
+    ):
+        """
+        Given: Claude structured outputs are active in a tool loop
+        When: The turn is streamed
+        Then: It uses messages.create(stream=True), matching the SDK-safe structured path
+        """
+
+        async def passthrough(operation, **kwargs):
+            return await operation()
+
+        response = SimpleNamespace(
+            content=[
+                SimpleNamespace(
+                    type="tool_use",
+                    id="toolu_structured",
+                    name="validate_draft",
+                    input={"text": '{"ok": true}'},
+                )
+            ],
+            usage=None,
+            stop_reason="tool_use",
+        )
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        }
+
+        ai_service_instance.anthropic_client = Mock()
+        ai_service_instance.anthropic_client.messages = Mock()
+        ai_service_instance.anthropic_client.messages.create = AsyncMock(
+            return_value=_claude_stream_for_response(response)
+        )
+        ai_service_instance.anthropic_client.messages.stream = Mock()
+        ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "model_info": {"provider": "claude", "model_id": "claude-sonnet-4-5"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+
+        def configure_structured(params, json_schema):
+            params["output_config"] = {"format": {"type": "json_schema", "schema": json_schema}}
+            return False
+
+        with patch.object(AIService, "_claude_supports_structured_outputs", return_value=True), patch.object(
+            ai_service_instance,
+            "_configure_claude_structured_output_params",
+            side_effect=configure_structured,
+        ):
+            content, envelope = await ai_service_instance.call_ai_with_validation_tools(
+                prompt="Write structured JSON.",
+                model="claude-sonnet-4-5",
+                validation_callback=lambda _: _approved_result(),
+                max_tool_rounds=2,
+                output_contract=OutputContract.JSON_STRUCTURED,
+                response_format=schema,
+            )
+
+        assert content == '{"ok": true}'
+        assert envelope.payload == {"ok": True}
         ai_service_instance.anthropic_client.messages.create.assert_awaited_once()
+        ai_service_instance.anthropic_client.messages.stream.assert_not_called()
+        create_kwargs = ai_service_instance.anthropic_client.messages.create.await_args.kwargs
+        assert create_kwargs["stream"] is True
+        assert create_kwargs["tools"][0]["eager_input_streaming"] is True
 
     @pytest.mark.asyncio
     async def test_claude_tool_loop_forces_final_turn_after_exhaustion(
@@ -2258,9 +3496,14 @@ class TestGenerationToolLoop:
 
         ai_service_instance.anthropic_client = Mock()
         ai_service_instance.anthropic_client.messages = Mock()
-        ai_service_instance.anthropic_client.messages.create = AsyncMock(
-            side_effect=[tool_response, tool_response, final_response]
+        ai_service_instance.anthropic_client.messages.stream = Mock(
+            side_effect=[
+                _claude_stream_for_response(tool_response),
+                _claude_stream_for_response(tool_response),
+                _claude_stream_for_response(final_response, stop_reason="end_turn"),
+            ]
         )
+        ai_service_instance.anthropic_client.messages.create = AsyncMock()
         ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
 
         mock_config.validate_token_limits = Mock(
@@ -2286,7 +3529,8 @@ class TestGenerationToolLoop:
         assert content == "valid claude final answer"
         assert envelope.accepted_via == "forced_final_turn"
         assert envelope.accepted is True
-        assert ai_service_instance.anthropic_client.messages.create.await_count == 3
+        assert ai_service_instance.anthropic_client.messages.stream.call_count == 3
+        ai_service_instance.anthropic_client.messages.create.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_claude_tool_loop_overflow_prefers_validate_draft_tool(
@@ -2330,7 +3574,10 @@ class TestGenerationToolLoop:
 
         ai_service_instance.anthropic_client = Mock()
         ai_service_instance.anthropic_client.messages = Mock()
-        ai_service_instance.anthropic_client.messages.create = AsyncMock(return_value=response)
+        ai_service_instance.anthropic_client.messages.stream = Mock(
+            return_value=_claude_stream_for_response(response)
+        )
+        ai_service_instance.anthropic_client.messages.create = AsyncMock()
         ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
         ai_service_instance.audit_accent = AsyncMock(
             return_value={"approved": True, "score": 10.0, "findings": [], "verdict_summary": ""}

@@ -1205,10 +1205,9 @@ class Arbiter:
         Returns ``False`` when:
 
         - ``mode == "never"`` (user explicitly disabled).
-        - Model resolves to the OpenAI Responses API (single-shot only — the
-          tool loop does not support that API today).
         - Provider is outside the supported matrix
           (``openai``, ``openrouter``, ``xai``, ``claude``, ``gemini``).
+        - Model does not advertise tool-calling support.
 
         Returns ``True`` otherwise. Unknown / unresolvable models fall back
         to ``False`` (fail-closed — no tools if we can't prove support).
@@ -1229,9 +1228,6 @@ class Arbiter:
         provider_raw = info.get("provider", "") if isinstance(info, dict) else ""
         model_id = info.get("model_id", model) if isinstance(info, dict) else model
         provider_key = AIService._normalize_tool_loop_provider(provider_raw)
-
-        if provider_key == "openai" and AIService._is_openai_responses_api_model(model_id):
-            return False
 
         if not AIService._supports_tool_calling(provider_key, str(model_id).lower()):
             return False

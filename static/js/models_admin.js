@@ -103,6 +103,9 @@
     const capabilities = normalizeCapabilities(
       entry.capabilities || entry.features || entry.modalities || entry.tags
     );
+    const supportedParameters = normalizeCapabilities(
+      entry.supported_parameters || entry.supportedParameters || entry.raw?.supported_parameters
+    );
     const contextWindow =
       Number(
         entry.context_window ??
@@ -133,6 +136,7 @@
       context_window: contextWindow,
       pricing,
       capabilities,
+      supported_parameters: supportedParameters,
       verified_at: entry.verified_at || entry.updated_at || entry.created_at || "",
       created_at: entry.created_at || entry.remote_created_at || "",
       source,
@@ -243,6 +247,7 @@
       output_tokens: model.output_tokens || 0,
       pricing: model.pricing || {},
       capabilities: [...(model.capabilities || [])].sort(),
+      supported_parameters: [...(model.supported_parameters || [])].sort(),
       source: model.source || "",
     };
     return JSON.stringify(payload);
@@ -1067,6 +1072,10 @@
         { key: "description", label: "Description" },
         { key: "source", label: "Source" },
       ];
+      const listFields = [
+        { key: "capabilities", label: "Capabilities" },
+        { key: "supported_parameters", label: "Supported parameters" },
+      ];
       const pricingFields = [
         { key: "input_per_million", label: "Input $/M" },
         { key: "output_per_million", label: "Output $/M" },
@@ -1089,6 +1098,16 @@
         const newVal = remoteModel.pricing?.[f.key];
         if (oldVal !== newVal) {
           diffs += `<div class="diff-field">${escapeHtml(f.label)}: <span class="diff-old">${formatMoney(oldVal)}</span> -> <span class="diff-new">${formatMoney(newVal)}</span></div>`;
+        }
+      }
+
+      for (const f of listFields) {
+        const oldVal = [...toArray(localModel[f.key])].sort();
+        const newVal = [...toArray(remoteModel[f.key])].sort();
+        const oldStr = oldVal.join(", ");
+        const newStr = newVal.join(", ");
+        if (oldStr !== newStr) {
+          diffs += `<div class="diff-field">${escapeHtml(f.label)}: <span class="diff-old">${escapeHtml(oldStr || "-")}</span> -> <span class="diff-new">${escapeHtml(newStr || "-")}</span></div>`;
         }
       }
 
@@ -1199,6 +1218,7 @@
       if (remote.pricing?.output_per_million !== local.pricing?.output_per_million) changes.push("output price");
       if (remote.output_tokens !== local.output_tokens) changes.push("output tokens");
       if (remote.name !== local.name) changes.push("name");
+      if ([...toArray(remote.supported_parameters)].sort().join(",") !== [...toArray(local.supported_parameters)].sort().join(",")) changes.push("supported parameters");
       return changes.length > 0 ? changes.join(", ") : "metadata";
     }
 

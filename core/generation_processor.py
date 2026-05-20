@@ -682,6 +682,157 @@ def _set_last_generated_content_metrics(session: Dict[str, Any], content: str) -
     session["last_generated_content_word_count"] = count_words(content) if content else 0
 
 
+def _read_json_string_at(source: str, start: int) -> Tuple[str, int, bool]:
+    """Read a JSON string from ``source`` starting at ``start``.
+
+    The reader accepts partial input so streamed tool arguments can expose the
+    decoded ``text`` field before the full JSON object is complete.
+    """
+
+    if start >= len(source) or source[start] != '"':
+        return "", start, False
+
+    chars: List[str] = []
+    i = start + 1
+    while i < len(source):
+        char = source[i]
+        if char == '"':
+            return "".join(chars), i + 1, True
+        if char != "\\":
+            chars.append(char)
+            i += 1
+            continue
+
+        i += 1
+        if i >= len(source):
+            return "".join(chars), i, False
+        escaped = source[i]
+        if escaped == "u":
+            hex_start = i + 1
+            hex_end = hex_start + 4
+            if hex_end > len(source):
+                return "".join(chars), len(source), False
+            hex_digits = source[hex_start:hex_end]
+            try:
+                chars.append(chr(int(hex_digits, 16)))
+            except ValueError:
+                chars.append("\\u" + hex_digits)
+            i = hex_end
+            continue
+
+        chars.append(
+            {
+                '"': '"',
+                "\\": "\\",
+                "/": "/",
+                "b": "\b",
+                "f": "\f",
+                "n": "\n",
+                "r": "\r",
+                "t": "\t",
+            }.get(escaped, escaped)
+        )
+        i += 1
+
+    return "".join(chars), i, False
+
+
+def _find_json_string_field_value_start(source: str, field_name: str) -> Optional[int]:
+    """Return the opening-offset payload for a JSON string field, if present."""
+
+    i = 0
+    while i < len(source):
+        if source[i] != '"':
+            i += 1
+            continue
+
+        key, after_key, complete = _read_json_string_at(source, i)
+        if not complete:
+            return None
+
+        cursor = after_key
+        while cursor < len(source) and source[cursor].isspace():
+            cursor += 1
+        if cursor >= len(source) or source[cursor] != ":":
+            i = after_key
+            continue
+        cursor += 1
+        while cursor < len(source) and source[cursor].isspace():
+            cursor += 1
+
+        if key == field_name and cursor < len(source) and source[cursor] == '"':
+            return cursor
+        i = after_key
+
+    return None
+
+
+def _decode_partial_json_string_field(source: str, field_name: str) -> str:
+    """Decode the partial string value for ``field_name`` from a JSON object."""
+
+    value_start = _find_json_string_field_value_start(source, field_name)
+    if value_start is None:
+        return ""
+    value, _end, _complete = _read_json_string_at(source, value_start)
+    return value
+
+
+def _tool_loop_stream_state_key(payload: Dict[str, Any]) -> Tuple[str, str, str, str, str, str]:
+    """Build a stable key for one streamed tool-call argument buffer."""
+
+    index = payload.get("index")
+    call_id = payload.get("tool_call_id")
+    return (
+        str(payload.get("loop_scope") or ""),
+        str(payload.get("provider") or ""),
+        str(payload.get("model") or ""),
+        str(payload.get("api_surface") or ""),
+        str(payload.get("turn") or ""),
+        str(index if index is not None else (call_id or "")),
+    )
+
+
+def _tool_loop_visible_chunk(
+    event_type: str,
+    payload: Dict[str, Any],
+    stream_state: Optional[Dict[Tuple[str, str, str, str, str, str], Dict[str, Any]]] = None,
+) -> Optional[str]:
+    """Return user-readable text for live tool-loop deltas."""
+
+    if event_type == "assistant_delta":
+        content = payload.get("content")
+        if isinstance(content, str) and content:
+            return content
+        return None
+
+    if event_type != "tool_call_delta" or stream_state is None:
+        return None
+
+    delta = payload.get("delta")
+    if not isinstance(delta, str) or not delta:
+        return None
+
+    key = _tool_loop_stream_state_key(payload)
+    state = stream_state.setdefault(key, {"arguments": "", "visible_chars": 0})
+    state["arguments"] = str(state.get("arguments") or "") + delta
+
+    decoded_text = _decode_partial_json_string_field(str(state["arguments"]), "text")
+    previous_chars = int(state.get("visible_chars") or 0)
+    if len(decoded_text) <= previous_chars:
+        return None
+
+    state["visible_chars"] = len(decoded_text)
+    return decoded_text[previous_chars:]
+
+
+def _tool_loop_publish_event_name(event_type: str, content: Optional[str]) -> str:
+    """Return the monitor event name for tool-loop telemetry."""
+
+    if content:
+        return "chunk"
+    return str(event_type) if event_type else "tool_event"
+
+
 def _make_gran_sabio_tool_event_callback(session_id: str, session: Dict[str, Any]):
     """Build a pre-bound tool-loop event callback for a GranSabio invocation.
 
@@ -694,16 +845,18 @@ def _make_gran_sabio_tool_event_callback(session_id: str, session: Dict[str, Any
     if not project_id:
         return None
     request_name = session.get("request_name")
+    tool_stream_state: Dict[Tuple[str, str, str, str, str, str], Dict[str, Any]] = {}
 
     async def _gran_sabio_tool_event_callback(event_type: str, payload: Dict[str, Any]) -> None:
         try:
+            visible_chunk = _tool_loop_visible_chunk(str(event_type), payload, tool_stream_state)
             await publish_project_phase_chunk(
                 project_id,
                 "gran_sabio",
-                None,
+                visible_chunk,
                 session_id=session_id,
                 request_name=request_name,
-                event=str(event_type) if event_type else "tool_event",
+                event=_tool_loop_publish_event_name(str(event_type), visible_chunk),
                 data=payload,
             )
         except Exception:
@@ -721,17 +874,19 @@ def _make_generation_tool_event_callback(session_id: str, session: Dict[str, Any
         return None
     request_name = session.get("request_name")
     project_epoch = session.get("project_epoch")
+    tool_stream_state: Dict[Tuple[str, str, str, str, str, str], Dict[str, Any]] = {}
 
     async def _generation_tool_event_callback(event_type: str, payload: Dict[str, Any]) -> None:
         try:
+            visible_chunk = _tool_loop_visible_chunk(str(event_type), payload, tool_stream_state)
             await publish_project_phase_chunk(
                 project_id,
                 "generation",
-                None,
+                visible_chunk,
                 session_id=session_id,
                 project_epoch=project_epoch,
                 request_name=request_name,
-                event=str(event_type) if event_type else "tool_event",
+                event=_tool_loop_publish_event_name(str(event_type), visible_chunk),
                 data=payload,
             )
         except Exception:
@@ -871,9 +1026,6 @@ def _should_use_generation_tools(request: ContentRequest) -> bool:
     model_id = str(model_info.get("model_id", "")).lower()
     provider_key = (provider or "").lower()
     supported = AIService._supports_tool_calling(provider_key, model_id)
-
-    if provider_key == "openai" and AIService._is_openai_responses_api_model(model_id):
-        supported = False
 
     return supported
 
@@ -1201,7 +1353,7 @@ async def _generate_full_content(
         else:
             # Proposal §3.7: ``call_ai_with_validation_tools`` may return an
             # envelope with ``tools_skipped_reason`` set when it consciously
-            # bypassed the tool loop (Responses API / no tool support) or hit
+            # bypassed the tool loop (no tool support) or hit
             # a fail-fast gate (context_too_large). Inspect before treating
             # any returned tuple as a successful generation.
             skipped_reason = getattr(tool_metadata, "tools_skipped_reason", None)
@@ -1212,7 +1364,7 @@ async def _generate_full_content(
                     f"Generator prompt exceeds model context window "
                     f"(model={request.generator_model})"
                 )
-            if skipped_reason in {"responses_api", "no_tool_support"}:
+            if skipped_reason == "no_tool_support":
                 # Centralised provider fallback: let execution continue into
                 # the standard streaming generation path below.
                 await add_verbose_log(
@@ -3048,19 +3200,25 @@ async def _process_all_layers_with_edits(
 
         _arbiter_project_id = session.get("project_id")
         _arbiter_request_name = session.get("request_name")
+        _arbiter_tool_stream_state: Dict[Tuple[str, str, str, str, str, str], Dict[str, Any]] = {}
 
         async def _arbiter_tool_event_callback(event_type: str, payload: Dict[str, Any]) -> None:
             """Forward Arbiter tool-loop events to the project stream under phase="arbiter"."""
             if not _arbiter_project_id:
                 return
             try:
+                visible_chunk = _tool_loop_visible_chunk(
+                    str(event_type),
+                    payload,
+                    _arbiter_tool_stream_state,
+                )
                 await publish_project_phase_chunk(
                     _arbiter_project_id,
                     "arbiter",
-                    None,
+                    visible_chunk,
                     session_id=session_id,
                     request_name=_arbiter_request_name,
-                    event=str(event_type) if event_type else "tool_event",
+                    event=_tool_loop_publish_event_name(str(event_type), visible_chunk),
                     data=payload,
                 )
             except Exception:
@@ -3083,6 +3241,8 @@ async def _process_all_layers_with_edits(
     # without importing ``app_state``.
     _qa_project_id = session.get("project_id")
     _qa_request_name = session.get("request_name")
+    _qa_tool_stream_state: Dict[Tuple[str, str, str, str, str, str], Dict[str, Any]] = {}
+    _qa_visible_started: set[Tuple[str, str]] = set()
 
     async def _qa_tool_event_callback(event_type: str, payload: Dict[str, Any]) -> None:
         """Forward QA tool-loop events to the project stream under phase="qa".
@@ -3093,14 +3253,31 @@ async def _process_all_layers_with_edits(
         if not _qa_project_id:
             return
         try:
+            visible_chunk = _tool_loop_visible_chunk(
+                str(event_type),
+                payload,
+                _qa_tool_stream_state,
+            )
+            qa_layer = str(payload.get("qa_layer") or "")
+            qa_model = str(payload.get("qa_model") or payload.get("model") or "")
+
+            if visible_chunk and qa_layer and qa_model:
+                visible_key = (qa_model, qa_layer)
+                if visible_key not in _qa_visible_started:
+                    visible_chunk = f"\n\n {qa_model} evaluating {qa_layer}:\n{visible_chunk}"
+                    _qa_visible_started.add(visible_key)
+                session["qa_content"] = str(session.get("qa_content", "")) + visible_chunk
+
             await publish_project_phase_chunk(
                 _qa_project_id,
                 "qa",
-                None,
+                visible_chunk,
                 session_id=session_id,
                 request_name=_qa_request_name,
-                event=str(event_type) if event_type else "tool_event",
+                event=_tool_loop_publish_event_name(str(event_type), visible_chunk),
                 data=payload,
+                qa_layer=qa_layer or None,
+                qa_model=qa_model or None,
             )
         except Exception:
             # Never let telemetry failures break QA execution.

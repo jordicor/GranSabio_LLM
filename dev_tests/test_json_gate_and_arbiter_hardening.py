@@ -29,9 +29,9 @@ class TestJsonPromptGate:
 
         assert AIService._should_inject_json_prompt("openrouter", "mistralai/mistral-large", True, schema) is True
 
-    def test_skips_prompt_instructions_for_openai_responses_models_with_effective_schema(self):
-        assert AIService._should_inject_json_prompt("openai", "o3-pro", True, None) is False
-        assert AIService._should_inject_json_prompt("openai", "gpt-5-pro", True, None) is False
+    def test_keeps_prompt_instructions_for_openai_responses_json_without_schema(self):
+        assert AIService._should_inject_json_prompt("openai", "o3-pro", True, None) is True
+        assert AIService._should_inject_json_prompt("openai", "gpt-5-pro", True, None) is True
 
     def test_keeps_prompt_instructions_for_json_mode_without_native_schema(self):
         assert AIService._should_inject_json_prompt("openai", "gpt-4o", True, None) is True

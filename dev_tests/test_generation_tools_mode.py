@@ -127,15 +127,17 @@ def test_auto_mode_rejects_models_without_tool_calling_support():
         assert _should_use_generation_tools(request) is False
 
 
-def test_auto_mode_rejects_openai_responses_api_models():
+def test_auto_mode_accepts_openai_responses_api_models_with_tool_support():
     request = SimpleNamespace(
         generation_tools_mode="auto",
         generator_model="gpt-5-pro",
     )
 
     with patch("core.generation_processor.has_active_generation_validators", return_value=True), \
-         patch("core.generation_processor.config", Mock(get_model_info=Mock(return_value={"provider": "openai", "model_id": "gpt-5-pro"}))):
-        assert _should_use_generation_tools(request) is False
+         patch("core.generation_processor.config", Mock(get_model_info=Mock(return_value={"provider": "openai", "model_id": "gpt-5-pro"}))), \
+         patch("core.generation_processor.AIService._is_openai_responses_api_model", return_value=True), \
+         patch("core.generation_processor.AIService._supports_tool_calling", return_value=True):
+        assert _should_use_generation_tools(request) is True
 
 
 def test_auto_mode_does_not_force_unsupported_provider():

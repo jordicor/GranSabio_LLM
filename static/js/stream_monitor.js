@@ -49,8 +49,19 @@ const KNOWN_STRUCTURED_EVENTS = new Set([
     'context_overflow_midloop',
     'force_finalize',
     'tool_call_start',
+    'tool_call_delta',
+    'tool_call_ready',
     'tool_call_result',
     'tool_call_error',
+    'tool_loop_turn_start',
+    'tool_loop_turn_done',
+    'tool_loop_budget_state',
+    'tool_loop_budget_warning',
+    'assistant_delta',
+    'thinking_delta',
+    'assistant_text_done',
+    'provider_usage_delta',
+    'tool_loop_provider_terminal',
     'tool_loop_error',
     'tool_loop_complete',
 ]);
@@ -1883,7 +1894,16 @@ function summarizeStructuredPayload(payload) {
 
     const interestingKeys = [
         'turn',
+        'model',
+        'api_surface',
+        'streaming',
+        'tool',
         'tool_name',
+        'tool_calls',
+        'remaining_tool_calls',
+        'arguments_chars',
+        'assistant_text_chars',
+        'finish_reason',
         'score',
         'hard_failed',
         'decision',
@@ -1922,6 +1942,17 @@ function parseGroundingPayload(data) {
 function formatStructuredEventLine(data) {
     const eventType = data.type || 'unknown';
     const payloadSummary = summarizeStructuredPayload(data.data);
+
+    if (eventType === 'assistant_delta') {
+        const delta = data.data && typeof data.data.content === 'string'
+            ? data.data.content
+            : '';
+        return `[TOOL_STREAM] assistant_delta${payloadSummary ? ' ' + payloadSummary : ''}${delta ? ` text=${JSON.stringify(delta)}` : ''}\n`;
+    }
+
+    if (eventType === 'tool_call_delta') {
+        return '';
+    }
 
     if (eventType === 'retry_start' || eventType === 'retry') {
         const attempt = data.attempt !== undefined ? `attempt ${data.attempt}/${data.max_attempts || '?'}` : 'attempt ?';
@@ -2066,6 +2097,9 @@ function handleStructuredEvent(data) {
     }
 
     const line = formatStructuredEventLine(data);
+    if (!line) {
+        return;
+    }
     appendStructuredEventForRequest(data, line, displayPhase);
 }
 

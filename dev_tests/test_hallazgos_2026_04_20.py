@@ -250,7 +250,6 @@ async def test_generator_handles_context_too_large_envelope():
     # exact signal is preserved so the guard's comparison works.
     assert envelope.tools_skipped_reason in {
         "context_too_large",
-        "responses_api",
         "no_tool_support",
     }
 

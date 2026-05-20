@@ -4,8 +4,8 @@ Covers the scope described in PROPOSAL_TOOLS_FOR_QA_ARBITER_GRANSABIO.md
 §3.4.1, §4.3, §4.11 and §4.14:
 
 - ``_should_use_qa_tools`` activation matrix (structured validators present,
-  ``qa_tools_mode="never"``, bypassable layer, Responses API models,
-  unsupported providers, no validators).
+  ``qa_tools_mode="never"``, bypassable layer, OpenAI Responses API models
+  with tool support, unsupported providers, no validators).
 - ``build_measurement_request_for_layer`` whitelist (carries only the
   allowed fields; returns ``None`` when nothing applies).
 - Integration: ``QAEvaluationService.evaluate_content`` routes through
@@ -258,21 +258,25 @@ def test_should_use_qa_tools_false_when_no_structured_validators():
         )
 
 
-def test_should_use_qa_tools_false_for_responses_api_model():
+def test_should_use_qa_tools_true_for_responses_api_model_with_tool_support():
     request = _make_request()
     layer = _make_layer()
     bypass_engine = Mock()
     bypass_engine.can_bypass_layer = Mock(return_value=False)
-    with _patch_model_info(provider="openai", model_id="o3-pro"), \
+    with _patch_model_info(provider="openai", model_id="gpt-5-pro"), \
          patch(
              "qa_evaluation_service.AIService._is_openai_responses_api_model",
+             return_value=True,
+         ), \
+         patch(
+             "qa_evaluation_service.AIService._supports_tool_calling",
              return_value=True,
          ):
         assert (
             _should_use_qa_tools(
-                request, layer, "o3-pro", bypass_engine=bypass_engine
+                request, layer, "gpt-5-pro", bypass_engine=bypass_engine
             )
-            is False
+            is True
         )
 
 

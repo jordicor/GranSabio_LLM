@@ -11,8 +11,8 @@ Covers:
 3. ``review_iterations`` routes with JSON_STRUCTURED + measurement over the
    best iteration's content.
 4. ``handle_model_conflict`` is no longer importable/callable on the engine.
-5. ``_should_use_gransabio_tools`` gating: ``"never"`` mode, unsupported
-   provider, and Responses API models each return False.
+5. ``_should_use_gransabio_tools`` gating: ``"never"`` mode and unsupported
+   providers return False; Responses API models with tool support return True.
 """
 
 from __future__ import annotations
@@ -163,17 +163,17 @@ class TestShouldUseGransabioTools:
         request = ContentRequest(prompt="Test prompt content", gransabio_tools_mode="auto")
         assert _should_use_gransabio_tools(request, "weird-model") is False
 
-    def test_responses_api_model_returns_false(self, tool_loop_config):
+    def test_responses_api_model_with_tool_support_returns_true(self, tool_loop_config):
         tool_loop_config.get_model_info.return_value = {
             "provider": "openai",
-            "model_id": "o3-pro",
+            "model_id": "gpt-5-pro",
         }
         request = ContentRequest(prompt="Test prompt content", gransabio_tools_mode="auto")
         with patch(
             "gran_sabio.AIService._is_openai_responses_api_model",
             return_value=True,
-        ):
-            assert _should_use_gransabio_tools(request, "o3-pro") is False
+        ), patch("gran_sabio.AIService._supports_tool_calling", return_value=True):
+            assert _should_use_gransabio_tools(request, "gpt-5-pro") is True
 
 
 class TestReviewMinorityUsesToolLoop:

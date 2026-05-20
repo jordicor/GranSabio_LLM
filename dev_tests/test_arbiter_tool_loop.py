@@ -11,8 +11,8 @@ Covers:
   asks for something specific in a long prompt, the Arbiter prompt must not
   truncate it to 1000 chars. This regression guarded the Phase 0
   truncation removal.
-- **Gate** — ``_should_use_arbiter_tools`` honours ``never`` mode, Responses
-  API models, and unsupported providers.
+- **Gate** — ``_should_use_arbiter_tools`` honours ``never`` mode,
+  unsupported providers, and model tool-calling capability.
 """
 
 from __future__ import annotations
@@ -111,15 +111,15 @@ class TestShouldUseArbiterTools:
         with patch("config.config", fake_config):
             assert Arbiter._should_use_arbiter_tools("auto", "mystery-model") is False
 
-    def test_responses_api_model_returns_false(self):
+    def test_responses_api_model_with_tool_support_returns_true(self):
         fake_config = MagicMock()
         fake_config.get_model_info.return_value = {
-            "provider": "openai", "model_id": "o3-pro",
+            "provider": "openai", "model_id": "gpt-5-pro",
         }
         with patch("config.config", fake_config), patch(
             "ai_service.AIService._is_openai_responses_api_model", return_value=True
-        ):
-            assert Arbiter._should_use_arbiter_tools("auto", "o3-pro") is False
+        ), patch("ai_service.AIService._supports_tool_calling", return_value=True):
+            assert Arbiter._should_use_arbiter_tools("auto", "gpt-5-pro") is True
 
     def test_unsupported_provider_returns_false(self):
         fake_config = MagicMock()

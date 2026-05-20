@@ -26,6 +26,8 @@ MANIFEST
 # Virtual environments
 venv/
 .venv/
+.venv-win/
+.venv-linux/
 env/
 ENV/
 env.bak/

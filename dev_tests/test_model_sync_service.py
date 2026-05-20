@@ -49,6 +49,7 @@ def sample_model_specs():
                     "context_window": 256000,
                     "pricing": {"input_per_million": 0.0, "output_per_million": 0.0},
                     "capabilities": ["text", "vision"],
+                    "supported_parameters": ["tools", "tool_choice"],
                     "verified_at": "2025-01-02T00:00:00+00:00",
                     "sync_metadata": {
                         "managed_by_ui": True,
@@ -108,6 +109,7 @@ def test_get_local_catalog_includes_sync_metadata(service):
     assert catalog["models"][0]["source_status"] == "needs_review"
     assert catalog["models"][1]["provider"] == "openrouter"
     assert catalog["models"][1]["source_status"] == "synced"
+    assert catalog["models"][1]["supported_parameters"] == ["tools", "tool_choice"]
 
 
 def test_sync_provider_reloads_config_and_creates_backup(service):
@@ -122,6 +124,7 @@ def test_sync_provider_reloads_config_and_creates_backup(service):
             "output_tokens": 8192,
             "pricing": {"input_per_million": 0.0, "output_per_million": 0.0},
             "capabilities": ["text", "vision"],
+            "supported_parameters": ["tools", "tool_choice", "response_format"],
             "source": "https://openrouter.ai/models/meta-llama/llama-4-scout",
         }
     ]
@@ -139,6 +142,11 @@ def test_sync_provider_reloads_config_and_creates_backup(service):
     updated = json.loads(service.specs_path.read_text(encoding="utf-8"))
     assert "openrouter" in updated["model_specifications"]
     assert "meta-llama/llama-4-scout" in updated["model_specifications"]["openrouter"]
+    assert updated["model_specifications"]["openrouter"]["meta-llama/llama-4-scout"]["supported_parameters"] == [
+        "tools",
+        "tool_choice",
+        "response_format",
+    ]
     assert updated["token_validation"]["external_generation_min_tokens"] == {
         "enabled": True,
         "default_min_tokens": None,
@@ -233,3 +241,11 @@ def test_provider_spec_preserves_remote_text_only_capabilities_for_non_reasoning
 
     assert spec["capabilities"] == ["text"]
     assert spec["sync_metadata"]["needs_review"] is True
+
+
+def test_openrouter_merge_preserves_supported_parameters_for_local_only(service):
+    merged = service._merge_remote_with_local("openrouter", [])
+
+    assert merged
+    assert merged[0]["local_only"] is True
+    assert merged[0]["supported_parameters"] == ["tools", "tool_choice"]

@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 STREAM_MONITOR_JS = ROOT / "static" / "js" / "stream_monitor.js"
 STREAM_MONITOR_TEMPLATE = ROOT / "templates" / "stream_monitor.html"
 APP_STATE = ROOT / "core" / "app_state.py"
+QA_EVALUATION_SERVICE = ROOT / "qa_evaluation_service.py"
 
 
 def test_frontend_phase_mapping_and_analysis_contract():
@@ -38,8 +39,17 @@ def test_frontend_structured_events_and_terminal_statuses_are_known():
         "project_end",
         "project_cancelled",
         "tool_call_start",
+        "tool_call_delta",
+        "tool_call_ready",
         "tool_call_result",
         "tool_call_error",
+        "tool_loop_turn_start",
+        "tool_loop_turn_done",
+        "tool_loop_budget_state",
+        "tool_loop_budget_warning",
+        "assistant_delta",
+        "thinking_delta",
+        "assistant_text_done",
         "force_finalize",
         "context_overflow_midloop",
         "validate_draft_oversize",
@@ -57,6 +67,56 @@ def test_frontend_structured_events_and_terminal_statuses_are_known():
     assert "content_snapshot" in source
     assert "shouldRenderRequestScopedPanelEvent(data, 'smartedit')" in source
     assert "appendStructuredEventForRequest(data, line, displayPhase)" in source
+    assert "TOOL_STREAM" in source
+    assert "eventType === 'tool_call_delta'" in source
+    assert "if (!line)" in source
+
+
+def test_backend_tool_loop_visible_chunks_decode_streamed_text_argument():
+    from core.generation_processor import (
+        _tool_loop_publish_event_name,
+        _tool_loop_visible_chunk,
+    )
+
+    state = {}
+    assistant_chunk = _tool_loop_visible_chunk(
+        "assistant_delta",
+        {"content": "{\"score\":"},
+        state,
+    )
+    assert assistant_chunk == "{\"score\":"
+    assert _tool_loop_publish_event_name("assistant_delta", assistant_chunk) == "chunk"
+
+    payload = {
+        "provider": "claude",
+        "model": "claude-sonnet-4-20250514",
+        "turn": 1,
+        "loop_scope": "qa",
+        "api_surface": "messages",
+        "index": 0,
+        "tool_name": "validate_draft",
+    }
+    first_chunk = _tool_loop_visible_chunk(
+        "tool_call_delta",
+        {**payload, "delta": '{"text":"{\\"score\\":'},
+        state,
+    )
+    second_chunk = _tool_loop_visible_chunk(
+        "tool_call_delta",
+        {**payload, "delta": '8.5,\\"feedback\\":\\"ok\\"}"}'},
+        state,
+    )
+
+    assert first_chunk == '{"score":'
+    assert second_chunk == '8.5,"feedback":"ok"}'
+    assert _tool_loop_publish_event_name("tool_call_delta", second_chunk) == "chunk"
+
+
+def test_qa_tool_loop_payloads_include_filter_context():
+    source = QA_EVALUATION_SERVICE.read_text(encoding="utf-8")
+
+    assert 'enriched_payload.setdefault("qa_model", model)' in source
+    assert 'enriched_payload.setdefault("qa_layer", layer_name)' in source
 
 
 def test_monitor_ui_avoids_inline_project_connect_handlers():

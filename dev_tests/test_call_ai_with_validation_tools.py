@@ -4,8 +4,8 @@ Covers the minimum set of scenarios required by the Phase 1 refactor:
 
 - Module-level shortcut is importable.
 - Entry point honours the typed envelope return contract.
-- Fallback envelopes surface ``tools_skipped_reason`` cleanly for
-  Responses API models, unsupported providers, and ``context_too_large``.
+- Fallback envelopes surface ``tools_skipped_reason`` cleanly for unsupported
+  providers, models without tool support, and ``context_too_large``.
 - Generator-path integration with ``DraftValidationResult`` succeeds when
   a tool call returns approved on the first pass.
 - Initial measurement injection fires when ``initial_measurement_text``
@@ -95,17 +95,89 @@ def test_aiservice_exposes_call_ai_method():
 
 
 # ---------------------------------------------------------------------------
-# Envelope-returning fallbacks (Responses API / no tool support / context overflow)
+# Envelope-returning fallbacks (no tool support / context overflow)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_fallback_responses_api_envelope():
-    """OpenAI Responses API models fall back to single-shot with a typed envelope."""
+async def test_responses_api_model_routes_to_tool_loop():
+    """OpenAI Responses API models use the shared tool-loop adapter when tool calling is supported."""
     service = AIService.__new__(AIService)
+    fake_loop = AsyncMock(return_value=(
+        "final from responses adapter",
+        {
+            "mode": "openai_tool_loop",
+            "turns": 1,
+            "accepted": "assistant_final",
+            "trace": [],
+        },
+    ))
     with patch.object(AIService, "_normalize_tool_loop_provider", return_value="openai"), \
          patch.object(AIService, "_is_openai_responses_api_model", return_value=True), \
+         patch.object(AIService, "_supports_tool_calling", return_value=True), \
+         patch.object(AIService, "_apply_temperature_policies", return_value=(0.7, None, False)), \
+         patch.object(AIService, "_should_inject_json_prompt", return_value=False), \
+         patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
+         patch.object(AIService, "_run_openai_compatible_validation_tool_loop", new=fake_loop), \
          patch("ai_service.config") as mock_config:
+        mock_config.validate_token_limits.return_value = {
+            "adjusted_tokens": 512,
+            "adjusted_reasoning_effort": None,
+            "adjusted_thinking_budget_tokens": None,
+            "model_info": {"provider": "openai", "model_id": "gpt-5-pro"},
+            "reasoning_timeout_seconds": None,
+        }
+        mock_config.GENERATOR_SYSTEM_PROMPT = "system"
+        mock_config.GENERATOR_SYSTEM_PROMPT_RAW = "raw system"
+        mock_config.TOOL_LOOP_MAX_PROMPT_CHARS = 200_000
+        mock_config.get_model_info.return_value = {"input_tokens": 400_000}
+        content, envelope = await service.call_ai_with_validation_tools(
+            prompt="p",
+            model="gpt-5-pro",
+            validation_callback=lambda _: _approved_result(),
+        )
+
+    assert content == "final from responses adapter"
+    assert isinstance(envelope, ToolLoopEnvelope)
+    assert envelope.tools_skipped_reason is None
+    assert envelope.accepted is True
+    assert fake_loop.await_args.kwargs["model_id"] == "gpt-5-pro"
+
+
+@pytest.mark.asyncio
+async def test_o3_pro_routes_to_tool_loop_from_registry_capability():
+    """o3-pro advertises Responses API function calling and should not be skipped."""
+    service = AIService.__new__(AIService)
+    fake_loop = AsyncMock(return_value=(
+        "final from o3 responses adapter",
+        {
+            "mode": "openai_tool_loop",
+            "turns": 1,
+            "accepted": "assistant_final",
+            "trace": [],
+        },
+    ))
+    with patch.object(AIService, "_normalize_tool_loop_provider", return_value="openai"), \
+         patch.object(AIService, "_apply_temperature_policies", return_value=(0.7, None, False)), \
+         patch.object(AIService, "_should_inject_json_prompt", return_value=False), \
+         patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
+         patch.object(AIService, "_run_openai_compatible_validation_tool_loop", new=fake_loop), \
+         patch("ai_service.config") as mock_config:
+        mock_config.model_specs = {
+            "model_specifications": {
+                "openai": {
+                    "o3-pro": {
+                        "model_id": "o3-pro",
+                        "capabilities": [
+                            "text",
+                            "reasoning",
+                            "function_calling",
+                            "responses_api",
+                        ],
+                    }
+                }
+            }
+        }
         mock_config.validate_token_limits.return_value = {
             "adjusted_tokens": 512,
             "adjusted_reasoning_effort": None,
@@ -113,15 +185,21 @@ async def test_fallback_responses_api_envelope():
             "model_info": {"provider": "openai", "model_id": "o3-pro"},
             "reasoning_timeout_seconds": None,
         }
+        mock_config.GENERATOR_SYSTEM_PROMPT = "system"
+        mock_config.GENERATOR_SYSTEM_PROMPT_RAW = "raw system"
+        mock_config.TOOL_LOOP_MAX_PROMPT_CHARS = 200_000
+        mock_config.get_model_info.return_value = {"input_tokens": 200_000}
         content, envelope = await service.call_ai_with_validation_tools(
             prompt="p",
             model="o3-pro",
             validation_callback=lambda _: _approved_result(),
         )
-    assert content == ""
+
+    assert content == "final from o3 responses adapter"
     assert isinstance(envelope, ToolLoopEnvelope)
-    assert envelope.tools_skipped_reason == "responses_api"
-    assert envelope.accepted is False
+    assert envelope.tools_skipped_reason is None
+    assert envelope.accepted is True
+    assert fake_loop.await_args.kwargs["model_id"] == "o3-pro"
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ Provides unified interface for content generation across different models.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import inspect
 import logging
@@ -16,6 +17,7 @@ import random
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional, Set, Tuple, TypeVar
 
 import aiohttp
@@ -149,6 +151,18 @@ def _is_token_limit_finish_reason(reason: Any) -> bool:
     }:
         return True
     return "max" in normalized and "token" in normalized
+
+
+def _is_unusable_openai_stream_finish(reason: Any) -> bool:
+    """Return True when an OpenAI streamed turn ended with unusable partial output."""
+
+    reason_text = (_stringify_finish_reason(reason) or "").strip().lower()
+    if not reason_text:
+        return True
+    normalized = reason_text.replace("-", "_").replace(" ", "_")
+    if normalized in {"stop", "tool_calls", "function_call", "completed"}:
+        return False
+    return True
 
 
 def _build_finish_metadata(
@@ -1277,7 +1291,7 @@ class AIService:
             if provider_key in {"openrouter", "xai", "ollama"}:
                 return "response_format.json_schema"
         if provider_key == "openai" and AIService._is_openai_responses_api_model(model_id):
-            return "text.format.json_schema"
+            return None
         if provider_key == "gemini":
             return "response_mime_type"
         if provider_key == "openai":
@@ -1743,10 +1757,6 @@ class AIService:
                     provider,
                 )
                 effective_json_schema = None
-        elif json_output and not json_schema and provider == "openai" and self._is_openai_responses_api_model(model_id):
-            fallback_schema = {"type": "object", "additionalProperties": False, "properties": {}}
-            self._validate_schema_for_structured_outputs(fallback_schema, provider, model_id)
-
         request_timeout = token_validation.get("reasoning_timeout_seconds")
         if request_timeout and request_timeout > 0:
             logger.info(
@@ -2164,6 +2174,27 @@ class AIService:
         return state.support == CapabilitySupport.SUPPORTED
 
     @staticmethod
+    def _openrouter_tool_streaming_supported(model_id: str) -> bool:
+        """Return True when OpenRouter metadata allows observable streamed tool loops."""
+        specs = getattr(config, "model_specs", {}) or {}
+        tool_state = registry_model_supports(
+            specs=specs,
+            provider="openrouter",
+            model_id=model_id,
+            capability="tool_calling",
+        )
+        streaming_state = registry_model_supports(
+            specs=specs,
+            provider="openrouter",
+            model_id=model_id,
+            capability="streaming",
+        )
+        return (
+            tool_state.support == CapabilitySupport.SUPPORTED
+            and streaming_state.support == CapabilitySupport.SUPPORTED
+        )
+
+    @staticmethod
     def _effective_json_schema_for_request(
         provider: str,
         model_id: str,
@@ -2173,8 +2204,8 @@ class AIService:
         """Return the schema that the provider path will actually use, if any.
 
         This is stricter than simply checking ``json_schema``: some provider/model
-        combinations synthesize an internal flexible schema when callers request JSON
-        output without supplying one explicitly.
+        combinations can use native schema enforcement only when a concrete
+        schema is available.
         """
         if not json_output:
             return None
@@ -2184,13 +2215,6 @@ class AIService:
 
         if json_schema and AIService._supports_structured_outputs(provider_key, model_lower):
             return json_schema
-
-        if not json_schema and provider_key == "openai" and AIService._is_openai_responses_api_model(model_lower):
-            return {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {},
-            }
 
         return None
 
@@ -3010,6 +3034,61 @@ class AIService:
 
         return serialized
 
+    @staticmethod
+    def _claude_tool_schema_for_streaming(tool_schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Enable Anthropic fine-grained tool input streaming on a cloned schema."""
+
+        streamed_schema = copy.deepcopy(tool_schema)
+        streamed_schema.setdefault("eager_input_streaming", True)
+        return streamed_schema
+
+    @staticmethod
+    def _is_unusable_claude_stream_stop(reason: Any) -> bool:
+        """Return True when a Claude streamed turn ended before usable output."""
+
+        reason_text = (_stringify_finish_reason(reason) or "").strip().lower()
+        if not reason_text:
+            return True
+        return reason_text not in {"end_turn", "tool_use", "stop_sequence"}
+
+    @staticmethod
+    def _get_claude_event_index(event: Any, fallback: int = 0) -> int:
+        try:
+            return int(getattr(event, "index", fallback) or 0)
+        except (TypeError, ValueError):
+            return fallback
+
+    @staticmethod
+    def _parse_claude_tool_input(raw_json: str, fallback_input: Any) -> Dict[str, Any]:
+        if isinstance(fallback_input, dict) and not raw_json:
+            return fallback_input
+        if not raw_json:
+            return {}
+        parsed = json.loads(raw_json)
+        if not isinstance(parsed, dict):
+            raise ValueError("Claude streamed tool input was not a JSON object")
+        return parsed
+
+    @staticmethod
+    def _claude_content_block_from_accumulator(acc: Dict[str, Any]) -> Any:
+        block_type = acc.get("type")
+        if block_type == "text":
+            return SimpleNamespace(type="text", text=acc.get("text", ""))
+        if block_type == "tool_use":
+            return SimpleNamespace(
+                type="tool_use",
+                id=acc.get("id", ""),
+                name=acc.get("name", ""),
+                input=acc.get("input", {}) or {},
+            )
+        if block_type == "thinking":
+            return SimpleNamespace(
+                type="thinking",
+                thinking=acc.get("thinking", ""),
+                signature=acc.get("signature", ""),
+            )
+        return SimpleNamespace(type=block_type or "text", text=acc.get("text", ""))
+
     def _extract_text_from_gemini_response(self, response: Any) -> str:
         """Extract text from Gemini responses across both new and legacy SDKs."""
         try:
@@ -3049,6 +3128,968 @@ class AIService:
             if function_call is not None:
                 function_calls.append(function_call)
         return function_calls
+
+    @staticmethod
+    def _openai_responses_tool_schema(chat_tool_schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert a Chat Completions function tool schema to Responses API shape."""
+
+        function_schema = chat_tool_schema.get("function") or {}
+        converted = {
+            "type": "function",
+            "name": function_schema.get("name", ""),
+            "description": function_schema.get("description", ""),
+            "parameters": function_schema.get("parameters") or {},
+        }
+        if function_schema.get("strict") is not None:
+            converted["strict"] = function_schema.get("strict")
+        return converted
+
+    @staticmethod
+    def _openai_responses_content_part(part: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Convert OpenAI chat content parts into Responses API input parts."""
+
+        part_type = part.get("type")
+        if part_type == "text":
+            return {"type": "input_text", "text": str(part.get("text") or "")}
+        if part_type == "input_text":
+            return {"type": "input_text", "text": str(part.get("text") or "")}
+        if part_type == "image_url":
+            image_url = part.get("image_url")
+            if isinstance(image_url, dict):
+                url = image_url.get("url")
+            else:
+                url = image_url
+            if url:
+                return {"type": "input_image", "image_url": url}
+        if part_type == "input_image":
+            return dict(part)
+        return None
+
+    def _build_openai_responses_input_from_messages(
+        self,
+        current_messages: List[Dict[str, Any]],
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Convert the chat-style tool-loop transcript to Responses API input."""
+
+        instructions: List[str] = []
+        input_items: List[Dict[str, Any]] = []
+
+        for message in current_messages:
+            role = message.get("role")
+            content_value = message.get("content")
+
+            if role == "system":
+                if isinstance(content_value, str) and content_value:
+                    instructions.append(content_value)
+                continue
+
+            if role == "tool":
+                input_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": str(message.get("tool_call_id") or ""),
+                        "output": str(content_value or ""),
+                    }
+                )
+                continue
+
+            if role == "assistant" and message.get("tool_calls"):
+                assistant_text = content_value if isinstance(content_value, str) else ""
+                if assistant_text:
+                    input_items.append({"role": "assistant", "content": assistant_text})
+                for tool_call in message.get("tool_calls") or []:
+                    function_data = tool_call.get("function") or {}
+                    input_items.append(
+                        {
+                            "type": "function_call",
+                            "id": str(
+                                tool_call.get("response_item_id")
+                                or tool_call.get("id")
+                                or tool_call.get("call_id")
+                                or ""
+                            ),
+                            "call_id": str(tool_call.get("call_id") or tool_call.get("id") or ""),
+                            "name": str(function_data.get("name") or ""),
+                            "arguments": str(function_data.get("arguments") or ""),
+                        }
+                    )
+                continue
+
+            if isinstance(content_value, list):
+                converted_parts = []
+                for part in content_value:
+                    if isinstance(part, dict):
+                        converted_part = self._openai_responses_content_part(part)
+                        if converted_part:
+                            converted_parts.append(converted_part)
+                if converted_parts:
+                    input_items.append({"role": role or "user", "content": converted_parts})
+                continue
+
+            input_items.append({"role": role or "user", "content": str(content_value or "")})
+
+        return "\n\n".join(instructions), input_items
+
+    def _build_openai_responses_tool_params(
+        self,
+        model_id: str,
+        current_messages: List[Dict[str, Any]],
+        max_tokens: int,
+        reasoning_effort: Optional[str],
+        json_output: bool,
+        json_schema: Optional[Dict[str, Any]],
+        tools_enabled: bool,
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Build Responses API params for OpenAI tool-loop turns."""
+
+        instructions, input_items = self._build_openai_responses_input_from_messages(
+            current_messages
+        )
+        create_params: Dict[str, Any] = {
+            "model": model_id,
+            "input": input_items,
+            "max_output_tokens": max_tokens,
+        }
+        if instructions:
+            create_params["instructions"] = instructions
+        if reasoning_effort:
+            create_params["reasoning"] = {"effort": reasoning_effort}
+
+        if json_output and json_schema:
+            create_params["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "structured_output",
+                    "strict": True,
+                    "schema": json_schema,
+                }
+            }
+
+        if tools_enabled:
+            active_schemas = (
+                list(tool_schemas)
+                if tool_schemas is not None
+                else [self._build_openai_validation_tool_schema()]
+            )
+            if active_schemas:
+                create_params["tools"] = [
+                    self._openai_responses_tool_schema(schema)
+                    for schema in active_schemas
+                ]
+                create_params["tool_choice"] = "auto"
+                create_params["parallel_tool_calls"] = False
+
+        return create_params
+
+    @staticmethod
+    def _openai_responses_tool_streaming_supported(model_id: str) -> bool:
+        """Return False for Responses models known to reject streaming."""
+
+        model_lower = (model_id or "").lower()
+        return "o3-pro" not in model_lower and "gpt-5-pro" not in model_lower
+
+    @staticmethod
+    def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    @classmethod
+    def _openai_responses_output_items(cls, response: Any) -> List[Any]:
+        output_items = cls._obj_get(response, "output", None)
+        if output_items is not None:
+            return list(output_items or [])
+        try:
+            data = response.model_dump() if hasattr(response, "model_dump") else None
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            return list(data.get("output") or [])
+        return []
+
+    @classmethod
+    def _extract_openai_responses_text(cls, response: Any) -> str:
+        output_text = cls._obj_get(response, "output_text", None)
+        if output_text:
+            return str(output_text)
+
+        pieces: List[str] = []
+        for item in cls._openai_responses_output_items(response):
+            if cls._obj_get(item, "type") != "message":
+                continue
+            for part in cls._obj_get(item, "content", []) or []:
+                text_value = cls._obj_get(part, "text", None)
+                if text_value:
+                    pieces.append(str(text_value))
+        return "".join(pieces)
+
+    @classmethod
+    def _extract_openai_responses_function_calls(cls, response: Any) -> List[Any]:
+        tool_calls: List[Any] = []
+        for item in cls._openai_responses_output_items(response):
+            if cls._obj_get(item, "type") != "function_call":
+                continue
+            item_id = str(cls._obj_get(item, "id", "") or "")
+            call_id = str(cls._obj_get(item, "call_id", "") or "")
+            name = str(cls._obj_get(item, "name", "") or "")
+            arguments = str(cls._obj_get(item, "arguments", "") or "")
+            tool_calls.append(
+                SimpleNamespace(
+                    id=item_id or call_id,
+                    call_id=call_id or item_id,
+                    response_item_id=item_id,
+                    type="function",
+                    function=SimpleNamespace(name=name, arguments=arguments),
+                )
+            )
+        return tool_calls
+
+    @staticmethod
+    def _openai_tool_response_id(call: Any) -> str:
+        """Return the id that a local tool result should reference."""
+
+        return str(getattr(call, "call_id", None) or getattr(call, "id", "") or "")
+
+    @staticmethod
+    def _serialize_openai_tool_call_for_messages(
+        call: Any,
+        *,
+        responses_api: bool,
+    ) -> Dict[str, Any]:
+        """Serialize a tool call for the local chat-style loop transcript."""
+
+        function_obj = getattr(call, "function", None)
+        item = {
+            "id": str(getattr(call, "id", "") or ""),
+            "type": "function",
+            "function": {
+                "name": str(getattr(function_obj, "name", "") or ""),
+                "arguments": str(getattr(function_obj, "arguments", "") or ""),
+            },
+        }
+        if responses_api:
+            call_id = getattr(call, "call_id", None)
+            response_item_id = getattr(call, "response_item_id", None)
+            if call_id:
+                item["call_id"] = str(call_id)
+            if response_item_id:
+                item["response_item_id"] = str(response_item_id)
+        return item
+
+    async def _stream_openai_compatible_tool_turn(
+        self,
+        client: Any,
+        create_params: Dict[str, Any],
+        request_kwargs: Dict[str, Any],
+        *,
+        provider_key: str,
+        model_id: str,
+        turn: int,
+        loop_scope: LoopScope,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]],
+        cancellation_token: Optional["CancellationToken"],
+    ) -> Tuple[Any, Any, Optional[str]]:
+        """Stream one Chat Completions tool-loop turn and return an aggregated message."""
+
+        params = dict(create_params)
+        params["stream"] = True
+        params.setdefault("stream_options", {})["include_usage"] = True
+
+        await self._emit_tool_event_safe(
+            tool_event_callback,
+            "tool_loop_turn_start",
+            {
+                "provider": provider_key,
+                "model": model_id,
+                "turn": turn,
+                "loop_scope": loop_scope.value,
+                "api_surface": "chat_completions",
+            },
+        )
+
+        stream = await client.chat.completions.create(**params, **request_kwargs)
+        if not hasattr(stream, "__aiter__"):
+            if provider_key == "openrouter":
+                await self._emit_tool_event_safe(
+                    tool_event_callback,
+                    "tool_loop_provider_terminal",
+                    {
+                        "provider": provider_key,
+                        "model": model_id,
+                        "turn": turn,
+                        "loop_scope": loop_scope.value,
+                        "api_surface": "chat_completions",
+                        "status": "non_stream_response",
+                        "detail": "OpenRouter returned a non-stream response to a streaming tool-loop request.",
+                    },
+                )
+                raise RuntimeError(
+                    "OpenRouter Chat Completions stream did not return an async stream"
+                )
+            response = stream
+            message = response.choices[0].message
+            finish_reason = _stringify_finish_reason(
+                getattr(response.choices[0], "finish_reason", None)
+            )
+            if finish_reason is not None and _is_unusable_openai_stream_finish(finish_reason):
+                await self._emit_tool_event_safe(
+                    tool_event_callback,
+                    "tool_loop_provider_terminal",
+                    {
+                        "provider": provider_key,
+                        "model": model_id,
+                        "turn": turn,
+                        "loop_scope": loop_scope.value,
+                        "api_surface": "chat_completions",
+                        "status": finish_reason,
+                    },
+                )
+                raise RuntimeError(
+                    f"OpenAI Chat Completions stream ended with unusable finish_reason={finish_reason}"
+                )
+            assistant_text = message.content or ""
+            if assistant_text:
+                await self._emit_tool_event_safe(
+                    tool_event_callback,
+                    "assistant_delta",
+                    {
+                        "provider": provider_key,
+                        "model": model_id,
+                        "turn": turn,
+                        "loop_scope": loop_scope.value,
+                        "api_surface": "chat_completions",
+                        "content": assistant_text,
+                    },
+                )
+            for call in message.tool_calls or []:
+                await self._emit_tool_event_safe(
+                    tool_event_callback,
+                    "tool_call_ready",
+                    {
+                        "provider": provider_key,
+                        "model": model_id,
+                        "turn": turn,
+                        "loop_scope": loop_scope.value,
+                        "api_surface": "chat_completions",
+                        "tool_call_id": getattr(call, "id", ""),
+                        "tool_name": getattr(getattr(call, "function", None), "name", ""),
+                        "arguments_chars": len(
+                            getattr(getattr(call, "function", None), "arguments", "") or ""
+                        ),
+                    },
+                )
+            return (
+                message,
+                getattr(response, "usage", None),
+                finish_reason,
+            )
+        assistant_parts: List[str] = []
+        tool_accumulators: Dict[int, Dict[str, Any]] = {}
+        usage_meta = None
+        finish_reason: Optional[str] = None
+
+        async for chunk in stream:
+            await self._raise_if_cancelled(cancellation_token)
+            chunk_error = getattr(chunk, "error", None)
+            if chunk_error is not None:
+                if isinstance(chunk_error, dict):
+                    detail = str(chunk_error.get("message") or chunk_error)
+                else:
+                    detail = str(getattr(chunk_error, "message", None) or chunk_error)
+                await self._emit_tool_event_safe(
+                    tool_event_callback,
+                    "tool_loop_provider_terminal",
+                    {
+                        "provider": provider_key,
+                        "model": model_id,
+                        "turn": turn,
+                        "loop_scope": loop_scope.value,
+                        "api_surface": "chat_completions",
+                        "status": "error",
+                        "detail": detail[:500],
+                    },
+                )
+                raise RuntimeError(
+                    f"{provider_key} Chat Completions stream error: {detail[:500] or 'n/a'}"
+                )
+            usage_value = getattr(chunk, "usage", None)
+            if usage_value is not None:
+                usage_meta = usage_value
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+
+            choice = choices[0]
+            choice_finish = getattr(choice, "finish_reason", None)
+            if choice_finish is not None:
+                finish_reason = _stringify_finish_reason(choice_finish)
+
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+
+            content_delta = getattr(delta, "content", None)
+            if content_delta:
+                text_delta = str(content_delta)
+                assistant_parts.append(text_delta)
+                await self._emit_tool_event_safe(
+                    tool_event_callback,
+                    "assistant_delta",
+                    {
+                        "provider": provider_key,
+                        "model": model_id,
+                        "turn": turn,
+                        "loop_scope": loop_scope.value,
+                        "api_surface": "chat_completions",
+                        "content": text_delta,
+                    },
+                )
+
+            for tool_delta in getattr(delta, "tool_calls", None) or []:
+                index = getattr(tool_delta, "index", None)
+                if index is None:
+                    index = len(tool_accumulators)
+                acc = tool_accumulators.setdefault(
+                    int(index),
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    },
+                )
+                delta_id = getattr(tool_delta, "id", None)
+                if delta_id:
+                    acc["id"] = str(delta_id)
+                delta_type = getattr(tool_delta, "type", None)
+                if delta_type:
+                    acc["type"] = str(delta_type)
+                function_delta = getattr(tool_delta, "function", None)
+                name_delta = getattr(function_delta, "name", None)
+                arguments_delta = getattr(function_delta, "arguments", None)
+                if name_delta:
+                    acc["function"]["name"] += str(name_delta)
+                if arguments_delta:
+                    acc["function"]["arguments"] += str(arguments_delta)
+                await self._emit_tool_event_safe(
+                    tool_event_callback,
+                    "tool_call_delta",
+                    {
+                        "provider": provider_key,
+                        "model": model_id,
+                        "turn": turn,
+                        "loop_scope": loop_scope.value,
+                        "api_surface": "chat_completions",
+                        "index": int(index),
+                        "tool_call_id": acc.get("id") or None,
+                        "tool_name": acc["function"].get("name") or None,
+                        "delta": str(arguments_delta or name_delta or ""),
+                        "arguments_chars": len(acc["function"].get("arguments") or ""),
+                    },
+                )
+
+        if _is_unusable_openai_stream_finish(finish_reason):
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_loop_provider_terminal",
+                {
+                    "provider": provider_key,
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "chat_completions",
+                    "status": finish_reason,
+                },
+            )
+            raise RuntimeError(
+                f"OpenAI Chat Completions stream ended with unusable finish_reason={finish_reason}"
+            )
+
+        tool_calls = []
+        for _, acc in sorted(tool_accumulators.items()):
+            function_data = acc.get("function") or {}
+            call = SimpleNamespace(
+                id=acc.get("id") or "",
+                type=acc.get("type") or "function",
+                function=SimpleNamespace(
+                    name=function_data.get("name") or "",
+                    arguments=function_data.get("arguments") or "",
+                ),
+            )
+            tool_calls.append(call)
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_call_ready",
+                {
+                    "provider": provider_key,
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "chat_completions",
+                    "tool_call_id": call.id,
+                    "tool_name": call.function.name,
+                    "arguments_chars": len(call.function.arguments or ""),
+                },
+            )
+
+        assistant_text = "".join(assistant_parts)
+        if assistant_text:
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "assistant_text_done",
+                {
+                    "provider": provider_key,
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "chat_completions",
+                    "content_chars": len(assistant_text),
+                },
+            )
+        await self._emit_tool_event_safe(
+            tool_event_callback,
+            "tool_loop_turn_done",
+            {
+                "provider": provider_key,
+                "model": model_id,
+                "turn": turn,
+                "loop_scope": loop_scope.value,
+                "api_surface": "chat_completions",
+                "finish_reason": finish_reason,
+                "assistant_text_chars": len(assistant_text),
+                "tool_calls": len(tool_calls),
+            },
+        )
+
+        return (
+            SimpleNamespace(content=assistant_text, tool_calls=tool_calls),
+            usage_meta,
+            finish_reason,
+        )
+
+    async def _run_openai_responses_tool_turn(
+        self,
+        create_params: Dict[str, Any],
+        request_kwargs: Dict[str, Any],
+        *,
+        model_id: str,
+        turn: int,
+        loop_scope: LoopScope,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]],
+        cancellation_token: Optional["CancellationToken"],
+    ) -> Tuple[Any, Any, Optional[str]]:
+        """Run one non-streaming Responses API tool-loop turn."""
+
+        if not self.openai_client:
+            raise ValueError("OpenAI client not initialized")
+
+        params = dict(create_params)
+        params.pop("stream", None)
+
+        await self._emit_tool_event_safe(
+            tool_event_callback,
+            "tool_loop_turn_start",
+            {
+                "provider": "openai",
+                "model": model_id,
+                "turn": turn,
+                "loop_scope": loop_scope.value,
+                "api_surface": "responses",
+                "streaming": False,
+            },
+        )
+
+        await self._raise_if_cancelled(cancellation_token)
+        response = await self.openai_client.responses.create(**params, **request_kwargs)
+        await self._raise_if_cancelled(cancellation_token)
+
+        usage_meta = getattr(response, "usage", None)
+        finish_reason = _stringify_finish_reason(getattr(response, "status", None))
+        if _is_unusable_openai_stream_finish(finish_reason):
+            error_obj = getattr(response, "error", None)
+            incomplete_details = getattr(response, "incomplete_details", None)
+            detail = str(error_obj or incomplete_details or "")[:500]
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_loop_provider_terminal",
+                {
+                    "provider": "openai",
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "responses",
+                    "status": finish_reason,
+                    "detail": detail,
+                },
+            )
+            raise RuntimeError(
+                "OpenAI Responses turn ended before a usable turn completed "
+                f"(status={finish_reason}, detail={detail or 'n/a'})"
+            )
+
+        assistant_text = self._extract_openai_responses_text(response)
+        tool_calls = self._extract_openai_responses_function_calls(response)
+
+        for call in tool_calls:
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_call_ready",
+                {
+                    "provider": "openai",
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "responses",
+                    "streaming": False,
+                    "tool_call_id": call.call_id or call.id,
+                    "tool_name": call.function.name,
+                    "arguments_chars": len(call.function.arguments or ""),
+                },
+            )
+
+        if assistant_text:
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "assistant_text_done",
+                {
+                    "provider": "openai",
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "responses",
+                    "streaming": False,
+                    "content_chars": len(assistant_text),
+                },
+            )
+        await self._emit_tool_event_safe(
+            tool_event_callback,
+            "tool_loop_turn_done",
+            {
+                "provider": "openai",
+                "model": model_id,
+                "turn": turn,
+                "loop_scope": loop_scope.value,
+                "api_surface": "responses",
+                "streaming": False,
+                "finish_reason": finish_reason,
+                "assistant_text_chars": len(assistant_text),
+                "tool_calls": len(tool_calls),
+            },
+        )
+
+        return (
+            SimpleNamespace(content=assistant_text, tool_calls=tool_calls),
+            usage_meta,
+            finish_reason,
+        )
+
+    async def _stream_openai_responses_tool_turn(
+        self,
+        create_params: Dict[str, Any],
+        request_kwargs: Dict[str, Any],
+        *,
+        model_id: str,
+        turn: int,
+        loop_scope: LoopScope,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]],
+        cancellation_token: Optional["CancellationToken"],
+    ) -> Tuple[Any, Any, Optional[str]]:
+        """Stream one Responses API tool-loop turn and return an aggregated message."""
+
+        if not self.openai_client:
+            raise ValueError("OpenAI client not initialized")
+
+        params = dict(create_params)
+        params["stream"] = True
+
+        await self._emit_tool_event_safe(
+            tool_event_callback,
+            "tool_loop_turn_start",
+            {
+                "provider": "openai",
+                "model": model_id,
+                "turn": turn,
+                "loop_scope": loop_scope.value,
+                "api_surface": "responses",
+            },
+        )
+
+        stream = await self.openai_client.responses.create(**params, **request_kwargs)
+        assistant_parts: List[str] = []
+        tool_accumulators: Dict[int, Dict[str, Any]] = {}
+        usage_meta = None
+        finish_reason: Optional[str] = None
+        terminal_error_status: Optional[str] = None
+        terminal_error_detail: Optional[str] = None
+        response_completed = False
+
+        async for event in stream:
+            await self._raise_if_cancelled(cancellation_token)
+            event_type = getattr(event, "type", "")
+
+            response_obj = getattr(event, "response", None)
+            if response_obj is not None:
+                usage_value = getattr(response_obj, "usage", None)
+                if usage_value is not None:
+                    usage_meta = usage_value
+                status_value = getattr(response_obj, "status", None)
+                if status_value:
+                    finish_reason = _stringify_finish_reason(status_value)
+
+            if event_type == "response.output_text.delta":
+                text_delta = str(getattr(event, "delta", "") or "")
+                if text_delta:
+                    assistant_parts.append(text_delta)
+                    await self._emit_tool_event_safe(
+                        tool_event_callback,
+                        "assistant_delta",
+                        {
+                            "provider": "openai",
+                            "model": model_id,
+                            "turn": turn,
+                            "loop_scope": loop_scope.value,
+                            "api_surface": "responses",
+                            "content": text_delta,
+                        },
+                    )
+                continue
+
+            if event_type == "response.output_text.done":
+                done_text = getattr(event, "text", None)
+                if done_text and not assistant_parts:
+                    assistant_parts.append(str(done_text))
+                continue
+
+            if event_type == "response.output_item.added":
+                item = getattr(event, "item", None)
+                item_type = getattr(item, "type", None)
+                if item_type == "function_call":
+                    output_index = int(getattr(event, "output_index", len(tool_accumulators)) or 0)
+                    tool_accumulators[output_index] = {
+                        "id": str(getattr(item, "id", "") or ""),
+                        "call_id": str(getattr(item, "call_id", "") or ""),
+                        "type": "function",
+                        "function": {
+                            "name": str(getattr(item, "name", "") or ""),
+                            "arguments": str(getattr(item, "arguments", "") or ""),
+                        },
+                    }
+                continue
+
+            if event_type == "response.function_call_arguments.delta":
+                output_index = int(getattr(event, "output_index", 0) or 0)
+                acc = tool_accumulators.setdefault(
+                    output_index,
+                    {
+                        "id": str(getattr(event, "item_id", "") or ""),
+                        "call_id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    },
+                )
+                item_id = getattr(event, "item_id", None)
+                if item_id:
+                    acc["id"] = str(item_id)
+                delta_text = str(getattr(event, "delta", "") or "")
+                acc["function"]["arguments"] += delta_text
+                await self._emit_tool_event_safe(
+                    tool_event_callback,
+                    "tool_call_delta",
+                    {
+                        "provider": "openai",
+                        "model": model_id,
+                        "turn": turn,
+                        "loop_scope": loop_scope.value,
+                        "api_surface": "responses",
+                        "index": output_index,
+                        "tool_call_id": acc.get("call_id") or acc.get("id") or None,
+                        "tool_name": acc["function"].get("name") or None,
+                        "delta": delta_text,
+                        "arguments_chars": len(acc["function"].get("arguments") or ""),
+                    },
+                )
+                continue
+
+            if event_type == "response.function_call_arguments.done":
+                output_index = int(getattr(event, "output_index", 0) or 0)
+                acc = tool_accumulators.setdefault(
+                    output_index,
+                    {
+                        "id": str(getattr(event, "item_id", "") or ""),
+                        "call_id": str(getattr(event, "call_id", "") or ""),
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    },
+                )
+                item_id = getattr(event, "item_id", None)
+                call_id = getattr(event, "call_id", None)
+                name = getattr(event, "name", None)
+                arguments = getattr(event, "arguments", None)
+                if item_id:
+                    acc["id"] = str(item_id)
+                if call_id:
+                    acc["call_id"] = str(call_id)
+                if name:
+                    acc["function"]["name"] = str(name)
+                if arguments is not None:
+                    acc["function"]["arguments"] = str(arguments)
+                continue
+
+            if event_type == "response.output_item.done":
+                item = getattr(event, "item", None)
+                item_type = getattr(item, "type", None)
+                if item_type == "function_call":
+                    output_index = int(getattr(event, "output_index", len(tool_accumulators)) or 0)
+                    acc = tool_accumulators.setdefault(
+                        output_index,
+                        {
+                            "id": "",
+                            "call_id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        },
+                    )
+                    acc["id"] = str(getattr(item, "id", "") or acc.get("id") or "")
+                    acc["call_id"] = str(getattr(item, "call_id", "") or acc.get("call_id") or "")
+                    acc["function"]["name"] = str(
+                        getattr(item, "name", "") or acc["function"].get("name") or ""
+                    )
+                    acc["function"]["arguments"] = str(
+                        getattr(item, "arguments", None)
+                        if getattr(item, "arguments", None) is not None
+                        else acc["function"].get("arguments") or ""
+                    )
+                continue
+
+            if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+                finish_reason = event_type.replace("response.", "")
+                if event_type == "response.completed":
+                    response_completed = True
+                else:
+                    terminal_error_status = finish_reason
+                    error_obj = getattr(event, "error", None)
+                    response_error = getattr(response_obj, "error", None) if response_obj is not None else None
+                    incomplete_details = (
+                        getattr(response_obj, "incomplete_details", None)
+                        if response_obj is not None
+                        else getattr(event, "incomplete_details", None)
+                    )
+                    terminal_error_detail = str(error_obj or response_error or incomplete_details or "")[:500]
+                    await self._emit_tool_event_safe(
+                        tool_event_callback,
+                        "tool_loop_provider_terminal",
+                        {
+                            "provider": "openai",
+                            "model": model_id,
+                            "turn": turn,
+                            "loop_scope": loop_scope.value,
+                            "api_surface": "responses",
+                            "status": finish_reason,
+                            "detail": terminal_error_detail,
+                        },
+                    )
+
+        if terminal_error_status is not None:
+            raise RuntimeError(
+                "OpenAI Responses stream ended before a usable turn completed "
+                f"(status={terminal_error_status}, detail={terminal_error_detail or 'n/a'})"
+            )
+
+        if not response_completed:
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_loop_provider_terminal",
+                {
+                    "provider": "openai",
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "responses",
+                    "status": "missing_terminal_event",
+                },
+            )
+            raise RuntimeError("OpenAI Responses stream ended without response.completed")
+
+        if _is_unusable_openai_stream_finish(finish_reason):
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_loop_provider_terminal",
+                {
+                    "provider": "openai",
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "responses",
+                    "status": finish_reason,
+                },
+            )
+            raise RuntimeError(
+                f"OpenAI Responses stream ended with unusable finish_reason={finish_reason}"
+            )
+
+        tool_calls = []
+        for _, acc in sorted(tool_accumulators.items()):
+            function_data = acc.get("function") or {}
+            call = SimpleNamespace(
+                id=acc.get("id") or acc.get("call_id") or "",
+                call_id=acc.get("call_id") or acc.get("id") or "",
+                response_item_id=acc.get("id") or "",
+                type=acc.get("type") or "function",
+                function=SimpleNamespace(
+                    name=function_data.get("name") or "",
+                    arguments=function_data.get("arguments") or "",
+                ),
+            )
+            tool_calls.append(call)
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_call_ready",
+                {
+                    "provider": "openai",
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "responses",
+                    "tool_call_id": call.call_id or call.id,
+                    "tool_name": call.function.name,
+                    "arguments_chars": len(call.function.arguments or ""),
+                },
+            )
+
+        assistant_text = "".join(assistant_parts)
+        if assistant_text:
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "assistant_text_done",
+                {
+                    "provider": "openai",
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "responses",
+                    "content_chars": len(assistant_text),
+                },
+            )
+        await self._emit_tool_event_safe(
+            tool_event_callback,
+            "tool_loop_turn_done",
+            {
+                "provider": "openai",
+                "model": model_id,
+                "turn": turn,
+                "loop_scope": loop_scope.value,
+                "api_surface": "responses",
+                "finish_reason": finish_reason,
+                "assistant_text_chars": len(assistant_text),
+                "tool_calls": len(tool_calls),
+            },
+        )
+
+        return (
+            SimpleNamespace(content=assistant_text, tool_calls=tool_calls),
+            usage_meta,
+            finish_reason,
+        )
 
     async def _run_openai_compatible_validation_tool_loop(
         self,
@@ -3111,6 +4152,36 @@ class AIService:
         client = self._get_openai_compatible_tool_client(provider)
         provider_key = self._normalize_tool_loop_provider(provider)
         mode_name = f"{provider_key}_tool_loop"
+        use_responses_api = provider_key == "openai" and self._is_openai_responses_api_model(model_id)
+        use_openrouter_chat_streaming = (
+            provider_key == "openrouter"
+            and self._openrouter_tool_streaming_supported(model_id)
+        )
+        if provider_key == "openrouter" and not use_openrouter_chat_streaming:
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_loop_provider_terminal",
+                {
+                    "provider": provider_key,
+                    "model": model_id,
+                    "turn": 0,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "chat_completions",
+                    "status": "streaming_unsupported",
+                    "detail": "OpenRouter tool loops require model metadata with tools and streaming support.",
+                },
+            )
+            raise ValueError(
+                "OpenRouter tool loop requires model metadata with tools and streaming support."
+            )
+        use_responses_streaming = (
+            use_responses_api
+            and self._openai_responses_tool_streaming_supported(model_id)
+        )
+        use_chat_streaming = (
+            provider_key in {"openai", "xai"}
+            or use_openrouter_chat_streaming
+        ) and not use_responses_api
 
         if images:
             image_parts = self._build_openai_image_content(images, use_responses_api=False)
@@ -3277,22 +4348,68 @@ class AIService:
                         ),
                     }
                 )
-                create_params = self._build_openai_compatible_tool_params(
-                    provider=provider_key,
-                    model_id=model_id,
-                    current_messages=forced_messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    reasoning_effort=reasoning_effort,
-                    json_output=json_output,
-                    json_schema=json_schema,
-                    tools_enabled=False,
-                )
-                try:
-                    response = await client.chat.completions.create(
-                        **create_params,
-                        **request_kwargs,
+                if use_responses_api:
+                    create_params = self._build_openai_responses_tool_params(
+                        model_id=model_id,
+                        current_messages=forced_messages,
+                        max_tokens=max_tokens,
+                        reasoning_effort=reasoning_effort,
+                        json_output=json_output,
+                        json_schema=json_schema,
+                        tools_enabled=False,
                     )
+                else:
+                    create_params = self._build_openai_compatible_tool_params(
+                        provider=provider_key,
+                        model_id=model_id,
+                        current_messages=forced_messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        reasoning_effort=reasoning_effort,
+                        json_output=json_output,
+                        json_schema=json_schema,
+                        tools_enabled=False,
+                    )
+                try:
+                    if use_responses_api and use_responses_streaming:
+                        message, usage_meta, _finish_reason = await self._stream_openai_responses_tool_turn(
+                            create_params,
+                            request_kwargs,
+                            model_id=model_id,
+                            turn=turn,
+                            loop_scope=loop_scope,
+                            tool_event_callback=tool_event_callback,
+                            cancellation_token=cancellation_token,
+                        )
+                    elif use_responses_api:
+                        message, usage_meta, _finish_reason = await self._run_openai_responses_tool_turn(
+                            create_params,
+                            request_kwargs,
+                            model_id=model_id,
+                            turn=turn,
+                            loop_scope=loop_scope,
+                            tool_event_callback=tool_event_callback,
+                            cancellation_token=cancellation_token,
+                        )
+                    elif use_chat_streaming:
+                        message, usage_meta, _finish_reason = await self._stream_openai_compatible_tool_turn(
+                            client,
+                            create_params,
+                            request_kwargs,
+                            provider_key=provider_key,
+                            model_id=model_id,
+                            turn=turn,
+                            loop_scope=loop_scope,
+                            tool_event_callback=tool_event_callback,
+                            cancellation_token=cancellation_token,
+                        )
+                    else:
+                        response = await client.chat.completions.create(
+                            **create_params,
+                            **request_kwargs,
+                        )
+                        usage_meta = getattr(response, "usage", None)
+                        message = response.choices[0].message
                 except Exception as provider_exc:
                     await self._maybe_raise_context_overflow_midloop(
                         provider_exc,
@@ -3302,10 +4419,8 @@ class AIService:
                         tool_event_callback=tool_event_callback,
                     )
                     raise
-                usage_meta = getattr(response, "usage", None)
                 self._emit_usage(usage_callback, model_id, provider_key, usage_meta, extra_payload)
 
-                message = response.choices[0].message
                 candidate = (message.content or "").strip()
                 trace.append(
                     {
@@ -3379,31 +4494,92 @@ class AIService:
 
             for turn in range(1, max_rounds + 1):
                 active_tools = _build_active_tool_schemas()
-                create_params = self._build_openai_compatible_tool_params(
-                    provider=provider_key,
-                    model_id=model_id,
-                    current_messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    reasoning_effort=reasoning_effort,
-                    json_output=json_output,
-                    json_schema=json_schema,
-                    tools_enabled=bool(active_tools),
-                    tool_schemas=active_tools if active_tools else None,
+                await self._emit_tool_event_safe(
+                    tool_event_callback,
+                    "tool_loop_budget_state",
+                    {
+                        "provider": provider_key,
+                        "model": model_id,
+                        "turn": turn,
+                        "max_tool_rounds": max_rounds,
+                        "total_tool_calls": total_tool_calls,
+                        "tool_call_budget": tool_call_budget,
+                        "remaining_tool_calls": max(0, tool_call_budget - total_tool_calls),
+                        "loop_scope": loop_scope.value,
+                    },
                 )
+                if use_responses_api:
+                    create_params = self._build_openai_responses_tool_params(
+                        model_id=model_id,
+                        current_messages=messages,
+                        max_tokens=max_tokens,
+                        reasoning_effort=reasoning_effort,
+                        json_output=json_output,
+                        json_schema=json_schema,
+                        tools_enabled=bool(active_tools),
+                        tool_schemas=active_tools if active_tools else None,
+                    )
+                else:
+                    create_params = self._build_openai_compatible_tool_params(
+                        provider=provider_key,
+                        model_id=model_id,
+                        current_messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        reasoning_effort=reasoning_effort,
+                        json_output=json_output,
+                        json_schema=json_schema,
+                        tools_enabled=bool(active_tools),
+                        tool_schemas=active_tools if active_tools else None,
+                    )
                 if extra_verbose:
                     logger.info(
                         "[EXTRA_VERBOSE] %s tool-loop parameters (turn %d): %s",
                         provider_key,
                         turn,
                         create_params,
-                    )
+                )
 
                 try:
-                    response = await client.chat.completions.create(
-                        **create_params,
-                        **request_kwargs,
-                    )
+                    if use_responses_api and use_responses_streaming:
+                        message, usage_meta, _finish_reason = await self._stream_openai_responses_tool_turn(
+                            create_params,
+                            request_kwargs,
+                            model_id=model_id,
+                            turn=turn,
+                            loop_scope=loop_scope,
+                            tool_event_callback=tool_event_callback,
+                            cancellation_token=cancellation_token,
+                        )
+                    elif use_responses_api:
+                        message, usage_meta, _finish_reason = await self._run_openai_responses_tool_turn(
+                            create_params,
+                            request_kwargs,
+                            model_id=model_id,
+                            turn=turn,
+                            loop_scope=loop_scope,
+                            tool_event_callback=tool_event_callback,
+                            cancellation_token=cancellation_token,
+                        )
+                    elif use_chat_streaming:
+                        message, usage_meta, _finish_reason = await self._stream_openai_compatible_tool_turn(
+                            client,
+                            create_params,
+                            request_kwargs,
+                            provider_key=provider_key,
+                            model_id=model_id,
+                            turn=turn,
+                            loop_scope=loop_scope,
+                            tool_event_callback=tool_event_callback,
+                            cancellation_token=cancellation_token,
+                        )
+                    else:
+                        response = await client.chat.completions.create(
+                            **create_params,
+                            **request_kwargs,
+                        )
+                        usage_meta = getattr(response, "usage", None)
+                        message = response.choices[0].message
                 except Exception as provider_exc:
                     await self._maybe_raise_context_overflow_midloop(
                         provider_exc,
@@ -3413,10 +4589,8 @@ class AIService:
                         tool_event_callback=tool_event_callback,
                     )
                     raise
-                usage_meta = getattr(response, "usage", None)
                 self._emit_usage(usage_callback, model_id, provider_key, usage_meta, extra_payload)
 
-                message = response.choices[0].message
                 assistant_text = message.content or ""
                 tool_calls = message.tool_calls or []
                 trace.append(
@@ -3438,6 +4612,24 @@ class AIService:
                             pending_tool_calls=len(tool_calls),
                             tool_call_budget=tool_call_budget,
                         )
+                        if budget_warning_emitted:
+                            await self._emit_tool_event_safe(
+                                tool_event_callback,
+                                "tool_loop_budget_warning",
+                                {
+                                    "provider": provider_key,
+                                    "model": model_id,
+                                    "turn": turn,
+                                    "total_tool_calls": total_tool_calls,
+                                    "pending_tool_calls": len(tool_calls),
+                                    "tool_call_budget": tool_call_budget,
+                                    "remaining_after_turn": max(
+                                        0,
+                                        tool_call_budget - (total_tool_calls + len(tool_calls)),
+                                    ),
+                                    "loop_scope": loop_scope.value,
+                                },
+                            )
                     if total_tool_calls + len(tool_calls) > tool_call_budget:
                         overflow_call = next(
                             (
@@ -3500,14 +4692,10 @@ class AIService:
                             "role": "assistant",
                             "content": assistant_text,
                             "tool_calls": [
-                                {
-                                    "id": call.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": call.function.name,
-                                        "arguments": call.function.arguments,
-                                    },
-                                }
+                                self._serialize_openai_tool_call_for_messages(
+                                    call,
+                                    responses_api=use_responses_api,
+                                )
                                 for call in tool_calls
                             ],
                         }
@@ -3568,7 +4756,7 @@ class AIService:
                             messages.append(
                                 {
                                     "role": "tool",
-                                    "tool_call_id": call.id,
+                                    "tool_call_id": self._openai_tool_response_id(call),
                                     "content": json.dumps(audit_result, ensure_ascii=True, sort_keys=True),
                                 }
                             )
@@ -3616,7 +4804,7 @@ class AIService:
                             messages.append(
                                 {
                                     "role": "tool",
-                                    "tool_call_id": call.id,
+                                    "tool_call_id": self._openai_tool_response_id(call),
                                     "content": json.dumps(
                                         {"error": "text_exceeds_limit"},
                                         ensure_ascii=True,
@@ -3649,7 +4837,7 @@ class AIService:
                         messages.append(
                             {
                                 "role": "tool",
-                                "tool_call_id": call.id,
+                                "tool_call_id": self._openai_tool_response_id(call),
                                 "content": json.dumps(
                                     tool_payload.build_visible_payload(payload_scope),
                                     ensure_ascii=True,
@@ -3871,6 +5059,407 @@ class AIService:
                 cancellation_token=cancellation_token,
             )
 
+    async def _stream_claude_tool_turn(
+        self,
+        create_params: Dict[str, Any],
+        request_kwargs: Dict[str, Any],
+        *,
+        provider_key: str,
+        model_id: str,
+        turn: int,
+        loop_scope: LoopScope,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]],
+        cancellation_token: Optional["CancellationToken"],
+        use_create_stream: bool = False,
+        use_beta_structured_outputs: bool = False,
+    ) -> Any:
+        """Stream one Claude tool-loop turn and return an accumulated message."""
+
+        if not self.anthropic_client:
+            raise ValueError("Claude client not initialized")
+
+        params = dict(create_params)
+        if params.get("tools"):
+            params["tools"] = [
+                self._claude_tool_schema_for_streaming(tool_schema)
+                for tool_schema in params.get("tools") or []
+            ]
+        tools_enabled = bool(params.get("tools"))
+
+        await self._emit_tool_event_safe(
+            tool_event_callback,
+            "tool_loop_turn_start",
+            {
+                "provider": provider_key,
+                "model": model_id,
+                "turn": turn,
+                "loop_scope": loop_scope.value,
+                "api_surface": "messages",
+                "streaming": True,
+                "tools_enabled": tools_enabled,
+            },
+        )
+
+        if use_create_stream:
+            params["stream"] = True
+            create = (
+                self.anthropic_client.beta.messages.create
+                if use_beta_structured_outputs
+                else self.anthropic_client.messages.create
+            )
+            stream_context = await create(**params, **request_kwargs)
+        else:
+            stream_context = self.anthropic_client.messages.stream(
+                **params,
+                **request_kwargs,
+            )
+
+        block_accumulators: Dict[int, Dict[str, Any]] = {}
+        usage_meta = None
+        input_tokens = 0
+        output_tokens = 0
+        stop_reason: Optional[str] = None
+        message_stop_seen = False
+        terminal_error_detail: Optional[str] = None
+        final_response = None
+
+        async with stream_context as stream:
+            async for event in stream:
+                await self._raise_if_cancelled(cancellation_token)
+                event_type = getattr(event, "type", "")
+
+                if event_type == "message_start":
+                    message = getattr(event, "message", None)
+                    usage_value = getattr(message, "usage", None)
+                    if usage_value is not None:
+                        usage_meta = usage_value
+                        input_tokens = getattr(usage_value, "input_tokens", input_tokens) or input_tokens
+                    continue
+
+                if event_type == "message_delta":
+                    delta = getattr(event, "delta", None)
+                    reason_value = getattr(delta, "stop_reason", None)
+                    if reason_value is not None:
+                        stop_reason = _stringify_finish_reason(reason_value)
+                    usage_value = getattr(event, "usage", None)
+                    if usage_value is not None:
+                        usage_meta = usage_value
+                        output_tokens = getattr(usage_value, "output_tokens", output_tokens) or output_tokens
+                    continue
+
+                if event_type == "message_stop":
+                    message_stop_seen = True
+                    continue
+
+                if event_type == "error":
+                    error_obj = getattr(event, "error", None)
+                    terminal_error_detail = str(error_obj or "")[:500]
+                    await self._emit_tool_event_safe(
+                        tool_event_callback,
+                        "tool_loop_provider_terminal",
+                        {
+                            "provider": provider_key,
+                            "model": model_id,
+                            "turn": turn,
+                            "loop_scope": loop_scope.value,
+                            "api_surface": "messages",
+                            "status": "error",
+                            "detail": terminal_error_detail,
+                        },
+                    )
+                    raise RuntimeError(
+                        "Claude Messages stream ended with provider error "
+                        f"(detail={terminal_error_detail or 'n/a'})"
+                    )
+
+                if event_type == "content_block_start":
+                    index = self._get_claude_event_index(event, len(block_accumulators))
+                    block = getattr(event, "content_block", None)
+                    block_type = getattr(block, "type", None)
+                    if block_type == "tool_use":
+                        block_accumulators[index] = {
+                            "type": "tool_use",
+                            "id": str(getattr(block, "id", "") or ""),
+                            "name": str(getattr(block, "name", "") or ""),
+                            "input": getattr(block, "input", {}) or {},
+                            "input_json": "",
+                        }
+                    elif block_type == "thinking":
+                        block_accumulators[index] = {
+                            "type": "thinking",
+                            "thinking": str(getattr(block, "thinking", "") or ""),
+                            "signature": str(getattr(block, "signature", "") or ""),
+                        }
+                    else:
+                        block_accumulators[index] = {
+                            "type": "text",
+                            "text": str(getattr(block, "text", "") or ""),
+                        }
+                    continue
+
+                if event_type == "content_block_delta":
+                    index = self._get_claude_event_index(event)
+                    delta = getattr(event, "delta", None)
+                    delta_type = getattr(delta, "type", None)
+                    acc = block_accumulators.setdefault(
+                        index,
+                        {"type": "text", "text": ""},
+                    )
+
+                    if delta_type == "text_delta":
+                        text_delta = str(getattr(delta, "text", "") or "")
+                        if text_delta:
+                            acc["type"] = "text"
+                            acc["text"] = str(acc.get("text", "")) + text_delta
+                            await self._emit_tool_event_safe(
+                                tool_event_callback,
+                                "assistant_delta",
+                                {
+                                    "provider": provider_key,
+                                    "model": model_id,
+                                    "turn": turn,
+                                    "loop_scope": loop_scope.value,
+                                    "api_surface": "messages",
+                                    "content": text_delta,
+                                },
+                            )
+                        continue
+
+                    if delta_type == "thinking_delta":
+                        thinking_delta = str(getattr(delta, "thinking", "") or "")
+                        if thinking_delta:
+                            acc["type"] = "thinking"
+                            acc["thinking"] = str(acc.get("thinking", "")) + thinking_delta
+                            await self._emit_tool_event_safe(
+                                tool_event_callback,
+                                "thinking_delta",
+                                {
+                                    "provider": provider_key,
+                                    "model": model_id,
+                                    "turn": turn,
+                                    "loop_scope": loop_scope.value,
+                                    "api_surface": "messages",
+                                    "content_chars": len(thinking_delta),
+                                },
+                            )
+                        continue
+
+                    if delta_type == "signature_delta":
+                        acc["type"] = "thinking"
+                        acc["signature"] = str(getattr(delta, "signature", "") or "")
+                        continue
+
+                    if delta_type == "input_json_delta":
+                        partial_json = str(getattr(delta, "partial_json", "") or "")
+                        acc["type"] = "tool_use"
+                        acc["input_json"] = str(acc.get("input_json", "")) + partial_json
+                        await self._emit_tool_event_safe(
+                            tool_event_callback,
+                            "tool_call_delta",
+                            {
+                                "provider": provider_key,
+                                "model": model_id,
+                                "turn": turn,
+                                "loop_scope": loop_scope.value,
+                                "api_surface": "messages",
+                                "index": index,
+                                "tool_call_id": acc.get("id") or None,
+                                "tool_name": acc.get("name") or None,
+                                "delta": partial_json,
+                                "arguments_chars": len(acc.get("input_json") or ""),
+                            },
+                        )
+                        continue
+
+                if event_type == "content_block_stop":
+                    index = self._get_claude_event_index(event)
+                    acc = block_accumulators.get(index)
+                    if acc and acc.get("type") == "tool_use":
+                        raw_json = str(acc.get("input_json", "") or "")
+                        try:
+                            acc["input"] = self._parse_claude_tool_input(
+                                raw_json,
+                                acc.get("input"),
+                            )
+                        except Exception as parse_exc:
+                            terminal_error_detail = str(parse_exc)[:500]
+                            await self._emit_tool_event_safe(
+                                tool_event_callback,
+                                "tool_loop_provider_terminal",
+                                {
+                                    "provider": provider_key,
+                                    "model": model_id,
+                                    "turn": turn,
+                                    "loop_scope": loop_scope.value,
+                                    "api_surface": "messages",
+                                    "status": "malformed_tool_input",
+                                    "detail": terminal_error_detail,
+                                },
+                            )
+                            raise RuntimeError(
+                                "Claude streamed tool input ended malformed "
+                                f"(detail={terminal_error_detail or 'n/a'})"
+                            ) from parse_exc
+                    continue
+
+            get_final = getattr(stream, "get_final_response", None) or getattr(
+                stream,
+                "get_final_message",
+                None,
+            )
+            if get_final is not None:
+                try:
+                    maybe_final = get_final()
+                    final_response = await maybe_final if asyncio.iscoroutine(maybe_final) else maybe_final
+                    final_usage = getattr(final_response, "usage", None)
+                    if final_usage is not None:
+                        usage_meta = final_usage
+                    stop_reason = _stringify_finish_reason(
+                        getattr(final_response, "stop_reason", None)
+                    ) or stop_reason
+                except Exception:
+                    final_response = None
+
+        if not message_stop_seen:
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_loop_provider_terminal",
+                {
+                    "provider": provider_key,
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "messages",
+                    "status": "missing_terminal_event",
+                },
+            )
+            raise RuntimeError("Claude Messages stream ended without message_stop")
+
+        if self._is_unusable_claude_stream_stop(stop_reason):
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_loop_provider_terminal",
+                {
+                    "provider": provider_key,
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "messages",
+                    "status": stop_reason,
+                },
+            )
+            raise RuntimeError(
+                f"Claude Messages stream ended with unusable stop_reason={stop_reason}"
+            )
+
+        if final_response is not None and getattr(final_response, "content", None) is not None:
+            content_blocks = list(getattr(final_response, "content") or [])
+        else:
+            content_blocks = [
+                self._claude_content_block_from_accumulator(acc)
+                for _, acc in sorted(block_accumulators.items())
+            ]
+
+        assistant_text = self._extract_text_from_claude_content(content_blocks)
+        tool_uses = [
+            block for block in content_blocks
+            if getattr(block, "type", None) == "tool_use"
+        ]
+
+        if tool_uses and stop_reason != "tool_use":
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_loop_provider_terminal",
+                {
+                    "provider": provider_key,
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "messages",
+                    "status": stop_reason,
+                    "detail": "tool_use blocks arrived without tool_use stop_reason",
+                },
+            )
+            raise RuntimeError("Claude Messages stream returned tool_use blocks without tool_use stop_reason")
+        if stop_reason == "tool_use" and not tool_uses:
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_loop_provider_terminal",
+                {
+                    "provider": provider_key,
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "messages",
+                    "status": "missing_tool_use_block",
+                },
+            )
+            raise RuntimeError("Claude Messages stream ended with tool_use but no tool_use blocks")
+
+        for block in tool_uses:
+            input_obj = getattr(block, "input", {}) or {}
+            try:
+                arguments_chars = len(json.dumps(input_obj, ensure_ascii=True, sort_keys=True))
+            except Exception:
+                arguments_chars = 0
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_call_ready",
+                {
+                    "provider": provider_key,
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "messages",
+                    "tool_call_id": getattr(block, "id", ""),
+                    "tool_name": getattr(block, "name", ""),
+                    "arguments_chars": arguments_chars,
+                },
+            )
+
+        if assistant_text:
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "assistant_text_done",
+                {
+                    "provider": provider_key,
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "messages",
+                    "content_chars": len(assistant_text),
+                },
+            )
+
+        if usage_meta is None and (input_tokens > 0 or output_tokens > 0):
+            usage_meta = SimpleNamespace(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=input_tokens + output_tokens,
+            )
+
+        await self._emit_tool_event_safe(
+            tool_event_callback,
+            "tool_loop_turn_done",
+            {
+                "provider": provider_key,
+                "model": model_id,
+                "turn": turn,
+                "loop_scope": loop_scope.value,
+                "api_surface": "messages",
+                "streaming": True,
+                "finish_reason": stop_reason,
+                "assistant_text_chars": len(assistant_text),
+                "tool_calls": len(tool_uses),
+            },
+        )
+
+        return SimpleNamespace(
+            content=content_blocks,
+            usage=usage_meta,
+            stop_reason=stop_reason,
+        )
+
     async def _run_claude_validation_tool_loop(
         self,
         provider: str,
@@ -3938,6 +5527,7 @@ class AIService:
             current_messages: List[Dict[str, Any]],
             tools_enabled: bool = True,
             tool_schemas: Optional[List[Dict[str, Any]]] = None,
+            turn: int = 0,
         ):
             create_params = {
                 "model": model_id,
@@ -3960,21 +5550,23 @@ class AIService:
 
             self._inject_claude_thinking_params(create_params, model_id, thinking_budget_tokens)
 
+            use_beta_structured_outputs = False
             if use_structured_outputs:
                 use_beta_structured_outputs = self._configure_claude_structured_output_params(
                     create_params,
                     json_schema,
                 )
-                create = (
-                    self.anthropic_client.beta.messages.create
-                    if use_beta_structured_outputs
-                    else self.anthropic_client.messages.create
-                )
-                return await create(**create_params, **request_kwargs)
-
-            return await self.anthropic_client.messages.create(
-                **create_params,
-                **request_kwargs,
+            return await self._stream_claude_tool_turn(
+                create_params,
+                request_kwargs,
+                provider_key=provider_key,
+                model_id=model_id,
+                turn=turn,
+                loop_scope=loop_scope,
+                tool_event_callback=tool_event_callback,
+                cancellation_token=cancellation_token,
+                use_create_stream=use_structured_outputs,
+                use_beta_structured_outputs=use_beta_structured_outputs,
             )
 
         async def _single_attempt() -> Tuple[str, Dict[str, Any]]:
@@ -4117,7 +5709,7 @@ class AIService:
                     }
                 )
                 try:
-                    response = await _create_response(forced_messages, tools_enabled=False)
+                    response = await _create_response(forced_messages, tools_enabled=False, turn=turn)
                 except Exception as provider_exc:
                     await self._maybe_raise_context_overflow_midloop(
                         provider_exc,
@@ -4202,6 +5794,7 @@ class AIService:
                         messages,
                         tools_enabled=bool(active_tools),
                         tool_schemas=active_tools if active_tools else None,
+                        turn=turn,
                     )
                 except Exception as provider_exc:
                     await self._maybe_raise_context_overflow_midloop(
@@ -6287,9 +7880,8 @@ class AIService:
 
         Central responsibilities handled here (§3.7):
 
-        - Fallback to single-shot for OpenAI Responses API models
-          (``o3-pro`` / ``gpt-5-pro``) with
-          ``envelope.tools_skipped_reason="responses_api"``.
+        - Route OpenAI Responses API models through a Responses-specific
+          tool-loop adapter when they advertise tool calling.
         - Fallback to single-shot for providers without tool support
           (``envelope.tools_skipped_reason="no_tool_support"``).
         - Fail-fast ``context_too_large`` detection before dispatch
@@ -6366,19 +7958,7 @@ class AIService:
         provider_key = self._normalize_tool_loop_provider(provider)
 
         # ----- Centralized provider fallback protection (§3.7) ---------------
-        # Responses API models do not support the tool-call contract the loops
-        # rely on. Return an envelope flagged ``responses_api`` instead of
         # raising — the caller can then route to a single-shot path.
-        if provider_key == "openai" and self._is_openai_responses_api_model(model_id):
-            envelope = ToolLoopEnvelope(
-                loop_scope=loop_scope,
-                tools_skipped_reason="responses_api",
-                turns=0,
-                accepted=False,
-                accepted_via="tools_skipped",
-            )
-            return "", envelope
-
         # Providers outside the supported matrix: surface a ``no_tool_support``
         # envelope rather than an exception (§3.7).
         if provider_key not in {"openai", "openrouter", "xai", "claude", "gemini"}:
@@ -6549,10 +8129,6 @@ class AIService:
                     provider_key,
                 )
                 effective_json_schema = None
-        elif json_output_flag and not json_schema_arg and provider_key == "openai" and self._is_openai_responses_api_model(model_id):
-            fallback_schema = {"type": "object", "additionalProperties": False, "properties": {}}
-            self._validate_schema_for_structured_outputs(fallback_schema, provider, model_id)
-
         if phase_logger:
             params = {
                 "temperature": temperature,
@@ -7017,31 +8593,17 @@ class AIService:
             if reasoning_effort:
                 create_params["reasoning"] = {"effort": reasoning_effort}
 
-            # Configure JSON output format (Responses API uses "text" parameter)
-            if json_output:
-                # Use provided schema or fallback to flexible schema
-                schema_to_use = json_schema if json_schema else {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {}
-                }
-
-                # Responses API uses text.format instead of response_format
+            # Configure structured output when a concrete schema is available.
+            if json_output and json_schema:
                 create_params["text"] = {
                     "format": {
                         "type": "json_schema",
-                        "json_schema": {
-                            "name": "structured_output" if json_schema else "flexible_json_output",
-                            "strict": True,
-                            "schema": schema_to_use
-                        }
+                        "name": "structured_output",
+                        "strict": True,
+                        "schema": json_schema,
                     }
                 }
-
-                if json_schema:
-                    logger.info(f"Using O3-Pro JSON Schema structured outputs (custom schema)")
-                else:
-                    logger.info(f"Using O3-Pro JSON Schema structured outputs (flexible schema)")
+                logger.info("Using O3-Pro JSON Schema structured outputs")
 
             if extra_verbose:
                 logger.info(f"[EXTRA_VERBOSE] O3-pro responses parameters: {create_params}")
@@ -7113,31 +8675,17 @@ class AIService:
             else:
                 create_params["reasoning"] = {"effort": "high"}
 
-            # Configure JSON output format (Responses API uses "text" parameter)
-            if json_output:
-                # Use provided schema or fallback to flexible schema
-                schema_to_use = json_schema if json_schema else {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {}
-                }
-
-                # Responses API uses text.format instead of response_format
+            # Configure structured output when a concrete schema is available.
+            if json_output and json_schema:
                 create_params["text"] = {
                     "format": {
                         "type": "json_schema",
-                        "json_schema": {
-                            "name": "structured_output" if json_schema else "flexible_json_output",
-                            "strict": True,
-                            "schema": schema_to_use
-                        }
+                        "name": "structured_output",
+                        "strict": True,
+                        "schema": json_schema,
                     }
                 }
-
-                if json_schema:
-                    logger.info(f"Using GPT-5 Pro JSON Schema structured outputs (custom schema)")
-                else:
-                    logger.info(f"Using GPT-5 Pro JSON Schema structured outputs (flexible schema)")
+                logger.info("Using GPT-5 Pro JSON Schema structured outputs")
 
             if extra_verbose:
                 logger.info(f"[EXTRA_VERBOSE] GPT-5 Pro responses parameters: {create_params}")
@@ -7545,9 +9093,6 @@ class AIService:
                     provider,
                 )
                 effective_json_schema = None
-        elif json_output and not json_schema and provider == "openai" and self._is_openai_responses_api_model(model_id):
-            fallback_schema = {"type": "object", "additionalProperties": False, "properties": {}}
-            self._validate_schema_for_structured_outputs(fallback_schema, provider, model_id)
         attempted_feature = self._attempted_output_feature(
             provider,
             model_id,

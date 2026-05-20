@@ -83,7 +83,7 @@ def _should_use_qa_tools(
     3. ``QABypassEngine.can_bypass_layer`` -> False (bypass wins: if a layer
        can be evaluated algorithmically we do not add an LLM tool round).
     4. No structured request-level validator present -> False.
-    5. Unsupported provider or OpenAI Responses API model -> False.
+    5. Unsupported provider or model without tool-calling support -> False.
     6. Otherwise True.
 
     NEVER uses regex over ``layer.criteria`` — the decision is based only on
@@ -118,8 +118,6 @@ def _should_use_qa_tools(
     model_id = str(model_info.get("model_id", "") or "").lower()
 
     if not AIService._supports_tool_calling(provider_key, model_id):
-        return False
-    if provider_key == "openai" and AIService._is_openai_responses_api_model(model_id):
         return False
 
     return True
@@ -502,9 +500,8 @@ IMPORTANT:
             )
 
         # --- Tool-loop activation (§3.4.1, Fase 2) ---
-        # Streaming is disabled when the tool loop is active — the loop drives
-        # its own provider calls turn-by-turn and cannot multiplex a
-        # client-side stream.
+        # Supported provider adapters now surface stream deltas through
+        # ``tool_event_callback``; other providers still emit sparse telemetry.
         use_tools = (
             layer is not None
             and _should_use_qa_tools(
@@ -562,12 +559,16 @@ IMPORTANT:
                     json_options=json_options,
                 )
 
-            bound_tool_event_callback = tool_event_callback
-            if bound_tool_event_callback is None:
-                async def bound_tool_event_callback(  # type: ignore[misc]
-                    event_type: str, payload: Dict[str, Any]
-                ) -> None:
-                    return None
+            async def bound_tool_event_callback(
+                event_type: str,
+                payload: Dict[str, Any],
+            ) -> None:
+                if tool_event_callback is None:
+                    return
+                enriched_payload = dict(payload or {})
+                enriched_payload.setdefault("qa_model", model)
+                enriched_payload.setdefault("qa_layer", layer_name)
+                await tool_event_callback(event_type, enriched_payload)
 
             loop_content, envelope = await self.ai_service.call_ai_with_validation_tools(
                 prompt=evaluation_prompt,
@@ -613,7 +614,7 @@ IMPORTANT:
                 if isinstance(envelope, ToolLoopEnvelope)
                 else None
             )
-            if skipped_reason in {"responses_api", "no_tool_support"}:
+            if skipped_reason == "no_tool_support":
                 logger.info(
                     "QA tool loop skipped for %s@%s (%s); falling back to single-shot QA",
                     model,
