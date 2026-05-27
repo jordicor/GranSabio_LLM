@@ -24,6 +24,8 @@ Functions tested:
 """
 
 import asyncio
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -77,6 +79,28 @@ def qa_engine(mock_ai_service, mock_bypass_engine):
     return engine
 
 
+class _FakeLocalAIService:
+    """Minimal AI service that exposes the local provider concurrency slot."""
+
+    def __init__(self):
+        self._ollama_request_semaphore = asyncio.Semaphore(1)
+        self.active = 0
+        self.max_active = 0
+
+    @asynccontextmanager
+    async def model_call_concurrency_slot(self, provider, model_id, operation):
+        if provider != "ollama":
+            yield None
+            return
+        async with self._ollama_request_semaphore:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                yield None
+            finally:
+                self.active -= 1
+
+
 @pytest.fixture
 def sample_qa_layer():
     """Create a sample QA layer."""
@@ -87,6 +111,67 @@ def sample_qa_layer():
         min_score=7.0,
         order=1
     )
+
+
+@pytest.mark.asyncio
+async def test_ollama_qa_evaluators_wait_for_local_slot_before_timeout(
+    monkeypatch,
+    mock_bypass_engine,
+):
+    """
+    Given: Multiple QA evaluators use Ollama
+    When: The scheduler launches them in parallel
+    Then: The local provider slot serializes actual evaluator work
+    """
+    fake_ai = _FakeLocalAIService()
+    engine = QAEngine(ai_service=fake_ai, bypass_engine=mock_bypass_engine)
+    layer = QALayer(
+        name="Local QA",
+        description="Local model concurrency",
+        criteria="Evaluate locally",
+        min_score=7.0,
+        order=1,
+    )
+
+    monkeypatch.setattr(
+        "qa_engine.calculate_qa_timeout_for_model",
+        lambda *args, **kwargs: 1.0,
+    )
+    import qa_engine as qa_engine_module
+
+    monkeypatch.setattr(
+        type(qa_engine_module.config),
+        "get_model_info",
+        lambda self, model: {"provider": "ollama"},
+    )
+
+    async def fake_evaluate_content(content, layer, model, original_request, **kwargs):
+        await asyncio.sleep(0.01)
+        return QAEvaluation(
+            model=model,
+            layer=layer.name,
+            score=8.0,
+            feedback="ok",
+            deal_breaker=False,
+            passes_score=True,
+        )
+
+    engine.evaluate_content = fake_evaluate_content
+
+    result = await engine._evaluate_ai_layer_with_scheduler(
+        content="content",
+        layer=layer,
+        qa_models=["local-a", "local-b", "local-c"],
+        qa_model_names=["local-a", "local-b", "local-c"],
+        original_request=SimpleNamespace(
+            qa_execution_mode="parallel",
+            smart_editing_mode="never",
+            content_type="other",
+        ),
+    )
+
+    assert fake_ai.max_active == 1
+    assert result.counts["valid"] == 3
 
 
 @pytest.fixture
@@ -342,6 +427,27 @@ class TestCalculateComprehensiveQATimeout:
             # 600 * 1.5 * 1 layer + 60 margin = 960
             assert timeout == 960.0
 
+    def test_local_ollama_models_are_budgeted_sequentially(self):
+        """
+        Given: Several Ollama QA models and local concurrency of one
+        When: calculate_comprehensive_qa_timeout() is called
+        Then: Reserves time for sequential local model execution
+        """
+        layers = [QALayer(name="Test", description="Test", criteria="Test", min_score=7.0, order=1)]
+        models = ["local-a", "local-b", "local-c"]
+
+        with patch('qa_engine.config') as mock_config:
+            mock_config.get_reasoning_timeout_seconds = Mock(return_value=None)
+            mock_config.QA_BASE_TIMEOUT = 100
+            mock_config.QA_COMPREHENSIVE_TIMEOUT_MARGIN = 30
+            mock_config.OLLAMA_MAX_CONCURRENT_REQUESTS = 1
+            mock_config.get_model_info = Mock(return_value={"provider": "ollama"})
+
+            timeout = calculate_comprehensive_qa_timeout(layers, models)
+
+            # (100 + 100 + 100) * 1 layer + 30 margin = 330
+            assert timeout == 330.0
+
 
 # ============================================================================
 # Test: QAEngine Initialization
@@ -555,6 +661,21 @@ class TestFailureTracking:
             result = qa_engine._qa_failure_threshold()
 
             assert result == 5
+
+    def test_scheduler_policy_uses_configured_provider_failure_retries(self, qa_engine):
+        """
+        Given: Config has MAX_QA_PROVIDER_RETRIES
+        When: _resolve_qa_scheduler_policy() is called
+        Then: The scheduler gets the provider failure retry budget
+        """
+        with patch('qa_engine.config') as mock_config:
+            mock_config.MAX_CONCURRENT_REQUESTS = 10
+            mock_config.MAX_QA_TIMEOUT_RETRIES = 2
+            mock_config.MAX_QA_PROVIDER_RETRIES = 3
+
+            policy = qa_engine._resolve_qa_scheduler_policy(None, configured_count=4)
+
+            assert policy.provider_failure_retries == 3
 
 
 # ============================================================================
@@ -1177,11 +1298,12 @@ class TestEvaluateAllLayersWithProgress:
         When: evaluate_all_layers_with_progress() is called
         Then: Skips failed model, continues with others
         """
-        call_count = [0]
+        call_count = {}
 
         async def mock_evaluate(*args, **kwargs):
-            call_count[0] += 1
-            if call_count[0] == 1:
+            model = kwargs.get("model")
+            call_count[model] = call_count.get(model, 0) + 1
+            if model == "gpt-4o":
                 raise QAResponseParseError("Invalid JSON")
             return sample_qa_evaluation
 

@@ -28,6 +28,7 @@ import aiosqlite
 import json_utils as json
 from ai_service import get_ai_service
 from core.cancellation import ProviderCallHandle
+from llm_routing import resolve_call
 from model_aliasing import ModelAliasRegistry, PromptPart
 
 logger = logging.getLogger(__name__)
@@ -52,8 +53,8 @@ class FeedbackConfig:
     cache_hours: int = 24
     max_evidence_samples: int = 5
     max_rules: int = 15
-    embedding_model: str = "text-embedding-3-large"
-    analysis_model: str = "gpt-4o-mini"
+    embedding_model: Optional[str] = None  # Deprecated explicit override; defaults resolve through llm_routing.
+    analysis_model: Optional[str] = None  # Deprecated explicit override; defaults resolve through llm_routing.
     analysis_temperature: float = 0.1
 
 
@@ -526,15 +527,21 @@ Provide a JSON response with:
 
 3. "next_iteration_hint": 1-3 sentences instructing how to fix the main issues
 
-Return ONLY valid JSON, no additional text."""
+        Return ONLY valid JSON, no additional text."""
 
         try:
+            route = resolve_call("feedback.analyze")
+            model_name = self.config.analysis_model or route.model
             response = await self.ai_service.generate_content(
                 prompt=prompt,
-                model=self.config.analysis_model,
-                temperature=self.config.analysis_temperature,
+                model=model_name,
+                temperature=route.params.get("temperature", self.config.analysis_temperature),
+                max_tokens=route.params.get("max_tokens", 2000),
+                reasoning_effort=route.params.get("reasoning_effort"),
+                thinking_budget_tokens=route.params.get("thinking_budget_tokens"),
                 json_output=True,
                 model_alias_registry=model_alias_registry,
+                llm_routing=None,
                 cancellation_token=cancellation_token,
                 prompt_safety_parts=[
                     PromptPart(
@@ -593,11 +600,13 @@ Return ONLY valid JSON, no additional text."""
             current_task.cancel()
 
         async def request_embeddings() -> Any:
+            route = resolve_call("feedback.embed")
+            embedding_model = self.config.embedding_model or route.model
             return await self.ai_service._make_request(
                 'POST',
                 'https://api.openai.com/v1/embeddings',
                 json={
-                    'model': self.config.embedding_model,
+                    'model': embedding_model,
                     'input': texts
                 }
             )
@@ -607,10 +616,12 @@ Return ONLY valid JSON, no additional text."""
                 raise asyncio.CancelledError()
 
             if cancellation_token:
+                route = resolve_call("feedback.embed")
+                embedding_model = self.config.embedding_model or route.model
                 handle = ProviderCallHandle(
                     call_id="",
                     provider="openai",
-                    model_id=self.config.embedding_model,
+                    model_id=embedding_model,
                     session_id=cancellation_token.session_id,
                     phase=cancellation_token.phase,
                     operation="feedback_embeddings",
@@ -658,14 +669,20 @@ Focus on the most frequent and severe issues.
 Return a JSON object with a single field "rules" containing an array of rule strings.
 Each rule should be imperative and actionable (e.g., "ALWAYS include publication dates", "AVOID excessive superlatives").
 
-Return ONLY valid JSON."""
+        Return ONLY valid JSON."""
 
         try:
+            route = resolve_call("feedback.synthesize_rules")
+            model_name = self.config.analysis_model or route.model
             response = await self.ai_service.generate_content(
                 prompt=prompt,
-                model=self.config.analysis_model,
-                temperature=0.0,
+                model=model_name,
+                temperature=route.params.get("temperature", 0.0),
+                max_tokens=route.params.get("max_tokens", 2000),
+                reasoning_effort=route.params.get("reasoning_effort"),
+                thinking_budget_tokens=route.params.get("thinking_budget_tokens"),
                 json_output=True,
+                llm_routing=None,
                 cancellation_token=cancellation_token,
             )
 

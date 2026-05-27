@@ -2,8 +2,8 @@
   /* ═══════════════════════════════════════════════════
    * Constants
    * ═══════════════════════════════════════════════════ */
-  const TABS = ["catalog", "openai", "anthropic", "google", "xai", "openrouter"];
-  const PROVIDER_TABS = ["openai", "anthropic", "google", "xai", "openrouter"];
+  const TABS = ["catalog", "openai", "anthropic", "google", "xai", "openrouter", "ollama"];
+  const PROVIDER_TABS = ["openai", "anthropic", "google", "xai", "openrouter", "ollama"];
   const PROVIDER_LABELS = {
     catalog: "Catalog",
     openai: "OpenAI",
@@ -11,8 +11,10 @@
     google: "Google",
     xai: "xAI",
     openrouter: "OpenRouter",
+    ollama: "Ollama",
   };
-  const FULL_SYNC_PROVIDERS = new Set(["openrouter", "xai"]);
+  const FULL_SYNC_PROVIDERS = new Set(["openrouter", "xai", "ollama"]);
+  const REMOVE_MISSING_BY_DEFAULT_PROVIDERS = new Set(["ollama"]);
 
   /* ═══════════════════════════════════════════════════
    * Utility functions (kept from previous version)
@@ -503,9 +505,13 @@
         const metaEl = document.getElementById("providerMeta");
         if (titleEl) titleEl.textContent = PROVIDER_LABELS[tab] || tab;
         if (metaEl) {
-          metaEl.textContent = FULL_SYNC_PROVIDERS.has(tab)
-            ? "Full sync - replaces provider section in catalog"
-            : "Discovery sync - adds new models to catalog";
+          metaEl.textContent = tab === "ollama"
+            ? "Local sync - mirrors models installed in Ollama"
+            : (
+              FULL_SYNC_PROVIDERS.has(tab)
+                ? "Full sync - replaces provider section in catalog"
+                : "Discovery sync - adds new models to catalog"
+            );
         }
         this.loadRemote(tab);
       }
@@ -840,7 +846,9 @@
       const selections = {
         new: new Set(newModels.map((m) => m.id)),           // all new checked by default
         updated: new Set(updatedModels.map((m) => m.remote.id)),   // all updated checked by default
-        missing: new Set(),                                  // none checked = keep all
+        missing: REMOVE_MISSING_BY_DEFAULT_PROVIDERS.has(provider)
+          ? new Set(missingModels.map((m) => m.id))
+          : new Set(),                                  // keep all unless provider is local source of truth
       };
       this.providerSelections.set(provider, selections);
     }
@@ -981,7 +989,11 @@
 
       // Not in API section (only for FULL_SYNC providers)
       if (FULL_SYNC_PROVIDERS.has(provider) && missingModels.length > 0) {
-        html += this.renderSection("missing", "Not in API", `${missingModels.length} models in catalog but not found in remote API. Check = remove from catalog.`, missingModels, {
+        const missingTitle = provider === "ollama" ? "Not installed locally" : "Not in API";
+        const missingDescription = provider === "ollama"
+          ? `${missingModels.length} models in catalog but not installed in Ollama. Checked models will be removed from the catalog.`
+          : `${missingModels.length} models in catalog but not found in remote API. Check = remove from catalog.`;
+        html += this.renderSection("missing", missingTitle, missingDescription, missingModels, {
           expanded: false,
           showCheckboxes: true,
           selectedSet: selections.missing,

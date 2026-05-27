@@ -56,25 +56,21 @@ GRANSABIO_API_KEY = os.getenv("GRANSABIO_API_KEY", "")
 REQUEST_TIMEOUT = int(os.getenv("GRANSABIO_TIMEOUT", "300"))
 POLL_INTERVAL = float(os.getenv("GRANSABIO_POLL_INTERVAL", "2.0"))
 
-# Default models configuration
-DEFAULT_GENERATOR_MODEL = os.getenv("GRANSABIO_GENERATOR_MODEL", "gpt-5.2")
-DEFAULT_QA_MODELS = os.getenv(
-    "GRANSABIO_QA_MODELS",
-    "claude-opus-4-6,z-ai/glm-4.7,gemini-3-pro-preview"
-).split(",")
-DEFAULT_ARBITER_MODEL = os.getenv(
-    "GRANSABIO_ARBITER_MODEL",
-    "claude-opus-4-6"
-)
+# Optional MCP-level overrides. When unset, the API resolves every model
+# through Gran Sabio's central llm_routing document.
+GENERATOR_MODEL_OVERRIDE = os.getenv("GRANSABIO_GENERATOR_MODEL")
+_qa_models_env = os.getenv("GRANSABIO_QA_MODELS")
+QA_MODEL_OVERRIDES = [item.strip() for item in _qa_models_env.split(",") if item.strip()] if _qa_models_env else None
+ARBITER_MODEL_OVERRIDE = os.getenv("GRANSABIO_ARBITER_MODEL")
 
-# Reasoning configuration defaults
-DEFAULT_GENERATOR_REASONING = os.getenv("GRANSABIO_GENERATOR_REASONING", "medium")
-DEFAULT_QA_REASONING = os.getenv("GRANSABIO_QA_REASONING", "medium")
-DEFAULT_ARBITER_REASONING = os.getenv("GRANSABIO_ARBITER_REASONING", "high")
+# Optional reasoning overrides.
+GENERATOR_REASONING_OVERRIDE = os.getenv("GRANSABIO_GENERATOR_REASONING")
+QA_REASONING_OVERRIDE = os.getenv("GRANSABIO_QA_REASONING")
+ARBITER_REASONING_OVERRIDE = os.getenv("GRANSABIO_ARBITER_REASONING")
 
 # Thinking budget for Claude models (0 = auto/disabled)
 _thinking_budget_env = os.getenv("GRANSABIO_THINKING_BUDGET", "0")
-DEFAULT_THINKING_BUDGET = int(_thinking_budget_env) if _thinking_budget_env.isdigit() else 0
+THINKING_BUDGET_OVERRIDE = int(_thinking_budget_env) if _thinking_budget_env.isdigit() else 0
 
 
 # =============================================================================
@@ -85,7 +81,7 @@ DEFAULT_THINKING_BUDGET = int(_thinking_budget_env) if _thinking_budget_env.isdi
 REASONING_PARAMS_SCHEMA = {
     "generator_model": {
         "type": "string",
-        "description": "Override the generator model (e.g., gpt-5.2, claude-opus-4-6)"
+        "description": "Optional explicit generator model override"
     },
     "qa_models": {
         "type": "array",
@@ -95,7 +91,7 @@ REASONING_PARAMS_SCHEMA = {
     "reasoning_effort": {
         "type": "string",
         "enum": ["none", "low", "medium", "high"],
-        "description": "Reasoning effort for generator (GPT-5/O1/O3 models). Higher = deeper analysis, slower response."
+        "description": "Reasoning effort for compatible reasoning models. Higher = deeper analysis, slower response."
     },
     "thinking_budget_tokens": {
         "type": "integer",
@@ -124,9 +120,10 @@ def _parse_reasoning_effort(value: Optional[str]) -> Optional[str]:
 
 def _build_generator_config(args: Dict[str, Any]) -> Dict[str, Any]:
     """Build generator configuration from arguments."""
-    config = {
-        "generator_model": args.get("generator_model", DEFAULT_GENERATOR_MODEL)
-    }
+    config = {}
+    generator_model = args.get("generator_model") or GENERATOR_MODEL_OVERRIDE
+    if generator_model:
+        config["generator_model"] = generator_model
 
     # Reasoning effort (GPT-5, O1, O3)
     reasoning = args.get("reasoning_effort")
@@ -134,8 +131,8 @@ def _build_generator_config(args: Dict[str, Any]) -> Dict[str, Any]:
         parsed = _parse_reasoning_effort(reasoning)
         if parsed:
             config["reasoning_effort"] = parsed
-    elif DEFAULT_GENERATOR_REASONING:
-        parsed = _parse_reasoning_effort(DEFAULT_GENERATOR_REASONING)
+    elif GENERATOR_REASONING_OVERRIDE:
+        parsed = _parse_reasoning_effort(GENERATOR_REASONING_OVERRIDE)
         if parsed:
             config["reasoning_effort"] = parsed
 
@@ -143,17 +140,18 @@ def _build_generator_config(args: Dict[str, Any]) -> Dict[str, Any]:
     thinking_budget = args.get("thinking_budget_tokens")
     if thinking_budget and isinstance(thinking_budget, int) and thinking_budget >= 1024:
         config["thinking_budget_tokens"] = thinking_budget
-    elif DEFAULT_THINKING_BUDGET >= 1024:
-        config["thinking_budget_tokens"] = DEFAULT_THINKING_BUDGET
+    elif THINKING_BUDGET_OVERRIDE >= 1024:
+        config["thinking_budget_tokens"] = THINKING_BUDGET_OVERRIDE
 
     return config
 
 
 def _build_qa_config(args: Dict[str, Any]) -> Dict[str, Any]:
     """Build QA models configuration from arguments."""
-    config = {
-        "qa_models": args.get("qa_models", DEFAULT_QA_MODELS)
-    }
+    config = {}
+    qa_models = args.get("qa_models") or QA_MODEL_OVERRIDES
+    if qa_models:
+        config["qa_models"] = qa_models
 
     # QA reasoning effort - apply globally to all QA models
     qa_reasoning = args.get("qa_reasoning_effort")
@@ -161,8 +159,8 @@ def _build_qa_config(args: Dict[str, Any]) -> Dict[str, Any]:
         parsed = _parse_reasoning_effort(qa_reasoning)
         if parsed:
             config["qa_global_config"] = {"reasoning_effort": parsed}
-    elif DEFAULT_QA_REASONING:
-        parsed = _parse_reasoning_effort(DEFAULT_QA_REASONING)
+    elif QA_REASONING_OVERRIDE:
+        parsed = _parse_reasoning_effort(QA_REASONING_OVERRIDE)
         if parsed:
             config["qa_global_config"] = {"reasoning_effort": parsed}
 
@@ -173,10 +171,11 @@ def _build_arbiter_config(args: Dict[str, Any]) -> Dict[str, Any]:
     """Build arbiter (Gran Sabio) configuration."""
     # Arbiter doesn't support per-call reasoning config in the API yet,
     # but we prepare the model selection
-    return {
-        "gran_sabio_model": args.get("gran_sabio_model", DEFAULT_ARBITER_MODEL),
-        "gran_sabio_fallback": True
-    }
+    config = {"gran_sabio_fallback": True}
+    arbiter_model = args.get("gran_sabio_model") or ARBITER_MODEL_OVERRIDE
+    if arbiter_model:
+        config["gran_sabio_model"] = arbiter_model
+    return config
 
 
 # Initialize MCP server
@@ -450,8 +449,8 @@ Shows models organized by provider with their capabilities and pricing.""",
         ),
         Tool(
             name="gransabio_get_config",
-            description="""Get current MCP server configuration including default models
-and reasoning settings. Useful for debugging or understanding current setup.""",
+            description="""Get current MCP server configuration including API routing source
+and optional MCP-level overrides. Useful for debugging current setup.""",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -807,15 +806,16 @@ def _handle_get_config() -> dict[str, Any]:
     return {
         "api_url": GRANSABIO_API_URL,
         "models": {
-            "generator": DEFAULT_GENERATOR_MODEL,
-            "qa_models": DEFAULT_QA_MODELS,
-            "arbiter": DEFAULT_ARBITER_MODEL
+            "generator_override": GENERATOR_MODEL_OVERRIDE,
+            "qa_model_overrides": QA_MODEL_OVERRIDES,
+            "arbiter_override": ARBITER_MODEL_OVERRIDE,
+            "default_source": "Gran Sabio API llm_routing"
         },
         "reasoning": {
-            "generator_reasoning": DEFAULT_GENERATOR_REASONING,
-            "qa_reasoning": DEFAULT_QA_REASONING,
-            "arbiter_reasoning": DEFAULT_ARBITER_REASONING,
-            "thinking_budget": DEFAULT_THINKING_BUDGET if DEFAULT_THINKING_BUDGET >= 1024 else "auto"
+            "generator_reasoning": GENERATOR_REASONING_OVERRIDE,
+            "qa_reasoning": QA_REASONING_OVERRIDE,
+            "arbiter_reasoning": ARBITER_REASONING_OVERRIDE,
+            "thinking_budget": THINKING_BUDGET_OVERRIDE if THINKING_BUDGET_OVERRIDE >= 1024 else "API routing"
         },
         "timeouts": {
             "request_timeout": REQUEST_TIMEOUT,
@@ -833,17 +833,21 @@ async def main():
     print("Gran Sabio LLM MCP Server", file=sys.stderr)
     print(f"API URL: {GRANSABIO_API_URL}", file=sys.stderr)
     print("", file=sys.stderr)
-    print("Models:", file=sys.stderr)
-    print(f"  Generator: {DEFAULT_GENERATOR_MODEL}", file=sys.stderr)
-    print(f"  QA: {', '.join(DEFAULT_QA_MODELS)}", file=sys.stderr)
-    print(f"  Arbiter: {DEFAULT_ARBITER_MODEL}", file=sys.stderr)
+    print("Model routing:", file=sys.stderr)
+    print("  Defaults: Gran Sabio API llm_routing", file=sys.stderr)
+    if GENERATOR_MODEL_OVERRIDE:
+        print(f"  Generator override: {GENERATOR_MODEL_OVERRIDE}", file=sys.stderr)
+    if QA_MODEL_OVERRIDES:
+        print(f"  QA overrides: {', '.join(QA_MODEL_OVERRIDES)}", file=sys.stderr)
+    if ARBITER_MODEL_OVERRIDE:
+        print(f"  Arbiter override: {ARBITER_MODEL_OVERRIDE}", file=sys.stderr)
     print("", file=sys.stderr)
-    print("Reasoning Defaults:", file=sys.stderr)
-    print(f"  Generator: {DEFAULT_GENERATOR_REASONING}", file=sys.stderr)
-    print(f"  QA: {DEFAULT_QA_REASONING}", file=sys.stderr)
-    print(f"  Arbiter: {DEFAULT_ARBITER_REASONING}", file=sys.stderr)
-    if DEFAULT_THINKING_BUDGET >= 1024:
-        print(f"  Thinking Budget: {DEFAULT_THINKING_BUDGET} tokens", file=sys.stderr)
+    print("Reasoning overrides:", file=sys.stderr)
+    print(f"  Generator: {GENERATOR_REASONING_OVERRIDE or 'API routing'}", file=sys.stderr)
+    print(f"  QA: {QA_REASONING_OVERRIDE or 'API routing'}", file=sys.stderr)
+    print(f"  Arbiter: {ARBITER_REASONING_OVERRIDE or 'API routing'}", file=sys.stderr)
+    if THINKING_BUDGET_OVERRIDE >= 1024:
+        print(f"  Thinking Budget: {THINKING_BUDGET_OVERRIDE} tokens", file=sys.stderr)
     print("", file=sys.stderr)
 
     async with stdio_server() as (read_stream, write_stream):

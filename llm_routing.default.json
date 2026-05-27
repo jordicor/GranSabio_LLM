@@ -1,0 +1,210 @@
+{
+  "version": 1,
+  "policy": {
+    "remote_allowed": true,
+    "unsupported_optional_params": "warn_and_drop",
+    "unsupported_required_capability": "fail_fast",
+    "missing_required_call": "fail_fast"
+  },
+  "global": {
+    "model": null,
+    "params": {}
+  },
+  "calls": {
+    "generation.main": {
+      "model": "gpt-4o",
+      "params": {
+        "temperature": 0.7
+      }
+    },
+    "generation.direct_stream": {
+      "model": "gpt-4o",
+      "params": {
+        "temperature": 0.7
+      }
+    },
+    "generation.json_retry": {
+      "model": "gpt-4o",
+      "params": {
+        "temperature": 0.7
+      }
+    },
+    "generation.smart_edit": {
+      "model": "gpt-4o-mini",
+      "params": {
+        "temperature": 0.2
+      }
+    },
+    "qa.evaluate_layer": {
+      "models": [
+        {
+          "model": "gpt-5-mini",
+          "params": {
+            "reasoning_effort": "medium"
+          }
+        },
+        {
+          "model": "claude-sonnet-4-20250514",
+          "params": {
+            "temperature": 0.3
+          }
+        },
+        {
+          "model": "gemini-2.5-flash",
+          "params": {
+            "temperature": 0.3
+          }
+        }
+      ]
+    },
+    "auto_qa.plan": {
+      "model": "claude-opus-4-6",
+      "params": {
+        "temperature": 0.0,
+        "max_tokens": 6000
+      }
+    },
+    "gransabio.review": {
+      "model": "claude-opus-4-6"
+    },
+    "gransabio.regenerate": {
+      "model": "claude-opus-4-6"
+    },
+    "gransabio.escalation": {
+      "model": "claude-opus-4-6"
+    },
+    "arbiter.resolve": {
+      "model": "gpt-5-mini",
+      "params": {
+        "reasoning_effort": "medium",
+        "max_tokens": 8000
+      }
+    },
+    "preflight.validate": {
+      "model": "grok-4-fast-non-reasoning",
+      "params": {
+        "temperature": 0.0,
+        "max_tokens": 800
+      }
+    },
+    "long_text.section_draft": {
+      "model": "gpt-4o",
+      "params": {
+        "temperature": 0.7
+      }
+    },
+    "long_text.section_tools": {
+      "model": "gpt-4o",
+      "params": {
+        "temperature": 0.7
+      }
+    },
+    "long_text.semantic_eval": {
+      "model": "gpt-5-mini",
+      "params": {
+        "reasoning_effort": "medium",
+        "max_tokens": 4096
+      }
+    },
+    "evidence.extract_claims": {
+      "model": "gpt-5-nano",
+      "params": {
+        "reasoning_effort": "low",
+        "max_tokens": 4000
+      }
+    },
+    "evidence.score_logprobs": {
+      "model": "gpt-4o-mini",
+      "requires": [
+        "logprobs"
+      ],
+      "params": {
+        "temperature": 0.0,
+        "max_tokens": 5
+      }
+    },
+    "feedback.analyze": {
+      "model": "gpt-4o-mini",
+      "params": {
+        "temperature": 0.1
+      }
+    },
+    "feedback.synthesize_rules": {
+      "model": "gpt-4o-mini",
+      "params": {
+        "temperature": 0.0
+      }
+    },
+    "feedback.embed": {
+      "model": "text-embedding-3-large",
+      "requires": [
+        "embeddings"
+      ]
+    },
+    "feedback.embed_fallback": {
+      "model": "text-embedding-3-small",
+      "requires": [
+        "embeddings"
+      ]
+    },
+    "embedding.openai": {
+      "model": "text-embedding-3-large",
+      "requires": [
+        "embeddings"
+      ]
+    },
+    "embedding.openai_fallback": {
+      "model": "text-embedding-3-small",
+      "requires": [
+        "embeddings"
+      ]
+    },
+    "embedding.google": {
+      "model": "models/text-embedding-004",
+      "requires": [
+        "embeddings"
+      ]
+    },
+    "accent.audit": {
+      "model": "gpt-5-mini",
+      "params": {
+        "reasoning_effort": "low"
+      }
+    },
+    "smart_edit.analyze": {
+      "model": "gpt-4o-mini",
+      "params": {
+        "temperature": 0.3,
+        "max_tokens": 4096
+      }
+    },
+    "smart_edit.apply": {
+      "model": "gpt-4o-mini",
+      "params": {
+        "temperature": 0.2,
+        "max_tokens": 4096
+      }
+    },
+    "health.openai": {
+      "model": "gpt-4o-mini",
+      "params": {
+        "max_tokens": 5
+      }
+    },
+    "health.claude": {
+      "model": "claude-haiku-4-5",
+      "params": {
+        "max_tokens": 5
+      }
+    },
+    "health.gemini": {
+      "model": "gemini-2.0-flash"
+    },
+    "health.xai": {
+      "model": "grok-4-0709",
+      "params": {
+        "max_tokens": 5
+      }
+    }
+  }
+}

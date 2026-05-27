@@ -85,7 +85,7 @@
     <div class="param-row">
       <div class="param-name">generator_model</div>
       <div class="param-type">string</div>
-      <div class="param-desc">AI model for generation (default: gpt-4o)</div>
+      <div class="param-desc">Optional explicit AI model override for generation. If omitted, llm_routing decides.</div>
     </div>
     <div class="param-row">
       <div class="param-name">temperature</div>
@@ -220,7 +220,7 @@
     <div class="param-row">
       <div class="param-name">gran_sabio_model</div>
       <div class="param-type">string</div>
-      <div class="param-desc">Model for Gran Sabio escalation (default: claude-opus-4-1-20250805).</div>
+      <div class="param-desc">Optional explicit model override for Gran Sabio escalation. If omitted, llm_routing decides.</div>
     </div>
     <div class="param-row">
       <div class="param-name">gran_sabio_fallback</div>
@@ -912,7 +912,7 @@
     <div class="param-row">
       <div class="param-name">model</div>
       <div class="param-type">string</div>
-      <div class="param-desc">Model for logprob verification. Must support logprobs (gpt-4o-mini, gpt-5-nano recommended). Default: server config.</div>
+      <div class="param-desc">Optional explicit model for logprob verification. If omitted, evidence.score_logprobs in llm_routing decides.</div>
     </div>
     <div class="param-row">
       <div class="param-name">max_claims</div>

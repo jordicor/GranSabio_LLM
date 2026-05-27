@@ -50,6 +50,12 @@ def _auto_qa_request(**overrides) -> ContentRequest:
         "qa_layers": [],
         "gran_sabio_model": "fake-gran-sabio",
         "arbiter_model": "fake-arbiter",
+        "llm_routing": {
+            "calls": {
+                "preflight.validate": {"model": "fake-preflight"},
+                "long_text.semantic_eval": {"model": "fake-preflight"},
+            }
+        },
         "auto_qa": {"enabled": True, "rigor": "light"},
     }
     payload.update(overrides)

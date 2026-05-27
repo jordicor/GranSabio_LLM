@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 from ai_service import StreamChunk
 from config import config
+from llm_routing import LLMRoutingError, resolve_call
 from model_aliasing import ModelAliasRegistry, PromptPart
 from models import ContentRequest, PreflightIssue, PreflightResult, WordCountAnalysis
 from usage_tracking import UsageTracker
@@ -35,15 +36,15 @@ def _normalise_model_name(value: Any) -> Optional[str]:
 
 def resolve_preflight_model(request: ContentRequest) -> Optional[str]:
     """Resolve the required LLM model for preflight validation."""
-    configured_model = _normalise_model_name(getattr(config, "PREFLIGHT_VALIDATION_MODEL", None))
-    if configured_model:
-        return configured_model
-
-    arbiter_model = _normalise_model_name(getattr(request, "arbiter_model", None))
-    if arbiter_model:
-        return arbiter_model
-
-    return _normalise_model_name(getattr(request, "gran_sabio_model", None))
+    request_model = _normalise_model_name(getattr(request, "_preflight_model", None))
+    if request_model:
+        return request_model
+    try:
+        route = resolve_call("preflight.validate", request=request)
+        setattr(request, "_preflight_route", route)
+        return route.model
+    except LLMRoutingError:
+        return None
 
 
 def _build_preflight_failure_result(
@@ -442,16 +443,28 @@ def _validate_evidence_grounding_config(request: ContentRequest) -> Optional[Pre
     if not request.evidence_grounding or not request.evidence_grounding.enabled:
         return None
 
-    # Get the scoring model (requires logprobs validation)
-    # If user specifies a model, it's used for both extraction and scoring
-    eg_scoring_model = request.evidence_grounding.model or config.EVIDENCE_GROUNDING_SCORING_MODEL
+    # Get the scoring model (requires logprobs validation).
+    # If user specifies a legacy model, it is used for both extraction and scoring.
+    try:
+        eg_scoring_model = (
+            request.evidence_grounding.model
+            or resolve_call("evidence.score_logprobs", request=request).model
+        )
+    except LLMRoutingError as exc:
+        return PreflightIssue(
+            code="evidence_grounding_routing_invalid",
+            severity="critical",
+            message=str(exc),
+            blockers=True,
+            related_requirements=["evidence_grounding"],
+        )
 
     if not eg_scoring_model:
         return PreflightIssue(
             code="evidence_grounding_no_model",
             severity="critical",
             message="Evidence grounding is enabled but no scoring model is configured. "
-                    "Set EVIDENCE_GROUNDING_SCORING_MODEL in config or specify model in request.",
+                    "Configure evidence.score_logprobs in llm_routing or specify a legacy evidence model in the request.",
             blockers=True,
             related_requirements=["evidence_grounding"],
         )
@@ -463,21 +476,20 @@ def _validate_evidence_grounding_config(request: ContentRequest) -> Optional[Pre
             code="evidence_grounding_unknown_model",
             severity="critical",
             message=f"Evidence grounding model '{eg_scoring_model}' is not recognized. "
-                    f"Please use a valid OpenAI model that supports logprobs.",
+                    f"Please use a valid model that supports logprobs.",
             blockers=True,
             related_requirements=["evidence_grounding"],
         )
 
     provider = model_info.get("provider", "")
 
-    # Only OpenAI models support logprobs
-    if provider != "openai":
+    # OpenAI and xAI non-reasoning models expose logprobs through the runtime.
+    if provider not in {"openai", "xai"}:
         return PreflightIssue(
             code="evidence_grounding_no_logprobs",
             severity="critical",
             message=f"Evidence grounding model '{eg_scoring_model}' (provider: {provider}) does not support logprobs. "
-                    f"Only OpenAI models support the logprob verification required for evidence grounding. "
-                    f"Please use gpt-4o-mini, gpt-5-nano, or similar OpenAI models.",
+                    f"The selected provider does not expose the logprob verification required for evidence grounding.",
             blockers=True,
             related_requirements=["evidence_grounding"],
         )
@@ -499,8 +511,7 @@ def _validate_evidence_grounding_config(request: ContentRequest) -> Optional[Pre
             code="evidence_grounding_reasoning_model",
             severity="critical",
             message=f"Evidence grounding model '{eg_scoring_model}' is a reasoning model that does not expose logprobs. "
-                    f"Reasoning models (o1, o1-mini, o3, o3-mini) cannot be used for evidence grounding verification. "
-                    f"Please use gpt-4o-mini, gpt-5-nano, or similar models instead.",
+                    f"Reasoning models without token logprobs cannot be used for evidence grounding verification.",
             blockers=True,
             related_requirements=["evidence_grounding"],
         )
@@ -536,10 +547,13 @@ async def run_preflight_validation(
         PreflightResult with decision (proceed/reject) and validation feedback.
     """
     selected_model = resolve_preflight_model(request)
+    preflight_route = getattr(request, "_preflight_route", None)
+    preflight_params = getattr(preflight_route, "params", {}) or {}
+    preflight_temperature = preflight_params.get("temperature", 0.0)
+    preflight_max_tokens = preflight_params.get("max_tokens", 800)
     if not selected_model:
         message = (
-            "Preflight validation could not start because no preflight, Arbiter, "
-            "or GranSabio model is configured."
+            "Preflight validation could not start because preflight.validate has no routed model."
         )
         logger.error(message)
         return _build_preflight_failure_result(
@@ -584,8 +598,8 @@ async def run_preflight_validation(
                 model=selected_model,
                 system_prompt=config.PREFLIGHT_SYSTEM_PROMPT,
                 user_prompt=validator_prompt,
-                temperature=0.0,
-                max_tokens=800
+                temperature=preflight_temperature,
+                max_tokens=preflight_max_tokens
             )
 
         usage_callback = (
@@ -608,14 +622,15 @@ async def run_preflight_validation(
             async for chunk in ai_service.generate_content_stream(
                 prompt=validator_prompt,
                 model=selected_model,
-                temperature=0.0,
-                max_tokens=800,
+                temperature=preflight_temperature,
+                max_tokens=preflight_max_tokens,
                 system_prompt=config.PREFLIGHT_SYSTEM_PROMPT,
                 extra_verbose=False,
                 usage_callback=usage_callback,
                 phase_logger=phase_logger,
                 model_alias_registry=model_alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                llm_routing=getattr(request, "_llm_routing", None),
                 cancellation_token=cancellation_token,
             ):
                 # Handle StreamChunk (Claude with thinking) vs plain string
@@ -638,14 +653,15 @@ async def run_preflight_validation(
             raw_output = await ai_service.generate_content(
                 prompt=validator_prompt,
                 model=selected_model,
-                temperature=0.0,
-                max_tokens=800,
+                temperature=preflight_temperature,
+                max_tokens=preflight_max_tokens,
                 system_prompt=config.PREFLIGHT_SYSTEM_PROMPT,
                 extra_verbose=False,
                 usage_callback=usage_callback,
                 phase_logger=phase_logger,
                 model_alias_registry=model_alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                llm_routing=getattr(request, "_llm_routing", None),
                 cancellation_token=cancellation_token,
             )
 

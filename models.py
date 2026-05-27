@@ -12,7 +12,11 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
-from config import config, get_default_models
+from config import config
+from model_capability_registry import (
+    model_qualifies_for_inline_accent_guard,
+    resolve_model_capability_context,
+)
 from phrase_frequency_config import normalize_phrase_frequency_config
 from smart_edit import TextEditRange
 
@@ -66,24 +70,6 @@ def is_json_output_requested(request: Any) -> bool:
         getattr(request, "json_output", False)
         or getattr(request, "content_type", None) == "json"
     )
-
-
-def _default_gran_sabio_model() -> str:
-    """Return configured default model for Gran Sabio from configuration."""
-    defaults = get_default_models()
-    default_model = defaults.get("gran_sabio")
-    if not default_model:
-        raise RuntimeError("Gran Sabio default model is not configured in model_specs.json under 'default_models.gran_sabio'.")
-    return default_model
-
-
-def _default_arbiter_model() -> str:
-    """Return configured default model for Arbiter from configuration."""
-    defaults = get_default_models()
-    default_model = defaults.get("arbiter")
-    if not default_model:
-        raise RuntimeError("Arbiter default model is not configured in model_specs.json under 'default_models.arbiter'.")
-    return default_model
 
 
 class QALayer(BaseModel):
@@ -564,9 +550,7 @@ class EvidenceGroundingConfig(BaseModel):
     model: Optional[str] = Field(
         default=None,
         description="[DEPRECATED] Override model for BOTH extraction and scoring. "
-                    "If None, uses separate optimized models: "
-                    "EVIDENCE_GROUNDING_EXTRACTION_MODEL (gpt-5-nano, cheap) for claim extraction, "
-                    "EVIDENCE_GROUNDING_SCORING_MODEL (gpt-4o-mini, logprobs) for budget scoring. "
+                    "If None, uses evidence.extract_claims and evidence.score_logprobs from llm_routing. "
                     "Only set this to force a single model for both phases."
     )
 
@@ -618,7 +602,7 @@ class EvidenceGroundingConfig(BaseModel):
         json_schema_extra = {
             "example": {
                 "enabled": True,
-                "model": None,  # Uses optimized dual-model: gpt-5-nano (extraction) + gpt-4o-mini (scoring)
+                "model": None,  # Uses evidence.extract_claims and evidence.score_logprobs routing
                 "filter_trivial": True,
                 "budget_gap_threshold": 0.5,
                 "on_flag": "deal_breaker",
@@ -913,6 +897,11 @@ class ContentRequest(BaseModel):
         validation_alias=AliasChoices("request_project_id", "get_project_id"),
         description="When true, allocate and return a project_id if one is not provided.",
     )
+    llm_routing: Optional[Dict[str, Any]] = Field(
+        default=None,
+        validation_alias=AliasChoices("llm_routing", "llmRouting"),
+        description="Optional request-scoped model routing overlay keyed by exact LLM call id.",
+    )
 
     # Context attachments configuration
     context_documents: Optional[List[ContextDocumentRef]] = Field(
@@ -931,10 +920,10 @@ class ContentRequest(BaseModel):
     )
 
     # Generator configuration
-    generator_model: str = Field(
-        default="gpt-4o",
+    generator_model: Optional[str] = Field(
+        default=None,
         validation_alias="model",  # Accept both 'model' and 'generator_model'
-        description="AI model for content generation"
+        description="Legacy explicit AI model override for primary generation. Defaults resolve via llm_routing."
     )
     temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="Generation temperature")
     max_tokens: Optional[int] = Field(default=None, gt=0, description="Maximum tokens for generation. If omitted at /generate, the server uses the selected model's max output from model_specs.json (fallback: 8192). Ignored if max_tokens_percentage is specified")
@@ -989,9 +978,9 @@ class ContentRequest(BaseModel):
         default_factory=AutoQAConfig,
         description="AI-assisted QA layer planning configuration.",
     )
-    qa_models: Union[List[str], List[QAModelConfig]] = Field(
-        default=["gpt-5-mini", "claude-sonnet-4-20250514", "gemini-2.5-flash"],
-        description="AI models for QA evaluation (strings for simple config, QAModelConfig objects for advanced)"
+    qa_models: Optional[Union[List[str], List[QAModelConfig]]] = Field(
+        default=None,
+        description="Legacy explicit AI models for QA evaluation. Defaults resolve via llm_routing."
     )
     qa_global_config: Optional[Dict[str, Any]] = Field(
         default=None,
@@ -1154,7 +1143,7 @@ class ContentRequest(BaseModel):
     )
 
     # Gran Sabio configuration
-    gran_sabio_model: str = Field(default_factory=_default_gran_sabio_model, description="Model for Gran Sabio escalation")
+    gran_sabio_model: Optional[str] = Field(default=None, description="Legacy explicit model for Gran Sabio escalation. Defaults resolve via llm_routing.")
     gran_sabio_fallback: bool = Field(default=False, description="Allow Gran Sabio to regenerate content when iterations are exhausted")
 
     gran_sabio_call_limit_per_iteration: int = Field(
@@ -1170,9 +1159,9 @@ class ContentRequest(BaseModel):
     )
 
     # Arbiter configuration (per-layer conflict resolution)
-    arbiter_model: str = Field(
-        default_factory=_default_arbiter_model,
-        description="Model for Arbiter conflict resolution between QA evaluators"
+    arbiter_model: Optional[str] = Field(
+        default=None,
+        description="Legacy explicit model for Arbiter conflict resolution. Defaults resolve via llm_routing."
     )
 
     # Word count enforcement configuration
@@ -1380,24 +1369,16 @@ class ContentRequest(BaseModel):
                 "Disable accent guard or set long_text_mode to 'auto'/'off'."
             )
         if guard.mode in {"inline", "inline_post"}:
-            try:
-                model_info = config.get_model_info(self.generator_model)
-            except Exception:
-                model_info = None
-            if model_info is not None:
-                from ai_service import AIService
-
-                provider_key = str(model_info.get("provider") or "").lower()
-                model_id_lc = str(model_info.get("model_id") or "").lower()
-                supported_providers = {
-                    "openai", "claude", "anthropic", "gemini", "google", "xai", "openrouter",
-                }
-                if (
-                    provider_key not in supported_providers
-                    or (
-                        provider_key == "openai"
-                        and AIService._is_openai_responses_api_model(model_id_lc)
-                    )
+            context = resolve_model_capability_context(
+                self.generator_model,
+                getattr(config, "model_specs", {}) or {},
+            )
+            if context.status == "resolved":
+                if not model_qualifies_for_inline_accent_guard(
+                    context.provider,
+                    context.model_id,
+                    getattr(config, "model_specs", {}) or {},
+                    model_data=context.model_data,
                 ):
                     raise ValueError(
                         "llm_accent_guard inline mode requires a provider with tool-calling "
@@ -1435,21 +1416,24 @@ class ContentRequest(BaseModel):
                 "prompt": "Escribe una biografía de 2000 palabras sobre Albert Einstein, enfocándote en sus contribuciones científicas y su impacto en la física moderna.",
                 "content_type": "biography",
                 "json_output": False,
-                "generator_model": "gpt-4o",
+                "llm_routing": {
+                    "calls": {
+                        "generation.main": {"model": "your-generator-model"},
+                        "qa.evaluate_layer": {"models": ["your-qa-model"]},
+                        "gransabio.review": {"model": "your-gransabio-model"},
+                        "arbiter.resolve": {"model": "your-arbiter-model"}
+                    }
+                },
                 "temperature": 0.7,
                 "min_words": 800,
                 "max_words": 1200,
                 "reasoning_effort": "medium",
                 "thinking_budget_tokens": 2000,
-                "qa_models": ["gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash"],
+                "qa_models": ["your-qa-model"],
                 "qa_models_config": {
-                    "gpt-4o": {
+                    "your-qa-model": {
                         "max_tokens": 10000,
                         "reasoning_effort": "medium"
-                    },
-                    "claude-sonnet-4-20250514": {
-                        "max_tokens": 12000,
-                        "thinking_budget_tokens": 5000
                     }
                 },
                 "qa_layers": [
@@ -1480,8 +1464,8 @@ class ContentRequest(BaseModel):
                 ],
                 "min_global_score": 8.0,
                 "max_iterations": 5,
-                "gran_sabio_model": _default_gran_sabio_model(),
-                "arbiter_model": _default_arbiter_model(),
+                "gran_sabio_model": "your-gransabio-model",
+                "arbiter_model": "your-arbiter-model",
                 "word_count_enforcement": {
                     "enabled": True,
                     "flexibility_percent": 15,
@@ -1518,7 +1502,6 @@ class ContentRequest(BaseModel):
                 },
                 "evidence_grounding": {
                     "enabled": True,
-                    "model": "gpt-4o-mini",
                     "filter_trivial": True,
                     "budget_gap_threshold": 0.5,
                     "on_flag": "warn",

@@ -4,12 +4,14 @@ Model synchronization services for the Gran Sabio LLM admin UI.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 
@@ -17,14 +19,17 @@ import json_utils as json
 
 MODEL_SPECS_PATH = Path(__file__).resolve().parent.parent / "model_specs.json"
 MODEL_SPECS_BACKUP_DIR = Path(__file__).resolve().parent.parent / "backups"
-SUPPORTED_SYNC_PROVIDERS = ("openrouter", "xai", "openai", "anthropic", "google")
-FULL_SYNC_PROVIDERS = {"openrouter", "xai"}
+SUPPORTED_SYNC_PROVIDERS = ("openrouter", "xai", "openai", "anthropic", "google", "ollama")
+FULL_SYNC_PROVIDERS = {"openrouter", "xai", "ollama"}
 DISCOVERY_SYNC_PROVIDERS = {"openai", "anthropic", "google"}
 OPENAI_MODEL_LIST_URL = "https://api.openai.com/v1/models"
 ANTHROPIC_MODEL_LIST_URL = "https://api.anthropic.com/v1/models"
 XAI_LANGUAGE_MODELS_URL = "https://api.x.ai/v1/language-models"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 GOOGLE_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+OLLAMA_MODEL_LIST_SOURCE = "local/ollama"
+OLLAMA_DEFAULT_CONTEXT_WINDOW = 32768
+OLLAMA_DEFAULT_OUTPUT_TOKENS = 8192
 ANTHROPIC_API_VERSION = "2023-06-01"
 REMOTE_JSON_HEADERS = {
     "Accept": "application/json",
@@ -139,6 +144,43 @@ def _normalize_model_hint(provider: str, model_id: str) -> str:
     elif provider == "anthropic":
         normalized = re.sub(r"-\d{8}$", "", normalized)
     return normalized
+
+
+def _normalize_ollama_host(host: Any) -> str:
+    normalized = str(host or "").strip().rstrip("/")
+    if not normalized:
+        return ""
+    if not normalized.startswith(("http://", "https://")):
+        normalized = f"http://{normalized}"
+    for suffix in ("/v1", "/api"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)].rstrip("/")
+    parsed = urlsplit(normalized)
+    if parsed.hostname in {"0.0.0.0", "::"}:
+        replacement_host = "127.0.0.1" if parsed.hostname == "0.0.0.0" else "[::1]"
+        if parsed.port:
+            replacement_host = f"{replacement_host}:{parsed.port}"
+        normalized = urlunsplit((parsed.scheme, replacement_host, parsed.path, parsed.query, parsed.fragment))
+    return normalized
+
+
+def _ollama_api_url(host: Any, endpoint: str) -> str:
+    base_url = _normalize_ollama_host(host)
+    if not base_url:
+        return ""
+    return f"{base_url}/api/{endpoint.strip('/')}"
+
+
+def _ollama_description(model_id: str, details: dict[str, Any]) -> str:
+    extras = []
+    parameter_size = str(details.get("parameter_size") or "").strip()
+    quantization = str(details.get("quantization_level") or "").strip()
+    if parameter_size:
+        extras.append(parameter_size)
+    if quantization:
+        extras.append(f"{quantization} quantization")
+    suffix = f" ({', '.join(extras)})" if extras else ""
+    return f"{model_id} running locally via Ollama{suffix}."
 
 
 def _is_openai_text_candidate(model_id: str) -> bool:
@@ -289,7 +331,7 @@ class ModelSyncService:
                 "needs_review": needs_review,
                 "provider_counts": provider_counts,
             },
-            "default_models": self.config.model_specs.get("default_models", {}),
+            "routing_default_path": getattr(self.config, "LLM_ROUTING_DEFAULT_PATH", None),
         }
 
     async def fetch_remote_models(self, provider: str) -> dict[str, Any]:
@@ -303,6 +345,7 @@ class ModelSyncService:
             "openai": self._fetch_openai_remote,
             "anthropic": self._fetch_anthropic_remote,
             "google": self._fetch_google_remote,
+            "ollama": self._fetch_ollama_remote,
         }
         remote_models = await fetchers[provider]()
         merged = self._merge_remote_with_local(provider, remote_models)
@@ -477,6 +520,114 @@ class ModelSyncService:
             )
 
         remote_models.sort(key=lambda item: (item.get("remote_created_at") or "", item["model_id"]), reverse=True)
+        return remote_models
+
+    async def _fetch_ollama_remote(self) -> list[dict[str, Any]]:
+        """Fetch locally installed Ollama models from the native Ollama API."""
+
+        host = getattr(self.config, "OLLAMA_HOST", "")
+        version_url = _ollama_api_url(host, "version")
+        tags_url = _ollama_api_url(host, "tags")
+        if not version_url or not tags_url:
+            raise ModelSyncError("OLLAMA_HOST is not configured.")
+
+        headers = _remote_json_headers()
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(version_url, headers=headers, timeout=timeout) as response:
+                    if response.status != 200:
+                        raise ModelSyncError(
+                            f"Ollama API health check failed at {version_url}: {await response.text()}"
+                        )
+                    version_payload = await response.json()
+            except ModelSyncError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                raise ModelSyncError(f"Ollama API is not reachable at {version_url}: {exc}") from exc
+
+            try:
+                async with session.get(tags_url, headers=headers, timeout=timeout) as response:
+                    if response.status != 200:
+                        raise ModelSyncError(f"Ollama API error at {tags_url}: {await response.text()}")
+                    payload = await response.json()
+            except ModelSyncError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                raise ModelSyncError(f"Failed to fetch Ollama models from {tags_url}: {exc}") from exc
+
+        models_payload = payload.get("models", []) if isinstance(payload, dict) else []
+        if not isinstance(models_payload, list):
+            raise ModelSyncError("Ollama API returned an invalid /api/tags payload.")
+
+        current_specs = self._get_provider_specs(self.load_specs(), "ollama")
+        remote_models: list[dict[str, Any]] = []
+        for model in models_payload:
+            if not isinstance(model, dict):
+                continue
+            model_id = str(model.get("model") or model.get("name") or "").strip()
+            if not model_id:
+                continue
+
+            local_template = self._find_best_local_template("ollama", model_id, current_specs)
+            details = model.get("details") if isinstance(model.get("details"), dict) else {}
+            context_window = _safe_int(
+                model.get("context_length"),
+                _safe_int(local_template.get("context_window"), OLLAMA_DEFAULT_CONTEXT_WINDOW),
+            )
+            output_tokens = _safe_int(
+                local_template.get("output_tokens"),
+                OLLAMA_DEFAULT_OUTPUT_TOKENS,
+            )
+            input_tokens = _safe_int(local_template.get("input_tokens"), context_window)
+            if input_tokens <= 0:
+                input_tokens = context_window
+            if context_window <= 0:
+                context_window = input_tokens or OLLAMA_DEFAULT_CONTEXT_WINDOW
+            if output_tokens <= 0:
+                output_tokens = OLLAMA_DEFAULT_OUTPUT_TOKENS
+
+            display_name = (
+                local_template.get("name")
+                or str(model.get("name") or "").strip()
+                or _title_case_model_name(model_id.replace(":", "-"))
+            )
+            description = local_template.get("description") or _ollama_description(model_id, details)
+
+            remote_models.append(
+                {
+                    "key": model_id,
+                    "id": model_id,
+                    "model_id": model_id,
+                    "name": display_name,
+                    "description": description,
+                    "provider": "ollama",
+                    "vendor": "ollama",
+                    "context_window": context_window,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "pricing": {
+                        "input_per_million": 0.0,
+                        "output_per_million": 0.0,
+                    },
+                    "capabilities": _dedupe_strings(local_template.get("capabilities") or ["text"]),
+                    "supported_parameters": _dedupe_strings(local_template.get("supported_parameters") or []),
+                    "supported": True,
+                    "needs_review": False,
+                    "sync_mode": "full",
+                    "source": OLLAMA_MODEL_LIST_SOURCE,
+                    "remote_created_at": model.get("modified_at"),
+                    "local_only": False,
+                    "raw": {
+                        "digest": model.get("digest"),
+                        "size": model.get("size"),
+                        "details": details,
+                        "ollama_version": version_payload.get("version") if isinstance(version_payload, dict) else None,
+                    },
+                }
+            )
+
+        remote_models.sort(key=lambda item: item["name"].lower())
         return remote_models
 
     async def _fetch_anthropic_remote(self) -> list[dict[str, Any]]:
@@ -1086,15 +1237,6 @@ class ModelSyncService:
                 missing_references.append(f"{path} -> {model_name}")
             elif not identifier_states[model_name]:
                 disabled_references.append(f"{path} -> {model_name}")
-
-        defaults = specs.get("default_models", {}) or {}
-        for key, value in defaults.items():
-            if isinstance(value, str) and value:
-                _validate_reference(f"default_models.{key}", value)
-            elif isinstance(value, list):
-                for index, model_name in enumerate(value):
-                    if model_name:
-                        _validate_reference(f"default_models.{key}[{index}]", model_name)
 
         for alias, target in (specs.get("aliases", {}) or {}).items():
             if target:

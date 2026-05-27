@@ -46,6 +46,29 @@ def minimal_request():
     )
 
 
+@pytest.fixture(autouse=True)
+def stub_model_catalog(monkeypatch):
+    import config as config_module
+
+    def fake_model_info(_self, model_name):
+        model_lower = str(model_name).lower()
+        if model_lower.startswith("claude-"):
+            provider = "anthropic"
+        elif model_lower.startswith("gemini-") or model_lower.startswith("models/"):
+            provider = "google"
+        elif model_lower.startswith("grok-"):
+            provider = "xai"
+        else:
+            provider = "openai"
+        return {
+            "model_id": model_name,
+            "provider": provider,
+            "capabilities": ["text"],
+        }
+
+    monkeypatch.setattr(config_module.Config, "get_model_info", fake_model_info)
+
+
 @pytest.fixture
 def request_with_qa_layers():
     """ContentRequest with QA layers."""
@@ -434,43 +457,38 @@ class TestParseValidatorResponse:
 class TestResolvePreflightModel:
     """Tests for resolve_preflight_model() model selection."""
 
-    def test_prefers_configured_preflight_model(self, minimal_request):
-        """Given: Explicit preflight model, Then: Uses it first."""
+    def test_prefers_routed_preflight_model(self, minimal_request):
+        """Given: Explicit preflight routing, Then: Uses it first."""
         minimal_request.arbiter_model = "arbiter-model"
+        minimal_request.llm_routing = {
+            "calls": {"preflight.validate": {"model": "grok-4-fast-non-reasoning"}}
+        }
 
-        with patch("preflight_validator.config") as mock_config:
-            mock_config.PREFLIGHT_VALIDATION_MODEL = "preflight-model"
+        assert resolve_preflight_model(minimal_request) == "grok-4-fast-non-reasoning"
 
-            assert resolve_preflight_model(minimal_request) == "preflight-model"
-
-    def test_falls_back_to_arbiter_then_gran_sabio(self, minimal_request):
-        """Given: No preflight model, Then: Uses Arbiter before GranSabio."""
+    def test_legacy_arbiter_and_gran_sabio_do_not_define_preflight(self, minimal_request):
+        """Given: Legacy model fields, Then: preflight still uses exact routing."""
         minimal_request.arbiter_model = "arbiter-model"
         minimal_request.gran_sabio_model = "gran-sabio-model"
+        minimal_request.llm_routing = {
+            "calls": {"preflight.validate": {"model": "grok-4-fast-non-reasoning"}}
+        }
 
-        with patch("preflight_validator.config") as mock_config:
-            mock_config.PREFLIGHT_VALIDATION_MODEL = ""
-
-            assert resolve_preflight_model(minimal_request) == "arbiter-model"
-
-        minimal_request.arbiter_model = ""
-
-        with patch("preflight_validator.config") as mock_config:
-            mock_config.PREFLIGHT_VALIDATION_MODEL = ""
-
-            assert resolve_preflight_model(minimal_request) == "gran-sabio-model"
+        assert resolve_preflight_model(minimal_request) == "grok-4-fast-non-reasoning"
 
 
 class TestRunPreflightValidation:
     """Tests for run_preflight_validation() async function."""
 
     @pytest.mark.asyncio
-    async def test_no_preflight_model_uses_arbiter_model(self, minimal_request, mock_ai_service):
-        """Given: No preflight model configured, Then: Uses Arbiter model."""
+    async def test_routed_preflight_model_is_used(self, minimal_request, mock_ai_service):
+        """Given: Preflight routing, Then: Uses routed model."""
         minimal_request.arbiter_model = "arbiter-preflight-model"
+        minimal_request.llm_routing = {
+            "calls": {"preflight.validate": {"model": "grok-4-fast-non-reasoning"}}
+        }
 
         with patch("preflight_validator.config") as mock_config:
-            mock_config.PREFLIGHT_VALIDATION_MODEL = None
             mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
 
             result = await run_preflight_validation(
@@ -480,16 +498,18 @@ class TestRunPreflightValidation:
 
             assert result.decision == "proceed"
             mock_ai_service.generate_content.assert_awaited_once()
-            assert mock_ai_service.generate_content.await_args.kwargs["model"] == "arbiter-preflight-model"
+            assert mock_ai_service.generate_content.await_args.kwargs["model"] == "grok-4-fast-non-reasoning"
 
     @pytest.mark.asyncio
-    async def test_no_preflight_or_arbiter_model_uses_gran_sabio(self, minimal_request, mock_ai_service):
-        """Given: No preflight/Arbiter model, Then: Uses GranSabio model."""
+    async def test_legacy_gran_sabio_model_does_not_define_preflight(self, minimal_request, mock_ai_service):
+        """Given: Legacy GranSabio model, Then: Uses exact preflight routing."""
         minimal_request.arbiter_model = ""
         minimal_request.gran_sabio_model = "gran-sabio-preflight-model"
+        minimal_request.llm_routing = {
+            "calls": {"preflight.validate": {"model": "grok-4-fast-non-reasoning"}}
+        }
 
         with patch("preflight_validator.config") as mock_config:
-            mock_config.PREFLIGHT_VALIDATION_MODEL = ""
             mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
 
             result = await run_preflight_validation(
@@ -499,17 +519,18 @@ class TestRunPreflightValidation:
 
             assert result.decision == "proceed"
             mock_ai_service.generate_content.assert_awaited_once()
-            assert mock_ai_service.generate_content.await_args.kwargs["model"] == "gran-sabio-preflight-model"
+            assert mock_ai_service.generate_content.await_args.kwargs["model"] == "grok-4-fast-non-reasoning"
 
     @pytest.mark.asyncio
     async def test_no_available_preflight_model_rejects_without_llm_call(self, minimal_request, mock_ai_service):
         """Given: No available model, Then: Rejects and does not call AI."""
         minimal_request.arbiter_model = ""
         minimal_request.gran_sabio_model = ""
+        minimal_request.llm_routing = {
+            "calls": {"preflight.validate": {"model": None}}
+        }
 
         with patch("preflight_validator.config") as mock_config:
-            mock_config.PREFLIGHT_VALIDATION_MODEL = None
-
             result = await run_preflight_validation(
                 ai_service=mock_ai_service,
                 request=minimal_request,
@@ -527,7 +548,6 @@ class TestRunPreflightValidation:
         )
 
         with patch("preflight_validator.config") as mock_config:
-            mock_config.PREFLIGHT_VALIDATION_MODEL = "gpt-4o"
             mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
 
             result = await run_preflight_validation(
@@ -545,9 +565,11 @@ class TestRunPreflightValidation:
         mock_ai_service.generate_content = AsyncMock(
             side_effect=Exception("API Error")
         )
+        minimal_request.llm_routing = {
+            "calls": {"preflight.validate": {"model": "grok-4-fast-non-reasoning"}}
+        }
 
         with patch("preflight_validator.config") as mock_config:
-            mock_config.PREFLIGHT_VALIDATION_MODEL = "gpt-4o"
             mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
 
             result = await run_preflight_validation(
@@ -557,7 +579,7 @@ class TestRunPreflightValidation:
 
             assert result.decision == "reject"
             assert result.issues[0].code == "preflight_llm_call_failed"
-            assert "gpt-4o" in result.user_feedback
+            assert "grok-4-fast-non-reasoning" in result.user_feedback
 
     @pytest.mark.asyncio
     async def test_unparseable_response_returns_reject(self, minimal_request, mock_ai_service):
@@ -567,7 +589,6 @@ class TestRunPreflightValidation:
         )
 
         with patch("preflight_validator.config") as mock_config:
-            mock_config.PREFLIGHT_VALIDATION_MODEL = "gpt-4o"
             mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
 
             result = await run_preflight_validation(
@@ -587,7 +608,6 @@ class TestRunPreflightValidation:
         mock_ai_service.generate_content = AsyncMock(return_value=raw_output)
 
         with patch("preflight_validator.config") as mock_config:
-            mock_config.PREFLIGHT_VALIDATION_MODEL = "gpt-4o"
             mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
 
             result = await run_preflight_validation(
@@ -606,7 +626,6 @@ class TestRunPreflightValidation:
         )
 
         with patch("preflight_validator.config") as mock_config:
-            mock_config.PREFLIGHT_VALIDATION_MODEL = "gpt-4o"
             mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
 
             result = await run_preflight_validation(
@@ -625,7 +644,6 @@ class TestRunPreflightValidation:
         )
 
         with patch("preflight_validator.config") as mock_config:
-            mock_config.PREFLIGHT_VALIDATION_MODEL = "gpt-4o"
             mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
 
             result = await run_preflight_validation(
@@ -648,7 +666,6 @@ class TestRunPreflightValidation:
         )
 
         with patch("preflight_validator.config") as mock_config:
-            mock_config.PREFLIGHT_VALIDATION_MODEL = "gpt-4o"
             mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
 
             result = await run_preflight_validation(
@@ -669,7 +686,6 @@ class TestRunPreflightValidation:
         )
 
         with patch("preflight_validator.config") as mock_config:
-            mock_config.PREFLIGHT_VALIDATION_MODEL = "gpt-4o"
             mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
 
             result = await run_preflight_validation(

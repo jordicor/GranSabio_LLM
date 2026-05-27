@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from config import config
 from models import ContentRequest, is_json_output_requested
 
 
@@ -10,6 +11,16 @@ def _base_request_kwargs() -> dict:
     return {
         "content_type": "article",
         "prompt": "Sample prompt for JSON contract validation.",
+    }
+
+
+def _specs_with_defaults(specs: dict) -> dict:
+    return {
+        "default_models": {
+            "gran_sabio": "gpt-4o",
+            "arbiter": "gpt-4o",
+        },
+        **specs,
     }
 
 
@@ -107,3 +118,77 @@ def test_content_request_accepts_no_schema_without_json_request():
 
     assert is_json_output_requested(request) is False
     assert request.json_schema is None
+
+
+def test_inline_accent_guard_rejects_resolved_model_without_runtime_tool_loop(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        "model_specs",
+        _specs_with_defaults({
+            "model_specifications": {
+                "custom": {
+                    "custom-model": {
+                        "model_id": "custom-model",
+                        "provider_capabilities": {"tool_calling": True},
+                    }
+                }
+            }
+        }),
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        ContentRequest(
+            **{
+                **_base_request_kwargs(),
+                "generator_model": "custom-model",
+                "llm_accent_guard": {"mode": "inline"},
+            }
+        )
+
+    assert "llm_accent_guard inline mode requires" in str(exc_info.value)
+
+
+def test_inline_accent_guard_defers_unresolved_model_to_route_validation(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        "model_specs",
+        _specs_with_defaults({"model_specifications": {}}),
+    )
+
+    request = ContentRequest(
+        **{
+            **_base_request_kwargs(),
+            "generator_model": "missing-model",
+            "llm_accent_guard": {"mode": "inline"},
+        }
+    )
+
+    assert request.generator_model == "missing-model"
+
+
+def test_inline_accent_guard_defers_disabled_model_to_route_validation(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        "model_specs",
+        _specs_with_defaults({
+            "model_specifications": {
+                "openai": {
+                    "disabled-model": {
+                        "model_id": "disabled-model",
+                        "enabled": False,
+                        "provider_capabilities": {"tool_calling": False},
+                    }
+                }
+            }
+        }),
+    )
+
+    request = ContentRequest(
+        **{
+            **_base_request_kwargs(),
+            "generator_model": "disabled-model",
+            "llm_accent_guard": {"mode": "inline"},
+        }
+    )
+
+    assert request.generator_model == "disabled-model"

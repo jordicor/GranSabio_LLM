@@ -248,6 +248,66 @@ async def test_fallback_no_tool_support_when_model_capability_is_unconfirmed():
     assert envelope.tools_skipped_reason == "no_tool_support"
 
 
+@pytest.mark.asyncio
+async def test_central_tool_loop_gate_preserves_supports_tool_calling_patch_point():
+    """The runtime gate must still honor the legacy _supports_tool_calling patch point."""
+    service = AIService.__new__(AIService)
+    fake_loop = AsyncMock(return_value=("should not run", ToolLoopEnvelope(loop_scope=LoopScope.GENERATOR)))
+    with patch.object(AIService, "_normalize_tool_loop_provider", return_value="openai"), \
+         patch.object(AIService, "_supports_tool_calling", return_value=False), \
+         patch.object(AIService, "_run_openai_compatible_validation_tool_loop", new=fake_loop), \
+         patch("ai_service.config") as mock_config:
+        mock_config.model_specs = {
+            "model_specifications": {
+                "openai": {
+                    "gpt-4o": {
+                        "model_id": "gpt-4o",
+                        "capabilities": ["tool_calling"],
+                    }
+                }
+            }
+        }
+        mock_config.validate_token_limits.return_value = {
+            "adjusted_tokens": 512,
+            "adjusted_reasoning_effort": None,
+            "adjusted_thinking_budget_tokens": None,
+            "model_info": {"provider": "openai", "model_id": "gpt-4o"},
+            "reasoning_timeout_seconds": None,
+        }
+        content, envelope = await service.call_ai_with_validation_tools(
+            prompt="p",
+            model="gpt-4o",
+            validation_callback=lambda _: _approved_result(),
+        )
+
+    assert content == ""
+    assert envelope.tools_skipped_reason == "no_tool_support"
+    fake_loop.assert_not_awaited()
+
+
+def test_runtime_tool_loop_gate_can_be_force_enabled_by_supports_tool_calling_patch_point():
+    """The legacy patch point can force-enable supported runtime providers."""
+    specs = {
+        "model_specifications": {
+            "openai": {
+                "patched-model": {
+                    "model_id": "patched-model",
+                    "provider_capabilities": {"tool_calling": False},
+                }
+            }
+        }
+    }
+
+    with patch("ai_service.config") as mock_config, \
+         patch.object(AIService, "_supports_tool_calling", return_value=True):
+        mock_config.model_specs = specs
+        assert AIService._supports_generation_validation_tool_loop(
+            "openai",
+            "patched-model",
+            model_data={"provider": "openai", "model_id": "patched-model"},
+        ) is True
+
+
 # ---------------------------------------------------------------------------
 # estimate_prompt_overflow helper
 # ---------------------------------------------------------------------------

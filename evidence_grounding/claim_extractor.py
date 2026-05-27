@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 # Use optimized JSON (3.6x faster than standard json)
 import json_utils as json
-from config import config
+from llm_routing import resolve_call
 from models import ExtractedClaim
 
 logger = logging.getLogger(__name__)
@@ -269,6 +269,7 @@ class ClaimExtractor:
         content: str,
         context: str,
         model: Optional[str] = None,
+        request: Optional[Any] = None,
         max_claims: int = 15,
         filter_trivial: bool = True,
         min_importance: float = 0.6,
@@ -282,7 +283,7 @@ class ClaimExtractor:
             content: The generated content to analyze
             context: The original evidence/context provided for generation
             model: AI model to use for extraction. If None, uses
-                   config.EVIDENCE_GROUNDING_EXTRACTION_MODEL (default: gpt-5-nano)
+                   evidence.extract_claims from llm_routing.
             max_claims: Maximum number of claims to extract (1-50)
             filter_trivial: Whether to filter out trivial claims
             min_importance: Minimum importance score to keep claims (0.0-1.0)
@@ -300,8 +301,10 @@ class ClaimExtractor:
         if not context or not context.strip():
             raise ValueError("Context/evidence cannot be empty")
 
-        # Resolve model - use config default if not specified
-        effective_model = model or config.EVIDENCE_GROUNDING_EXTRACTION_MODEL
+        route = resolve_call("evidence.extract_claims", request=request)
+        effective_model = model or route.model
+        routed_temperature = route.params.get("temperature", 0.3)
+        routed_max_tokens = route.params.get("max_tokens", 4000)
 
         logger.info(
             f"Extracting claims using model={effective_model}, "
@@ -322,14 +325,15 @@ class ClaimExtractor:
             response = await self.ai_service.generate_content(
                 prompt=user_prompt,
                 model=effective_model,
-                temperature=0.3,  # Low temperature for consistent extraction
-                max_tokens=4000,
+                temperature=routed_temperature,
+                max_tokens=routed_max_tokens,
                 system_prompt=CLAIM_EXTRACTION_SYSTEM_PROMPT,
                 json_output=True,
                 json_schema=CLAIM_EXTRACTION_SCHEMA,
                 extra_verbose=extra_verbose,
                 usage_callback=usage_callback,
                 usage_extra={"phase": "evidence_grounding", "subphase": "claim_extraction"},
+                llm_routing=getattr(request, "_llm_routing", None),
                 cancellation_token=cancellation_token,
             )
         except asyncio.CancelledError:
@@ -370,7 +374,7 @@ async def extract_claims(
     Args:
         content: The generated content to analyze
         context: The original evidence/context provided for generation
-        model: AI model to use (None = config.EVIDENCE_GROUNDING_EXTRACTION_MODEL)
+        model: AI model to use (None = evidence.extract_claims routing)
         max_claims: Maximum claims to extract
         filter_trivial: Filter out trivial claims
         min_importance: Minimum importance threshold

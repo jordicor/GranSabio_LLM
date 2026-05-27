@@ -72,16 +72,36 @@ def _make_request(**overrides: Any) -> SimpleNamespace:
 
 
 def _patch_model_info(provider: str = "openai", model_id: str = "gpt-4o"):
-    """Return a patch context for ``config.get_model_info`` used by the helper.
+    """Return a patch context for model metadata used by the helper.
 
     Also pins ``QA_MAX_TOOL_ROUNDS=3`` (the default from ``config.py``) so the
     integration tests can assert the budget propagation through the adapter
     without relying on module state leaking through the ``Mock`` replacement.
     """
+    catalog_provider = "anthropic" if provider == "claude" else provider
+    model_data = {
+        "model_id": model_id,
+        "capabilities": ["tool_calling"],
+    }
+    if provider == "custom":
+        model_data["provider_capabilities"] = {"tool_calling": True}
+    if model_id == "unknown-openai-model":
+        model_data["provider_capabilities"] = {"tool_calling": False}
+        model_data["capabilities"] = []
+    if model_id == "gpt-5-pro":
+        model_data["capabilities"] = ["tool_calling", "responses_api"]
+    model_specs = {
+        "model_specifications": {
+            catalog_provider: {
+                model_id: model_data,
+            }
+        }
+    }
     return patch(
         "qa_evaluation_service.config",
         Mock(
             get_model_info=Mock(return_value={"provider": provider, "model_id": model_id}),
+            model_specs=model_specs,
             QA_MAX_TOOL_ROUNDS=3,
             QA_SYSTEM_PROMPT="qa system",
             QA_SYSTEM_PROMPT_RAW="qa system raw",
@@ -263,15 +283,7 @@ def test_should_use_qa_tools_true_for_responses_api_model_with_tool_support():
     layer = _make_layer()
     bypass_engine = Mock()
     bypass_engine.can_bypass_layer = Mock(return_value=False)
-    with _patch_model_info(provider="openai", model_id="gpt-5-pro"), \
-         patch(
-             "qa_evaluation_service.AIService._is_openai_responses_api_model",
-             return_value=True,
-         ), \
-         patch(
-             "qa_evaluation_service.AIService._supports_tool_calling",
-             return_value=True,
-         ):
+    with _patch_model_info(provider="openai", model_id="gpt-5-pro"):
         assert (
             _should_use_qa_tools(
                 request, layer, "gpt-5-pro", bypass_engine=bypass_engine
@@ -299,11 +311,25 @@ def test_should_use_qa_tools_false_when_model_lacks_tool_support():
     layer = _make_layer()
     bypass_engine = Mock()
     bypass_engine.can_bypass_layer = Mock(return_value=False)
-    with _patch_model_info(provider="openai", model_id="unknown-openai-model"), \
-         patch("qa_evaluation_service.AIService._supports_tool_calling", return_value=False):
+    with _patch_model_info(provider="openai", model_id="unknown-openai-model"):
         assert (
             _should_use_qa_tools(
                 request, layer, "unknown-openai-model", bypass_engine=bypass_engine
+            )
+            is False
+        )
+
+
+def test_should_use_qa_tools_honors_aiservice_tool_calling_patch_point():
+    request = _make_request()
+    layer = _make_layer()
+    bypass_engine = Mock()
+    bypass_engine.can_bypass_layer = Mock(return_value=False)
+    with _patch_model_info(provider="openai", model_id="gpt-4o"), \
+         patch("qa_evaluation_service.AIService._supports_tool_calling", return_value=False):
+        assert (
+            _should_use_qa_tools(
+                request, layer, "gpt-4o", bypass_engine=bypass_engine
             )
             is False
         )
@@ -334,7 +360,10 @@ def test_should_use_qa_tools_false_when_model_info_raises():
     bypass_engine.can_bypass_layer = Mock(return_value=False)
     with patch(
         "qa_evaluation_service.config",
-        Mock(get_model_info=Mock(side_effect=RuntimeError("unknown model"))),
+        Mock(
+            get_model_info=Mock(side_effect=RuntimeError("unknown model")),
+            model_specs={"model_specifications": {}},
+        ),
     ):
         assert (
             _should_use_qa_tools(
@@ -546,7 +575,14 @@ async def test_evaluate_content_uses_tool_loop_when_eligible():
         assert call_kwargs["stop_on_approval"] is False
         assert call_kwargs["retries_enabled"] is False
         assert call_kwargs["initial_measurement_text"] == "Generated body."
-        assert call_kwargs["tool_event_callback"] is _callback
+        assert call_kwargs["tool_event_callback"] is not None
+        await call_kwargs["tool_event_callback"]("tool_call_delta", {"delta": "{}"})
+        assert captured_calls["events"] == [
+            (
+                "tool_call_delta",
+                {"delta": "{}", "qa_model": "gpt-4o", "qa_layer": layer.name},
+            )
+        ]
         # QA_MAX_TOOL_ROUNDS default is 3 (see config.py).
         assert call_kwargs["max_tool_rounds"] == 3
 

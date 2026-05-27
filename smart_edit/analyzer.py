@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import re
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from inspect import isawaitable
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
 import json_utils as json
+from llm_routing import resolve_call
 
 if TYPE_CHECKING:
     from ai_service import AIService
@@ -103,10 +105,11 @@ class TextAnalyzer:
     async def analyze(
         self,
         text: str,
-        model: str = "gpt-4o-mini",
+        model: Optional[str] = None,
         max_issues: int = 15,
         categories: Optional[List[str]] = None,
         temperature: float = 0.3,
+        llm_routing: Optional[Mapping[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Analyze text and return suggested edit actions.
@@ -117,6 +120,7 @@ class TextAnalyzer:
             max_issues: Maximum number of issues to return
             categories: Filter by categories (redundancy, grammar, style, formatting)
             temperature: AI temperature (lower = more focused)
+            llm_routing: Optional merged routing document for this request
 
         Returns:
             List of action dictionaries with keys:
@@ -138,7 +142,7 @@ class TextAnalyzer:
         )
 
         # Call AI
-        response = await self._call_ai(prompt, model, temperature)
+        response = await self._call_ai(prompt, model, temperature, llm_routing=llm_routing)
 
         # Parse response
         issues = self._parse_response(response)
@@ -165,16 +169,48 @@ class TextAnalyzer:
     async def _call_ai(
         self,
         prompt: str,
-        model: str = "gpt-4o-mini",
+        model: Optional[str] = None,
         temperature: float = 0.3,
+        llm_routing: Optional[Mapping[str, Any]] = None,
     ) -> str:
         """Make AI service call and return response text."""
-        response = await self.ai_service.generate(
-            model=model,
-            prompt=prompt,
-            temperature=temperature,
-            max_tokens=4096,
+        if model and llm_routing is None:
+            model_name = model
+            route_params: Dict[str, Any] = {}
+        else:
+            route = resolve_call("smart_edit.analyze", routing=llm_routing)
+            model_name = model or route.model
+            route_params = route.params
+        kwargs = {
+            "model": model_name,
+            "prompt": prompt,
+            "temperature": route_params.get("temperature", temperature),
+            "max_tokens": route_params.get("max_tokens", 4096),
+            "reasoning_effort": route_params.get("reasoning_effort"),
+            "thinking_budget_tokens": route_params.get("thinking_budget_tokens"),
+            "json_output": True,
+        }
+        generate_content = getattr(self.ai_service, "generate_content", None)
+        has_real_generate_content = (
+            callable(generate_content)
+            and (
+                "generate_content" in vars(self.ai_service)
+                or hasattr(type(self.ai_service), "generate_content")
+            )
         )
+        if has_real_generate_content:
+            response = generate_content(**kwargs)
+            if isawaitable(response):
+                response = await response
+        else:
+            response = self.ai_service.generate(
+                model=kwargs["model"],
+                prompt=kwargs["prompt"],
+                temperature=kwargs["temperature"],
+                max_tokens=kwargs["max_tokens"],
+            )
+            if isawaitable(response):
+                response = await response
 
         # Extract text from response
         if hasattr(response, "content"):

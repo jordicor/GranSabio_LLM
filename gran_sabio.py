@@ -19,7 +19,9 @@ from ai_service import AIRequestError, AIService, StreamChunk, get_ai_service
 from config import config, get_default_models
 from deterministic_validation import DraftValidationResult, validate_generation_candidate
 from json_utils import dumps as json_dumps
+from llm_routing import resolve_call
 from model_aliasing import PromptPart, get_evaluator_alias
+from model_capability_registry import resolve_model_capability_context
 from models import ContentRequest, GranSabioResult, is_json_output_requested
 from tool_loop_models import (
     JsonContractError,
@@ -91,15 +93,17 @@ def _should_use_gransabio_tools(request: ContentRequest, model: str) -> bool:
     if tools_mode == "never":
         return False
 
-    try:
-        model_info = config.get_model_info(model)
-    except Exception:
+    specs = getattr(config, "model_specs", {}) or {}
+    context = resolve_model_capability_context(model, specs)
+    if context.status != "resolved":
         return False
 
-    provider = model_info.get("provider")
-    model_id = str(model_info.get("model_id", "")).lower()
-    provider_key = (provider or "").lower()
-    if not AIService._supports_tool_calling(provider_key, model_id):
+    if not AIService._supports_generation_validation_tool_loop(
+        context.provider,
+        context.model_id,
+        model_data=context.model_data,
+        specs=specs,
+    ):
         return False
 
     return True
@@ -299,13 +303,10 @@ class GranSabioEngine:
 
     def _get_configured_default_model(self) -> str:
         """Return the configured default model for Gran Sabio operations."""
-        defaults = get_default_models()
-        model = defaults.get("gran_sabio")
+        model = (get_default_models() or {}).get("gran_sabio")
         if not model:
-            raise RuntimeError(
-                "Gran Sabio default model is not configured in model_specs.json under 'default_models.gran_sabio'."
-            )
-        return model
+            raise RuntimeError("Gran Sabio default model is not configured.")
+        return str(model)
 
     def _get_default_thinking_tokens(self, model_name: str) -> Optional[int]:
         """Return the default thinking budget for a model when supported."""
@@ -319,28 +320,54 @@ class GranSabioEngine:
         return None
 
     def _get_default_critical_analysis_model(
-        self, requested_model: Optional[str]
+        self,
+        requested_model: Optional[str],
+        original_request: Optional[Any] = None,
+        call_id: str = "gransabio.review",
     ) -> Tuple[str, Optional[str], Optional[int]]:
         """
         Get default model for critical analysis and decision making (deal-breakers, conflicts)
         Returns (model, reasoning_effort, thinking_budget_tokens)
         """
-        default_model = self._get_configured_default_model()
-        selected_model = requested_model or default_model
+        route = resolve_call(call_id, request=original_request)
+        if original_request is not None and not getattr(
+            original_request,
+            "_legacy_gran_sabio_model_explicit",
+            False,
+        ):
+            requested_model = None
+        selected_model = requested_model or route.model
         thinking_tokens = self._get_default_thinking_tokens(selected_model)
-        return selected_model, None, thinking_tokens
+        return (
+            selected_model,
+            route.params.get("reasoning_effort"),
+            route.params.get("thinking_budget_tokens", thinking_tokens),
+        )
 
     def _get_default_content_generation_model(
-        self, requested_model: Optional[str]
+        self,
+        requested_model: Optional[str],
+        original_request: Optional[Any] = None,
+        call_id: str = "gransabio.regenerate",
     ) -> Tuple[str, Optional[str], Optional[int]]:
         """
         Get default model for content generation
         Returns (model, reasoning_effort, thinking_budget_tokens)
         """
-        default_model = self._get_configured_default_model()
-        selected_model = requested_model or default_model
+        route = resolve_call(call_id, request=original_request)
+        if original_request is not None and not getattr(
+            original_request,
+            "_legacy_gran_sabio_model_explicit",
+            False,
+        ):
+            requested_model = None
+        selected_model = requested_model or route.model
         thinking_tokens = self._get_default_thinking_tokens(selected_model)
-        return selected_model, None, thinking_tokens
+        return (
+            selected_model,
+            route.params.get("reasoning_effort"),
+            route.params.get("thinking_budget_tokens", thinking_tokens),
+        )
 
     def _resolve_model_alias(self, model_name: str) -> str:
         """Resolve aliases defined in model specs."""
@@ -539,7 +566,9 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
 
         try:
             model, reasoning_effort, thinking_tokens = self._get_default_critical_analysis_model(
-                original_request.gran_sabio_model
+                original_request.gran_sabio_model,
+                original_request,
+                "gransabio.escalation",
             )
             adequate_model = self._ensure_adequate_model_capacity(len(content), model, original_request)
             logger.info(
@@ -807,7 +836,9 @@ CRITICAL INSTRUCTIONS:
             model_alias_registry = getattr(original_request, "_model_alias_registry", None)
 
             model, reasoning_effort, thinking_tokens = self._get_default_content_generation_model(
-                original_request.gran_sabio_model
+                original_request.gran_sabio_model,
+                original_request,
+                "gransabio.regenerate",
             )
             adequate_model = self._ensure_adequate_model_capacity(
                 len(original_request.prompt) + len(previous_context), model, original_request
@@ -898,6 +929,7 @@ CRITICAL INSTRUCTIONS:
                         images=images,
                         model_alias_registry=model_alias_registry,
                         prompt_safety_parts=prompt_safety_parts,
+                        llm_routing=getattr(original_request, "_llm_routing", None),
                         cancellation_token=cancellation_token,
                     )
                 except Exception:
@@ -922,6 +954,7 @@ CRITICAL INSTRUCTIONS:
                         images=images,
                         model_alias_registry=model_alias_registry,
                         prompt_safety_parts=prompt_safety_parts,
+                        llm_routing=getattr(original_request, "_llm_routing", None),
                         cancellation_token=cancellation_token,
                     )
                     if json_output_effective:
@@ -964,6 +997,7 @@ CRITICAL INSTRUCTIONS:
                             images=images,
                             model_alias_registry=model_alias_registry,
                             prompt_safety_parts=prompt_safety_parts,
+                            llm_routing=getattr(original_request, "_llm_routing", None),
                             cancellation_token=cancellation_token,
                         ):
                             # Handle StreamChunk (Claude with thinking) vs plain string
@@ -1029,6 +1063,7 @@ CRITICAL INSTRUCTIONS:
                     images=images,
                     model_alias_registry=model_alias_registry,
                     prompt_safety_parts=prompt_safety_parts,
+                    llm_routing=getattr(original_request, "_llm_routing", None),
                     cancellation_token=cancellation_token,
                 )
                 if json_output_effective:
@@ -1148,7 +1183,9 @@ CRITICAL INSTRUCTIONS:
             best_content = best_iteration.get("content", "") if best_iteration else ""
 
             model, reasoning_effort, thinking_tokens = self._get_default_critical_analysis_model(
-                original_request.gran_sabio_model
+                original_request.gran_sabio_model,
+                original_request,
+                "gransabio.review",
             )
             adequate_model = self._ensure_adequate_model_capacity(len(best_content), model, original_request)
             logger.info(
@@ -1567,6 +1604,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 phase_logger=phase_logger,
                 model_alias_registry=alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                llm_routing=getattr(request, "_llm_routing", None),
                 cancellation_token=cancellation_token,
             )
 
@@ -1602,6 +1640,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 phase_logger=phase_logger,
                 model_alias_registry=alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                llm_routing=getattr(request, "_llm_routing", None),
                 cancellation_token=cancellation_token,
             ):
                 if isinstance(chunk, StreamChunk):
@@ -1631,6 +1670,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 phase_logger=phase_logger,
                 model_alias_registry=alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                llm_routing=getattr(request, "_llm_routing", None),
                 cancellation_token=cancellation_token,
             )
 

@@ -228,12 +228,12 @@ def test_preflight_payload_uses_prompt_safe_roles_and_evaluators():
 @pytest.mark.asyncio
 async def test_preflight_ai_call_receives_source_aware_blinded_payload():
     request = _content_request()
+    request._preflight_model = "real-preflight-model"
     registry = ModelAliasRegistry.from_request(request, preflight_model="real-preflight-model")
     ai_service = MagicMock()
     ai_service.generate_content = AsyncMock(return_value='{"decision": "proceed", "summary": "OK"}')
 
     with patch("preflight_validator.config") as mock_config:
-        mock_config.PREFLIGHT_VALIDATION_MODEL = "real-preflight-model"
         mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
 
         result = await run_preflight_validation(

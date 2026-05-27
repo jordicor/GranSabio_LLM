@@ -111,7 +111,7 @@ async def test_preflight_rejects_non_vision_model():
 
         result = response.json()
         status = result.get("status")
-        preflight = result.get("preflight_feedback", {})
+        preflight = result.get("preflight_feedback") or {}
         decision = preflight.get("decision", "")
 
         print(f"\n[Result]")
@@ -305,7 +305,7 @@ async def test_preflight_no_images_with_vision_qa():
 
         result = response.json()
         status = result.get("status")
-        preflight = result.get("preflight_feedback", {})
+        preflight = result.get("preflight_feedback") or {}
         decision = preflight.get("decision")
 
         print(f"\n[Result]")

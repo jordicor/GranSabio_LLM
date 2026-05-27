@@ -248,6 +248,21 @@
             color: var(--green);
         }
 
+        .status-indicator.completed {
+            background: rgba(0, 255, 65, 0.1);
+            border: 1px solid var(--green);
+            color: var(--green);
+        }
+
+        .status-indicator.cancelled,
+        .status-indicator.rejected,
+        .status-indicator.failed,
+        .status-indicator.error {
+            background: rgba(255, 51, 51, 0.1);
+            border: 1px solid var(--red);
+            color: var(--red);
+        }
+
         .status-dot {
             width: 8px;
             height: 8px;
@@ -257,6 +272,14 @@
 
         .status-indicator.connected .status-dot {
             animation: pulse-dot 2s infinite;
+        }
+
+        .status-indicator.completed .status-dot,
+        .status-indicator.cancelled .status-dot,
+        .status-indicator.rejected .status-dot,
+        .status-indicator.failed .status-dot,
+        .status-indicator.error .status-dot {
+            animation: none;
         }
 
         @keyframes pulse-dot {
@@ -437,6 +460,27 @@
             color: var(--amber);
         }
 
+        .stream-badge.thinking {
+            background: rgba(0, 255, 255, 0.12);
+            border-color: var(--cyan);
+            color: var(--cyan);
+        }
+
+        .stream-badge.completed {
+            background: rgba(0, 255, 65, 0.1);
+            border-color: var(--green);
+            color: var(--green);
+        }
+
+        .stream-badge.cancelled,
+        .stream-badge.rejected,
+        .stream-badge.failed,
+        .stream-badge.error {
+            background: rgba(255, 51, 51, 0.1);
+            border-color: var(--red);
+            color: var(--red);
+        }
+
         .stream-badge.muted {
             background: rgba(72, 79, 88, 0.3);
             border-color: var(--gray);
@@ -499,6 +543,163 @@
             word-break: break-word;
             background: var(--bg-dark);
             color: var(--green-dim);
+        }
+
+        .thinking-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            margin: 2px 0 6px;
+            padding: 4px 8px;
+            border: 1px solid rgba(0, 255, 255, 0.45);
+            border-radius: 3px;
+            background: rgba(0, 255, 255, 0.06);
+            color: var(--cyan);
+            font-style: italic;
+        }
+
+        .thinking-indicator::before {
+            content: "";
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--cyan);
+            box-shadow: 0 0 8px var(--cyan);
+            animation: pulse-dot 1s infinite;
+        }
+
+        .thinking-block {
+            margin: 6px 0;
+            padding: 8px 10px;
+            border-left: 2px solid var(--cyan);
+            background: rgba(0, 255, 255, 0.06);
+            color: #8be9ff;
+            white-space: pre-wrap;
+        }
+
+        .thinking-block.active {
+            box-shadow: inset 0 0 12px rgba(0, 255, 255, 0.08);
+        }
+
+        .thinking-label {
+            display: block;
+            margin-bottom: 5px;
+            color: var(--cyan);
+            font-size: 9px;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        .thinking-text {
+            color: #8be9ff;
+        }
+
+        .monitor-line {
+            display: block;
+            margin: 1px 0;
+            white-space: pre-wrap;
+        }
+
+        .monitor-line-tool,
+        .monitor-line-stream {
+            color: #9ca3af;
+        }
+
+        .monitor-line-event,
+        .monitor-line-status {
+            color: var(--white);
+        }
+
+        .monitor-line-retry {
+            color: var(--amber);
+        }
+
+        .monitor-line-error,
+        .monitor-line-unknown {
+            color: var(--red);
+        }
+
+        .monitor-line-grounding {
+            color: #a78bfa;
+        }
+
+        .monitor-token {
+            display: inline-block;
+            margin-right: 6px;
+            padding: 1px 5px;
+            border-radius: 3px;
+            font-size: 9px;
+            letter-spacing: 0.5px;
+        }
+
+        .monitor-token-tool,
+        .monitor-token-stream {
+            border: 1px solid var(--gray);
+            color: var(--gray);
+        }
+
+        .monitor-token-event,
+        .monitor-token-status {
+            border: 1px solid var(--white);
+            color: var(--white);
+        }
+
+        .monitor-token-retry {
+            border: 1px solid var(--amber);
+            color: var(--amber);
+        }
+
+        .monitor-token-error,
+        .monitor-token-unknown {
+            border: 1px solid var(--red);
+            color: var(--red);
+        }
+
+        .monitor-token-grounding {
+            border: 1px solid #a78bfa;
+            color: #a78bfa;
+        }
+
+        .monitor-key {
+            color: var(--cyan);
+        }
+
+        .monitor-value {
+            color: var(--white);
+        }
+
+        .monitor-value-model {
+            color: #7dd3fc;
+        }
+
+        .monitor-value-layer {
+            color: #f9e2af;
+        }
+
+        .monitor-value-score {
+            color: var(--green);
+        }
+
+        .monitor-json-line {
+            display: block;
+            color: #b4f8c8;
+        }
+
+        .qa-stream-header {
+            display: block;
+            margin: 8px 0 4px;
+            padding: 4px 8px;
+            border-left: 2px solid var(--amber);
+            background: rgba(255, 176, 0, 0.05);
+            color: var(--amber);
+        }
+
+        .qa-stream-model {
+            color: #7dd3fc;
+        }
+
+        .qa-stream-layer {
+            color: #f9e2af;
         }
 
         .stream-content:empty::before {
@@ -595,6 +796,149 @@
         .log-entry.error { color: var(--red); }
         .log-entry.warn { color: var(--amber); }
         .log-entry.event { color: var(--white); }
+        .log-repeat-count {
+            color: var(--amber);
+            margin-left: 6px;
+        }
+
+        /* ============================================
+           STATUS PANEL
+           ============================================ */
+
+        .status-live-summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+            gap: 6px;
+            margin-bottom: 10px;
+        }
+
+        .status-metric {
+            border: 1px solid var(--border);
+            background: rgba(13, 17, 23, 0.8);
+            padding: 6px 8px;
+            min-width: 0;
+        }
+
+        .status-metric-label {
+            display: block;
+            color: var(--gray);
+            font-size: 9px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 3px;
+        }
+
+        .status-metric-value {
+            display: block;
+            color: var(--white);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .status-metric-value.project,
+        .status-session-id {
+            color: var(--cyan);
+        }
+
+        .status-metric-value.running,
+        .status-metric-value.active,
+        .status-session-state.generating,
+        .status-session-state.running,
+        .status-session-state.qa_evaluation,
+        .status-session-state.consensus,
+        .status-session-state.gran_sabio_review {
+            color: var(--amber);
+        }
+
+        .status-metric-value.completed,
+        .status-session-state.completed {
+            color: var(--green);
+        }
+
+        .status-metric-value.idle,
+        .status-metric-value.unknown {
+            color: var(--gray);
+        }
+
+        .status-metric-value.failed,
+        .status-metric-value.error,
+        .status-metric-value.cancelled,
+        .status-metric-value.rejected,
+        .status-session-state.failed,
+        .status-session-state.error,
+        .status-session-state.cancelled,
+        .status-session-state.rejected {
+            color: var(--red);
+        }
+
+        .status-section {
+            border-top: 1px dashed var(--border);
+            padding-top: 8px;
+            margin-top: 8px;
+        }
+
+        .status-section-title {
+            color: var(--amber);
+            font-size: 10px;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            margin-bottom: 6px;
+        }
+
+        .status-session-row {
+            display: grid;
+            grid-template-columns: 72px minmax(0, 1fr) minmax(0, 0.8fr) minmax(0, 0.7fr) 58px;
+            gap: 8px;
+            align-items: center;
+            padding: 3px 0;
+            border-bottom: 1px solid rgba(72, 79, 88, 0.35);
+        }
+
+        .status-session-id,
+        .status-session-name,
+        .status-session-phase,
+        .status-session-state,
+        .status-session-iter {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .status-session-name {
+            color: var(--white);
+        }
+
+        .status-session-phase,
+        .status-session-iter {
+            color: var(--gray);
+        }
+
+        .status-event-row {
+            display: flex;
+            align-items: baseline;
+            gap: 6px;
+            padding: 2px 0;
+            color: var(--white);
+        }
+
+        .status-event-detail {
+            color: var(--white);
+            min-width: 0;
+            overflow-wrap: anywhere;
+        }
+
+        .status-event-count {
+            color: var(--amber);
+            margin-left: auto;
+        }
+
+        .status-empty {
+            color: var(--gray);
+            font-style: italic;
+            padding: 4px 0;
+        }
 
         /* ============================================
            PROJECT STATUS DASHBOARD

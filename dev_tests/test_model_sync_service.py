@@ -14,7 +14,52 @@ from unittest.mock import MagicMock
 import pytest
 
 import json_utils as json
-from services.model_sync import ModelSyncError, ModelSyncService, _remote_json_headers
+import services.model_sync as model_sync
+from services.model_sync import ModelSyncError, ModelSyncService, _normalize_ollama_host, _remote_json_headers
+
+
+class _FakeResponse:
+    def __init__(self, status=200, payload=None, text=""):
+        self.status = status
+        self._payload = payload if payload is not None else {}
+        self._text = text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def json(self):
+        return self._payload
+
+    async def text(self):
+        return self._text
+
+
+class _FakeOllamaSession:
+    def __init__(self, *, version_status=200, tags_payload=None):
+        self.version_status = version_status
+        self.tags_payload = tags_payload if tags_payload is not None else {"models": []}
+        self.urls = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def get(self, url, **kwargs):
+        self.urls.append(url)
+        if url.endswith("/api/version"):
+            return _FakeResponse(
+                status=self.version_status,
+                payload={"version": "0.12.6"},
+                text="not running",
+            )
+        if url.endswith("/api/tags"):
+            return _FakeResponse(payload=self.tags_payload)
+        raise AssertionError(f"Unexpected URL: {url}")
 
 
 @pytest.fixture
@@ -90,6 +135,7 @@ def service(tmp_path, sample_model_specs):
             XAI_API_KEY="xai-test",
             OPENAI_API_KEY="openai-test",
             ANTHROPIC_API_KEY="anthropic-test",
+            OLLAMA_HOST="http://localhost:11434",
             model_specs=sample_model_specs,
             reload_model_specifications=MagicMock(),
         ),
@@ -155,9 +201,9 @@ def test_sync_provider_reloads_config_and_creates_backup(service):
     }
 
 
-def test_sync_provider_blocks_invalid_default_references(service):
+def test_sync_provider_blocks_invalid_alias_references(service):
     bad_specs = service.load_specs()
-    bad_specs["default_models"]["generator"] = "missing-model"
+    bad_specs["aliases"]["missing_alias"] = "missing-model"
     service.specs_path.write_text(json.dumps(bad_specs, indent=2), encoding="utf-8")
 
     with pytest.raises(ModelSyncError, match="invalid model references"):
@@ -221,6 +267,66 @@ def test_remote_json_headers_do_not_request_brotli():
     assert headers["Accept-Encoding"] == "gzip, deflate"
     assert "br" not in headers["Accept-Encoding"]
     assert headers["Authorization"] == "Bearer test"
+
+
+def test_normalize_ollama_host_rewrites_unspecified_bind_address():
+    assert _normalize_ollama_host("0.0.0.0:11434/v1") == "http://127.0.0.1:11434"
+    assert _normalize_ollama_host("http://192.168.1.50:11434") == "http://192.168.1.50:11434"
+
+
+@pytest.mark.asyncio
+async def test_fetch_ollama_remote_models_from_local_tags(service, monkeypatch):
+    service.config.OLLAMA_HOST = "localhost:11434/v1"
+    fake_session = _FakeOllamaSession(
+        tags_payload={
+            "models": [
+                {
+                    "name": "llama3.1:8b",
+                    "model": "llama3.1:8b",
+                    "modified_at": "2026-05-01T10:00:00Z",
+                    "size": 4920753328,
+                    "digest": "abc123",
+                    "details": {
+                        "format": "gguf",
+                        "family": "llama",
+                        "parameter_size": "8B",
+                        "quantization_level": "Q4_K_M",
+                    },
+                }
+            ]
+        }
+    )
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+
+    result = await service.fetch_remote_models("ollama")
+
+    assert fake_session.urls == [
+        "http://localhost:11434/api/version",
+        "http://localhost:11434/api/tags",
+    ]
+    assert result["provider"] == "ollama"
+    assert result["sync_mode"] == "full"
+    assert result["stats"]["new"] == 1
+    model = result["models"][0]
+    assert model["id"] == "llama3.1:8b"
+    assert model["provider"] == "ollama"
+    assert model["context_window"] == 32768
+    assert model["output_tokens"] == 8192
+    assert model["pricing"] == {"input_per_million": 0.0, "output_per_million": 0.0}
+    assert model["source"] == "local/ollama"
+    assert "8B" in model["description"]
+    assert "Q4_K_M" in model["description"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_ollama_remote_requires_reachable_server(service, monkeypatch):
+    fake_session = _FakeOllamaSession(version_status=503)
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+
+    with pytest.raises(ModelSyncError, match="Ollama API health check failed"):
+        await service.fetch_remote_models("ollama")
+
+    assert fake_session.urls == ["http://localhost:11434/api/version"]
 
 
 def test_provider_spec_preserves_remote_text_only_capabilities_for_non_reasoning_xai(service):

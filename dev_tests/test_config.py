@@ -24,6 +24,17 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+@pytest.fixture(autouse=True)
+def restore_config_module_after_test():
+    """Keep config reload tests from leaking patched catalogs into later tests."""
+    import config as config_module
+
+    original_config = config_module.config
+    yield
+    config_module.config = original_config
+    original_config.reload_model_specifications()
+
+
 # ============================================================================
 # Fixtures
 # ============================================================================
@@ -345,6 +356,8 @@ class TestEnvironmentLoading:
                 assert cfg.APP_HOST == "0.0.0.0"
                 assert cfg.APP_PORT == 8000
                 assert cfg.MAX_RETRIES == 3
+                assert cfg.SESSION_CLEANUP_IDLE_EMPTY_CHECKS == 3
+                assert cfg.SESSION_CLEANUP_IDLE_INTERVAL == 3600
 
     def test_session_cleanup_interval_from_legacy_env(self, minimal_model_specs):
         """Given: CLEANUP_INTERVAL (legacy) in env, Then: Uses it for SESSION_CLEANUP_INTERVAL"""
@@ -359,13 +372,28 @@ class TestEnvironmentLoading:
                 assert cfg.SESSION_CLEANUP_INTERVAL == 450
                 assert cfg.CLEANUP_INTERVAL == 450
 
+    def test_session_cleanup_idle_settings_from_env(self, minimal_model_specs):
+        """Given: Cleanup idle env vars, Then: Config loads adaptive cleanup settings"""
+        import json_utils as json
+        specs_json = json.dumps(minimal_model_specs)
+
+        env = {
+            "SESSION_CLEANUP_IDLE_EMPTY_CHECKS": "5",
+            "SESSION_CLEANUP_IDLE_INTERVAL": "1800",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch("builtins.open", mock_open(read_data=specs_json)):
+                from config import Config
+                cfg = Config()
+                assert cfg.SESSION_CLEANUP_IDLE_EMPTY_CHECKS == 5
+                assert cfg.SESSION_CLEANUP_IDLE_INTERVAL == 1800
+
     def test_attachment_settings_from_env(self, minimal_model_specs):
         """Given: Attachment env vars, Then: Config loads them"""
         import json_utils as json
         specs_json = json.dumps(minimal_model_specs)
 
         env = {
-            "ATTACHMENTS_BASE_PATH": "/custom/path",
             "ATTACHMENTS_MAX_SIZE_BYTES": "20971520",
             "ATTACHMENTS_MAX_FILES_PER_REQUEST": "10"
         }
@@ -373,12 +401,11 @@ class TestEnvironmentLoading:
             with patch("builtins.open", mock_open(read_data=specs_json)):
                 from config import Config
                 cfg = Config()
-                assert cfg.ATTACHMENTS.base_path == "/custom/path"
                 assert cfg.ATTACHMENTS.max_size_bytes == 20971520
                 assert cfg.ATTACHMENTS.max_files_per_request == 10
 
-    def test_attachment_dedupe_defaults_are_rollout_safe(self, minimal_model_specs):
-        """Given: No dedupe env vars, Then: Dedupe rollout flags are conservative"""
+    def test_attachment_storage_defaults_are_db_backed(self, minimal_model_specs):
+        """Given: No attachment storage env vars, Then: DB-backed storage is configured"""
         import json_utils as json
         specs_json = json.dumps(minimal_model_specs)
 
@@ -386,36 +413,26 @@ class TestEnvironmentLoading:
             with patch("builtins.open", mock_open(read_data=specs_json)):
                 from config import Config
                 cfg = Config()
-                assert cfg.ATTACHMENTS.dedupe_read_enabled is False
-                assert cfg.ATTACHMENTS.dedupe_write_enabled is False
-                assert cfg.ATTACHMENTS.legacy_read_fallback_enabled is True
-                assert cfg.ATTACHMENTS.legacy_write_index_enabled is True
+                assert cfg.ATTACHMENTS.dedupe_db_path == "data/attachments/attachments.sqlite3"
+                assert cfg.ATTACHMENTS.blob_base_path == "data/attachment_blobs"
                 assert cfg.ATTACHMENTS.blob_gc_enabled is False
 
-    def test_attachment_dedupe_settings_from_env(self, minimal_model_specs):
-        """Given: Dedupe env vars, Then: Config loads paths and booleans"""
+    def test_attachment_storage_settings_from_env(self, minimal_model_specs):
+        """Given: Attachment storage env vars, Then: Config loads paths and booleans"""
         import json_utils as json
         specs_json = json.dumps(minimal_model_specs)
 
         env = {
-            "ATTACHMENTS_DEDUPE_READ_ENABLED": "true",
-            "ATTACHMENTS_DEDUPE_WRITE_ENABLED": "1",
             "ATTACHMENTS_DEDUPE_DB_PATH": "/tmp/attachments.sqlite3",
             "ATTACHMENTS_BLOB_BASE_PATH": "/tmp/attachment_blobs",
-            "ATTACHMENTS_LEGACY_READ_FALLBACK_ENABLED": "false",
-            "ATTACHMENTS_LEGACY_WRITE_INDEX_ENABLED": "0",
             "ATTACHMENTS_BLOB_GC_ENABLED": "yes",
         }
         with patch.dict(os.environ, env, clear=False):
             with patch("builtins.open", mock_open(read_data=specs_json)):
                 from config import Config
                 cfg = Config()
-                assert cfg.ATTACHMENTS.dedupe_read_enabled is True
-                assert cfg.ATTACHMENTS.dedupe_write_enabled is True
                 assert cfg.ATTACHMENTS.dedupe_db_path == "/tmp/attachments.sqlite3"
                 assert cfg.ATTACHMENTS.blob_base_path == "/tmp/attachment_blobs"
-                assert cfg.ATTACHMENTS.legacy_read_fallback_enabled is False
-                assert cfg.ATTACHMENTS.legacy_write_index_enabled is False
                 assert cfg.ATTACHMENTS.blob_gc_enabled is True
 
     def test_attachment_mime_types_from_env(self, minimal_model_specs):
@@ -1432,37 +1449,65 @@ class TestModuleLevelFunctions:
             assert aliases["gpt4"] == "gpt-4o"
 
     def test_get_default_models(self, minimal_model_specs):
-        """Given: Config with defaults, Then: get_default_models returns them"""
+        """Given: Runtime routing defaults, Then: get_default_models returns compatibility view"""
         import json_utils as json
         specs_json = json.dumps(minimal_model_specs)
+        routing = {
+            "policy": {"missing_required_call": "fail_fast"},
+            "global": {},
+            "calls": {
+                "generation.main": {"model": "llama3"},
+                "qa.evaluate_layer": {"models": [{"model": "llama3"}]},
+                "gransabio.review": {"model": "llama3"},
+                "gransabio.regenerate": {"model": "llama3"},
+                "arbiter.resolve": {"model": "llama3"},
+            },
+        }
 
-        with patch("builtins.open", mock_open(read_data=specs_json)):
+        with patch("builtins.open", mock_open(read_data=specs_json)), patch(
+            "llm_routing.get_default_routing", return_value=routing
+        ):
             import importlib
 
             import config as config_module
             importlib.reload(config_module)
 
             defaults = config_module.get_default_models()
-            assert defaults["generator"] == "gpt-4o"
+            assert defaults["generator"] == "llama3"
 
     def test_get_default_models_raises_if_missing(self):
-        """Given: No default_models in specs, Then: Raises RuntimeError"""
+        """Given: No generation model in routing, Then: Raises routing error"""
         import json_utils as json
+        from llm_routing import LLMRoutingError
+
         specs_without_defaults = {
             "model_specifications": {"openai": {}},
             "aliases": {}
         }
         specs_json = json.dumps(specs_without_defaults)
+        routing = {
+            "policy": {"missing_required_call": "fail_fast"},
+            "global": {},
+            "calls": {
+                "generation.main": {},
+                "qa.evaluate_layer": {"models": []},
+                "gransabio.review": {},
+                "gransabio.regenerate": {},
+                "arbiter.resolve": {},
+            },
+        }
 
-        with patch("builtins.open", mock_open(read_data=specs_json)):
+        with patch("builtins.open", mock_open(read_data=specs_json)), patch(
+            "llm_routing.get_default_routing", return_value=routing
+        ):
             import importlib
 
             import config as config_module
             importlib.reload(config_module)
 
-            with pytest.raises(RuntimeError) as exc_info:
+            with pytest.raises(LLMRoutingError) as exc_info:
                 config_module.get_default_models()
-            assert "default_models" in str(exc_info.value)
+            assert "generation.main" in str(exc_info.value)
 
     def test_get_model_parameter_requirements_gpt5(self):
         """Given: GPT-5 model, Then: Returns correct parameters"""

@@ -39,6 +39,8 @@ from debug_logger import (
     shutdown_debug_logger,
 )
 
+from .state import session_store
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -168,6 +170,9 @@ def _ensure_services():
 active_sessions: Dict[str, Dict] = {}
 # Initialized during FastAPI startup to bind the lock to the running event loop
 active_sessions_lock: Optional[asyncio.Lock] = None
+_session_cleanup_task: Optional[asyncio.Task] = None
+_session_cleanup_wake_event: Optional[asyncio.Event] = None
+_session_cleanup_activity_counter = 0
 _project_hard_stop_completion_tasks: Set[asyncio.Task] = set()
 _project_session_end_tasks: Set[asyncio.Task] = set()
 _debug_status_update_tasks: Set[asyncio.Task] = set()
@@ -213,6 +218,38 @@ async def _drain_background_tasks(
             label,
             timeout,
         )
+
+
+def _signal_session_cleanup_activity() -> None:
+    """Wake the cleanup loop when new session work arrives during idle cadence."""
+    global _session_cleanup_activity_counter
+    _session_cleanup_activity_counter += 1
+    wake_event = _session_cleanup_wake_event
+    if wake_event is not None:
+        wake_event.set()
+
+
+async def _wait_for_session_cleanup_interval(seconds: int, *, wakeable: bool) -> bool:
+    """Sleep for cleanup cadence, optionally waking early on new session activity."""
+    if not wakeable:
+        await asyncio.sleep(seconds)
+        return False
+
+    wake_event = _session_cleanup_wake_event
+    if wake_event is None:
+        await asyncio.sleep(seconds)
+        return False
+
+    counter_before_clear = _session_cleanup_activity_counter
+    wake_event.clear()
+    if _session_cleanup_activity_counter != counter_before_clear:
+        return True
+
+    try:
+        await asyncio.wait_for(wake_event.wait(), timeout=seconds)
+        return True
+    except asyncio.TimeoutError:
+        return False
 
 
 def _track_project_hard_stop_task(task: asyncio.Task) -> None:
@@ -473,9 +510,11 @@ def queue_debug_session_transition(
 async def startup_event():
     """Initialize services and background tasks on startup"""
     global active_sessions_lock, project_phase_streams_lock, project_status_streams_lock, debug_logger
+    global _session_cleanup_task, _session_cleanup_wake_event
     active_sessions_lock = asyncio.Lock()
     project_phase_streams_lock = asyncio.Lock()
     project_status_streams_lock = asyncio.Lock()
+    _session_cleanup_wake_event = asyncio.Event()
 
     # Initialize services early to catch any configuration issues
     try:
@@ -513,7 +552,7 @@ async def startup_event():
 
     # Initialize session cleanup
     await perform_session_cleanup()
-    asyncio.create_task(session_cleanup_loop())
+    _session_cleanup_task = asyncio.create_task(session_cleanup_loop(), name="session-cleanup")
 
     # Initialize feedback memory system
     try:
@@ -529,7 +568,17 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Clean up resources on shutdown"""
+    global _session_cleanup_task
     logger.info("Shutting down Gran Sabio LLM Engine...")
+
+    cleanup_task = _session_cleanup_task
+    if cleanup_task is not None:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+        _session_cleanup_task = None
 
     # Close the shared AI service instance connections
     try:
@@ -579,7 +628,7 @@ async def register_session(session_id: str, session_data: Dict[str, Any]) -> Non
     guard = await cancellation_registry.get_session_commit_guard(session_id)
     session_data["_hard_cancel_event"] = guard.dispatch_sealed_event
 
-    def _store() -> None:
+    def _store() -> bool:
         existing = active_sessions.get(session_id)
         if existing is not None and is_terminal_session(existing) and not is_terminal_session(session_data):
             existing["late_writes_blocked"] = existing.get("late_writes_blocked", 0) + 1
@@ -587,30 +636,28 @@ async def register_session(session_id: str, session_data: Dict[str, Any]) -> Non
                 "Blocked non-terminal session overwrite after terminal status for session %s",
                 session_id,
             )
-            return
+            return False
         active_sessions[session_id] = session_data
+        return True
 
     lock = active_sessions_lock
     if lock is None:
-        _store()
-        return
-    async with lock:
-        _store()
+        stored = _store()
+    else:
+        async with lock:
+            stored = _store()
+    if stored:
+        _signal_session_cleanup_activity()
 
 
 async def mutate_session(session_id: str, mutator: Callable[[Dict[str, Any]], T]) -> Optional[T]:
     """Run a mutator while holding the session lock."""
-    lock = active_sessions_lock
-    if lock is None:
-        session = active_sessions.get(session_id)
-        if session is None:
-            return None
-        return mutator(session)
-    async with lock:
-        session = active_sessions.get(session_id)
-        if session is None:
-            return None
-        return mutator(session)
+    return await session_store.mutate_session(
+        active_sessions,
+        active_sessions_lock,
+        session_id,
+        mutator,
+    )
 
 
 async def mutate_session_if_not_hard_cancelled(
@@ -634,10 +681,11 @@ async def mutate_session_if_not_hard_cancelled(
 
 async def increment_late_writes_blocked(session_id: str) -> None:
     """Increment the hard-cancel late-write counter without running arbitrary mutations."""
-    def _increment(session: Dict[str, Any]) -> None:
-        session["late_writes_blocked"] = session.get("late_writes_blocked", 0) + 1
-
-    await mutate_session(session_id, _increment)
+    await session_store.increment_late_writes_blocked(
+        active_sessions,
+        active_sessions_lock,
+        session_id,
+    )
 
 
 async def pop_session(session_id: str) -> Optional[Dict[str, Any]]:
@@ -655,20 +703,20 @@ async def pop_session(session_id: str) -> Optional[Dict[str, Any]]:
 
 async def session_exists(session_id: str) -> bool:
     """Check if a session exists under lock."""
-    lock = active_sessions_lock
-    if lock is None:
-        return session_id in active_sessions
-    async with lock:
-        return session_id in active_sessions
+    return await session_store.session_exists(
+        active_sessions,
+        active_sessions_lock,
+        session_id,
+    )
 
 
 async def get_session(session_id: str) -> Optional[Dict[str, Any]]:
     """Retrieve a session safely under lock."""
-    lock = active_sessions_lock
-    if lock is None:
-        return active_sessions.get(session_id)
-    async with lock:
-        return active_sessions.get(session_id)
+    return await session_store.get_session(
+        active_sessions,
+        active_sessions_lock,
+        session_id,
+    )
 
 
 def _is_hard_cancel_sealed(session: Dict[str, Any]) -> bool:
@@ -784,14 +832,15 @@ def _build_cancelled_final_result(
 
 def is_terminal_session(session: Dict[str, Any]) -> bool:
     """Return True when a session has already reached a final status."""
-    status = session.get("status")
-    status_value = status.value if isinstance(status, GenerationStatus) else str(status)
-    return status_value in {
-        GenerationStatus.COMPLETED.value,
-        GenerationStatus.REJECTED.value,
-        GenerationStatus.FAILED.value,
-        GenerationStatus.CANCELLED.value,
-    }
+    return session_store.is_terminal_session(
+        session,
+        {
+            GenerationStatus.COMPLETED.value,
+            GenerationStatus.REJECTED.value,
+            GenerationStatus.FAILED.value,
+            GenerationStatus.CANCELLED.value,
+        },
+    )
 
 
 def apply_session_cancelled_state(
@@ -1227,6 +1276,7 @@ def _build_project_phase_event(
     project_epoch: Optional[int] = None,
     request_name: Optional[str] = None,
     content: Optional[str] = None,
+    is_thinking: Optional[bool] = None,
     status: Optional[str] = None,
     # Retry-specific fields
     attempt: Optional[int] = None,
@@ -1269,6 +1319,8 @@ def _build_project_phase_event(
         obj["status"] = status
     if content is not None:
         obj["content"] = content
+    if is_thinking is not None:
+        obj["is_thinking"] = is_thinking
     # Retry fields
     if attempt is not None:
         obj["attempt"] = attempt
@@ -1342,6 +1394,7 @@ async def publish_project_phase_chunk(
     session_id: Optional[str] = None,
     project_epoch: Optional[int] = None,
     request_name: Optional[str] = None,
+    is_thinking: Optional[bool] = None,
     event: str = "chunk",
     status: Optional[str] = None,
     end_stream: bool = False,
@@ -1422,6 +1475,7 @@ async def publish_project_phase_chunk(
         project_epoch=effective_project_epoch,
         request_name=request_name,
         content=content,
+        is_thinking=is_thinking,
         status=status,
         attempt=attempt,
         max_attempts=max_attempts,
@@ -1791,17 +1845,31 @@ def cleanup_session_sidecars(session_id: str) -> None:
         logger.warning("Failed to clear QA runtime state for session %s: %s", session_id, exc)
 
 
-async def perform_session_cleanup() -> None:
+async def _get_active_session_count() -> int:
+    """Return active session count using the shared lock when available."""
+    lock = active_sessions_lock
+    if lock is None:
+        return len(active_sessions)
+    async with lock:
+        return len(active_sessions)
+
+
+async def perform_session_cleanup() -> Dict[str, Any]:
     """Remove expired sessions and trim verbose logs respecting configuration."""
     lock = active_sessions_lock
     now = datetime.now()
     timeout_seconds = getattr(config, 'SESSION_TIMEOUT', 3600)
     max_entries = max(1, getattr(config, 'VERBOSE_MAX_ENTRIES', 100))
     if timeout_seconds <= 0 and max_entries <= 0:
-        return
+        return {
+            "expired_count": 0,
+            "trimmed_log_count": 0,
+            "remaining_sessions": await _get_active_session_count(),
+        }
 
     expired_sessions: List[str] = []
     trimmed_logs: List[tuple[str, int]] = []
+    remaining_sessions = 0
 
     def _cleanup_sessions(items):
         nonlocal expired_sessions, trimmed_logs
@@ -1834,34 +1902,83 @@ async def perform_session_cleanup() -> None:
         for session_id in expired_sessions:
             active_sessions.pop(session_id, None)
             cleanup_session_sidecars(session_id)
+        remaining_sessions = len(active_sessions)
     else:
         async with lock:
             _cleanup_sessions(list(active_sessions.items()))
             for session_id in expired_sessions:
                 active_sessions.pop(session_id, None)
                 cleanup_session_sidecars(session_id)
+            remaining_sessions = len(active_sessions)
 
     for session_id in expired_sessions:
         await cancellation_registry.unregister_session(session_id)
 
     if expired_sessions:
-        logger.info('Cleaned up %d expired session(s): %s', len(expired_sessions), ', '.join(expired_sessions))
+        logger.info('Cleaned up %d expired session(s)', len(expired_sessions))
+        logger.debug('Expired session ids removed: %s', ', '.join(expired_sessions))
     if trimmed_logs:
         summary = ', '.join(f"{sid} (-{count})" for sid, count in trimmed_logs)
         logger.debug('Trimmed verbose logs: %s', summary)
 
+    return {
+        "expired_count": len(expired_sessions),
+        "trimmed_log_count": len(trimmed_logs),
+        "remaining_sessions": remaining_sessions,
+    }
+
 
 async def session_cleanup_loop() -> None:
-    """Periodic background task that performs session maintenance."""
+    """Periodic background task that performs session maintenance with idle cadence."""
     interval = max(1, getattr(config, 'SESSION_CLEANUP_INTERVAL', 300))
-    logger.info('Session cleanup loop started (interval=%ss)', interval)
+    idle_after_empty_checks = max(1, getattr(config, 'SESSION_CLEANUP_IDLE_EMPTY_CHECKS', 3))
+    idle_interval = max(interval, getattr(config, 'SESSION_CLEANUP_IDLE_INTERVAL', 3600))
+    empty_checks = 0
+    last_activity_counter = _session_cleanup_activity_counter
+    logger.info(
+        'Session cleanup loop started (interval=%ss, idle_interval=%ss, idle_after_empty_checks=%s)',
+        interval,
+        idle_interval,
+        idle_after_empty_checks,
+    )
     try:
         while True:
-            await asyncio.sleep(interval)
+            idle_wait = empty_checks >= idle_after_empty_checks
+            wait_seconds = idle_interval if idle_wait else interval
+            woke_for_activity = await _wait_for_session_cleanup_interval(
+                wait_seconds,
+                wakeable=idle_wait,
+            )
+            if idle_wait and woke_for_activity:
+                logger.info('Session cleanup loop resumed from idle after new session activity')
+
             try:
-                await perform_session_cleanup()
+                cleanup_result = await perform_session_cleanup()
             except Exception as exc:
                 logger.exception('Session cleanup iteration failed: %s', exc)
+                empty_checks = 0
+                continue
+
+            current_activity_counter = _session_cleanup_activity_counter
+            had_session_activity = current_activity_counter != last_activity_counter or woke_for_activity
+            last_activity_counter = current_activity_counter
+            did_cleanup_work = (
+                cleanup_result.get("expired_count", 0) > 0
+                or cleanup_result.get("trimmed_log_count", 0) > 0
+            )
+            remaining_sessions = cleanup_result.get("remaining_sessions", 0)
+
+            if remaining_sessions == 0 and not did_cleanup_work and not had_session_activity:
+                empty_checks += 1
+                if empty_checks == idle_after_empty_checks:
+                    logger.info(
+                        'Session cleanup loop entering idle cadence '
+                        '(idle_interval=%ss after %d empty check(s))',
+                        idle_interval,
+                        empty_checks,
+                    )
+            else:
+                empty_checks = 0
     except asyncio.CancelledError:
         logger.info('Session cleanup loop cancelled')
         raise

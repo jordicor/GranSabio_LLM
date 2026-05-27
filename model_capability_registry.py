@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
 from provider_capabilities import (
@@ -11,6 +12,26 @@ from provider_capabilities import (
     ModelCapabilities,
     capability_state,
 )
+
+
+TOOL_LOOP_RUNTIME_PROVIDERS = frozenset({"openai", "openrouter", "xai", "claude", "gemini"})
+
+
+@dataclass(frozen=True)
+class ModelCapabilityContext:
+    """Catalog resolution payload for capability checks that must not require API keys."""
+
+    status: str
+    provider: str = ""
+    model_id: str = ""
+    model_data: Mapping[str, Any] | None = None
+    model_name: str = ""
+    catalog_provider: str = ""
+    model_key: str = ""
+
+    @property
+    def resolved(self) -> bool:
+        return self.status == "resolved"
 
 
 _CAPABILITY_ALIASES = {
@@ -73,6 +94,36 @@ def find_model_spec(specs: Mapping[str, Any], provider: str, model_id: str) -> M
         if target in {declared_id, str(model_key).strip().lower()}:
             return model_data
     return {}
+
+
+def resolve_model_capability_context(
+    model_name: str,
+    specs: Mapping[str, Any],
+) -> ModelCapabilityContext:
+    """Resolve a model for capability gates without validating credentials."""
+
+    from config import resolve_model_catalog_entry
+
+    catalog = dict(specs) if isinstance(specs, Mapping) else {}
+    resolved = resolve_model_catalog_entry(model_name, catalog)
+    if not resolved.get("matched"):
+        return ModelCapabilityContext(
+            status="unresolved",
+            model_name=str(model_name or ""),
+        )
+
+    model_data = resolved.get("model_data") if isinstance(resolved.get("model_data"), Mapping) else {}
+    provider = normalize_provider(str(resolved.get("provider") or resolved.get("catalog_provider") or ""))
+    context = ModelCapabilityContext(
+        status="resolved" if resolved.get("enabled") else "disabled",
+        provider=provider,
+        model_id=str(resolved.get("model_id") or ""),
+        model_data=model_data,
+        model_name=str(resolved.get("model_name") or model_name or ""),
+        catalog_provider=str(resolved.get("catalog_provider") or ""),
+        model_key=str(resolved.get("model_key") or ""),
+    )
+    return context
 
 
 def _state_from_provider_capabilities(
@@ -283,3 +334,147 @@ def model_supports(
         model_data=model_data,
     )
     return getattr(capabilities, normalize_capability_name(capability), capability_state(CapabilitySupport.UNKNOWN))
+
+
+def model_uses_responses_api(
+    provider: str,
+    model_id: str,
+    specs: Mapping[str, Any],
+    *,
+    model_data: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Return True when specs mark the model as using the Responses API."""
+
+    state = model_supports(
+        specs=specs,
+        provider=normalize_provider(provider),
+        model_id=model_id,
+        capability="responses_api",
+        model_data=model_data,
+    )
+    return state.support == CapabilitySupport.SUPPORTED
+
+
+def _openrouter_supports_tools_parameter(
+    specs: Mapping[str, Any],
+    model_id: str,
+    model_data: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    data = model_data if isinstance(model_data, Mapping) else {}
+    params = data.get("supported_parameters")
+    if params is None:
+        params = (data.get("sync_metadata") or {}).get("supported_parameters")
+    if not isinstance(params, list):
+        data = find_model_spec(specs, "openrouter", model_id)
+        params = data.get("supported_parameters") if isinstance(data, Mapping) else None
+        if params is None and isinstance(data, Mapping):
+            params = (data.get("sync_metadata") or {}).get("supported_parameters")
+    if not isinstance(data, Mapping):
+        return False
+    if not isinstance(params, list):
+        return False
+    return "tools" in {str(param).strip() for param in params}
+
+
+def _openrouter_model_data_for_parameter_checks(
+    specs: Mapping[str, Any],
+    model_id: str,
+    model_data: Optional[Mapping[str, Any]] = None,
+) -> Optional[Mapping[str, Any]]:
+    data = model_data if isinstance(model_data, Mapping) else None
+    params = None
+    if data is not None:
+        params = data.get("supported_parameters")
+        if params is None:
+            params = (data.get("sync_metadata") or {}).get("supported_parameters")
+    if isinstance(params, list):
+        return data
+    fallback = find_model_spec(specs, "openrouter", model_id)
+    return fallback if isinstance(fallback, Mapping) and fallback else data
+
+
+def model_supports_generation_validation_tool_loop(
+    provider: str,
+    model_id: str,
+    specs: Mapping[str, Any],
+    *,
+    model_data: Optional[Mapping[str, Any]] = None,
+    tool_calling_supported: Optional[bool] = None,
+) -> bool:
+    """Return whether the implemented runtime can run the validation tool loop."""
+
+    provider_key = normalize_provider(provider)
+    if provider_key not in TOOL_LOOP_RUNTIME_PROVIDERS:
+        return False
+    effective_model_data = model_data
+    if provider_key == "openrouter":
+        effective_model_data = _openrouter_model_data_for_parameter_checks(
+            specs,
+            model_id,
+            model_data,
+        )
+
+    if tool_calling_supported is None:
+        tool_state = model_supports(
+            specs=specs,
+            provider=provider_key,
+            model_id=model_id,
+            capability="tool_calling",
+            model_data=effective_model_data,
+        )
+        tool_calling_supported = tool_state.support == CapabilitySupport.SUPPORTED
+    if not tool_calling_supported:
+        return False
+
+    if provider_key == "openrouter" and not _openrouter_supports_tools_parameter(
+        specs,
+        model_id,
+        model_data=effective_model_data,
+    ):
+        return False
+
+    return True
+
+
+def model_qualifies_for_inline_accent_guard(
+    provider: str,
+    model_id: str,
+    specs: Mapping[str, Any],
+    *,
+    model_data: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Return whether inline accent guard can run for the generator model."""
+
+    provider_key = normalize_provider(provider)
+    if not model_supports_generation_validation_tool_loop(
+        provider_key,
+        model_id,
+        specs,
+        model_data=model_data,
+    ):
+        return False
+    if provider_key == "openai" and model_uses_responses_api(
+        provider_key,
+        model_id,
+        specs,
+        model_data=model_data,
+    ):
+        return False
+    return True
+
+
+def model_supports_long_text_section_tool_loop(
+    provider: str,
+    model_id: str,
+    specs: Mapping[str, Any],
+    *,
+    model_data: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Return whether Long Text section drafts can use the shared tool loop."""
+
+    return model_qualifies_for_inline_accent_guard(
+        provider,
+        model_id,
+        specs,
+        model_data=model_data,
+    )

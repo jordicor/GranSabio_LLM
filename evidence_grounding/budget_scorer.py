@@ -22,7 +22,6 @@ import math
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from config import config
 from evidence_grounding.evidence_matcher import (
     format_spans_for_prompt,
     scrub_spans,
@@ -33,6 +32,7 @@ from models import (
     EvidenceSpan,
     ExtractedClaim,
 )
+from llm_routing import resolve_call
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +297,8 @@ class BudgetScorer:
         budget_gap_threshold: Optional[float] = None,
         top_logprobs: int = 10,
         placeholder: str = "[EVIDENCE REMOVED]",
+        max_tokens: int = 5,
+        temperature: float = 0.0,
         extra_verbose: bool = False,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         cancellation_token: Optional[Any] = None,
@@ -332,6 +334,8 @@ class BudgetScorer:
             prompt=posterior_prompt,
             model=model,
             top_logprobs=top_logprobs,
+            max_tokens=max_tokens,
+            temperature=temperature,
             extra_verbose=extra_verbose,
             usage_callback=usage_callback,
             usage_extra={"subphase": "posterior", "claim_idx": claim.idx},
@@ -348,6 +352,8 @@ class BudgetScorer:
             prompt=prior_prompt,
             model=model,
             top_logprobs=top_logprobs,
+            max_tokens=max_tokens,
+            temperature=temperature,
             extra_verbose=extra_verbose,
             usage_callback=usage_callback,
             usage_extra={"subphase": "prior", "claim_idx": claim.idx},
@@ -405,6 +411,7 @@ class BudgetScorer:
         config_obj: EvidenceGroundingConfig,
         extra_verbose: bool = False,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        request: Optional[Any] = None,
         cancellation_token: Optional[Any] = None,
     ) -> List[ClaimBudgetResult]:
         """Score multiple claims for evidence grounding.
@@ -425,8 +432,10 @@ class BudgetScorer:
         if not claims:
             return []
 
-        # Resolve model - use scoring model (requires logprobs)
-        model = config_obj.model or config.EVIDENCE_GROUNDING_SCORING_MODEL
+        route = resolve_call("evidence.score_logprobs", request=request)
+        model = config_obj.model or route.model
+        routed_max_tokens = int(route.params.get("max_tokens", 5))
+        routed_temperature = float(route.params.get("temperature", 0.0))
 
         logger.info(
             f"Scoring {len(claims)} claims using model={model}, "
@@ -445,6 +454,8 @@ class BudgetScorer:
                     budget_gap_threshold=config_obj.budget_gap_threshold,
                     top_logprobs=config_obj.top_logprobs,
                     placeholder=config_obj.placeholder_text,
+                    max_tokens=routed_max_tokens,
+                    temperature=routed_temperature,
                     extra_verbose=extra_verbose,
                     usage_callback=usage_callback,
                     cancellation_token=cancellation_token,
@@ -476,6 +487,8 @@ class BudgetScorer:
         prompt: str,
         model: str,
         top_logprobs: int = 10,
+        max_tokens: int = 5,
+        temperature: float = 0.0,
         extra_verbose: bool = False,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
@@ -503,9 +516,9 @@ class BudgetScorer:
             prompt=prompt,
             model=model,
             system_prompt=ENTAILMENT_SYSTEM_PROMPT,
-            max_tokens=5,  # Only need YES/NO/UNSURE
+            max_tokens=max_tokens,
             top_logprobs=top_logprobs,
-            temperature=0.0,  # Deterministic for consistency
+            temperature=temperature,
             usage_callback=usage_callback,
             usage_extra={
                 "phase": "evidence_grounding",

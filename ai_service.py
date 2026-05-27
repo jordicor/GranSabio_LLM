@@ -9,6 +9,7 @@ Provides unified interface for content generation across different models.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 import hashlib
 import inspect
@@ -18,7 +19,8 @@ import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional, Set, Tuple, TypeVar
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optional, Set, Tuple, TypeVar
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 
@@ -45,15 +47,30 @@ except ImportError:
 
 # Use optimized JSON (3.6x faster than standard json)
 import json_utils as json
+from ai_runtime import capabilities as runtime_capabilities
+from ai_runtime import schemas as runtime_schemas
+from ai_runtime import usage as runtime_usage
+from ai_runtime import vision as runtime_vision
 from config import config, get_model_parameter_requirements
 from deterministic_validation import DraftValidationResult
+from llm_routing import resolve_call
 from llm_accent_prompts import (
     build_accent_criteria_block,
     build_inline_accent_prompt,
 )
 from model_aliasing import PromptPart, PromptSource, assert_prompt_is_model_blind
-from model_capability_registry import model_supports as registry_model_supports
-from model_capability_registry import normalize_provider
+from model_capability_registry import (
+    model_supports as registry_model_supports,
+    model_supports_generation_validation_tool_loop,
+    normalize_provider,
+)
+from provider_adapters import (
+    DesiredOutputContract,
+    EffectiveOutputPlan,
+    OutputPlanningContext,
+    ProviderCallContext,
+    get_provider_adapter,
+)
 from provider_capabilities import CapabilitySupport
 from provider_errors import ProviderErrorKind, ProviderFailure, classify_provider_exception
 from schema_utils import json_schema_to_pydantic
@@ -72,6 +89,10 @@ from tool_loop_models import (
 from tools.string_utils import escape_xml_delimiters, remove_invisible_control
 
 logger = logging.getLogger(__name__)
+_ollama_concurrency_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "ollama_concurrency_depth",
+    default=0,
+)
 
 
 def _ensure_aiohttp_compatibility() -> None:
@@ -119,50 +140,38 @@ def _should_normalize_json_contract_content(
 def _stringify_finish_reason(value: Any) -> Optional[str]:
     """Return provider finish/stop reasons as stable strings."""
 
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    name = getattr(value, "name", None)
-    if isinstance(name, str):
-        return name
-    value_attr = getattr(value, "value", None)
-    if isinstance(value_attr, str):
-        return value_attr
-    return str(value)
+    return runtime_usage.stringify_finish_reason(value)
 
 
 def _is_token_limit_finish_reason(reason: Any) -> bool:
     """Detect provider stop reasons that mean output was cut by token budget."""
 
-    reason_text = (_stringify_finish_reason(reason) or "").strip().lower()
-    if not reason_text:
-        return False
-    normalized = reason_text.replace("-", "_").replace(" ", "_")
-    if normalized in {
-        "length",
-        "max_tokens",
-        "max_output_tokens",
-        "max_token",
-        "token_limit",
-        "output_token_limit",
-        "max_tokens_exceeded",
-        "max_output_tokens_exceeded",
-    }:
-        return True
-    return "max" in normalized and "token" in normalized
+    return runtime_usage.is_token_limit_finish_reason(reason)
 
 
 def _is_unusable_openai_stream_finish(reason: Any) -> bool:
     """Return True when an OpenAI streamed turn ended with unusable partial output."""
 
-    reason_text = (_stringify_finish_reason(reason) or "").strip().lower()
-    if not reason_text:
-        return True
-    normalized = reason_text.replace("-", "_").replace(" ", "_")
-    if normalized in {"stop", "tool_calls", "function_call", "completed"}:
-        return False
-    return True
+    return runtime_usage.is_unusable_openai_stream_finish(reason)
+
+
+def _normalize_ollama_openai_base_url(host: Any) -> str:
+    """Return the OpenAI-compatible Ollama base URL used by this client."""
+
+    base_url = str(host or "").strip().rstrip("/")
+    if not base_url:
+        return ""
+    if not base_url.startswith(("http://", "https://")):
+        base_url = f"http://{base_url}"
+    parsed = urlsplit(base_url)
+    if parsed.hostname in {"0.0.0.0", "::"}:
+        replacement_host = "127.0.0.1" if parsed.hostname == "0.0.0.0" else "[::1]"
+        if parsed.port:
+            replacement_host = f"{replacement_host}:{parsed.port}"
+        base_url = urlunsplit((parsed.scheme, replacement_host, parsed.path, parsed.query, parsed.fragment))
+    if not base_url.endswith("/v1"):
+        base_url = f"{base_url}/v1"
+    return base_url
 
 
 def _build_finish_metadata(
@@ -173,19 +182,11 @@ def _build_finish_metadata(
 ) -> Dict[str, Any]:
     """Build lightweight streaming finish metadata."""
 
-    finish_reason_text = _stringify_finish_reason(finish_reason)
-    metadata: Dict[str, Any] = {
-        "provider": provider,
-        "output_truncated": _is_token_limit_finish_reason(finish_reason_text),
-    }
-    if finish_reason_text is not None:
-        metadata["finish_reason"] = finish_reason_text
-        metadata["provider_stop_reason"] = finish_reason_text
-    if max_tokens is not None:
-        metadata["max_tokens"] = max_tokens
-    if metadata["output_truncated"]:
-        metadata["truncation_reason"] = "output_token_limit"
-    return metadata
+    return runtime_usage.build_finish_metadata(
+        provider=provider,
+        finish_reason=finish_reason,
+        max_tokens=max_tokens,
+    )
 
 
 class AccentGuardError(Exception):
@@ -376,6 +377,13 @@ class AIService:
         self.openrouter_client = None
         self.ollama_client = None
         self.fake_client = None
+        self._ollama_max_concurrent_requests = self._positive_int_config(
+            "OLLAMA_MAX_CONCURRENT_REQUESTS",
+            1,
+        )
+        self._ollama_request_semaphore = asyncio.Semaphore(
+            self._ollama_max_concurrent_requests
+        )
 
         # Configure optimized HTTP connector for better performance
         self.http_connector = aiohttp.TCPConnector(
@@ -512,12 +520,7 @@ class AIService:
 
         # Initialize Ollama client (local models, OpenAI-compatible API)
         if config.OLLAMA_HOST:
-            ollama_base_url = config.OLLAMA_HOST.rstrip("/")
-            # Add http:// if no protocol specified
-            if not ollama_base_url.startswith(("http://", "https://")):
-                ollama_base_url = f"http://{ollama_base_url}"
-            if not ollama_base_url.endswith("/v1"):
-                ollama_base_url = f"{ollama_base_url}/v1"
+            ollama_base_url = _normalize_ollama_openai_base_url(config.OLLAMA_HOST)
             self.ollama_client = openai.AsyncOpenAI(
                 api_key="ollama",  # Dummy key, Ollama doesn't require authentication
                 base_url=ollama_base_url,
@@ -561,43 +564,7 @@ class AIService:
         Returns:
             A deep copy of the schema with all 'additionalProperties' fields removed
         """
-        if not isinstance(schema, dict):
-            return schema
-
-        result = {}
-        for key, value in schema.items():
-            if key == "additionalProperties":
-                continue  # Skip this field entirely
-            elif key == "properties" and isinstance(value, dict):
-                result[key] = {
-                    k: AIService._strip_additional_properties(v)
-                    for k, v in value.items()
-                }
-            elif key == "items":
-                if isinstance(value, dict):
-                    result[key] = AIService._strip_additional_properties(value)
-                elif isinstance(value, list):
-                    result[key] = [AIService._strip_additional_properties(item) for item in value]
-                else:
-                    result[key] = value
-            elif key in ("allOf", "anyOf", "oneOf") and isinstance(value, list):
-                result[key] = [AIService._strip_additional_properties(item) for item in value]
-            elif key in ("definitions", "$defs") and isinstance(value, dict):
-                result[key] = {
-                    k: AIService._strip_additional_properties(v)
-                    for k, v in value.items()
-                }
-            elif isinstance(value, dict):
-                result[key] = AIService._strip_additional_properties(value)
-            elif isinstance(value, list):
-                result[key] = [
-                    AIService._strip_additional_properties(item) if isinstance(item, dict) else item
-                    for item in value
-                ]
-            else:
-                result[key] = value
-
-        return result
+        return runtime_schemas.strip_additional_properties(schema)
 
     @staticmethod
     def _convert_nullable_to_gemini_format(schema: Dict[str, Any]) -> Dict[str, Any]:
@@ -626,71 +593,7 @@ class AIService:
         Returns:
             A deep copy of the schema with type arrays converted to Gemini format
         """
-        if not isinstance(schema, dict):
-            return schema
-
-        result = {}
-        for key, value in schema.items():
-            if key == "type" and isinstance(value, list):
-                # Check if this is a nullable type pattern: [actual_type, "null"]
-                if len(value) == 2 and "null" in value:
-                    # Extract the non-null type
-                    non_null_type = [t for t in value if t != "null"][0]
-                    result["type"] = non_null_type
-                    result["nullable"] = True
-                    continue
-                elif "null" not in value and len(value) >= 1:
-                    # Union type without null (e.g., ["integer", "number"])
-                    # Gemini doesn't support type arrays, pick the most permissive type
-                    # Priority: number > integer > string > boolean > first type
-                    if "number" in value:
-                        selected_type = "number"
-                    elif "integer" in value:
-                        selected_type = "integer"
-                    elif "string" in value:
-                        selected_type = "string"
-                    elif "boolean" in value:
-                        selected_type = "boolean"
-                    else:
-                        selected_type = value[0]
-                    result["type"] = selected_type
-                    logger.debug(
-                        f"Gemini schema conversion: Simplified union type {value} to '{selected_type}'"
-                    )
-                    continue
-                else:
-                    # Other patterns (e.g., more than 2 types with null), keep as is
-                    result[key] = value
-            elif key == "properties" and isinstance(value, dict):
-                result[key] = {
-                    k: AIService._convert_nullable_to_gemini_format(v)
-                    for k, v in value.items()
-                }
-            elif key == "items":
-                if isinstance(value, dict):
-                    result[key] = AIService._convert_nullable_to_gemini_format(value)
-                elif isinstance(value, list):
-                    result[key] = [AIService._convert_nullable_to_gemini_format(item) for item in value]
-                else:
-                    result[key] = value
-            elif key in ("allOf", "anyOf", "oneOf") and isinstance(value, list):
-                result[key] = [AIService._convert_nullable_to_gemini_format(item) for item in value]
-            elif key in ("definitions", "$defs") and isinstance(value, dict):
-                result[key] = {
-                    k: AIService._convert_nullable_to_gemini_format(v)
-                    for k, v in value.items()
-                }
-            elif isinstance(value, dict):
-                result[key] = AIService._convert_nullable_to_gemini_format(value)
-            elif isinstance(value, list):
-                result[key] = [
-                    AIService._convert_nullable_to_gemini_format(item) if isinstance(item, dict) else item
-                    for item in value
-                ]
-            else:
-                result[key] = value
-
-        return result
+        return runtime_schemas.convert_nullable_to_gemini_format(schema)
 
     @staticmethod
     def _normalize_openai_strict_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
@@ -703,70 +606,7 @@ class AIService:
         request is sent, while still allowing the validator to reject schemas
         that explicitly ask for ``additionalProperties: true``.
         """
-        if not isinstance(schema, dict):
-            return schema
-
-        result: Dict[str, Any] = {}
-        properties = schema.get("properties")
-
-        for key, value in schema.items():
-            if key == "properties" and isinstance(value, dict):
-                result[key] = {
-                    prop_name: AIService._normalize_openai_strict_schema(prop_schema)
-                    for prop_name, prop_schema in value.items()
-                }
-            elif key == "items":
-                if isinstance(value, dict):
-                    result[key] = AIService._normalize_openai_strict_schema(value)
-                elif isinstance(value, list):
-                    result[key] = [
-                        AIService._normalize_openai_strict_schema(item)
-                        if isinstance(item, dict)
-                        else item
-                        for item in value
-                    ]
-                else:
-                    result[key] = value
-            elif key in ("allOf", "anyOf", "oneOf") and isinstance(value, list):
-                result[key] = [
-                    AIService._normalize_openai_strict_schema(item)
-                    if isinstance(item, dict)
-                    else item
-                    for item in value
-                ]
-            elif key in ("definitions", "$defs") and isinstance(value, dict):
-                result[key] = {
-                    def_name: AIService._normalize_openai_strict_schema(def_schema)
-                    for def_name, def_schema in value.items()
-                }
-            elif isinstance(value, dict):
-                result[key] = AIService._normalize_openai_strict_schema(value)
-            elif isinstance(value, list):
-                result[key] = [
-                    AIService._normalize_openai_strict_schema(item)
-                    if isinstance(item, dict)
-                    else item
-                    for item in value
-                ]
-            else:
-                result[key] = value
-
-        is_object_schema = (
-            schema.get("type") == "object"
-            or isinstance(properties, dict)
-        )
-        if is_object_schema and result.get("additionalProperties") is not True:
-            result["additionalProperties"] = False
-
-        if isinstance(properties, dict):
-            declared = list(properties.keys())
-            existing_required = [
-                item for item in result.get("required", []) if isinstance(item, str)
-            ]
-            required = list(dict.fromkeys([*existing_required, *declared]))
-            result["required"] = required
-
-        return result
+        return runtime_schemas.normalize_openai_strict_schema(schema)
 
     @staticmethod
     def _prepare_structured_output_schema(
@@ -776,33 +616,15 @@ class AIService:
     ) -> Optional[Dict[str, Any]]:
         """Return a provider-compatible JSON Schema copy for native JSON output."""
 
-        if not json_schema:
-            return json_schema
-
-        provider_key = (provider or "").lower()
-        model_lower = (model_id or "").lower()
-
-        if provider_key in {"gemini", "google"}:
-            effective_schema = AIService._strip_additional_properties(json_schema)
-            return AIService._convert_nullable_to_gemini_format(effective_schema)
-
-        if provider_key in {"openai", "openrouter", "xai", "ollama"}:
-            return AIService._normalize_openai_strict_schema(json_schema)
-
-        if (
-            provider_key in {"claude", "anthropic"}
-            and AIService._claude_supports_structured_outputs(model_lower)
-        ):
-            try:
-                claude_schema = json_schema_to_pydantic(json_schema).model_json_schema()
-                return AIService._normalize_openai_strict_schema(claude_schema)
-            except Exception as exc:  # noqa: BLE001 - normalize schema errors
-                raise ValueError(
-                    f"Schema validation error for {model_id}: failed to normalize "
-                    f"Claude structured-output schema: {exc}"
-                ) from exc
-
-        return json_schema
+        return runtime_schemas.prepare_structured_output_schema(
+            provider,
+            model_id,
+            json_schema,
+            claude_structured_outputs_supported=AIService._claude_supports_structured_outputs(
+                (model_id or "").lower()
+            ),
+            json_schema_to_pydantic_fn=json_schema_to_pydantic,
+        )
 
     @staticmethod
     def _apply_gemini_structured_output_schema(
@@ -815,12 +637,7 @@ class AIService:
         Raw JSON Schema dictionaries must use `response_json_schema`. Non-dict
         typed schemas can still use `response_schema`.
         """
-        if not json_schema:
-            return
-        if isinstance(json_schema, dict):
-            config_params["response_json_schema"] = json_schema
-        else:
-            config_params["response_schema"] = json_schema
+        runtime_schemas.apply_gemini_structured_output_schema(config_params, json_schema)
 
     @staticmethod
     def _validate_schema_for_structured_outputs(
@@ -838,86 +655,7 @@ class AIService:
         Raises:
             ValueError: If the schema contains unsupported features (e.g., additionalProperties: true)
         """
-        provider_key = (provider or "").lower()
-
-        def _check(node: Any, path: str) -> None:
-            if not isinstance(node, dict):
-                return
-
-            schema_type = node.get("type")
-
-            if path == "root" and schema_type is None:
-                raise ValueError(
-                    f"Schema validation error at '{path}': missing required 'type' at the root. "
-                    f"Structured outputs for {model_id} need an explicit type (e.g., 'object'). "
-                    "See https://docs.anthropic.com/en/docs/build-with-claude/structured-outputs"
-                )
-
-            # For Gemini, additionalProperties should already be stripped before validation
-            # This check is now a safety net in case someone forgets to strip
-            if provider_key in {"gemini", "google"}:
-                if "additionalProperties" in node:
-                    raise ValueError(
-                        f"Schema validation error at '{path}': Gemini structured outputs "
-                        f"do not support 'additionalProperties'. Use _strip_additional_properties() first."
-                    )
-            else:
-                if node.get("additionalProperties") is True:
-                    raise ValueError(
-                        f"Schema validation error at '{path}': structured outputs for {model_id} "
-                        f"do not allow 'additionalProperties: true'. Set it to false or remove it. "
-                        "See https://docs.anthropic.com/en/docs/build-with-claude/structured-outputs"
-                    )
-                if provider_key in {"openai", "openrouter", "xai", "ollama"}:
-                    is_object_schema = schema_type == "object" or isinstance(
-                        node.get("properties"), dict
-                    )
-                    if is_object_schema and node.get("additionalProperties") is not False:
-                        raise ValueError(
-                            f"Schema validation error at '{path}': strict structured outputs "
-                            f"for {model_id} require 'additionalProperties: false' on every object."
-                        )
-
-            properties = node.get("properties")
-            if isinstance(properties, dict):
-                if provider_key in {"openai", "openrouter", "xai", "ollama"}:
-                    required = node.get("required")
-                    missing_required = [
-                        prop_name
-                        for prop_name in properties
-                        if not isinstance(required, list) or prop_name not in required
-                    ]
-                    if missing_required:
-                        missing = ", ".join(sorted(missing_required))
-                        raise ValueError(
-                            f"Schema validation error at '{path}': strict structured outputs "
-                            f"for {model_id} require every property to be listed in 'required'. "
-                            f"Missing: {missing}"
-                        )
-                for prop_name, prop_schema in properties.items():
-                    _check(prop_schema, f"{path}.properties.{prop_name}")
-
-            items = node.get("items")
-            if isinstance(items, dict):
-                _check(items, f"{path}.items")
-            elif isinstance(items, list):
-                for index, item_schema in enumerate(items):
-                    _check(item_schema, f"{path}.items[{index}]")
-
-            # Handle common combinators
-            for combinator in ("allOf", "anyOf", "oneOf"):
-                if combinator in node and isinstance(node[combinator], list):
-                    for idx, subschema in enumerate(node[combinator]):
-                        _check(subschema, f"{path}.{combinator}[{idx}]")
-
-            # Handle definitions / $defs
-            for defs_key in ("definitions", "$defs"):
-                definitions = node.get(defs_key)
-                if isinstance(definitions, dict):
-                    for def_name, def_schema in definitions.items():
-                        _check(def_schema, f"{path}.{defs_key}.{def_name}")
-
-        _check(schema, "root")
+        runtime_schemas.validate_schema_for_structured_outputs(schema, provider, model_id)
 
     # =========================================================================
     # Vision/Image Support Methods
@@ -940,32 +678,7 @@ class AIService:
         Returns:
             Estimated token count for the image
         """
-        if detail == "low":
-            return 85
-
-        # High/auto detail: calculate tiles
-        # Images are resized to fit in 2048x2048, then tiled at 512x512
-        if width == 0 or height == 0:
-            return 85  # Fallback for unknown dimensions
-
-        scale = min(2048 / max(width, height), 1.0)
-        scaled_w = int(width * scale)
-        scaled_h = int(height * scale)
-
-        # Shortest side scaled to 768
-        short_side = min(scaled_w, scaled_h)
-        if short_side == 0:
-            return 85
-        short_scale = 768 / short_side
-        final_w = int(scaled_w * short_scale)
-        final_h = int(scaled_h * short_scale)
-
-        # Count 512x512 tiles
-        tiles_w = (final_w + 511) // 512
-        tiles_h = (final_h + 511) // 512
-        tiles = tiles_w * tiles_h
-
-        return 170 * tiles + 85
+        return runtime_vision.estimate_image_tokens_openai(width, height, detail)
 
     def _estimate_image_tokens_claude(self, width: int, height: int) -> int:
         """
@@ -978,9 +691,7 @@ class AIService:
         Returns:
             Estimated token count for the image
         """
-        if width == 0 or height == 0:
-            return 258  # Fallback for unknown dimensions
-        return (width * height) // 750
+        return runtime_vision.estimate_image_tokens_claude(width, height)
 
     def _estimate_image_tokens_gemini(self, width: int, height: int) -> int:
         """
@@ -993,16 +704,7 @@ class AIService:
         Returns:
             Estimated token count for the image
         """
-        if width == 0 or height == 0:
-            return 258  # Fallback for unknown dimensions
-
-        if max(width, height) <= 384:
-            return 258
-
-        # Calculate 768x768 tiles
-        tiles_w = (width + 767) // 768
-        tiles_h = (height + 767) // 768
-        return 258 * tiles_w * tiles_h
+        return runtime_vision.estimate_image_tokens_gemini(width, height)
 
     def _build_openai_image_content(
         self,
@@ -1020,30 +722,7 @@ class AIService:
         Returns:
             List of content parts ready for the API
         """
-        parts = []
-        for img in images:
-            detail = img.detail or "auto"
-            data_url = f"data:{img.mime_type};base64,{img.base64_data}"
-
-            if use_responses_api:
-                # Responses API format (O3-pro, GPT-5 Pro)
-                part = {
-                    "type": "input_image",
-                    "image_url": data_url,
-                }
-                if detail != "auto":
-                    part["detail"] = detail
-                parts.append(part)
-            else:
-                # Chat Completions API format (GPT-4o, GPT-5, O1/O3)
-                parts.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": data_url,
-                        "detail": detail
-                    }
-                })
-        return parts
+        return runtime_vision.build_openai_image_content(images, use_responses_api)
 
     def _build_claude_image_content(
         self,
@@ -1058,17 +737,7 @@ class AIService:
         Returns:
             List of content parts ready for Claude API
         """
-        parts = []
-        for img in images:
-            parts.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": img.mime_type,
-                    "data": img.base64_data
-                }
-            })
-        return parts
+        return runtime_vision.build_claude_image_content(images)
 
     def _build_gemini_image_parts(self, images: List["ImageData"]) -> List:
         """
@@ -1080,17 +749,7 @@ class AIService:
         Returns:
             List of Gemini Part objects ready for the API
         """
-        import base64 as b64
-
-        from google.genai import types
-
-        parts = []
-        for img in images:
-            image_bytes = b64.b64decode(img.base64_data)
-            parts.append(
-                types.Part.from_bytes(data=image_bytes, mime_type=img.mime_type)
-            )
-        return parts
+        return runtime_vision.build_gemini_image_parts(images)
 
     def _log_vision_request(
         self,
@@ -1099,22 +758,7 @@ class AIService:
         model_id: str
     ) -> None:
         """Log information about a vision request."""
-        total_tokens = 0
-        for img in images:
-            if img.width and img.height:
-                if provider in ("openai", "xai", "openrouter"):
-                    total_tokens += self._estimate_image_tokens_openai(
-                        img.width, img.height, img.detail or "auto"
-                    )
-                elif provider in ("claude", "anthropic"):
-                    total_tokens += self._estimate_image_tokens_claude(img.width, img.height)
-                elif provider in ("gemini", "google"):
-                    total_tokens += self._estimate_image_tokens_gemini(img.width, img.height)
-
-        logger.info(
-            f"Vision request: {len(images)} image(s) for {model_id} "
-            f"(estimated ~{total_tokens} tokens)"
-        )
+        runtime_vision.log_vision_request(images, provider, model_id)
 
     def _max_retry_attempts(self) -> int:
         try:
@@ -1244,14 +888,17 @@ class AIService:
             failure = getattr(exc, "provider_failure", None)
             if failure is not None:
                 return failure
-        return classify_provider_exception(
+        adapter = get_provider_adapter(provider)
+        return adapter.classify_exception(
             exc,
-            provider=provider,
-            model_id=model_id,
-            operation=action,
-            attempt=attempt,
-            max_attempts=max_attempts,
-            attempted_feature=attempted_feature,
+            ProviderCallContext(
+                provider=provider,
+                model_id=model_id,
+                operation=action,
+                attempted_feature=attempted_feature,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            ),
         )
 
     @staticmethod
@@ -1276,29 +923,75 @@ class AIService:
         json_schema: Optional[Dict[str, Any]],
     ) -> Optional[str]:
         """Return the native output-format parameter that will be sent."""
+        return AIService._plan_output_contract(
+            provider,
+            model_id,
+            json_output=json_output,
+            json_schema=json_schema,
+        ).attempted_feature
+
+    @staticmethod
+    def _desired_output_contract(
+        *,
+        json_output: bool,
+        json_schema: Optional[Dict[str, Any]],
+    ) -> DesiredOutputContract:
         if not json_output:
-            return None
-        provider_key = normalize_provider(provider)
+            return DesiredOutputContract(OutputContract.FREE_TEXT)
         if json_schema:
-            if not AIService._supports_structured_outputs(provider_key, model_id):
-                return None
-            if provider_key == "openai":
-                return "text.format.json_schema" if AIService._is_openai_responses_api_model(model_id) else "response_format.json_schema"
-            if provider_key == "claude":
-                return "output_format"
-            if provider_key == "gemini":
-                return "response_json_schema"
-            if provider_key in {"openrouter", "xai", "ollama"}:
-                return "response_format.json_schema"
-        if provider_key == "openai" and AIService._is_openai_responses_api_model(model_id):
-            return None
-        if provider_key == "gemini":
-            return "response_mime_type"
-        if provider_key == "openai":
-            return "response_format.json_object"
-        if provider_key in {"openrouter", "xai", "ollama"} and AIService._supports_json_object(provider_key, model_id):
-            return "response_format.json_object"
-        return None
+            return DesiredOutputContract(
+                OutputContract.JSON_STRUCTURED,
+                schema=json_schema,
+                local_validation_required=False,
+            )
+        return DesiredOutputContract(
+            OutputContract.JSON_LOOSE,
+            local_validation_required=True,
+        )
+
+    @staticmethod
+    def _plan_output_contract(
+        provider: str,
+        model_id: str,
+        *,
+        json_output: bool,
+        json_schema: Optional[Dict[str, Any]],
+    ) -> EffectiveOutputPlan:
+        """Plan native JSON behavior through provider adapters.
+
+        The capability decisions are resolved through AIService wrappers first so
+        tests and consumers that patch those methods still affect runtime output
+        planning.
+        """
+
+        provider_key = normalize_provider(provider)
+        supports_structured_outputs = AIService._supports_structured_outputs(provider_key, model_id)
+        supports_json_object = AIService._supports_json_object(provider_key, model_id)
+        prepared_schema = None
+        if json_output and json_schema and supports_structured_outputs:
+            prepared_schema = AIService._prepare_structured_output_schema(
+                provider_key,
+                model_id,
+                json_schema,
+            )
+        adapter = get_provider_adapter(provider_key)
+        return adapter.plan_output_contract(
+            OutputPlanningContext(
+                provider=provider_key,
+                model_id=model_id,
+                desired=AIService._desired_output_contract(
+                    json_output=json_output,
+                    json_schema=json_schema,
+                ),
+                supports_structured_outputs=supports_structured_outputs,
+                supports_json_object=supports_json_object,
+                uses_openai_responses_api=(
+                    provider_key == "openai"
+                    and AIService._is_openai_responses_api_model(model_id)
+                ),
+                prepared_schema=prepared_schema,
+            )
+        )
 
     async def _execute_with_retries(
         self,
@@ -1456,63 +1149,7 @@ class AIService:
     def _normalize_usage(usage_obj: Any) -> Optional[Dict[str, Any]]:
         """Extract token metrics from provider-specific usage objects."""
 
-        if usage_obj is None:
-            return None
-
-        def _pluck(obj: Any, *names: str) -> Optional[int]:
-            for name in names:
-                if isinstance(obj, dict) and name in obj:
-                    return obj[name]
-                if hasattr(obj, name):
-                    value = getattr(obj, name)
-                    if value is not None:
-                        return value
-            return None
-
-        input_tokens = _pluck(usage_obj, "prompt_tokens", "input_tokens", "input_token_count") or 0
-        output_tokens = _pluck(usage_obj, "completion_tokens", "output_tokens", "output_token_count") or 0
-        total_tokens = _pluck(usage_obj, "total_tokens", "total_token_count")
-        reasoning_tokens = _pluck(usage_obj, "reasoning_tokens", "thinking_tokens")
-        finish_reason = None
-        for name in ("finish_reason", "stop_reason", "provider_stop_reason"):
-            if isinstance(usage_obj, dict) and usage_obj.get(name) is not None:
-                finish_reason = usage_obj.get(name)
-                break
-            if hasattr(usage_obj, name):
-                finish_reason = getattr(usage_obj, name)
-                break
-        output_truncated = None
-        if isinstance(usage_obj, dict) and "output_truncated" in usage_obj:
-            output_truncated = bool(usage_obj.get("output_truncated"))
-
-        # Some providers return nested metadata (e.g., Anthropic streaming final response)
-        if hasattr(usage_obj, "model_dump"):
-            try:
-                dumped = usage_obj.model_dump()
-                if isinstance(dumped, dict):
-                    input_tokens = dumped.get("input_tokens", input_tokens) or input_tokens
-                    output_tokens = dumped.get("output_tokens", output_tokens) or output_tokens
-                    total_tokens = dumped.get("total_tokens", total_tokens)
-                    finish_reason = finish_reason or dumped.get("finish_reason") or dumped.get("stop_reason")
-            except Exception:
-                pass
-
-        normalized = {
-            "input_tokens": int(input_tokens or 0),
-            "output_tokens": int(output_tokens or 0),
-            "total_tokens": int(total_tokens) if total_tokens is not None else None,
-            "reasoning_tokens": int(reasoning_tokens) if reasoning_tokens is not None else None,
-        }
-        finish_reason_text = _stringify_finish_reason(finish_reason)
-        if finish_reason_text is not None:
-            normalized["finish_reason"] = finish_reason_text
-            normalized["provider_stop_reason"] = finish_reason_text
-        if output_truncated is None:
-            output_truncated = _is_token_limit_finish_reason(finish_reason_text)
-        normalized["output_truncated"] = bool(output_truncated)
-        if normalized["output_truncated"]:
-            normalized["truncation_reason"] = "output_token_limit"
-        return normalized
+        return runtime_usage.normalize_usage(usage_obj)
 
     def _usage_with_finish_metadata(
         self,
@@ -1525,46 +1162,13 @@ class AIService:
     ) -> Dict[str, Any]:
         """Combine token usage with provider stop/finish reason metadata."""
 
-        usage_payload = self._normalize_usage(usage_obj) or {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": None,
-            "reasoning_tokens": None,
-        }
-        finish_reason = fallback_finish_reason
-
-        if finish_reason is None:
-            finish_reason = getattr(response, "stop_reason", None)
-        if finish_reason is None:
-            finish_reason = getattr(response, "finish_reason", None)
-        if finish_reason is None:
-            choices = getattr(response, "choices", None) or []
-            if choices:
-                finish_reason = getattr(choices[0], "finish_reason", None)
-        if finish_reason is None:
-            candidates = getattr(response, "candidates", None) or []
-            if candidates:
-                finish_reason = getattr(candidates[0], "finish_reason", None)
-        if finish_reason is None:
-            incomplete_details = getattr(response, "incomplete_details", None)
-            if incomplete_details is not None:
-                finish_reason = getattr(incomplete_details, "reason", None)
-                if finish_reason is None and isinstance(incomplete_details, dict):
-                    finish_reason = incomplete_details.get("reason")
-
-        finish_reason_text = _stringify_finish_reason(finish_reason)
-        if finish_reason_text:
-            usage_payload["finish_reason"] = finish_reason_text
-            usage_payload["provider_stop_reason"] = finish_reason_text
-        usage_payload["provider"] = provider
-        if max_tokens is not None:
-            usage_payload["max_tokens"] = max_tokens
-        if _is_token_limit_finish_reason(finish_reason_text):
-            usage_payload["output_truncated"] = True
-            usage_payload["truncation_reason"] = "output_token_limit"
-        else:
-            usage_payload.setdefault("output_truncated", False)
-        return usage_payload
+        return runtime_usage.usage_with_finish_metadata(
+            usage_obj,
+            response,
+            provider=provider,
+            max_tokens=max_tokens,
+            fallback_finish_reason=fallback_finish_reason,
+        )
 
     def _emit_usage(
         self,
@@ -1642,6 +1246,44 @@ class AIService:
         if cancellation_token and await cancellation_token.any_cancelled():
             raise asyncio.CancelledError()
 
+    @staticmethod
+    def _positive_int_config(name: str, default: int) -> int:
+        try:
+            value = int(getattr(config, name, default) or default)
+        except (TypeError, ValueError):
+            value = default
+        return max(1, value)
+
+    @asynccontextmanager
+    async def model_call_concurrency_slot(
+        self,
+        provider: Optional[str],
+        model_id: Optional[str],
+        operation: str,
+    ):
+        """Throttle local model calls without affecting remote providers."""
+
+        provider_key = normalize_provider(str(provider or ""))
+        if provider_key != "ollama":
+            yield None
+            return
+
+        depth = _ollama_concurrency_depth.get()
+        if depth > 0:
+            token = _ollama_concurrency_depth.set(depth + 1)
+            try:
+                yield None
+            finally:
+                _ollama_concurrency_depth.reset(token)
+            return
+
+        async with self._ollama_request_semaphore:
+            token = _ollama_concurrency_depth.set(1)
+            try:
+                yield None
+            finally:
+                _ollama_concurrency_depth.reset(token)
+
     async def generate_content(
         self,
         prompt: str,
@@ -1662,6 +1304,7 @@ class AIService:
         model_alias_registry: Optional[Any] = None,
         prompt_safety_parts: Optional[List[Any]] = None,
         system_prompt_source: "PromptSource" = "system_generated",
+        llm_routing: Optional[Mapping[str, Any]] = None,
         cancellation_token: Optional["CancellationToken"] = None,
     ) -> str:
         """
@@ -1740,14 +1383,15 @@ class AIService:
 
         # Enforce structured-output schema compatibility upfront, using the
         # same provider-normalized schema that native JSON calls will receive.
-        effective_json_schema = json_schema
+        output_plan = self._plan_output_contract(
+            provider,
+            model_id,
+            json_output=json_output,
+            json_schema=json_schema,
+        )
+        effective_json_schema = output_plan.schema if json_output and json_schema else json_schema
         if json_output and json_schema:
-            if self._supports_structured_outputs(provider, model_id):
-                effective_json_schema = self._prepare_structured_output_schema(
-                    provider,
-                    model_id,
-                    json_schema,
-                )
+            if effective_json_schema is not None:
                 self._validate_schema_for_structured_outputs(effective_json_schema, provider, model_id)
             else:
                 logger.info(
@@ -1766,12 +1410,7 @@ class AIService:
         # Use the intelligently adjusted parameters for generation
         reasoning_effort = adjusted_reasoning_effort
         thinking_budget_tokens = adjusted_thinking_budget
-        attempted_feature = self._attempted_output_feature(
-            provider,
-            model_id,
-            json_output=json_output,
-            json_schema=effective_json_schema,
-        )
+        attempted_feature = output_plan.attempted_feature
 
         temperature, thinking_budget_tokens, forced_temperature = self._apply_temperature_policies(
             model_info, temperature, thinking_budget_tokens
@@ -2133,90 +1772,68 @@ class AIService:
     @staticmethod
     def _normalize_tool_loop_provider(provider: str) -> str:
         """Normalize provider labels for tool-loop metadata and routing."""
-        provider_key = (provider or "").lower()
-        if provider_key in {"anthropic", "claude"}:
-            return "claude"
-        if provider_key in {"google", "gemini"}:
-            return "gemini"
-        return provider_key
+        return runtime_capabilities.normalize_tool_loop_provider(provider)
 
     @staticmethod
     def _supports_structured_outputs(provider: str, model_id: str) -> bool:
         """Return True when the provider/model can enforce JSON Schema natively."""
-        state = registry_model_supports(
-            specs=getattr(config, "model_specs", {}) or {},
-            provider=normalize_provider(provider),
-            model_id=model_id,
-            capability="json_schema",
+        return runtime_capabilities.supports_structured_outputs(
+            provider,
+            model_id,
+            getattr(config, "model_specs", {}) or {},
         )
-        return state.support == CapabilitySupport.SUPPORTED
 
     @staticmethod
     def _supports_json_object(provider: str, model_id: str) -> bool:
         """Return True when the provider/model supports provider-native JSON mode."""
-        state = registry_model_supports(
-            specs=getattr(config, "model_specs", {}) or {},
-            provider=normalize_provider(provider),
-            model_id=model_id,
-            capability="json_object",
+        return runtime_capabilities.supports_json_object(
+            provider,
+            model_id,
+            getattr(config, "model_specs", {}) or {},
         )
-        return state.support == CapabilitySupport.SUPPORTED
 
     @staticmethod
-    def _supports_tool_calling(provider: str, model_id: str) -> bool:
+    def _supports_tool_calling(
+        provider: str,
+        model_id: str,
+        *,
+        specs: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Return True when the provider/model advertises native tool calling."""
-        state = registry_model_supports(
-            specs=getattr(config, "model_specs", {}) or {},
-            provider=normalize_provider(provider),
-            model_id=model_id,
-            capability="tool_calling",
+        return runtime_capabilities.supports_tool_calling(
+            provider,
+            model_id,
+            specs if specs is not None else (getattr(config, "model_specs", {}) or {}),
         )
-        return state.support == CapabilitySupport.SUPPORTED
+
+    @staticmethod
+    def _supports_generation_validation_tool_loop(
+        provider: str,
+        model_id: str,
+        *,
+        model_data: Optional[Dict[str, Any]] = None,
+        specs: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Return True when the runtime can run the validation tool loop."""
+        provider_key = AIService._normalize_tool_loop_provider(provider)
+        effective_specs = specs if specs is not None else (getattr(config, "model_specs", {}) or {})
+        if not AIService._supports_tool_calling(provider_key, model_id, specs=effective_specs):
+            return False
+        return model_supports_generation_validation_tool_loop(
+            provider_key,
+            model_id,
+            effective_specs,
+            model_data=model_data,
+            tool_calling_supported=True,
+        )
 
     @staticmethod
     def _openrouter_tool_streaming_supported(model_id: str) -> bool:
         """Return True when OpenRouter metadata allows observable streamed tool loops."""
-        specs = getattr(config, "model_specs", {}) or {}
-        tool_state = registry_model_supports(
-            specs=specs,
-            provider="openrouter",
-            model_id=model_id,
-            capability="tool_calling",
+        return runtime_capabilities.openrouter_tool_streaming_supported(
+            model_id,
+            getattr(config, "model_specs", {}) or {},
         )
-        streaming_state = registry_model_supports(
-            specs=specs,
-            provider="openrouter",
-            model_id=model_id,
-            capability="streaming",
-        )
-        return (
-            tool_state.support == CapabilitySupport.SUPPORTED
-            and streaming_state.support == CapabilitySupport.SUPPORTED
-        )
-
-    @staticmethod
-    def _effective_json_schema_for_request(
-        provider: str,
-        model_id: str,
-        json_output: bool,
-        json_schema: Optional[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
-        """Return the schema that the provider path will actually use, if any.
-
-        This is stricter than simply checking ``json_schema``: some provider/model
-        combinations can use native schema enforcement only when a concrete
-        schema is available.
-        """
-        if not json_output:
-            return None
-
-        provider_key = (provider or "").lower()
-        model_lower = (model_id or "").lower()
-
-        if json_schema and AIService._supports_structured_outputs(provider_key, model_lower):
-            return json_schema
-
-        return None
 
     @staticmethod
     def _uses_native_structured_outputs(
@@ -2225,7 +1842,12 @@ class AIService:
         json_schema: Optional[Dict[str, Any]],
     ) -> bool:
         """Return True when the provider/model will enforce JSON through native structured outputs."""
-        return json_schema is not None and AIService._supports_structured_outputs(provider, model_id)
+        return runtime_capabilities.uses_native_structured_outputs(
+            provider,
+            model_id,
+            json_schema,
+            getattr(config, "model_specs", {}) or {},
+        )
 
     @staticmethod
     def _should_inject_json_prompt(
@@ -2235,17 +1857,12 @@ class AIService:
         json_schema: Optional[Dict[str, Any]],
     ) -> bool:
         """Return True when the legacy JSON prompt instruction is still needed."""
-        effective_schema = AIService._effective_json_schema_for_request(
+        return AIService._plan_output_contract(
             provider,
             model_id,
-            json_output,
-            json_schema,
-        )
-        return json_output and not AIService._uses_native_structured_outputs(
-            provider,
-            model_id,
-            effective_schema,
-        )
+            json_output=json_output,
+            json_schema=json_schema,
+        ).inject_json_instruction
 
     @staticmethod
     def _build_validation_tool_parameters_schema() -> Dict[str, Any]:
@@ -2331,7 +1948,10 @@ class AIService:
     @staticmethod
     def _claude_supports_structured_outputs(model_lower: str) -> bool:
         """Return True when official/docs-backed capability says Claude supports JSON Schema."""
-        return AIService._supports_structured_outputs("claude", model_lower)
+        return runtime_capabilities.claude_supports_structured_outputs(
+            model_lower,
+            getattr(config, "model_specs", {}) or {},
+        )
 
     @staticmethod
     def _callable_has_keyword(callable_obj: Any, keyword: str) -> bool:
@@ -2377,7 +1997,11 @@ class AIService:
         Note: since round 4, ("openai", "o3-pro") returns True because the Responses API
         path now emits strict structured audit payloads via the text.format channel.
         """
-        return AIService._supports_structured_outputs(provider_key, model_id)
+        return runtime_capabilities.audit_model_supports_structured_outputs(
+            provider_key,
+            model_id,
+            getattr(config, "model_specs", {}) or {},
+        )
 
     @staticmethod
     def _is_openai_responses_api_model(model_id: str) -> bool:
@@ -2390,21 +2014,10 @@ class AIService:
         """
         if not model_id:
             return False
-        specs = getattr(config, "model_specs", None) or {}
-        openai_specs = (specs.get("model_specifications", {}) or {}).get("openai", {}) or {}
-        target = model_id.lower()
-        for model_key, model_data in openai_specs.items():
-            if not isinstance(model_data, dict):
-                continue
-            declared_id = str(model_data.get("model_id") or model_key).lower()
-            if declared_id != target and str(model_key).lower() != target:
-                continue
-            capabilities = model_data.get("capabilities") or []
-            for cap in capabilities:
-                if isinstance(cap, str) and cap.lower() == "responses_api":
-                    return True
-            return False
-        return False
+        return runtime_capabilities.is_openai_responses_api_model(
+            model_id,
+            getattr(config, "model_specs", {}) or {},
+        )
 
     @staticmethod
     def _build_validate_draft_feedback_message(feedback: str) -> str:
@@ -2694,6 +2307,7 @@ class AIService:
         timeout_seconds: float,
         max_tokens: int,
         on_error: Literal["fail_closed", "fail_open"],
+        llm_routing: Optional[Mapping[str, Any]] = None,
         cancellation_token: Optional["CancellationToken"] = None,
     ) -> Dict[str, Any]:
         """Call the configured accent-judge model and return a normalized audit payload (Sec 5.4).
@@ -2704,7 +2318,9 @@ class AIService:
         """
         from tools.ai_json_cleanroom import validate_ai_json
 
-        audit_model = config.AI_ACCENT_AUDIT_MODEL
+        audit_route = resolve_call("accent.audit", routing=llm_routing)
+        audit_model = audit_route.model
+        routed_temperature = audit_route.params.get("temperature", 0.0)
         # Symmetric hardening with criteria: strip Unicode format/control chars before
         # XML-escape so adversarial drafts cannot smuggle bidi/zero-width markers to the judge.
         escaped_draft = escape_xml_delimiters(remove_invisible_control(text or ""))
@@ -2757,7 +2373,7 @@ class AIService:
             return await self.generate_content(
                 prompt=user_prompt,
                 model=audit_model,
-                temperature=0.0,
+                temperature=routed_temperature,
                 max_tokens=int(max_tokens),
                 system_prompt=system_prompt,
                 json_output=True,
@@ -4300,6 +3916,7 @@ class AIService:
                         timeout_seconds=float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
                         max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                         on_error=audit_on_error,
+                        llm_routing=llm_routing,
                     )
                 except AccentGuardError as acc_exc:
                     if audit_on_error == "fail_open":
@@ -4723,6 +4340,7 @@ class AIService:
                                     timeout_seconds=float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
                                     max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                                     on_error=audit_on_error,
+                                    llm_routing=llm_routing,
                                 )
                             except AccentGuardError as acc_exc:
                                 if audit_on_error == "fail_closed":
@@ -5660,6 +5278,7 @@ class AIService:
                         timeout_seconds=float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
                         max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                         on_error=audit_on_error,
+                        llm_routing=llm_routing,
                     )
                 except AccentGuardError as acc_exc:
                     if audit_on_error == "fail_open":
@@ -5912,6 +5531,7 @@ class AIService:
                                     timeout_seconds=float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
                                     max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                                     on_error=audit_on_error,
+                                    llm_routing=llm_routing,
                                 )
                             except AccentGuardError as acc_exc:
                                 if audit_on_error == "fail_closed":
@@ -6449,6 +6069,7 @@ class AIService:
                         timeout_seconds=float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
                         max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                         on_error=audit_on_error,
+                        llm_routing=llm_routing,
                     )
                 except AccentGuardError as acc_exc:
                     if audit_on_error == "fail_open":
@@ -6710,6 +6331,7 @@ class AIService:
                                     timeout_seconds=float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
                                     max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                                     on_error=audit_on_error,
+                                    llm_routing=llm_routing,
                                 )
                             except AccentGuardError as acc_exc:
                                 if audit_on_error == "fail_closed":
@@ -7234,6 +6856,7 @@ class AIService:
                         timeout_seconds=float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
                         max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                         on_error=audit_on_error,
+                        llm_routing=llm_routing,
                     )
                 except AccentGuardError as acc_exc:
                     if audit_on_error == "fail_open":
@@ -7492,6 +7115,7 @@ class AIService:
                                     timeout_seconds=float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
                                     max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                                     on_error=audit_on_error,
+                                    llm_routing=llm_routing,
                                 )
                             except AccentGuardError as acc_exc:
                                 if audit_on_error == "fail_closed":
@@ -7870,6 +7494,7 @@ class AIService:
         enable_validate_draft: bool = True,
         min_global_score: Optional[float] = None,
         system_prompt_source: "PromptSource" = "system_generated",
+        llm_routing: Optional[Mapping[str, Any]] = None,
         cancellation_token: Optional["CancellationToken"] = None,
     ) -> Tuple[str, ToolLoopEnvelope]:
         """Reusable entry point for the shared ``validate_draft`` tool loop.
@@ -7961,16 +7586,11 @@ class AIService:
         # raising — the caller can then route to a single-shot path.
         # Providers outside the supported matrix: surface a ``no_tool_support``
         # envelope rather than an exception (§3.7).
-        if provider_key not in {"openai", "openrouter", "xai", "claude", "gemini"}:
-            envelope = ToolLoopEnvelope(
-                loop_scope=loop_scope,
-                tools_skipped_reason="no_tool_support",
-                turns=0,
-                accepted=False,
-                accepted_via="tools_skipped",
-            )
-            return "", envelope
-        if not self._supports_tool_calling(provider_key, model_id):
+        if not self._supports_generation_validation_tool_loop(
+            provider_key,
+            model_id,
+            model_data=model_info,
+        ):
             envelope = ToolLoopEnvelope(
                 loop_scope=loop_scope,
                 tools_skipped_reason="no_tool_support",
@@ -8108,14 +7728,15 @@ class AIService:
                 "min_score": resolved_min_score,
             }
 
-        effective_json_schema = json_schema_arg
+        output_plan = self._plan_output_contract(
+            provider_key,
+            model_id,
+            json_output=json_output_flag,
+            json_schema=json_schema_arg,
+        )
+        effective_json_schema = output_plan.schema if json_output_flag and json_schema_arg else json_schema_arg
         if json_output_flag and json_schema_arg:
-            if self._supports_structured_outputs(provider_key, model_id):
-                effective_json_schema = self._prepare_structured_output_schema(
-                    provider_key,
-                    model_id,
-                    json_schema_arg,
-                )
+            if effective_json_schema is not None:
                 self._validate_schema_for_structured_outputs(
                     effective_json_schema,
                     provider,
@@ -8166,12 +7787,7 @@ class AIService:
             "measurement_feedback_message": measurement_feedback_message,
             "force_finalize_message": force_finalize_message,
             "retries_enabled": retries_enabled,
-            "attempted_feature": self._attempted_output_feature(
-                provider_key,
-                model_id,
-                json_output=json_output_flag,
-                json_schema=effective_json_schema,
-            ) or "tools",
+            "attempted_feature": output_plan.attempted_feature or "tools",
             "cancellation_token": cancellation_token,
         }
 
@@ -8998,6 +8614,7 @@ class AIService:
         model_alias_registry: Optional[Any] = None,
         prompt_safety_parts: Optional[List[Any]] = None,
         system_prompt_source: "PromptSource" = "system_generated",
+        llm_routing: Optional[Mapping[str, Any]] = None,
         cancellation_token: Optional["CancellationToken"] = None,
     ):
         """
@@ -9076,14 +8693,15 @@ class AIService:
 
         # Enforce structured-output schema compatibility upfront, using the
         # provider-normalized schema for dict-based native JSON calls.
-        effective_json_schema = json_schema
+        output_plan = self._plan_output_contract(
+            provider,
+            model_id,
+            json_output=json_output,
+            json_schema=json_schema,
+        )
+        effective_json_schema = output_plan.schema if json_output and json_schema else json_schema
         if json_output and json_schema:
-            if self._supports_structured_outputs(provider, model_id):
-                effective_json_schema = self._prepare_structured_output_schema(
-                    provider,
-                    model_id,
-                    json_schema,
-                )
+            if effective_json_schema is not None:
                 self._validate_schema_for_structured_outputs(effective_json_schema, provider, model_id)
             else:
                 logger.info(
@@ -9093,12 +8711,7 @@ class AIService:
                     provider,
                 )
                 effective_json_schema = None
-        attempted_feature = self._attempted_output_feature(
-            provider,
-            model_id,
-            json_output=json_output,
-            json_schema=effective_json_schema,
-        )
+        attempted_feature = output_plan.attempted_feature
 
         request_timeout = token_validation.get("reasoning_timeout_seconds")
 
@@ -10070,10 +9683,11 @@ class AIService:
         # Test OpenAI
         try:
             if self.openai_client:
+                route = resolve_call("health.openai")
                 await self.openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
+                    model=route.model,
                     messages=[{"role": "user", "content": "Hello"}],
-                    max_tokens=5
+                    max_tokens=route.params.get("max_tokens", 5)
                 )
                 health_status["openai"] = True
             else:
@@ -10085,9 +9699,10 @@ class AIService:
         # Test Claude
         try:
             if self.anthropic_client:
+                route = resolve_call("health.claude")
                 await self.anthropic_client.messages.create(
-                    model="claude-haiku-4-5",
-                    max_tokens=5,
+                    model=route.model,
+                    max_tokens=route.params.get("max_tokens", 5),
                     messages=[{"role": "user", "content": "Hello"}]
                 )
                 health_status["claude"] = True
@@ -10100,7 +9715,8 @@ class AIService:
         # Test Gemini
         try:
             if self.genai_client:
-                model = self.genai_client.GenerativeModel('gemini-2.0-flash')
+                route = resolve_call("health.gemini")
+                model = self.genai_client.GenerativeModel(route.model)
                 await model.generate_content_async("Hello")
                 health_status["gemini"] = True
             else:
@@ -10112,10 +9728,11 @@ class AIService:
         # Test xAI
         try:
             if self.xai_client:
+                route = resolve_call("health.xai")
                 await self.xai_client.chat.completions.create(
-                    model="grok-4-0709",
+                    model=route.model,
                     messages=[{"role": "user", "content": "Hello"}],
-                    max_tokens=5
+                    max_tokens=route.params.get("max_tokens", 5)
                 )
                 health_status["xai"] = True
             else:
@@ -11216,10 +10833,11 @@ class AIService:
                 request_params["response_format"] = {"type": "json_object"}
                 logger.info(f"Using Ollama JSON mode for {model_id}")
 
-        response = await self.ollama_client.chat.completions.create(
-            **request_params,
-            **request_kwargs,
-        )
+        async with self.model_call_concurrency_slot("ollama", model_id, "generate_content"):
+            response = await self.ollama_client.chat.completions.create(
+                **request_params,
+                **request_kwargs,
+            )
 
         return response.choices[0].message.content, self._usage_with_finish_metadata(
             getattr(response, "usage", None),
@@ -11302,49 +10920,50 @@ class AIService:
                     create_params["response_format"] = {"type": "json_object"}
                     logger.info(f"Using Ollama JSON mode (streaming) for {model_id}")
 
-            stream = await self.ollama_client.chat.completions.create(**create_params)
+            async with self.model_call_concurrency_slot("ollama", model_id, "generate_content_stream"):
+                stream = await self.ollama_client.chat.completions.create(**create_params)
 
-            usage_obj = None
-            finish_reason = None
-            async for chunk in stream:
-                # Verify that choices exists and has elements before accessing
-                if chunk.choices and len(chunk.choices) > 0:
-                    if getattr(chunk.choices[0], "finish_reason", None) is not None:
-                        finish_reason = getattr(chunk.choices[0], "finish_reason", None)
-                    if chunk.choices[0].delta.content is not None:
-                        yield chunk.choices[0].delta.content
-                # Capture usage even if choices is empty
-                if hasattr(chunk, "usage") and chunk.usage:
-                    usage_obj = chunk.usage
+                usage_obj = None
+                finish_reason = None
+                async for chunk in stream:
+                    # Verify that choices exists and has elements before accessing
+                    if chunk.choices and len(chunk.choices) > 0:
+                        if getattr(chunk.choices[0], "finish_reason", None) is not None:
+                            finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+                        if chunk.choices[0].delta.content is not None:
+                            yield chunk.choices[0].delta.content
+                    # Capture usage even if choices is empty
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        usage_obj = chunk.usage
 
-            if hasattr(stream, "response"):
-                usage_obj = getattr(stream.response, "usage", usage_obj)
-            elif hasattr(stream, "usage") and stream.usage:
-                usage_obj = stream.usage
+                if hasattr(stream, "response"):
+                    usage_obj = getattr(stream.response, "usage", usage_obj)
+                elif hasattr(stream, "usage") and stream.usage:
+                    usage_obj = stream.usage
 
-            usage_with_finish = self._usage_with_finish_metadata(
-                usage_obj,
-                None,
-                provider="ollama",
-                max_tokens=max_tokens,
-                fallback_finish_reason=finish_reason,
-            )
-            self._emit_usage(
-                usage_callback,
-                model_id,
-                "ollama",
-                usage_with_finish,
-                extra_payload,
-            )
-            yield StreamChunk(
-                "",
-                is_thinking=False,
-                metadata=_build_finish_metadata(
+                usage_with_finish = self._usage_with_finish_metadata(
+                    usage_obj,
+                    None,
                     provider="ollama",
-                    finish_reason=finish_reason,
                     max_tokens=max_tokens,
-                ),
-            )
+                    fallback_finish_reason=finish_reason,
+                )
+                self._emit_usage(
+                    usage_callback,
+                    model_id,
+                    "ollama",
+                    usage_with_finish,
+                    extra_payload,
+                )
+                yield StreamChunk(
+                    "",
+                    is_thinking=False,
+                    metadata=_build_finish_metadata(
+                        provider="ollama",
+                        finish_reason=finish_reason,
+                        max_tokens=max_tokens,
+                    ),
+                )
         except Exception as e:
             logger.error(f"Ollama streaming error: {e}")
             raise
@@ -11493,7 +11112,7 @@ class AIService:
 
         Args:
             texts: List of texts to embed
-            model: Optional model to use (defaults to text-embedding-3-large for OpenAI)
+            model: Optional explicit model override. Defaults resolve through llm_routing.
 
         Returns:
             List of embedding vectors
@@ -11515,7 +11134,7 @@ class AIService:
     async def _get_openai_embeddings(self, texts: List[str], model: str = None) -> List[List[float]]:
         """Get embeddings using OpenAI API"""
         if not model:
-            model = "text-embedding-3-large"  # Best quality embeddings
+            model = resolve_call("embedding.openai").model
 
         try:
             response = await self.openai_client.embeddings.create(
@@ -11527,23 +11146,23 @@ class AIService:
 
         except Exception as e:
             logger.error(f"OpenAI embedding error: {e}")
-            # Try with smaller model as fallback
-            if model == "text-embedding-3-large":
-                try:
+            try:
+                fallback_model = resolve_call("embedding.openai_fallback").model
+                if fallback_model and fallback_model != model:
                     response = await self.openai_client.embeddings.create(
-                        model="text-embedding-3-small",
+                        model=fallback_model,
                         input=texts
                     )
                     return [item.embedding for item in response.data]
-                except Exception as e2:
-                    logger.error(f"OpenAI embedding fallback failed: {e2}")
+            except Exception as e2:
+                logger.error(f"OpenAI embedding fallback failed: {e2}")
 
             return [[] for _ in texts]
 
     async def _get_google_embeddings(self, texts: List[str], model: str = None) -> List[List[float]]:
         """Get embeddings using Google/Gemini API"""
         if not model:
-            model = "models/text-embedding-004"  # Latest Gemini embedding model
+            model = resolve_call("embedding.google").model
 
         try:
             embeddings = []

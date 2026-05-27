@@ -231,14 +231,18 @@ async function handleGenerateActions() {
     elements.generateBtn.disabled = true;
 
     try {
+        const payload = {
+            text: text,
+            max_actions: 20,
+        };
+        if (elements.analysisModel.value) {
+            payload.analysis_model = elements.analysisModel.value;
+        }
+
         const response = await fetch('/smart-edit/analyze', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                text: text,
-                analysis_model: elements.analysisModel.value,
-                max_actions: 20,
-            }),
+            body: JSON.stringify(payload),
         });
 
         if (!response.ok) throw new Error('Analysis failed');

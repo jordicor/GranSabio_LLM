@@ -26,6 +26,7 @@ from feedback_memory import get_feedback_manager
 from gran_sabio import GranSabioProcessCancelled
 from gran_sabio_supervisor import GranSabioSupervisor
 from json_field_utils import prepare_content_for_qa, reconstruct_json, try_extract_json_from_content
+from llm_routing import resolve_call
 from llm_accent_prompts import ACCENT_SYSTEM_PROMPT_SNIPPET
 from logging_utils import Phase, create_phase_logger
 from long_text.controller import (
@@ -39,6 +40,7 @@ from long_text.models import (
     coerce_resolved_long_text_mode,
 )
 from model_aliasing import ModelAliasRegistry, PromptPart, get_evaluator_alias, to_prompt_safe_data
+from model_capability_registry import resolve_model_capability_context
 from models import (
     ContentRequest,
     GenerationStatus,
@@ -116,6 +118,8 @@ from .feedback_formatter import (
     _fallback_actionable_feedback,
     _format_layer_feedback_lines,
 )
+from .generation import results as generation_results
+from .generation import tool_events as generation_tool_events
 from .prompt_templates import build_deal_breaker_awareness_prompt, build_json_validation_error_prompt
 from .qa_decision_engine import (
     _check_50_50_tie_deal_breakers,
@@ -132,51 +136,31 @@ def _run_json_post_guard(
 ) -> ValidationResult:
     """Validate generated JSON using the same loose/structured split as tools."""
 
-    if schema is not None:
-        return validate_ai_json(content, schema=schema, expectations=expectations)
-    return validate_loose_json(content, expectations=expectations)
+    return generation_results.run_json_post_guard(
+        content,
+        schema=schema,
+        expectations=expectations,
+        validate_ai_json_fn=validate_ai_json,
+        validate_loose_json_fn=validate_loose_json,
+    )
 
 
 def _json_guard_data_to_content(result: ValidationResult) -> Optional[str]:
     """Serialize the parsed JSON payload after a successful guard pass."""
 
-    if result.data is None:
-        return None
-    return json.dumps(result.data, ensure_ascii=False)
+    return generation_results.json_guard_data_to_content(result)
 
 
 def _generation_was_truncated(session: Dict[str, Any]) -> bool:
     """Return True when provider metadata says the output hit token limit."""
 
-    finish_metadata = session.get("generation_finish_metadata") or {}
-    if isinstance(finish_metadata, dict) and finish_metadata.get("output_truncated"):
-        return True
-    tool_metadata = session.get("generation_tool_metadata")
-    if isinstance(tool_metadata, dict) and tool_metadata.get("output_truncated"):
-        return True
-    if hasattr(tool_metadata, "output_truncated"):
-        return bool(getattr(tool_metadata, "output_truncated"))
-    return False
+    return generation_results.generation_was_truncated(session)
 
 
 def _build_truncation_failure_reason(session: Dict[str, Any], request: ContentRequest) -> str:
     """Build a user/actionable reason for output-token truncation."""
 
-    finish_metadata = session.get("generation_finish_metadata") or {}
-    stop_reason = None
-    if isinstance(finish_metadata, dict):
-        stop_reason = finish_metadata.get("finish_reason") or finish_metadata.get("provider_stop_reason")
-    max_tokens = getattr(request, "max_tokens", None)
-    details = []
-    if stop_reason:
-        details.append(f"stop_reason={stop_reason}")
-    if max_tokens:
-        details.append(f"max_tokens={max_tokens}")
-    suffix = f" ({', '.join(details)})" if details else ""
-    return (
-        "Generation output was truncated because the provider exhausted the "
-        f"output token budget{suffix}. Regenerate a shorter response or increase max_tokens."
-    )
+    return generation_results.build_truncation_failure_reason(session, request)
 
 
 class _ServiceProxy:
@@ -688,108 +672,25 @@ def _read_json_string_at(source: str, start: int) -> Tuple[str, int, bool]:
     The reader accepts partial input so streamed tool arguments can expose the
     decoded ``text`` field before the full JSON object is complete.
     """
-
-    if start >= len(source) or source[start] != '"':
-        return "", start, False
-
-    chars: List[str] = []
-    i = start + 1
-    while i < len(source):
-        char = source[i]
-        if char == '"':
-            return "".join(chars), i + 1, True
-        if char != "\\":
-            chars.append(char)
-            i += 1
-            continue
-
-        i += 1
-        if i >= len(source):
-            return "".join(chars), i, False
-        escaped = source[i]
-        if escaped == "u":
-            hex_start = i + 1
-            hex_end = hex_start + 4
-            if hex_end > len(source):
-                return "".join(chars), len(source), False
-            hex_digits = source[hex_start:hex_end]
-            try:
-                chars.append(chr(int(hex_digits, 16)))
-            except ValueError:
-                chars.append("\\u" + hex_digits)
-            i = hex_end
-            continue
-
-        chars.append(
-            {
-                '"': '"',
-                "\\": "\\",
-                "/": "/",
-                "b": "\b",
-                "f": "\f",
-                "n": "\n",
-                "r": "\r",
-                "t": "\t",
-            }.get(escaped, escaped)
-        )
-        i += 1
-
-    return "".join(chars), i, False
+    return generation_tool_events.read_json_string_at(source, start)
 
 
 def _find_json_string_field_value_start(source: str, field_name: str) -> Optional[int]:
     """Return the opening-offset payload for a JSON string field, if present."""
 
-    i = 0
-    while i < len(source):
-        if source[i] != '"':
-            i += 1
-            continue
-
-        key, after_key, complete = _read_json_string_at(source, i)
-        if not complete:
-            return None
-
-        cursor = after_key
-        while cursor < len(source) and source[cursor].isspace():
-            cursor += 1
-        if cursor >= len(source) or source[cursor] != ":":
-            i = after_key
-            continue
-        cursor += 1
-        while cursor < len(source) and source[cursor].isspace():
-            cursor += 1
-
-        if key == field_name and cursor < len(source) and source[cursor] == '"':
-            return cursor
-        i = after_key
-
-    return None
+    return generation_tool_events.find_json_string_field_value_start(source, field_name)
 
 
 def _decode_partial_json_string_field(source: str, field_name: str) -> str:
     """Decode the partial string value for ``field_name`` from a JSON object."""
 
-    value_start = _find_json_string_field_value_start(source, field_name)
-    if value_start is None:
-        return ""
-    value, _end, _complete = _read_json_string_at(source, value_start)
-    return value
+    return generation_tool_events.decode_partial_json_string_field(source, field_name)
 
 
 def _tool_loop_stream_state_key(payload: Dict[str, Any]) -> Tuple[str, str, str, str, str, str]:
     """Build a stable key for one streamed tool-call argument buffer."""
 
-    index = payload.get("index")
-    call_id = payload.get("tool_call_id")
-    return (
-        str(payload.get("loop_scope") or ""),
-        str(payload.get("provider") or ""),
-        str(payload.get("model") or ""),
-        str(payload.get("api_surface") or ""),
-        str(payload.get("turn") or ""),
-        str(index if index is not None else (call_id or "")),
-    )
+    return generation_tool_events.tool_loop_stream_state_key(payload)
 
 
 def _tool_loop_visible_chunk(
@@ -799,38 +700,13 @@ def _tool_loop_visible_chunk(
 ) -> Optional[str]:
     """Return user-readable text for live tool-loop deltas."""
 
-    if event_type == "assistant_delta":
-        content = payload.get("content")
-        if isinstance(content, str) and content:
-            return content
-        return None
-
-    if event_type != "tool_call_delta" or stream_state is None:
-        return None
-
-    delta = payload.get("delta")
-    if not isinstance(delta, str) or not delta:
-        return None
-
-    key = _tool_loop_stream_state_key(payload)
-    state = stream_state.setdefault(key, {"arguments": "", "visible_chars": 0})
-    state["arguments"] = str(state.get("arguments") or "") + delta
-
-    decoded_text = _decode_partial_json_string_field(str(state["arguments"]), "text")
-    previous_chars = int(state.get("visible_chars") or 0)
-    if len(decoded_text) <= previous_chars:
-        return None
-
-    state["visible_chars"] = len(decoded_text)
-    return decoded_text[previous_chars:]
+    return generation_tool_events.tool_loop_visible_chunk(event_type, payload, stream_state)
 
 
 def _tool_loop_publish_event_name(event_type: str, content: Optional[str]) -> str:
     """Return the monitor event name for tool-loop telemetry."""
 
-    if content:
-        return "chunk"
-    return str(event_type) if event_type else "tool_event"
+    return generation_tool_events.tool_loop_publish_event_name(event_type, content)
 
 
 def _make_gran_sabio_tool_event_callback(session_id: str, session: Dict[str, Any]):
@@ -1017,17 +893,17 @@ def _should_use_generation_tools(request: ContentRequest) -> bool:
     if not (mechanical_active or accent_active):
         return False
 
-    try:
-        model_info = config.get_model_info(request.generator_model)
-    except Exception:
+    specs = getattr(config, "model_specs", {}) or {}
+    context = resolve_model_capability_context(request.generator_model, specs)
+    if context.status != "resolved":
         return False
 
-    provider = model_info.get("provider")
-    model_id = str(model_info.get("model_id", "")).lower()
-    provider_key = (provider or "").lower()
-    supported = AIService._supports_tool_calling(provider_key, model_id)
-
-    return supported
+    return AIService._supports_generation_validation_tool_loop(
+        context.provider,
+        context.model_id,
+        model_data=context.model_data,
+        specs=specs,
+    )
 
 def _get_final_content(session: Dict[str, Any], raw_content: str, request: ContentRequest, is_gran_sabio: bool = False) -> Any:
     """
@@ -1045,21 +921,13 @@ def _get_final_content(session: Dict[str, Any], raw_content: str, request: Conte
     Returns:
         Either the parsed JSON object or the raw content string
     """
-    # Check if we should use parsed JSON
-    json_output_requested = is_json_output_requested(request)
-
-    if json_output_requested:
-        # Check for Gran Sabio parsed content if applicable
-        if is_gran_sabio:
-            parsed_content = session.get("gran_sabio_json_parsed_content")
-        else:
-            parsed_content = session.get("json_parsed_content")
-
-        if parsed_content is not None:
-            return parsed_content
-
-    # Default: return raw content
-    return raw_content
+    return generation_results.get_final_content(
+        session,
+        raw_content,
+        request,
+        is_json_output_requested_fn=is_json_output_requested,
+        is_gran_sabio=is_gran_sabio,
+    )
 
 
 # --- Streaming Retry Helpers ---
@@ -1286,6 +1154,7 @@ async def _generate_full_content(
                 model_alias_registry=getattr(request, "_model_alias_registry", None),
                 prompt_safety_parts=prompt_safety_parts,
                 tool_event_callback=generation_tool_event_callback,
+                llm_routing=getattr(request, "_llm_routing", None),
                 cancellation_token=cancellation_token,
             )
         except AccentGuardError as accent_exc:
@@ -1471,6 +1340,7 @@ async def _generate_full_content(
                 images=images,
                 model_alias_registry=getattr(request, "_model_alias_registry", None),
                 prompt_safety_parts=prompt_safety_parts,
+                llm_routing=getattr(request, "_llm_routing", None),
                 cancellation_token=cancellation_token,
                 cancel_callback=_generation_cancelled,
             ):
@@ -1530,6 +1400,7 @@ async def _generate_full_content(
                         chunk_text,
                         session_id=session_id,
                         request_name=session.get("request_name"),
+                        is_thinking=is_thinking,
                     )
 
                 # Send periodic thinking status updates if AI is taking long before first chunk
@@ -4131,8 +4002,9 @@ async def _generate_smart_edits(
         }
 
         # Get edit configuration from request
-        edit_model = request.generator_model if request else "gpt-4o-mini"
-        edit_temperature = getattr(request, 'temperature', 0.2) or 0.2
+        edit_route = resolve_call("generation.smart_edit", request=request)
+        edit_model = edit_route.model
+        edit_temperature = edit_route.params.get("temperature", getattr(request, 'temperature', 0.2) if request else 0.2) or 0.2
 
         # Sort edits by position (reverse order: back to front) to avoid index invalidation
         sorted_paragraphs = []
@@ -5239,18 +5111,20 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                             final_prompt_retry = "\n\n".join(segment.strip() for segment in prompt_sections_retry if segment)
 
                             # Regenerate content
+                            json_retry_route = resolve_call("generation.json_retry", request=request)
+                            json_retry_params = json_retry_route.params
                             content_chunks = []
                             try:
                                 async for chunk in ai_service.generate_content_stream(
                                     prompt=final_prompt_retry,
-                                    model=request.generator_model,
-                                    temperature=request.temperature,
-                                    max_tokens=request.max_tokens,
+                                    model=json_retry_route.model,
+                                    temperature=json_retry_params.get("temperature", request.temperature),
+                                    max_tokens=json_retry_params.get("max_tokens", request.max_tokens),
                                     system_prompt=request.system_prompt,
                                     system_prompt_source="user_supplied" if request.system_prompt is not None else "system_generated",
                                     extra_verbose=getattr(request, 'extra_verbose', False),
-                                    reasoning_effort=getattr(request, 'reasoning_effort', None),
-                                    thinking_budget_tokens=getattr(request, 'thinking_budget_tokens', None),
+                                    reasoning_effort=json_retry_params.get("reasoning_effort", getattr(request, 'reasoning_effort', None)),
+                                    thinking_budget_tokens=json_retry_params.get("thinking_budget_tokens", getattr(request, 'thinking_budget_tokens', None)),
                                     content_type=request.content_type,
                                     json_output=json_output_requested,
                                     json_schema=getattr(request, 'json_schema', None),
@@ -5258,7 +5132,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                                         phase="json_retry",
                                         role="generator",
                                         iteration=iteration + 1,
-                                        metadata={"requested_model": request.generator_model, "json_retry": json_retry_count},
+                                        metadata={"requested_model": json_retry_route.model, "json_retry": json_retry_count},
                                     ) if usage_tracker else None,
                                     phase_logger=phase_logger,
                                     images=images_for_generation,
@@ -5266,6 +5140,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                                     prompt_safety_parts=[
                                         PromptPart(word_instructions, "system_generated", "json_retry.word_instructions")
                                     ] if word_instructions else None,
+                                    llm_routing=getattr(request, "_llm_routing", None),
                                     cancellation_token=cancellation_token,
                                     cancel_callback=cancellation_requested,
                                 ):

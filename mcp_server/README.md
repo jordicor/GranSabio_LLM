@@ -223,22 +223,24 @@ All configuration is via environment variables:
 | `GRANSABIO_TIMEOUT` | `300` | Request timeout in seconds |
 | `GRANSABIO_POLL_INTERVAL` | `2.0` | Polling interval for results |
 
-### Model Configuration
+### Optional Model Overrides
+
+MCP does not define model defaults. When these variables are unset, the Gran Sabio API resolves models through its own `llm_routing` configuration.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GRANSABIO_GENERATOR_MODEL` | `gpt-5.2` | Default generator model |
-| `GRANSABIO_QA_MODELS` | `claude-opus-4-6,z-ai/glm-4.7,gemini-3-pro-preview` | Comma-separated QA models |
-| `GRANSABIO_ARBITER_MODEL` | `claude-opus-4-6` | Model for conflict resolution |
+| `GRANSABIO_GENERATOR_MODEL` | unset | Explicit generator model override |
+| `GRANSABIO_QA_MODELS` | unset | Comma-separated QA model overrides |
+| `GRANSABIO_ARBITER_MODEL` | unset | Explicit Gran Sabio/arbiter model override |
 
 ### Reasoning Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GRANSABIO_GENERATOR_REASONING` | `medium` | Default reasoning effort for generator (`none`, `low`, `medium`, `high`) |
-| `GRANSABIO_QA_REASONING` | `medium` | Default reasoning effort for QA models |
-| `GRANSABIO_ARBITER_REASONING` | `high` | Default reasoning effort for arbiter |
-| `GRANSABIO_THINKING_BUDGET` | `0` | Default thinking budget for Claude models (0 = auto) |
+| `GRANSABIO_GENERATOR_REASONING` | unset | Optional reasoning effort override for generator (`none`, `low`, `medium`, `high`) |
+| `GRANSABIO_QA_REASONING` | unset | Optional reasoning effort override for QA models |
+| `GRANSABIO_ARBITER_REASONING` | unset | Optional reasoning effort override for arbiter |
+| `GRANSABIO_THINKING_BUDGET` | `0` | Optional thinking budget override for compatible models (0 = API routing) |
 
 ### Reasoning Effort Levels
 
@@ -246,7 +248,7 @@ All configuration is via environment variables:
 |-------|-------------|----------|
 | `none` | No extended reasoning | Simple tasks, fast responses |
 | `low` | Light reasoning | Routine code reviews |
-| `medium` | Balanced reasoning | Most analysis tasks (default) |
+| `medium` | Balanced reasoning | Most analysis tasks |
 | `high` | Deep reasoning | Complex security analysis, critical fixes |
 
 **Example with custom configuration:**

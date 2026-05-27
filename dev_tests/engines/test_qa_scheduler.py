@@ -237,6 +237,70 @@ async def test_timeout_retries_then_skips_if_quorum_remains():
 
 
 @pytest.mark.asyncio
+async def test_retryable_provider_failure_retries_before_skipping():
+    attempts = {}
+
+    async def evaluate(slot, attempt):
+        attempts[slot.model_name] = attempts.get(slot.model_name, 0) + 1
+        if slot.index == 0 and attempt == 1:
+            raise QASchedulerTechnicalFailure(
+                "api_failure",
+                "provider unavailable",
+                retryable=True,
+            )
+        return _eval(slot)
+
+    scheduler = QAScheduler(
+        QASchedulerPolicy(
+            on_model_unavailable="skip_if_quorum",
+            provider_failure_retries=1,
+        )
+    )
+    result = await scheduler.evaluate_layer(
+        layer_name="Style",
+        has_deal_breaker_criteria=False,
+        slots=_slots(3),
+        evaluate_slot=evaluate,
+    )
+
+    assert attempts["model-0"] == 2
+    assert result.counts["technical_failed"] == 0
+    assert result.counts["valid"] == 3
+
+
+@pytest.mark.asyncio
+async def test_nonretryable_provider_failure_does_not_retry():
+    attempts = {}
+
+    async def evaluate(slot, attempt):
+        attempts[slot.model_name] = attempts.get(slot.model_name, 0) + 1
+        if slot.index == 0:
+            raise QASchedulerTechnicalFailure(
+                "model_unavailable",
+                "unsupported model",
+                retryable=False,
+            )
+        return _eval(slot)
+
+    scheduler = QAScheduler(
+        QASchedulerPolicy(
+            on_model_unavailable="skip_if_quorum",
+            provider_failure_retries=1,
+        )
+    )
+    result = await scheduler.evaluate_layer(
+        layer_name="Style",
+        has_deal_breaker_criteria=False,
+        slots=_slots(3),
+        evaluate_slot=evaluate,
+    )
+
+    assert attempts["model-0"] == 1
+    assert result.counts["technical_failed"] == 1
+    assert result.counts["valid"] == 2
+
+
+@pytest.mark.asyncio
 async def test_parse_error_retries_before_marking_technical_failure():
     attempts = {}
 

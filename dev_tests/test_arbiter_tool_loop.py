@@ -105,54 +105,100 @@ class TestShouldUseArbiterTools:
         assert Arbiter._should_use_arbiter_tools("auto", "") is False
 
     def test_unknown_model_returns_false(self):
-        """``config.get_model_info`` raising must downgrade to False."""
+        """Unknown catalog models must downgrade to False."""
         fake_config = MagicMock()
-        fake_config.get_model_info.side_effect = RuntimeError("unknown")
+        fake_config.model_specs = {"model_specifications": {}}
         with patch("config.config", fake_config):
             assert Arbiter._should_use_arbiter_tools("auto", "mystery-model") is False
 
     def test_responses_api_model_with_tool_support_returns_true(self):
         fake_config = MagicMock()
-        fake_config.get_model_info.return_value = {
-            "provider": "openai", "model_id": "gpt-5-pro",
+        fake_config.model_specs = {
+            "model_specifications": {
+                "openai": {
+                    "gpt-5-pro": {
+                        "model_id": "gpt-5-pro",
+                        "capabilities": ["tool_calling", "responses_api"],
+                    }
+                }
+            }
         }
-        with patch("config.config", fake_config), patch(
-            "ai_service.AIService._is_openai_responses_api_model", return_value=True
-        ), patch("ai_service.AIService._supports_tool_calling", return_value=True):
+        with patch("config.config", fake_config):
             assert Arbiter._should_use_arbiter_tools("auto", "gpt-5-pro") is True
 
     def test_unsupported_provider_returns_false(self):
         fake_config = MagicMock()
-        fake_config.get_model_info.return_value = {
-            "provider": "ollama", "model_id": "llama3.1",
+        fake_config.model_specs = {
+            "model_specifications": {
+                "ollama": {
+                    "llama3.1": {
+                        "model_id": "llama3.1",
+                        "provider_capabilities": {"tool_calling": True},
+                    }
+                }
+            }
         }
         with patch("config.config", fake_config):
             assert Arbiter._should_use_arbiter_tools("auto", "llama3.1") is False
 
     def test_supported_openai_model_returns_true(self):
         fake_config = MagicMock()
-        fake_config.get_model_info.return_value = {
-            "provider": "openai", "model_id": "gpt-4o-mini",
+        fake_config.model_specs = {
+            "model_specifications": {
+                "openai": {
+                    "gpt-4o-mini": {
+                        "model_id": "gpt-4o-mini",
+                        "capabilities": ["tool_calling"],
+                    }
+                }
+            }
         }
-        with patch("config.config", fake_config), patch(
-            "ai_service.AIService._is_openai_responses_api_model", return_value=False
-        ):
+        with patch("config.config", fake_config):
             assert Arbiter._should_use_arbiter_tools("auto", "gpt-4o-mini") is True
 
     def test_model_without_tool_calling_support_returns_false(self):
         fake_config = MagicMock()
-        fake_config.get_model_info.return_value = {
-            "provider": "openai", "model_id": "unknown-openai-model",
+        fake_config.model_specs = {
+            "model_specifications": {
+                "openai": {
+                    "unknown-openai-model": {
+                        "model_id": "unknown-openai-model",
+                        "provider_capabilities": {"tool_calling": False},
+                    }
+                }
+            }
+        }
+        with patch("config.config", fake_config):
+            assert Arbiter._should_use_arbiter_tools("auto", "unknown-openai-model") is False
+
+    def test_honors_aiservice_tool_calling_patch_point(self):
+        fake_config = MagicMock()
+        fake_config.model_specs = {
+            "model_specifications": {
+                "openai": {
+                    "gpt-4o-mini": {
+                        "model_id": "gpt-4o-mini",
+                        "capabilities": ["tool_calling"],
+                    }
+                }
+            }
         }
         with patch("config.config", fake_config), patch(
             "ai_service.AIService._supports_tool_calling", return_value=False
         ):
-            assert Arbiter._should_use_arbiter_tools("auto", "unknown-openai-model") is False
+            assert Arbiter._should_use_arbiter_tools("auto", "gpt-4o-mini") is False
 
     def test_supported_claude_model_returns_true(self):
         fake_config = MagicMock()
-        fake_config.get_model_info.return_value = {
-            "provider": "anthropic", "model_id": "claude-sonnet-4-5",
+        fake_config.model_specs = {
+            "model_specifications": {
+                "anthropic": {
+                    "claude-sonnet-4-5": {
+                        "model_id": "claude-sonnet-4-5",
+                        "capabilities": ["tool_calling"],
+                    }
+                }
+            }
         }
         with patch("config.config", fake_config):
             assert Arbiter._should_use_arbiter_tools("auto", "claude-sonnet-4-5") is True

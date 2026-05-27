@@ -147,10 +147,6 @@ def resolve_model_catalog_entry(model_name: str, model_specs: Optional[Dict[str,
 class AttachmentSettings(BaseModel):
     """Attachment ingestion configuration and limits."""
 
-    base_path: str = Field(
-        default="data/users",
-        description="Base directory for storing user-scoped attachment data",
-    )
     max_size_bytes: int = Field(
         default=10 * 1024 * 1024,
         description="Maximum allowed attachment size in bytes",
@@ -194,11 +190,6 @@ class AttachmentSettings(BaseModel):
         default=5,
         ge=1,
         description="Maximum attachments accepted in a single request",
-    )
-    index_history_limit: int = Field(
-        default=100,
-        ge=1,
-        description="Number of attachment entries retained in the user index",
     )
     magic_sample_bytes: int = Field(
         default=8192,
@@ -276,14 +267,6 @@ class AttachmentSettings(BaseModel):
         ge=1,
         description="Days to retain attachments before cleanup removes them",
     )
-    dedupe_read_enabled: bool = Field(
-        default=False,
-        description="Read attachment metadata from the deduplicated SQLite store before legacy files",
-    )
-    dedupe_write_enabled: bool = Field(
-        default=False,
-        description="Persist new attachments through the deduplicated blob store",
-    )
     dedupe_db_path: str = Field(
         default="data/attachments/attachments.sqlite3",
         description="SQLite database path for deduplicated attachment metadata",
@@ -291,14 +274,6 @@ class AttachmentSettings(BaseModel):
     blob_base_path: str = Field(
         default="data/attachment_blobs",
         description="Base directory for content-addressed attachment blobs",
-    )
-    legacy_read_fallback_enabled: bool = Field(
-        default=True,
-        description="Allow legacy user-scoped file lookup when the dedupe store has no upload row",
-    )
-    legacy_write_index_enabled: bool = Field(
-        default=True,
-        description="Write legacy metadata/index mirrors for DB-backed uploads during rollout",
     )
     blob_gc_enabled: bool = Field(
         default=False,
@@ -358,13 +333,13 @@ class FeedbackMemorySettings(BaseModel):
         ge=5,
         description="Maximum normative rules to include in prompt"
     )
-    embedding_model: str = Field(
-        default="text-embedding-3-large",
-        description="OpenAI embedding model for similarity detection"
+    embedding_model: Optional[str] = Field(
+        default=None,
+        description="Deprecated. Feedback embedding models are resolved through llm_routing."
     )
-    analysis_model: str = Field(
-        default="gpt-5-mini",
-        description="Model for feedback analysis and extraction"
+    analysis_model: Optional[str] = Field(
+        default=None,
+        description="Deprecated. Feedback analysis models are resolved through llm_routing."
     )
     analysis_temperature: float = Field(
         default=0.1,
@@ -442,6 +417,11 @@ class Config(BaseModel):
     XAI_API_KEY: str = Field(default="", description="xAI Grok API key")
     OPENROUTER_API_KEY: str = Field(default="", description="OpenRouter API key for unified model access")
     OLLAMA_HOST: str = Field(default="http://localhost:11434", description="Ollama server URL for local models")
+    OLLAMA_MAX_CONCURRENT_REQUESTS: int = Field(
+        default=1,
+        ge=1,
+        description="Maximum concurrent requests sent to local Ollama models",
+    )
     FAKE_AI_HOST: str = Field(default="", description="Fake AI server URL for testing (e.g., http://localhost:8989)")
     PEPPER: str = Field(default="", description="Pepper used for stable user hashing")
     ATTACHMENTS: AttachmentSettings = Field(default_factory=AttachmentSettings, description="Attachment ingestion settings")
@@ -455,6 +435,10 @@ class Config(BaseModel):
         description="Model specifications with token limits",
         validation_alias=AliasChoices("model_specs", "model_spec_catalog"),
         serialization_alias="model_specs",
+    )
+    LLM_ROUTING_DEFAULT_PATH: str = Field(
+        default="llm_routing.default.json",
+        description="Path to the default runtime LLM routing document.",
     )
 
     # Legacy model configurations for backward compatibility (populated strictly from specs)
@@ -548,10 +532,6 @@ Objectives:
 
 Act to the highest editorial standards and deliver a concise, well-reasoned decision.""")
 
-    PREFLIGHT_VALIDATION_MODEL: str = Field(
-        default="grok-4-fast-non-reasoning",
-        description="Model used for preflight feasibility checks."
-    )
     PREFLIGHT_SYSTEM_PROMPT: str = Field(
         default="""You are the preflight validator for the Gran Sabio LLM editorial engine. Analyze the incoming request and QA contract before any generation. Detect contradictions, impossible requirements, or obvious failure risks. Output JSON only, strictly following the schema in the user message. No creative writing—feasibility analysis only.""",
         description="System prompt used for preflight validation queries."
@@ -572,7 +552,6 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
     LONG_TEXT_PLAN_SUM_TOLERANCE_PERCENT: int = Field(default=5, description="Allowed drift between section-budget sum and document target")
     LONG_TEXT_MAX_ROLLING_ANCHORS: int = Field(default=3, description="Maximum number of rolling section anchors kept in prompt context")
     LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS: int = Field(default=450, description="Maximum total words carried in rolling section anchors")
-    LONG_TEXT_CONTROLLER_EVAL_MODEL: str = Field(default="gpt-5-mini", description="Model used for Long Text semantic evaluation phases")
     LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS: int = Field(default=90, description="Timeout for Long Text source-brief distillation")
     LONG_TEXT_PLAN_TIMEOUT_FULL_SECONDS: int = Field(default=240, description="Timeout for Long Text planning with full profile")
     LONG_TEXT_PLAN_TIMEOUT_BALANCED_SECONDS: int = Field(default=150, description="Timeout for Long Text planning with balanced profile")
@@ -596,26 +575,6 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
     )
     LONG_TEXT_MAX_NO_VIABLE_CANDIDATES: int = Field(default=2, description="Maximum consecutive Long Text no-candidate controller failures")
     LONG_TEXT_SECTION_DIAGNOSTIC_CONCURRENCY: int = Field(default=2, description="Maximum concurrent section-level Long Text diagnostics")
-
-    # Evidence Grounding Configuration
-    EVIDENCE_GROUNDING_EXTRACTION_MODEL: str = Field(
-        default="gpt-5-nano",
-        description="Model for claim extraction phase (does NOT require logprobs). "
-                    "gpt-5-nano is cheapest ($0.05/$0.40 per M tokens) and fast."
-    )
-    EVIDENCE_GROUNDING_SCORING_MODEL: str = Field(
-        default="gpt-4o-mini",
-        description="Model for budget scoring phase (REQUIRES logprobs support). "
-                    "Must be OpenAI or xAI non-reasoning model. "
-                    "gpt-4o-mini recommended for best price/quality ratio."
-    )
-    # Legacy alias for backwards compatibility
-    EVIDENCE_GROUNDING_MODEL: str = Field(
-        default="gpt-4o-mini",
-        description="[DEPRECATED] Use EVIDENCE_GROUNDING_EXTRACTION_MODEL and "
-                    "EVIDENCE_GROUNDING_SCORING_MODEL instead. This field is kept "
-                    "for backwards compatibility and defaults to the scoring model."
-    )
 
     # Request limits and timeouts
     MAX_CONCURRENT_REQUESTS: int = Field(default=10, description="Maximum concurrent API requests")
@@ -645,6 +604,11 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         default=2,
         ge=0,
         description="Maximum retry attempts when QA evaluation times out (without consuming iterations)"
+    )
+    MAX_QA_PROVIDER_RETRIES: int = Field(
+        default=1,
+        ge=0,
+        description="Maximum retry attempts when a QA evaluator hits a retryable provider/API failure"
     )
     QA_COMPREHENSIVE_TIMEOUT_MARGIN: int = Field(
         default=60,
@@ -720,10 +684,6 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
     )
 
     # LLM-accent guard configuration (Cambio 1 v5, §5.10)
-    AI_ACCENT_AUDIT_MODEL: str = Field(
-        default="gpt-5-mini",
-        description="Model used by the inline audit_accent tool handler (Cambio 1 v5, §5.10)."
-    )
     AI_ACCENT_AUDIT_TIMEOUT_SECONDS: int = Field(
         default=30,
         ge=5,
@@ -817,6 +777,14 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
     MAX_ACTIVE_SESSIONS: int = Field(default=100, description="Maximum active sessions")
     SESSION_TIMEOUT: int = Field(default=3600, description="Session timeout in seconds")
     SESSION_CLEANUP_INTERVAL: int = Field(default=300, description="Session cleanup interval in seconds")
+    SESSION_CLEANUP_IDLE_EMPTY_CHECKS: int = Field(
+        default=3,
+        description="Empty cleanup checks before switching to idle cleanup cadence",
+    )
+    SESSION_CLEANUP_IDLE_INTERVAL: int = Field(
+        default=3600,
+        description="Idle session cleanup interval in seconds",
+    )
     CLEANUP_INTERVAL: int = Field(default=300, description="Legacy cleanup interval field for backward compatibility")
 
     # Verbose logging
@@ -881,12 +849,20 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         self.XAI_API_KEY = os.getenv("XAI_API_KEY", "")
         self.OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
         self.OLLAMA_HOST = os.getenv("OLLAMA_HOST", self.OLLAMA_HOST)
+        ollama_concurrency_override = os.getenv("OLLAMA_MAX_CONCURRENT_REQUESTS")
+        if ollama_concurrency_override:
+            try:
+                parsed = int(ollama_concurrency_override)
+                if parsed > 0:
+                    self.OLLAMA_MAX_CONCURRENT_REQUESTS = parsed
+            except ValueError:
+                pass
         self.FAKE_AI_HOST = os.getenv("FAKE_AI_HOST", self.FAKE_AI_HOST)
         self.PEPPER = os.getenv("PEPPER", self.PEPPER)
-
-        attachments_base_path = os.getenv("ATTACHMENTS_BASE_PATH")
-        if attachments_base_path:
-            self.ATTACHMENTS.base_path = attachments_base_path
+        self.LLM_ROUTING_DEFAULT_PATH = os.getenv(
+            "LLM_ROUTING_DEFAULT_PATH",
+            self.LLM_ROUTING_DEFAULT_PATH,
+        )
 
         max_size_override = os.getenv("ATTACHMENTS_MAX_SIZE_BYTES")
         if max_size_override:
@@ -925,15 +901,6 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             except ValueError:
                 pass
 
-        index_limit_override = os.getenv("ATTACHMENTS_INDEX_HISTORY_LIMIT")
-        if index_limit_override:
-            try:
-                parsed = int(index_limit_override)
-                if parsed > 0:
-                    self.ATTACHMENTS.index_history_limit = parsed
-            except ValueError:
-                pass
-
         retention_override = os.getenv("ATTACHMENTS_RETENTION_DAYS")
         if retention_override:
             try:
@@ -943,24 +910,6 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             except ValueError:
                 pass
 
-        dedupe_read_override = os.getenv("ATTACHMENTS_DEDUPE_READ_ENABLED")
-        if dedupe_read_override is not None:
-            self.ATTACHMENTS.dedupe_read_enabled = dedupe_read_override.strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }
-
-        dedupe_write_override = os.getenv("ATTACHMENTS_DEDUPE_WRITE_ENABLED")
-        if dedupe_write_override is not None:
-            self.ATTACHMENTS.dedupe_write_enabled = dedupe_write_override.strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }
-
         dedupe_db_path_override = os.getenv("ATTACHMENTS_DEDUPE_DB_PATH")
         if dedupe_db_path_override:
             self.ATTACHMENTS.dedupe_db_path = dedupe_db_path_override
@@ -968,24 +917,6 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         blob_base_path_override = os.getenv("ATTACHMENTS_BLOB_BASE_PATH")
         if blob_base_path_override:
             self.ATTACHMENTS.blob_base_path = blob_base_path_override
-
-        legacy_read_override = os.getenv("ATTACHMENTS_LEGACY_READ_FALLBACK_ENABLED")
-        if legacy_read_override is not None:
-            self.ATTACHMENTS.legacy_read_fallback_enabled = legacy_read_override.strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }
-
-        legacy_write_override = os.getenv("ATTACHMENTS_LEGACY_WRITE_INDEX_ENABLED")
-        if legacy_write_override is not None:
-            self.ATTACHMENTS.legacy_write_index_enabled = legacy_write_override.strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }
 
         blob_gc_override = os.getenv("ATTACHMENTS_BLOB_GC_ENABLED")
         if blob_gc_override is not None:
@@ -1034,6 +965,9 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         self.QA_TIMEOUT_MULTIPLIER = float(os.getenv("QA_TIMEOUT_MULTIPLIER", "1.5"))
         self.QA_BASE_TIMEOUT = int(os.getenv("QA_BASE_TIMEOUT", "120"))
         self.MAX_QA_TIMEOUT_RETRIES = int(os.getenv("MAX_QA_TIMEOUT_RETRIES", "2"))
+        self.MAX_QA_PROVIDER_RETRIES = int(os.getenv("MAX_QA_PROVIDER_RETRIES", "1"))
+        if self.MAX_QA_PROVIDER_RETRIES < 0:
+            self.MAX_QA_PROVIDER_RETRIES = 1
         self.QA_COMPREHENSIVE_TIMEOUT_MARGIN = int(os.getenv("QA_COMPREHENSIVE_TIMEOUT_MARGIN", "60"))
         self.QA_MODEL_FAILURE_THRESHOLD = int(os.getenv("QA_MODEL_FAILURE_THRESHOLD", "5"))
         if self.QA_MODEL_FAILURE_THRESHOLD < 1:
@@ -1054,26 +988,15 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         self.MAX_ACTIVE_SESSIONS = int(os.getenv("MAX_ACTIVE_SESSIONS", "100"))
         self.SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT", "3600"))
         self.SESSION_CLEANUP_INTERVAL = int(os.getenv("SESSION_CLEANUP_INTERVAL", os.getenv("CLEANUP_INTERVAL", "300")))
+        self.SESSION_CLEANUP_IDLE_EMPTY_CHECKS = int(os.getenv("SESSION_CLEANUP_IDLE_EMPTY_CHECKS", "3"))
+        self.SESSION_CLEANUP_IDLE_INTERVAL = int(os.getenv("SESSION_CLEANUP_IDLE_INTERVAL", "3600"))
         # Backward compatibility for legacy references
         self.CLEANUP_INTERVAL = self.SESSION_CLEANUP_INTERVAL
 
         # Logging
         self.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
         self.VERBOSE_MAX_ENTRIES = int(os.getenv("VERBOSE_MAX_ENTRIES", "100"))
-        self.PREFLIGHT_VALIDATION_MODEL = os.getenv("PREFLIGHT_VALIDATION_MODEL", self.PREFLIGHT_VALIDATION_MODEL)
         self.PREFLIGHT_SYSTEM_PROMPT = os.getenv("PREFLIGHT_SYSTEM_PROMPT", self.PREFLIGHT_SYSTEM_PROMPT)
-
-        # Evidence Grounding
-        self.EVIDENCE_GROUNDING_EXTRACTION_MODEL = os.getenv(
-            "EVIDENCE_GROUNDING_EXTRACTION_MODEL", self.EVIDENCE_GROUNDING_EXTRACTION_MODEL
-        )
-        self.EVIDENCE_GROUNDING_SCORING_MODEL = os.getenv(
-            "EVIDENCE_GROUNDING_SCORING_MODEL", self.EVIDENCE_GROUNDING_SCORING_MODEL
-        )
-        # Legacy alias - falls back to scoring model for backwards compatibility
-        self.EVIDENCE_GROUNDING_MODEL = os.getenv(
-            "EVIDENCE_GROUNDING_MODEL", self.EVIDENCE_GROUNDING_SCORING_MODEL
-        )
 
         # Gran Sabio Limits
         self.DEFAULT_GRAN_SABIO_LIMIT_PER_ITERATION = int(
@@ -1113,9 +1036,6 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         )
 
         # LLM-accent guard configuration (Cambio 1 v5, §5.10)
-        self.AI_ACCENT_AUDIT_MODEL = os.getenv(
-            "AI_ACCENT_AUDIT_MODEL", self.AI_ACCENT_AUDIT_MODEL
-        )
         self.AI_ACCENT_AUDIT_TIMEOUT_SECONDS = int(
             os.getenv("AI_ACCENT_AUDIT_TIMEOUT_SECONDS", str(self.AI_ACCENT_AUDIT_TIMEOUT_SECONDS))
         )
@@ -1219,10 +1139,6 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         )
         self.LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS = int(
             os.getenv("LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS", str(self.LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS))
-        )
-        self.LONG_TEXT_CONTROLLER_EVAL_MODEL = os.getenv(
-            "LONG_TEXT_CONTROLLER_EVAL_MODEL",
-            self.LONG_TEXT_CONTROLLER_EVAL_MODEL,
         )
         self.LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS = int(
             os.getenv("LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS", str(self.LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS))
@@ -2461,15 +2377,13 @@ def get_model_aliases():
 
 def get_default_models():
     """
-    Get default model configuration.
-    Defaults are not auto-provided anymore.
+    Compatibility view of default model routing.
+
+    Runtime defaults live in llm_routing.default.json, not model_specs.json.
     """
-    defaults = config.model_specs.get("default_models")
-    if not defaults:
-        msg = "[CONFIG ERROR] 'default_models' is missing in model_specs.json. Provide explicit defaults; fallbacks are disabled."
-        print(msg, file=sys.stderr, flush=True)
-        raise RuntimeError(msg)
-    return defaults
+    from llm_routing import legacy_default_models_view
+
+    return legacy_default_models_view()
 
 def get_model_parameter_requirements(model_name: str) -> Dict[str, Any]:
     """
@@ -2518,22 +2432,8 @@ def get_model_parameter_requirements(model_name: str) -> Dict[str, Any]:
         "default_temperature": None  # Can use any temperature
     }
 
-# Legacy aliases for backward compatibility (no fallback targets)
-MODEL_ALIASES = {
-    "premium": {
-        "openai": "gpt-5.2",
-        "claude": "claude-sonnet-4",
-        "gemini": "gemini-2.5-flash"
-    },
-    "standard": {
-        "openai": "gpt-5-mini",
-        "claude": "claude-3.5-haiku",
-        "gemini": "gemini-2.0-flash"
-    },
-    "gran_sabio": {
-        "primary": "claude-opus-4.5"
-    }
-}
+# Runtime model aliases/defaults are resolved through model_specs.json and llm_routing.default.json.
+MODEL_ALIASES = {}
 
 # Content type to default QA layers mapping
 CONTENT_TYPE_QA_MAPPING = {

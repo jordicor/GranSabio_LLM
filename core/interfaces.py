@@ -20,7 +20,7 @@ async def web_interface(request: Request):
 @app.get("/monitor", response_class=HTMLResponse)
 async def monitor_interface(request: Request):
     """Serve the live stream monitor interface"""
-    return templates.TemplateResponse("stream_monitor.html", {"request": request})
+    return templates.TemplateResponse(request, "stream_monitor.html")
 
 
 @app.get("/debugger", response_class=HTMLResponse)

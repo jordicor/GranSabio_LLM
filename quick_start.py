@@ -78,10 +78,8 @@ async def test_basic_request():
     test_request = {
         "prompt": "Escribe un párrafo corto sobre la importancia de la inteligencia artificial en el futuro.",
         "content_type": "article",
-        "generator_model": "gpt-4o-mini",  # Use cheaper model for testing
         "temperature": 0.7,
         "max_tokens": 200,
-        "qa_models": ["gpt-4o-mini"],  # Single model for faster testing
         "qa_layers": [
             {
                 "name": "Calidad Básica",

@@ -7,6 +7,7 @@ client initialization, and provider routing logic.
 Target: 30 tests
 """
 
+import asyncio
 import os
 import sys
 import threading
@@ -528,6 +529,60 @@ class TestOllamaClientInit:
             assert ollama_call is not None
             assert ollama_call[1]["base_url"].startswith("http://")
 
+    def test_ollama_client_rewrites_unspecified_bind_address(self, mock_all_api_clients, reset_singleton):
+        """
+        Given: OLLAMA_HOST is set to a server bind address
+        When: AIService is initialized
+        Then: the outbound client connects to localhost instead
+        """
+        mock_cfg = MagicMock()
+        mock_cfg.OPENAI_API_KEY = "sk-test"
+        mock_cfg.ANTHROPIC_API_KEY = "sk-ant-test"
+        mock_cfg.GOOGLE_API_KEY = None
+        mock_cfg.XAI_API_KEY = None
+        mock_cfg.OPENROUTER_API_KEY = None
+        mock_cfg.OLLAMA_HOST = "0.0.0.0:11434"
+
+        with patch("ai_service.config", mock_cfg):
+            from ai_service import AIService
+
+            AIService()
+
+            calls = mock_all_api_clients["openai"].AsyncOpenAI.call_args_list
+            ollama_call = next(
+                (c for c in calls if "127.0.0.1:11434" in str(c[1].get("base_url", ""))),
+                None
+            )
+            assert ollama_call is not None
+            assert ollama_call[1]["base_url"] == "http://127.0.0.1:11434/v1"
+
+    def test_ollama_client_preserves_lan_host(self, mock_all_api_clients, reset_singleton):
+        """
+        Given: OLLAMA_HOST points to another LAN machine
+        When: AIService is initialized
+        Then: that host is preserved as the outbound target
+        """
+        mock_cfg = MagicMock()
+        mock_cfg.OPENAI_API_KEY = "sk-test"
+        mock_cfg.ANTHROPIC_API_KEY = "sk-ant-test"
+        mock_cfg.GOOGLE_API_KEY = None
+        mock_cfg.XAI_API_KEY = None
+        mock_cfg.OPENROUTER_API_KEY = None
+        mock_cfg.OLLAMA_HOST = "http://192.168.1.50:11434"
+
+        with patch("ai_service.config", mock_cfg):
+            from ai_service import AIService
+
+            AIService()
+
+            calls = mock_all_api_clients["openai"].AsyncOpenAI.call_args_list
+            ollama_call = next(
+                (c for c in calls if "192.168.1.50:11434" in str(c[1].get("base_url", ""))),
+                None
+            )
+            assert ollama_call is not None
+            assert ollama_call[1]["base_url"] == "http://192.168.1.50:11434/v1"
+
     def test_ollama_client_none_without_host(self, mock_all_api_clients, mock_config_no_keys, reset_singleton, caplog):
         """
         Given: OLLAMA_HOST is not set
@@ -543,6 +598,60 @@ class TestOllamaClientInit:
 
                 assert service.ollama_client is None
                 assert "Ollama not configured" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_ollama_concurrency_slot_serializes_local_calls(self):
+        """
+        Given: Ollama concurrency is limited to one request
+        When: Multiple local model scopes run concurrently
+        Then: Only one local model call is active at a time
+        """
+        from ai_service import AIService
+
+        service = AIService.__new__(AIService)
+        service._ollama_max_concurrent_requests = 1
+        service._ollama_request_semaphore = asyncio.Semaphore(1)
+        active = 0
+        max_active = 0
+
+        async def run_call():
+            nonlocal active, max_active
+            async with service.model_call_concurrency_slot("ollama", "local-model", "test"):
+                active += 1
+                max_active = max(max_active, active)
+                await asyncio.sleep(0.01)
+                active -= 1
+
+        await asyncio.gather(*(run_call() for _ in range(3)))
+
+        assert max_active == 1
+
+    @pytest.mark.asyncio
+    async def test_remote_concurrency_slot_does_not_serialize_calls(self):
+        """
+        Given: A remote provider
+        When: Multiple scopes run concurrently
+        Then: The Ollama limiter is not applied
+        """
+        from ai_service import AIService
+
+        service = AIService.__new__(AIService)
+        service._ollama_max_concurrent_requests = 1
+        service._ollama_request_semaphore = asyncio.Semaphore(1)
+        active = 0
+        max_active = 0
+
+        async def run_call():
+            nonlocal active, max_active
+            async with service.model_call_concurrency_slot("openai", "gpt-test", "test"):
+                active += 1
+                max_active = max(max_active, active)
+                await asyncio.sleep(0.01)
+                active -= 1
+
+        await asyncio.gather(*(run_call() for _ in range(3)))
+
+        assert max_active > 1
 
 
 # ============================================================================

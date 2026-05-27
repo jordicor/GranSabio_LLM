@@ -10,6 +10,7 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from deal_breaker_tracker import get_tracker
+from llm_routing import legacy_default_models_view
 from version import BUILD_VERSION_INFO
 
 from .app_state import _ensure_services, active_sessions, app, logger, templates
@@ -146,7 +147,7 @@ async def get_qa_models():
     """Get list of models suitable for QA evaluation"""
     from config import config
     all_models = config.get_available_models()
-    defaults = config.model_specs.get("default_models", {}) or {}
+    defaults = legacy_default_models_view()
 
     qa_suitable_models = []
 
@@ -177,13 +178,12 @@ async def get_qa_models():
     # Sort by QA priority (fast first, then standard, then premium)
     priority_order = {"fast": 1, "standard": 2, "premium": 3}
     qa_suitable_models.sort(key=lambda x: (priority_order.get(x["qa_priority"], 2), x["name"]))
-
     return {
         "qa_models": qa_suitable_models,
         "recommendations": {
             "fast": [m["key"] for m in qa_suitable_models if m["qa_priority"] == "fast"][:3],
             "balanced": [m["key"] for m in qa_suitable_models if m["qa_priority"] == "standard"][:3],
-            "premium": [m["key"] for m in qa_suitable_models if m["qa_priority"] == "premium"][:2]
+            "premium": [m["key"] for m in qa_suitable_models if m["qa_priority"] == "premium"][:2],
         },
         "defaults": defaults,
     }

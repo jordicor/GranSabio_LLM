@@ -20,9 +20,9 @@ import logging
 import time
 from typing import Any, Callable, Dict, Optional
 
-from config import config
 from evidence_grounding.budget_scorer import BudgetScorer
 from evidence_grounding.claim_extractor import ClaimExtractor
+from llm_routing import resolve_call
 from evidence_grounding.evidence_matcher import (
     EvidenceMatcher,
     match_claims_to_spans,
@@ -102,6 +102,7 @@ class GroundingEngine:
         stream_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         extra_verbose: bool = False,
+        original_request: Optional[Any] = None,
         cancellation_token: Optional[Any] = None,
     ) -> EvidenceGroundingResult:
         """
@@ -128,10 +129,11 @@ class GroundingEngine:
         start_time = time.time()
         tokens_used = 0  # Track across all API calls
 
-        # Use separate models for extraction (cheap, no logprobs) and scoring (logprobs required)
-        # If user specifies a model in config, use it for both (backwards compatible)
-        extraction_model = grounding_config.model or config.EVIDENCE_GROUNDING_EXTRACTION_MODEL
-        scoring_model = grounding_config.model or config.EVIDENCE_GROUNDING_SCORING_MODEL
+        extraction_route = resolve_call("evidence.extract_claims", request=original_request)
+        scoring_route = resolve_call("evidence.score_logprobs", request=original_request)
+        # If user specifies a legacy model in config, use it for both phases.
+        extraction_model = grounding_config.model or extraction_route.model
+        scoring_model = grounding_config.model or scoring_route.model
 
         if extra_verbose:
             logger.info(f"[GROUNDING] Starting evidence grounding check")
@@ -153,6 +155,7 @@ class GroundingEngine:
                 content=content,
                 context=context,
                 model=extraction_model,
+                request=original_request,
                 max_claims=grounding_config.max_claims,
                 filter_trivial=grounding_config.filter_trivial,
                 min_importance=grounding_config.min_claim_importance,
@@ -237,6 +240,7 @@ class GroundingEngine:
                 claims=matched_claims,
                 spans=spans,
                 config_obj=grounding_config,
+                request=original_request,
                 extra_verbose=extra_verbose,
                 usage_callback=usage_callback,
                 cancellation_token=cancellation_token,

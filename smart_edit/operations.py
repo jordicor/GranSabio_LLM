@@ -16,7 +16,9 @@ from __future__ import annotations
 import difflib
 import re
 import time
-from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Literal, Mapping, Optional, Tuple, Union
+
+from llm_routing import resolve_call
 
 from .locators import (
     build_word_map,
@@ -663,13 +665,14 @@ class SmartTextEditor:
         temperature: float = 0.2,
         usage_callback: Optional[Callable] = None,
         cancellation_token: Optional[Any] = None,
+        llm_routing: Optional[Mapping[str, Any]] = None,
     ) -> str:
         """
         Call AI service to generate text.
 
         Args:
             prompt: The prompt to send
-            model: AI model to use (defaults to gpt-4o-mini)
+            model: Optional explicit model override. Defaults resolve through llm_routing.
             temperature: Generation temperature
             usage_callback: Optional callback for tracking token usage
 
@@ -685,16 +688,24 @@ class SmartTextEditor:
                 "Initialize SmartTextEditor with ai_service parameter."
             )
 
-        model = model or "gpt-4o-mini"
+        if model and llm_routing is None:
+            route_params: dict[str, Any] = {}
+        else:
+            route = resolve_call("smart_edit.apply", routing=llm_routing)
+            model = model or route.model
+            route_params = route.params
 
         # Call AI service using generate_content (the actual method name)
         response = await self.ai_service.generate_content(
             model=model,
             prompt=prompt,
-            temperature=temperature,
-            max_tokens=4096,
+            temperature=route_params.get("temperature", temperature),
+            max_tokens=route_params.get("max_tokens", 4096),
+            reasoning_effort=route_params.get("reasoning_effort"),
+            thinking_budget_tokens=route_params.get("thinking_budget_tokens"),
             usage_callback=usage_callback,
             cancellation_token=cancellation_token,
+            llm_routing=llm_routing,
         )
 
         # generate_content returns the content string directly
@@ -720,6 +731,7 @@ class SmartTextEditor:
         clean_output: bool = True,
         usage_callback: Optional[Callable] = None,
         cancellation_token: Optional[Any] = None,
+        llm_routing: Optional[Mapping[str, Any]] = None,
     ) -> EditResult:
         """
         Apply an edit to target text using AI with a specific instruction.
@@ -733,11 +745,12 @@ class SmartTextEditor:
             target: Text segment to edit (string, position tuple, or TextTarget)
             instruction: Specific instruction for the edit (from QA, user, etc.)
             context: Optional full document context for style preservation
-            model: AI model to use (defaults to gpt-4o-mini)
+            model: Optional explicit model override. Defaults resolve through llm_routing.
             temperature: Generation temperature (default 0.2 for consistency)
             preserve_length: Try to maintain similar length (default True)
             clean_output: Clean AI artifacts from output (default True)
             usage_callback: Optional callback for tracking token usage
+            llm_routing: Optional merged routing document for this request
 
         Returns:
             EditResult with edited content
@@ -798,6 +811,7 @@ class SmartTextEditor:
                 temperature=temperature,
                 usage_callback=usage_callback,
                 cancellation_token=cancellation_token,
+                llm_routing=llm_routing,
             )
 
             # Clean AI response
@@ -845,6 +859,7 @@ class SmartTextEditor:
         preserve_length: bool = True,
         model: Optional[str] = None,
         temperature: float = 0.2,
+        llm_routing: Optional[Mapping[str, Any]] = None,
     ) -> EditResult:
         """
         Rephrase target text using AI while maintaining meaning.
@@ -875,6 +890,7 @@ class SmartTextEditor:
             model=model,
             temperature=temperature,
             preserve_length=preserve_length,
+            llm_routing=llm_routing,
         )
 
     async def improve(
@@ -884,6 +900,7 @@ class SmartTextEditor:
         criteria: Optional[List[str]] = None,
         model: Optional[str] = None,
         temperature: float = 0.3,
+        llm_routing: Optional[Mapping[str, Any]] = None,
     ) -> EditResult:
         """
         Improve target text using AI based on criteria.
@@ -911,6 +928,7 @@ class SmartTextEditor:
             model=model,
             temperature=temperature,
             preserve_length=False,  # Improvements may change length
+            llm_routing=llm_routing,
         )
 
     async def fix(
@@ -920,6 +938,7 @@ class SmartTextEditor:
         fix_type: Literal["grammar", "style", "tone", "all"] = "all",
         model: Optional[str] = None,
         temperature: float = 0.2,
+        llm_routing: Optional[Mapping[str, Any]] = None,
     ) -> EditResult:
         """
         Fix issues in target text using AI.
@@ -952,6 +971,7 @@ class SmartTextEditor:
             model=model,
             temperature=temperature,
             preserve_length=True,
+            llm_routing=llm_routing,
         )
 
     async def expand(
@@ -960,6 +980,7 @@ class SmartTextEditor:
         target: TargetSpec,
         model: Optional[str] = None,
         temperature: float = 0.4,
+        llm_routing: Optional[Mapping[str, Any]] = None,
     ) -> EditResult:
         """
         Expand target text with more detail using AI.
@@ -982,6 +1003,7 @@ class SmartTextEditor:
             model=model,
             temperature=temperature,
             preserve_length=False,  # Expansion increases length
+            llm_routing=llm_routing,
         )
 
     async def condense(
@@ -990,6 +1012,7 @@ class SmartTextEditor:
         target: TargetSpec,
         model: Optional[str] = None,
         temperature: float = 0.2,
+        llm_routing: Optional[Mapping[str, Any]] = None,
     ) -> EditResult:
         """
         Condense target text to be more concise using AI.
@@ -1012,6 +1035,7 @@ class SmartTextEditor:
             model=model,
             temperature=temperature,
             preserve_length=False,  # Condensing reduces length
+            llm_routing=llm_routing,
         )
 
     # =========================================================================

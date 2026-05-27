@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from .operations import SmartTextEditor
 
@@ -71,8 +71,13 @@ class AnalyzeRequest(BaseModel):
     """Request for text analysis."""
 
     text: str = Field(description="Text to analyze", max_length=50000)
-    analysis_model: str = Field(
-        default="gpt-4o-mini",
+    llm_routing: Optional[Dict[str, Any]] = Field(
+        default=None,
+        validation_alias=AliasChoices("llm_routing", "llmRouting"),
+        description="Optional request-scoped model routing overlay keyed by exact LLM call id.",
+    )
+    analysis_model: Optional[str] = Field(
+        default=None,
         description="Model to use for analysis",
     )
     max_actions: int = Field(default=20, description="Maximum actions to return")
@@ -96,6 +101,11 @@ class ExecuteRequest(BaseModel):
 
     text: str = Field(description="Current text content", max_length=50000)
     action: ActionRequest = Field(description="Action to execute")
+    llm_routing: Optional[Dict[str, Any]] = Field(
+        default=None,
+        validation_alias=AliasChoices("llm_routing", "llmRouting"),
+        description="Optional request-scoped model routing overlay keyed by exact LLM call id.",
+    )
 
 
 class ExecuteResponse(BaseModel):
@@ -114,6 +124,11 @@ class BatchExecuteRequest(BaseModel):
 
     text: str = Field(description="Original text content", max_length=50000)
     actions: List[ActionRequest] = Field(description="Actions to execute")
+    llm_routing: Optional[Dict[str, Any]] = Field(
+        default=None,
+        validation_alias=AliasChoices("llm_routing", "llmRouting"),
+        description="Optional request-scoped model routing overlay keyed by exact LLM call id.",
+    )
     stop_on_error: bool = Field(
         default=False,
         description="Stop execution on first error",
@@ -339,7 +354,11 @@ async def analyze_text(request: AnalyzeRequest):
     start_time = time.perf_counter()
 
     actions = []
-    analysis_model_used = request.analysis_model
+    from llm_routing import attach_request_llm_routing, resolve_call
+
+    attach_request_llm_routing(request)
+    analysis_route = resolve_call("smart_edit.analyze", request=request)
+    analysis_model_used = request.analysis_model or analysis_route.model
 
     try:
         # Try AI-powered analysis
@@ -370,6 +389,7 @@ async def analyze_text(request: AnalyzeRequest):
             model=request.analysis_model,
             max_issues=request.max_actions,
             categories=categories,
+            llm_routing=getattr(request, "_llm_routing", None),
         )
 
         stats = calculate_stats(actions)
@@ -418,6 +438,10 @@ async def execute_single_action(request: ExecuteRequest):
     action = request.action
 
     try:
+        from llm_routing import attach_request_llm_routing
+
+        attach_request_llm_routing(request)
+
         # Map request to operation type
         op_type_map = {
             "delete": "delete",
@@ -467,19 +491,45 @@ async def execute_single_action(request: ExecuteRequest):
             result = editor.format(request.text, target, format_type)
         elif op_type == "rephrase":
             result = await editor.rephrase(
-                request.text, target, instruction=action.instruction
+                request.text,
+                target,
+                instruction=action.instruction,
+                llm_routing=getattr(request, "_llm_routing", None),
             )
         elif op_type == "improve":
             criteria = action.metadata.get("criteria", ["clarity", "conciseness"])
-            result = await editor.improve(request.text, target, criteria=criteria)
+            result = await editor.improve(
+                request.text,
+                target,
+                criteria=criteria,
+                llm_routing=getattr(request, "_llm_routing", None),
+            )
         elif op_type == "fix_grammar":
-            result = await editor.fix(request.text, target, fix_type="grammar")
+            result = await editor.fix(
+                request.text,
+                target,
+                fix_type="grammar",
+                llm_routing=getattr(request, "_llm_routing", None),
+            )
         elif op_type == "fix_style":
-            result = await editor.fix(request.text, target, fix_type="style")
+            result = await editor.fix(
+                request.text,
+                target,
+                fix_type="style",
+                llm_routing=getattr(request, "_llm_routing", None),
+            )
         elif op_type == "expand":
-            result = await editor.expand(request.text, target)
+            result = await editor.expand(
+                request.text,
+                target,
+                llm_routing=getattr(request, "_llm_routing", None),
+            )
         elif op_type == "condense":
-            result = await editor.condense(request.text, target)
+            result = await editor.condense(
+                request.text,
+                target,
+                llm_routing=getattr(request, "_llm_routing", None),
+            )
         else:
             # Fallback for any unmapped operation
             return ExecuteResponse(
@@ -539,7 +589,11 @@ async def execute_batch_actions(request: BatchExecuteRequest):
         action_start = time.perf_counter()
 
         # Execute single action
-        exec_request = ExecuteRequest(text=current_text, action=action)
+        exec_request = ExecuteRequest(
+            text=current_text,
+            action=action,
+            llm_routing=request.llm_routing,
+        )
         exec_response = await execute_single_action(exec_request)
 
         action_result = {

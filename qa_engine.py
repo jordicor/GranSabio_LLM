@@ -17,6 +17,7 @@ Changes (2025-11-06):
 import asyncio
 import logging
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -65,6 +66,11 @@ class QAModelUnavailableError(RuntimeError):
 
 
 CancelCallback = Optional[Callable[[], Awaitable[bool]]]
+
+
+@asynccontextmanager
+async def _noop_async_context():
+    yield None
 
 
 def _qa_model_result_key(
@@ -131,6 +137,35 @@ def calculate_qa_timeout_for_model(
         return timeout
 
 
+def _positive_int_config(name: str, default: int) -> int:
+    try:
+        value = int(getattr(config, name, default) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(1, value)
+
+
+def _provider_for_timeout_model(model_name: str) -> Optional[str]:
+    try:
+        model_info = config.get_model_info(model_name)
+    except Exception:
+        return None
+    if not isinstance(model_info, dict):
+        return None
+    provider = model_info.get("provider")
+    return str(provider).lower() if provider else None
+
+
+def _batched_timeout_total(timeouts: List[float], max_concurrency: int) -> float:
+    if not timeouts:
+        return 0.0
+    slots = [0.0 for _ in range(max(1, max_concurrency))]
+    for timeout in sorted(timeouts, reverse=True):
+        slot_index = min(range(len(slots)), key=slots.__getitem__)
+        slots[slot_index] += timeout
+    return max(slots)
+
+
 def calculate_comprehensive_qa_timeout(
     layers: List[Any],
     qa_models: List[Any]
@@ -139,8 +174,10 @@ def calculate_comprehensive_qa_timeout(
     Calculate total timeout for comprehensive QA evaluation.
     """
 
-    # Calculate the max timeout needed per layer (models run in parallel)
-    max_timeout_per_layer = 0.0
+    # Remote QA models can still run in parallel. Local Ollama models are
+    # queued by default, so reserve enough wall-clock budget for that queue.
+    remote_max_timeout_per_layer = 0.0
+    ollama_timeouts: List[float] = []
 
     for model in qa_models:
         # Normalize model to extract configuration
@@ -158,9 +195,18 @@ def calculate_comprehensive_qa_timeout(
             reasoning_effort,
             thinking_budget_tokens
         )
-        max_timeout_per_layer = max(max_timeout_per_layer, individual_timeout)
+        provider = _provider_for_timeout_model(model_name)
+        if provider == "ollama":
+            ollama_timeouts.append(individual_timeout)
+        else:
+            remote_max_timeout_per_layer = max(remote_max_timeout_per_layer, individual_timeout)
 
     num_layers = len(layers)
+    ollama_timeout_per_layer = _batched_timeout_total(
+        ollama_timeouts,
+        _positive_int_config("OLLAMA_MAX_CONCURRENT_REQUESTS", 1),
+    )
+    max_timeout_per_layer = max(remote_max_timeout_per_layer, ollama_timeout_per_layer)
     comprehensive_timeout = (max_timeout_per_layer * num_layers) + config.QA_COMPREHENSIVE_TIMEOUT_MARGIN
 
     logger.info(
@@ -392,6 +438,7 @@ class QAEngine:
         usage_tracker: Optional[UsageTracker] = None,
         extra_verbose: bool = False,
         phase_logger: Optional["PhaseLogger"] = None,
+        original_request: Optional[Any] = None,
         cancellation_token: Optional[Any] = None,
     ) -> tuple:
         """
@@ -437,6 +484,7 @@ class QAEngine:
             stream_callback=stream_callback,
             usage_callback=usage_callback,
             extra_verbose=extra_verbose,
+            original_request=original_request,
             cancellation_token=cancellation_token,
         )
 
@@ -618,6 +666,7 @@ class QAEngine:
                     usage_tracker=usage_tracker,
                     extra_verbose=extra_verbose,
                     phase_logger=phase_logger,
+                    original_request=original_request,
                     cancellation_token=cancellation_token,
                 )
 
@@ -1259,6 +1308,7 @@ Source QA layers:
                 usage_tracker=usage_tracker,
                 extra_verbose=getattr(original_request, "extra_verbose", False) if original_request else False,
                 phase_logger=phase_logger,
+                original_request=original_request,
                 cancellation_token=cancellation_token,
             )
             return "Evidence Grounding", {"evidence_grounding_logprobs": qa_eval}, full_result
@@ -1574,6 +1624,7 @@ Source QA layers:
 
         max_concurrency = max(1, int(getattr(config, "MAX_CONCURRENT_REQUESTS", 10) or 10))
         timeout_retries = max(0, int(getattr(config, "MAX_QA_TIMEOUT_RETRIES", 2) or 0))
+        provider_failure_retries = max(0, int(getattr(config, "MAX_QA_PROVIDER_RETRIES", 1) or 0))
         min_valid_models = (
             getattr(original_request, "min_valid_qa_models", None)
             if original_request
@@ -1618,6 +1669,7 @@ Source QA layers:
             min_valid_model_ratio=min_valid_ratio,
             max_concurrency=min(max_concurrency, max(1, configured_count)),
             timeout_retries=timeout_retries,
+            provider_failure_retries=provider_failure_retries,
         )
 
     async def _evaluate_ai_layer_with_scheduler(
@@ -1771,30 +1823,39 @@ Source QA layers:
                 )
 
             try:
-                evaluation = await asyncio.wait_for(
-                    self.evaluate_content(
-                        content,
-                        layer,
-                        slot.model,
-                        original_request,
-                        extra_verbose=extra_verbose,
-                        stream_callback=stream_callback,
-                        usage_callback=usage_callback_fn,
-                        request_edit_info=request_edit_info,
-                        phase_logger=phase_logger,
-                        marker_mode=marker_mode,
-                        marker_length=marker_length,
-                        word_map_formatted=word_map_formatted,
-                        draft_map_formatted=draft_map_formatted,
-                        input_images=input_images,
-                        edit_history=edit_history,
-                        model_alias_registry=model_alias_registry,
-                        session_id=session_id,
-                        project_id=project_id,
-                        tool_event_callback=tool_event_callback,
-                    ),
-                    timeout=slot.timeout_seconds,
+                provider_name = _provider_for_model(slot.model_name)
+                concurrency_slot = getattr(self.ai_service, "model_call_concurrency_slot", None)
+                slot_context = (
+                    concurrency_slot(provider_name, slot.model_name, f"qa:{layer.name}")
+                    if callable(concurrency_slot)
+                    and hasattr(self.ai_service, "_ollama_request_semaphore")
+                    else _noop_async_context()
                 )
+                async with slot_context:
+                    evaluation = await asyncio.wait_for(
+                        self.evaluate_content(
+                            content,
+                            layer,
+                            slot.model,
+                            original_request,
+                            extra_verbose=extra_verbose,
+                            stream_callback=stream_callback,
+                            usage_callback=usage_callback_fn,
+                            request_edit_info=request_edit_info,
+                            phase_logger=phase_logger,
+                            marker_mode=marker_mode,
+                            marker_length=marker_length,
+                            word_map_formatted=word_map_formatted,
+                            draft_map_formatted=draft_map_formatted,
+                            input_images=input_images,
+                            edit_history=edit_history,
+                            model_alias_registry=model_alias_registry,
+                            session_id=session_id,
+                            project_id=project_id,
+                            tool_event_callback=tool_event_callback,
+                        ),
+                        timeout=slot.timeout_seconds,
+                    )
             except QAResponseParseError as parse_error:
                 logger.warning(
                     "QA model %s returned invalid JSON for layer %s.",
@@ -1830,6 +1891,23 @@ Source QA layers:
             except AIRequestError as api_err:
                 failure_count = self._increment_model_failure(session_id, slot.model_name)
                 cause = getattr(api_err, "cause", None)
+                provider_failure = getattr(api_err, "provider_failure", None)
+                provider_failure_kind = getattr(
+                    getattr(provider_failure, "kind", None),
+                    "value",
+                    None,
+                )
+                provider_retryable = (
+                    bool(getattr(provider_failure, "retryable"))
+                    if provider_failure is not None
+                    else True
+                )
+                threshold_reached = failure_count >= self._qa_failure_threshold()
+                retryable = provider_retryable and not threshold_reached
+                will_retry_provider = (
+                    retryable
+                    and attempt <= max(0, scheduler_policy.provider_failure_retries)
+                )
                 logger.error(
                     "QA model %s failed due to provider error in layer %s: %s",
                     slot.model_name,
@@ -1838,24 +1916,41 @@ Source QA layers:
                     exc_info=True,
                 )
                 if phase_logger:
+                    retry_note = " Retrying evaluator." if will_retry_provider else ""
                     phase_logger.info(
                         f"Model {slot.model_name} provider error (failure {failure_count})."
+                        f"{retry_note}"
                     )
                 if progress_callback:
-                    await progress_callback(
-                        f"{slot.evaluator_label}: API error after "
-                        f"{getattr(api_err, 'attempts', 0)} attempts."
-                    )
+                    if will_retry_provider:
+                        await progress_callback(
+                            f"{slot.evaluator_label}: temporary API error. Retrying."
+                        )
+                    else:
+                        await progress_callback(
+                            f"{slot.evaluator_label}: API error after "
+                            f"{getattr(api_err, 'attempts', 0)} attempts."
+                        )
                 error_type = (
                     "model_unavailable"
-                    if failure_count >= self._qa_failure_threshold()
+                    if threshold_reached or not provider_retryable
                     else "api_failure"
                 )
+                provider_extra: Dict[str, Any] = {}
+                if provider_failure is not None:
+                    provider_extra = {
+                        "provider_failure_kind": provider_failure_kind,
+                        "provider_retryable": provider_retryable,
+                        "provider_status_code": getattr(provider_failure, "status_code", None),
+                        "provider_error_type": getattr(provider_failure, "provider_error_type", None),
+                        "provider_error_code": getattr(provider_failure, "provider_error_code", None),
+                        "provider_request_id": getattr(provider_failure, "request_id", None),
+                    }
                 metadata = _qa_failure_metadata(
                     slot=slot,
                     error_type=error_type,
                     message=str(api_err),
-                    retryable=True,
+                    retryable=retryable,
                     attempts=getattr(api_err, "attempts", attempt),
                     max_attempts=getattr(api_err, "max_attempts", None),
                     original_exception=api_err,
@@ -1864,6 +1959,7 @@ Source QA layers:
                         "exception_class": type(api_err).__name__,
                         "cause_class": type(cause).__name__ if cause is not None else None,
                         "cause_message": str(cause)[:500] if cause is not None else None,
+                        **provider_extra,
                     },
                 )
                 await _emit_qa_evaluator_failed(metadata)

@@ -959,9 +959,10 @@ class TestArbiterConfig:
         assert defaults["arbiter"] == "gpt-5-mini"
 
     def test_arbiter_model_function(self):
-        """_default_arbiter_model should return configured model."""
-        from models import _default_arbiter_model
-        model = _default_arbiter_model()
+        """arbiter.resolve routing should return configured model."""
+        from llm_routing import resolve_call
+
+        model = resolve_call("arbiter.resolve").model
         assert model == "gpt-5-mini"
 
     def test_arbiter_config_values(self):

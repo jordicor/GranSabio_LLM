@@ -152,28 +152,35 @@ class TestShouldUseGransabioTools:
 
     def test_auto_mode_returns_false_when_model_lacks_tool_support(self, tool_loop_config):
         request = ContentRequest(prompt="Test prompt content", gransabio_tools_mode="auto")
+        tool_loop_config.model_specs["model_specifications"]["anthropic"]["claude-sonnet-4-20250514"][
+            "provider_capabilities"
+        ] = {"tool_calling": False}
+        assert _should_use_gransabio_tools(request, "claude-sonnet-4-20250514") is False
+
+    def test_auto_mode_honors_aiservice_tool_calling_patch_point(self, tool_loop_config):
+        request = ContentRequest(prompt="Test prompt content", gransabio_tools_mode="auto")
         with patch("gran_sabio.AIService._supports_tool_calling", return_value=False):
             assert _should_use_gransabio_tools(request, "claude-sonnet-4-20250514") is False
 
     def test_unsupported_provider_returns_false(self, tool_loop_config):
-        tool_loop_config.get_model_info.return_value = {
-            "provider": "some_other_provider",
-            "model_id": "weird-model",
+        tool_loop_config.model_specs["model_specifications"]["some_other_provider"] = {
+            "weird-model": {
+                "model_id": "weird-model",
+                "provider_capabilities": {"tool_calling": True},
+            }
         }
         request = ContentRequest(prompt="Test prompt content", gransabio_tools_mode="auto")
         assert _should_use_gransabio_tools(request, "weird-model") is False
 
     def test_responses_api_model_with_tool_support_returns_true(self, tool_loop_config):
-        tool_loop_config.get_model_info.return_value = {
-            "provider": "openai",
-            "model_id": "gpt-5-pro",
+        tool_loop_config.model_specs["model_specifications"]["openai"] = {
+            "gpt-5-pro": {
+                "model_id": "gpt-5-pro",
+                "capabilities": ["tool_calling", "responses_api"],
+            }
         }
         request = ContentRequest(prompt="Test prompt content", gransabio_tools_mode="auto")
-        with patch(
-            "gran_sabio.AIService._is_openai_responses_api_model",
-            return_value=True,
-        ), patch("gran_sabio.AIService._supports_tool_calling", return_value=True):
-            assert _should_use_gransabio_tools(request, "gpt-5-pro") is True
+        assert _should_use_gransabio_tools(request, "gpt-5-pro") is True
 
 
 class TestReviewMinorityUsesToolLoop:

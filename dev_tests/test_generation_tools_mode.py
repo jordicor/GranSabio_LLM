@@ -109,9 +109,19 @@ def test_auto_mode_supports_non_openai_tool_loop_providers():
         generation_tools_mode="auto",
         generator_model="claude-sonnet-4-5",
     )
+    specs = {
+        "model_specifications": {
+            "anthropic": {
+                "claude-sonnet-4-5": {
+                    "model_id": "claude-sonnet-4-5",
+                    "capabilities": ["tool_calling"],
+                }
+            }
+        }
+    }
 
     with patch("core.generation_processor.has_active_generation_validators", return_value=True), \
-         patch("core.generation_processor.config", Mock(get_model_info=Mock(return_value={"provider": "claude", "model_id": "claude-sonnet-4-5"}))):
+         patch("core.generation_processor.config", Mock(model_specs=specs)):
         assert _should_use_generation_tools(request) is True
 
 
@@ -120,10 +130,19 @@ def test_auto_mode_rejects_models_without_tool_calling_support():
         generation_tools_mode="auto",
         generator_model="unknown-openai-model",
     )
+    specs = {
+        "model_specifications": {
+            "openai": {
+                "unknown-openai-model": {
+                    "model_id": "unknown-openai-model",
+                    "provider_capabilities": {"tool_calling": False},
+                }
+            }
+        }
+    }
 
     with patch("core.generation_processor.has_active_generation_validators", return_value=True), \
-         patch("core.generation_processor.config", Mock(get_model_info=Mock(return_value={"provider": "openai", "model_id": "unknown-openai-model"}))), \
-         patch("core.generation_processor.AIService._supports_tool_calling", return_value=False):
+         patch("core.generation_processor.config", Mock(model_specs=specs)):
         assert _should_use_generation_tools(request) is False
 
 
@@ -132,12 +151,42 @@ def test_auto_mode_accepts_openai_responses_api_models_with_tool_support():
         generation_tools_mode="auto",
         generator_model="gpt-5-pro",
     )
+    specs = {
+        "model_specifications": {
+            "openai": {
+                "gpt-5-pro": {
+                    "model_id": "gpt-5-pro",
+                    "capabilities": ["tool_calling", "responses_api"],
+                }
+            }
+        }
+    }
 
     with patch("core.generation_processor.has_active_generation_validators", return_value=True), \
-         patch("core.generation_processor.config", Mock(get_model_info=Mock(return_value={"provider": "openai", "model_id": "gpt-5-pro"}))), \
-         patch("core.generation_processor.AIService._is_openai_responses_api_model", return_value=True), \
-         patch("core.generation_processor.AIService._supports_tool_calling", return_value=True):
+         patch("core.generation_processor.config", Mock(model_specs=specs)):
         assert _should_use_generation_tools(request) is True
+
+
+def test_auto_mode_honors_aiservice_tool_calling_patch_point():
+    request = SimpleNamespace(
+        generation_tools_mode="auto",
+        generator_model="gpt-4o",
+    )
+    specs = {
+        "model_specifications": {
+            "openai": {
+                "gpt-4o": {
+                    "model_id": "gpt-4o",
+                    "capabilities": ["tool_calling"],
+                }
+            }
+        }
+    }
+
+    with patch("core.generation_processor.has_active_generation_validators", return_value=True), \
+         patch("core.generation_processor.config", Mock(model_specs=specs)), \
+         patch("core.generation_processor.AIService._supports_tool_calling", return_value=False):
+        assert _should_use_generation_tools(request) is False
 
 
 def test_auto_mode_does_not_force_unsupported_provider():
@@ -145,9 +194,19 @@ def test_auto_mode_does_not_force_unsupported_provider():
         generation_tools_mode="auto",
         generator_model="custom-model",
     )
+    specs = {
+        "model_specifications": {
+            "custom": {
+                "custom-model": {
+                    "model_id": "custom-model",
+                    "provider_capabilities": {"tool_calling": True},
+                }
+            }
+        }
+    }
 
     with patch("core.generation_processor.has_active_generation_validators", return_value=True), \
-         patch("core.generation_processor.config", Mock(get_model_info=Mock(return_value={"provider": "custom", "model_id": "custom-model"}))):
+         patch("core.generation_processor.config", Mock(model_specs=specs)):
         assert _should_use_generation_tools(request) is False
 
 

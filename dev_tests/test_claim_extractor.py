@@ -329,17 +329,19 @@ class TestClaimExtractor:
         mock_ai_service.generate_content.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_uses_config_default_model(self, extractor, mock_ai_service):
+    async def test_uses_routed_default_model(self, extractor, mock_ai_service):
         """
         Given: No model specified
         When: extract_claims is called
-        Then: Uses config.EVIDENCE_GROUNDING_MODEL
+        Then: Uses evidence.extract_claims from llm_routing
         """
+        from types import SimpleNamespace
+
         mock_ai_service.generate_content.return_value = '{"claims": []}'
 
         with patch(
-            "evidence_grounding.claim_extractor.config.EVIDENCE_GROUNDING_EXTRACTION_MODEL",
-            "gpt-5-nano",
+            "evidence_grounding.claim_extractor.resolve_call",
+            return_value=SimpleNamespace(model="routed-claims-model", params={}),
         ):
             await extractor.extract_claims(
                 content="Content",
@@ -348,7 +350,7 @@ class TestClaimExtractor:
             )
 
         call_kwargs = mock_ai_service.generate_content.call_args[1]
-        assert call_kwargs["model"] == "gpt-5-nano"
+        assert call_kwargs["model"] == "routed-claims-model"
 
     @pytest.mark.asyncio
     async def test_uses_specified_model(self, extractor, mock_ai_service):

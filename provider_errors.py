@@ -230,6 +230,40 @@ def _feature_error_matches_attempt(
     return False
 
 
+def _is_overload_signal(
+    *,
+    status: Optional[int],
+    err_type: Optional[str],
+    err_code: Optional[str],
+    message: str,
+) -> bool:
+    """Return True only for explicit overload/capacity provider signals."""
+
+    if status == 529:
+        return True
+
+    markers = _normalized_error_markers(err_type, err_code)
+    overload_markers = {
+        "overloaded",
+        "overload",
+        "capacity_exceeded",
+        "server_overloaded",
+        "too_many_requests",
+    }
+    if markers.intersection(overload_markers):
+        return True
+
+    return any(
+        marker in message
+        for marker in (
+            "overloaded",
+            "over capacity",
+            "capacity exceeded",
+            "server is busy",
+        )
+    )
+
+
 def classify_provider_exception(
     exc: BaseException,
     *,
@@ -326,7 +360,16 @@ def classify_provider_exception(
     elif status == 429:
         kind = quota_or_billing_kind or ProviderErrorKind.RATE_LIMITED
     elif status in {500, 502, 503, 529}:
-        kind = ProviderErrorKind.PROVIDER_OVERLOADED if status in {503, 529} else ProviderErrorKind.PROVIDER_DOWN
+        kind = (
+            ProviderErrorKind.PROVIDER_OVERLOADED
+            if _is_overload_signal(
+                status=status,
+                err_type=err_type,
+                err_code=err_code,
+                message=message_lower,
+            )
+            else ProviderErrorKind.PROVIDER_DOWN
+        )
     elif status is None and isinstance(exc, (aiohttp.ClientError, ConnectionError, OSError)):
         kind = ProviderErrorKind.TRANSIENT_NETWORK
     else:

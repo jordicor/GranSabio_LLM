@@ -34,15 +34,17 @@ def _resolve_manager() -> AttachmentManager:
     return AttachmentManager(settings=config.ATTACHMENTS, pepper=pepper)
 
 
-def _resolve_user_root(manager: AttachmentManager, *, username: Optional[str], user_hash: Optional[str]) -> Path:
+def _resolve_user_hash(manager: AttachmentManager, *, username: Optional[str], user_hash: Optional[str]) -> str:
+    if username and user_hash:
+        raise CLIError("Specify either --username or --user-hash, not both")
     if username:
-        prefix1, prefix2, hashed = manager.generate_user_hash(username)
-        return manager._user_root(prefix1, prefix2, hashed)
+        _prefix1, _prefix2, hashed = manager.generate_user_hash(username)
+        return hashed
     if user_hash:
         normalized = user_hash.strip().lower()
-        if len(normalized) < 7:
-            raise CLIError("user_hash must contain at least seven hexadecimal characters")
-        return manager._user_root(normalized[:3], normalized[3:7], normalized)
+        if len(normalized) != 40 or any(ch not in "0123456789abcdef" for ch in normalized):
+            raise CLIError("user_hash must be a full 40-character SHA1 hex digest")
+        return normalized
     raise CLIError("Specify either --username or --user-hash")
 
 
@@ -63,19 +65,11 @@ def _print_table(entries: List[Dict[str, Any]]) -> None:
 
 def _command_list(args: argparse.Namespace) -> int:
     manager = _resolve_manager()
-    user_root = _resolve_user_root(manager, username=args.username, user_hash=args.user_hash)
-    index_file = user_root / "uploads" / "index.json"
-    if not index_file.exists():
-        print("No attachment index found for the provided user.")
-        return 0
-    try:
-        with index_file.open("r", encoding="utf-8") as fh:
-            entries: List[Dict[str, Any]] = json.load(fh)
-    except Exception as exc:  # pragma: no cover - unexpected IO error
-        raise CLIError(f"Unable to read index file: {exc}") from exc
-
-    if args.limit is not None:
-        entries = entries[: args.limit]
+    resolved_hash = _resolve_user_hash(manager, username=args.username, user_hash=args.user_hash)
+    entries = [
+        manager._record_from_store_row(row).model_dump()
+        for row in manager.store.iter_uploads_by_user(user_hash=resolved_hash, limit=args.limit)
+    ]
 
     if args.as_json:
         print(json.dumps(entries, ensure_ascii=False, indent=2))
@@ -139,7 +133,7 @@ def _command_delete(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        result = manager.delete_attachment(
+        manager.delete_attachment(
             username=args.username,
             upload_id=args.upload_id,
             reason="attachments_cli delete",
@@ -147,13 +141,7 @@ def _command_delete(args: argparse.Namespace) -> int:
     except AttachmentError as exc:
         raise CLIError(str(exc)) from exc
 
-    if result.get("db_backed"):
-        print(
-            "Deleted logical DB upload; shared blob was left for garbage collection. "
-            f"Removed {result.get('removed_files', 0)} legacy mirror file(s)."
-        )
-    else:
-        print(f"Removed {result.get('removed_files', 0)} file(s) and rebuilt index for user {args.username}.")
+    print("Deleted logical DB upload; shared blob was left for garbage collection.")
     return 0
 
 

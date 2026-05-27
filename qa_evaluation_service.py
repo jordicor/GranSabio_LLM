@@ -21,6 +21,7 @@ from ai_service import AIRequestError, AIService, StreamChunk
 from config import EDITABLE_CONTENT_TYPES, config
 from deterministic_validation import DraftValidationResult, validate_generation_candidate
 from model_aliasing import ModelAliasRegistry, PromptPart
+from model_capability_registry import resolve_model_capability_context
 from models import QAEvaluation, is_json_output_requested
 from phrase_frequency_config import is_phrase_frequency_active
 from qa_bypass_engine import QABypassEngine
@@ -109,15 +110,17 @@ def _should_use_qa_tools(
     if not _has_structured_request_validators(request):
         return False
 
-    try:
-        model_info = config.get_model_info(model)
-    except Exception:
+    specs = getattr(config, "model_specs", {}) or {}
+    context = resolve_model_capability_context(model, specs)
+    if context.status != "resolved":
         return False
 
-    provider_key = str(model_info.get("provider", "") or "").lower()
-    model_id = str(model_info.get("model_id", "") or "").lower()
-
-    if not AIService._supports_tool_calling(provider_key, model_id):
+    if not AIService._supports_generation_validation_tool_loop(
+        context.provider,
+        context.model_id,
+        model_data=context.model_data,
+        specs=specs,
+    ):
         return False
 
     return True

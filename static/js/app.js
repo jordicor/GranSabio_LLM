@@ -1539,12 +1539,7 @@ class GranSabioInterface {
 
     loadDefaultQAModels() {
         const configuredDefaults = Array.isArray(this.modelDefaults.qa) ? this.modelDefaults.qa : [];
-        const recommendedDefaults = [
-            'claude-sonnet-4-20250514',
-            'gpt-4o',
-            'gemini-3-flash-preview'
-        ];
-        const defaultModels = configuredDefaults.length > 0 ? configuredDefaults : recommendedDefaults;
+        const defaultModels = configuredDefaults;
 
         defaultModels.forEach(modelKey => {
             const modelData = this.qaModels.find(m => m.key === modelKey);

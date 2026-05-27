@@ -1,5 +1,6 @@
 """Focused regressions for the /monitor project stream event contract."""
 
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -29,6 +30,7 @@ def test_frontend_phase_mapping_and_analysis_contract():
 
 def test_frontend_structured_events_and_terminal_statuses_are_known():
     source = STREAM_MONITOR_JS.read_text(encoding="utf-8")
+    template = STREAM_MONITOR_TEMPLATE.read_text(encoding="utf-8")
 
     for status in ("auto_qa_rejected", "preflight_rejected", "cancelled"):
         assert status in source
@@ -67,9 +69,53 @@ def test_frontend_structured_events_and_terminal_statuses_are_known():
     assert "content_snapshot" in source
     assert "shouldRenderRequestScopedPanelEvent(data, 'smartedit')" in source
     assert "appendStructuredEventForRequest(data, line, displayPhase)" in source
+    assert "handleThinkingEvent(data, displayPhase)" in source
+    assert "appendThinkingContent(displayPhase, thinkingText" in source
+    assert "buildGroupedQAContent(iter)" in source
+    assert "indexQAContent(iterData, data, line)" in source
+    assert "describeEventForLog(data)" in source
+    assert "eventType !== 'chunk' && !isThinkingEvent(data)" in source
+    assert "data.is_thinking === true" in source
+    assert "renderStatusPanel()" in source
+    assert "recordStatusPanelEvent(" in source
+    assert "'STATUS_CHANGE'," in source
+    assert "trigger=${triggeredBy} active=${activeSessions} completed=${completedSessions}" in source
+    assert "markStatusPanelProjectTerminal(status)" in source
+    assert "const RECEIVING_IDLE_TIMEOUT_MS = 1200" in source
+    assert "finalizeMonitorStream(terminalStatusFromStreamEndReason(data.reason))" in source
+    assert "maybeFinalizeMonitorFromStatusPanel()" in source
+    assert "setBadge(phase, getPhaseRestingBadgeStatus(phase))" in source
+    assert ".thinking-indicator" in template
+    assert ".monitor-token" in template
+    assert ".log-repeat-count" in template
+    assert ".status-live-summary" in template
+    assert ".status-event-count" in template
+    assert ".stream-badge.completed" in template
+    assert ".status-indicator.completed" in template
+    assert "grid-template-columns: 72px minmax(0, 1fr)" in template
     assert "TOOL_STREAM" in source
     assert "eventType === 'tool_call_delta'" in source
     assert "if (!line)" in source
+    assert "appendContent('status'" not in source
+    assert "Event: ${eventType} (phase:" not in source
+
+
+def test_project_phase_events_can_mark_thinking_chunks():
+    from core.app_state import _build_project_phase_event
+
+    payload = json.loads(
+        _build_project_phase_event(
+            event="chunk",
+            phase="generation",
+            content="reasoning preview",
+            is_thinking=True,
+        )
+    )
+
+    assert payload["type"] == "chunk"
+    assert payload["phase"] == "generation"
+    assert payload["content"] == "reasoning preview"
+    assert payload["is_thinking"] is True
 
 
 def test_backend_tool_loop_visible_chunks_decode_streamed_text_argument():

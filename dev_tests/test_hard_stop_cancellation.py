@@ -69,6 +69,15 @@ def _fake_model_specs() -> dict:
     }
 
 
+def _fake_route_llm_routing() -> dict:
+    return {
+        "calls": {
+            "preflight.validate": {"model": "fake-preflight"},
+            "long_text.semantic_eval": {"model": "fake-preflight"},
+        }
+    }
+
+
 def test_generation_streaming_retry_helper_respects_ai_request_provider_failure():
     class BadRequest(Exception):
         status_code = 400
@@ -1465,6 +1474,7 @@ async def test_generate_pause_during_preflight_preserves_cancelled_temp_session(
         auto_qa={"enabled": False},
         long_text_mode="off",
         project_id=project_id,
+        llm_routing=_fake_route_llm_routing(),
     )
     preflight_result = PreflightResult(
         decision="proceed",
@@ -1520,6 +1530,7 @@ async def test_generate_hard_stop_during_preflight_reject_preserves_cancelled_te
         auto_qa={"enabled": False},
         long_text_mode="off",
         project_id=project_id,
+        llm_routing=_fake_route_llm_routing(),
     )
     reject_result = PreflightResult(
         decision="reject",
@@ -1575,6 +1586,7 @@ async def test_generate_soft_cancelled_preflight_exception_preserves_cancelled_s
         auto_qa={"enabled": False},
         long_text_mode="off",
         project_id=project_id,
+        llm_routing=_fake_route_llm_routing(),
     )
     background_started = asyncio.Event()
 

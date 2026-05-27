@@ -160,7 +160,7 @@ Define what "quality" means for YOUR use case:
 }
 ```
 
-QA scheduling is configurable through `qa_execution_mode`, `on_qa_model_unavailable`, `on_qa_timeout`, `min_valid_qa_models`, `min_valid_qa_model_ratio`, and `qa_replacement_policy`. The default `auto` mode uses progressive quorum for deal-breaker layers, so it may stop once a reliable quorum is guaranteed, and bounded parallel execution for normal scoring layers.
+QA scheduling is configurable through `qa_execution_mode`, `on_qa_model_unavailable`, `on_qa_timeout`, `min_valid_qa_models`, `min_valid_qa_model_ratio`, and `qa_replacement_policy`. The default `auto` mode uses progressive quorum for deal-breaker layers, so it may stop once a reliable quorum is guaranteed, and bounded parallel execution for normal scoring layers. Retryable QA provider failures use the bounded `MAX_QA_PROVIDER_RETRIES` budget before the evaluator is marked as a technical failure.
 
 ---
 
@@ -539,6 +539,8 @@ PEPPER=any-random-string-here
 
 > **Note:** You only need keys for the providers you want to use. At minimum, configure one provider.
 
+For local Ollama models, `OLLAMA_MAX_CONCURRENT_REQUESTS` defaults to `1` so local generation and QA model calls are queued instead of hitting the same GPU in parallel. Increase it only if your local hardware can handle concurrent Ollama requests.
+
 ### 3. Start the Server
 
 ```bash
@@ -569,6 +571,44 @@ curl -X POST "http://localhost:8000/generate" \
     "max_iterations": 3
   }'
 ```
+
+### Model Routing
+
+Runtime model defaults live in `llm_routing.default.json`. Requests can still
+override exact call sites through `llm_routing.calls` without changing platform
+configuration or `model_specs.json`.
+
+```json
+{
+  "prompt": "Write a 500-word technical summary of the attached notes",
+  "content_type": "technical",
+  "llm_routing": {
+    "calls": {
+      "generation.main": {
+        "model": "your-generator-model"
+      },
+      "qa.evaluate_layer": {
+        "models": [
+          {"model": "your-qa-model"}
+        ]
+      }
+    }
+  },
+  "qa_layers": [
+    {
+      "name": "Completeness",
+      "description": "Checks whether the answer covers the requested points",
+      "criteria": "Verify that the summary covers all important points from the prompt",
+      "min_score": 8.0
+    }
+  ]
+}
+```
+
+Run the API on `0.0.0.0` for LAN access. Other PCs should call the Gran Sabio
+server; Ollama only needs to be reachable from the machine running the API.
+Keep `llm_accent_guard` off in this preset; that audit path uses a global model
+setting and is rejected for strict offline requests.
 
 ---
 
@@ -650,6 +690,8 @@ Group multiple sessions under a single project ID:
 | `/api/admin/models/catalog/{provider}` | PATCH | Enable or disable one local catalog model |
 | `/api/admin/models/catalog/{provider}` | DELETE | Remove one local catalog model |
 | `/api/admin/models/sync-all` | POST | Sync the provider/model selection supplied in the request body |
+
+Provider sync covers OpenAI, Anthropic, Google, xAI, OpenRouter, and local Ollama models from `OLLAMA_HOST` via Ollama's native `/api/version` and `/api/tags` endpoints.
 
 ---
 

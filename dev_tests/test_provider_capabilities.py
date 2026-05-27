@@ -5,7 +5,14 @@ from types import SimpleNamespace
 import aiohttp
 
 from provider_capabilities import CapabilitySupport
-from model_capability_registry import model_supports
+from model_capability_registry import (
+    model_qualifies_for_inline_accent_guard,
+    model_supports,
+    model_supports_generation_validation_tool_loop,
+    model_supports_long_text_section_tool_loop,
+    model_uses_responses_api,
+    resolve_model_capability_context,
+)
 from provider_errors import ProviderErrorKind, classify_provider_exception
 
 
@@ -91,6 +98,119 @@ def test_explicit_provider_capability_overrides_docs_rule():
     assert state.support == CapabilitySupport.UNSUPPORTED
 
 
+def test_model_uses_responses_api_matches_key_model_id_and_overrides():
+    specs = {
+        "model_specifications": {
+            "openai": {
+                "gpt-5-pro": {
+                    "model_id": "gpt-5-pro-2025-10-06",
+                    "capabilities": ["responses_api"],
+                },
+                "gpt-5-chat": {
+                    "model_id": "gpt-5-chat",
+                    "provider_capabilities": {"responses_api": False},
+                    "capabilities": ["responses_api"],
+                },
+            }
+        }
+    }
+
+    assert model_uses_responses_api("openai", "gpt-5-pro", specs) is True
+    assert model_uses_responses_api("openai", "gpt-5-pro-2025-10-06", specs) is True
+    assert model_uses_responses_api("openai", "missing-model", specs) is False
+    assert model_uses_responses_api("openai", "gpt-5-chat", specs) is False
+
+
+def test_resolve_model_capability_context_statuses_without_credentials():
+    specs = {
+        "model_specifications": {
+            "openai": {
+                "gpt-ok": {
+                    "model_id": "gpt-ok",
+                    "capabilities": ["tool_calling"],
+                },
+                "gpt-disabled": {
+                    "model_id": "gpt-disabled",
+                    "enabled": False,
+                    "capabilities": ["tool_calling"],
+                },
+            }
+        }
+    }
+
+    resolved = resolve_model_capability_context("gpt-ok", specs)
+    disabled = resolve_model_capability_context("gpt-disabled", specs)
+    missing = resolve_model_capability_context("gpt-missing", specs)
+
+    assert resolved.status == "resolved"
+    assert resolved.provider == "openai"
+    assert resolved.model_id == "gpt-ok"
+    assert disabled.status == "disabled"
+    assert missing.status == "unresolved"
+
+
+def test_generation_validation_tool_loop_runtime_matrix_and_openrouter_tools():
+    specs = {
+        "model_specifications": {
+            "custom": {
+                "custom-tool-model": {
+                    "model_id": "custom-tool-model",
+                    "provider_capabilities": {"tool_calling": True},
+                }
+            },
+            "openai": {
+                "gpt-tool": {
+                    "model_id": "gpt-tool",
+                    "provider_capabilities": {"tool_calling": True},
+                },
+                "gpt-no-tool": {
+                    "model_id": "gpt-no-tool",
+                    "provider_capabilities": {"tool_calling": False},
+                },
+            },
+            "openrouter": {
+                "vendor/with-tools": {
+                    "model_id": "vendor/with-tools",
+                    "supported_parameters": ["tools"],
+                },
+                "vendor/no-tools": {
+                    "model_id": "vendor/no-tools",
+                    "provider_capabilities": {"tool_calling": True},
+                    "supported_parameters": ["response_format"],
+                },
+            },
+        }
+    }
+
+    assert model_supports_generation_validation_tool_loop("custom", "custom-tool-model", specs) is False
+    assert model_supports_generation_validation_tool_loop("openai", "gpt-tool", specs) is True
+    assert model_supports_generation_validation_tool_loop("openai", "gpt-no-tool", specs) is False
+    assert model_supports_generation_validation_tool_loop("openrouter", "vendor/with-tools", specs) is True
+    assert model_supports_generation_validation_tool_loop("openrouter", "vendor/no-tools", specs) is False
+
+
+def test_inline_and_long_text_wrappers_exclude_openai_responses_api():
+    specs = {
+        "model_specifications": {
+            "openai": {
+                "gpt-4o": {
+                    "model_id": "gpt-4o",
+                    "capabilities": ["tool_calling"],
+                },
+                "gpt-5-pro": {
+                    "model_id": "gpt-5-pro",
+                    "capabilities": ["tool_calling", "responses_api"],
+                },
+            }
+        }
+    }
+
+    assert model_qualifies_for_inline_accent_guard("openai", "gpt-4o", specs) is True
+    assert model_supports_long_text_section_tool_loop("openai", "gpt-4o", specs) is True
+    assert model_qualifies_for_inline_accent_guard("openai", "gpt-5-pro", specs) is False
+    assert model_supports_long_text_section_tool_loop("openai", "gpt-5-pro", specs) is False
+
+
 def test_tool_calling_docs_rules_cover_known_provider_model_families():
     specs = {"model_specifications": {}}
 
@@ -143,6 +263,38 @@ def test_429_plain_rate_limit_remains_retryable():
     )
 
     assert failure.kind == ProviderErrorKind.RATE_LIMITED
+    assert failure.retryable is True
+
+
+def test_gemini_503_unavailable_is_provider_down_not_overloaded():
+    class GeminiUnavailableError(Exception):
+        status_code = 503
+        body = {"error": {"code": 503, "status": "UNAVAILABLE"}}
+
+    failure = classify_provider_exception(
+        GeminiUnavailableError("The service is currently unavailable."),
+        provider="gemini",
+        model_id="gemini-3-flash-preview",
+        operation="tool_loop_generation",
+    )
+
+    assert failure.kind == ProviderErrorKind.PROVIDER_DOWN
+    assert failure.retryable is True
+
+
+def test_529_capacity_signal_remains_provider_overloaded():
+    class ProviderOverloadedError(Exception):
+        status_code = 529
+        body = {"error": {"code": "overloaded", "type": "server_overloaded"}}
+
+    failure = classify_provider_exception(
+        ProviderOverloadedError("server overloaded"),
+        provider="anthropic",
+        model_id="claude-sonnet-4-5",
+        operation="generation",
+    )
+
+    assert failure.kind == ProviderErrorKind.PROVIDER_OVERLOADED
     assert failure.retryable is True
 
 

@@ -15,6 +15,7 @@ import json_utils as json
 from ai_service import StreamChunk
 from attachments_router import get_attachment_manager
 from config import config
+from llm_routing import resolve_call
 from models import GenerationStatus
 from services.attachment_manager import AttachmentError
 from services.project_stream import ProjectStreamManager, SubscriptionError, parse_phases
@@ -123,10 +124,12 @@ async def stream_content_direct_v2(session_id: str):
             if word_instructions:
                 prompt_sections.append(word_instructions)
             final_prompt = "\n\n".join(section.strip() for section in prompt_sections if section)
-            requested_max_tokens = getattr(request_data, 'max_tokens', None)
+            route = resolve_call("generation.direct_stream", request=request_data)
+            route_params = route.params
+            requested_max_tokens = route_params.get("max_tokens", getattr(request_data, 'max_tokens', None))
             if requested_max_tokens is None:
                 requested_max_tokens = _model_default_max_tokens(
-                    getattr(request_data, 'generator_model', '')
+                    route.model
                 )
 
             async def direct_stream_cancelled() -> bool:
@@ -134,12 +137,13 @@ async def stream_content_direct_v2(session_id: str):
 
             async for chunk in ai_service.generate_content_stream(
                 prompt=final_prompt,
-                model=request_data.generator_model,
-                temperature=request_data.temperature,
+                model=route.model,
+                temperature=route_params.get("temperature", request_data.temperature),
                 max_tokens=requested_max_tokens,
-                reasoning_effort=getattr(request_data, 'reasoning_effort', None),
-                thinking_budget_tokens=getattr(request_data, 'thinking_budget_tokens', None),
+                reasoning_effort=route_params.get("reasoning_effort", getattr(request_data, 'reasoning_effort', None)),
+                thinking_budget_tokens=route_params.get("thinking_budget_tokens", getattr(request_data, 'thinking_budget_tokens', None)),
                 content_type=getattr(request_data, 'content_type', 'biography'),
+                llm_routing=getattr(request_data, "_llm_routing", None),
                 cancellation_token=cancellation_token,
                 cancel_callback=direct_stream_cancelled,
             ):

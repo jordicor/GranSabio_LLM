@@ -379,7 +379,7 @@ class AsyncGranSabioClient:
         self,
         prompt: str,
         content_type: str = "article",
-        generator_model: str = "gpt-4o",
+        generator_model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         min_words: Optional[int] = None,
@@ -388,7 +388,7 @@ class AsyncGranSabioClient:
         qa_layers: Optional[List[Dict[str, Any]]] = None,
         min_global_score: float = 8.0,
         max_iterations: int = 3,
-        gran_sabio_model: str = "claude-opus-4-6",
+        gran_sabio_model: Optional[str] = None,
         gran_sabio_fallback: bool = True,
         verbose: bool = True,
         project_id: Optional[str] = None,
@@ -448,11 +448,9 @@ class AsyncGranSabioClient:
         payload = {
             "prompt": prompt,
             "content_type": content_type,
-            "generator_model": generator_model,
             "temperature": temperature,
             "min_global_score": min_global_score,
             "max_iterations": max_iterations,
-            "gran_sabio_model": gran_sabio_model,
             "gran_sabio_fallback": gran_sabio_fallback,
             "verbose": verbose,
         }
@@ -464,10 +462,14 @@ class AsyncGranSabioClient:
             payload["max_words"] = max_words
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        if generator_model is not None:
+            payload["generator_model"] = generator_model
         if qa_models is not None:
             payload["qa_models"] = qa_models
         if qa_layers is not None:
             payload["qa_layers"] = qa_layers
+        if gran_sabio_model is not None:
+            payload["gran_sabio_model"] = gran_sabio_model
         if project_id:
             payload["project_id"] = project_id
         if request_name:
@@ -1055,7 +1057,7 @@ class AsyncGranSabioClient:
         self,
         prompt: str,
         schema: Dict[str, Any],
-        model: str = "gpt-4o",
+        model: Optional[str] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -1095,7 +1097,7 @@ class AsyncGranSabioClient:
     async def generate_fast(
         self,
         prompt: str,
-        model: str = "gpt-4o-mini",
+        model: Optional[str] = None,
         max_tokens: int = 2000,
         **kwargs
     ) -> Dict[str, Any]:
@@ -1560,7 +1562,7 @@ class AsyncGranSabioClient:
         prompt: str,
         *,
         content_type: str = "article",
-        generator_model: str = "gpt-4o",
+        generator_model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         min_words: Optional[int] = None,
@@ -1569,7 +1571,7 @@ class AsyncGranSabioClient:
         qa_layers: Optional[List[Dict[str, Any]]] = None,
         min_global_score: float = 8.0,
         max_iterations: int = 3,
-        gran_sabio_model: str = "claude-opus-4-6",
+        gran_sabio_model: Optional[str] = None,
         gran_sabio_fallback: bool = True,
         verbose: bool = True,
         project_id: Optional[str] = None,
@@ -1633,7 +1635,6 @@ class AsyncGranSabioClient:
         # Build the kwargs dict for generate(), forwarding all explicit params
         gen_kwargs: Dict[str, Any] = {
             "content_type": content_type,
-            "generator_model": generator_model,
             "temperature": temperature,
             "min_words": min_words,
             "max_words": max_words,
@@ -1641,7 +1642,6 @@ class AsyncGranSabioClient:
             "qa_layers": qa_layers,
             "min_global_score": min_global_score,
             "max_iterations": max_iterations,
-            "gran_sabio_model": gran_sabio_model,
             "gran_sabio_fallback": gran_sabio_fallback,
             "verbose": verbose,
             "project_id": project_id,
@@ -1655,6 +1655,10 @@ class AsyncGranSabioClient:
             "thinking_budget_tokens": thinking_budget_tokens,
             "wait_for_completion": False,
         }
+        if generator_model is not None:
+            gen_kwargs["generator_model"] = generator_model
+        if gran_sabio_model is not None:
+            gen_kwargs["gran_sabio_model"] = gran_sabio_model
         if max_tokens is not None:
             gen_kwargs["max_tokens"] = max_tokens
         gen_kwargs.update(kwargs)

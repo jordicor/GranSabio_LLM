@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from model_aliasing import PromptPart
+from model_capability_registry import resolve_model_capability_context
 
 if TYPE_CHECKING:
     from smart_edit import TextEditRange
@@ -570,8 +571,9 @@ class Arbiter:
         """Get the default economic model for arbitration."""
         if self._model:
             return self._model
-        from config import get_default_models
-        return get_default_models().get("arbiter", "gpt-5-mini")
+        from llm_routing import resolve_call
+
+        return str(resolve_call("arbiter.resolve").model)
 
     # =========================================================================
     # DISTRIBUTION CLASSIFICATION METHODS
@@ -1217,19 +1219,21 @@ class Arbiter:
         if not model:
             return False
 
-        from ai_service import AIService
         from config import config as _config
 
-        try:
-            info = _config.get_model_info(model)
-        except Exception:
+        specs = getattr(_config, "model_specs", {}) or {}
+        context = resolve_model_capability_context(model, specs)
+        if context.status != "resolved":
             return False
 
-        provider_raw = info.get("provider", "") if isinstance(info, dict) else ""
-        model_id = info.get("model_id", model) if isinstance(info, dict) else model
-        provider_key = AIService._normalize_tool_loop_provider(provider_raw)
+        from ai_service import AIService
 
-        if not AIService._supports_tool_calling(provider_key, str(model_id).lower()):
+        if not AIService._supports_generation_validation_tool_loop(
+            context.provider,
+            context.model_id,
+            model_data=context.model_data,
+            specs=specs,
+        ):
             return False
 
         return True

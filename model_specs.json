@@ -15759,15 +15759,24 @@
         "output_tokens": 8192,
         "context_window": 32768,
         "pricing": {
-          "input_per_million": 0,
-          "output_per_million": 0
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
         },
         "capabilities": [
           "text",
           "reasoning"
         ],
-        "verified_at": "2025-11-28T00:00:00+00:00",
-        "source": "local/ollama"
+        "verified_at": "2026-05-25T17:06:24.247012+00:00",
+        "source": "local/ollama",
+        "supported_parameters": [],
+        "sync_metadata": {
+          "managed_by_ui": true,
+          "provider_sync": "ollama",
+          "sync_mode": "full",
+          "last_synced_at": "2026-05-25T17:06:24.247012+00:00",
+          "remote_created_at": "2025-11-28T21:35:23.5956382+01:00",
+          "needs_review": false
+        }
       },
       "gpt-oss:120b": {
         "model_id": "gpt-oss:120b",
@@ -15777,14 +15786,23 @@
         "output_tokens": 8192,
         "context_window": 32768,
         "pricing": {
-          "input_per_million": 0,
-          "output_per_million": 0
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
         },
         "capabilities": [
           "text"
         ],
-        "verified_at": "2025-11-28T00:00:00+00:00",
-        "source": "local/ollama"
+        "verified_at": "2026-05-25T17:06:24.247012+00:00",
+        "source": "local/ollama",
+        "supported_parameters": [],
+        "sync_metadata": {
+          "managed_by_ui": true,
+          "provider_sync": "ollama",
+          "sync_mode": "full",
+          "last_synced_at": "2026-05-25T17:06:24.247012+00:00",
+          "remote_created_at": "2025-11-28T20:59:35.5363703+01:00",
+          "needs_review": false
+        }
       },
       "gpt-oss:20b": {
         "model_id": "gpt-oss:20b",
@@ -15794,32 +15812,23 @@
         "output_tokens": 8192,
         "context_window": 32768,
         "pricing": {
-          "input_per_million": 0,
-          "output_per_million": 0
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
         },
         "capabilities": [
           "text"
         ],
-        "verified_at": "2025-11-28T00:00:00+00:00",
-        "source": "local/ollama"
-      },
-      "qwen3:30b-a3b": {
-        "model_id": "qwen3:30b-a3b",
-        "name": "Qwen3 30B A3B",
-        "description": "Qwen3 MoE model running locally via Ollama (30.5B parameters, Q4_K_M quantization)",
-        "input_tokens": 32768,
-        "output_tokens": 8192,
-        "context_window": 32768,
-        "pricing": {
-          "input_per_million": 0,
-          "output_per_million": 0
-        },
-        "capabilities": [
-          "text",
-          "reasoning"
-        ],
-        "verified_at": "2025-11-28T00:00:00+00:00",
-        "source": "local/ollama"
+        "verified_at": "2026-05-25T17:06:24.247012+00:00",
+        "source": "local/ollama",
+        "supported_parameters": [],
+        "sync_metadata": {
+          "managed_by_ui": true,
+          "provider_sync": "ollama",
+          "sync_mode": "full",
+          "last_synced_at": "2026-05-25T17:06:24.247012+00:00",
+          "remote_created_at": "2025-11-28T20:03:30.8830782+01:00",
+          "needs_review": false
+        }
       },
       "qwen2.5:14b": {
         "model_id": "qwen2.5:14b",
@@ -15829,14 +15838,316 @@
         "output_tokens": 8192,
         "context_window": 32768,
         "pricing": {
-          "input_per_million": 0,
-          "output_per_million": 0
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
         },
         "capabilities": [
           "text"
         ],
-        "verified_at": "2025-11-28T00:00:00+00:00",
-        "source": "local/ollama"
+        "verified_at": "2026-05-25T17:06:24.247012+00:00",
+        "source": "local/ollama",
+        "supported_parameters": [],
+        "sync_metadata": {
+          "managed_by_ui": true,
+          "provider_sync": "ollama",
+          "sync_mode": "full",
+          "last_synced_at": "2026-05-25T17:06:24.247012+00:00",
+          "remote_created_at": "2025-11-28T20:05:26.1924776+01:00",
+          "needs_review": false
+        }
+      },
+      "qwen3:30b-a3b": {
+        "model_id": "qwen3:30b-a3b",
+        "name": "Qwen3 30B A3B",
+        "description": "Qwen3 MoE model running locally via Ollama (30.5B parameters, Q4_K_M quantization)",
+        "input_tokens": 32768,
+        "output_tokens": 8192,
+        "context_window": 32768,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text",
+          "reasoning"
+        ],
+        "verified_at": "2026-05-25T17:06:24.247012+00:00",
+        "source": "local/ollama",
+        "supported_parameters": [],
+        "sync_metadata": {
+          "managed_by_ui": true,
+          "provider_sync": "ollama",
+          "sync_mode": "full",
+          "last_synced_at": "2026-05-25T17:06:24.247012+00:00",
+          "remote_created_at": "2025-11-28T20:08:42.6060074+01:00",
+          "needs_review": false
+        }
+      },
+      "gemma3:27b": {
+        "model_id": "gemma3:27b",
+        "name": "gemma3:27b",
+        "description": "gemma3:27b running locally via Ollama (27.4B, Q4_K_M quantization).",
+        "input_tokens": 32768,
+        "output_tokens": 8192,
+        "context_window": 32768,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text"
+        ],
+        "supported_parameters": [],
+        "verified_at": "2026-05-25T17:06:24.247012+00:00",
+        "source": "local/ollama",
+        "sync_metadata": {
+          "managed_by_ui": true,
+          "provider_sync": "ollama",
+          "sync_mode": "full",
+          "last_synced_at": "2026-05-25T17:06:24.247012+00:00",
+          "remote_created_at": "2025-11-28T23:08:49.8141882+01:00",
+          "needs_review": false
+        }
+      },
+      "gemma4:26b": {
+        "model_id": "gemma4:26b",
+        "name": "gemma4:26b",
+        "description": "gemma4:26b running locally via Ollama (25.8B, Q4_K_M quantization).",
+        "input_tokens": 32768,
+        "output_tokens": 8192,
+        "context_window": 32768,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text"
+        ],
+        "supported_parameters": [],
+        "verified_at": "2026-05-25T17:06:24.247012+00:00",
+        "source": "local/ollama",
+        "sync_metadata": {
+          "managed_by_ui": true,
+          "provider_sync": "ollama",
+          "sync_mode": "full",
+          "last_synced_at": "2026-05-25T17:06:24.247012+00:00",
+          "remote_created_at": "2026-04-07T18:14:32.9508141+02:00",
+          "needs_review": false
+        }
+      },
+      "mistral-small3.2:24b": {
+        "model_id": "mistral-small3.2:24b",
+        "name": "mistral-small3.2:24b",
+        "description": "mistral-small3.2:24b running locally via Ollama (24.0B, Q4_K_M quantization).",
+        "input_tokens": 32768,
+        "output_tokens": 8192,
+        "context_window": 32768,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text"
+        ],
+        "supported_parameters": [],
+        "verified_at": "2026-05-25T17:06:24.247012+00:00",
+        "source": "local/ollama",
+        "sync_metadata": {
+          "managed_by_ui": true,
+          "provider_sync": "ollama",
+          "sync_mode": "full",
+          "last_synced_at": "2026-05-25T17:06:24.247012+00:00",
+          "remote_created_at": "2026-05-24T23:10:30.1134188+02:00",
+          "needs_review": false
+        }
+      },
+      "nemotron-3-nano:latest": {
+        "model_id": "nemotron-3-nano:latest",
+        "name": "nemotron-3-nano:latest",
+        "description": "nemotron-3-nano:latest running locally via Ollama (31.6B, Q4_K_M quantization).",
+        "input_tokens": 32768,
+        "output_tokens": 8192,
+        "context_window": 32768,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text"
+        ],
+        "supported_parameters": [],
+        "verified_at": "2026-05-25T17:06:24.247012+00:00",
+        "source": "local/ollama",
+        "sync_metadata": {
+          "managed_by_ui": true,
+          "provider_sync": "ollama",
+          "sync_mode": "full",
+          "last_synced_at": "2026-05-25T17:06:24.247012+00:00",
+          "remote_created_at": "2026-04-07T18:57:11.2356291+02:00",
+          "needs_review": false
+        }
+      },
+      "qwen3.5:35b-a3b": {
+        "model_id": "qwen3.5:35b-a3b",
+        "name": "Qwen3 30B A3B",
+        "description": "Qwen3 MoE model running locally via Ollama (30.5B parameters, Q4_K_M quantization)",
+        "input_tokens": 32768,
+        "output_tokens": 8192,
+        "context_window": 32768,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text",
+          "reasoning"
+        ],
+        "supported_parameters": [],
+        "verified_at": "2026-05-25T17:06:24.247012+00:00",
+        "source": "local/ollama",
+        "sync_metadata": {
+          "managed_by_ui": true,
+          "provider_sync": "ollama",
+          "sync_mode": "full",
+          "last_synced_at": "2026-05-25T17:06:24.247012+00:00",
+          "remote_created_at": "2026-04-07T18:42:10.9220648+02:00",
+          "needs_review": false
+        }
+      },
+      "qwen3:8b": {
+        "model_id": "qwen3:8b",
+        "name": "Qwen3 30B A3B",
+        "description": "Qwen3 MoE model running locally via Ollama (30.5B parameters, Q4_K_M quantization)",
+        "input_tokens": 32768,
+        "output_tokens": 8192,
+        "context_window": 32768,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text",
+          "reasoning"
+        ],
+        "supported_parameters": [],
+        "verified_at": "2026-05-25T17:06:24.247012+00:00",
+        "source": "local/ollama",
+        "sync_metadata": {
+          "managed_by_ui": true,
+          "provider_sync": "ollama",
+          "sync_mode": "full",
+          "last_synced_at": "2026-05-25T17:06:24.247012+00:00",
+          "remote_created_at": "2026-04-07T19:36:26.4953708+02:00",
+          "needs_review": false
+        }
+      },
+      "qwen3-coder:30b": {
+        "model_id": "qwen3-coder:30b",
+        "name": "Qwen3 30B A3B",
+        "description": "Qwen3 MoE model running locally via Ollama (30.5B parameters, Q4_K_M quantization)",
+        "input_tokens": 32768,
+        "output_tokens": 8192,
+        "context_window": 32768,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text",
+          "reasoning"
+        ],
+        "supported_parameters": [],
+        "verified_at": "2026-05-25T17:06:24.247012+00:00",
+        "source": "local/ollama",
+        "sync_metadata": {
+          "managed_by_ui": true,
+          "provider_sync": "ollama",
+          "sync_mode": "full",
+          "last_synced_at": "2026-05-25T17:06:24.247012+00:00",
+          "remote_created_at": "2026-05-24T23:28:28.8408925+02:00",
+          "needs_review": false
+        }
+      },
+      "qwen3.6:27b": {
+        "model_id": "qwen3.6:27b",
+        "name": "Qwen3 30B A3B",
+        "description": "Qwen3 MoE model running locally via Ollama (30.5B parameters, Q4_K_M quantization)",
+        "input_tokens": 32768,
+        "output_tokens": 8192,
+        "context_window": 32768,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text",
+          "reasoning"
+        ],
+        "supported_parameters": [],
+        "verified_at": "2026-05-25T17:06:24.247012+00:00",
+        "source": "local/ollama",
+        "sync_metadata": {
+          "managed_by_ui": true,
+          "provider_sync": "ollama",
+          "sync_mode": "full",
+          "last_synced_at": "2026-05-25T17:06:24.247012+00:00",
+          "remote_created_at": "2026-05-25T02:17:34.1273937+02:00",
+          "needs_review": false
+        }
+      },
+      "qwen3.6-27b-16k:local": {
+        "model_id": "qwen3.6-27b-16k:local",
+        "name": "Qwen3 30B A3B",
+        "description": "Qwen3 MoE model running locally via Ollama (30.5B parameters, Q4_K_M quantization)",
+        "input_tokens": 32768,
+        "output_tokens": 8192,
+        "context_window": 32768,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text",
+          "reasoning"
+        ],
+        "supported_parameters": [],
+        "verified_at": "2026-05-25T17:06:24.247012+00:00",
+        "source": "local/ollama",
+        "sync_metadata": {
+          "managed_by_ui": true,
+          "provider_sync": "ollama",
+          "sync_mode": "full",
+          "last_synced_at": "2026-05-25T17:06:24.247012+00:00",
+          "remote_created_at": "2026-05-25T02:19:42.8448208+02:00",
+          "needs_review": false
+        }
+      },
+      "qwen36_27b_16k:latest": {
+        "model_id": "qwen36_27b_16k:latest",
+        "name": "Qwen3 30B A3B",
+        "description": "Qwen3 MoE model running locally via Ollama (30.5B parameters, Q4_K_M quantization)",
+        "input_tokens": 32768,
+        "output_tokens": 8192,
+        "context_window": 32768,
+        "pricing": {
+          "input_per_million": 0.0,
+          "output_per_million": 0.0
+        },
+        "capabilities": [
+          "text",
+          "reasoning"
+        ],
+        "supported_parameters": [],
+        "verified_at": "2026-05-25T17:06:24.247012+00:00",
+        "source": "local/ollama",
+        "sync_metadata": {
+          "managed_by_ui": true,
+          "provider_sync": "ollama",
+          "sync_mode": "full",
+          "last_synced_at": "2026-05-25T17:06:24.247012+00:00",
+          "remote_created_at": "2026-05-25T02:25:38.610265+02:00",
+          "needs_review": false
+        }
       }
     },
     "fake": {
@@ -15956,15 +16267,6 @@
     "claude-haiku": "claude-haiku-4-5",
     "gemini-pro": "gemini-3.1-pro-preview",
     "gemini-flash": "gemini-2.5-flash"
-  },
-  "default_models": {
-    "gran_sabio": "claude-opus-4-6",
-    "gran_sabio_fallback": "claude-opus-4-6",
-    "premium_generator": "claude-sonnet-4-6",
-    "standard_generator": "gpt-5.1",
-    "fast_qa": "claude-haiku-4-5",
-    "reasoning": "gpt-5-mini",
-    "arbiter": "gpt-5-mini"
   },
   "token_validation": {
     "default_max_input": 100000,

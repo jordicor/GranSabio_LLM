@@ -315,7 +315,6 @@ class OpenRouterSync:
             # Check main structure preserved
             assert "model_specifications" in new_specs
             assert "aliases" in new_specs
-            assert "default_models" in new_specs
 
             # Check other providers not affected
             for provider in old_specs["model_specifications"]:

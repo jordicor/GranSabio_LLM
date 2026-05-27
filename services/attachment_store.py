@@ -65,9 +65,6 @@ class AttachmentUploadRow:
     detected_mime: Optional[str]
     original_url: Optional[str]
     metadata_signature: str
-    legacy_storage_path: Optional[str]
-    legacy_metadata_path: Optional[str]
-    migrated_from_legacy: bool
     status: str
     created_at: str
     updated_at: str
@@ -126,9 +123,6 @@ class AttachmentStore:
                     detected_mime TEXT,
                     original_url TEXT,
                     metadata_signature TEXT NOT NULL,
-                    legacy_storage_path TEXT,
-                    legacy_metadata_path TEXT,
-                    migrated_from_legacy INTEGER NOT NULL DEFAULT 0 CHECK (migrated_from_legacy IN (0, 1)),
                     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'quarantined')),
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -144,17 +138,6 @@ class AttachmentStore:
                     deleted_at TEXT NOT NULL,
                     reason TEXT,
                     PRIMARY KEY (user_hash, upload_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS attachment_migration_issues (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    legacy_metadata_path TEXT,
-                    legacy_storage_path TEXT,
-                    upload_id TEXT,
-                    user_hash TEXT,
-                    issue_code TEXT NOT NULL,
-                    detail TEXT NOT NULL,
-                    created_at TEXT NOT NULL
                 );
                 """
             )
@@ -225,9 +208,6 @@ class AttachmentStore:
         temp_path: Path,
         metadata_signature: str,
         created_at: str,
-        legacy_storage_path: Optional[str] = None,
-        legacy_metadata_path: Optional[str] = None,
-        migrated_from_legacy: bool = False,
     ) -> AttachmentUploadRow:
         """Persist or reuse a blob and create an upload row for it."""
         self.ensure_schema()
@@ -330,10 +310,9 @@ class AttachmentStore:
                         upload_id, blob_id, user_hash, hash_prefix1, hash_prefix2,
                         origin, intended_usage, original_filename, stored_filename, mime_type,
                         declared_size, declared_mime, detected_mime, original_url,
-                        metadata_signature, legacy_storage_path, legacy_metadata_path,
-                        migrated_from_legacy, status, created_at, updated_at
+                        metadata_signature, status, created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
                     """,
                     (
                         upload_id,
@@ -351,9 +330,6 @@ class AttachmentStore:
                         detected_mime,
                         original_url,
                         metadata_signature,
-                        legacy_storage_path,
-                        legacy_metadata_path,
-                        1 if migrated_from_legacy else 0,
                         created_at,
                         now,
                     ),
@@ -418,6 +394,44 @@ class AttachmentStore:
             )
             return True
 
+    def expire_uploads(
+        self,
+        *,
+        cutoff_created_at: str,
+        reason: str,
+        dry_run: bool = True,
+        user_hash: Optional[str] = None,
+    ) -> int:
+        """Delete active upload rows older than a cutoff and preserve tombstones."""
+        self.ensure_schema()
+        where = "status = 'active' AND created_at < ?"
+        params: list[object] = [cutoff_created_at]
+        if user_hash is not None:
+            where += " AND user_hash = ?"
+            params.append(user_hash)
+
+        with self._connection(immediate=not dry_run) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT user_hash, upload_id
+                FROM attachment_uploads
+                WHERE {where}
+                ORDER BY created_at ASC, id ASC
+                """,
+                params,
+            ).fetchall()
+            if dry_run:
+                return len(rows)
+            for row in rows:
+                self._record_deletion_tombstone(
+                    conn=conn,
+                    user_hash=str(row["user_hash"]),
+                    upload_id=str(row["upload_id"]),
+                    reason=reason,
+                )
+            conn.execute(f"DELETE FROM attachment_uploads WHERE {where}", params)
+            return len(rows)
+
     def record_deletion_tombstone(self, *, user_hash: str, upload_id: str, reason: str) -> None:
         """Insert a deletion tombstone without requiring an active upload row."""
         self.ensure_schema()
@@ -427,38 +441,6 @@ class AttachmentStore:
                 user_hash=user_hash,
                 upload_id=upload_id,
                 reason=reason,
-            )
-
-    def record_migration_issue(
-        self,
-        *,
-        issue_code: str,
-        detail: str,
-        legacy_metadata_path: Optional[str] = None,
-        legacy_storage_path: Optional[str] = None,
-        upload_id: Optional[str] = None,
-        user_hash: Optional[str] = None,
-    ) -> None:
-        """Persist a migration issue for later audit."""
-        self.ensure_schema()
-        with self._connection(immediate=True) as conn:
-            conn.execute(
-                """
-                INSERT INTO attachment_migration_issues (
-                    legacy_metadata_path, legacy_storage_path, upload_id, user_hash,
-                    issue_code, detail, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    legacy_metadata_path,
-                    legacy_storage_path,
-                    upload_id,
-                    user_hash,
-                    issue_code,
-                    detail,
-                    self._utc_now(),
-                ),
             )
 
     def iter_uploads(self) -> Iterator[AttachmentUploadRow]:
@@ -473,8 +455,7 @@ class AttachmentStore:
                     u.origin, u.intended_usage, u.original_filename, u.stored_filename,
                     u.mime_type AS upload_mime_type,
                     u.declared_size, u.declared_mime, u.detected_mime, u.original_url,
-                    u.metadata_signature, u.legacy_storage_path, u.legacy_metadata_path,
-                    u.migrated_from_legacy, u.status AS upload_status,
+                    u.metadata_signature, u.status AS upload_status,
                     u.created_at AS upload_created_at, u.updated_at AS upload_updated_at,
                     b.id AS blob_id, b.sha256, b.size_bytes, b.kind,
                     b.mime_type AS blob_mime_type, b.storage_key, b.status AS blob_status,
@@ -485,6 +466,49 @@ class AttachmentStore:
                 ORDER BY u.created_at ASC, u.id ASC
                 """
             )
+            for row in rows:
+                yield self._row_to_upload(row)
+
+    def iter_uploads_by_user(
+        self,
+        *,
+        user_hash: str,
+        limit: Optional[int] = None,
+    ) -> Iterator[AttachmentUploadRow]:
+        """Yield active ready uploads for one user without scanning unrelated rows."""
+        self.ensure_schema()
+        if not user_hash:
+            return
+        if limit is not None and limit <= 0:
+            return
+
+        query = """
+            SELECT
+                u.id AS upload_row_id,
+                u.upload_id, u.user_hash, u.hash_prefix1, u.hash_prefix2,
+                u.origin, u.intended_usage, u.original_filename, u.stored_filename,
+                u.mime_type AS upload_mime_type,
+                u.declared_size, u.declared_mime, u.detected_mime, u.original_url,
+                u.metadata_signature, u.status AS upload_status,
+                u.created_at AS upload_created_at, u.updated_at AS upload_updated_at,
+                b.id AS blob_id, b.sha256, b.size_bytes, b.kind,
+                b.mime_type AS blob_mime_type, b.storage_key, b.status AS blob_status,
+                b.quarantine_reason, b.created_at AS blob_created_at,
+                b.updated_at AS blob_updated_at
+            FROM attachment_uploads u
+            JOIN attachment_blobs b ON b.id = u.blob_id
+            WHERE u.user_hash = ?
+              AND u.status = 'active'
+              AND b.status = 'ready'
+            ORDER BY u.created_at DESC, u.id DESC
+        """
+        params: list[object] = [user_hash]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        with self._connection() as conn:
+            rows = conn.execute(query, params)
             for row in rows:
                 yield self._row_to_upload(row)
 
@@ -769,8 +793,7 @@ class AttachmentStore:
                 u.origin, u.intended_usage, u.original_filename, u.stored_filename,
                 u.mime_type AS upload_mime_type,
                 u.declared_size, u.declared_mime, u.detected_mime, u.original_url,
-                u.metadata_signature, u.legacy_storage_path, u.legacy_metadata_path,
-                u.migrated_from_legacy, u.status AS upload_status,
+                u.metadata_signature, u.status AS upload_status,
                 u.created_at AS upload_created_at, u.updated_at AS upload_updated_at,
                 b.id AS blob_id, b.sha256, b.size_bytes, b.kind,
                 b.mime_type AS blob_mime_type, b.storage_key, b.status AS blob_status,
@@ -848,9 +871,6 @@ class AttachmentStore:
             detected_mime=row["detected_mime"],
             original_url=row["original_url"],
             metadata_signature=str(row["metadata_signature"]),
-            legacy_storage_path=row["legacy_storage_path"],
-            legacy_metadata_path=row["legacy_metadata_path"],
-            migrated_from_legacy=bool(row["migrated_from_legacy"]),
             status=str(row["upload_status"]),
             created_at=str(row["upload_created_at"]),
             updated_at=str(row["upload_updated_at"]),

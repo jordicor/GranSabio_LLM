@@ -32,14 +32,15 @@ GRANSABIO_API_URL = os.getenv("GRANSABIO_API_URL", "http://localhost:8000")
 REQUEST_TIMEOUT = 300
 POLL_INTERVAL = 2.0
 
-# Models matching MCP defaults
-DEFAULT_GENERATOR_MODEL = "gpt-5.2"
-DEFAULT_QA_MODELS = ["claude-opus-4-5-20251101", "z-ai/glm-4.7", "gemini-3-pro-preview"]
-DEFAULT_GRAN_SABIO_MODEL = "claude-opus-4-5-20251101"
+# Optional model overrides matching MCP behavior
+GENERATOR_MODEL_OVERRIDE = os.getenv("GRANSABIO_GENERATOR_MODEL")
+_qa_models_env = os.getenv("GRANSABIO_QA_MODELS")
+QA_MODEL_OVERRIDES = [item.strip() for item in _qa_models_env.split(",") if item.strip()] if _qa_models_env else None
+GRAN_SABIO_MODEL_OVERRIDE = os.getenv("GRANSABIO_ARBITER_MODEL")
 
-# Reasoning defaults
-DEFAULT_GENERATOR_REASONING = "medium"
-DEFAULT_QA_REASONING = "medium"
+# Optional reasoning overrides
+GENERATOR_REASONING_OVERRIDE = os.getenv("GRANSABIO_GENERATOR_REASONING")
+QA_REASONING_OVERRIDE = os.getenv("GRANSABIO_QA_REASONING")
 
 
 def _build_headers() -> dict:
@@ -61,17 +62,18 @@ def _parse_reasoning_effort(value: Optional[str]) -> Optional[str]:
 
 def _build_generator_config(args: Dict[str, Any]) -> Dict[str, Any]:
     """Build generator configuration from arguments."""
-    config = {
-        "generator_model": args.get("generator_model", DEFAULT_GENERATOR_MODEL)
-    }
+    config = {}
+    generator_model = args.get("generator_model") or GENERATOR_MODEL_OVERRIDE
+    if generator_model:
+        config["generator_model"] = generator_model
 
     reasoning = args.get("reasoning_effort")
     if reasoning:
         parsed = _parse_reasoning_effort(reasoning)
         if parsed:
             config["reasoning_effort"] = parsed
-    elif DEFAULT_GENERATOR_REASONING:
-        parsed = _parse_reasoning_effort(DEFAULT_GENERATOR_REASONING)
+    elif GENERATOR_REASONING_OVERRIDE:
+        parsed = _parse_reasoning_effort(GENERATOR_REASONING_OVERRIDE)
         if parsed:
             config["reasoning_effort"] = parsed
 
@@ -84,17 +86,18 @@ def _build_generator_config(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def _build_qa_config(args: Dict[str, Any]) -> Dict[str, Any]:
     """Build QA models configuration from arguments."""
-    config = {
-        "qa_models": args.get("qa_models", DEFAULT_QA_MODELS)
-    }
+    config = {}
+    qa_models = args.get("qa_models") or QA_MODEL_OVERRIDES
+    if qa_models:
+        config["qa_models"] = qa_models
 
     qa_reasoning = args.get("qa_reasoning_effort")
     if qa_reasoning:
         parsed = _parse_reasoning_effort(qa_reasoning)
         if parsed:
             config["qa_global_config"] = {"reasoning_effort": parsed}
-    elif DEFAULT_QA_REASONING:
-        parsed = _parse_reasoning_effort(DEFAULT_QA_REASONING)
+    elif QA_REASONING_OVERRIDE:
+        parsed = _parse_reasoning_effort(QA_REASONING_OVERRIDE)
         if parsed:
             config["qa_global_config"] = {"reasoning_effort": parsed}
 
@@ -286,7 +289,6 @@ Analyze and respond in JSON format:
         "json_output": True,
         **generator_config,
         **qa_config,
-        "gran_sabio_model": DEFAULT_GRAN_SABIO_MODEL,
         "gran_sabio_fallback": True,
         "qa_layers": qa_layers,
         "min_global_score": 7.5,
@@ -294,6 +296,8 @@ Analyze and respond in JSON format:
         "temperature": 0.2,
         "show_query_costs": 2
     }
+    if GRAN_SABIO_MODEL_OVERRIDE:
+        payload["gran_sabio_model"] = GRAN_SABIO_MODEL_OVERRIDE
 
     print("\n[Test Case]")
     print("-" * 40)
@@ -369,12 +373,12 @@ async def main():
     print("#  Gran Sabio MCP Server Emulation Test (with Reasoning)")
     print("#" * 70)
     print(f"\nAPI URL: {GRANSABIO_API_URL}")
-    print(f"Generator: {DEFAULT_GENERATOR_MODEL}")
-    print(f"QA Models: {', '.join(DEFAULT_QA_MODELS)}")
-    print(f"Gran Sabio: {DEFAULT_GRAN_SABIO_MODEL}")
-    print(f"\nReasoning Defaults:")
-    print(f"  Generator: {DEFAULT_GENERATOR_REASONING}")
-    print(f"  QA: {DEFAULT_QA_REASONING}")
+    print(f"Generator override: {GENERATOR_MODEL_OVERRIDE or 'API routing'}")
+    print(f"QA overrides: {', '.join(QA_MODEL_OVERRIDES) if QA_MODEL_OVERRIDES else 'API routing'}")
+    print(f"Gran Sabio override: {GRAN_SABIO_MODEL_OVERRIDE or 'API routing'}")
+    print(f"\nReasoning overrides:")
+    print(f"  Generator: {GENERATOR_REASONING_OVERRIDE or 'API routing'}")
+    print(f"  QA: {QA_REASONING_OVERRIDE or 'API routing'}")
 
     if not await test_health_check():
         print("\n[ABORT] Cannot reach Gran Sabio API. Ensure it's running:")
