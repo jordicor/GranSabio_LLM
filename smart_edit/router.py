@@ -18,12 +18,14 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import AliasChoices, BaseModel, Field
 
+from template_compat import enable_template_response_compat
+
 from .operations import SmartTextEditor
 
 router = APIRouter(tags=["Smart Edit"])
 
 # Templates for demo page
-templates = Jinja2Templates(directory="templates")
+templates = enable_template_response_compat(Jinja2Templates(directory="templates"))
 
 
 # =============================================================================

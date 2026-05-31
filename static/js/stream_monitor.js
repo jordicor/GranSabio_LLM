@@ -6,7 +6,7 @@
 // Direct connection - no proxy needed
 const STREAM_BASE = '';
 // UI panels (note: 'analysis' combines Auto-QA, preflight, and consensus)
-const PHASES = ['generation', 'qa', 'arbiter', 'smartedit', 'analysis', 'gransabio', 'status', 'everything'];
+const PHASES = ['generation', 'qa', 'arbiter', 'smartedit', 'analysis', 'gransabio', 'status', 'console', 'everything'];
 // Phases that can be hard-switched (excluded from subscription)
 const HARD_SWITCHABLE_PHASES = ['generation', 'qa', 'arbiter', 'smartedit', 'analysis', 'gransabio', 'status'];
 const REQUEST_PANEL_PHASES = ['generation', 'qa', 'arbiter', 'analysis', 'gransabio', 'smartedit'];
@@ -94,6 +94,8 @@ const MONITOR_LINE_CLASS_BY_TAG = {
 
 // State
 let eventSource = null;
+let consoleEventSource = null;
+let consoleScope = 'global';
 let currentProjectId = null;
 let stats = {};
 let lastProjectData = null;  // Cache for re-rendering dashboard
@@ -346,6 +348,110 @@ function handleConnectionError(error) {
     } else {
         log('Connection error', 'error');
         setConnectionStatus('disconnected', 'ERROR');
+    }
+}
+
+function updateConsoleScopeUI() {
+    document.querySelectorAll('[data-console-scope]').forEach(segment => {
+        segment.classList.toggle('active', segment.dataset.consoleScope === consoleScope);
+    });
+}
+
+function setConsoleScope(scope) {
+    if (scope !== 'global' && scope !== 'project') return;
+    if (consoleScope === scope) return;
+
+    consoleScope = scope;
+    updateConsoleScopeUI();
+    log(`Console scope switched to ${scope}`, 'info');
+
+    if (consoleEventSource || scope === 'global' || currentProjectId) {
+        connectConsoleStream();
+    }
+}
+
+function initConsoleScopeListeners() {
+    document.querySelectorAll('[data-console-scope]').forEach(segment => {
+        segment.addEventListener('click', () => {
+            setConsoleScope(segment.dataset.consoleScope);
+        });
+    });
+    updateConsoleScopeUI();
+}
+
+function connectConsoleStream() {
+    if (consoleEventSource) {
+        consoleEventSource.close();
+        consoleEventSource = null;
+    }
+
+    const consoleParams = new URLSearchParams({ tail: '200' });
+    if (consoleScope === 'project') {
+        if (!currentProjectId) {
+            setBadge('console', 'idle');
+            appendContent('console', '[console] waiting for project scope\n');
+            return;
+        }
+        consoleParams.set('project_id', currentProjectId);
+    }
+    const consoleUrl = `${STREAM_BASE}/stream/console?${consoleParams.toString()}`;
+    try {
+        consoleEventSource = new EventSource(consoleUrl);
+
+        consoleEventSource.onopen = function() {
+            setBadge('console', 'active');
+        };
+
+        consoleEventSource.onmessage = function(event) {
+            handleConsoleMessage(event.data);
+        };
+
+        consoleEventSource.onerror = function(error) {
+            console.error('Console EventSource error:', error);
+            setBadge('console', 'error');
+        };
+    } catch (error) {
+        log(`Failed to connect console stream: ${error.message}`, 'error');
+        setBadge('console', 'error');
+    }
+}
+
+function disconnectConsoleStream() {
+    if (consoleEventSource) {
+        consoleEventSource.close();
+        consoleEventSource = null;
+    }
+}
+
+function handleConsoleMessage(rawData) {
+    let data;
+    try {
+        data = JSON.parse(rawData);
+    } catch (parseError) {
+        appendContent('console', rawData + '\n');
+        return;
+    }
+
+    if (data.type === 'console_connected') {
+        const filters = data.filters || {};
+        const scopeLabel = filters.project_id ? `project=${filters.project_id}` : 'global';
+        appendContent('console', `[console] connected ${scopeLabel} tail=${data.tail ?? 0}\n`);
+        log(`Console stream connected (${scopeLabel}, tail=${data.tail ?? 0})`, 'success');
+        setBadge('console', 'active');
+        return;
+    }
+
+    if (data.type !== 'console_output') {
+        appendContent('console', rawData + '\n');
+        return;
+    }
+
+    appendContent('console', data.text || '');
+    if (data.stream === 'stderr' || data.level === 'ERROR' || data.level === 'CRITICAL') {
+        const badge = document.getElementById('badge-console');
+        if (badge) {
+            badge.classList.add('error');
+        }
     }
 }
 
@@ -2424,6 +2530,7 @@ function connect() {
     if (eventSource) {
         disconnect();
     }
+    disconnectConsoleStream();
 
     clearAllContent();
     setConnectionStatus('connecting', 'CONNECTING...');
@@ -2458,6 +2565,8 @@ function connect() {
             handleConnectionError(error);
         };
 
+        connectConsoleStream();
+
     } catch (error) {
         log(`Failed to connect: ${error.message}`, 'error');
         setConnectionStatus('disconnected', 'ERROR');
@@ -2470,11 +2579,15 @@ function disconnect() {
         eventSource = null;
         log('Disconnected from stream', 'info');
     }
+    disconnectConsoleStream();
 
     streamTerminalStatus = null;
     currentProjectId = null;
     setConnectionStatus('disconnected', 'OFFLINE');
     PHASES.forEach(phase => setBadge(phase, 'idle'));
+    if (consoleScope === 'global') {
+        connectConsoleStream();
+    }
     updateUrl(null);
     resetQAFilters();
 }
@@ -3789,11 +3902,15 @@ function showLiveActivityIndicator(iteration) {
 document.addEventListener('DOMContentLoaded', function() {
     log('Gran Sabio LLM Stream Monitor initialized', 'success');
     log(`Stream endpoint: ${STREAM_BASE}/stream/project/{id}`, 'info');
+    log(`Console endpoint: ${STREAM_BASE}/stream/console`, 'info');
     renderStatusPanel();
 
     // Initialize toggle switch listeners
     initToggleListeners();
     log('Phase toggle switches ready', 'info');
+
+    initConsoleScopeListeners();
+    connectConsoleStream();
 
     // Initialize analysis filter pill listeners
     bindAnalysisFilterListeners();
@@ -4139,5 +4256,8 @@ function escapeHtml(text) {
 window.addEventListener('beforeunload', function() {
     if (eventSource) {
         eventSource.close();
+    }
+    if (consoleEventSource) {
+        consoleEventSource.close();
     }
 });

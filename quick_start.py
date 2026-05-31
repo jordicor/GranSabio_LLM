@@ -58,7 +58,7 @@ def check_dependencies():
     try:
         import anthropic
         import fastapi
-        import google.generativeai
+        from google import genai  # noqa: F401  (new google-genai SDK)
         import openai
         import uvicorn
         from dotenv import load_dotenv

@@ -282,19 +282,16 @@ class TestModelsEndpoint:
         data = response.json()
         assert "provider" in data
 
-    def test_models_unknown_model_raises_error(self, client):
+    def test_models_unknown_model_returns_404(self, client):
         """
         Given: An unknown model name
         When: GET /models/{name} is called
-        Then: Raises RuntimeError (unhandled by endpoint)
-
-        Note: The current API implementation raises RuntimeError for unknown models
-        which is not caught by the endpoint. Ideally this should return 404 HTTPException.
-        This test documents the current behavior.
+        Then: Returns 404 Not Found without surfacing an unhandled exception
         """
-        with pytest.raises(RuntimeError) as exc_info:
-            client.get("/models/nonexistent-model-xyz")
-        assert "Unknown model" in str(exc_info.value)
+        response = client.get("/models/nonexistent-model-xyz")
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Model not found: nonexistent-model-xyz"
 
     def test_models_response_excludes_api_key(self, client):
         """
@@ -307,6 +304,38 @@ class TestModelsEndpoint:
         # Should have has_api_key flag, not raw key
         assert "api_key" not in data
         assert "has_api_key" in data
+
+    def test_models_known_model_without_api_key_returns_metadata(self, client, monkeypatch):
+        """
+        Given: A declared model whose provider key is not configured
+        When: GET /models/{name} is called
+        Then: Returns model metadata with has_api_key=false instead of a server error
+        """
+        from config import config
+
+        monkeypatch.setattr(config, "OPENAI_API_KEY", "")
+        monkeypatch.setattr(config, "model_specs", {
+            "model_specifications": {
+                "openai": {
+                    "no-key-test-model": {
+                        "model_id": "no-key-test-model",
+                        "name": "No Key Test Model",
+                        "input_tokens": 1000,
+                        "output_tokens": 2000,
+                        "enabled": True,
+                    }
+                }
+            },
+            "aliases": {},
+        })
+
+        response = client.get("/models/no-key-test-model")
+        data = response.json()
+
+        assert response.status_code == 200
+        assert data["model_id"] == "no-key-test-model"
+        assert data["has_api_key"] is False
+        assert "api_key" not in data
 
 
 # ============================================================================

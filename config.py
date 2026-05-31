@@ -824,7 +824,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
     # FastAPI Configuration
     APP_HOST: str = Field(default="0.0.0.0", description="FastAPI host")
     APP_PORT: int = Field(default=8000, description="FastAPI port")
-    APP_RELOAD: bool = Field(default=True, description="FastAPI reload mode")
+    APP_RELOAD: bool = Field(default=False, description="FastAPI reload mode")
 
     def __init__(self):
         super().__init__()
@@ -947,7 +947,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         # FastAPI Configuration
         self.APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
         self.APP_PORT = int(os.getenv("APP_PORT", "8000"))
-        self.APP_RELOAD = os.getenv("APP_RELOAD", "true").lower() == "true"
+        self.APP_RELOAD = os.getenv("APP_RELOAD", "false").lower() == "true"
 
         # Request Limits
         self.MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))

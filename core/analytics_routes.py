@@ -112,17 +112,46 @@ async def get_model_analytics(model_name: str):
 @app.get("/models/{model_name}")
 async def get_model_info(model_name: str):
     """Get detailed information about a specific model"""
-    from config import config
-    model_info = config.get_model_info(model_name)
+    from config import config, resolve_model_catalog_entry
 
-    if model_info["provider"] == "unknown":
-        raise HTTPException(status_code=404, detail="Model not found")
+    resolved = resolve_model_catalog_entry(model_name, config.model_specs)
+    if not resolved["matched"] or not resolved["enabled"]:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model not found: {model_name}",
+        )
 
-    # Remove sensitive information before returning
-    safe_model_info = {k: v for k, v in model_info.items() if k != "api_key"}
-    safe_model_info["has_api_key"] = bool(model_info.get("api_key"))
+    model_data = resolved["model_data"] or {}
+    catalog_provider = str(resolved["catalog_provider"] or "")
+    provider_has_key = {
+        "openai": bool(config.OPENAI_API_KEY),
+        "anthropic": bool(config.ANTHROPIC_API_KEY),
+        "google": bool(config.GOOGLE_API_KEY),
+        "xai": bool(config.XAI_API_KEY),
+        "openrouter": bool(config.OPENROUTER_API_KEY),
+        "ollama": True,
+        "fake": True,
+    }
+    has_api_key = bool(resolved["is_test_model"]) or bool(provider_has_key.get(catalog_provider))
 
-    return safe_model_info
+    return {
+        "provider": resolved["provider"],
+        "model_id": resolved["model_id"],
+        "input_tokens": model_data.get("input_tokens", 100000),
+        "output_tokens": model_data.get("output_tokens", 8192),
+        "context_window": model_data.get("context_window", 100000),
+        "name": model_data.get("name", resolved["model_key"]),
+        "description": model_data.get("description", ""),
+        "capabilities": model_data.get("capabilities", []),
+        "special_features": model_data.get("special_features", []),
+        "provider_capabilities": model_data.get("provider_capabilities", {}),
+        "supported_parameters": model_data.get("supported_parameters", []),
+        "sync_metadata": model_data.get("sync_metadata", {}),
+        "reasoning_effort": model_data.get("reasoning_effort", {}),
+        "thinking_budget": model_data.get("thinking_budget", {}),
+        "pricing": model_data.get("pricing", {}),
+        "has_api_key": has_api_key,
+    }
 
 
 @app.get("/api-docs", response_class=HTMLResponse)

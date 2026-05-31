@@ -604,6 +604,19 @@ class TestModelSpecsThinkingBudget:
             assert "default_tokens" in thinking_budget, \
                 f"{model_id}: missing default_tokens"
 
+    def test_claude_opus_48_uses_adaptive_thinking_metadata(self):
+        """Claude Opus 4.8 should not advertise extended thinking budgets."""
+        spec = self._get_model_spec("claude-opus-4-8")
+        assert spec is not None, "Model claude-opus-4-8 not found in specs"
+
+        assert spec["input_tokens"] == 1000000
+        assert spec["output_tokens"] == 128000
+        assert spec["context_window"] == 1000000
+        assert spec["pricing"]["input_per_million"] == 5.0
+        assert spec["pricing"]["output_per_million"] == 25.0
+        assert "adaptive_thinking" in spec.get("special_features", [])
+        assert spec.get("thinking_budget", {}).get("supported") is not True
+
     def test_gemini_models_have_thinking_budget(self):
         """Gemini models should have thinking_budget configuration with parameter_name."""
         gemini_models = [

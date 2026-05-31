@@ -1803,10 +1803,14 @@ class GranSabioInterface {
                                        selectedModel.includes('o3') ||
                                        (selectedModel.includes('o1') && !selectedModel.includes('o1-mini'));
         
+        const claudeAdaptiveOnly = selectedModel.includes('claude-opus-4-7') ||
+                                  selectedModel.includes('claude-opus-4-8');
+
         // Check if the model supports thinking_budget_tokens (Claude 3.7/4 models)
-        const supportsThinkingBudget = selectedModel.includes('claude-3-7') ||
+        const supportsThinkingBudget = !claudeAdaptiveOnly && (
+                                      selectedModel.includes('claude-3-7') ||
                                       selectedModel.includes('claude-opus-4') ||
-                                      selectedModel.includes('claude-sonnet-4');
+                                      selectedModel.includes('claude-sonnet-4'));
         
         if (supportsReasoningEffort) {
             reasoningEffortGroup.style.display = 'block';

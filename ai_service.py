@@ -33,17 +33,8 @@ import openai
 
 try:
     from google import genai as google_genai
-    GOOGLE_NEW_SDK = True
 except ImportError:
     google_genai = None
-    GOOGLE_NEW_SDK = False
-
-# Legacy SDK as fallback
-try:
-    import google.generativeai as genai
-    from google.ai.generativelanguage_v1beta.types import content
-except ImportError:
-    genai = None
 
 # Use optimized JSON (3.6x faster than standard json)
 import json_utils as json
@@ -371,7 +362,6 @@ class AIService:
         """Initialize AI service with API clients"""
         self.openai_client = None
         self.anthropic_client = None
-        self.genai_client = None
         self.google_new_client = None
         self.xai_client = None
         self.openrouter_client = None
@@ -464,30 +454,14 @@ class AIService:
 
         # Initialize Google AI client
         if config.GOOGLE_API_KEY:
-            if GOOGLE_NEW_SDK and google_genai:
+            if google_genai:
                 try:
                     self.google_new_client = google_genai.Client(api_key=config.GOOGLE_API_KEY)
-                    self.genai_client = None
                     logger.info("Using new Google GenAI SDK")
                 except Exception as e:
-                    logger.error(f"Failed to initialize new Google GenAI SDK: {e}")
-                    # Fallback to legacy SDK
-                    if genai:
-                        try:
-                            genai.configure(api_key=config.GOOGLE_API_KEY)
-                            self.genai_client = genai
-                            logger.info("Fell back to legacy Google GenerativeAI SDK")
-                        except Exception as e2:
-                            logger.error(f"Failed to initialize legacy SDK: {e2}")
-            elif genai:
-                try:
-                    genai.configure(api_key=config.GOOGLE_API_KEY)
-                    self.genai_client = genai
-                    logger.info("Using legacy Google GenerativeAI SDK")
-                except Exception as e:
-                    logger.error(f"Failed to initialize Google GenerativeAI SDK: {e}")
+                    logger.error(f"Failed to initialize Google GenAI SDK: {e}")
             else:
-                logger.error("No Google SDK available")
+                logger.error("google-genai SDK not available")
         else:
             logger.warning("Google AI API key not found")
 
@@ -2130,8 +2104,8 @@ class AIService:
     ) -> "DraftValidationResult":
         """Run the local validator with consistent error handling across providers.
 
-        Single insertion point that protects all four tool loops (OpenAI-compatible,
-        Claude, Gemini new SDK, Gemini legacy SDK). Performs:
+        Single insertion point that protects all provider tool loops
+        (OpenAI-compatible, Claude, and Gemini). Performs:
 
         1. Centralized ``VALIDATE_DRAFT_MAX_LENGTH`` enforcement (defense in
            depth — some providers do not strictly enforce tool schema
@@ -2547,9 +2521,10 @@ class AIService:
             create_params = {
                 "model": model_id,
                 "messages": current_messages,
-                "temperature": temperature,
                 "max_tokens": max_tokens,
             }
+            if provider_key != "openrouter" or self._openrouter_accepts_temperature(model_id):
+                create_params["temperature"] = temperature
 
         native_json_schema = bool(json_schema) and self._supports_structured_outputs(provider_key, model_id)
         native_json_object = self._supports_json_object(provider_key, model_id)
@@ -2706,7 +2681,7 @@ class AIService:
         return SimpleNamespace(type=block_type or "text", text=acc.get("text", ""))
 
     def _extract_text_from_gemini_response(self, response: Any) -> str:
-        """Extract text from Gemini responses across both new and legacy SDKs."""
+        """Extract text from Gemini responses from the google-genai SDK."""
         try:
             response_text = getattr(response, "text", None)
             if response_text:
@@ -3738,6 +3713,7 @@ class AIService:
         force_finalize_message: Optional[str] = None,
         retries_enabled: bool = True,
         attempted_feature: Optional[str] = None,
+        llm_routing: Optional[Mapping[str, Any]] = None,
         cancellation_token: Optional["CancellationToken"] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on OpenAI-style chat APIs.
@@ -5109,6 +5085,7 @@ class AIService:
         force_finalize_message: Optional[str] = None,
         retries_enabled: bool = True,
         attempted_feature: Optional[str] = None,
+        llm_routing: Optional[Mapping[str, Any]] = None,
         cancellation_token: Optional["CancellationToken"] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on Claude messages API."""
@@ -5150,9 +5127,9 @@ class AIService:
             create_params = {
                 "model": model_id,
                 "max_tokens": max_tokens,
-                "temperature": temperature,
                 "messages": current_messages,
             }
+            self._add_claude_sampling_params(create_params, model_id, temperature)
             if tools_enabled:
                 if tool_schemas is None:
                     effective_tools = [self._build_claude_validation_tool_schema()]
@@ -5898,6 +5875,7 @@ class AIService:
         force_finalize_message: Optional[str] = None,
         retries_enabled: bool = True,
         attempted_feature: Optional[str] = None,
+        llm_routing: Optional[Mapping[str, Any]] = None,
         cancellation_token: Optional["CancellationToken"] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on the new Gemini SDK."""
@@ -6668,791 +6646,6 @@ class AIService:
                 cancellation_token=cancellation_token,
             )
 
-    async def _run_gemini_legacy_sdk_validation_tool_loop(
-        self,
-        model_id: str,
-        prompt: str,
-        validation_callback: Callable[[str], "DraftValidationResult"],
-        temperature: float,
-        max_tokens: int,
-        system_prompt: str,
-        json_output: bool,
-        json_schema: Optional[Dict[str, Any]],
-        usage_callback: Optional[Callable[[Dict[str, Any]], None]],
-        usage_extra: Optional[Dict[str, Any]],
-        max_rounds: int,
-        extra_verbose: bool = False,
-        accent_context: Optional[Dict[str, Any]] = None,
-        enable_validate_draft: bool = True,
-        *,
-        stop_on_approval: bool = True,
-        output_contract: OutputContract = OutputContract.FREE_TEXT,
-        payload_scope: PayloadScope = PayloadScope.GENERATOR,
-        loop_scope: LoopScope = LoopScope.GENERATOR,
-        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
-        initial_measurement_text: Optional[str] = None,
-        measurement_feedback_message: Optional[str] = None,
-        force_finalize_message: Optional[str] = None,
-        retries_enabled: bool = True,
-        attempted_feature: Optional[str] = None,
-        cancellation_token: Optional["CancellationToken"] = None,
-    ) -> Tuple[str, Dict[str, Any]]:
-        """Run the deterministic validator tool-loop on the legacy Gemini SDK."""
-        if not (enable_validate_draft or accent_context is not None):
-            raise ValueError(
-                "Gemini (legacy SDK) tool loop invoked with neither validate_draft nor accent_context."
-            )
-        if not self.genai_client:
-            raise ValueError("Legacy Gemini client not initialized")
-
-        mode_name = "gemini_tool_loop"
-        system_instruction = system_prompt or ""
-
-        model = self.genai_client.GenerativeModel(
-            model_name=model_id,
-            system_instruction=system_instruction if system_instruction else None,
-        )
-
-        def _build_tools(include_validate_draft: bool, include_audit_accent: bool) -> List[Any]:
-            function_declarations: List[Any] = []
-            if include_validate_draft:
-                function_declarations.append(
-                    self.genai_client.types.FunctionDeclaration(
-                        name="validate_draft",
-                        description="Validate the exact current draft for measurable constraints.",
-                        parameters=self._build_validation_tool_parameters_schema(),
-                    )
-                )
-            if include_audit_accent:
-                function_declarations.append(
-                    self.genai_client.types.FunctionDeclaration(
-                        name="audit_accent",
-                        description=(
-                            "Ask an external judge to score the draft for recognizably generic "
-                            "AI prose and stylistic formulas."
-                        ),
-                        parameters=self._build_audit_accent_tool_parameters_schema(),
-                    )
-                )
-            if not function_declarations:
-                return []
-            return [
-                self.genai_client.types.Tool(function_declarations=function_declarations)
-            ]
-
-        tool_config = {
-            "function_calling_config": {
-                "mode": "AUTO",
-            }
-        }
-        history: List[Any] = [{"role": "user", "parts": [prompt]}]
-
-        extra_payload = {"requested_model": model_id}
-        if usage_extra:
-            extra_payload.update(usage_extra)
-
-        def _build_generation_config(tools_enabled: bool) -> Any:
-            config_kwargs = {
-                "temperature": temperature,
-                "max_output_tokens": max_tokens,
-            }
-            if not tools_enabled and json_output:
-                config_kwargs["response_mime_type"] = "application/json"
-                if json_schema:
-                    config_kwargs["response_schema"] = json_schema
-            try:
-                return self.genai_client.GenerationConfig(**config_kwargs)
-            except TypeError:
-                config_kwargs.pop("response_schema", None)
-                config_kwargs.pop("response_mime_type", None)
-                return self.genai_client.GenerationConfig(**config_kwargs)
-
-        async def _single_attempt() -> Tuple[str, Dict[str, Any]]:
-            trace: List[Dict[str, Any]] = []
-            latest_validated_text = ""
-            latest_feedback = ""
-            latest_invalid_draft = ""
-            latest_audit_result: Optional[Dict[str, Any]] = None
-            total_tool_calls = 0
-            tool_call_budget = self._get_tool_loop_call_budget(max_rounds)
-            budget_warning_emitted = False
-
-            audit_accent_approved_hashes: Set[str] = set()
-            tool_call_counts: Dict[str, int] = {"validate_draft": 0, "audit_accent": 0}
-            accent_last_inline_score: Optional[float] = None
-            accent_approved_count = 0
-            accent_rejected_count = 0
-            accent_fail_open_delta_count = 0
-            accent_fail_open_delta_paths: List[str] = []
-            accent_inline_required = accent_context is not None
-            audit_accent_cap = (
-                int(accent_context["guard"].max_inline_calls) if accent_context is not None else 0
-            )
-            audit_on_error = (
-                accent_context["guard"].on_error if accent_context is not None else "fail_closed"
-            )
-            # Concrete float always; 0.0 sentinel is never consumed because every use site
-            # is guarded by `accent_context is not None` (early-returns otherwise).
-            resolved_accent_min_score: float = (
-                float(accent_context["min_score"]) if accent_context is not None else 0.0
-            )
-
-            def _draft_hash(value: str) -> str:
-                return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
-
-            def _estimate_accumulated_chars() -> int:
-                total = 0
-                for entry in history:
-                    parts = None
-                    if isinstance(entry, dict):
-                        parts = entry.get("parts")
-                    else:
-                        parts = getattr(entry, "parts", None)
-                    if not parts:
-                        continue
-                    for part in parts:
-                        if isinstance(part, str):
-                            total += len(part)
-                            continue
-                        text_val = None
-                        if isinstance(part, dict):
-                            text_val = part.get("text")
-                        else:
-                            text_val = getattr(part, "text", None)
-                        if isinstance(text_val, str):
-                            total += len(text_val)
-                return total
-
-            def _build_accent_envelope() -> Dict[str, Any]:
-                if accent_context is None:
-                    return {}
-                return {
-                    "accent_calls": tool_call_counts["audit_accent"],
-                    "accent_approved_count": accent_approved_count,
-                    "accent_rejected_count": accent_rejected_count,
-                    "accent_last_inline_score": accent_last_inline_score,
-                    "accent_approved_hash_count": len(audit_accent_approved_hashes),
-                    "accent_fail_open_delta_count": accent_fail_open_delta_count,
-                    "accent_fail_open_delta_paths": list(accent_fail_open_delta_paths),
-                }
-
-            async def _sync_audit_or_fail(
-                candidate_text: str,
-                path_label: str,
-                turn: int,
-            ) -> None:
-                nonlocal accent_last_inline_score, accent_approved_count, accent_rejected_count
-                nonlocal accent_fail_open_delta_count
-                if accent_context is None or not candidate_text:
-                    return
-                if _draft_hash(candidate_text) in audit_accent_approved_hashes:
-                    return
-                try:
-                    audit = await self.audit_accent(
-                        candidate_text,
-                        language=None,
-                        criteria_block=accent_context["criteria_block"],
-                        min_score=resolved_accent_min_score,
-                        timeout_seconds=float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
-                        max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
-                        on_error=audit_on_error,
-                        llm_routing=llm_routing,
-                    )
-                except AccentGuardError as acc_exc:
-                    if audit_on_error == "fail_open":
-                        accent_fail_open_delta_count += 1
-                        accent_fail_open_delta_paths.append(path_label)
-                        trace.append({
-                            "turn": turn,
-                            "event": "accent_fail_open",
-                            "path": path_label,
-                            "reason": acc_exc.reason,
-                        })
-                        return
-                    raise
-                score_val = audit.get("score")
-                if audit.get("approved"):
-                    audit_accent_approved_hashes.add(_draft_hash(candidate_text))
-                    accent_last_inline_score = score_val
-                    accent_approved_count += 1
-                else:
-                    accent_rejected_count += 1
-                    raise AccentGuardError(
-                        f"Accent judge rejected candidate at {path_label}.",
-                        reason="rejected",
-                        details={"score": score_val, "path": path_label},
-                    )
-
-            async def _run_forced_final_turn(
-                turn: int,
-                reason: str,
-                feedback: str,
-                draft: str,
-            ) -> Optional[Tuple[str, Dict[str, Any]]]:
-                await self._emit_tool_event_safe(
-                    tool_event_callback,
-                    "force_finalize",
-                    {"turn": turn, "reason": reason},
-                )
-                forced_history = list(history)
-                forced_history.append(
-                    {
-                        "role": "user",
-                        "parts": [
-                            self._build_tool_loop_force_finalize_message(
-                                feedback=feedback,
-                                draft=draft,
-                                json_output=json_output,
-                            )
-                        ],
-                    }
-                )
-                try:
-                    response = await model.generate_content_async(
-                        forced_history,
-                        generation_config=_build_generation_config(tools_enabled=False),
-                    )
-                except Exception as provider_exc:
-                    await self._maybe_raise_context_overflow_midloop(
-                        provider_exc,
-                        provider_key="gemini",
-                        turn=turn,
-                        accumulated_chars_estimate=_estimate_accumulated_chars(),
-                        tool_event_callback=tool_event_callback,
-                    )
-                    raise
-                usage_meta = getattr(response, "usage_metadata", None)
-                self._emit_usage(usage_callback, model_id, "gemini", usage_meta, extra_payload)
-
-                candidate = self._extract_text_from_gemini_response(response)
-                trace.append(
-                    {
-                        "turn": turn,
-                        "event": "forced_final_turn",
-                        "reason": reason,
-                        "assistant_text_chars": len(candidate),
-                    }
-                )
-                if not candidate:
-                    return None
-
-                if payload_scope == PayloadScope.MEASUREMENT_ONLY:
-                    trace.append(
-                        {
-                            "turn": turn,
-                            "skipped_final_validation_for_evaluator": True,
-                            "stage": "forced_final_turn",
-                        }
-                    )
-                    await _sync_audit_or_fail(candidate, "path_c", turn)
-                    envelope = {
-                        "mode": mode_name,
-                        "turns": turn,
-                        "accepted": "forced_final_turn",
-                        "trace": trace,
-                    }
-                    envelope.update(_build_accent_envelope())
-                    return candidate, envelope
-
-                final_report = self._invoke_validation_callback(
-                    validation_callback,
-                    candidate,
-                    mode_name=mode_name,
-                    model_id=model_id,
-                    turn=turn,
-                    stage="forced_final_turn",
-                    tool_event_callback=tool_event_callback,
-                )
-                trace.append(
-                    {
-                        "turn": turn,
-                        "validator_after_forced_final": {
-                            "approved": bool(final_report.approved),
-                            "score": final_report.score,
-                            "word_count": final_report.word_count,
-                            "hard_failed": bool(final_report.hard_failed),
-                        },
-                        "metrics": self._build_trace_metrics(final_report),
-                    }
-                )
-                if not final_report.approved:
-                    return None
-
-                await _sync_audit_or_fail(candidate, "path_c", turn)
-
-                envelope = {
-                    "mode": mode_name,
-                    "turns": turn,
-                    "accepted": "forced_final_turn",
-                    "trace": trace,
-                }
-                envelope.update(_build_accent_envelope())
-                return candidate, envelope
-
-            for turn in range(1, max_rounds + 1):
-                if extra_verbose:
-                    logger.info("[EXTRA_VERBOSE] gemini-legacy tool-loop turn %d", turn)
-
-                include_audit_accent = (
-                    accent_context is not None
-                    and tool_call_counts["audit_accent"] < audit_accent_cap
-                )
-                active_tools = _build_tools(
-                    include_validate_draft=enable_validate_draft,
-                    include_audit_accent=include_audit_accent,
-                )
-                try:
-                    response = await model.generate_content_async(
-                        history,
-                        generation_config=_build_generation_config(tools_enabled=bool(active_tools)),
-                        tools=active_tools if active_tools else None,
-                        tool_config=tool_config if active_tools else None,
-                    )
-                except Exception as provider_exc:
-                    await self._maybe_raise_context_overflow_midloop(
-                        provider_exc,
-                        provider_key="gemini",
-                        turn=turn,
-                        accumulated_chars_estimate=_estimate_accumulated_chars(),
-                        tool_event_callback=tool_event_callback,
-                    )
-                    raise
-                usage_meta = getattr(response, "usage_metadata", None)
-                self._emit_usage(usage_callback, model_id, "gemini", usage_meta, extra_payload)
-
-                assistant_text = self._extract_text_from_gemini_response(response)
-                function_calls = self._extract_gemini_function_calls(response)
-                trace.append(
-                    {
-                        "turn": turn,
-                        "assistant_text_chars": len(assistant_text),
-                        "tool_calls": [getattr(call, "name", "") for call in function_calls],
-                    }
-                )
-
-                if function_calls:
-                    if not budget_warning_emitted:
-                        budget_warning_emitted = self._maybe_record_tool_budget_warning(
-                            trace,
-                            mode_name=mode_name,
-                            model_id=model_id,
-                            turn=turn,
-                            total_tool_calls=total_tool_calls,
-                            pending_tool_calls=len(function_calls),
-                            tool_call_budget=tool_call_budget,
-                        )
-                    if total_tool_calls + len(function_calls) > tool_call_budget:
-                        overflow_call = next(
-                            (c for c in function_calls if getattr(c, "name", "") == "validate_draft"),
-                            function_calls[0],
-                        )
-                        overflow_args = dict(getattr(overflow_call, "args", {}) or {})
-                        overflow_draft = (
-                            str(overflow_args.get("text") or "").strip() or assistant_text.strip()
-                        )
-                        overflow_report = self._invoke_validation_callback(
-                            validation_callback,
-                            overflow_draft,
-                            mode_name=mode_name,
-                            model_id=model_id,
-                            turn=turn,
-                            stage="overflow_tool_argument",
-                            tool_event_callback=tool_event_callback,
-                        )
-                        latest_feedback = str(
-                            overflow_report.feedback or "The draft failed deterministic validation."
-                        ).strip()
-                        latest_invalid_draft = overflow_draft
-                        trace.append(
-                            {
-                                "turn": turn,
-                                "event": "tool_call_budget_exceeded",
-                                "tool_call_budget": tool_call_budget,
-                                "attempted_tool_calls": len(function_calls),
-                                "metrics": self._build_trace_metrics(overflow_report),
-                            }
-                        )
-                        if overflow_report.approved:
-                            await _sync_audit_or_fail(overflow_draft, "path_e", turn)
-                            envelope = {
-                                "mode": mode_name,
-                                "turns": turn,
-                                "accepted": "validated_tool_argument",
-                                "trace": trace,
-                            }
-                            envelope.update(_build_accent_envelope())
-                            return overflow_draft, envelope
-                        forced_result = await _run_forced_final_turn(
-                            turn=turn + 1,
-                            reason="tool_call_budget_exceeded",
-                            feedback=latest_feedback,
-                            draft=latest_invalid_draft,
-                        )
-                        if forced_result:
-                            return forced_result
-                        raise ValueError("Tool loop exhausted without producing a validated draft")
-
-                    candidate_content = getattr(response.candidates[0], "content", None)
-                    if candidate_content is not None:
-                        history.append(candidate_content)
-
-                    function_response_parts: List[Any] = []
-                    candidate_validated_draft: Optional[str] = None
-                    turn_accent_rejected_text: Optional[str] = None
-                    input_too_large_detected = False
-                    for call in function_calls:
-                        call_name = getattr(call, "name", "validate_draft") or "validate_draft"
-                        args = dict(getattr(call, "args", {}) or {})
-                        draft = str(args.get("text") or "").strip() or assistant_text.strip()
-
-                        if call_name == "audit_accent" and accent_context is not None:
-                            try:
-                                audit_result = await self.audit_accent(
-                                    draft,
-                                    language=None,
-                                    criteria_block=accent_context["criteria_block"],
-                                    min_score=resolved_accent_min_score,
-                                    timeout_seconds=float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
-                                    max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
-                                    on_error=audit_on_error,
-                                    llm_routing=llm_routing,
-                                )
-                            except AccentGuardError as acc_exc:
-                                if audit_on_error == "fail_closed":
-                                    raise
-                                accent_fail_open_delta_count += 1
-                                accent_fail_open_delta_paths.append("inline_tool")
-                                trace.append({
-                                    "turn": turn,
-                                    "event": "accent_fail_open",
-                                    "path": "inline_tool",
-                                    "reason": acc_exc.reason,
-                                })
-                                audit_result = {
-                                    "approved": True,
-                                    "score": None,
-                                    "findings": [],
-                                    "verdict_summary": "",
-                                    "warning": acc_exc.reason,
-                                }
-                            tool_call_counts["audit_accent"] += 1
-                            total_tool_calls += 1
-                            score_val = audit_result.get("score")
-                            if audit_result.get("approved"):
-                                audit_accent_approved_hashes.add(_draft_hash(draft))
-                                accent_last_inline_score = score_val
-                                accent_approved_count += 1
-                            else:
-                                accent_rejected_count += 1
-                                turn_accent_rejected_text = draft
-                            latest_audit_result = audit_result
-                            function_response_parts.append(
-                                self.genai_client.protos.Part(
-                                    function_response=self.genai_client.protos.FunctionResponse(
-                                        name="audit_accent",
-                                        response=audit_result,
-                                    )
-                                )
-                            )
-                            trace.append({
-                                "turn": turn,
-                                "tool": "audit_accent",
-                                "event": "tool_result",
-                                "approved": bool(audit_result.get("approved")),
-                                "score": score_val,
-                                "findings_count": len(audit_result.get("findings") or []),
-                            })
-                            continue
-
-                        await self._emit_tool_event_safe(
-                            tool_event_callback,
-                            "tool_call_start",
-                            {
-                                "tool": "validate_draft",
-                                "turn": turn,
-                                "args_preview": draft[:200],
-                            },
-                        )
-                        try:
-                            tool_payload = self._invoke_validation_callback(
-                                validation_callback,
-                                draft,
-                                mode_name=mode_name,
-                                model_id=model_id,
-                                turn=turn,
-                                stage="tool_argument",
-                                tool_event_callback=tool_event_callback,
-                            )
-                        except ValidationToolInputTooLarge as oversize_exc:
-                            await self._emit_tool_event_safe(
-                                tool_event_callback,
-                                "tool_call_error",
-                                {
-                                    "turn": turn,
-                                    "reason": "input_too_large",
-                                    "actual_length": oversize_exc.actual_length,
-                                    "max_length": oversize_exc.max_length,
-                                },
-                            )
-                            function_response_parts.append(
-                                self.genai_client.protos.Part(
-                                    function_response=self.genai_client.protos.FunctionResponse(
-                                        name=call_name,
-                                        response={"error": "text_exceeds_limit"},
-                                    )
-                                )
-                            )
-                            trace.append(
-                                {
-                                    "turn": turn,
-                                    "tool": call_name,
-                                    "event": "tool_call_error",
-                                    "reason": "input_too_large",
-                                    "actual_length": oversize_exc.actual_length,
-                                    "max_length": oversize_exc.max_length,
-                                }
-                            )
-                            input_too_large_detected = True
-                            continue
-                        total_tool_calls += 1
-                        tool_call_counts["validate_draft"] += 1
-                        if tool_payload.approved:
-                            candidate_validated_draft = draft
-                        else:
-                            latest_feedback = str(
-                                tool_payload.feedback or "The draft failed deterministic validation."
-                            ).strip()
-                            latest_invalid_draft = draft
-                        function_response_parts.append(
-                            self.genai_client.protos.Part(
-                                function_response=self.genai_client.protos.FunctionResponse(
-                                    name=call_name,
-                                    response=tool_payload.build_visible_payload(payload_scope),
-                                )
-                            )
-                        )
-                        trace.append(
-                            {
-                                "turn": turn,
-                                "tool": call_name,
-                                "approved": bool(tool_payload.approved),
-                                "score": tool_payload.score,
-                                "word_count": tool_payload.word_count,
-                                "hard_failed": bool(tool_payload.hard_failed),
-                                "metrics": self._build_trace_metrics(tool_payload),
-                            }
-                        )
-                        await self._emit_tool_event_safe(
-                            tool_event_callback,
-                            "tool_call_result",
-                            {
-                                "turn": turn,
-                                "score": tool_payload.score,
-                                "hard_failed": bool(tool_payload.hard_failed),
-                                "word_count": tool_payload.word_count,
-                                "issue_codes": [
-                                    i.get("code") for i in (tool_payload.issues or [])
-                                    if isinstance(i, dict)
-                                ],
-                            },
-                        )
-
-                    if input_too_large_detected:
-                        history.append(
-                            self.genai_client.protos.Content(
-                                role="user", parts=list(function_response_parts)
-                            )
-                        )
-                        forced_result = await _run_forced_final_turn(
-                            turn=turn + 1,
-                            reason="input_too_large",
-                            feedback=(
-                                latest_feedback
-                                or "The draft failed deterministic validation."
-                            ),
-                            draft=latest_invalid_draft,
-                        )
-                        if forced_result:
-                            return forced_result
-                        raise ToolLoopSchemaViolationError(
-                            "Tool loop exhausted after validate_draft input_too_large"
-                        )
-
-                    if candidate_validated_draft is not None and (
-                        not accent_inline_required
-                        or _draft_hash(candidate_validated_draft) in audit_accent_approved_hashes
-                    ):
-                        latest_validated_text = candidate_validated_draft
-                        envelope = {
-                            "mode": mode_name,
-                            "turns": turn,
-                            "accepted": "validated_tool_argument",
-                            "trace": trace,
-                        }
-                        envelope.update(_build_accent_envelope())
-                        return latest_validated_text, envelope
-
-                    combined_parts: List[Any] = list(function_response_parts)
-                    if accent_inline_required and candidate_validated_draft is not None and (
-                        _draft_hash(candidate_validated_draft) not in audit_accent_approved_hashes
-                    ):
-                        snippet_text = turn_accent_rejected_text or candidate_validated_draft
-                        combined_parts.append(
-                            self.genai_client.protos.Part(
-                                text=self._build_audit_accent_feedback_message(
-                                    snippet_text[:200], latest_audit_result
-                                )
-                            )
-                        )
-                        trace.append({
-                            "turn": turn,
-                            "event": "accent_gate_blocked",
-                            "stage": "tool_call",
-                        })
-                    history.append(
-                        self.genai_client.protos.Content(role="user", parts=combined_parts)
-                    )
-                    continue
-
-                candidate = assistant_text.strip() or latest_validated_text
-                if not candidate:
-                    continue
-
-                if payload_scope == PayloadScope.MEASUREMENT_ONLY:
-                    trace.append(
-                        {
-                            "turn": turn,
-                            "skipped_final_validation_for_evaluator": True,
-                            "stage": "assistant_final",
-                        }
-                    )
-                    if accent_inline_required and _draft_hash(candidate) not in audit_accent_approved_hashes:
-                        history.append(
-                            {
-                                "role": "user",
-                                "parts": [
-                                    self._build_audit_accent_feedback_message(
-                                        candidate[:200], latest_audit_result
-                                    )
-                                ],
-                            }
-                        )
-                        trace.append({
-                            "turn": turn,
-                            "event": "accent_gate_blocked",
-                            "stage": "assistant_final",
-                        })
-                        continue
-                    envelope = {
-                        "mode": mode_name,
-                        "turns": turn,
-                        "accepted": "assistant_final",
-                        "trace": trace,
-                    }
-                    envelope.update(_build_accent_envelope())
-                    return candidate, envelope
-
-                final_report = self._invoke_validation_callback(
-                    validation_callback,
-                    candidate,
-                    mode_name=mode_name,
-                    model_id=model_id,
-                    turn=turn,
-                    stage="assistant_final",
-                    tool_event_callback=tool_event_callback,
-                )
-                trace.append(
-                    {
-                        "turn": turn,
-                        "validator_after_final": {
-                            "approved": bool(final_report.approved),
-                            "score": final_report.score,
-                            "word_count": final_report.word_count,
-                            "hard_failed": bool(final_report.hard_failed),
-                        },
-                        "metrics": self._build_trace_metrics(final_report),
-                    }
-                )
-                if final_report.approved:
-                    if accent_inline_required and _draft_hash(candidate) not in audit_accent_approved_hashes:
-                        history.append(
-                            {
-                                "role": "user",
-                                "parts": [
-                                    self._build_audit_accent_feedback_message(
-                                        candidate[:200], latest_audit_result
-                                    )
-                                ],
-                            }
-                        )
-                        trace.append({
-                            "turn": turn,
-                            "event": "accent_gate_blocked",
-                            "stage": "assistant_final",
-                        })
-                        continue
-                    envelope = {
-                        "mode": mode_name,
-                        "turns": turn,
-                        "accepted": "assistant_final",
-                        "trace": trace,
-                    }
-                    envelope.update(_build_accent_envelope())
-                    return candidate, envelope
-
-                feedback = str(final_report.feedback or "The draft failed deterministic validation.").strip()
-                latest_feedback = feedback
-                latest_invalid_draft = candidate
-                history.append(
-                    {"role": "user", "parts": [self._build_validate_draft_feedback_message(feedback)]}
-                )
-
-            forced_result = await _run_forced_final_turn(
-                turn=max_rounds + 1,
-                reason="max_rounds_exhausted",
-                feedback=latest_feedback or "The draft failed deterministic validation.",
-                draft=latest_invalid_draft,
-            )
-            if forced_result:
-                return forced_result
-
-            if latest_validated_text.strip():
-                await _sync_audit_or_fail(latest_validated_text, "path_d", max_rounds)
-                envelope = {
-                    "mode": mode_name,
-                    "turns": max_rounds,
-                    "accepted": "tool_loop_exhausted",
-                    "trace": trace,
-                }
-                envelope.update(_build_accent_envelope())
-                return latest_validated_text, envelope
-
-            raise ValueError("Tool loop exhausted without producing a validated draft")
-
-        async with self._provider_call_scope(
-            cancellation_token,
-            provider="gemini",
-            model_id=model_id,
-            operation="tool_loop_generation",
-        ):
-            if retries_enabled:
-                return await self._execute_with_retries(
-                    _single_attempt,
-                    provider="gemini",
-                    model_id=model_id,
-                    action="tool_loop_generation",
-                    attempted_feature=attempted_feature,
-                    cancellation_token=cancellation_token,
-                )
-            return await self._execute_without_retries(
-                _single_attempt,
-                provider="gemini",
-                model_id=model_id,
-                action="tool_loop_generation",
-                attempted_feature=attempted_feature,
-                cancellation_token=cancellation_token,
-            )
-
     async def call_ai_with_validation_tools(
         self,
         prompt: str,
@@ -7788,6 +6981,7 @@ class AIService:
             "force_finalize_message": force_finalize_message,
             "retries_enabled": retries_enabled,
             "attempted_feature": output_plan.attempted_feature or "tools",
+            "llm_routing": llm_routing,
             "cancellation_token": cancellation_token,
         }
 
@@ -7851,30 +7045,6 @@ class AIService:
                         usage_callback=usage_callback,
                         usage_extra=extra_payload,
                         images=images,
-                        max_rounds=effective_max_rounds,
-                        extra_verbose=extra_verbose,
-                        accent_context=accent_context,
-                        enable_validate_draft=enable_validate_draft,
-                        **loop_common_kwargs,
-                    )
-                elif self.genai_client:
-                    if images:
-                        logger.warning(
-                            "Vision not supported with legacy Gemini SDK tool loop. "
-                            "Images will be ignored for model %s.",
-                            model_id,
-                        )
-                    content, metadata = await self._run_gemini_legacy_sdk_validation_tool_loop(
-                        model_id=model_id,
-                        prompt=prompt,
-                        validation_callback=validation_callback,
-                        temperature=temperature,
-                        max_tokens=adjusted_max_tokens,
-                        system_prompt=effective_system_prompt,
-                        json_output=json_output_flag,
-                        json_schema=effective_json_schema,
-                        usage_callback=usage_callback,
-                        usage_extra=extra_payload,
                         max_rounds=effective_max_rounds,
                         extra_verbose=extra_verbose,
                         accent_context=accent_context,
@@ -9048,9 +8218,9 @@ class AIService:
         create_params = {
             "model": model_id,
             "max_tokens": max_tokens,
-            "temperature": temperature,
             "messages": messages
         }
+        self._add_claude_sampling_params(create_params, model_id, temperature)
 
         # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
         effective_system = system_prompt.strip() if system_prompt else ""
@@ -9135,38 +8305,19 @@ class AIService:
         images: Optional[List["ImageData"]] = None,
     ) -> Tuple[str, Any]:
         """Generate content using Gemini API with optional JSON Schema and vision support"""
-        if self.google_new_client:
-            return await self._generate_gemini_new_sdk(
-                prompt,
-                model_id,
-                temperature,
-                max_tokens,
-                system_prompt,
-                thinking_budget_tokens=thinking_budget_tokens,
-                json_output=json_output,
-                json_schema=json_schema,
-                images=images,
-            )
-        elif self.genai_client:
-            # Legacy SDK: log warning if images provided (not fully supported)
-            if images:
-                logger.warning(
-                    "Vision not supported with legacy Gemini SDK. "
-                    "Images will be ignored for model %s. "
-                    "Consider upgrading to google-genai SDK.",
-                    model_id
-                )
-            return await self._generate_gemini_legacy_sdk(
-                prompt,
-                model_id,
-                temperature,
-                max_tokens,
-                system_prompt,
-                json_output=json_output,
-                json_schema=json_schema,
-            )
-        else:
+        if not self.google_new_client:
             raise ValueError("No Gemini client initialized")
+        return await self._generate_gemini_new_sdk(
+            prompt,
+            model_id,
+            temperature,
+            max_tokens,
+            system_prompt,
+            thinking_budget_tokens=thinking_budget_tokens,
+            json_output=json_output,
+            json_schema=json_schema,
+            images=images,
+        )
 
     async def _generate_gemini_new_sdk(
         self,
@@ -9286,105 +8437,6 @@ class AIService:
             logger.error(f"New Gemini SDK error: {e}")
             raise
 
-    async def _generate_gemini_legacy_sdk(
-        self,
-        prompt: str,
-        model_id: str,
-        temperature: float,
-        max_tokens: int,
-        system_prompt: str,
-        json_output: bool = False,
-        json_schema: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[str, Any]:
-        """Generate content using legacy Google GenerativeAI SDK with optional JSON Schema support
-
-        Args:
-            prompt: Generation prompt
-            model_id: Gemini model identifier
-            temperature: Generation temperature
-            max_tokens: Maximum output tokens
-            system_prompt: System prompt
-            json_output: Enable JSON output mode
-            json_schema: Optional JSON schema for structured outputs (requires json_output=True)
-        """
-        # Build system instruction with JSON instructions if needed (avoids prompt contamination in user message)
-        system_instruction = system_prompt or ""
-        if self._should_inject_json_prompt("gemini", model_id, json_output, json_schema):
-            json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
-            if system_instruction:
-                system_instruction = f"{system_instruction}\n\n{json_instructions}"
-            else:
-                system_instruction = json_instructions
-
-        model = self.genai_client.GenerativeModel(
-            model_name=model_id,
-            system_instruction=system_instruction if system_instruction else None
-        )
-
-        # User prompt stays clean - JSON instructions go in system_instruction only
-        final_prompt = prompt
-
-        config_kwargs = {
-            "temperature": temperature,
-            "max_output_tokens": max_tokens,
-        }
-
-        # Configure JSON output format
-        if json_output:
-            config_kwargs["response_mime_type"] = "application/json"
-            if json_schema:
-                # Use JSON Schema for structured outputs (Gemini 2.5+, Nov 2025)
-                config_kwargs["response_schema"] = json_schema
-                logger.info(f"Using Gemini legacy SDK JSON Schema structured outputs for {model_id}")
-            else:
-                logger.info(f"Using Gemini legacy SDK JSON mode (flexible) for {model_id}")
-
-        try:
-            generation_config = self.genai_client.GenerationConfig(**config_kwargs)
-        except TypeError:
-            # Older SDKs might not support response_mime_type or response_schema
-            config_kwargs.pop("response_schema", None)
-            config_kwargs.pop("response_mime_type", None)
-            generation_config = self.genai_client.GenerationConfig(**config_kwargs)
-
-        response = await model.generate_content_async(
-            final_prompt,
-            generation_config=generation_config
-        )
-
-        # Check if response was blocked by safety filters
-        if not response.parts or not response.text:
-            # Check safety ratings
-            if hasattr(response, 'candidates') and response.candidates:
-                candidate = response.candidates[0]
-                if hasattr(candidate, 'safety_ratings') and candidate.safety_ratings:
-                    safety_issues = []
-                    for rating in candidate.safety_ratings:
-                        if rating.probability.name in ['HIGH', 'MEDIUM']:
-                            safety_issues.append(f"{rating.category.name}: {rating.probability.name}")
-                    if safety_issues:
-                        return (
-                            f"Content blocked by safety filters: {'; '.join(safety_issues)}. Please try a different prompt.",
-                            getattr(response, 'usage_metadata', None),
-                        )
-
-            return (
-                "Unable to generate content. The response may have been blocked by safety filters or the model didn't return valid content. Please try rephrasing your request.",
-                self._usage_with_finish_metadata(
-                    getattr(response, 'usage_metadata', None),
-                    response,
-                    provider="gemini",
-                    max_tokens=max_tokens,
-                ),
-            )
-
-        return response.text, self._usage_with_finish_metadata(
-            getattr(response, 'usage_metadata', None),
-            response,
-            provider="gemini",
-            max_tokens=max_tokens,
-        )
-
     def _apply_temperature_policies(
         self,
         model_info: Dict[str, Any],
@@ -9398,6 +8450,10 @@ class AIService:
         effective_temperature = requested_temperature
         adjusted_thinking = thinking_budget_tokens
         forced_temperature = False
+        model_id = model_info.get("model_id", "")
+
+        if provider in {"claude", "anthropic"} and self._claude_omits_sampling_params(model_id):
+            return effective_temperature, adjusted_thinking, forced_temperature
 
         # Claude models with thinking mode enabled REQUIRE temperature = 1.0
         if provider in {"claude", "anthropic"}:
@@ -9414,7 +8470,7 @@ class AIService:
                 # Anthropic reasoning models require thinking mode with temperature=1
                 if provider in {"claude", "anthropic"}:
                     if not adjusted_thinking or adjusted_thinking <= 0:
-                        default_budget = self._get_thinking_budget_for_model(model_info.get("model_id", ""))
+                        default_budget = self._get_thinking_budget_for_model(model_id)
                         if default_budget:
                             adjusted_thinking = default_budget
             elif provider == "openai":
@@ -9422,6 +8478,33 @@ class AIService:
                 pass
 
         return effective_temperature, adjusted_thinking, forced_temperature
+
+    @staticmethod
+    def _claude_omits_sampling_params(model_id: str) -> bool:
+        """Return True for Claude Messages models that reject sampling params."""
+        normalized = (model_id or "").strip().lower().replace(".", "-")
+        restricted_markers = (
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+        )
+        return any(marker in normalized for marker in restricted_markers)
+
+    @classmethod
+    def _claude_uses_adaptive_thinking_only(cls, model_id: str) -> bool:
+        """Return True when manual extended thinking budgets are rejected."""
+        return cls._claude_omits_sampling_params(model_id)
+
+    @classmethod
+    def _add_claude_sampling_params(
+        cls,
+        params: Dict[str, Any],
+        model_id: str,
+        temperature: float,
+    ) -> None:
+        """Attach Claude sampling params only for models that support them."""
+        if cls._claude_omits_sampling_params(model_id):
+            return
+        params["temperature"] = temperature
 
     @staticmethod
     def _supports_claude_thinking(model_id: str) -> bool:
@@ -9441,14 +8524,20 @@ class AIService:
     @staticmethod
     def _openrouter_accepts_temperature(model_id: str) -> bool:
         """Return False for OpenRouter models documented to reject sampling params."""
-        normalized = (model_id or "").strip().lower().split(":", 1)[0]
+        normalized = (model_id or "").strip().lower().split(":", 1)[0].replace(".", "-")
+        no_temperature_prefixes = (
+            "anthropic/claude-opus-4-7",
+            "anthropic/claude-opus-4-8",
+        )
         no_temperature_models = (
-            "anthropic/claude-opus-4.7",
-            "anthropic/claude-sonnet-4.6",
+            "anthropic/claude-sonnet-4-6",
             "~anthropic/claude-opus-latest",
             "~anthropic/claude-sonnet-latest",
         )
-        return not any(normalized == marker for marker in no_temperature_models)
+        return not (
+            any(normalized.startswith(marker) for marker in no_temperature_prefixes)
+            or any(normalized == marker for marker in no_temperature_models)
+        )
 
     def _get_thinking_budget_details(self, model_id: str) -> Optional[Dict[str, int]]:
         """Fetch full thinking budget configuration for a model if available."""
@@ -9476,6 +8565,11 @@ class AIService:
             return
 
         if not self._supports_claude_thinking(model_id):
+            return
+
+        if self._claude_uses_adaptive_thinking_only(model_id):
+            params["thinking"] = {"type": "adaptive"}
+            logger.info(f"{log_context}Using adaptive thinking for model {model_id}")
             return
 
         budget = int(thinking_budget_tokens)
@@ -9714,10 +8808,12 @@ class AIService:
 
         # Test Gemini
         try:
-            if self.genai_client:
+            if self.google_new_client:
                 route = resolve_call("health.gemini")
-                model = self.genai_client.GenerativeModel(route.model)
-                await model.generate_content_async("Hello")
+                await self.google_new_client.aio.models.generate_content(
+                    model=route.model,
+                    contents="Hello",
+                )
                 health_status["gemini"] = True
             else:
                 health_status["gemini"] = False
@@ -10067,9 +9163,9 @@ class AIService:
             stream_params = {
                 "max_tokens": max_tokens,
                 "model": model_id,
-                "temperature": temperature,
                 "messages": messages
             }
+            self._add_claude_sampling_params(stream_params, model_id, temperature)
 
             # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
             effective_system = system_prompt.strip() if system_prompt else ""
@@ -10213,44 +9309,22 @@ class AIService:
     ):
         """Stream Gemini content generation with optional JSON Schema and vision support"""
         extra_payload = usage_extra or {}
-        if self.google_new_client:
-            async for chunk in self._stream_gemini_new_sdk(
-                prompt,
-                model_id,
-                temperature,
-                max_tokens,
-                system_prompt,
-                json_output,
-                json_schema,
-                usage_callback,
-                provider,
-                extra_payload,
-                images=images,
-            ):
-                yield chunk
-        elif self.genai_client:
-            # Legacy SDK: log warning if images provided (not fully supported)
-            if images:
-                logger.warning(
-                    "Vision streaming not supported with legacy Gemini SDK. "
-                    "Images will be ignored for model %s.",
-                    model_id
-                )
-            async for chunk in self._stream_gemini_legacy_sdk(
-                prompt,
-                model_id,
-                temperature,
-                max_tokens,
-                system_prompt,
-                json_output,
-                json_schema,
-                usage_callback,
-                provider,
-                extra_payload,
-            ):
-                yield chunk
-        else:
+        if not self.google_new_client:
             raise ValueError("No Gemini client initialized")
+        async for chunk in self._stream_gemini_new_sdk(
+            prompt,
+            model_id,
+            temperature,
+            max_tokens,
+            system_prompt,
+            json_output,
+            json_schema,
+            usage_callback,
+            provider,
+            extra_payload,
+            images=images,
+        ):
+            yield chunk
 
     async def _stream_gemini_new_sdk(
         self,
@@ -10422,97 +9496,6 @@ class AIService:
         except Exception as e:
             logger.error(f"New Gemini SDK streaming error: {e}")
             raise
-
-
-    async def _stream_gemini_legacy_sdk(
-        self,
-        prompt: str,
-        model_id: str,
-        temperature: float,
-        max_tokens: int,
-        system_prompt: Optional[str],
-        json_output: bool = False,
-        json_schema: Optional[Dict[str, Any]] = None,
-        usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-        provider: str = "gemini",
-        usage_extra: Optional[Dict[str, Any]] = None,
-    ):
-        """Stream content using legacy Google GenerativeAI SDK with optional JSON Schema support"""
-        extra_payload = usage_extra or {}
-        try:
-            # Build system instruction with JSON instructions if needed (avoids prompt contamination in user message)
-            system_instruction = system_prompt or ""
-            if self._should_inject_json_prompt("gemini", model_id, json_output, json_schema):
-                json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
-                if system_instruction:
-                    system_instruction = f"{system_instruction}\n\n{json_instructions}"
-                else:
-                    system_instruction = json_instructions
-
-            # Configure model
-            config_params = {
-                "temperature": temperature,
-                "max_output_tokens": max_tokens,
-            }
-
-            # Configure JSON output format
-            if json_output:
-                config_params["response_mime_type"] = "application/json"
-                if json_schema:
-                    # Use JSON Schema for structured outputs (Gemini 2.5+, Nov 2025)
-                    config_params["response_schema"] = json_schema
-                    logger.info(f"Using Gemini legacy SDK JSON Schema structured outputs (streaming) for {model_id}")
-                else:
-                    logger.info(f"Using Gemini legacy SDK JSON mode (streaming, flexible) for {model_id}")
-
-            generation_config = self.genai_client.types.GenerationConfig(**config_params)
-
-            # Use system_instruction parameter for proper separation
-            model = self.genai_client.GenerativeModel(
-                model_id,
-                generation_config=generation_config,
-                system_instruction=system_instruction if system_instruction else None
-            )
-            # User prompt stays clean
-            response = await model.generate_content_async(prompt, stream=True)
-
-            usage_metadata = None
-            finish_reason = None
-            async for chunk in response:
-                candidates = getattr(chunk, "candidates", None) or []
-                if candidates and getattr(candidates[0], "finish_reason", None) is not None:
-                    finish_reason = getattr(candidates[0], "finish_reason", None)
-                if chunk.text:
-                    yield chunk.text
-                if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
-                    usage_metadata = chunk.usage_metadata
-        except Exception as e:
-            logger.error(f"Legacy Gemini SDK streaming error: {e}")
-            raise
-
-        usage_with_finish = self._usage_with_finish_metadata(
-            usage_metadata,
-            None,
-            provider=provider,
-            max_tokens=max_tokens,
-            fallback_finish_reason=finish_reason,
-        )
-        self._emit_usage(
-            usage_callback,
-            model_id,
-            provider,
-            usage_with_finish,
-            extra_payload,
-        )
-        yield StreamChunk(
-            "",
-            is_thinking=False,
-            metadata=_build_finish_metadata(
-                provider=provider,
-                finish_reason=finish_reason,
-                max_tokens=max_tokens,
-            ),
-        )
 
     async def _stream_xai(
         self,
@@ -11125,7 +10108,7 @@ class AIService:
             return await self._get_openai_embeddings(texts, model)
 
         # Fallback to Google if available (Gemini supports embeddings)
-        if self.genai_client and config.GOOGLE_API_KEY:
+        if self.google_new_client and config.GOOGLE_API_KEY:
             return await self._get_google_embeddings(texts, model)
 
         logger.warning("No embedding provider available")
@@ -11165,16 +10148,19 @@ class AIService:
             model = resolve_call("embedding.google").model
 
         try:
+            from google.genai import types
+
             embeddings = []
+            embed_config = types.EmbedContentConfig(task_type="retrieval_document")
 
             for text in texts:
                 # Google embeddings API requires individual requests
-                result = self.genai_client.embed_content(
+                result = await self.google_new_client.aio.models.embed_content(
                     model=model,
-                    content=text,
-                    task_type="retrieval_document"
+                    contents=text,
+                    config=embed_config,
                 )
-                embeddings.append(result['embedding'])
+                embeddings.append(list(result.embeddings[0].values))
 
             return embeddings
 

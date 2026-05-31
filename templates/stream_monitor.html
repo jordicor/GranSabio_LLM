@@ -437,6 +437,17 @@
             color: var(--white);
         }
 
+        .stream-header-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-left: auto;
+        }
+
+        .stream-header-controls .phase-toggle {
+            margin: 0;
+        }
+
         .stream-badge {
             font-size: 9px;
             padding: 2px 8px;
@@ -2383,6 +2394,29 @@
                 </div>
             </div>
 
+            <!-- Runtime Console -->
+            <div class="stream-panel" data-phase="console">
+                <div class="stream-header">
+                    <span class="stream-title">Console</span>
+                    <div class="stream-header-controls">
+                        <div class="phase-toggle console-scope-toggle" id="consoleScopeToggle">
+                            <span class="toggle-segment on active" data-console-scope="global" title="Global runtime console">Global</span>
+                            <span class="toggle-segment soft" data-console-scope="project" title="Current project console only">Project</span>
+                        </div>
+                        <div class="phase-toggle" data-phase="console">
+                            <span class="toggle-segment on active" data-state="on" title="Active - Showing runtime console output">&#9673;</span>
+                            <span class="toggle-segment soft" data-state="soft" title="Muted - Ignoring console output locally">&#9684;</span>
+                        </div>
+                        <span class="stream-badge" id="badge-console">idle</span>
+                    </div>
+                </div>
+                <div class="stream-content" id="content-console"></div>
+                <div class="stream-stats">
+                    <div class="stat-item"><span class="stat-label">Chunks:</span><span class="stat-value" id="chunks-console">0</span></div>
+                    <div class="stat-item"><span class="stat-label">Bytes:</span><span class="stat-value" id="bytes-console">0</span></div>
+                </div>
+            </div>
+
             <!-- Everything (raw unfiltered) - Only 2 states: on/soft (no hard switch) -->
             <div class="stream-panel" data-phase="everything">
                 <div class="stream-header">
@@ -2411,6 +2445,6 @@
         </div>
     </div>
 
-    <script src="/static/js/stream_monitor.js"></script>
+    <script src="/static/js/stream_monitor.js?v=runtime-console-scope-20260530"></script>
 </body>
 </html>

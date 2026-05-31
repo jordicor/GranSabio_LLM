@@ -46,6 +46,7 @@ from llm_routing import (
     resolve_call_models,
 )
 from usage_tracking import UsageTracker
+from services.runtime_console import bind_console_context
 from word_count_utils import (
     is_word_count_enforcement_enabled,
     validate_word_count_config,
@@ -605,6 +606,8 @@ async def generate_content(request: ContentRequest):
         logger.info(f"GRANSABIO_MAIN: Using session_id as project_id: {project_id}")
     else:
         logger.info(f"GRANSABIO_MAIN: Using explicit project_id: {project_id}")
+
+    bind_console_context(session_id=session_id, project_id=project_id, phase="admission")
 
     if project_id:
         _reserve_project_id(project_id)

@@ -42,7 +42,6 @@ def ai_service_instance():
                         service.openai_client = None
                         service.anthropic_client = None
                         service.google_new_client = None
-                        service.genai_client = None
                         service.xai_client = None
                         service.openrouter_client = None
                         service.ollama_client = None
@@ -979,6 +978,11 @@ class TestOpenRouterTemperatureParams:
     def test_claude_opus_47_thinking_alias_omits_temperature(self):
         assert AIService._openrouter_accepts_temperature("anthropic/claude-opus-4.7:thinking") is False
 
+    def test_claude_opus_48_omits_temperature(self):
+        assert AIService._openrouter_accepts_temperature("anthropic/claude-opus-4.8") is False
+        assert AIService._openrouter_accepts_temperature("anthropic/claude-opus-4.8:thinking") is False
+        assert AIService._openrouter_accepts_temperature("anthropic/claude-opus-4.8-fast") is False
+
     def test_claude_sonnet_46_omits_temperature(self):
         assert AIService._openrouter_accepts_temperature("anthropic/claude-sonnet-4.6") is False
 
@@ -987,7 +991,14 @@ class TestOpenRouterTemperatureParams:
         assert AIService._openrouter_accepts_temperature("x-ai/grok-4-fast") is True
 
     @pytest.mark.asyncio
-    async def test_generate_openrouter_does_not_send_temperature_for_opus_47(self, ai_service_instance):
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "anthropic/claude-opus-4.7",
+            "anthropic/claude-opus-4.8",
+        ],
+    )
+    async def test_generate_openrouter_does_not_send_temperature_for_restricted_opus(self, ai_service_instance, model_id):
         create = AsyncMock(
             return_value=SimpleNamespace(
                 choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
@@ -1000,7 +1011,7 @@ class TestOpenRouterTemperatureParams:
 
         content, _usage = await ai_service_instance._generate_openrouter(
             prompt="Hello",
-            model_id="anthropic/claude-opus-4.7",
+            model_id=model_id,
             temperature=0.4,
             max_tokens=64,
             system_prompt="System",
@@ -1008,8 +1019,85 @@ class TestOpenRouterTemperatureParams:
 
         assert content == "ok"
         request_kwargs = create.await_args.kwargs
-        assert request_kwargs["model"] == "anthropic/claude-opus-4.7"
+        assert request_kwargs["model"] == model_id
         assert request_kwargs["max_tokens"] == 64
+        assert "temperature" not in request_kwargs
+
+    def test_openrouter_tool_params_omit_temperature_for_restricted_opus(self, ai_service_instance):
+        params = ai_service_instance._build_openai_compatible_tool_params(
+            provider="openrouter",
+            model_id="anthropic/claude-opus-4.8",
+            current_messages=[{"role": "user", "content": "Hello"}],
+            temperature=0.4,
+            max_tokens=64,
+            reasoning_effort=None,
+            json_output=False,
+            json_schema=None,
+            tools_enabled=False,
+        )
+
+        assert params["model"] == "anthropic/claude-opus-4.8"
+        assert "temperature" not in params
+
+
+class TestClaudeOpus47And48Compatibility:
+    """Tests for Opus 4.7+ Anthropic Messages API constraints."""
+
+    def test_direct_claude_restricted_models_omit_sampling_params(self):
+        assert AIService._claude_omits_sampling_params("claude-opus-4-7") is True
+        assert AIService._claude_omits_sampling_params("claude-opus-4-8") is True
+        assert AIService._claude_omits_sampling_params("claude-opus-4-6") is False
+
+    @pytest.mark.asyncio
+    async def test_generate_claude_omits_temperature_for_opus_48(self, ai_service_instance):
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="ok")],
+                usage=None,
+                stop_reason="end_turn",
+            )
+        )
+        ai_service_instance.anthropic_client = SimpleNamespace(
+            messages=SimpleNamespace(create=create),
+        )
+
+        content, _usage = await ai_service_instance._generate_claude(
+            prompt="Hello",
+            model_id="claude-opus-4-8",
+            temperature=0.4,
+            max_tokens=64,
+            system_prompt="System",
+        )
+
+        assert content == "ok"
+        request_kwargs = create.await_args.kwargs
+        assert request_kwargs["model"] == "claude-opus-4-8"
+        assert "temperature" not in request_kwargs
+
+    @pytest.mark.asyncio
+    async def test_generate_claude_translates_opus_48_thinking_budget_to_adaptive(self, ai_service_instance):
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="ok")],
+                usage=None,
+                stop_reason="end_turn",
+            )
+        )
+        ai_service_instance.anthropic_client = SimpleNamespace(
+            messages=SimpleNamespace(create=create),
+        )
+
+        await ai_service_instance._generate_claude(
+            prompt="Hello",
+            model_id="claude-opus-4-8",
+            temperature=1.0,
+            max_tokens=64,
+            system_prompt="System",
+            thinking_budget_tokens=12000,
+        )
+
+        request_kwargs = create.await_args.kwargs
+        assert request_kwargs["thinking"] == {"type": "adaptive"}
         assert "temperature" not in request_kwargs
 
 

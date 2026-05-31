@@ -9,6 +9,7 @@ definitions attach to the shared FastAPI application.
 from . import (
     analytics_routes,  # noqa: F401
     app_state,  # noqa: F401
+    console_routes,  # noqa: F401
     debug_routes,  # noqa: F401
     generation_routes,  # noqa: F401
     interfaces,  # noqa: F401

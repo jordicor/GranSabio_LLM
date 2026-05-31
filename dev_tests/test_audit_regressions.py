@@ -269,6 +269,7 @@ def test_claude_opus_47_supports_structured_outputs():
     from ai_service import AIService
 
     assert AIService._claude_supports_structured_outputs("claude-opus-4-7")
+    assert AIService._claude_supports_structured_outputs("claude-opus-4-8")
 
 
 def test_generation_tools_auto_does_not_force_unsupported_provider(monkeypatch):

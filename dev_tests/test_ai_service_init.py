@@ -29,8 +29,6 @@ def mock_all_api_clients():
     with patch("ai_service.openai") as mock_openai, \
          patch("ai_service.anthropic") as mock_anthropic, \
          patch("ai_service.google_genai", None), \
-         patch("ai_service.GOOGLE_NEW_SDK", False), \
-         patch("ai_service.genai", None), \
          patch("ai_service.aiohttp.TCPConnector") as mock_connector:
 
         # Configure OpenAI mock
@@ -330,8 +328,6 @@ class TestGoogleClientInit:
              patch("ai_service.openai") as mock_openai, \
              patch("ai_service.anthropic") as mock_anthropic, \
              patch("ai_service.google_genai", mock_google_genai), \
-             patch("ai_service.GOOGLE_NEW_SDK", True), \
-             patch("ai_service.genai", None), \
              patch("ai_service.aiohttp.TCPConnector"):
 
             mock_openai.AsyncOpenAI = MagicMock()
@@ -343,32 +339,6 @@ class TestGoogleClientInit:
 
             assert service.google_new_client is not None
             mock_google_genai.Client.assert_called_once_with(api_key="test-google-key")
-
-    def test_google_legacy_sdk_fallback(self, mock_config_with_keys, reset_singleton):
-        """
-        Given: GOOGLE_API_KEY is set but new SDK not available
-        When: AIService is initialized
-        Then: Legacy genai SDK is configured as fallback
-        """
-        mock_legacy_genai = MagicMock()
-
-        with patch("ai_service.config", mock_config_with_keys), \
-             patch("ai_service.openai") as mock_openai, \
-             patch("ai_service.anthropic") as mock_anthropic, \
-             patch("ai_service.google_genai", None), \
-             patch("ai_service.GOOGLE_NEW_SDK", False), \
-             patch("ai_service.genai", mock_legacy_genai), \
-             patch("ai_service.aiohttp.TCPConnector"):
-
-            mock_openai.AsyncOpenAI = MagicMock()
-            mock_openai.OpenAI = MagicMock()
-            mock_anthropic.AsyncAnthropic = MagicMock()
-
-            from ai_service import AIService
-            service = AIService()
-
-            assert service.genai_client is not None
-            mock_legacy_genai.configure.assert_called_once_with(api_key="test-google-key")
 
     def test_google_client_none_without_key(self, mock_all_api_clients, mock_config_no_keys, reset_singleton, caplog):
         """
@@ -384,7 +354,6 @@ class TestGoogleClientInit:
                 service = AIService()
 
                 assert service.google_new_client is None
-                assert service.genai_client is None
                 assert "Google AI API key not found" in caplog.text
 
 

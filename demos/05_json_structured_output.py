@@ -217,9 +217,10 @@ async def demo_json_structured_output():
 
     parser = argparse.ArgumentParser(description="JSON Structured Output Demo")
     parser.add_argument("--text", help="Custom text to extract from")
-    parser.add_argument("--model", default="gpt-5.4",
-                        choices=["gpt-5.4", "claude-sonnet-4-6",
-                                 "gemini-3-flash-preview", "grok-4-1-fast-non-reasoning",
+    parser.add_argument("--model", default="gpt-5-nano",
+                        choices=["gpt-5-nano", "gpt-5.4", "claude-sonnet-4-6",
+                                 "gemini-3.1-flash-lite", "gemini-3-flash-preview",
+                                 "grok-4-1-fast-non-reasoning", "z-ai/glm-5.1",
                                  "z-ai/glm-4.6", "deepseek/deepseek-v3.2-exp", "qwen/qwen3-max"],
                         help="Model to use for extraction")
     parser.add_argument("--simple", action="store_true",
@@ -290,7 +291,7 @@ Extract all relevant information. For missing fields, use null or empty arrays.
             json_output=True,
             json_schema=schema,
             qa_layers=[],  # No QA - schema validation only
-            qa_models=["gpt-5.4"],
+            qa_models=[args.model],
             verbose=True,
             request_name=f"JSON Extraction ({schema_name})",
             wait_for_completion=False  # Return immediately with session_id
@@ -347,11 +348,15 @@ Extract all relevant information. For missing fields, use null or empty arrays.
 
             if "skills" in extracted:
                 skills = extracted.get("skills", {})
-                total_skills = sum(len(v) for v in skills.values() if isinstance(v, list))
-                print(f"  Total Skills: {total_skills}")
-                for category, skill_list in skills.items():
-                    if skill_list:
-                        print(f"    - {category}: {', '.join(skill_list[:5])}")
+                if isinstance(skills, dict):
+                    total_skills = sum(len(v) for v in skills.values() if isinstance(v, list))
+                    print(f"  Total Skills: {total_skills}")
+                    for category, skill_list in skills.items():
+                        if skill_list:
+                            print(f"    - {category}: {', '.join(skill_list[:5])}")
+                elif isinstance(skills, list):
+                    print(f"  Total Skills: {len(skills)}")
+                    print(f"    - {', '.join(str(skill) for skill in skills[:8])}")
 
             if "education" in extracted:
                 print(f"  Education: {len(extracted['education'])} entries")
@@ -372,7 +377,7 @@ Extract all relevant information. For missing fields, use null or empty arrays.
         print("  - 100% guaranteed format compliance")
         print("  - Zero parsing errors")
         print("  - Model validates during generation")
-        print("  - Works with GPT-4o, Claude 4, Gemini, Grok")
+        print("  - Works with GPT, Claude, Gemini, Grok, and OpenRouter models")
         print()
         print("WITHOUT json_schema (flexible mode):")
         print("  - Model decides structure")

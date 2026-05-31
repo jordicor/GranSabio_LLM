@@ -19,6 +19,7 @@ from llm_routing import resolve_call
 from models import GenerationStatus
 from services.attachment_manager import AttachmentError
 from services.project_stream import ProjectStreamManager, SubscriptionError, parse_phases
+from services.runtime_console import bind_console_context, reset_console_context
 from word_count_utils import build_word_count_instructions
 
 from .cancellation import CancellationToken, cancellation_registry
@@ -94,6 +95,11 @@ async def stream_content_direct_v2(session_id: str):
         raise HTTPException(status_code=400, detail="No request data found")
 
     async def direct_content_generator():
+        console_context_tokens = bind_console_context(
+            session_id=session_id,
+            project_id=project_id,
+            phase="direct_stream",
+        )
         current_task = asyncio.current_task()
         registered_task = False
         try:
@@ -167,6 +173,7 @@ async def stream_content_direct_v2(session_id: str):
         finally:
             if registered_task and current_task is not None:
                 await cancellation_registry.unregister_task(session_id, current_task)
+            reset_console_context(console_context_tokens)
 
     return StreamingResponse(
         direct_content_generator(),

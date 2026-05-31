@@ -139,8 +139,8 @@ python demos/05_json_structured_output.py
 # Simple schema:
 python demos/05_json_structured_output.py --simple
 
-# Different model:
-python demos/05_json_structured_output.py --model claude-sonnet-4-20250514
+# Cheap Gemini schema test:
+python demos/05_json_structured_output.py --simple --model gemini-3.1-flash-lite
 ```
 
 **Features:**
@@ -399,7 +399,7 @@ async with AsyncGranSabioClient() as client:
     result = await client.generate(
         prompt="Your prompt here",
         content_type="article",
-        generator_model="gpt-5.4"
+        generator_model="gpt-5-nano"
     )
 
     # Wait for completion
@@ -443,5 +443,5 @@ Optional:
 - Check `/models` endpoint for available models
 
 **Slow response times**
-- Reasoning models (GPT-5.4, O3, Claude thinking) are slower by design
-- Use faster models (gpt-5.4) for quick tests
+- Reasoning-heavy models (O3, Claude thinking, larger GPT-5 variants) are slower by design
+- Use cheaper fast models (`gpt-5-nano`, `gemini-3.1-flash-lite`) for quick tests

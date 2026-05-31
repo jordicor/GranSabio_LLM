@@ -224,6 +224,7 @@ def _docs_rule_state(provider: str, model_id: str, capability: str) -> Capabilit
             normalized_model = model_lower.replace(".", "-")
             supported_markers = (
                 "claude-mythos",
+                "claude-opus-4-8",
                 "claude-opus-4-7",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",

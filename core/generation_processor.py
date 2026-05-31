@@ -63,6 +63,7 @@ from services.attachment_manager import (
     AttachmentValidationError,
     ResolvedAttachment,
 )
+from services.runtime_console import bind_console_context, reset_console_context
 
 # Smart Edit imports (standalone module)
 from smart_edit import (
@@ -4394,6 +4395,11 @@ async def process_content_generation(
     if session is None:
         logger.error(f"Session {session_id} not found - cannot process generation")
         return
+    console_context_tokens = bind_console_context(
+        session_id=session_id,
+        project_id=session.get("project_id"),
+        phase=session.get("current_phase") or "generation",
+    )
     cancellation_token = CancellationToken(
         session_id=session_id,
         project_id=session.get("project_id"),
@@ -7358,11 +7364,29 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
         logger.error(f"--- END REJECTED CONTENT ---")
     finally:
         await cancellation_registry.unregister_session(session_id)
+        reset_console_context(console_context_tokens)
 
+
+
+def _strip_console_unsafe_symbols(message: str) -> str:
+    """Remove emoji-style symbols that commonly fail in Windows consoles."""
+    unsafe_ranges = (
+        (0x1F000, 0x1FAFF),
+        (0x2600, 0x27BF),
+    )
+    unsafe_codepoints = {0xFE0F, 0x200D}
+    cleaned = "".join(
+        char
+        for char in str(message)
+        if ord(char) not in unsafe_codepoints
+        and not any(start <= ord(char) <= end for start, end in unsafe_ranges)
+    )
+    return " ".join(cleaned.split())
 
 
 async def add_verbose_log(session_id: str, message: str) -> None:
     '''Add a verbose log entry with timestamp and enforce log limits.'''
+    message = _strip_console_unsafe_symbols(message)
     timestamp = datetime.now().strftime("%H:%M:%S")
     log_entry = f"[{timestamp}] {message}"
     max_entries = max(1, getattr(config, "VERBOSE_MAX_ENTRIES", 100))
@@ -7379,9 +7403,7 @@ async def add_verbose_log(session_id: str, message: str) -> None:
     if not appended:
         return
 
-    import re
-    console_message = re.sub(r"[^ -~]", "", message)
-    logger.info(f"Session {session_id}: {console_message}")
+    logger.info(f"Session {session_id}: {message}")
 
     if "rejection" in message.lower() or "rechaza" in message.lower():
         logger.warning(f"DETAILED REJECTION LOG - Session {session_id}")

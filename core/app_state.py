@@ -38,6 +38,7 @@ from debug_logger import (
     get_debug_logger,
     shutdown_debug_logger,
 )
+from services.runtime_console import activate_runtime_console_capture, set_console_phase
 
 from .state import session_store
 
@@ -49,6 +50,7 @@ logging.basicConfig(
         logging.StreamHandler(),
     ]
 )
+activate_runtime_console_capture()
 
 # Silence noisy third-party loggers to avoid cluttering output
 # This prevents low-level HTTP connection logs from httpcore, httpx, etc.
@@ -100,6 +102,7 @@ from qa_engine import QAEngine
 from services.attachment_manager import (
     ResolvedAttachment,
 )
+from template_compat import enable_template_response_compat
 from .cancellation import CancelMode, cancellation_registry
 
 T = TypeVar("T")
@@ -142,7 +145,7 @@ from .monitor_routes import router as monitor_router
 app.include_router(monitor_router)
 
 # Templates
-templates = Jinja2Templates(directory="templates")
+templates = enable_template_response_compat(Jinja2Templates(directory="templates"))
 
 # Global services - initialized lazily to avoid event loop issues
 ai_service = None
@@ -1755,6 +1758,7 @@ def update_session_status(
     session["status"] = status
     if phase is not None:
         session["current_phase"] = phase
+        set_console_phase(phase)
     queue_project_status_event(session, session_id)
     queue_debug_session_transition(
         session_id,
@@ -1766,6 +1770,7 @@ def update_session_status(
 def update_session_phase(session: Dict[str, Any], session_id: str, phase: str) -> None:
     """Set current phase and trigger project status hook."""
     session["current_phase"] = phase
+    set_console_phase(phase)
     queue_project_status_event(session, session_id)
     queue_debug_session_transition(
         session_id,
