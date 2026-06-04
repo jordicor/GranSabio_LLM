@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 # Use optimized JSON (3.6x faster than standard json)
 import json_utils as json
-from llm_routing import resolve_call
+from llm_routing import resolve_call, resolve_temperature
 from models import ExtractedClaim
 
 logger = logging.getLogger(__name__)
@@ -303,7 +303,7 @@ class ClaimExtractor:
 
         route = resolve_call("evidence.extract_claims", request=request)
         effective_model = model or route.model
-        routed_temperature = route.params.get("temperature", 0.3)
+        routed_temperature = resolve_temperature(route)
         routed_max_tokens = route.params.get("max_tokens", 4000)
 
         logger.info(

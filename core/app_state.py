@@ -2124,6 +2124,31 @@ async def get_project_status(project_id: str, *, include_content_snapshot: bool 
                     "escalation_count": escalation_count,
                 },
             }
+            final_result = session.get("final_result") or {}
+            provider_error = (
+                final_result.get("provider_error")
+                if isinstance(final_result, dict)
+                else None
+            ) or session.get("provider_error")
+            failure_reason = (
+                final_result.get("failure_reason")
+                if isinstance(final_result, dict)
+                else None
+            ) or session.get("error")
+            if failure_reason:
+                session_info["failure_reason"] = failure_reason
+            if isinstance(provider_error, dict):
+                session_info["provider_error"] = provider_error
+                session_info["error_type"] = (
+                    final_result.get("error_type")
+                    if isinstance(final_result, dict)
+                    else None
+                ) or session.get("error_type", "provider_error")
+                session_info["error_code"] = (
+                    final_result.get("error_code")
+                    if isinstance(final_result, dict)
+                    else None
+                ) or session.get("error_code") or provider_error.get("kind")
             if include_content_snapshot:
                 content_snapshot = _build_monitor_content_snapshot(session)
                 if content_snapshot:

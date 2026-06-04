@@ -1212,9 +1212,9 @@ class GranSabioInterface {
                 waitingSection.style.display = 'none';
             }
 
-            // Determine if content was approved
-            const isApproved = result.approved !== false;
-            const status = result.approved === false ? 'rejected' : 'completed';
+            // Determine terminal status from the API payload.
+            const status = result.status || (result.approved === false ? 'rejected' : 'completed');
+            const isApproved = status === 'completed' && result.approved !== false;
 
             // Update status badge
             this.updateResultStatusBadge(isApproved, status);
@@ -1265,9 +1265,20 @@ class GranSabioInterface {
                 finalContentDisplay.style.backgroundColor = isApproved ? '#f0fdf4' : '#fef2f2';
             }
 
-            // Add failure reason if rejected
-            if (!isApproved && result.failure_reason) {
-                console.log('Content rejection reason:', result.failure_reason);
+            // Add failure reason for rejected content or technical failures.
+            const providerError = result.provider_error || null;
+            const failureMessage = providerError && providerError.message
+                ? providerError.message
+                : result.failure_reason;
+            if (!isApproved && failureMessage) {
+                const failureLabel = providerError
+                    ? 'Provider error'
+                    : status === 'failed'
+                        ? 'Generation error'
+                        : status === 'cancelled'
+                            ? 'Cancellation reason'
+                            : 'Rejection reason';
+                console.log(`${failureLabel}:`, failureMessage);
 
                 const failureReasonElement = document.createElement('div');
                 failureReasonElement.className = 'failure-reason';
@@ -1280,7 +1291,13 @@ class GranSabioInterface {
                     color: #dc2626;
                     font-size: 14px;
                 `;
-                failureReasonElement.innerHTML = `<strong>Rejection reason:</strong> ${escapeHtml(result.failure_reason)}`;
+                const providerMeta = providerError
+                    ? [providerError.kind, providerError.provider, providerError.model].filter(Boolean).join(' - ')
+                    : '';
+                const providerMetaHtml = providerMeta
+                    ? `<div style="margin-top: 6px; color: #7f1d1d;">${escapeHtml(providerMeta)}</div>`
+                    : '';
+                failureReasonElement.innerHTML = `<strong>${failureLabel}:</strong> ${escapeHtml(failureMessage)}${providerMetaHtml}`;
 
                 // Insert before the content display
                 if (finalContentDisplay && finalContentDisplay.parentNode) {

@@ -28,7 +28,7 @@ import aiosqlite
 import json_utils as json
 from ai_service import get_ai_service
 from core.cancellation import ProviderCallHandle
-from llm_routing import resolve_call
+from llm_routing import resolve_call, resolve_temperature
 from model_aliasing import ModelAliasRegistry, PromptPart
 
 logger = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ class FeedbackConfig:
     max_rules: int = 15
     embedding_model: Optional[str] = None  # Deprecated explicit override; defaults resolve through llm_routing.
     analysis_model: Optional[str] = None  # Deprecated explicit override; defaults resolve through llm_routing.
-    analysis_temperature: float = 0.1
+    analysis_temperature: float = 0.2
 
 
 # ---------- Utilities ----------
@@ -535,7 +535,7 @@ Provide a JSON response with:
             response = await self.ai_service.generate_content(
                 prompt=prompt,
                 model=model_name,
-                temperature=route.params.get("temperature", self.config.analysis_temperature),
+                temperature=resolve_temperature(route, default=self.config.analysis_temperature),
                 max_tokens=route.params.get("max_tokens", 2000),
                 reasoning_effort=route.params.get("reasoning_effort"),
                 thinking_budget_tokens=route.params.get("thinking_budget_tokens"),
@@ -677,7 +677,7 @@ Each rule should be imperative and actionable (e.g., "ALWAYS include publication
             response = await self.ai_service.generate_content(
                 prompt=prompt,
                 model=model_name,
-                temperature=route.params.get("temperature", 0.0),
+                temperature=resolve_temperature(route),
                 max_tokens=route.params.get("max_tokens", 2000),
                 reasoning_effort=route.params.get("reasoning_effort"),
                 thinking_budget_tokens=route.params.get("thinking_budget_tokens"),

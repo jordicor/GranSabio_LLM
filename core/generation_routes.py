@@ -256,7 +256,9 @@ def _apply_request_model_routing(request: ContentRequest, request_fields_set: se
     if "arbiter_model" not in request_fields_set:
         request.arbiter_model = resolve_call("arbiter.resolve", request=request).model
 
-    request._preflight_model = resolve_call("preflight.validate", request=request).model
+    preflight_route = resolve_call("preflight.validate", request=request)
+    request._preflight_route = preflight_route
+    request._preflight_model = preflight_route.model
     request._long_text_controller_eval_model = resolve_call("long_text.semantic_eval", request=request).model
 
 
@@ -667,7 +669,12 @@ async def generate_content(request: ContentRequest):
 
     json_output_requested = is_json_output_requested(request)
 
-    usage_tracker = UsageTracker(detail_level=getattr(request, "show_query_costs", 0))
+    usage_tracker = UsageTracker(
+        detail_level=max(
+            getattr(request, "show_query_costs", 0),
+            getattr(request, "show_query_stats", 0),
+        )
+    )
 
     if json_output_requested:
         fields_set = getattr(request, "model_fields_set", None)
@@ -889,6 +896,18 @@ async def get_status(session_id: str):
             ]
         },
         "error": session.get("error"),
+        "error_type": (
+            (session.get("final_result") or {}).get("error_type")
+            or session.get("error_type")
+        ),
+        "error_code": (
+            (session.get("final_result") or {}).get("error_code")
+            or session.get("error_code")
+        ),
+        "provider_error": (
+            (session.get("final_result") or {}).get("provider_error")
+            or session.get("provider_error")
+        ),
         "failure_reason": (
             (session.get("final_result") or {}).get("failure_reason")
             or session.get("error")

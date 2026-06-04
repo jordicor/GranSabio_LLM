@@ -89,8 +89,12 @@ result = client.generate(
     # Optional
     reasoning_effort="medium",      # For OpenAI reasoning models
     thinking_budget_tokens=8000,    # For Claude thinking models
+    show_query_costs=2,             # Token/cost summary
+    show_query_stats=3,             # Timing and per-call stats
 )
 ```
+
+`show_query_stats` controls prompt-free execution visibility: `1` returns summary aggregates, `2` adds phase/iteration/layer detail, and `3` adds per-call rows with duration, tokens, provider, model, and estimated cost.
 
 ### JSON Structured Output
 

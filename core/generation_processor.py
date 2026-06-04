@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from contextlib import nullcontext
 import re
 import time
 from datetime import datetime
@@ -26,7 +27,7 @@ from feedback_memory import get_feedback_manager
 from gran_sabio import GranSabioProcessCancelled
 from gran_sabio_supervisor import GranSabioSupervisor
 from json_field_utils import prepare_content_for_qa, reconstruct_json, try_extract_json_from_content
-from llm_routing import resolve_call
+from llm_routing import resolve_call, resolve_temperature
 from llm_accent_prompts import ACCENT_SYSTEM_PROMPT_SNIPPET
 from logging_utils import Phase, create_phase_logger
 from long_text.controller import (
@@ -56,6 +57,7 @@ from qa_result_utils import (
     is_technical_qa_failure,
     semantic_deal_breakers,
 )
+from provider_errors import ProviderErrorKind, ProviderFailure
 from services.attachment_manager import (
     AttachmentError,
     AttachmentManager,
@@ -162,6 +164,166 @@ def _build_truncation_failure_reason(session: Dict[str, Any], request: ContentRe
     """Build a user/actionable reason for output-token truncation."""
 
     return generation_results.build_truncation_failure_reason(session, request)
+
+
+def _extract_provider_failure(exc: Exception) -> Optional[ProviderFailure]:
+    """Return normalized provider metadata carried by request failures."""
+
+    if isinstance(exc, AIRequestError):
+        failure = getattr(exc, "provider_failure", None)
+        if isinstance(failure, ProviderFailure):
+            return failure
+    if isinstance(exc, ProviderFailure):
+        return exc
+    return None
+
+
+def _provider_failure_public_message(failure: ProviderFailure) -> str:
+    """Build an actionable message for user-facing API payloads."""
+
+    target = f"{failure.provider}/{failure.model_id}"
+    if failure.kind == ProviderErrorKind.QUOTA_EXHAUSTED:
+        return (
+            f"Provider quota exhausted for {target}. Check the provider quota or "
+            "billing plan, or switch to another configured model/provider."
+        )
+    if failure.kind == ProviderErrorKind.BILLING_REQUIRED:
+        return (
+            f"Provider billing or credits are required for {target}. Check the "
+            "provider billing settings, available credits, or use another configured model/provider."
+        )
+    if failure.kind == ProviderErrorKind.AUTH_INVALID:
+        return (
+            f"Provider authentication failed for {target}. Check the configured API key "
+            "or provider credentials."
+        )
+    if failure.kind == ProviderErrorKind.PERMISSION_DENIED:
+        return (
+            f"Provider denied access to {target}. Check model access permissions or "
+            "choose another configured model/provider."
+        )
+    if failure.kind == ProviderErrorKind.RATE_LIMITED:
+        return (
+            f"Provider rate limit reached for {target}. Retry later or choose another "
+            "configured model/provider."
+        )
+    return f"Provider request failed for {target}: {failure.message}"
+
+
+def _provider_failure_public_payload(failure: ProviderFailure) -> Dict[str, Any]:
+    """Serialize provider failure metadata for public status/result payloads."""
+
+    payload: Dict[str, Any] = {
+        "type": "provider_error",
+        "kind": failure.kind.value,
+        "provider": failure.provider,
+        "model": failure.model_id,
+        "operation": failure.operation,
+        "message": _provider_failure_public_message(failure),
+        "retryable": failure.retryable,
+        "downgradable": failure.downgradable,
+        "status_code": failure.status_code,
+        "provider_error_type": failure.provider_error_type,
+        "provider_error_code": failure.provider_error_code,
+        "provider_error_param": failure.provider_error_param,
+        "request_id": failure.request_id,
+        "attempt": failure.attempt,
+        "max_attempts": failure.max_attempts,
+        "raw_exception_class": failure.raw_exception_class,
+    }
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _get_error_result_content(session: Dict[str, Any], *, default: str) -> str:
+    """Return the best available generated content for failed-result payloads."""
+
+    content = session.get("last_generated_content")
+    if content is None:
+        content = session.get("generation_content")
+    if content is None:
+        return default
+    return str(content)
+
+
+def _build_generation_error_result(
+    session: Dict[str, Any],
+    request: ContentRequest,
+    exc: Exception,
+) -> Dict[str, Any]:
+    """Build the terminal FAILED payload for unexpected generation errors."""
+
+    provider_failure = _extract_provider_failure(exc)
+    if provider_failure is not None:
+        provider_error = _provider_failure_public_payload(provider_failure)
+        error_msg = provider_error["message"]
+        session["provider_error"] = provider_error
+        session["error_type"] = "provider_error"
+        session["error_code"] = provider_failure.kind.value
+        final_result = {
+            "content": _get_error_result_content(session, default=""),
+            "final_iteration": session.get("current_iteration", 0),
+            "final_score": 0.0,
+            "approved": False,
+            "status": GenerationStatus.FAILED.value,
+            "failure_reason": error_msg,
+            "error_type": "provider_error",
+            "error_code": provider_failure.kind.value,
+            "provider_error": provider_error,
+            "evidence_grounding": None,
+            "generated_at": datetime.now().isoformat(),
+        }
+    else:
+        error_msg = str(exc)
+        final_result = {
+            "content": _get_error_result_content(session, default="No content generated"),
+            "final_iteration": session.get("current_iteration", 0),
+            "final_score": 0.0,
+            "approved": False,
+            "status": GenerationStatus.FAILED.value,
+            "failure_reason": error_msg,
+            "evidence_grounding": None,
+            "generated_at": datetime.now().isoformat(),
+        }
+
+    _attach_json_guard_metadata(session, final_result, request)
+    return final_result
+
+
+def _log_generation_error_result(
+    session_id: str,
+    exc: Exception,
+    final_result: Dict[str, Any],
+) -> None:
+    """Log terminal generation failures without labeling provider errors as QA rejections."""
+
+    provider_error = final_result.get("provider_error")
+    if isinstance(provider_error, dict):
+        logger.error("GENERATION FAILED DUE TO PROVIDER ERROR - Session %s", session_id)
+        logger.error(
+            "Provider error: kind=%s provider=%s model=%s status_code=%s code=%s retryable=%s",
+            provider_error.get("kind"),
+            provider_error.get("provider"),
+            provider_error.get("model"),
+            provider_error.get("status_code"),
+            provider_error.get("provider_error_code"),
+            provider_error.get("retryable"),
+        )
+        logger.error("Failure reason: %s", final_result.get("failure_reason"))
+        content_to_log = final_result.get("content") or ""
+        if content_to_log:
+            logger.error("Partial Content (%d characters):", len(content_to_log))
+            logger.error("--- START PARTIAL CONTENT ---")
+            logger.error(content_to_log)
+            logger.error("--- END PARTIAL CONTENT ---")
+        return
+
+    content_to_log = final_result.get("content") or "No content generated"
+    logger.error(f"CONTENT REJECTED DUE TO ERROR - Session {session_id}")
+    logger.error(f"Error: {str(exc)}")
+    logger.error(f"Rejected Content ({len(content_to_log)} characters):")
+    logger.error(f"--- START REJECTED CONTENT ---")
+    logger.error(content_to_log)
+    logger.error(f"--- END REJECTED CONTENT ---")
 
 
 class _ServiceProxy:
@@ -582,6 +744,11 @@ def _build_final_result(session: Dict[str, Any]):
         "generated_at": datetime.now().isoformat(),
         "status": normalized_status,
     }
+    provider_error = session.get("provider_error")
+    if isinstance(provider_error, dict):
+        payload["provider_error"] = provider_error
+        payload["error_type"] = session.get("error_type", "provider_error")
+        payload["error_code"] = session.get("error_code") or provider_error.get("kind")
     if project_id:
         payload["project_id"] = project_id
     if request_name:
@@ -596,32 +763,42 @@ def _attach_usage_metadata(session: Dict[str, Any], final_result: Dict[str, Any]
     """Attach usage and cost metadata to the final payload when requested."""
     tracker: Optional[UsageTracker] = session.get("usage_tracker")
     level = getattr(request, "show_query_costs", 0)
+    stats_level = getattr(request, "show_query_stats", 0)
 
     if not tracker or level <= 0:
         final_result.pop("costs", None)
-        return
-
-    summary = tracker.build_summary(level)
-    if not summary:
-        final_result.pop("costs", None)
-        return
-
-    alias_registry = getattr(request, "_model_alias_registry", None) or session.get("model_alias_registry")
-    prompt_safe_summary = to_prompt_safe_data(summary, alias_registry)
-    final_result["costs"] = prompt_safe_summary
-    content_value = final_result.get("content")
-    json_output_requested = is_json_output_requested(request)
-
-    if json_output_requested:
-        if isinstance(content_value, dict):
-            final_result["content"] = inject_costs_into_json_payload(content_value, prompt_safe_summary)
-        elif isinstance(content_value, str):
-            final_result["content"] = merge_costs_into_json_string(content_value, prompt_safe_summary)
-        elif content_value is not None:
-            final_result["content"] = inject_costs_into_json_payload(content_value, prompt_safe_summary)
     else:
-        if isinstance(content_value, str):
-            final_result["content"] = tracker.embed_text_summary(content_value, 1)
+        summary = tracker.build_summary(level)
+        if not summary:
+            final_result.pop("costs", None)
+        else:
+            alias_registry = getattr(request, "_model_alias_registry", None) or session.get("model_alias_registry")
+            prompt_safe_summary = to_prompt_safe_data(summary, alias_registry)
+            final_result["costs"] = prompt_safe_summary
+            content_value = final_result.get("content")
+            json_output_requested = is_json_output_requested(request)
+
+            if json_output_requested:
+                if isinstance(content_value, dict):
+                    final_result["content"] = inject_costs_into_json_payload(content_value, prompt_safe_summary)
+                elif isinstance(content_value, str):
+                    final_result["content"] = merge_costs_into_json_string(content_value, prompt_safe_summary)
+                elif content_value is not None:
+                    final_result["content"] = inject_costs_into_json_payload(content_value, prompt_safe_summary)
+            else:
+                if isinstance(content_value, str):
+                    final_result["content"] = tracker.embed_text_summary(content_value, 1)
+
+    if not tracker or stats_level <= 0:
+        final_result.pop("query_stats", None)
+        return
+
+    query_stats = tracker.build_query_stats(stats_level)
+    if not query_stats:
+        final_result.pop("query_stats", None)
+        return
+
+    final_result["query_stats"] = query_stats
 
 def _attach_json_guard_metadata(session: Dict[str, Any], final_result: Dict[str, Any], request: ContentRequest) -> None:
     """Attach JSON guard metadata to the final result when applicable."""
@@ -2890,16 +3067,17 @@ async def _process_single_layer_with_edits(
 
         try:
             # Generate and apply edits
-            edited_content = await _generate_smart_edits(
-                session=session,
-                request=request,
-                ai_service=ai_service,
-                usage_tracker=usage_tracker,
-                session_id=session_id,
-                iteration=iteration,
-                phase_logger=phase_logger,
-                cancellation_token=cancellation_token,
-            )
+            with (usage_tracker.span(phase="smart_edit", operation="apply_smart_edits", iteration=iteration) if usage_tracker else nullcontext()):
+                edited_content = await _generate_smart_edits(
+                    session=session,
+                    request=request,
+                    ai_service=ai_service,
+                    usage_tracker=usage_tracker,
+                    session_id=session_id,
+                    iteration=iteration,
+                    phase_logger=phase_logger,
+                    cancellation_token=cancellation_token,
+                )
             content = edited_content
             logger.info(f"Layer '{layer_name}': Edits applied successfully. Re-evaluating...")
 
@@ -4005,7 +4183,7 @@ async def _generate_smart_edits(
         # Get edit configuration from request
         edit_route = resolve_call("generation.smart_edit", request=request)
         edit_model = edit_route.model
-        edit_temperature = edit_route.params.get("temperature", getattr(request, 'temperature', 0.2) if request else 0.2) or 0.2
+        edit_temperature = resolve_temperature(edit_route)
 
         # Sort edits by position (reverse order: back to front) to avoid index invalidation
         sorted_paragraphs = []
@@ -4150,6 +4328,8 @@ async def _generate_smart_edits(
                     usage_callback = usage_tracker.create_callback(
                         phase="smart_edit",
                         role="editor",
+                        iteration=iteration,
+                        operation="edit_paragraph",
                         metadata={"paragraph": paragraph_key}
                     )
 
@@ -4812,16 +4992,17 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     f"✏️ Smart Edit Mode ({session.get('smart_edit_consecutive', 0)}/{request.max_consecutive_smart_edits})"
                 )
 
-                content = await _generate_smart_edits(
-                    session=session,
-                    request=request,
-                    ai_service=ai_service,
-                    usage_tracker=usage_tracker,
-                    session_id=session_id,
-                    iteration=iteration,
-                    phase_logger=phase_logger,
-                    cancellation_token=cancellation_token,
-                )
+                with (usage_tracker.span(phase="smart_edit", operation="apply_smart_edits", iteration=iteration) if usage_tracker else nullcontext()):
+                    content = await _generate_smart_edits(
+                        session=session,
+                        request=request,
+                        ai_service=ai_service,
+                        usage_tracker=usage_tracker,
+                        session_id=session_id,
+                        iteration=iteration,
+                        phase_logger=phase_logger,
+                        cancellation_token=cancellation_token,
+                    )
 
                 # Update session state
                 _set_generation_content_metrics(session, content)
@@ -5124,7 +5305,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                                 async for chunk in ai_service.generate_content_stream(
                                     prompt=final_prompt_retry,
                                     model=json_retry_route.model,
-                                    temperature=json_retry_params.get("temperature", request.temperature),
+                                    temperature=resolve_temperature(json_retry_route),
                                     max_tokens=json_retry_params.get("max_tokens", request.max_tokens),
                                     system_prompt=request.system_prompt,
                                     system_prompt_source="user_supplied" if request.system_prompt is not None else "system_generated",
@@ -5999,13 +6180,14 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     session_id=session_id,
                     request_name=session.get("request_name"),
                 )
-            consensus_result = await consensus_engine.calculate_consensus(
-                content=content,
-                qa_results=qa_results,
-                layers=consensus_layers_to_use,
-                original_request=request,
-                phase_logger=phase_logger,
-            )
+            with (usage_tracker.span(phase="consensus", operation="calculate_consensus", iteration=iteration + 1) if usage_tracker else nullcontext()):
+                consensus_result = await consensus_engine.calculate_consensus(
+                    content=content,
+                    qa_results=qa_results,
+                    layers=consensus_layers_to_use,
+                    original_request=request,
+                    phase_logger=phase_logger,
+                )
 
             # Mark final evaluation as completed and store consensus metrics
             if qa_last_seen["model"] is not None:
@@ -6742,12 +6924,13 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                                 return
 
                             await add_verbose_log(session_id, "Calculando consenso para contenido de Gran Sabio...")
-                            consensus_result = await consensus_engine.calculate_consensus(
-                                content=gran_sabio_content,
-                                qa_results=qa_results,
-                                layers=gran_sabio_consensus_layers,
-                                original_request=request
-                            )
+                            with (usage_tracker.span(phase="consensus", operation="gran_sabio_consensus", iteration=request.max_iterations + 1) if usage_tracker else nullcontext()):
+                                consensus_result = await consensus_engine.calculate_consensus(
+                                    content=gran_sabio_content,
+                                    qa_results=qa_results,
+                                    layers=gran_sabio_consensus_layers,
+                                    original_request=request
+                                )
 
                             await _debug_record_event(
                                 session_id,
@@ -7320,18 +7503,9 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
         finally:
             raise
     except Exception as e:
-        await add_verbose_log(session_id, f"💥 Error in generation: {str(e)}")
-        error_msg = str(e)
-        final_result = {
-            "content": session.get("last_generated_content", "No content generated"),
-            "final_iteration": session.get("current_iteration", 0),
-            "final_score": 0.0,
-            "approved": False,
-            "failure_reason": error_msg,
-            "evidence_grounding": None,
-            "generated_at": datetime.now().isoformat()
-        }
-        _attach_json_guard_metadata(session, final_result, request)
+        final_result = _build_generation_error_result(session, request, e)
+        error_msg = str(final_result.get("failure_reason") or str(e))
+        await add_verbose_log(session_id, f"Error in generation: {error_msg}")
         _store_final_result(
             session,
             final_result,
@@ -7354,14 +7528,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
             final_payload=final_result,
         )
 
-        # Console logging for error-based rejected content
-        content_to_log = session.get("last_generated_content", "No content generated")
-        logger.error(f"CONTENT REJECTED DUE TO ERROR - Session {session_id}")
-        logger.error(f"Error: {str(e)}")
-        logger.error(f"Rejected Content ({len(content_to_log)} characters):")
-        logger.error(f"--- START REJECTED CONTENT ---")
-        logger.error(content_to_log)
-        logger.error(f"--- END REJECTED CONTENT ---")
+        _log_generation_error_result(session_id, e, final_result)
     finally:
         await cancellation_registry.unregister_session(session_id)
         reset_console_context(console_context_tokens)

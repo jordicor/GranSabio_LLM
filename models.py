@@ -1202,6 +1202,15 @@ class ContentRequest(BaseModel):
             "1=aggregate summary, 2=full detailed breakdown."
         ),
     )
+    show_query_stats: int = Field(
+        default=0,
+        ge=0,
+        le=3,
+        description=(
+            "When >0, include prompt-free execution statistics in final outputs. "
+            "1=summary, 2=phase/iteration details, 3=level 2 plus per-call breakdown."
+        ),
+    )
 
     # JSON Schema validation configuration
     json_schema: Optional[Dict[str, Any]] = Field(
@@ -1792,6 +1801,10 @@ class ContentResponse(BaseModel):
     costs: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Token usage and cost summary when requested by the client",
+    )
+    query_stats: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Prompt-free execution timing, usage, and call statistics when requested by the client",
     )
 
     # Optional Gran Sabio fields

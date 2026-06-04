@@ -117,6 +117,50 @@ _SOFT_PARAMS = {
 }
 
 
+DEFAULT_TEMPERATURE_BY_CALL: Dict[str, float] = {
+    "generation.json_retry": 0.3,
+    "generation.smart_edit": 0.2,
+    "qa.evaluate_layer": 0.3,
+    "auto_qa.plan": 0.2,
+    "gransabio.review": 0.4,
+    "gransabio.regenerate": 0.7,
+    "gransabio.escalation": 0.4,
+    "preflight.validate": 0.2,
+    "long_text.semantic_eval": 0.2,
+    "evidence.extract_claims": 0.3,
+    "evidence.score_logprobs": 0.1,
+    "feedback.analyze": 0.2,
+    "feedback.synthesize_rules": 0.2,
+    "accent.audit": 0.2,
+    "smart_edit.analyze": 0.3,
+    "smart_edit.apply": 0.2,
+}
+
+
+def default_temperature_for_call(call_id: str, *, default: Optional[float] = None) -> float:
+    """Return the central fallback temperature for a call id."""
+
+    if call_id in DEFAULT_TEMPERATURE_BY_CALL:
+        return DEFAULT_TEMPERATURE_BY_CALL[call_id]
+    if default is not None:
+        return float(default)
+    raise LLMRoutingError(f"No temperature configured for LLM call '{call_id}'.")
+
+
+def resolve_temperature(route: LLMRouteResolution, *, default: Optional[float] = None) -> float:
+    """Return the effective temperature for a resolved call.
+
+    Route params remain the primary source. The central fallback avoids spreading
+    internal sampling defaults across runtime call-sites, and also covers routes
+    whose default model drops temperature during parameter sanitization.
+    """
+
+    routed_value = route.params.get("temperature")
+    if routed_value is not None:
+        return float(routed_value)
+    return default_temperature_for_call(route.call_id, default=default)
+
+
 def _repo_default_path() -> str:
     return os.path.join(os.path.dirname(__file__), DEFAULT_ROUTING_FILENAME)
 

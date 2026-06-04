@@ -248,6 +248,11 @@
       <div class="param-desc">Token usage and cost reporting: 0=disabled, 1=summary, 2=detailed.</div>
     </div>
     <div class="param-row">
+      <div class="param-name">show_query_stats</div>
+      <div class="param-type">integer</div>
+      <div class="param-desc">Prompt-free execution statistics: 0=disabled, 1=summary, 2=phase/iteration detail, 3=per-call detail.</div>
+    </div>
+    <div class="param-row">
       <div class="param-name">evidence_grounding</div>
       <div class="param-type">object</div>
       <div class="param-desc">Confabulation detection via logprobs. Detects when AI claims to use evidence but ignores it. See #evidence-grounding section.</div>
@@ -696,8 +701,8 @@
 
 <section id="usage-cost-tracking" class="docs-section">
   <h2 class="docs-subheading">Usage &amp; Cost Tracking</h2>
-  <p>Provides token usage and cost tracking across generation, QA, preflight, and Gran Sabio phases, controlled by show_query_costs.</p>
-  <p>Costs normalized to USD and can be embedded in JSON or text outputs.</p>
+  <p>Provides token usage, cost tracking, and prompt-free execution statistics across generation, QA, preflight, consensus, smart-edit, and Gran Sabio phases.</p>
+  <p>Use show_query_costs for legacy cost summaries and show_query_stats for timing, phase, iteration, provider/model, and per-call visibility.</p>
 </section>
 
 <section id="preflight-validation" class="docs-section">

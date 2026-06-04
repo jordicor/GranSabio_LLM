@@ -15,7 +15,7 @@ from inspect import isawaitable
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
 import json_utils as json
-from llm_routing import resolve_call
+from llm_routing import default_temperature_for_call, resolve_call
 
 if TYPE_CHECKING:
     from ai_service import AIService
@@ -108,7 +108,7 @@ class TextAnalyzer:
         model: Optional[str] = None,
         max_issues: int = 15,
         categories: Optional[List[str]] = None,
-        temperature: float = 0.3,
+        temperature: Optional[float] = None,
         llm_routing: Optional[Mapping[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
@@ -170,7 +170,7 @@ class TextAnalyzer:
         self,
         prompt: str,
         model: Optional[str] = None,
-        temperature: float = 0.3,
+        temperature: Optional[float] = None,
         llm_routing: Optional[Mapping[str, Any]] = None,
     ) -> str:
         """Make AI service call and return response text."""
@@ -181,10 +181,17 @@ class TextAnalyzer:
             route = resolve_call("smart_edit.analyze", routing=llm_routing)
             model_name = model or route.model
             route_params = route.params
+        effective_temperature = route_params.get("temperature")
+        if effective_temperature is None:
+            effective_temperature = (
+                temperature
+                if temperature is not None
+                else default_temperature_for_call("smart_edit.analyze")
+            )
         kwargs = {
             "model": model_name,
             "prompt": prompt,
-            "temperature": route_params.get("temperature", temperature),
+            "temperature": effective_temperature,
             "max_tokens": route_params.get("max_tokens", 4096),
             "reasoning_effort": route_params.get("reasoning_effort"),
             "thinking_budget_tokens": route_params.get("thinking_budget_tokens"),

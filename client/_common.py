@@ -328,7 +328,15 @@ def validate_result(result: Dict[str, Any]) -> None:
             or "unknown error"
         )
         raise GranSabioClientError(
-            f"Generation returned status '{status}' ({message})."
+            f"Generation returned status '{status}' ({message}).",
+            details={
+                "status": raw_status,
+                "failure_reason": result.get("failure_reason"),
+                "error_type": result.get("error_type"),
+                "error_code": result.get("error_code"),
+                "provider_error": result.get("provider_error"),
+                "session_id": result.get("session_id"),
+            },
         )
 
     if status and status not in {"completed", "success", "succeeded"}:
@@ -339,7 +347,15 @@ def validate_result(result: Dict[str, Any]) -> None:
             or "unknown error"
         )
         raise GranSabioClientError(
-            f"Generation returned status '{status}' ({message})."
+            f"Generation returned status '{status}' ({message}).",
+            details={
+                "status": raw_status,
+                "failure_reason": result.get("failure_reason"),
+                "error_type": result.get("error_type"),
+                "error_code": result.get("error_code"),
+                "provider_error": result.get("provider_error"),
+                "session_id": result.get("session_id"),
+            },
         )
 
     if result.get("approved") is False:

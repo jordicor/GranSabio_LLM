@@ -7,6 +7,7 @@ from ai_service import AccentGuardError, AIRequestError
 from core import app_state
 from core.app_state import active_sessions
 from core.generation_processor import (
+    _build_generation_error_result,
     _build_truncation_failure_reason,
     _generate_full_content,
     _generation_was_truncated,
@@ -15,6 +16,7 @@ from core.generation_processor import (
     process_content_generation,
 )
 from models import ContentRequest, is_json_output_requested
+from provider_errors import ProviderErrorKind, ProviderFailure
 from tool_loop_models import (
     JsonContractError,
     LoopScope,
@@ -102,6 +104,48 @@ def test_build_truncation_failure_reason_includes_actionable_details():
     assert "stop_reason=max_tokens" in reason
     assert "max_tokens=4000" in reason
     assert "shorter response" in reason
+
+
+def test_build_generation_error_result_surfaces_provider_quota():
+    failure = ProviderFailure(
+        provider="openai",
+        model_id="gpt-5.1",
+        operation="tool_loop_generation",
+        kind=ProviderErrorKind.QUOTA_EXHAUSTED,
+        message="insufficient_quota",
+        retryable=False,
+        status_code=429,
+        provider_error_type="insufficient_quota",
+        provider_error_code="insufficient_quota",
+        attempt=1,
+        max_attempts=5,
+        raw_exception_class="RateLimitError",
+    )
+    exc = AIRequestError(
+        provider="openai",
+        model="gpt-5.1",
+        attempts=1,
+        max_attempts=5,
+        cause=RuntimeError("quota"),
+        provider_failure=failure,
+    )
+    session = {"current_iteration": 1}
+
+    result = _build_generation_error_result(
+        session,
+        _tool_request(generator_model="gpt-5.1"),
+        exc,
+    )
+
+    assert result["status"] == "failed"
+    assert result["content"] == ""
+    assert result["error_type"] == "provider_error"
+    assert result["error_code"] == "quota_exhausted"
+    assert "quota exhausted" in result["failure_reason"]
+    assert result["provider_error"]["kind"] == "quota_exhausted"
+    assert result["provider_error"]["provider_error_code"] == "insufficient_quota"
+    assert result["provider_error"]["retryable"] is False
+    assert session["provider_error"]["status_code"] == 429
 
 
 def test_auto_mode_supports_non_openai_tool_loop_providers():

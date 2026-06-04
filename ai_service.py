@@ -44,7 +44,7 @@ from ai_runtime import usage as runtime_usage
 from ai_runtime import vision as runtime_vision
 from config import config, get_model_parameter_requirements
 from deterministic_validation import DraftValidationResult
-from llm_routing import resolve_call
+from llm_routing import resolve_call, resolve_temperature
 from llm_accent_prompts import (
     build_accent_criteria_block,
     build_inline_accent_prompt,
@@ -2294,7 +2294,7 @@ class AIService:
 
         audit_route = resolve_call("accent.audit", routing=llm_routing)
         audit_model = audit_route.model
-        routed_temperature = audit_route.params.get("temperature", 0.0)
+        routed_temperature = resolve_temperature(audit_route)
         # Symmetric hardening with criteria: strip Unicode format/control chars before
         # XML-escape so adversarial drafts cannot smuggle bidi/zero-width markers to the judge.
         escaped_draft = escape_xml_delimiters(remove_invisible_control(text or ""))
@@ -7604,7 +7604,7 @@ class AIService:
         system_prompt: Optional[str] = None,
         max_tokens: int = 5,
         top_logprobs: int = 10,
-        temperature: float = 0.0,
+        temperature: float = 0.1,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
         model_alias_registry: Optional[Any] = None,
@@ -7627,7 +7627,7 @@ class AIService:
             system_prompt: Optional system prompt
             max_tokens: Maximum tokens to generate (usually small, e.g., 5)
             top_logprobs: Number of top logprobs per token (1-20)
-            temperature: Generation temperature (0.0 for deterministic)
+            temperature: Generation temperature for the logprob probe
             usage_callback: Token usage tracking callback
             usage_extra: Additional metadata for usage tracking
 

@@ -925,6 +925,17 @@ Returns detailed token usage and costs:
 }
 ```
 
+For execution timing and per-call visibility, use `show_query_stats`:
+
+```json
+{
+  "show_query_stats": 3,
+  "prompt": "..."
+}
+```
+
+`show_query_stats=1` returns phase/model/provider aggregates, `2` adds iteration and layer detail, and `3` adds prompt-free per-call rows with duration, tokens, provider, model, finish reason, and estimated cost. Local spans such as consensus and smart-edit timing are included without increasing the LLM call count.
+
 ---
 
 ## About the Name

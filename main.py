@@ -12,18 +12,59 @@ import platform
 import signal
 import sys
 
-import core  # noqa: F401  # Ensure route modules are imported for side effects
-from core.app_state import app  # noqa: F401  # Re-export for uvicorn "main:app"
-
 
 def _force_exit(signum, frame):
-    """Force immediate exit on Ctrl+C without waiting for graceful shutdown."""
-    print("\nForced exit (Ctrl+C)")
+    """Force immediate process termination on Ctrl+C.
+
+    The runtime console feature keeps long-lived SSE streams open
+    (/stream/console, /stream/project), so uvicorn's graceful shutdown would
+    otherwise wait indefinitely for those connections to close. For a local
+    dev server a single Ctrl+C must kill the process immediately, bypassing
+    graceful shutdown entirely.
+
+    We write directly to the stderr file descriptor (fd 2) instead of print():
+    sys.stdout/sys.stderr are wrapped by the runtime console capture, and
+    writing through that wrapper from inside a signal handler could block on
+    its internal lock. os.write + os._exit are async-signal-safe.
+    """
+    try:
+        os.write(2, b"\nForced exit (Ctrl+C)\n")
+    except Exception:
+        pass
     os._exit(0)
 
 
-# Register handler for immediate exit on Ctrl+C
-signal.signal(signal.SIGINT, _force_exit)
+def _force_exit_signal_numbers() -> set[int]:
+    """Return console-control signals that should stop the local dev server."""
+    signals = {int(signal.SIGINT)}
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sigbreak is not None:
+        signals.add(int(sigbreak))
+    return signals
+
+
+def _should_force_exit_for_signal(sig) -> bool:
+    try:
+        return int(sig) in _force_exit_signal_numbers()
+    except (TypeError, ValueError):
+        return False
+
+
+def _install_force_exit_signal_handlers() -> None:
+    """Install early handlers before imports can start long-running work."""
+    for sig_number in _force_exit_signal_numbers():
+        try:
+            signal.signal(sig_number, _force_exit)
+        except (OSError, ValueError):
+            pass
+
+
+# Register before importing core so Ctrl+C also works during import/startup.
+_install_force_exit_signal_handlers()
+
+import core  # noqa: E402,F401  # Ensure route modules are imported for side effects
+from core.app_state import app  # noqa: E402,F401  # Re-export for uvicorn "main:app"
+
 from core.app_state import (
     FILE_LOGGING_ENV_VAR,
     FORCE_EXTRA_VERBOSE_ENV_VAR,
@@ -115,10 +156,37 @@ if __name__ == "__main__":
         import uvicorn
 
         logger.info("Starting with uvicorn (detected Windows)")
-        uvicorn.run(
-            "main:app",
-            host=config.APP_HOST,
-            port=config.APP_PORT,
-            http="httptools",
-            reload=config.APP_RELOAD,
-        )
+
+        if config.APP_RELOAD:
+            # Reload mode runs under a subprocess supervisor that owns signal
+            # handling, so the standard entrypoint is kept for that path.
+            uvicorn.run(
+                "main:app",
+                host=config.APP_HOST,
+                port=config.APP_PORT,
+                http="httptools",
+                reload=True,
+            )
+        else:
+            class ImmediateExitServer(uvicorn.Server):
+                """uvicorn Server that kills the process on the first Ctrl+C.
+
+                uvicorn installs its own SIGINT/SIGTERM/SIGBREAK handlers while
+                serving, so a module-level signal handler cannot take effect.
+                Overriding handle_exit is the supported hook: it runs for every
+                captured signal. Forcing exit here avoids hanging on long-lived
+                SSE streams (e.g. /stream/console) during graceful shutdown.
+                """
+
+                def handle_exit(self, sig, frame):
+                    if _should_force_exit_for_signal(sig):
+                        _force_exit(sig, frame)
+                    super().handle_exit(sig, frame)
+
+            uvicorn_config = uvicorn.Config(
+                "main:app",
+                host=config.APP_HOST,
+                port=config.APP_PORT,
+                http="httptools",
+            )
+            ImmediateExitServer(uvicorn_config).run()

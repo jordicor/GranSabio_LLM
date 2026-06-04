@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 from ai_service import AIRequestError, AIService, StreamChunk
 from config import EDITABLE_CONTENT_TYPES, config
 from deterministic_validation import DraftValidationResult, validate_generation_candidate
+from llm_routing import default_temperature_for_call
 from model_aliasing import ModelAliasRegistry, PromptPart
 from model_capability_registry import resolve_model_capability_context
 from models import QAEvaluation, is_json_output_requested
@@ -406,6 +407,12 @@ IMPORTANT:
 - Always respond in the same language as the original user request, regardless of the language used in these evaluation instructions.
 """
 
+        eval_temperature = (
+            temperature
+            if temperature is not None
+            else default_temperature_for_call("qa.evaluate_layer")
+        )
+
         # Log full prompt if extra_verbose is enabled
         if phase_logger:
             phase_logger.log_prompt(
@@ -413,7 +420,7 @@ IMPORTANT:
                 system_prompt=qa_system_prompt,
                 user_prompt=evaluation_prompt,
                 layer=layer_name,
-                temperature=temperature if temperature is not None else 0.3,
+                temperature=eval_temperature,
                 max_tokens=max_tokens
             )
         elif extra_verbose:
@@ -422,8 +429,6 @@ IMPORTANT:
             logger.info(f"[QA PROMPT DEBUG] User prompt preview (first 1000 chars): {evaluation_prompt[:1000]}...")
             logger.info(f"[QA PROMPT DEBUG] --- END QA PROMPT PREVIEW ---")
 
-        # Use provided temperature or default to 0.3 for consistent evaluation
-        eval_temperature = temperature if temperature is not None else 0.3
         streamed_response_started = False
 
         async def _generate_qa_response(json_schema: Optional[Dict[str, Any]]) -> str:

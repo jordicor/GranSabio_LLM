@@ -391,6 +391,8 @@ class AsyncGranSabioClient:
         gran_sabio_model: Optional[str] = None,
         gran_sabio_fallback: bool = True,
         verbose: bool = True,
+        show_query_costs: int = 0,
+        show_query_stats: int = 0,
         project_id: Optional[str] = None,
         request_name: Optional[str] = None,
         json_output: bool = False,
@@ -426,6 +428,8 @@ class AsyncGranSabioClient:
             gran_sabio_model: Model for escalation and arbitration
             gran_sabio_fallback: Allow regeneration on exhausted iterations
             verbose: Enable detailed logging
+            show_query_costs: Cost reporting level (0=off, 1=summary, 2=detailed)
+            show_query_stats: Execution stats level (0=off, 1=summary, 2=detailed, 3=per-call)
             project_id: Group with existing project
             request_name: Human-readable request label
             json_output: Expect JSON output
@@ -470,6 +474,10 @@ class AsyncGranSabioClient:
             payload["qa_layers"] = qa_layers
         if gran_sabio_model is not None:
             payload["gran_sabio_model"] = gran_sabio_model
+        if show_query_costs:
+            payload["show_query_costs"] = show_query_costs
+        if show_query_stats:
+            payload["show_query_stats"] = show_query_stats
         if project_id:
             payload["project_id"] = project_id
         if request_name:
@@ -1574,6 +1582,8 @@ class AsyncGranSabioClient:
         gran_sabio_model: Optional[str] = None,
         gran_sabio_fallback: bool = True,
         verbose: bool = True,
+        show_query_costs: int = 0,
+        show_query_stats: int = 0,
         project_id: Optional[str] = None,
         request_name: Optional[str] = None,
         json_output: bool = False,
@@ -1613,6 +1623,8 @@ class AsyncGranSabioClient:
             gran_sabio_model: Model for escalation and arbitration.
             gran_sabio_fallback: Allow regeneration on exhausted iterations.
             verbose: Enable detailed logging.
+            show_query_costs: Cost reporting level (0=off, 1=summary, 2=detailed).
+            show_query_stats: Execution stats level (0=off, 1=summary, 2=detailed, 3=per-call).
             project_id: Group with existing project.
             request_name: Human-readable request label.
             json_output: Expect JSON output.
@@ -1644,6 +1656,8 @@ class AsyncGranSabioClient:
             "max_iterations": max_iterations,
             "gran_sabio_fallback": gran_sabio_fallback,
             "verbose": verbose,
+            "show_query_costs": show_query_costs,
+            "show_query_stats": show_query_stats,
             "project_id": project_id,
             "request_name": request_name,
             "json_output": json_output,

@@ -32,7 +32,7 @@ from models import (
     EvidenceSpan,
     ExtractedClaim,
 )
-from llm_routing import resolve_call
+from llm_routing import resolve_call, resolve_temperature
 
 logger = logging.getLogger(__name__)
 
@@ -298,7 +298,7 @@ class BudgetScorer:
         top_logprobs: int = 10,
         placeholder: str = "[EVIDENCE REMOVED]",
         max_tokens: int = 5,
-        temperature: float = 0.0,
+        temperature: float = 0.1,
         extra_verbose: bool = False,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         cancellation_token: Optional[Any] = None,
@@ -435,7 +435,7 @@ class BudgetScorer:
         route = resolve_call("evidence.score_logprobs", request=request)
         model = config_obj.model or route.model
         routed_max_tokens = int(route.params.get("max_tokens", 5))
-        routed_temperature = float(route.params.get("temperature", 0.0))
+        routed_temperature = resolve_temperature(route)
 
         logger.info(
             f"Scoring {len(claims)} claims using model={model}, "
@@ -488,7 +488,7 @@ class BudgetScorer:
         model: str,
         top_logprobs: int = 10,
         max_tokens: int = 5,
-        temperature: float = 0.0,
+        temperature: float = 0.1,
         extra_verbose: bool = False,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,

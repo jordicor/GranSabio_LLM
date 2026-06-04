@@ -525,9 +525,18 @@ class TestWaitForResult:
 
         result_response = Mock()
         result_response.status_code = 200
+        provider_error = {
+            "kind": "quota_exhausted",
+            "provider": "openai",
+            "model": "gpt-5.1",
+            "provider_error_code": "insufficient_quota",
+        }
         result_response.json.return_value = {
             "status": "failed",
             "failure_reason": "Generation error",
+            "error_type": "provider_error",
+            "error_code": "quota_exhausted",
+            "provider_error": provider_error,
         }
 
         mock_requests.request.side_effect = [status_response, result_response]
@@ -537,6 +546,8 @@ class TestWaitForResult:
 
         assert "status 'failed'" in str(exc.value)
         assert "Generation error" in str(exc.value)
+        assert exc.value.details["error_code"] == "quota_exhausted"
+        assert exc.value.details["provider_error"] == provider_error
 
     def test_wait_for_result_handles_semantic_rejection(self, client, mock_requests):
         """Given: Session is semantically rejected, Then: Raises GranSabioGenerationRejected."""

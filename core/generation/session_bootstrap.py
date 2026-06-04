@@ -87,6 +87,7 @@ def build_session_payload(
         "model_alias_map_internal": model_alias_registry.internal_snapshot(),
         "model_alias_map_prompt": model_alias_registry.prompt_snapshot(),
         "show_query_costs": getattr(request, "show_query_costs", 0),
+        "show_query_stats": getattr(request, "show_query_stats", 0),
         "project_id": project_id,
         "project_epoch": project_epoch,
         "qa_models_config": request.qa_models,

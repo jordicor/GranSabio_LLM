@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 from ai_service import StreamChunk
 from config import config
-from llm_routing import LLMRoutingError, resolve_call
+from llm_routing import LLMRoutingError, resolve_call, resolve_temperature
 from model_aliasing import ModelAliasRegistry, PromptPart
 from models import ContentRequest, PreflightIssue, PreflightResult, WordCountAnalysis
 from usage_tracking import UsageTracker
@@ -547,10 +547,6 @@ async def run_preflight_validation(
         PreflightResult with decision (proceed/reject) and validation feedback.
     """
     selected_model = resolve_preflight_model(request)
-    preflight_route = getattr(request, "_preflight_route", None)
-    preflight_params = getattr(preflight_route, "params", {}) or {}
-    preflight_temperature = preflight_params.get("temperature", 0.0)
-    preflight_max_tokens = preflight_params.get("max_tokens", 800)
     if not selected_model:
         message = (
             "Preflight validation could not start because preflight.validate has no routed model."
@@ -561,6 +557,13 @@ async def run_preflight_validation(
             message=message,
             summary="Preflight model unavailable",
         )
+    preflight_route = getattr(request, "_preflight_route", None)
+    if preflight_route is None:
+        preflight_route = resolve_call("preflight.validate", request=request)
+        setattr(request, "_preflight_route", preflight_route)
+    preflight_params = getattr(preflight_route, "params", {}) or {}
+    preflight_temperature = resolve_temperature(preflight_route)
+    preflight_max_tokens = preflight_params.get("max_tokens", 800)
 
     # Early validation: Check evidence grounding model compatibility (no API call needed)
     evidence_grounding_issue = _validate_evidence_grounding_config(request)

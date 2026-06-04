@@ -18,7 +18,7 @@ from model_aliasing import (
     PromptPart,
     assert_prompt_is_model_blind,
 )
-from llm_routing import resolve_call
+from llm_routing import resolve_call, resolve_temperature
 from models import ContentRequest, QALayer
 from tool_loop_models import JsonContractError, parse_json_with_markdown_fences
 
@@ -628,7 +628,7 @@ async def run_auto_qa_planning(
         raw_output = await ai_service.generate_content(
             prompt=_build_planner_prompt(payload),
             model=route.model,
-            temperature=route.params.get("temperature", 0.0),
+            temperature=resolve_temperature(route),
             max_tokens=route.params.get("max_tokens", 6000),
             system_prompt="Plan QA layers for Gran Sabio. Return strict JSON only.",
             content_type="json",

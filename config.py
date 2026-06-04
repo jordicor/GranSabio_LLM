@@ -342,7 +342,7 @@ class FeedbackMemorySettings(BaseModel):
         description="Deprecated. Feedback analysis models are resolved through llm_routing."
     )
     analysis_temperature: float = Field(
-        default=0.1,
+        default=0.2,
         ge=0.0,
         le=1.0,
         description="Temperature for feedback analysis"

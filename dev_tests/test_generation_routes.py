@@ -1,13 +1,19 @@
 """Unit tests for generation route helpers."""
 
+from datetime import datetime
 from types import SimpleNamespace
+
+import pytest
 
 from core.generation_routes import (
     _apply_external_generation_min_tokens,
     _estimate_tokens_for_word_target,
     _model_default_max_tokens,
+    get_result,
+    get_status,
 )
-from models import ContentRequest
+from core.app_state import pop_session, register_session
+from models import ContentRequest, GenerationStatus
 
 
 class TestEstimateTokensForWordTarget:
@@ -115,3 +121,59 @@ class TestExternalGenerationMinTokens:
         assert adjustment is None
         assert request.max_tokens == 200
         assert not hasattr(request, "_external_generation_min_tokens_adjustment")
+
+
+@pytest.mark.asyncio
+async def test_status_and_result_surface_provider_error_payload():
+    session_id = "session-provider-quota"
+    provider_error = {
+        "type": "provider_error",
+        "kind": "quota_exhausted",
+        "provider": "openai",
+        "model": "gpt-5.1",
+        "operation": "tool_loop_generation",
+        "message": "Provider quota exhausted for openai/gpt-5.1.",
+        "retryable": False,
+        "status_code": 429,
+        "provider_error_type": "insufficient_quota",
+        "provider_error_code": "insufficient_quota",
+    }
+    final_result = {
+        "content": "",
+        "final_iteration": 1,
+        "final_score": 0.0,
+        "approved": False,
+        "status": GenerationStatus.FAILED.value,
+        "failure_reason": provider_error["message"],
+        "error_type": "provider_error",
+        "error_code": "quota_exhausted",
+        "provider_error": provider_error,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+    await register_session(
+        session_id,
+        {
+            "project_id": "project-provider-quota",
+            "request_name": "Quota regression",
+            "status": GenerationStatus.FAILED,
+            "current_iteration": 1,
+            "max_iterations": 1,
+            "verbose_log": [],
+            "created_at": datetime.utcnow(),
+            "final_result": final_result,
+            "error": provider_error["message"],
+        },
+    )
+    try:
+        status_payload = await get_status(session_id)
+        result_payload = await get_result(session_id)
+    finally:
+        await pop_session(session_id)
+
+    assert status_payload["status"] == "failed"
+    assert status_payload["error_type"] == "provider_error"
+    assert status_payload["error_code"] == "quota_exhausted"
+    assert status_payload["provider_error"]["provider_error_code"] == "insufficient_quota"
+    assert result_payload["status"] == "failed"
+    assert result_payload["provider_error"]["kind"] == "quota_exhausted"
+    assert result_payload["failure_reason"] == provider_error["message"]

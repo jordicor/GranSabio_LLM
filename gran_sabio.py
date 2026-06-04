@@ -19,7 +19,7 @@ from ai_service import AIRequestError, AIService, StreamChunk, get_ai_service
 from config import config, get_default_models
 from deterministic_validation import DraftValidationResult, validate_generation_candidate
 from json_utils import dumps as json_dumps
-from llm_routing import resolve_call
+from llm_routing import resolve_call, resolve_temperature
 from model_aliasing import PromptPart, get_evaluator_alias
 from model_capability_registry import resolve_model_capability_context
 from models import ContentRequest, GranSabioResult, is_json_output_requested
@@ -324,10 +324,10 @@ class GranSabioEngine:
         requested_model: Optional[str],
         original_request: Optional[Any] = None,
         call_id: str = "gransabio.review",
-    ) -> Tuple[str, Optional[str], Optional[int]]:
+    ) -> Tuple[str, Optional[str], Optional[int], float]:
         """
         Get default model for critical analysis and decision making (deal-breakers, conflicts)
-        Returns (model, reasoning_effort, thinking_budget_tokens)
+        Returns (model, reasoning_effort, thinking_budget_tokens, temperature)
         """
         route = resolve_call(call_id, request=original_request)
         if original_request is not None and not getattr(
@@ -342,6 +342,7 @@ class GranSabioEngine:
             selected_model,
             route.params.get("reasoning_effort"),
             route.params.get("thinking_budget_tokens", thinking_tokens),
+            resolve_temperature(route),
         )
 
     def _get_default_content_generation_model(
@@ -349,10 +350,10 @@ class GranSabioEngine:
         requested_model: Optional[str],
         original_request: Optional[Any] = None,
         call_id: str = "gransabio.regenerate",
-    ) -> Tuple[str, Optional[str], Optional[int]]:
+    ) -> Tuple[str, Optional[str], Optional[int], float]:
         """
         Get default model for content generation
-        Returns (model, reasoning_effort, thinking_budget_tokens)
+        Returns (model, reasoning_effort, thinking_budget_tokens, temperature)
         """
         route = resolve_call(call_id, request=original_request)
         if original_request is not None and not getattr(
@@ -367,6 +368,7 @@ class GranSabioEngine:
             selected_model,
             route.params.get("reasoning_effort"),
             route.params.get("thinking_budget_tokens", thinking_tokens),
+            resolve_temperature(route),
         )
 
     def _resolve_model_alias(self, model_name: str) -> str:
@@ -565,7 +567,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
 """.strip()
 
         try:
-            model, reasoning_effort, thinking_tokens = self._get_default_critical_analysis_model(
+            model, reasoning_effort, thinking_tokens, temperature = self._get_default_critical_analysis_model(
                 original_request.gran_sabio_model,
                 original_request,
                 "gransabio.escalation",
@@ -596,7 +598,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                     model=adequate_model,
                     system_prompt=None,
                     user_prompt=prompt,
-                    temperature=0.3,
+                    temperature=temperature,
                     max_tokens=original_request.max_tokens,
                     reasoning_effort=reasoning_effort,
                     thinking_budget_tokens=thinking_tokens
@@ -610,7 +612,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 model=adequate_model,
                 reasoning_effort=reasoning_effort,
                 thinking_tokens=thinking_tokens,
-                temperature=0.3,
+                temperature=temperature,
                 system_prompt=None,
                 response_schema=GRAN_SABIO_MINORITY_OVERRIDE_SCHEMA,
                 max_tool_rounds=config.GRAN_SABIO_DECISION_MAX_TOOL_ROUNDS,
@@ -835,7 +837,7 @@ CRITICAL INSTRUCTIONS:
             ]
             model_alias_registry = getattr(original_request, "_model_alias_registry", None)
 
-            model, reasoning_effort, thinking_tokens = self._get_default_content_generation_model(
+            model, reasoning_effort, thinking_tokens, temperature = self._get_default_content_generation_model(
                 original_request.gran_sabio_model,
                 original_request,
                 "gransabio.regenerate",
@@ -919,7 +921,7 @@ CRITICAL INSTRUCTIONS:
                         loop_scope=LoopScope.GRAN_SABIO,
                         tool_event_callback=tool_event_callback if tool_event_callback is not None else self._tool_event_callback,
                         initial_measurement_text=None,
-                        temperature=0.7,
+                        temperature=temperature,
                         max_tokens=original_request.max_tokens,
                         extra_verbose=getattr(original_request, "extra_verbose", False),
                         reasoning_effort=reasoning_effort,
@@ -943,7 +945,7 @@ CRITICAL INSTRUCTIONS:
                     generated_content = await self.ai_service.generate_content(
                         prompt=generation_prompt,
                         model=adequate_model,
-                        temperature=0.7,
+                        temperature=temperature,
                         max_tokens=original_request.max_tokens,
                         extra_verbose=getattr(original_request, "extra_verbose", False),
                         reasoning_effort=reasoning_effort,
@@ -986,7 +988,7 @@ CRITICAL INSTRUCTIONS:
                         async for chunk in self.ai_service.generate_content_stream(
                             prompt=generation_prompt,
                             model=adequate_model,
-                            temperature=0.7,
+                            temperature=temperature,
                             max_tokens=original_request.max_tokens,
                             extra_verbose=getattr(original_request, "extra_verbose", False),
                             reasoning_effort=reasoning_effort,
@@ -1052,7 +1054,7 @@ CRITICAL INSTRUCTIONS:
                 generated_content = await self.ai_service.generate_content(
                     prompt=generation_prompt,
                     model=adequate_model,
-                    temperature=0.7,
+                    temperature=temperature,
                     max_tokens=original_request.max_tokens,
                     extra_verbose=getattr(original_request, "extra_verbose", False),
                     reasoning_effort=reasoning_effort,
@@ -1182,7 +1184,7 @@ CRITICAL INSTRUCTIONS:
             best_iteration = self._pick_best_iteration(iterations)
             best_content = best_iteration.get("content", "") if best_iteration else ""
 
-            model, reasoning_effort, thinking_tokens = self._get_default_critical_analysis_model(
+            model, reasoning_effort, thinking_tokens, temperature = self._get_default_critical_analysis_model(
                 original_request.gran_sabio_model,
                 original_request,
                 "gransabio.review",
@@ -1212,7 +1214,7 @@ CRITICAL INSTRUCTIONS:
                     model=adequate_model,
                     system_prompt=config.GRAN_SABIO_SYSTEM_PROMPT,
                     user_prompt=review_prompt,
-                    temperature=0.4,
+                    temperature=temperature,
                     max_tokens=original_request.max_tokens,
                     reasoning_effort=reasoning_effort,
                     thinking_budget_tokens=thinking_tokens
@@ -1226,7 +1228,7 @@ CRITICAL INSTRUCTIONS:
                 model=adequate_model,
                 reasoning_effort=reasoning_effort,
                 thinking_tokens=thinking_tokens,
-                temperature=0.4,
+                temperature=temperature,
                 system_prompt=config.GRAN_SABIO_SYSTEM_PROMPT,
                 response_schema=GRAN_SABIO_ESCALATION_SCHEMA,
                 max_tool_rounds=config.GRAN_SABIO_ESCALATION_MAX_TOOL_ROUNDS,

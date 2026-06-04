@@ -18,7 +18,7 @@ import re
 import time
 from typing import TYPE_CHECKING, Any, Callable, List, Literal, Mapping, Optional, Tuple, Union
 
-from llm_routing import resolve_call
+from llm_routing import default_temperature_for_call, resolve_call
 
 from .locators import (
     build_word_map,
@@ -662,7 +662,7 @@ class SmartTextEditor:
         self,
         prompt: str,
         model: Optional[str] = None,
-        temperature: float = 0.2,
+        temperature: Optional[float] = None,
         usage_callback: Optional[Callable] = None,
         cancellation_token: Optional[Any] = None,
         llm_routing: Optional[Mapping[str, Any]] = None,
@@ -694,12 +694,19 @@ class SmartTextEditor:
             route = resolve_call("smart_edit.apply", routing=llm_routing)
             model = model or route.model
             route_params = route.params
+        effective_temperature = route_params.get("temperature")
+        if effective_temperature is None:
+            effective_temperature = (
+                temperature
+                if temperature is not None
+                else default_temperature_for_call("smart_edit.apply")
+            )
 
         # Call AI service using generate_content (the actual method name)
         response = await self.ai_service.generate_content(
             model=model,
             prompt=prompt,
-            temperature=route_params.get("temperature", temperature),
+            temperature=effective_temperature,
             max_tokens=route_params.get("max_tokens", 4096),
             reasoning_effort=route_params.get("reasoning_effort"),
             thinking_budget_tokens=route_params.get("thinking_budget_tokens"),

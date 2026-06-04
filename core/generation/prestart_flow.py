@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -83,6 +84,7 @@ async def run_prestart_flow(
         "qa_content": "",
         "current_phase": "auto_qa_planning" if auto_qa_requested else "preflight_validation",
         "usage_tracker": usage_tracker,
+        "show_query_stats": getattr(request, "show_query_stats", 0),
     }
     try:
         await deps.cancellation_registry.register_session(session_id, project_id, project_epoch)
@@ -177,22 +179,23 @@ async def run_prestart_flow(
                     "manual_layer_policy": request.auto_qa.manual_layer_policy,
                 },
             )
-            with preflight_phase_logger.phase(Phase.AUTO_QA):
-                auto_qa_plan = await deps.run_auto_qa_planning(
-                    deps.ai_service,
-                    request,
-                    context_documents=preflight_context,
-                    image_info=preflight_image_info,
-                    model_alias_registry=model_alias_registry,
-                    stream_callback=auto_qa_stream_callback,
-                    usage_callback=usage_tracker.create_callback(
-                        phase="auto_qa",
-                        role="gran_sabio",
-                        operation="auto_qa_planning",
-                    ),
-                    phase_logger=preflight_phase_logger,
-                    cancellation_token=pre_start_cancellation_token,
-                )
+            with (usage_tracker.span(phase="auto_qa", operation="auto_qa_planning") if usage_tracker else nullcontext()):
+                with preflight_phase_logger.phase(Phase.AUTO_QA):
+                    auto_qa_plan = await deps.run_auto_qa_planning(
+                        deps.ai_service,
+                        request,
+                        context_documents=preflight_context,
+                        image_info=preflight_image_info,
+                        model_alias_registry=model_alias_registry,
+                        stream_callback=auto_qa_stream_callback,
+                        usage_callback=usage_tracker.create_callback(
+                            phase="auto_qa",
+                            role="gran_sabio",
+                            operation="auto_qa_planning",
+                        ),
+                        phase_logger=preflight_phase_logger,
+                        cancellation_token=pre_start_cancellation_token,
+                    )
             await deps.debug_record_event(
                 session_id,
                 "auto_qa_completed",
@@ -270,18 +273,19 @@ async def run_prestart_flow(
             )
 
     try:
-        with preflight_phase_logger.phase(Phase.PREFLIGHT):
-            preflight_result = await deps.run_preflight_validation(
-                deps.ai_service,
-                request,
-                context_documents=preflight_context,
-                image_info=preflight_image_info,
-                stream_callback=preflight_stream_callback,
-                usage_tracker=usage_tracker,
-                phase_logger=preflight_phase_logger,
-                model_alias_registry=model_alias_registry,
-                cancellation_token=pre_start_cancellation_token,
-            )
+        with (usage_tracker.span(phase="preflight", operation="preflight_validation") if usage_tracker else nullcontext()):
+            with preflight_phase_logger.phase(Phase.PREFLIGHT):
+                preflight_result = await deps.run_preflight_validation(
+                    deps.ai_service,
+                    request,
+                    context_documents=preflight_context,
+                    image_info=preflight_image_info,
+                    stream_callback=preflight_stream_callback,
+                    usage_tracker=usage_tracker,
+                    phase_logger=preflight_phase_logger,
+                    model_alias_registry=model_alias_registry,
+                    cancellation_token=pre_start_cancellation_token,
+                )
     except asyncio.CancelledError:
         return PrestartFlowResult(
             temp_session=temp_session,
