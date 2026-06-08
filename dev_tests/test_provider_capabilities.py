@@ -310,6 +310,23 @@ def test_generic_timeout_message_is_retryable_timeout():
     assert failure.retryable is True
 
 
+def test_provider_body_numeric_error_code_is_treated_as_status():
+    class OpenRouterStreamingError(Exception):
+        body = {"error": {"message": "Provider returned error", "code": 504}}
+
+    failure = classify_provider_exception(
+        OpenRouterStreamingError("Provider returned error"),
+        provider="openrouter",
+        model_id="nvidia/nemotron-3-ultra-550b-a55b:free",
+        operation="tool_loop_generation",
+    )
+
+    assert failure.kind == ProviderErrorKind.TIMEOUT
+    assert failure.status_code == 504
+    assert failure.provider_error_code == "504"
+    assert failure.retryable is True
+
+
 def test_attempted_feature_400_ignores_unrelated_provider_param():
     class ProviderBadRequest(Exception):
         status_code = 400

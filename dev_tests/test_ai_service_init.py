@@ -58,6 +58,7 @@ def mock_config_with_keys():
     mock_cfg.XAI_API_KEY = "xai-test-key"
     mock_cfg.OPENROUTER_API_KEY = "sk-or-test-key"
     mock_cfg.OLLAMA_HOST = None  # Disabled by default
+    mock_cfg.FAKE_AI_HOST = None
     return mock_cfg
 
 
@@ -71,6 +72,7 @@ def mock_config_no_keys():
     mock_cfg.XAI_API_KEY = None
     mock_cfg.OPENROUTER_API_KEY = None
     mock_cfg.OLLAMA_HOST = None
+    mock_cfg.FAKE_AI_HOST = None
     return mock_cfg
 
 
@@ -240,6 +242,31 @@ class TestOpenAIClientInit:
             mock_all_api_clients["openai"].OpenAI.assert_called_once()
             call_kwargs = mock_all_api_clients["openai"].OpenAI.call_args[1]
             assert call_kwargs["api_key"] == "sk-test-openai-key"
+
+    def test_sdk_http_clients_use_extended_keepalive(self, mock_all_api_clients, mock_config_with_keys, reset_singleton):
+        """
+        Given: Provider SDK clients are initialized
+        When: AIService builds their HTTP clients
+        Then: HTTPX pools keep idle connections for 20 seconds
+        """
+        with patch("ai_service.config", mock_config_with_keys):
+            from ai_service import SDK_HTTP_KEEPALIVE_EXPIRY_SECONDS, AIService
+
+            AIService()
+
+            openai_async_calls = mock_all_api_clients["openai"].DefaultAsyncHttpxClient.call_args_list
+            assert len(openai_async_calls) == 3  # OpenAI, xAI, OpenRouter
+            for call in openai_async_calls:
+                limits = call.kwargs["limits"]
+                assert limits.keepalive_expiry == SDK_HTTP_KEEPALIVE_EXPIRY_SECONDS
+                assert limits.max_connections == 1000
+                assert limits.max_keepalive_connections == 100
+
+            openai_sync_limits = mock_all_api_clients["openai"].DefaultHttpxClient.call_args.kwargs["limits"]
+            assert openai_sync_limits.keepalive_expiry == SDK_HTTP_KEEPALIVE_EXPIRY_SECONDS
+
+            anthropic_limits = mock_all_api_clients["anthropic"].DefaultAsyncHttpxClient.call_args.kwargs["limits"]
+            assert anthropic_limits.keepalive_expiry == SDK_HTTP_KEEPALIVE_EXPIRY_SECONDS
 
     def test_openai_client_none_without_key(self, mock_all_api_clients, mock_config_no_keys, reset_singleton, caplog):
         """

@@ -113,6 +113,8 @@ class ToolLoopEnvelope(BaseModel):
     accepted: bool = False
     accepted_via: str = ""
     context_size_estimate: Optional[int] = None
+    context_overflow_kind: Optional[str] = None
+    context_overflow_details: Optional[Dict[str, Any]] = None
     payload: Optional[Dict[str, Any]] = None
 
 

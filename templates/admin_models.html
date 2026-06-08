@@ -221,6 +221,27 @@
     .spinner { width: 16px; height: 16px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin .6s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
 
+    .provider-health-strip {
+      border: 1px solid var(--border-light); background: rgba(255,255,255,.86);
+      border-radius: 8px; padding: 12px 14px; margin-bottom: 16px;
+    }
+    .provider-health-header {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px;
+    }
+    .provider-health-title { font-size: .82rem; font-weight: 700; color: var(--text-primary); }
+    .provider-health-items { display: flex; flex-wrap: wrap; gap: 8px; }
+    .health-pill {
+      display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px; border-radius: 999px;
+      font-size: .76rem; border: 1px solid var(--border-light); background: var(--bg-secondary); color: var(--text-secondary);
+    }
+    .health-pill strong { font-weight: 700; color: var(--text-primary); }
+    .health-pill.operational { background: var(--success-bg); color: var(--success); border-color: transparent; }
+    .health-pill.suspected { background: var(--warning-bg); color: var(--warning); border-color: transparent; }
+    .health-pill.degraded { background: var(--error-bg); color: var(--error); border-color: transparent; }
+    .health-pill.recovering { background: var(--accent-blue-bg); color: var(--accent-blue); border-color: transparent; }
+    .health-pill.unavailable { background: var(--bg-secondary); color: var(--text-muted); }
+    .health-source { color: var(--text-muted); }
+
     /* ── Modal ──────────────────────────────── */
     .modal-overlay {
       position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 1000;
@@ -317,6 +338,16 @@
 
     <!-- Notice area -->
     <div id="globalNotice" class="notice"></div>
+
+    <div id="providerHealthPanel" class="provider-health-strip">
+      <div class="provider-health-header">
+        <span class="provider-health-title">Provider health</span>
+        <button type="button" class="btn-secondary btn-sm" id="refreshProviderHealthBtn">Refresh status</button>
+      </div>
+      <div id="providerHealthItems" class="provider-health-items">
+        <span class="health-pill unavailable">Loading...</span>
+      </div>
+    </div>
 
     <!-- Tab strip -->
     <div class="tab-strip" id="tabStrip">

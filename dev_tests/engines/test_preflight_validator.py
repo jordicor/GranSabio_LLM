@@ -481,10 +481,29 @@ class TestRunPreflightValidation:
     """Tests for run_preflight_validation() async function."""
 
     @pytest.mark.asyncio
-    async def test_routed_preflight_model_is_used(self, minimal_request, mock_ai_service):
+    async def test_noop_request_bypasses_preflight_llm_even_without_model(
+        self, minimal_request, mock_ai_service
+    ):
+        """Given: No active preflight surface, Then: Proceeds without an LLM call."""
+        minimal_request.llm_routing = {
+            "calls": {"preflight.validate": {"model": None}}
+        }
+
+        result = await run_preflight_validation(
+            ai_service=mock_ai_service,
+            request=minimal_request,
+        )
+
+        assert result.decision == "proceed"
+        assert result.summary == "Preflight skipped: no active validation surface"
+        assert result.issues == []
+        mock_ai_service.generate_content.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_routed_preflight_model_is_used(self, request_with_qa_layers, mock_ai_service):
         """Given: Preflight routing, Then: Uses routed model."""
-        minimal_request.arbiter_model = "arbiter-preflight-model"
-        minimal_request.llm_routing = {
+        request_with_qa_layers.arbiter_model = "arbiter-preflight-model"
+        request_with_qa_layers.llm_routing = {
             "calls": {"preflight.validate": {"model": "grok-4-fast-non-reasoning"}}
         }
 
@@ -493,7 +512,7 @@ class TestRunPreflightValidation:
 
             result = await run_preflight_validation(
                 ai_service=mock_ai_service,
-                request=minimal_request,
+                request=request_with_qa_layers,
             )
 
             assert result.decision == "proceed"
@@ -501,11 +520,11 @@ class TestRunPreflightValidation:
             assert mock_ai_service.generate_content.await_args.kwargs["model"] == "grok-4-fast-non-reasoning"
 
     @pytest.mark.asyncio
-    async def test_legacy_gran_sabio_model_does_not_define_preflight(self, minimal_request, mock_ai_service):
+    async def test_legacy_gran_sabio_model_does_not_define_preflight(self, request_with_qa_layers, mock_ai_service):
         """Given: Legacy GranSabio model, Then: Uses exact preflight routing."""
-        minimal_request.arbiter_model = ""
-        minimal_request.gran_sabio_model = "gran-sabio-preflight-model"
-        minimal_request.llm_routing = {
+        request_with_qa_layers.arbiter_model = ""
+        request_with_qa_layers.gran_sabio_model = "gran-sabio-preflight-model"
+        request_with_qa_layers.llm_routing = {
             "calls": {"preflight.validate": {"model": "grok-4-fast-non-reasoning"}}
         }
 
@@ -514,7 +533,7 @@ class TestRunPreflightValidation:
 
             result = await run_preflight_validation(
                 ai_service=mock_ai_service,
-                request=minimal_request,
+                request=request_with_qa_layers,
             )
 
             assert result.decision == "proceed"
@@ -522,18 +541,18 @@ class TestRunPreflightValidation:
             assert mock_ai_service.generate_content.await_args.kwargs["model"] == "grok-4-fast-non-reasoning"
 
     @pytest.mark.asyncio
-    async def test_no_available_preflight_model_rejects_without_llm_call(self, minimal_request, mock_ai_service):
+    async def test_no_available_preflight_model_rejects_without_llm_call(self, request_with_qa_layers, mock_ai_service):
         """Given: No available model, Then: Rejects and does not call AI."""
-        minimal_request.arbiter_model = ""
-        minimal_request.gran_sabio_model = ""
-        minimal_request.llm_routing = {
+        request_with_qa_layers.arbiter_model = ""
+        request_with_qa_layers.gran_sabio_model = ""
+        request_with_qa_layers.llm_routing = {
             "calls": {"preflight.validate": {"model": None}}
         }
 
         with patch("preflight_validator.config") as mock_config:
             result = await run_preflight_validation(
                 ai_service=mock_ai_service,
-                request=minimal_request,
+                request=request_with_qa_layers,
             )
 
             assert result.decision == "reject"
@@ -541,7 +560,7 @@ class TestRunPreflightValidation:
             mock_ai_service.generate_content.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_successful_validation_returns_result(self, minimal_request, mock_ai_service):
+    async def test_successful_validation_returns_result(self, request_with_qa_layers, mock_ai_service):
         """Given: Successful AI validation, Then: Returns parsed result."""
         mock_ai_service.generate_content = AsyncMock(
             return_value='{"decision": "proceed", "summary": "Request validated", "user_feedback": "Approved", "confidence": 0.95}'
@@ -552,7 +571,7 @@ class TestRunPreflightValidation:
 
             result = await run_preflight_validation(
                 ai_service=mock_ai_service,
-                request=minimal_request,
+                request=request_with_qa_layers,
             )
 
             assert result.decision == "proceed"
@@ -560,12 +579,12 @@ class TestRunPreflightValidation:
             assert result.confidence == 0.95
 
     @pytest.mark.asyncio
-    async def test_ai_error_returns_reject(self, minimal_request, mock_ai_service):
+    async def test_ai_error_returns_reject(self, request_with_qa_layers, mock_ai_service):
         """Given: AI service error, Then: Rejects fail-closed."""
         mock_ai_service.generate_content = AsyncMock(
             side_effect=Exception("API Error")
         )
-        minimal_request.llm_routing = {
+        request_with_qa_layers.llm_routing = {
             "calls": {"preflight.validate": {"model": "grok-4-fast-non-reasoning"}}
         }
 
@@ -574,7 +593,7 @@ class TestRunPreflightValidation:
 
             result = await run_preflight_validation(
                 ai_service=mock_ai_service,
-                request=minimal_request,
+                request=request_with_qa_layers,
             )
 
             assert result.decision == "reject"
@@ -582,7 +601,7 @@ class TestRunPreflightValidation:
             assert "grok-4-fast-non-reasoning" in result.user_feedback
 
     @pytest.mark.asyncio
-    async def test_unparseable_response_returns_reject(self, minimal_request, mock_ai_service):
+    async def test_unparseable_response_returns_reject(self, request_with_qa_layers, mock_ai_service):
         """Given: Unparseable AI response, Then: Rejects fail-closed."""
         mock_ai_service.generate_content = AsyncMock(
             return_value="This is not valid JSON at all"
@@ -593,7 +612,7 @@ class TestRunPreflightValidation:
 
             result = await run_preflight_validation(
                 ai_service=mock_ai_service,
-                request=minimal_request,
+                request=request_with_qa_layers,
             )
 
             assert result.decision == "reject"
@@ -602,7 +621,7 @@ class TestRunPreflightValidation:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("raw_output", ['[{}]', '"ok"', '123', 'true'])
     async def test_valid_non_object_json_response_returns_reject(
-        self, minimal_request, mock_ai_service, raw_output
+        self, request_with_qa_layers, mock_ai_service, raw_output
     ):
         """Given: Valid non-object JSON response, Then: Rejects fail-closed."""
         mock_ai_service.generate_content = AsyncMock(return_value=raw_output)
@@ -612,14 +631,14 @@ class TestRunPreflightValidation:
 
             result = await run_preflight_validation(
                 ai_service=mock_ai_service,
-                request=minimal_request,
+                request=request_with_qa_layers,
             )
 
             assert result.decision == "reject"
             assert result.issues[0].code == "preflight_invalid_response"
 
     @pytest.mark.asyncio
-    async def test_invalid_decision_returns_reject(self, minimal_request, mock_ai_service):
+    async def test_invalid_decision_returns_reject(self, request_with_qa_layers, mock_ai_service):
         """Given: JSON with invalid decision, Then: Rejects fail-closed."""
         mock_ai_service.generate_content = AsyncMock(
             return_value='{"decision": "maybe", "summary": "Unsure"}'
@@ -630,14 +649,14 @@ class TestRunPreflightValidation:
 
             result = await run_preflight_validation(
                 ai_service=mock_ai_service,
-                request=minimal_request,
+                request=request_with_qa_layers,
             )
 
             assert result.decision == "reject"
             assert result.issues[0].code == "preflight_invalid_decision"
 
     @pytest.mark.asyncio
-    async def test_reject_decision_parsed_correctly(self, minimal_request, mock_ai_service):
+    async def test_reject_decision_parsed_correctly(self, request_with_qa_layers, mock_ai_service):
         """Given: AI returns reject, Then: Result has reject decision."""
         mock_ai_service.generate_content = AsyncMock(
             return_value='{"decision": "reject", "summary": "Contradictions found", "user_feedback": "Cannot proceed", "issues": [{"code": "contradiction", "severity": "critical", "message": "Conflicting requirements"}]}'
@@ -648,7 +667,7 @@ class TestRunPreflightValidation:
 
             result = await run_preflight_validation(
                 ai_service=mock_ai_service,
-                request=minimal_request,
+                request=request_with_qa_layers,
             )
 
             assert result.decision == "reject"

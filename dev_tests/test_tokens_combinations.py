@@ -104,15 +104,17 @@ class TestThinkingTokenSpecsMatrix:
 
     def test_all_gemini_models_specs(self):
         """Verify all Gemini models have correct thinking specs."""
-        gemini_specs = {
+        gemini_budget_specs = {
             "gemini-2.5-pro": {"min": 1024, "max": 65536, "default": 32768},
             "gemini-2.5-flash": {"min": 1024, "max": 65536, "default": 4000},
             "gemini-2.5-flash-lite": {"min": 1024, "max": 65536, "default": 0},
-            "gemini-3-pro-preview": {"min": 1024, "max": 65536, "default": 32768},
-            "gemini-3-flash-preview": {"min": 1024, "max": 32768, "default": 8192},
+        }
+        gemini_level_specs = {
+            "gemini-3-pro-preview": ["low", "medium", "high"],
+            "gemini-3-flash-preview": ["minimal", "low", "medium", "high"],
         }
 
-        for model_id, expected in gemini_specs.items():
+        for model_id, expected in gemini_budget_specs.items():
             details = self._get_thinking_details(model_id)
             assert details is not None, f"{model_id}: No thinking details found"
             assert details.get("supported") is True
@@ -130,6 +132,15 @@ class TestThinkingTokenSpecsMatrix:
                 f"{model_id}: default_tokens expected {expected['default']}, got {actual_default}"
 
             print(f"[OK] {model_id}: min={actual_min}, max={actual_max}, default={actual_default}")
+
+        for model_id, expected_levels in gemini_level_specs.items():
+            details = self._get_thinking_details(model_id)
+            assert details is not None, f"{model_id}: No thinking details found"
+            assert details.get("supported") is True
+            assert details.get("parameter_name") == "thinking_level"
+            assert details.get("levels") == expected_levels
+
+            print(f"[OK] {model_id}: thinking_level={expected_levels}")
 
 
 class TestReasoningEffortConversionMatrix:

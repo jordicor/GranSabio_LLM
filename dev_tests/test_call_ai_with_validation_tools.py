@@ -336,6 +336,164 @@ def test_estimate_prompt_overflow_exceeds_returns_flag():
         assert estimate_prompt_overflow("tiny-model", 100_000, 100) == "context_too_large"
 
 
+@pytest.mark.asyncio
+async def test_known_large_context_model_over_hard_cap_uses_model_window():
+    """A known 1M-token model must not be rejected by the generic 200k char cap."""
+    service = AIService.__new__(AIService)
+    service.google_new_client = object()
+    fake_loop = AsyncMock(return_value=(
+        "provider called",
+        {
+            "mode": "gemini_tool_loop",
+            "turns": 1,
+            "accepted": "assistant_final",
+            "trace": [],
+        },
+    ))
+
+    with patch.object(AIService, "_normalize_tool_loop_provider", return_value="gemini"), \
+         patch.object(AIService, "_supports_generation_validation_tool_loop", return_value=True), \
+         patch.object(AIService, "_apply_temperature_policies", return_value=(0.7, None, False)), \
+         patch.object(AIService, "_should_inject_json_prompt", return_value=False), \
+         patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
+         patch.object(AIService, "_run_gemini_new_sdk_validation_tool_loop", new=fake_loop), \
+         patch("ai_service.config") as mock_config:
+        mock_config.validate_token_limits.return_value = {
+            "adjusted_tokens": 16_000,
+            "adjusted_reasoning_effort": None,
+            "adjusted_thinking_budget_tokens": None,
+            "model_info": {
+                "provider": "gemini",
+                "model_id": "gemini-3.1-flash-lite",
+                "input_tokens": 1_048_576,
+                "context_window": 1_048_576,
+            },
+            "reasoning_timeout_seconds": None,
+        }
+        mock_config.GENERATOR_SYSTEM_PROMPT = "system"
+        mock_config.GENERATOR_SYSTEM_PROMPT_RAW = "raw system"
+        mock_config.TOOL_LOOP_MAX_PROMPT_CHARS = 200_000
+
+        content, envelope = await service.call_ai_with_validation_tools(
+            prompt="x" * 373_588,
+            model="gemini-3.1-flash-lite",
+            max_tokens=16_000,
+            validation_callback=lambda _: _approved_result(),
+        )
+
+    assert content == "provider called"
+    assert envelope.tools_skipped_reason is None
+    fake_loop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_known_model_context_overflow_rejects_with_model_details():
+    """A known model that truly exceeds its resolved window still fails fast."""
+    service = AIService.__new__(AIService)
+    service.google_new_client = object()
+    fake_loop = AsyncMock(return_value=(
+        "should not run",
+        {
+            "mode": "gemini_tool_loop",
+            "turns": 1,
+            "accepted": "assistant_final",
+            "trace": [],
+        },
+    ))
+
+    with patch.object(AIService, "_normalize_tool_loop_provider", return_value="gemini"), \
+         patch.object(AIService, "_supports_generation_validation_tool_loop", return_value=True), \
+         patch.object(AIService, "_apply_temperature_policies", return_value=(0.7, None, False)), \
+         patch.object(AIService, "_should_inject_json_prompt", return_value=False), \
+         patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
+         patch.object(AIService, "_run_gemini_new_sdk_validation_tool_loop", new=fake_loop), \
+         patch("ai_service.config") as mock_config:
+        mock_config.validate_token_limits.return_value = {
+            "adjusted_tokens": 16_000,
+            "adjusted_reasoning_effort": None,
+            "adjusted_thinking_budget_tokens": None,
+            "model_info": {
+                "provider": "gemini",
+                "model_id": "gemini-3.1-flash-lite",
+                "input_tokens": 1_048_576,
+                "context_window": 1_048_576,
+            },
+            "reasoning_timeout_seconds": None,
+        }
+        mock_config.GENERATOR_SYSTEM_PROMPT = "system"
+        mock_config.GENERATOR_SYSTEM_PROMPT_RAW = "raw system"
+        mock_config.TOOL_LOOP_MAX_PROMPT_CHARS = 200_000
+
+        content, envelope = await service.call_ai_with_validation_tools(
+            prompt="x" * 4_200_000,
+            model="gemini-3.1-flash-lite",
+            max_tokens=16_000,
+            validation_callback=lambda _: _approved_result(),
+        )
+
+    assert content == ""
+    assert envelope.tools_skipped_reason == "context_too_large"
+    assert envelope.context_overflow_kind == "model_context_overflow"
+    assert envelope.context_overflow_details["context_window"] == 1_048_576
+    assert (
+        envelope.context_overflow_details["estimated_input_tokens"]
+        > envelope.context_overflow_details["available_input_tokens"]
+    )
+    fake_loop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unknown_model_over_hard_cap_rejects_with_hard_cap_details():
+    """The generic hard cap still protects unknown models with no resolved window."""
+    service = AIService.__new__(AIService)
+    fake_loop = AsyncMock(return_value=(
+        "should not run",
+        {
+            "mode": "openai_tool_loop",
+            "turns": 1,
+            "accepted": "assistant_final",
+            "trace": [],
+        },
+    ))
+
+    with patch.object(AIService, "_normalize_tool_loop_provider", return_value="openai"), \
+         patch.object(AIService, "_supports_generation_validation_tool_loop", return_value=True), \
+         patch.object(AIService, "_apply_temperature_policies", return_value=(0.7, None, False)), \
+         patch.object(AIService, "_should_inject_json_prompt", return_value=False), \
+         patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
+         patch.object(AIService, "_run_openai_compatible_validation_tool_loop", new=fake_loop), \
+         patch("ai_service.config") as mock_config:
+        mock_config.validate_token_limits.return_value = {
+            "adjusted_tokens": 1024,
+            "adjusted_reasoning_effort": None,
+            "adjusted_thinking_budget_tokens": None,
+            "model_info": {
+                "provider": "openai",
+                "model_id": "unknown-tool-model",
+            },
+            "reasoning_timeout_seconds": None,
+        }
+        mock_config.GENERATOR_SYSTEM_PROMPT = "system"
+        mock_config.GENERATOR_SYSTEM_PROMPT_RAW = "raw system"
+        mock_config.TOOL_LOOP_MAX_PROMPT_CHARS = 200_000
+        mock_config.get_model_info.side_effect = RuntimeError("unknown model")
+
+        content, envelope = await service.call_ai_with_validation_tools(
+            prompt="x" * 250_000,
+            model="unknown-tool-model",
+            max_tokens=1024,
+            validation_callback=lambda _: _approved_result(),
+        )
+
+    assert content == ""
+    assert envelope.tools_skipped_reason == "context_too_large"
+    assert envelope.context_overflow_kind == "unknown_model_hard_cap_overflow"
+    assert envelope.context_overflow_details["context_window"] is None
+    assert envelope.context_overflow_details["hard_cap_chars"] == 200_000
+    assert envelope.context_overflow_details["prompt_chars"] > 200_000
+    fake_loop.assert_not_awaited()
+
+
 def test_normalize_usage_marks_length_finish_reason_as_truncated():
     """OpenAI-style ``length`` finish reason must be surfaced as output truncation."""
     service = AIService.__new__(AIService)

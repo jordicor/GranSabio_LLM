@@ -117,9 +117,6 @@ cache/
 !requirements.txt
 !core/trusted_proxies.txt
 !dev_tests/fake_ai/*.txt
-!saas/docs/
-!saas/docs/*.md
-!saas/docs/**/*.md
 !/docs/
 !/docs/**
 

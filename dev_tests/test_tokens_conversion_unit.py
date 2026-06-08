@@ -35,6 +35,7 @@ class TestReasoningEffortNormalization:
         assert self.config.normalize_reasoning_effort_label("medium") == "medium"
         assert self.config.normalize_reasoning_effort_label("high") == "high"
         assert self.config.normalize_reasoning_effort_label("xhigh") == "xhigh"
+        assert self.config.normalize_reasoning_effort_label("max") == "max"
 
     def test_normalize_aliases(self):
         """Test that aliases are correctly mapped."""
@@ -53,6 +54,8 @@ class TestReasoningEffortNormalization:
         assert self.config.normalize_reasoning_effort_label("minimum") == "minimal"
         assert self.config.normalize_reasoning_effort_label("off") == "none"
         assert self.config.normalize_reasoning_effort_label("xh") == "xhigh"
+        assert self.config.normalize_reasoning_effort_label("x-high") == "xhigh"
+        assert self.config.normalize_reasoning_effort_label("maximum") == "max"
 
     def test_normalize_case_insensitive(self):
         """Test that normalization is case-insensitive."""
@@ -63,6 +66,7 @@ class TestReasoningEffortNormalization:
         assert self.config.normalize_reasoning_effort_label("MINIMAL") == "minimal"
         assert self.config.normalize_reasoning_effort_label("MID") == "medium"
         assert self.config.normalize_reasoning_effort_label("XHIGH") == "xhigh"
+        assert self.config.normalize_reasoning_effort_label("MAX") == "max"
 
     def test_normalize_none_input(self):
         """Test that None returns None."""
@@ -73,6 +77,49 @@ class TestReasoningEffortNormalization:
         assert self.config.normalize_reasoning_effort_label("invalid") is None
         assert self.config.normalize_reasoning_effort_label("extreme") is None
         assert self.config.normalize_reasoning_effort_label("") is None
+
+
+class TestReasoningEffortCoercion:
+    """Test model-specific effort fallback behavior."""
+
+    def setup_method(self):
+        self.config = config.Config()
+
+    def test_minimal_maps_to_medium_when_only_medium_supported(self):
+        adjusted, validation = self.config._coerce_reasoning_effort_to_supported_level(
+            "minimal",
+            {"supported": True, "levels": ["medium"], "default": "medium"},
+        )
+
+        assert adjusted == "medium"
+        assert validation["was_adjusted"] is True
+
+    def test_minimal_maps_to_low_when_low_is_nearest_supported(self):
+        adjusted, validation = self.config._coerce_reasoning_effort_to_supported_level(
+            "minimal",
+            {"supported": True, "levels": ["low", "medium"], "default": "low"},
+        )
+
+        assert adjusted == "low"
+        assert validation["was_adjusted"] is True
+
+    def test_low_maps_to_minimal_when_minimal_is_nearest_supported(self):
+        adjusted, validation = self.config._coerce_reasoning_effort_to_supported_level(
+            "low",
+            {"supported": True, "levels": ["minimal", "medium"], "default": "minimal"},
+        )
+
+        assert adjusted == "minimal"
+        assert validation["was_adjusted"] is True
+
+    def test_max_maps_to_xhigh_when_max_is_not_supported(self):
+        adjusted, validation = self.config._coerce_reasoning_effort_to_supported_level(
+            "max",
+            {"supported": True, "levels": ["low", "high", "xhigh"], "default": "high"},
+        )
+
+        assert adjusted == "xhigh"
+        assert validation["was_adjusted"] is True
 
 
 class TestConvertReasoningEffortToTokens:
@@ -239,9 +286,9 @@ class TestConvertReasoningEffortToTokens:
 
         assert tokens == 16384, f"Expected 16384, got {tokens}"
 
-    # Gemini 3 Flash tests (max: 32768)
-    def test_gemini_3_flash_high(self):
-        """Gemini 3 Flash with high effort should use max tokens (32768)."""
+    # Gemini 3 Flash uses thinking_level, not numeric thinking_budget.
+    def test_gemini_3_flash_high_is_not_converted_to_tokens(self):
+        """Gemini 3 Flash high effort should stay a named thinking level."""
         model_info = self._get_model_info("gemini-3-flash-preview")
         thinking_details = self._get_thinking_details("gemini-3-flash-preview")
 
@@ -249,18 +296,14 @@ class TestConvertReasoningEffortToTokens:
             "high", model_info, thinking_details
         )
 
-        assert tokens == 32768, f"Expected 32768, got {tokens}"
+        assert tokens is None
 
-    def test_gemini_3_flash_medium(self):
-        """Gemini 3 Flash with medium effort should use 50% of max (16384)."""
-        model_info = self._get_model_info("gemini-3-flash-preview")
+    def test_gemini_3_flash_metadata_uses_thinking_level(self):
+        """Gemini 3 Flash should advertise provider-native thinking levels."""
         thinking_details = self._get_thinking_details("gemini-3-flash-preview")
 
-        tokens = self.config._convert_reasoning_effort_to_tokens(
-            "medium", model_info, thinking_details
-        )
-
-        assert tokens == 16384, f"Expected 16384, got {tokens}"
+        assert thinking_details["parameter_name"] == "thinking_level"
+        assert thinking_details["levels"] == ["minimal", "low", "medium", "high"]
 
 
 class TestConvertTokensToReasoningEffort:
@@ -467,6 +510,28 @@ class TestValidateTokenLimits:
 
         assert result["adjusted_reasoning_effort"] == "high"
 
+    def test_openai_chat_latest_minimal_maps_to_medium(self):
+        """gpt-5.1-chat-latest only accepts medium reasoning effort."""
+        result = self.config.validate_token_limits(
+            model_name="gpt-5.1-chat-latest",
+            max_tokens=4000,
+            reasoning_effort="minimal"
+        )
+
+        assert result["adjusted_reasoning_effort"] == "medium"
+        assert result["adjusted_thinking_budget_tokens"] is None
+
+    def test_openai_gpt52_chat_low_maps_to_medium(self):
+        """gpt-5.2-chat-latest only accepts medium reasoning effort."""
+        result = self.config.validate_token_limits(
+            model_name="gpt-5.2-chat-latest",
+            max_tokens=4000,
+            reasoning_effort="low"
+        )
+
+        assert result["adjusted_reasoning_effort"] == "medium"
+        assert result["adjusted_thinking_budget_tokens"] is None
+
     # Gemini tests - should produce thinking_budget_tokens
     def test_gemini_with_reasoning_effort_high(self):
         """Gemini with reasoning_effort=high should convert to max thinking_budget_tokens."""
@@ -489,6 +554,60 @@ class TestValidateTokenLimits:
         # Gemini 2.5 Pro default is 32768
         assert result["adjusted_thinking_budget_tokens"] == 32768, \
             f"Expected 32768, got {result['adjusted_thinking_budget_tokens']}"
+
+    def test_gemini_3_flash_minimal_uses_named_level(self):
+        """Gemini 3 Flash minimal should remain thinking_level=minimal."""
+        result = self.config.validate_token_limits(
+            model_name="gemini-3-flash-preview",
+            max_tokens=4000,
+            reasoning_effort="minimal"
+        )
+
+        assert result["adjusted_reasoning_effort"] == "minimal"
+        assert result["adjusted_thinking_budget_tokens"] is None
+
+    def test_gemini_3_pro_minimal_maps_to_low(self):
+        """Gemini 3 Pro does not support minimal, so use nearest level low."""
+        result = self.config.validate_token_limits(
+            model_name="gemini-3.1-pro-preview",
+            max_tokens=4000,
+            reasoning_effort="minimal"
+        )
+
+        assert result["adjusted_reasoning_effort"] == "low"
+        assert result["adjusted_thinking_budget_tokens"] is None
+
+    def test_gemini_3_legacy_budget_converts_to_named_level(self):
+        """Gemini 3 numeric thinking budgets should map to thinking_level."""
+        result = self.config.validate_token_limits(
+            model_name="gemini-3-flash-preview",
+            max_tokens=4000,
+            thinking_budget_tokens=8000
+        )
+
+        assert result["adjusted_reasoning_effort"] == "low"
+        assert result["adjusted_thinking_budget_tokens"] is None
+
+    def test_xai_grok43_defaults_to_low_reasoning_effort(self):
+        """Grok 4.3 should use the provider default low reasoning effort."""
+        result = self.config.validate_token_limits(
+            model_name="grok-4.3",
+            max_tokens=4000
+        )
+
+        assert result["adjusted_reasoning_effort"] == "low"
+        assert result["adjusted_thinking_budget_tokens"] is None
+
+    def test_xai_multi_agent_max_maps_to_xhigh(self):
+        """Grok multi-agent supports xhigh but not max."""
+        result = self.config.validate_token_limits(
+            model_name="grok-4.20-multi-agent-0309",
+            max_tokens=4000,
+            reasoning_effort="max"
+        )
+
+        assert result["adjusted_reasoning_effort"] == "xhigh"
+        assert result["adjusted_thinking_budget_tokens"] is None
 
 
 class TestDifferentModelsTokenCalculations:
@@ -522,14 +641,12 @@ class TestDifferentModelsTokenCalculations:
                 assert tokens == expected_max, \
                     f"{model_id}: Expected {expected_max}, got {tokens}"
 
-    def test_all_gemini_models_high(self):
-        """Test high effort produces max_tokens for all Gemini models with thinking."""
+    def test_all_gemini_25_models_high(self):
+        """Test high effort produces max_tokens for Gemini 2.5 budget models."""
         gemini_models = {
             "gemini-2.5-pro": 65536,
             "gemini-2.5-flash": 65536,
             "gemini-2.5-flash-lite": 65536,
-            "gemini-3-pro-preview": 65536,
-            "gemini-3-flash-preview": 32768,
         }
 
         for model_id, expected_max in gemini_models.items():
@@ -542,6 +659,22 @@ class TestDifferentModelsTokenCalculations:
                 )
                 assert tokens == expected_max, \
                     f"{model_id}: Expected {expected_max}, got {tokens}"
+
+    def test_all_gemini_3_models_use_named_levels(self):
+        """Gemini 3+ models should use thinking_level instead of token budgets."""
+        gemini_models = {
+            "gemini-3-pro-preview": ["low", "medium", "high"],
+            "gemini-3-flash-preview": ["minimal", "low", "medium", "high"],
+            "gemini-3.1-flash-lite": ["minimal", "low", "medium", "high"],
+            "gemini-3.5-flash": ["minimal", "low", "medium", "high"],
+        }
+
+        for model_id, expected_levels in gemini_models.items():
+            thinking_details = self._get_thinking_details(model_id)
+
+            assert thinking_details and thinking_details.get("supported"), model_id
+            assert thinking_details.get("parameter_name") == "thinking_level"
+            assert thinking_details.get("levels") == expected_levels
 
     def test_all_claude_models_low(self):
         """Test low effort produces 25% of max_tokens for Claude models."""
@@ -619,23 +752,23 @@ class TestModelSpecsThinkingBudget:
 
     def test_gemini_models_have_thinking_budget(self):
         """Gemini models should have thinking_budget configuration with parameter_name."""
-        gemini_models = [
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
-            "gemini-3-pro-preview",
-            "gemini-3-flash-preview",
-        ]
+        gemini_models = {
+            "gemini-2.5-pro": "thinking_budget",
+            "gemini-2.5-flash": "thinking_budget",
+            "gemini-2.5-flash-lite": "thinking_budget",
+            "gemini-3-pro-preview": "thinking_level",
+            "gemini-3-flash-preview": "thinking_level",
+        }
 
-        for model_id in gemini_models:
+        for model_id, expected_parameter in gemini_models.items():
             spec = self._get_model_spec(model_id)
             assert spec is not None, f"Model {model_id} not found in specs"
 
             thinking_budget = spec.get("thinking_budget", {})
             assert thinking_budget.get("supported") is True, \
                 f"{model_id}: thinking_budget.supported should be True"
-            assert thinking_budget.get("parameter_name") == "thinking_budget", \
-                f"{model_id}: parameter_name should be 'thinking_budget'"
+            assert thinking_budget.get("parameter_name") == expected_parameter, \
+                f"{model_id}: parameter_name should be '{expected_parameter}'"
 
     def test_openai_models_have_reasoning_effort(self):
         """OpenAI models should have reasoning_effort configuration."""

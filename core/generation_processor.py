@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from contextlib import nullcontext
 import re
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -27,8 +27,8 @@ from feedback_memory import get_feedback_manager
 from gran_sabio import GranSabioProcessCancelled
 from gran_sabio_supervisor import GranSabioSupervisor
 from json_field_utils import prepare_content_for_qa, reconstruct_json, try_extract_json_from_content
-from llm_routing import resolve_call, resolve_temperature
 from llm_accent_prompts import ACCENT_SYSTEM_PROMPT_SNIPPET
+from llm_routing import resolve_call, resolve_temperature
 from logging_utils import Phase, create_phase_logger
 from long_text.controller import (
     LongTextGenerationError,
@@ -50,6 +50,8 @@ from models import (
     is_json_output_requested,
 )
 from preflight_validator import resolve_preflight_model
+from provider_errors import ProviderErrorKind, ProviderFailure
+from provider_health import provider_health_for_failure_payload
 from qa_engine import QAModelUnavailableError, QAProcessCancelled
 from qa_result_utils import (
     apply_gran_sabio_false_positive_override,
@@ -57,7 +59,6 @@ from qa_result_utils import (
     is_technical_qa_failure,
     semantic_deal_breakers,
 )
-from provider_errors import ProviderErrorKind, ProviderFailure
 from services.attachment_manager import (
     AttachmentError,
     AttachmentManager,
@@ -91,13 +92,13 @@ from word_count_utils import build_word_count_instructions, count_words, prepare
 
 from . import app_state
 from .app_state import (
-    apply_session_cancelled_state,
     _debug_record_event,
     _debug_record_usage,
     _debug_update_status,
     _ensure_services,
     _serialize_for_debug,
     _store_final_result,
+    apply_session_cancelled_state,
     get_session,
     is_terminal_session,
     logger,
@@ -231,6 +232,12 @@ def _provider_failure_public_payload(failure: ProviderFailure) -> Dict[str, Any]
         "max_attempts": failure.max_attempts,
         "raw_exception_class": failure.raw_exception_class,
     }
+    health_payload = provider_health_for_failure_payload(failure)
+    if health_payload:
+        payload.update(health_payload)
+        health_message = health_payload.get("provider_health_message")
+        if isinstance(health_message, str) and health_message and health_message not in payload["message"]:
+            payload["message"] = f"{payload['message']} {health_message}"
     return {key: value for key, value in payload.items() if value is not None}
 
 
@@ -950,6 +957,37 @@ def _make_generation_tool_event_callback(session_id: str, session: Dict[str, Any
     return _generation_tool_event_callback
 
 
+def _format_context_overflow_message(model: str, tool_metadata: Any) -> str:
+    """Build a debugger-friendly message for tool-loop context fail-fast."""
+
+    details = getattr(tool_metadata, "context_overflow_details", None) or {}
+    kind = (
+        getattr(tool_metadata, "context_overflow_kind", None)
+        or details.get("context_overflow_kind")
+    )
+    if kind == "unknown_model_hard_cap_overflow":
+        base = "Generator prompt exceeds unknown-model tool-loop hard cap"
+    else:
+        base = "Generator prompt exceeds model context window"
+
+    fields: List[str] = [f"model={model}"]
+    if kind:
+        fields.append(f"overflow_type={kind}")
+    for key in (
+        "prompt_chars",
+        "estimated_input_tokens",
+        "context_window",
+        "max_tokens",
+        "thinking_budget",
+        "available_input_tokens",
+        "hard_cap_chars",
+    ):
+        value = details.get(key)
+        if value is not None:
+            fields.append(f"{key}={value}")
+    return f"{base} ({'; '.join(fields)})"
+
+
 def _build_smart_edit_marker_config(content: str, request: ContentRequest) -> Dict[str, Any]:
     """Build the active smart-edit locator config for the current draft."""
 
@@ -1406,11 +1444,33 @@ async def _generate_full_content(
             skipped_reason = getattr(tool_metadata, "tools_skipped_reason", None)
             if skipped_reason == "context_too_large":
                 # Fail-fast: no automatic recovery. The prompt does not fit
-                # the selected model's context window.
-                raise ValueError(
-                    f"Generator prompt exceeds model context window "
-                    f"(model={request.generator_model})"
+                # the selected model's context window, or the model context
+                # could not be resolved and the unknown-model hard cap fired.
+                overflow_message = _format_context_overflow_message(
+                    request.generator_model,
+                    tool_metadata,
                 )
+                await add_verbose_log(session_id, f"[Tools] {overflow_message}")
+                await _debug_record_event(
+                    session_id,
+                    "generator_tool_loop_context_overflow",
+                    {
+                        "iteration": iteration + 1,
+                        "model": request.generator_model,
+                        "tools_skipped_reason": skipped_reason,
+                        "context_overflow_kind": getattr(
+                            tool_metadata,
+                            "context_overflow_kind",
+                            None,
+                        ),
+                        "context_overflow_details": getattr(
+                            tool_metadata,
+                            "context_overflow_details",
+                            None,
+                        ),
+                    },
+                )
+                raise ValueError(overflow_message)
             if skipped_reason == "no_tool_support":
                 # Centralised provider fallback: let execution continue into
                 # the standard streaming generation path below.

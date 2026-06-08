@@ -242,6 +242,8 @@ Preflight Response:
 }
 ```
 
+Requests without an active validation surface skip the LLM preflight query and proceed immediately. Adding QA layers, Auto-QA, word/phrase/lexical validators, evidence grounding, accent guard, images, context/source text, or Gran Sabio fallback keeps the normal preflight gate.
+
 **No tokens wasted on impossible requests.**
 
 ---
@@ -501,7 +503,7 @@ Need fast generation without QA? Just send empty layers:
 }
 ```
 
-Content is approved immediately. Perfect for testing, bulk generation, or content that will be manually edited.
+When no other validation surface is active, content is approved immediately. Perfect for testing, bulk generation, or content that will be manually edited.
 
 ---
 

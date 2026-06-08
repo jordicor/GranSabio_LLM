@@ -15,6 +15,15 @@
   };
   const FULL_SYNC_PROVIDERS = new Set(["openrouter", "xai", "ollama"]);
   const REMOVE_MISSING_BY_DEFAULT_PROVIDERS = new Set(["ollama"]);
+  const HEALTH_PROVIDERS = ["openai", "claude", "gemini", "xai", "openrouter", "ollama"];
+  const HEALTH_PROVIDER_LABELS = {
+    openai: "OpenAI",
+    claude: "Claude",
+    gemini: "Gemini",
+    xai: "xAI",
+    openrouter: "OpenRouter",
+    ollama: "Ollama",
+  };
 
   /* ═══════════════════════════════════════════════════
    * Utility functions (kept from previous version)
@@ -273,6 +282,7 @@
       this.abortControllers = new Map();
       this.sortState = this._loadSortState();
       this.providerSelections = new Map();
+      this.providerHealth = null;
       this._deletePopover = null;
       this.init();
     }
@@ -284,13 +294,71 @@
       this.bindCatalogControls();
       this.bindProviderControls();
       this.bindModals();
+      this.bindProviderHealthControls();
 
       const boot = window.ADMIN_BOOT || {};
       const savedTab = localStorage.getItem("gransabio_admin_tab");
       const initialTab = savedTab && TABS.includes(savedTab) ? savedTab : boot.initialTab || "catalog";
 
       this.refreshCatalog();
+      this.refreshProviderHealth(false);
       this.activateTab(TABS.includes(initialTab) ? initialTab : "catalog");
+    }
+
+    bindProviderHealthControls() {
+      const refreshBtn = document.getElementById("refreshProviderHealthBtn");
+      if (!refreshBtn) return;
+      refreshBtn.addEventListener("click", () => this.refreshProviderHealth(true));
+    }
+
+    async refreshProviderHealth(refreshOfficial) {
+      const refreshBtn = document.getElementById("refreshProviderHealthBtn");
+      if (refreshBtn) {
+        refreshBtn.disabled = true;
+      }
+      try {
+        const suffix = refreshOfficial ? "?refresh=true" : "";
+        const payload = await fetchJson(`/api/admin/provider-health${suffix}`);
+        this.providerHealth = payload;
+        this.renderProviderHealth();
+      } catch (err) {
+        this.renderProviderHealthError(err);
+      } finally {
+        if (refreshBtn) {
+          refreshBtn.disabled = false;
+        }
+      }
+    }
+
+    renderProviderHealth() {
+      const container = document.getElementById("providerHealthItems");
+      if (!container) return;
+      const providers = this.providerHealth?.providers || {};
+      container.innerHTML = "";
+      HEALTH_PROVIDERS.forEach((provider) => {
+        const health = providers[provider] || {};
+        const status = health.status || "unknown";
+        const source = health.source || "local";
+        const pill = document.createElement("span");
+        pill.className = `health-pill ${status}`;
+        pill.title = health.message || `${HEALTH_PROVIDER_LABELS[provider] || provider}: ${status}`;
+        pill.innerHTML = `
+          <strong>${escapeHtml(HEALTH_PROVIDER_LABELS[provider] || provider)}</strong>
+          <span>${escapeHtml(status.replaceAll("_", " "))}</span>
+          <em class="health-source">${escapeHtml(source.replaceAll("_", " "))}</em>
+        `;
+        container.appendChild(pill);
+      });
+    }
+
+    renderProviderHealthError(err) {
+      const container = document.getElementById("providerHealthItems");
+      if (!container) return;
+      container.innerHTML = "";
+      const pill = document.createElement("span");
+      pill.className = "health-pill unavailable";
+      pill.textContent = err?.message || "Provider health unavailable";
+      container.appendChild(pill);
     }
 
     /* ─── Sort persistence ──────────────────── */

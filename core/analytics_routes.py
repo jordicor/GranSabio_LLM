@@ -6,11 +6,12 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import Depends, HTTPException, Request
+from fastapi import Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from deal_breaker_tracker import get_tracker
 from llm_routing import legacy_default_models_view
+from provider_health import get_all_provider_health, refresh_official_provider_health
 from version import BUILD_VERSION_INFO
 
 from .app_state import _ensure_services, active_sessions, app, logger, templates
@@ -44,6 +45,20 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "version": BUILD_VERSION_INFO,
     }
+
+
+@app.get("/api/admin/provider-health")
+async def get_provider_health_status(
+    refresh: bool = Query(default=False, description="Refresh cached official provider status before returning."),
+    _client_ip: str = Depends(require_internal_ip),
+):
+    """Return cached LLM provider health without changing process health semantics."""
+
+    if refresh:
+        payload = await refresh_official_provider_health()
+    else:
+        payload = get_all_provider_health()
+    return JSONResponse(content=payload)
 
 
 @app.get("/models")

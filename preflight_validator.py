@@ -78,6 +78,62 @@ def _build_preflight_failure_result(
     )
 
 
+def _build_preflight_bypass_result() -> PreflightResult:
+    """Approve requests that have no active preflight validation surface."""
+    return PreflightResult(
+        decision="proceed",
+        user_feedback="Request approved",
+        summary="Preflight skipped: no active validation surface",
+        issues=[],
+        word_count_analysis=None,
+        enable_algorithmic_word_count=False,
+        duplicate_word_count_layers_to_remove=[],
+    )
+
+
+def _auto_qa_enabled(request: ContentRequest) -> bool:
+    auto_qa = getattr(request, "auto_qa", None)
+    return bool(auto_qa and getattr(auto_qa, "enabled", False))
+
+
+def _evidence_grounding_enabled(request: ContentRequest) -> bool:
+    evidence_grounding = getattr(request, "evidence_grounding", None)
+    return bool(evidence_grounding and getattr(evidence_grounding, "enabled", False))
+
+
+def _llm_accent_guard_enabled(request: ContentRequest) -> bool:
+    guard = getattr(request, "llm_accent_guard", None)
+    return bool(guard and getattr(guard, "mode", "off") != "off")
+
+
+def _should_bypass_llm_preflight(
+    request: ContentRequest,
+    *,
+    context_documents: Optional[List[Dict[str, Any]]] = None,
+    image_info: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Return True when the LLM preflight would have no active contract to inspect."""
+    return not any(
+        (
+            request.qa_layers,
+            _auto_qa_enabled(request),
+            request.min_words is not None,
+            request.max_words is not None,
+            request.word_count_enforcement is not None,
+            request.phrase_frequency is not None,
+            request.lexical_diversity is not None,
+            _evidence_grounding_enabled(request),
+            _llm_accent_guard_enabled(request),
+            getattr(request, "images", None),
+            image_info,
+            getattr(request, "context_documents", None),
+            context_documents,
+            getattr(request, "source_text", None),
+            getattr(request, "gran_sabio_fallback", False),
+        )
+    )
+
+
 def _normalize_qa_models(qa_models: Any) -> List[str]:
     """Convert QAModelConfig objects to model name strings for JSON serialization.
 
@@ -546,6 +602,22 @@ async def run_preflight_validation(
     Returns:
         PreflightResult with decision (proceed/reject) and validation feedback.
     """
+    if _should_bypass_llm_preflight(
+        request,
+        context_documents=context_documents,
+        image_info=image_info,
+    ):
+        result = _build_preflight_bypass_result()
+        if phase_logger:
+            phase_logger.info(result.summary or "Preflight skipped")
+            phase_logger.log_decision(
+                decision=result.decision.upper(),
+                reason=result.summary or result.user_feedback,
+            )
+        else:
+            logger.info(result.summary)
+        return result
+
     selected_model = resolve_preflight_model(request)
     if not selected_model:
         message = (

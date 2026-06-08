@@ -135,6 +135,18 @@ def _extract_error_fields(payload: Mapping[str, Any]) -> tuple[Optional[str], Op
     )
 
 
+def _status_from_error_marker(value: Optional[str]) -> Optional[int]:
+    """Return an HTTP-like status code embedded in provider error metadata."""
+
+    if not isinstance(value, str):
+        return None
+    marker = value.strip()
+    if not marker.isdigit():
+        return None
+    status = int(marker)
+    return status if 100 <= status <= 599 else None
+
+
 def _normalized_error_markers(*values: Optional[str]) -> set[str]:
     return {
         value.strip().lower()
@@ -282,6 +294,11 @@ def classify_provider_exception(
     status = _get_status(exc)
     payload = _provider_error_payload(exc)
     err_type, err_code, err_param = _extract_error_fields(payload)
+    if status is None:
+        status = (
+            _status_from_error_marker(err_code)
+            or _status_from_error_marker(err_type)
+        )
     request_id = _get_request_id(exc)
     message_lower = str(exc).lower()
     quota_or_billing_kind = _quota_or_billing_kind(

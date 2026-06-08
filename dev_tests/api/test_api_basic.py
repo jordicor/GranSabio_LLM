@@ -368,18 +368,20 @@ class TestGenerateEndpointValidation:
         })
         assert response.status_code == 422
 
-    def test_generate_missing_generator_model_returns_400(self, client):
+    def test_generate_missing_generator_model_uses_routing_default(
+        self, client, mock_preflight_proceed
+    ):
         """
         Given: Request without generator_model
         When: POST /generate is called
-        Then: Returns 400 Bad Request
+        Then: Uses generation.main routing default
         """
         response = client.post("/generate", json={
             "prompt": "Write a comprehensive article about testing",
             "qa_layers": []
         })
-        assert response.status_code == 400
-        assert "generator_model" in response.json()["detail"].lower()
+        assert response.status_code == 200
+        assert response.json()["status"] == "initialized"
 
     def test_generate_invalid_generator_model_returns_400(self, client):
         """
@@ -395,11 +397,13 @@ class TestGenerateEndpointValidation:
         assert response.status_code == 400
         assert "invalid" in response.json()["detail"].lower()
 
-    def test_generate_qa_layers_without_qa_models_returns_400(self, client):
+    def test_generate_qa_layers_without_qa_models_uses_routing_default(
+        self, client, mock_preflight_proceed
+    ):
         """
         Given: QA layers provided without qa_models
         When: POST /generate is called
-        Then: Returns 400 Bad Request
+        Then: Uses qa.evaluate_layer routing defaults
         """
         response = client.post("/generate", json={
             "prompt": "Write a comprehensive article about software testing",
@@ -414,8 +418,8 @@ class TestGenerateEndpointValidation:
                 }
             ]
         })
-        assert response.status_code == 400
-        assert "qa_models" in response.json()["detail"].lower()
+        assert response.status_code == 200
+        assert response.json()["status"] == "initialized"
 
     def test_generate_qa_layers_with_empty_qa_models_returns_400(self, client):
         """
@@ -439,11 +443,13 @@ class TestGenerateEndpointValidation:
         })
         assert response.status_code == 400
 
-    def test_generate_qa_layers_without_gran_sabio_model_returns_400(self, client):
+    def test_generate_qa_layers_without_gran_sabio_model_uses_routing_default(
+        self, client, mock_preflight_proceed
+    ):
         """
         Given: QA layers provided without gran_sabio_model
         When: POST /generate is called
-        Then: Returns 400 Bad Request
+        Then: Uses gransabio.review routing default
         """
         response = client.post("/generate", json={
             "prompt": "Write a comprehensive article about software testing",
@@ -459,8 +465,8 @@ class TestGenerateEndpointValidation:
             ],
             "qa_models": ["gpt-4o"]
         })
-        assert response.status_code == 400
-        assert "gran_sabio_model" in response.json()["detail"].lower()
+        assert response.status_code == 200
+        assert response.json()["status"] == "initialized"
 
     def test_generate_invalid_qa_model_returns_400(self, client):
         """
@@ -614,13 +620,13 @@ class TestGenerateEndpointValidation:
         assert "session_id" in data
         assert data["status"] == "initialized"
 
-    def test_generate_without_qa_still_runs_preflight(
+    def test_generate_without_qa_delegates_preflight_decision(
         self, client, valid_generate_request
     ):
         """
         Given: Valid request without QA layers
         When: POST /generate is called
-        Then: Preflight still runs instead of being bypassed
+        Then: The route still delegates the preflight decision to the validator
         """
         from models import PreflightResult
 
@@ -645,7 +651,7 @@ class TestGenerateEndpointValidation:
         mock_run.assert_awaited_once()
 
     def test_generate_preflight_non_object_json_returns_rejected(
-        self, client, valid_generate_request
+        self, client, valid_generate_request_with_qa
     ):
         """
         Given: Preflight LLM returns valid JSON that is not an object
@@ -662,7 +668,7 @@ class TestGenerateEndpointValidation:
             "generate_content_stream",
             new=invalid_preflight_stream,
         ):
-            response = client.post("/generate", json=valid_generate_request)
+            response = client.post("/generate", json=valid_generate_request_with_qa)
 
         assert response.status_code == 200
         data = response.json()

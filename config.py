@@ -26,6 +26,16 @@ _PROVIDER_NAME_ALIASES = {
     "google": "gemini",
 }
 
+_REASONING_EFFORT_ORDER = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
+
 
 def _strip_model_prefix(model_name: str) -> str:
     """Remove any mechanical provider prefix from a model name."""
@@ -1830,6 +1840,8 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         # Fetch model-specific reasoning / thinking metadata once
         reasoning_config = self._get_reasoning_config(model_info.get("model_id", model_name))
         thinking_details = self._get_thinking_budget_details(model_info.get("model_id", ""))
+        thinking_uses_named_levels = self._thinking_uses_named_levels(thinking_details)
+        adaptive_effort_config = self._reasoning_uses_adaptive_effort(reasoning_config)
 
         if is_reasoning_model:
             if provider == "openai":
@@ -1844,6 +1856,28 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                         adjusted_reasoning_effort = self.normalize_reasoning_effort_label(
                             reasoning_config.get("default") if reasoning_config else None
                         )
+            elif provider == "gemini" and thinking_uses_named_levels:
+                if adjusted_reasoning_effort is None:
+                    if adjusted_thinking_budget is not None:
+                        adjusted_reasoning_effort = self._convert_tokens_to_reasoning_effort(
+                            adjusted_thinking_budget
+                        )
+                    else:
+                        adjusted_reasoning_effort = self.normalize_reasoning_effort_label(
+                            (thinking_details or {}).get("default_level")
+                        )
+                adjusted_thinking_budget = None
+            elif provider in {"claude", "anthropic"} and adaptive_effort_config:
+                if adjusted_reasoning_effort is None:
+                    if adjusted_thinking_budget is not None:
+                        adjusted_reasoning_effort = self._convert_tokens_to_reasoning_effort(
+                            adjusted_thinking_budget
+                        )
+                    else:
+                        adjusted_reasoning_effort = self.normalize_reasoning_effort_label(
+                            reasoning_config.get("default")
+                        )
+                adjusted_thinking_budget = None
             elif provider in {"claude", "anthropic", "gemini"}:
                 if adjusted_thinking_budget is None:
                     if adjusted_reasoning_effort:
@@ -1898,9 +1932,18 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                     adjusted_thinking_budget, thinking_details
                 ) or adjusted_reasoning_effort
 
+        effective_reasoning_config = reasoning_config
+        if provider == "gemini" and thinking_uses_named_levels and thinking_details:
+            effective_reasoning_config = {
+                "supported": True,
+                "levels": thinking_details.get("levels", []),
+                "default": thinking_details.get("default_level"),
+                "parameter_name": thinking_details.get("parameter_name"),
+            }
+
         adjusted_reasoning_effort, reasoning_effort_validation = self._coerce_reasoning_effort_to_supported_level(
             adjusted_reasoning_effort,
-            reasoning_config,
+            effective_reasoning_config,
         )
 
         reasoning_timeout = self._calculate_reasoning_timeout(
@@ -1931,10 +1974,12 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         """Normalize reasoning effort labels and map common aliases."""
         if not effort:
             return None
-        normalized = effort.strip().lower()
+        normalized = effort.strip().lower().replace(" ", "_")
         alias_map = {
             "off": "none",
             "disabled": "none",
+            "disable": "none",
+            "no_reasoning": "none",
             "mid": "medium",
             "med": "medium",
             "hi": "high",
@@ -1942,11 +1987,16 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "minimum": "minimal",
             "min": "minimal",
             "xh": "xhigh",
+            "x-high": "xhigh",
+            "extra high": "xhigh",
             "extra-high": "xhigh",
             "extra_high": "xhigh",
+            "maximum": "max",
+            "maximal": "max",
+            "ultra": "max",
         }
         normalized = alias_map.get(normalized, normalized)
-        if normalized in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+        if normalized in _REASONING_EFFORT_ORDER:
             return normalized
         return None
 
@@ -1987,11 +2037,17 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         if normalized in supported_levels:
             return normalized, validation
 
-        effort_order = ["none", "minimal", "low", "medium", "high", "xhigh"]
-        requested_index = effort_order.index(normalized)
+        order_index = {level: index for index, level in enumerate(_REASONING_EFFORT_ORDER)}
+        if normalized not in order_index:
+            return normalized, validation
+        indexed_supported = [level for level in supported_levels if level in order_index]
+        if not indexed_supported:
+            return normalized, validation
+
+        requested_index = order_index[normalized]
         adjusted = min(
-            supported_levels,
-            key=lambda level: (abs(effort_order.index(level) - requested_index), effort_order.index(level)),
+            indexed_supported,
+            key=lambda level: (abs(order_index[level] - requested_index), order_index[level]),
         )
         validation.update(
             {
@@ -2042,7 +2098,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             tokens = _fraction_to_tokens(0.5)
         elif label == "high":
             tokens = max_tokens
-        elif label == "xhigh":
+        elif label in {"xhigh", "max"}:
             tokens = max_tokens
         else:
             tokens = default_tokens or min_tokens or max_tokens
@@ -2136,6 +2192,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "medium": 3600,   # 60 minutes
             "high": 7200,     # 120 minutes
             "xhigh": 14400,   # 240 minutes
+            "max": 21600,     # 360 minutes
         }
 
         return timeout_map.get(normalized_effort, timeout_map["medium"]) if normalized_effort else None
@@ -2232,15 +2289,10 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
 
     def _get_thinking_budget_config(self, model_name: str) -> Dict[str, Any]:
         """Get thinking budget configuration for a model from model specifications."""
-        aliases = self.model_specs.get("aliases", {})
-        resolved_name = aliases.get(model_name, model_name)
-
-        specs = self.model_specs.get("model_specifications", {})
-
-        for provider, models in specs.items():
-            for model_key, model_data in models.items():
-                if model_key == resolved_name or model_key == model_name:
-                    return model_data.get("thinking_budget", {"supported": False})
+        resolved = resolve_model_catalog_entry(model_name, self.model_specs)
+        model_data = resolved.get("model_data") or {}
+        if model_data:
+            return model_data.get("thinking_budget", {"supported": False})
 
         return {"supported": False}
 
@@ -2249,31 +2301,37 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         if not model_identifier:
             return None
 
-        specs = self.model_specs.get("model_specifications", {})
-        for provider_models in specs.values():
-            for model_key, model_data in provider_models.items():
-                if (
-                    model_data.get("model_id") == model_identifier
-                    or model_key == model_identifier
-                ):
-                    thinking_budget = model_data.get("thinking_budget")
-                    if thinking_budget and thinking_budget.get("supported", False):
-                        return thinking_budget
+        resolved = resolve_model_catalog_entry(model_identifier, self.model_specs)
+        model_data = resolved.get("model_data") or {}
+        thinking_budget = model_data.get("thinking_budget")
+        if thinking_budget and thinking_budget.get("supported", False):
+            return thinking_budget
         return None
 
     def _get_reasoning_config(self, model_name: str) -> Dict[str, Any]:
         """Get reasoning effort configuration for a model from specifications."""
-        aliases = self.model_specs.get("aliases", {})
-        resolved_name = aliases.get(model_name, model_name)
-
-        specs = self.model_specs.get("model_specifications", {})
-
-        for provider, models in specs.items():
-            for model_key, model_data in models.items():
-                if model_key == resolved_name or model_key == model_name:
-                    return model_data.get("reasoning_effort", {"supported": False})
+        resolved = resolve_model_catalog_entry(model_name, self.model_specs)
+        model_data = resolved.get("model_data") or {}
+        if model_data:
+            return model_data.get("reasoning_effort", {"supported": False})
 
         return {"supported": False}
+
+    @staticmethod
+    def _thinking_uses_named_levels(thinking_details: Optional[Dict[str, Any]]) -> bool:
+        """Return True when a thinking config uses provider-native named levels."""
+        if not thinking_details or not thinking_details.get("supported", False):
+            return False
+        parameter_name = str(thinking_details.get("parameter_name") or "").strip().lower()
+        return parameter_name in {"thinking_level", "thinkinglevel"}
+
+    @staticmethod
+    def _reasoning_uses_adaptive_effort(reasoning_config: Optional[Dict[str, Any]]) -> bool:
+        """Return True when a reasoning config maps to Anthropic adaptive effort."""
+        if not reasoning_config or not reasoning_config.get("supported", False):
+            return False
+        parameter_name = str(reasoning_config.get("parameter_name") or "").strip().lower()
+        return parameter_name in {"output_config.effort", "output_config_effort", "effort"}
 
     def get_reasoning_timeout_seconds(
         self,
@@ -2282,28 +2340,19 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         thinking_budget_tokens: Optional[int] = None
     ) -> Optional[int]:
         """Estimate the reasoning timeout for a model using specification metadata."""
-        aliases = self.model_specs.get("aliases", {})
-        resolved_name = aliases.get(model_name, model_name)
+        resolved = resolve_model_catalog_entry(model_name, self.model_specs)
+        model_data = resolved.get("model_data") or {}
+        if model_data:
+            model_info = {
+                "capabilities": model_data.get("capabilities", []),
+                "model_id": model_data.get("model_id", resolved.get("model_key") or model_name),
+            }
 
-        specs = self.model_specs.get("model_specifications", {})
-
-        for provider_models in specs.values():
-            for model_key, model_data in provider_models.items():
-                matches_alias = model_key == resolved_name or model_key == model_name
-                matches_identifier = model_data.get("model_id") == model_name
-                if not (matches_alias or matches_identifier):
-                    continue
-
-                model_info = {
-                    "capabilities": model_data.get("capabilities", []),
-                    "model_id": model_data.get("model_id", model_key),
-                }
-
-                return self._calculate_reasoning_timeout(
-                    model_info,
-                    reasoning_effort,
-                    thinking_budget_tokens,
-                )
+            return self._calculate_reasoning_timeout(
+                model_info,
+                reasoning_effort,
+                thinking_budget_tokens,
+            )
 
         return None
 

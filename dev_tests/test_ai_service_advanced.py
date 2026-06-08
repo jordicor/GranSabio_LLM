@@ -16,12 +16,14 @@ from typing import Any, Dict
 from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
-import json_utils as json
 import pytest
+
+import json_utils as json
 
 # Import the module under test
 from ai_service import AIRequestError, AIService, _ensure_aiohttp_compatibility
 from deterministic_validation import DraftValidationResult
+from provider_errors import ProviderErrorKind
 from tool_loop_models import LoopScope, OutputContract, ToolLoopEnvelope
 
 # ============================================================================
@@ -1099,6 +1101,117 @@ class TestClaudeOpus47And48Compatibility:
         request_kwargs = create.await_args.kwargs
         assert request_kwargs["thinking"] == {"type": "adaptive"}
         assert "temperature" not in request_kwargs
+
+    @pytest.mark.asyncio
+    async def test_generate_claude_uses_output_config_effort_for_opus_48(self, ai_service_instance):
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="ok")],
+                usage=None,
+                stop_reason="end_turn",
+            )
+        )
+        ai_service_instance.anthropic_client = SimpleNamespace(
+            messages=SimpleNamespace(create=create),
+        )
+
+        await ai_service_instance._generate_claude(
+            prompt="Hello",
+            model_id="claude-opus-4-8",
+            temperature=1.0,
+            max_tokens=64,
+            system_prompt="System",
+            reasoning_effort="max",
+        )
+
+        request_kwargs = create.await_args.kwargs
+        assert request_kwargs["output_config"]["effort"] == "max"
+        assert request_kwargs["thinking"] == {"type": "adaptive"}
+
+
+class TestReasoningEffortProviderRetry:
+    """Tests provider-error correction for stale reasoning effort metadata."""
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_retry_coerces_to_provider_supported_level(self, ai_service_instance):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+            usage=None,
+        )
+        create = AsyncMock(
+            side_effect=[
+                Exception("Unsupported value: 'minimal'. Supported values are: 'medium'."),
+                response,
+            ]
+        )
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+        result = await ai_service_instance._call_chat_completions_create_with_reasoning_retry(
+            client,
+            {
+                "model": "gpt-5.1-chat-latest",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "minimal",
+            },
+            provider_key="openai",
+            model_id="gpt-5.1-chat-latest",
+        )
+
+        assert result is response
+        assert create.await_args_list[1].kwargs["reasoning_effort"] == "medium"
+
+    @pytest.mark.asyncio
+    async def test_responses_retry_coerces_max_to_xhigh(self, ai_service_instance):
+        response = SimpleNamespace(output_text="ok", usage=None)
+        create = AsyncMock(
+            side_effect=[
+                Exception("reasoning.effort: Input should be 'low', 'medium', 'high' or 'xhigh'"),
+                response,
+            ]
+        )
+        ai_service_instance.openai_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create)
+        )
+
+        result = await ai_service_instance._call_responses_create_with_reasoning_retry(
+            {
+                "model": "some-responses-model",
+                "input": "hi",
+                "reasoning": {"effort": "max"},
+            },
+            model_id="some-responses-model",
+        )
+
+        assert result is response
+        assert create.await_args_list[1].kwargs["reasoning"]["effort"] == "xhigh"
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_retry_removes_effort_when_supported_values_absent(self, ai_service_instance):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+            usage=None,
+        )
+        create = AsyncMock(
+            side_effect=[
+                Exception("reasoning_effort is not supported by this model"),
+                response,
+            ]
+        )
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+        result = await ai_service_instance._call_chat_completions_create_with_reasoning_retry(
+            client,
+            {
+                "model": "legacy",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "low",
+            },
+            provider_key="openai",
+            model_id="legacy",
+        )
+
+        assert result is response
+        assert "reasoning_effort" not in create.await_args_list[1].kwargs
 
 
 class TestClaudeStructuredOutputsParams:
@@ -2370,6 +2483,44 @@ class TestExecuteWithRetries:
             action="test"
         )
         assert result == "success"
+
+    @pytest.mark.asyncio
+    async def test_records_provider_health_on_success(self, ai_service_instance, mock_config):
+        mock_config.MAX_RETRIES = 3
+
+        async def successful_operation():
+            return "success"
+
+        with patch("ai_service.record_provider_success", new_callable=AsyncMock) as record_success:
+            result = await ai_service_instance._execute_with_retries(
+                successful_operation,
+                provider="openai",
+                model_id="gpt-4o",
+                action="test",
+            )
+
+        assert result == "success"
+        record_success.assert_awaited_once_with("openai", model="gpt-4o", operation="test")
+
+    @pytest.mark.asyncio
+    async def test_records_provider_health_on_wrapped_failure(self, ai_service_instance):
+        ai_service_instance._max_retry_attempts = lambda: 1
+
+        async def failing_operation():
+            raise ConnectionError("Provider unavailable")
+
+        with patch("ai_service.record_provider_failure", new_callable=AsyncMock) as record_failure:
+            with pytest.raises(AIRequestError):
+                await ai_service_instance._execute_with_retries(
+                    failing_operation,
+                    provider="openai",
+                    model_id="gpt-4o",
+                    action="test",
+                )
+
+        record_failure.assert_awaited_once()
+        failure = record_failure.await_args.args[0]
+        assert failure.kind == ProviderErrorKind.TRANSIENT_NETWORK
 
     @pytest.mark.asyncio
     async def test_retries_on_transient_error(self, ai_service_instance, mock_config):

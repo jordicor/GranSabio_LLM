@@ -15,6 +15,7 @@ import hashlib
 import inspect
 import logging
 import random
+import re
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal,
 from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
+import httpx
 
 if TYPE_CHECKING:
     from core.cancellation import CancellationToken
@@ -44,14 +46,16 @@ from ai_runtime import usage as runtime_usage
 from ai_runtime import vision as runtime_vision
 from config import config, get_model_parameter_requirements
 from deterministic_validation import DraftValidationResult
-from llm_routing import resolve_call, resolve_temperature
 from llm_accent_prompts import (
     build_accent_criteria_block,
     build_inline_accent_prompt,
 )
+from llm_routing import resolve_call, resolve_temperature
 from model_aliasing import PromptPart, PromptSource, assert_prompt_is_model_blind
 from model_capability_registry import (
     model_supports as registry_model_supports,
+)
+from model_capability_registry import (
     model_supports_generation_validation_tool_loop,
     normalize_provider,
 )
@@ -64,6 +68,7 @@ from provider_adapters import (
 )
 from provider_capabilities import CapabilitySupport
 from provider_errors import ProviderErrorKind, ProviderFailure, classify_provider_exception
+from provider_health import record_provider_failure, record_provider_success
 from schema_utils import json_schema_to_pydantic
 from tool_loop_models import (
     JsonContractError,
@@ -80,6 +85,9 @@ from tool_loop_models import (
 from tools.string_utils import escape_xml_delimiters, remove_invisible_control
 
 logger = logging.getLogger(__name__)
+SDK_HTTP_KEEPALIVE_EXPIRY_SECONDS = 20.0
+SDK_HTTP_MAX_CONNECTIONS = 1000
+SDK_HTTP_MAX_KEEPALIVE_CONNECTIONS = 100
 _ollama_concurrency_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
     "ollama_concurrency_depth",
     default=0,
@@ -102,6 +110,34 @@ def _ensure_aiohttp_compatibility() -> None:
 
 
 _ensure_aiohttp_compatibility()
+
+
+def _sdk_http_limits() -> httpx.Limits:
+    """Return SDK HTTPX pool limits with a longer idle keep-alive window."""
+
+    return httpx.Limits(
+        max_connections=SDK_HTTP_MAX_CONNECTIONS,
+        max_keepalive_connections=SDK_HTTP_MAX_KEEPALIVE_CONNECTIONS,
+        keepalive_expiry=SDK_HTTP_KEEPALIVE_EXPIRY_SECONDS,
+    )
+
+
+def _openai_async_http_client() -> httpx.AsyncClient:
+    """Build an OpenAI-compatible async HTTP client with shared pool settings."""
+
+    return openai.DefaultAsyncHttpxClient(limits=_sdk_http_limits())
+
+
+def _openai_sync_http_client() -> httpx.Client:
+    """Build an OpenAI-compatible sync HTTP client with shared pool settings."""
+
+    return openai.DefaultHttpxClient(limits=_sdk_http_limits())
+
+
+def _anthropic_async_http_client() -> httpx.AsyncClient:
+    """Build an Anthropic async HTTP client with shared pool settings."""
+
+    return anthropic.DefaultAsyncHttpxClient(limits=_sdk_http_limits())
 
 
 def _truncate_to_bytes(text: str, limit: int) -> str:
@@ -298,6 +334,84 @@ _shared_ai_service: Optional["AIService"] = None
 _ai_service_init_lock = threading.Lock()
 
 
+def _coerce_positive_int(value: Any) -> Optional[int]:
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return None
+    if coerced <= 0:
+        return None
+    return coerced
+
+
+def _resolve_model_context_window(model_info: Optional[Dict[str, Any]]) -> Optional[int]:
+    if not model_info:
+        return None
+    return (
+        _coerce_positive_int(model_info.get("input_tokens"))
+        or _coerce_positive_int(model_info.get("context_window"))
+    )
+
+
+def estimate_prompt_context_budget(
+    model_id: str,
+    prompt_chars: int,
+    max_tokens: int,
+    thinking_budget: int = 0,
+    *,
+    model_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return a cheap, structured context-budget estimate for a tool-loop prompt."""
+
+    estimated_input_tokens = int(prompt_chars) // 4
+    max_tokens_int = _coerce_positive_int(max_tokens) or 0
+    thinking_budget_int = _coerce_positive_int(thinking_budget) or 0
+    overhead = 512  # system-prompt fragments + tool definitions safety margin
+
+    context_window = _resolve_model_context_window(model_info)
+    context_window_source = "model_info" if context_window is not None else None
+    resolution_error: Optional[str] = None
+
+    if context_window is None:
+        try:
+            resolved_model_info = config.get_model_info(model_id)
+        except RuntimeError as exc:
+            resolution_error = str(exc)
+        except Exception as exc:
+            resolution_error = type(exc).__name__
+        else:
+            context_window = _resolve_model_context_window(resolved_model_info)
+            if context_window is not None:
+                context_window_source = "config.get_model_info"
+
+    available_input_tokens: Optional[int] = None
+    overflow_reason: Optional[str] = None
+    overflow_kind: Optional[str] = None
+
+    if context_window is not None:
+        available_input_tokens = (
+            context_window - max_tokens_int - thinking_budget_int - overhead
+        )
+        if estimated_input_tokens > available_input_tokens:
+            overflow_reason = "context_too_large"
+            overflow_kind = "model_context_overflow"
+
+    return {
+        "model_id": model_id,
+        "prompt_chars": int(prompt_chars),
+        "estimated_input_tokens": estimated_input_tokens,
+        "context_window": context_window,
+        "context_window_source": context_window_source,
+        "max_tokens": max_tokens_int,
+        "thinking_budget": thinking_budget_int,
+        "overhead_tokens": overhead,
+        "available_input_tokens": available_input_tokens,
+        "overflow_reason": overflow_reason,
+        "context_overflow_kind": overflow_kind,
+        "context_resolution_error": resolution_error,
+    }
+
+
 def estimate_prompt_overflow(
     model_id: str,
     prompt_chars: int,
@@ -316,23 +430,12 @@ def estimate_prompt_overflow(
     a false positive is better than a wasted round-trip on a request that
     the provider would reject anyway.
     """
-    try:
-        model_info = config.get_model_info(model_id)
-    except RuntimeError:
-        return None
-    except Exception:
-        return None
-
-    context_window = model_info.get("input_tokens") or model_info.get("context_window")
-    if not context_window:
-        return None
-
-    estimated_input_tokens = prompt_chars // 4
-    overhead = 512  # system-prompt fragments + tool definitions safety margin
-    available = int(context_window) - int(max_tokens) - int(thinking_budget or 0) - overhead
-    if estimated_input_tokens > available:
-        return "context_too_large"
-    return None
+    return estimate_prompt_context_budget(
+        model_id=model_id,
+        prompt_chars=prompt_chars,
+        max_tokens=max_tokens,
+        thinking_budget=thinking_budget,
+    )["overflow_reason"]
 
 
 def get_ai_service() -> "AIService":
@@ -424,13 +527,15 @@ class AIService:
             self.openai_client = openai.AsyncOpenAI(
                 api_key=config.OPENAI_API_KEY,
                 timeout=180.0,  # Increased timeout for better stability
-                max_retries=3  # Retry failed requests twice
+                max_retries=3,  # Retry failed requests twice
+                http_client=_openai_async_http_client(),
             )
             # Initialize sync OpenAI client for O3-pro (Responses API requirement)
             self.openai_sync_client = openai.OpenAI(
                 api_key=config.OPENAI_API_KEY,
                 timeout=180.0,  # Increased timeout for better stability
-                max_retries=3
+                max_retries=3,
+                http_client=_openai_sync_http_client(),
             )
         else:
             logger.warning("OpenAI API key not found")
@@ -446,7 +551,8 @@ class AIService:
                 api_key=config.ANTHROPIC_API_KEY,
                 timeout=180.0,    # Increased timeout for better stability
                 max_retries=3,   # Retry failed requests twice
-                default_headers=default_headers
+                default_headers=default_headers,
+                http_client=_anthropic_async_http_client(),
             )
             logger.info("Anthropic client initialized with updated SDK and beta headers for thinking mode")
         else:
@@ -471,7 +577,8 @@ class AIService:
                 api_key=config.XAI_API_KEY,
                 base_url="https://api.x.ai/v1",
                 timeout=130.0,  # Increased timeout for better stability
-                max_retries=3
+                max_retries=3,
+                http_client=_openai_async_http_client(),
             )
         else:
             logger.warning("xAI API key not found")
@@ -486,7 +593,8 @@ class AIService:
                 default_headers={
                     "HTTP-Referer": "https://gransabio-llm.local",
                     "X-Title": "Gran Sabio LLM Engine"
-                }
+                },
+                http_client=_openai_async_http_client(),
             )
             logger.info("OpenRouter client initialized for unified model access")
         else:
@@ -499,7 +607,8 @@ class AIService:
                 api_key="ollama",  # Dummy key, Ollama doesn't require authentication
                 base_url=ollama_base_url,
                 timeout=300.0,  # Longer timeout for local models (can be slow)
-                max_retries=2
+                max_retries=2,
+                http_client=_openai_async_http_client(),
             )
             logger.info(f"Ollama client initialized at {ollama_base_url}")
         else:
@@ -516,7 +625,8 @@ class AIService:
                 api_key="fake",  # Dummy key, Fake AI doesn't require authentication
                 base_url=fake_base_url,
                 timeout=30.0,
-                max_retries=1
+                max_retries=1,
+                http_client=_openai_async_http_client(),
             )
             logger.info(f"Fake AI client initialized at {fake_base_url}")
         else:
@@ -889,6 +999,22 @@ class AIService:
         )
 
     @staticmethod
+    async def _record_provider_health_success(provider: str, model_id: str, operation: str) -> None:
+        try:
+            await record_provider_success(provider, model=model_id, operation=operation)
+        except Exception:
+            logger.exception("Provider health success recording failed for %s/%s", provider, model_id)
+
+    @staticmethod
+    async def _record_provider_health_failure(failure: ProviderFailure | None) -> None:
+        if failure is None:
+            return
+        try:
+            await record_provider_failure(failure)
+        except Exception:
+            logger.exception("Provider health failure recording failed for %s/%s", failure.provider, failure.model_id)
+
+    @staticmethod
     def _attempted_output_feature(
         provider: str,
         model_id: str,
@@ -983,10 +1109,13 @@ class AIService:
         for attempt in range(1, max_attempts + 1):
             try:
                 await self._raise_if_cancelled(cancellation_token)
-                return await operation()
+                result = await operation()
+                await self._record_provider_health_success(provider, model_id, action)
+                return result
             except asyncio.CancelledError:
                 raise
-            except AIRequestError:
+            except AIRequestError as exc:
+                await self._record_provider_health_failure(getattr(exc, "provider_failure", None))
                 raise
             except AccentGuardError:
                 raise
@@ -1006,6 +1135,7 @@ class AIService:
                     max_attempts=max_attempts,
                     attempted_feature=attempted_feature,
                 )
+                await self._record_provider_health_failure(failure)
                 should_retry = attempt < max_attempts and failure.retryable
 
                 if not should_retry:
@@ -1049,6 +1179,7 @@ class AIService:
             max_attempts=max_attempts,
             attempted_feature=attempted_feature,
         )
+        await self._record_provider_health_failure(failure)
         raise AIRequestError(
             provider,
             model_id,
@@ -1072,10 +1203,13 @@ class AIService:
 
         try:
             await self._raise_if_cancelled(cancellation_token)
-            return await operation()
+            result = await operation()
+            await self._record_provider_health_success(provider, model_id, action)
+            return result
         except asyncio.CancelledError:
             raise
-        except AIRequestError:
+        except AIRequestError as exc:
+            await self._record_provider_health_failure(getattr(exc, "provider_failure", None))
             raise
         except AccentGuardError:
             raise
@@ -1093,6 +1227,7 @@ class AIService:
                 max_attempts=1,
                 attempted_feature=attempted_feature,
             )
+            await self._record_provider_health_failure(failure)
             if not failure.retryable:
                 if not self._should_wrap_provider_failure(failure):
                     raise
@@ -1499,6 +1634,7 @@ class AIService:
                     adjusted_max_tokens,
                     system_prompt or "",
                     thinking_budget_tokens,
+                    reasoning_effort=reasoning_effort,
                     request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
@@ -1533,6 +1669,7 @@ class AIService:
                     temperature,
                     adjusted_max_tokens,
                     system_prompt or "",
+                    reasoning_effort=reasoning_effort,
                     thinking_budget_tokens=thinking_budget_tokens,
                     json_output=json_output,
                     json_schema=effective_json_schema,
@@ -1567,6 +1704,7 @@ class AIService:
                     temperature,
                     adjusted_max_tokens,
                     system_prompt or "",
+                    reasoning_effort=reasoning_effort,
                     request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
@@ -1957,7 +2095,7 @@ class AIService:
             None,
         )
         if regular_create and self._callable_has_keyword(regular_create, "output_config"):
-            request_params["output_config"] = {"format": output_format}
+            request_params.setdefault("output_config", {})["format"] = output_format
             return False
 
         request_params["output_format"] = output_format
@@ -2271,6 +2409,267 @@ class AIService:
                     return True
         return False
 
+    @staticmethod
+    def _provider_error_text(exc: BaseException) -> str:
+        """Return provider error text plus structured body fields when available."""
+        parts = [str(exc or "")]
+        for attr in ("body", "response", "error"):
+            value = getattr(exc, attr, None)
+            if value is None:
+                continue
+            try:
+                if hasattr(value, "json"):
+                    value = value.json()
+                parts.append(json.dumps(value, ensure_ascii=True, sort_keys=True))
+            except Exception:
+                parts.append(str(value))
+        return "\n".join(part for part in parts if part)
+
+    @staticmethod
+    def _is_reasoning_effort_provider_error(exc: BaseException) -> bool:
+        """Return True when a provider error appears to reject a reasoning effort param."""
+        text = AIService._provider_error_text(exc).lower()
+        if not text:
+            return False
+        parameter_markers = (
+            "reasoning_effort",
+            "reasoning.effort",
+            "reasoning effort",
+            "output_config.effort",
+            "thinking_level",
+            "thinkinglevel",
+        )
+        error_markers = (
+            "unsupported",
+            "not supported",
+            "supported values",
+            "input should be",
+            "invalid_reasoning_effort",
+            "invalid value",
+        )
+        return any(marker in text for marker in parameter_markers) and any(
+            marker in text for marker in error_markers
+        )
+
+    @staticmethod
+    def _extract_supported_reasoning_efforts_from_error(exc: BaseException) -> List[str]:
+        """Extract supported reasoning levels from provider validation text."""
+        text = AIService._provider_error_text(exc).lower()
+        if not text:
+            return []
+
+        tail = text
+        for marker in (
+            "supported values are",
+            "supported values",
+            "supported:",
+            "input should be",
+            "must be one of",
+            "valid values are",
+        ):
+            marker_index = text.rfind(marker)
+            if marker_index >= 0:
+                tail = text[marker_index:]
+                break
+
+        matches = re.findall(
+            r"(?<![a-z0-9_-])(none|minimal|low|medium|high|xhigh|max)(?![a-z0-9_-])",
+            tail,
+        )
+        supported: List[str] = []
+        seen: Set[str] = set()
+        for match in matches:
+            normalized = config.normalize_reasoning_effort_label(match)
+            if normalized and normalized not in seen:
+                supported.append(normalized)
+                seen.add(normalized)
+        return supported
+
+    @staticmethod
+    def _model_reasoning_effort_config(model_id: str) -> Dict[str, Any]:
+        """Return catalog reasoning-effort metadata without requiring API keys."""
+        try:
+            return config._get_reasoning_config(model_id)
+        except Exception:
+            return {"supported": False}
+
+    @classmethod
+    def _model_supports_reasoning_effort(cls, model_id: str) -> bool:
+        """Return True when catalog metadata says a model accepts named effort."""
+        reasoning_config = cls._model_reasoning_effort_config(model_id)
+        return bool(reasoning_config.get("supported"))
+
+    @staticmethod
+    def _coerce_retry_reasoning_effort(
+        current_effort: Optional[str],
+        supported_levels: List[str],
+    ) -> Optional[str]:
+        """Choose a retry-safe effort level from provider-reported supported values."""
+        if not current_effort or not supported_levels:
+            return None
+        adjusted, _validation = config._coerce_reasoning_effort_to_supported_level(
+            current_effort,
+            {"supported": True, "levels": supported_levels},
+        )
+        return adjusted
+
+    def _adjust_reasoning_params_for_provider_retry(
+        self,
+        params: Dict[str, Any],
+        exc: BaseException,
+        *,
+        surface: Literal["chat_completions", "responses", "claude_messages"],
+    ) -> Optional[Tuple[Dict[str, Any], str]]:
+        """Return adjusted params for one provider retry, or None if not applicable."""
+        supported_levels = self._extract_supported_reasoning_efforts_from_error(exc)
+        retry_params = copy.deepcopy(params)
+        current_effort: Optional[str] = None
+
+        if surface == "chat_completions":
+            current_effort = retry_params.get("reasoning_effort")
+            parameter_path = "reasoning_effort"
+        elif surface == "responses":
+            reasoning_payload = retry_params.get("reasoning")
+            if isinstance(reasoning_payload, dict):
+                current_effort = reasoning_payload.get("effort")
+            parameter_path = "reasoning.effort"
+        else:
+            output_config = retry_params.get("output_config")
+            if isinstance(output_config, dict):
+                current_effort = output_config.get("effort")
+            parameter_path = "output_config.effort"
+
+        if not current_effort:
+            return None
+
+        if not self._is_reasoning_effort_provider_error(exc):
+            text = self._provider_error_text(exc).lower()
+            generic_value_rejection = any(
+                marker in text
+                for marker in (
+                    "unsupported",
+                    "not supported",
+                    "supported values",
+                    "input should be",
+                    "invalid value",
+                )
+            )
+            if not generic_value_rejection:
+                return None
+
+        adjusted_effort = self._coerce_retry_reasoning_effort(current_effort, supported_levels)
+        if adjusted_effort and adjusted_effort != current_effort:
+            if surface == "chat_completions":
+                retry_params["reasoning_effort"] = adjusted_effort
+            elif surface == "responses":
+                retry_params.setdefault("reasoning", {})["effort"] = adjusted_effort
+            else:
+                retry_params.setdefault("output_config", {})["effort"] = adjusted_effort
+            return retry_params, f"{parameter_path}: {current_effort} -> {adjusted_effort}"
+
+        if surface == "chat_completions":
+            retry_params.pop("reasoning_effort", None)
+        elif surface == "responses":
+            reasoning_payload = retry_params.get("reasoning")
+            if isinstance(reasoning_payload, dict):
+                reasoning_payload.pop("effort", None)
+                if not reasoning_payload:
+                    retry_params.pop("reasoning", None)
+        else:
+            output_config = retry_params.get("output_config")
+            if isinstance(output_config, dict):
+                output_config.pop("effort", None)
+                if not output_config:
+                    retry_params.pop("output_config", None)
+        return retry_params, f"removed unsupported {parameter_path}={current_effort}"
+
+    async def _call_chat_completions_create_with_reasoning_retry(
+        self,
+        client: Any,
+        params: Dict[str, Any],
+        request_kwargs: Optional[Dict[str, Any]] = None,
+        *,
+        provider_key: str,
+        model_id: str,
+    ) -> Any:
+        """Call Chat Completions and retry once if provider rejects effort level."""
+        request_kwargs = request_kwargs or {}
+        try:
+            return await client.chat.completions.create(**params, **request_kwargs)
+        except Exception as exc:
+            retry = self._adjust_reasoning_params_for_provider_retry(
+                params,
+                exc,
+                surface="chat_completions",
+            )
+            if retry is None:
+                raise
+            retry_params, reason = retry
+            logger.warning(
+                "Retrying %s Chat Completions for %s after reasoning effort rejection (%s)",
+                provider_key,
+                model_id,
+                reason,
+            )
+            return await client.chat.completions.create(**retry_params, **request_kwargs)
+
+    async def _call_responses_create_with_reasoning_retry(
+        self,
+        params: Dict[str, Any],
+        request_kwargs: Optional[Dict[str, Any]] = None,
+        *,
+        model_id: str,
+    ) -> Any:
+        """Call OpenAI Responses and retry once if provider rejects effort level."""
+        if not self.openai_client:
+            raise ValueError("OpenAI client not initialized")
+        request_kwargs = request_kwargs or {}
+        try:
+            return await self.openai_client.responses.create(**params, **request_kwargs)
+        except Exception as exc:
+            retry = self._adjust_reasoning_params_for_provider_retry(
+                params,
+                exc,
+                surface="responses",
+            )
+            if retry is None:
+                raise
+            retry_params, reason = retry
+            logger.warning(
+                "Retrying OpenAI Responses for %s after reasoning effort rejection (%s)",
+                model_id,
+                reason,
+            )
+            return await self.openai_client.responses.create(**retry_params, **request_kwargs)
+
+    async def _call_claude_messages_create_with_reasoning_retry(
+        self,
+        create: Callable[..., Awaitable[Any]],
+        params: Dict[str, Any],
+        request_kwargs: Optional[Dict[str, Any]] = None,
+        *,
+        model_id: str,
+    ) -> Any:
+        """Call Claude Messages and retry once if provider rejects effort level."""
+        request_kwargs = request_kwargs or {}
+        try:
+            return await create(**params, **request_kwargs)
+        except Exception as exc:
+            retry = self._adjust_reasoning_params_for_provider_retry(
+                params,
+                exc,
+                surface="claude_messages",
+            )
+            if retry is None:
+                raise
+            retry_params, reason = retry
+            logger.warning(
+                "Retrying Claude Messages for %s after effort rejection (%s)",
+                model_id,
+                reason,
+            )
+            return await create(**retry_params, **request_kwargs)
+
     async def audit_accent(
         self,
         text: str,
@@ -2525,6 +2924,12 @@ class AIService:
             }
             if provider_key != "openrouter" or self._openrouter_accepts_temperature(model_id):
                 create_params["temperature"] = temperature
+            if (
+                provider_key == "xai"
+                and reasoning_effort
+                and self._model_supports_reasoning_effort(model_id)
+            ):
+                create_params["reasoning_effort"] = reasoning_effort
 
         native_json_schema = bool(json_schema) and self._supports_structured_outputs(provider_key, model_id)
         native_json_object = self._supports_json_object(provider_key, model_id)
@@ -2999,7 +3404,13 @@ class AIService:
             },
         )
 
-        stream = await client.chat.completions.create(**params, **request_kwargs)
+        stream = await self._call_chat_completions_create_with_reasoning_retry(
+            client,
+            params,
+            request_kwargs,
+            provider_key=provider_key,
+            model_id=model_id,
+        )
         if not hasattr(stream, "__aiter__"):
             if provider_key == "openrouter":
                 await self._emit_tool_event_safe(
@@ -3291,7 +3702,11 @@ class AIService:
         )
 
         await self._raise_if_cancelled(cancellation_token)
-        response = await self.openai_client.responses.create(**params, **request_kwargs)
+        response = await self._call_responses_create_with_reasoning_retry(
+            params,
+            request_kwargs,
+            model_id=model_id,
+        )
         await self._raise_if_cancelled(cancellation_token)
 
         usage_meta = getattr(response, "usage", None)
@@ -3405,7 +3820,11 @@ class AIService:
             },
         )
 
-        stream = await self.openai_client.responses.create(**params, **request_kwargs)
+        stream = await self._call_responses_create_with_reasoning_retry(
+            params,
+            request_kwargs,
+            model_id=model_id,
+        )
         assistant_parts: List[str] = []
         tool_accumulators: Dict[int, Dict[str, Any]] = {}
         usage_meta = None
@@ -3997,9 +4416,12 @@ class AIService:
                             cancellation_token=cancellation_token,
                         )
                     else:
-                        response = await client.chat.completions.create(
-                            **create_params,
-                            **request_kwargs,
+                        response = await self._call_chat_completions_create_with_reasoning_retry(
+                            client,
+                            create_params,
+                            request_kwargs,
+                            provider_key=provider_key,
+                            model_id=model_id,
                         )
                         usage_meta = getattr(response, "usage", None)
                         message = response.choices[0].message
@@ -4167,9 +4589,12 @@ class AIService:
                             cancellation_token=cancellation_token,
                         )
                     else:
-                        response = await client.chat.completions.create(
-                            **create_params,
-                            **request_kwargs,
+                        response = await self._call_chat_completions_create_with_reasoning_retry(
+                            client,
+                            create_params,
+                            request_kwargs,
+                            provider_key=provider_key,
+                            model_id=model_id,
                         )
                         usage_meta = getattr(response, "usage", None)
                         message = response.choices[0].message
@@ -4701,7 +5126,12 @@ class AIService:
                 if use_beta_structured_outputs
                 else self.anthropic_client.messages.create
             )
-            stream_context = await create(**params, **request_kwargs)
+            stream_context = await self._call_claude_messages_create_with_reasoning_retry(
+                create,
+                params,
+                request_kwargs,
+                model_id=model_id,
+            )
         else:
             stream_context = self.anthropic_client.messages.stream(
                 **params,
@@ -5075,6 +5505,7 @@ class AIService:
         accent_context: Optional[Dict[str, Any]] = None,
         enable_validate_draft: bool = True,
         *,
+        reasoning_effort: Optional[str] = None,
         stop_on_approval: bool = True,
         output_contract: OutputContract = OutputContract.FREE_TEXT,
         payload_scope: PayloadScope = PayloadScope.GENERATOR,
@@ -5143,7 +5574,12 @@ class AIService:
             if effective_system:
                 create_params["system"] = effective_system
 
-            self._inject_claude_thinking_params(create_params, model_id, thinking_budget_tokens)
+            self._inject_claude_thinking_params(
+                create_params,
+                model_id,
+                thinking_budget_tokens,
+                reasoning_effort=reasoning_effort,
+            )
 
             use_beta_structured_outputs = False
             if use_structured_outputs:
@@ -5854,6 +6290,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: str,
+        reasoning_effort: Optional[str],
         thinking_budget_tokens: Optional[int],
         json_output: bool,
         json_schema: Optional[Dict[str, Any]],
@@ -5897,7 +6334,11 @@ class AIService:
         initial_parts.append({"text": prompt})
         contents: List[Any] = [{"role": "user", "parts": initial_parts}]
 
-        thinking_budget = thinking_budget_tokens or self._get_thinking_budget_for_model(model_id)
+        thinking_config_kwargs = self._build_gemini_thinking_config_kwargs(
+            model_id,
+            reasoning_effort=reasoning_effort,
+            thinking_budget_tokens=thinking_budget_tokens,
+        )
 
         def _build_function_declarations(
             include_validate_draft: bool,
@@ -5953,8 +6394,8 @@ class AIService:
 
             if effective_system:
                 config_params["system_instruction"] = effective_system
-            if thinking_budget and thinking_budget > 0:
-                config_params["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+            if thinking_config_kwargs:
+                config_params["thinking_config"] = types.ThinkingConfig(**thinking_config_kwargs)
             return types.GenerateContentConfig(**config_params)
 
         extra_payload = {"requested_model": model_id}
@@ -6886,16 +7327,44 @@ class AIService:
 
         # ----- Context-budget fail-fast (§3.2.5) -----------------------------
         prompt_chars = len(effective_system_prompt or "") + len(prompt or "")
-        overflow_reason = estimate_prompt_overflow(
+        context_budget = estimate_prompt_context_budget(
             model_id=model_id,
             prompt_chars=prompt_chars,
             max_tokens=adjusted_max_tokens,
             thinking_budget=adjusted_thinking_budget or 0,
+            model_info=model_info,
         )
+        overflow_reason = context_budget["overflow_reason"]
         hard_cap = getattr(config, "TOOL_LOOP_MAX_PROMPT_CHARS", 200000)
-        if overflow_reason is None and prompt_chars > hard_cap:
+        if (
+            overflow_reason is None
+            and context_budget.get("context_window") is None
+            and prompt_chars > hard_cap
+        ):
             overflow_reason = "context_too_large"
+            context_budget["overflow_reason"] = overflow_reason
+            context_budget["context_overflow_kind"] = "unknown_model_hard_cap_overflow"
+            context_budget["hard_cap_chars"] = int(hard_cap)
         if overflow_reason == "context_too_large":
+            logger.warning(
+                "Tool-loop prompt overflow for %s: kind=%s prompt_chars=%s "
+                "estimated_input_tokens=%s context_window=%s max_tokens=%s "
+                "thinking_budget=%s available_input_tokens=%s hard_cap_chars=%s",
+                model,
+                context_budget.get("context_overflow_kind"),
+                context_budget.get("prompt_chars"),
+                context_budget.get("estimated_input_tokens"),
+                context_budget.get("context_window"),
+                context_budget.get("max_tokens"),
+                context_budget.get("thinking_budget"),
+                context_budget.get("available_input_tokens"),
+                context_budget.get("hard_cap_chars"),
+            )
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_loop_context_overflow",
+                context_budget,
+            )
             envelope = ToolLoopEnvelope(
                 loop_scope=loop_scope,
                 tools_skipped_reason="context_too_large",
@@ -6903,6 +7372,8 @@ class AIService:
                 accepted=False,
                 accepted_via="tools_skipped",
                 context_size_estimate=prompt_chars,
+                context_overflow_kind=context_budget.get("context_overflow_kind"),
+                context_overflow_details=context_budget,
             )
             return "", envelope
 
@@ -7019,6 +7490,7 @@ class AIService:
                     system_prompt=effective_system_prompt,
                     request_timeout=request_timeout,
                     thinking_budget_tokens=thinking_budget_tokens,
+                    reasoning_effort=reasoning_effort,
                     json_output=json_output_flag,
                     json_schema=effective_json_schema,
                     usage_callback=usage_callback,
@@ -7039,6 +7511,7 @@ class AIService:
                         temperature=temperature,
                         max_tokens=adjusted_max_tokens,
                         system_prompt=effective_system_prompt,
+                        reasoning_effort=reasoning_effort,
                         thinking_budget_tokens=thinking_budget_tokens,
                         json_output=json_output_flag,
                         json_schema=effective_json_schema,
@@ -7099,13 +7572,34 @@ class AIService:
         except Exception as e:
             if cancellation_token and await cancellation_token.any_cancelled():
                 raise asyncio.CancelledError() from e
-            logger.error(
-                "Tool-loop generation failed for %s via %s: %s",
-                model,
-                provider_key,
-                e,
-                exc_info=True,
+            provider_failure = (
+                getattr(e, "provider_failure", None)
+                if isinstance(e, AIRequestError)
+                else None
             )
+            if isinstance(provider_failure, ProviderFailure):
+                logger.error(
+                    "Tool-loop provider failure for %s via %s: "
+                    "kind=%s status_code=%s provider_code=%s retryable=%s "
+                    "attempts=%s/%s: %s",
+                    model,
+                    provider_key,
+                    provider_failure.kind.value,
+                    provider_failure.status_code,
+                    provider_failure.provider_error_code,
+                    provider_failure.retryable,
+                    provider_failure.attempt,
+                    provider_failure.max_attempts,
+                    provider_failure.message,
+                )
+            else:
+                logger.error(
+                    "Tool-loop generation failed for %s via %s: %s",
+                    model,
+                    provider_key,
+                    e,
+                    exc_info=True,
+                )
             await self._emit_tool_event_safe(
                 tool_event_callback,
                 "tool_loop_error",
@@ -7394,9 +7888,10 @@ class AIService:
             if extra_verbose:
                 logger.info(f"[EXTRA_VERBOSE] O3-pro responses parameters: {create_params}")
 
-            response = await self.openai_client.responses.create(
-                **create_params,
-                **request_kwargs,
+            response = await self._call_responses_create_with_reasoning_retry(
+                create_params,
+                request_kwargs,
+                model_id=model_id,
             )
 
             # Robust text extraction: 1) output_text; 2) assemble from 'output'
@@ -7476,9 +7971,10 @@ class AIService:
             if extra_verbose:
                 logger.info(f"[EXTRA_VERBOSE] GPT-5 Pro responses parameters: {create_params}")
 
-            response = await self.openai_client.responses.create(
-                **create_params,
-                **request_kwargs,
+            response = await self._call_responses_create_with_reasoning_retry(
+                create_params,
+                request_kwargs,
+                model_id=model_id,
             )
 
             # Robust text extraction (same as o3-pro)
@@ -7540,9 +8036,12 @@ class AIService:
                 logger.info(f"[EXTRA_VERBOSE] GPT-5 non-streaming parameters: {create_params}")
 
             try:
-                response = await self.openai_client.chat.completions.create(
-                    **create_params,
-                    **request_kwargs,
+                response = await self._call_chat_completions_create_with_reasoning_retry(
+                    self.openai_client,
+                    create_params,
+                    request_kwargs,
+                    provider_key="openai",
+                    model_id=model_id,
                 )
             except Exception as e:
                 error_msg = f"GPT-5 model '{model_id}' failed: {str(e)}"
@@ -7586,9 +8085,12 @@ class AIService:
                     standard_params["response_format"] = {"type": "json_object"}
                     logger.info(f"Using OpenAI JSON mode (flexible) for {model_id}")
 
-            response = await self.openai_client.chat.completions.create(
-                **standard_params,
-                **request_kwargs,
+            response = await self._call_chat_completions_create_with_reasoning_retry(
+                self.openai_client,
+                standard_params,
+                request_kwargs,
+                provider_key="openai",
+                model_id=model_id,
             )
             return response.choices[0].message.content, self._usage_with_finish_metadata(
                 getattr(response, "usage", None),
@@ -7978,6 +8480,7 @@ class AIService:
                     system_prompt,
                     extra_verbose,
                     thinking_budget_tokens,
+                    reasoning_effort=reasoning_effort,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     usage_callback=usage_callback,
@@ -7994,6 +8497,8 @@ class AIService:
                     temperature,
                     adjusted_max_tokens,
                     system_prompt,
+                    reasoning_effort=reasoning_effort,
+                    thinking_budget_tokens=thinking_budget_tokens,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     usage_callback=usage_callback,
@@ -8009,6 +8514,7 @@ class AIService:
                     temperature,
                     adjusted_max_tokens,
                     system_prompt,
+                    reasoning_effort=reasoning_effort,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     usage_callback=usage_callback,
@@ -8089,10 +8595,12 @@ class AIService:
                         if await _stream_cancel_requested():
                             return
                         yield chunk
+                await self._record_provider_health_success(provider, model_id, "streaming")
                 return
             except asyncio.CancelledError:
                 raise
-            except AIRequestError:
+            except AIRequestError as exc:
+                await self._record_provider_health_failure(getattr(exc, "provider_failure", None))
                 raise
             except Exception as exc:
                 if cancellation_token and await cancellation_token.any_cancelled():
@@ -8107,6 +8615,7 @@ class AIService:
                     attempt=attempt,
                     max_attempts=max_attempts,
                 )
+                await self._record_provider_health_failure(failure)
                 should_retry = (
                     attempt < max_attempts
                     and chunks_emitted == 0
@@ -8152,6 +8661,7 @@ class AIService:
             attempt=max_attempts,
             max_attempts=max_attempts,
         )
+        await self._record_provider_health_failure(failure)
         raise AIRequestError(
             provider,
             model_id,
@@ -8169,6 +8679,7 @@ class AIService:
         max_tokens: int,
         system_prompt: str,
         thinking_budget_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
         request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
@@ -8235,7 +8746,12 @@ class AIService:
 
         # Add thinking mode for Claude models that support it (Claude 3.7, Claude 4 Sonnet, Claude 4 Opus)
         # Structured outputs + thinking is supported; Claude ignores thinking tokens for tool calls
-        self._inject_claude_thinking_params(create_params, model_id, thinking_budget_tokens)
+        self._inject_claude_thinking_params(
+            create_params,
+            model_id,
+            thinking_budget_tokens,
+            reasoning_effort=reasoning_effort,
+        )
 
         # Add Structured Outputs configuration when supported by the target SDK.
         use_beta_structured_outputs = False
@@ -8256,14 +8772,18 @@ class AIService:
                 if use_beta_structured_outputs
                 else self.anthropic_client.messages.create
             )
-            response = await create(
-                **create_params,
-                **request_kwargs,
+            response = await self._call_claude_messages_create_with_reasoning_retry(
+                create,
+                create_params,
+                request_kwargs,
+                model_id=model_id,
             )
         else:
-            response = await self.anthropic_client.messages.create(
-                **create_params,
-                **request_kwargs,
+            response = await self._call_claude_messages_create_with_reasoning_retry(
+                self.anthropic_client.messages.create,
+                create_params,
+                request_kwargs,
+                model_id=model_id,
             )
 
         # Handle thinking mode responses which may have different content structure
@@ -8299,6 +8819,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: str,
+        reasoning_effort: Optional[str] = None,
         thinking_budget_tokens: Optional[int] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
@@ -8313,6 +8834,7 @@ class AIService:
             temperature,
             max_tokens,
             system_prompt,
+            reasoning_effort=reasoning_effort,
             thinking_budget_tokens=thinking_budget_tokens,
             json_output=json_output,
             json_schema=json_schema,
@@ -8326,6 +8848,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: str,
+        reasoning_effort: Optional[str] = None,
         thinking_budget_tokens: Optional[int] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
@@ -8363,10 +8886,11 @@ class AIService:
             parts.append({"text": prompt})
             contents.append({"role": "user", "parts": parts})
 
-            # Use token validation's adjusted budget when present; otherwise apply model default.
-            thinking_budget = thinking_budget_tokens
-            if thinking_budget is None:
-                thinking_budget = self._get_thinking_budget_for_model(model_id)
+            thinking_config_kwargs = self._build_gemini_thinking_config_kwargs(
+                model_id,
+                reasoning_effort=reasoning_effort,
+                thinking_budget_tokens=thinking_budget_tokens,
+            )
 
             # Configure generation with system_instruction in config (not concatenated in user message)
             config_params = {
@@ -8388,8 +8912,8 @@ class AIService:
                     config_params["response_mime_type"] = "application/json"
                     logger.info(f"Using Gemini JSON mode (flexible) for {model_id}")
 
-            if thinking_budget and thinking_budget > 0:
-                config_params["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+            if thinking_config_kwargs:
+                config_params["thinking_config"] = types.ThinkingConfig(**thinking_config_kwargs)
 
             config = types.GenerateContentConfig(**config_params)
 
@@ -8469,7 +8993,10 @@ class AIService:
 
                 # Anthropic reasoning models require thinking mode with temperature=1
                 if provider in {"claude", "anthropic"}:
-                    if not adjusted_thinking or adjusted_thinking <= 0:
+                    if (
+                        not self._model_supports_reasoning_effort(model_id)
+                        and (not adjusted_thinking or adjusted_thinking <= 0)
+                    ):
                         default_budget = self._get_thinking_budget_for_model(model_id)
                         if default_budget:
                             adjusted_thinking = default_budget
@@ -8539,7 +9066,7 @@ class AIService:
             or any(normalized == marker for marker in no_temperature_models)
         )
 
-    def _get_thinking_budget_details(self, model_id: str) -> Optional[Dict[str, int]]:
+    def _get_thinking_budget_details(self, model_id: str) -> Optional[Dict[str, Any]]:
         """Fetch full thinking budget configuration for a model if available."""
         try:
             model_specs = config.get_model_specs()
@@ -8558,18 +9085,29 @@ class AIService:
         params: Dict[str, Any],
         model_id: str,
         thinking_budget_tokens: Optional[int],
+        reasoning_effort: Optional[str] = None,
         log_context: str = ""
     ) -> None:
         """Attach thinking payload for Claude if supported and requested."""
-        if not thinking_budget_tokens or thinking_budget_tokens <= 0:
-            return
+        if reasoning_effort and self._model_supports_reasoning_effort(model_id):
+            params.setdefault("output_config", {})["effort"] = reasoning_effort
+            logger.info(f"{log_context}Using Claude effort={reasoning_effort} for model {model_id}")
 
         if not self._supports_claude_thinking(model_id):
             return
 
         if self._claude_uses_adaptive_thinking_only(model_id):
+            if reasoning_effort or (thinking_budget_tokens is not None and thinking_budget_tokens > 0):
+                params["thinking"] = {"type": "adaptive"}
+                logger.info(f"{log_context}Using adaptive thinking for model {model_id}")
+            return
+
+        if reasoning_effort and self._model_supports_reasoning_effort(model_id):
             params["thinking"] = {"type": "adaptive"}
             logger.info(f"{log_context}Using adaptive thinking for model {model_id}")
+            return
+
+        if not thinking_budget_tokens or thinking_budget_tokens <= 0:
             return
 
         budget = int(thinking_budget_tokens)
@@ -8602,6 +9140,50 @@ class AIService:
             return 0
         return int(details.get("default_tokens", 0))
 
+    def _build_gemini_thinking_config_kwargs(
+        self,
+        model_id: str,
+        *,
+        reasoning_effort: Optional[str],
+        thinking_budget_tokens: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        """Return kwargs for google.genai.types.ThinkingConfig."""
+        details = self._get_thinking_budget_details(model_id)
+        if not details:
+            return None
+
+        parameter_name = str(details.get("parameter_name") or "thinking_budget").lower()
+        if parameter_name in {"thinking_level", "thinkinglevel"}:
+            requested_level = config.normalize_reasoning_effort_label(
+                reasoning_effort or details.get("default_level")
+            )
+            adjusted_level, _validation = config._coerce_reasoning_effort_to_supported_level(
+                requested_level,
+                {
+                    "supported": True,
+                    "levels": details.get("levels", []),
+                    "default": details.get("default_level"),
+                },
+            )
+            if adjusted_level:
+                return {"thinking_level": adjusted_level}
+            return None
+
+        if thinking_budget_tokens is not None:
+            budget = int(thinking_budget_tokens)
+        else:
+            budget = int(details.get("default_tokens", 0) or 0)
+
+        min_tokens = details.get("min_tokens")
+        max_tokens = details.get("max_tokens")
+        if isinstance(min_tokens, int) and budget > 0:
+            budget = max(budget, min_tokens)
+        if isinstance(max_tokens, int):
+            budget = min(budget, max_tokens)
+        if budget == 0 or budget > 0:
+            return {"thinking_budget": budget}
+        return None
+
     async def _generate_xai(
         self,
         prompt: str,
@@ -8609,6 +9191,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: str,
+        reasoning_effort: Optional[str] = None,
         request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
@@ -8656,6 +9239,8 @@ class AIService:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if reasoning_effort and self._model_supports_reasoning_effort(model_id):
+            request_params["reasoning_effort"] = reasoning_effort
         request_kwargs: Dict[str, Any] = {}
         if request_timeout and request_timeout > 0:
             request_kwargs["timeout"] = request_timeout
@@ -8678,9 +9263,12 @@ class AIService:
                 request_params["response_format"] = {"type": "json_object"}
                 logger.info(f"Using Grok JSON mode (flexible) for {model_id}")
 
-        response = await self.xai_client.chat.completions.create(
-            **request_params,
-            **request_kwargs,
+        response = await self._call_chat_completions_create_with_reasoning_retry(
+            self.xai_client,
+            request_params,
+            request_kwargs,
+            provider_key="xai",
+            model_id=model_id,
         )
 
         return response.choices[0].message.content, self._usage_with_finish_metadata(
@@ -9003,9 +9591,12 @@ class AIService:
                     logger.info(f"[EXTRA_VERBOSE] GPT-5 streaming parameters: {create_params}")
 
                 try:
-                    stream = await self.openai_client.chat.completions.create(
-                        **create_params,
-                        **request_kwargs,
+                    stream = await self._call_chat_completions_create_with_reasoning_retry(
+                        self.openai_client,
+                        create_params,
+                        request_kwargs,
+                        provider_key=provider,
+                        model_id=model_id,
                     )
                 except Exception as stream_error:
                     logger.error(f"GPT-5 streaming failed to initialize: {str(stream_error)}")
@@ -9044,9 +9635,12 @@ class AIService:
                         create_params["response_format"] = {"type": "json_object"}
                         logger.info(f"Using OpenAI JSON mode (streaming, flexible) for {model_id}")
 
-                stream = await self.openai_client.chat.completions.create(
-                    **create_params,
-                    **request_kwargs,
+                stream = await self._call_chat_completions_create_with_reasoning_retry(
+                    self.openai_client,
+                    create_params,
+                    request_kwargs,
+                    provider_key=provider,
+                    model_id=model_id,
                 )
 
             chunk_count = 0
@@ -9120,6 +9714,7 @@ class AIService:
         system_prompt: Optional[str],
         extra_verbose: bool,
         thinking_budget_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -9179,7 +9774,13 @@ class AIService:
                 stream_params["system"] = effective_system
 
             # Add thinking mode for Claude models that support it (structured outputs compatible)
-            self._inject_claude_thinking_params(stream_params, model_id, thinking_budget_tokens, log_context="Streaming: ")
+            self._inject_claude_thinking_params(
+                stream_params,
+                model_id,
+                thinking_budget_tokens,
+                reasoning_effort=reasoning_effort,
+                log_context="Streaming: ",
+            )
 
             # Add Structured Outputs configuration when supported by the target SDK.
             use_beta_structured_outputs = False
@@ -9199,7 +9800,11 @@ class AIService:
                     if use_beta_structured_outputs
                     else self.anthropic_client.messages.create
                 )
-                stream_context = await create(**stream_params)
+                stream_context = await self._call_claude_messages_create_with_reasoning_retry(
+                    create,
+                    stream_params,
+                    model_id=model_id,
+                )
             else:
                 stream_context = self.anthropic_client.messages.stream(**stream_params)
 
@@ -9300,6 +9905,8 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: Optional[str],
+        reasoning_effort: Optional[str] = None,
+        thinking_budget_tokens: Optional[int] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -9317,11 +9924,13 @@ class AIService:
             temperature,
             max_tokens,
             system_prompt,
-            json_output,
-            json_schema,
-            usage_callback,
-            provider,
-            extra_payload,
+            reasoning_effort=reasoning_effort,
+            thinking_budget_tokens=thinking_budget_tokens,
+            json_output=json_output,
+            json_schema=json_schema,
+            usage_callback=usage_callback,
+            provider=provider,
+            usage_extra=extra_payload,
             images=images,
         ):
             yield chunk
@@ -9333,6 +9942,8 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: Optional[str],
+        reasoning_effort: Optional[str] = None,
+        thinking_budget_tokens: Optional[int] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -9362,8 +9973,11 @@ class AIService:
             parts.append({"text": prompt})
             contents.append({"role": "user", "parts": parts})
 
-            # Check if model supports thinking
-            thinking_budget = self._get_thinking_budget_for_model(model_id)
+            thinking_config_kwargs = self._build_gemini_thinking_config_kwargs(
+                model_id,
+                reasoning_effort=reasoning_effort,
+                thinking_budget_tokens=thinking_budget_tokens,
+            )
 
             # Configure generation with system_instruction in config (not concatenated in user message)
             config_params = {
@@ -9385,8 +9999,8 @@ class AIService:
                     config_params["response_mime_type"] = "application/json"
                     logger.info(f"Using Gemini JSON mode (streaming, flexible) for {model_id}")
 
-            if thinking_budget and thinking_budget > 0:
-                config_params["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+            if thinking_config_kwargs:
+                config_params["thinking_config"] = types.ThinkingConfig(**thinking_config_kwargs)
 
             config = types.GenerateContentConfig(**config_params)
 
@@ -9456,6 +10070,8 @@ class AIService:
                         temperature,
                         max_tokens,
                         system_prompt,
+                        reasoning_effort=reasoning_effort,
+                        thinking_budget_tokens=thinking_budget_tokens,
                         json_output=json_output,
                         json_schema=json_schema,
                     )
@@ -9504,6 +10120,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: Optional[str],
+        reasoning_effort: Optional[str] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -9558,6 +10175,8 @@ class AIService:
                 "max_tokens": max_tokens,
                 "stream": True
             }
+            if reasoning_effort and self._model_supports_reasoning_effort(model_id):
+                create_params["reasoning_effort"] = reasoning_effort
 
             # Include usage stats in streaming response (OpenAI-compatible API)
             create_params.setdefault("stream_options", {})["include_usage"] = True
@@ -9580,7 +10199,12 @@ class AIService:
                     create_params["response_format"] = {"type": "json_object"}
                     logger.info(f"Using Grok JSON mode (streaming, flexible) for {model_id}")
 
-            stream = await self.xai_client.chat.completions.create(**create_params)
+            stream = await self._call_chat_completions_create_with_reasoning_retry(
+                self.xai_client,
+                create_params,
+                provider_key="xai",
+                model_id=model_id,
+            )
 
             usage_obj = None
             finish_reason = None
