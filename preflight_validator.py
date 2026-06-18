@@ -7,7 +7,7 @@ content generation iterations.
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 # Use optimized JSON helper to align with rest of codebase
 import json_utils as json
@@ -467,19 +467,74 @@ def _normalise_issues(raw_issues: Any) -> List[PreflightIssue]:
 
 def _parse_validator_response(raw_output: str) -> Optional[Dict[str, Any]]:
     """Parse the validator JSON response."""
+    parsed, _diagnostics = _parse_validator_response_with_diagnostics(raw_output)
+    return parsed
+
+
+def _parse_validator_response_with_diagnostics(
+    raw_output: str,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Parse the validator JSON response and return cleanroom diagnostics."""
+    diagnostics: Dict[str, Any] = {
+        "likely_truncated": False,
+        "errors": [],
+        "source": None,
+    }
+    if not raw_output:
+        diagnostics["errors"] = [{"code": "empty_response", "message": "Empty response"}]
+        return None, diagnostics
+
+    try:
+        from tools.ai_json_cleanroom import validate_loose_json
+    except Exception as exc:
+        diagnostics["cleanroom_unavailable"] = type(exc).__name__
+    else:
+        validation_result = validate_loose_json(raw_output)
+        diagnostics = {
+            "likely_truncated": bool(validation_result.likely_truncated),
+            "errors": [
+                issue.to_dict()
+                for issue in (validation_result.errors or [])
+            ],
+            "source": (validation_result.info or {}).get("source"),
+            "extraction": (validation_result.info or {}).get("extraction"),
+            "repair": (validation_result.info or {}).get("repair"),
+        }
+        if validation_result.json_valid and isinstance(validation_result.data, dict):
+            return validation_result.data, diagnostics
+        if validation_result.json_valid:
+            diagnostics["errors"].append(
+                {
+                    "code": "non_object_json",
+                    "message": (
+                        "Preflight validator response must be a JSON object, "
+                        f"got {type(validation_result.data).__name__}."
+                    ),
+                }
+            )
+        return None, diagnostics
+
     json_blob = _extract_json_blob(raw_output)
     if not json_blob:
-        return None
+        diagnostics["errors"] = [{"code": "parse_error", "message": "No JSON object found"}]
+        return None, diagnostics
 
     try:
         parsed = json.loads(json_blob)
     except json.JSONDecodeError:
-        return None
+        diagnostics["errors"] = [{"code": "parse_error", "message": "JSON decode failed"}]
+        return None, diagnostics
 
     if not isinstance(parsed, dict):
-        return None
+        diagnostics["errors"] = [
+            {
+                "code": "non_object_json",
+                "message": f"Expected object, got {type(parsed).__name__}",
+            }
+        ]
+        return None, diagnostics
 
-    return parsed
+    return parsed, diagnostics
 
 
 def _validate_evidence_grounding_config(request: ContentRequest) -> Optional[PreflightIssue]:
@@ -763,16 +818,31 @@ async def run_preflight_validation(
             model=selected_model,
         )
 
-    parsed = _parse_validator_response(raw_output)
+    parsed, parse_diagnostics = _parse_validator_response_with_diagnostics(raw_output)
     if not parsed:
-        logger.warning("Preflight validator returned unparseable output: %s", raw_output)
-        return _build_preflight_failure_result(
-            code="preflight_invalid_response",
-            message=(
+        logger.warning(
+            "Preflight validator returned unparseable output: %s | diagnostics=%s",
+            raw_output,
+            parse_diagnostics,
+        )
+        likely_truncated = bool(parse_diagnostics.get("likely_truncated"))
+        invalid_message = (
+            f"Preflight validation failed because model '{selected_model}' returned "
+            "truncated or incomplete JSON."
+            if likely_truncated
+            else (
                 f"Preflight validation failed because model '{selected_model}' returned "
                 "an unparseable response."
+            )
+        )
+        return _build_preflight_failure_result(
+            code="preflight_invalid_response",
+            message=invalid_message,
+            summary=(
+                "Preflight response truncated"
+                if likely_truncated
+                else "Preflight response unparseable"
             ),
-            summary="Preflight response unparseable",
             model=selected_model,
         )
 

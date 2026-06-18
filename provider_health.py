@@ -35,7 +35,7 @@ LOCAL_ERRORS_SOURCE = "local_errors"
 LOCAL_SUCCESSES_SOURCE = "local_successes"
 
 REMOTE_STATUS_PROVIDERS = ("openai", "claude", "gemini", "openrouter", "xai")
-DEFAULT_PROVIDERS = (*REMOTE_STATUS_PROVIDERS, "ollama", "fake")
+DEFAULT_PROVIDERS = (*REMOTE_STATUS_PROVIDERS, "minimax", "moonshot", "ollama", "fake")
 
 _EVENT_TTL_SECONDS = 15 * 60
 _MAX_EVENTS_PER_PROVIDER = 300
@@ -50,6 +50,8 @@ _PROVIDER_DISPLAY_NAMES = {
     "gemini": "Gemini",
     "openrouter": "OpenRouter",
     "xai": "xAI",
+    "minimax": "MiniMax",
+    "moonshot": "Moonshot/Kimi",
     "ollama": "Ollama",
     "fake": "Fake AI",
 }
@@ -111,6 +113,10 @@ def normalize_provider_key(value: str | None) -> str:
         "openai": "openai",
         "openai responses": "openai",
         "openrouter": "openrouter",
+        "minimax": "minimax",
+        "moonshot": "moonshot",
+        "kimi": "moonshot",
+        "moonshotai": "moonshot",
         "x-ai": "xai",
         "xai": "xai",
         "grok": "xai",

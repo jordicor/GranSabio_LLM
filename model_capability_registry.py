@@ -13,7 +13,6 @@ from provider_capabilities import (
     capability_state,
 )
 
-
 TOOL_LOOP_RUNTIME_PROVIDERS = frozenset({"openai", "openrouter", "xai", "claude", "gemini"})
 
 
@@ -203,7 +202,7 @@ def _docs_rule_state(provider: str, model_id: str, capability: str) -> Capabilit
     if capability == "streaming":
         return capability_state(True, source=CapabilitySource.OFFICIAL_DOCS)
     if capability == "json_object":
-        if provider_key in {"openai", "xai", "ollama"}:
+        if provider_key in {"openai", "xai", "ollama", "moonshot"}:
             return capability_state(True, source=CapabilitySource.OFFICIAL_DOCS)
         if provider_key in {"claude", "gemini"}:
             return capability_state(False, source=CapabilitySource.OFFICIAL_DOCS)

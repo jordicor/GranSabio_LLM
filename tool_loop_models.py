@@ -115,6 +115,11 @@ class ToolLoopEnvelope(BaseModel):
     context_size_estimate: Optional[int] = None
     context_overflow_kind: Optional[str] = None
     context_overflow_details: Optional[Dict[str, Any]] = None
+    output_truncated: bool = False
+    truncation_reason: Optional[str] = None
+    provider_stop_reason: Optional[str] = None
+    finish_reason: Optional[str] = None
+    max_tokens: Optional[int] = None
     payload: Optional[Dict[str, Any]] = None
 
 
@@ -174,6 +179,38 @@ class ToolLoopContextOverflow(Exception):
         self.turn = turn
         self.accumulated_chars_estimate = accumulated_chars_estimate
         self.provider_error = provider_error
+
+
+class ToolLoopOutputTruncated(RuntimeError):
+    """Raised when a provider ends a tool-loop turn at the output token limit.
+
+    Partial tool-call arguments are not safe to execute. This typed exception
+    lets callers surface a controlled truncation result instead of treating the
+    provider stop as a generic generation crash.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        model_id: str,
+        turn: int,
+        finish_reason: str,
+        max_tokens: Optional[int] = None,
+        api_surface: Optional[str] = None,
+        partial_content_chars: int = 0,
+        partial_tool_calls: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.model_id = model_id
+        self.turn = turn
+        self.finish_reason = finish_reason
+        self.max_tokens = max_tokens
+        self.api_surface = api_surface
+        self.partial_content_chars = partial_content_chars
+        self.partial_tool_calls = partial_tool_calls
 
 
 class JsonContractError(Exception):

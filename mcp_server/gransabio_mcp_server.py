@@ -440,7 +440,7 @@ Shows models organized by provider with their capabilities and pricing.""",
                 "properties": {
                     "provider": {
                         "type": "string",
-                        "description": "Filter by provider: openai, anthropic, google, xai, openrouter, all",
+                        "description": "Filter by provider: openai, anthropic, google, xai, openrouter, minimax, moonshot, all",
                         "default": "all"
                     }
                 },

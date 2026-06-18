@@ -12,27 +12,21 @@
   },
   "calls": {
     "generation.main": {
-      "model": "gpt-4o",
-      "params": {
-        "temperature": 0.7
-      }
+      "model": "gpt-5.4-mini",
+      "params": {}
     },
     "generation.direct_stream": {
-      "model": "gpt-4o",
-      "params": {
-        "temperature": 0.7
-      }
+      "model": "gpt-5.4-mini",
+      "params": {}
     },
     "generation.json_retry": {
-      "model": "gpt-4o",
-      "params": {
-        "temperature": 0.3
-      }
+      "model": "gpt-5.4-mini",
+      "params": {}
     },
     "generation.smart_edit": {
-      "model": "gpt-4o-mini",
+      "model": "gpt-5-nano",
       "params": {
-        "temperature": 0.2
+        "reasoning_effort": "low"
       }
     },
     "qa.evaluate_layer": {
@@ -44,7 +38,7 @@
           }
         },
         {
-          "model": "claude-sonnet-4-20250514",
+          "model": "claude-sonnet-4-6",
           "params": {
             "temperature": 0.3
           }
@@ -58,29 +52,22 @@
       ]
     },
     "auto_qa.plan": {
-      "model": "claude-opus-4-6",
+      "model": "kimi-k2.7-code",
       "params": {
-        "temperature": 0.2,
         "max_tokens": 6000
       }
     },
     "gransabio.review": {
-      "model": "claude-opus-4-6",
-      "params": {
-        "temperature": 0.4
-      }
+      "model": "kimi-k2.7-code",
+      "params": {}
     },
     "gransabio.regenerate": {
-      "model": "claude-opus-4-6",
-      "params": {
-        "temperature": 0.7
-      }
+      "model": "kimi-k2.7-code",
+      "params": {}
     },
     "gransabio.escalation": {
-      "model": "claude-opus-4-6",
-      "params": {
-        "temperature": 0.4
-      }
+      "model": "kimi-k2.7-code",
+      "params": {}
     },
     "arbiter.resolve": {
       "model": "gpt-5-mini",
@@ -97,16 +84,12 @@
       }
     },
     "long_text.section_draft": {
-      "model": "gpt-4o",
-      "params": {
-        "temperature": 0.7
-      }
+      "model": "gpt-5.4-mini",
+      "params": {}
     },
     "long_text.section_tools": {
-      "model": "gpt-4o",
-      "params": {
-        "temperature": 0.7
-      }
+      "model": "gpt-5.4-mini",
+      "params": {}
     },
     "long_text.semantic_eval": {
       "model": "gpt-5-mini",
@@ -133,15 +116,15 @@
       }
     },
     "feedback.analyze": {
-      "model": "gpt-4o-mini",
+      "model": "gpt-5-nano",
       "params": {
-        "temperature": 0.2
+        "reasoning_effort": "low"
       }
     },
     "feedback.synthesize_rules": {
-      "model": "gpt-4o-mini",
+      "model": "gpt-5-nano",
       "params": {
-        "temperature": 0.2
+        "reasoning_effort": "low"
       }
     },
     "feedback.embed": {
@@ -181,16 +164,16 @@
       }
     },
     "smart_edit.analyze": {
-      "model": "gpt-4o-mini",
+      "model": "gpt-5-nano",
       "params": {
-        "temperature": 0.3,
+        "reasoning_effort": "low",
         "max_tokens": 4096
       }
     },
     "smart_edit.apply": {
-      "model": "gpt-4o-mini",
+      "model": "gpt-5-nano",
       "params": {
-        "temperature": 0.2,
+        "reasoning_effort": "low",
         "max_tokens": 4096
       }
     },
@@ -211,6 +194,18 @@
     },
     "health.xai": {
       "model": "grok-4-0709",
+      "params": {
+        "max_tokens": 5
+      }
+    },
+    "health.minimax": {
+      "model": "MiniMax-M3",
+      "params": {
+        "max_tokens": 5
+      }
+    },
+    "health.moonshot": {
+      "model": "kimi-k2.7-code",
       "params": {
         "max_tokens": 5
       }

@@ -106,6 +106,67 @@ def test_build_truncation_failure_reason_includes_actionable_details():
     assert "shorter response" in reason
 
 
+def test_build_truncation_failure_reason_reads_tool_loop_metadata():
+    request = _tool_request(max_tokens=4000)
+    session = {
+        "generation_tool_metadata": ToolLoopEnvelope(
+            loop_scope=LoopScope.GENERATOR,
+            output_truncated=True,
+            provider_stop_reason="length",
+            max_tokens=1024,
+        )
+    }
+
+    reason = _build_truncation_failure_reason(session, request)
+
+    assert "stop_reason=length" in reason
+    assert "max_tokens=1024" in reason
+
+
+@pytest.mark.asyncio
+async def test_generate_full_content_records_tool_loop_output_truncation():
+    request = _tool_request(max_tokens=1024)
+    envelope = ToolLoopEnvelope(
+        loop_scope=LoopScope.GENERATOR,
+        turns=1,
+        accepted=False,
+        accepted_via="output_truncated",
+        output_schema_valid=False,
+        output_truncated=True,
+        truncation_reason="output_token_limit",
+        finish_reason="length",
+        provider_stop_reason="length",
+        max_tokens=1024,
+    )
+    ai_service = SimpleNamespace(
+        call_ai_with_validation_tools=AsyncMock(return_value=("", envelope)),
+        generate_content_stream=AsyncMock(),
+    )
+    session = {}
+
+    with patch("core.generation_processor._should_use_generation_tools", return_value=True), \
+         patch("core.generation_processor.has_active_generation_validators", return_value=True), \
+         patch("core.generation_processor.add_verbose_log", new=AsyncMock()), \
+         patch("core.generation_processor._debug_record_event", new=AsyncMock()):
+        content = await _generate_full_content(
+            final_prompt="Write something long.",
+            request=request,
+            ai_service=ai_service,
+            usage_tracker=None,
+            session_id="session-tool-truncated",
+            session=session,
+            iteration=0,
+            json_output_requested=False,
+        )
+
+    assert content == ""
+    assert session["generation_tool_metadata"] is envelope
+    assert session["generation_finish_metadata"]["output_truncated"] is True
+    assert session["generation_finish_metadata"]["provider_stop_reason"] == "length"
+    assert _generation_was_truncated(session) is True
+    ai_service.generate_content_stream.assert_not_called()
+
+
 def test_build_generation_error_result_surfaces_provider_quota():
     failure = ProviderFailure(
         provider="openai",

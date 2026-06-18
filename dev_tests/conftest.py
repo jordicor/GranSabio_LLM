@@ -23,6 +23,8 @@ def mock_env_vars():
         "GOOGLE_API_KEY": "test-google-key-12345",
         "XAI_API_KEY": "xai-test-key-12345",
         "OPENROUTER_API_KEY": "sk-or-test-key-12345",
+        "MINIMAX_API_KEY": "minimax-test-key-12345",
+        "MOONSHOT_API_KEY": "moonshot-test-key-12345",
         "DEFAULT_MIN_GLOBAL_SCORE": "8.0",
         "DEFAULT_MAX_ITERATIONS": "5",
         "APP_HOST": "0.0.0.0",
@@ -37,7 +39,7 @@ def clean_env():
     """Provide clean environment without API keys."""
     keys_to_remove = [
         "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
-        "XAI_API_KEY", "OPENROUTER_API_KEY"
+        "XAI_API_KEY", "OPENROUTER_API_KEY", "MINIMAX_API_KEY", "MOONSHOT_API_KEY"
     ]
     with patch.dict(os.environ, {}, clear=False):
         for key in keys_to_remove:

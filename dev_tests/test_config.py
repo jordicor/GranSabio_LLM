@@ -114,6 +114,26 @@ def minimal_model_specs():
                     "capabilities": ["text"]
                 }
             },
+            "minimax": {
+                "MiniMax-M3": {
+                    "model_id": "MiniMax-M3",
+                    "name": "MiniMax M3",
+                    "description": "MiniMax test model",
+                    "input_tokens": 1000000,
+                    "output_tokens": 131072,
+                    "capabilities": ["text", "vision"]
+                }
+            },
+            "moonshot": {
+                "kimi-k2.7-code": {
+                    "model_id": "kimi-k2.7-code",
+                    "name": "Kimi K2.7 Code",
+                    "description": "Moonshot/Kimi test model",
+                    "input_tokens": 262144,
+                    "output_tokens": 65536,
+                    "capabilities": ["text", "vision"]
+                }
+            },
             "ollama": {
                 "llama3": {
                     "model_id": "llama3",
@@ -128,7 +148,9 @@ def minimal_model_specs():
         "aliases": {
             "gpt4": "gpt-4o",
             "claude": "claude-sonnet-4",
-            "gemini": "gemini-2.0-flash"
+            "gemini": "gemini-2.0-flash",
+            "minimax-m3": "MiniMax-M3",
+            "kimi-k2.7": "kimi-k2.7-code"
         },
         "default_models": {
             "generator": "gpt-4o",
@@ -217,6 +239,8 @@ def mock_env_vars():
         "GOOGLE_API_KEY": "test-google-key-12345",
         "XAI_API_KEY": "xai-test-key-12345",
         "OPENROUTER_API_KEY": "sk-or-test-key-12345",
+        "MINIMAX_API_KEY": "minimax-test-key-12345",
+        "MOONSHOT_API_KEY": "moonshot-test-key-12345",
         "APP_HOST": "0.0.0.0",
         "APP_PORT": "8000",
         "MAX_CONCURRENT_REQUESTS": "20",
@@ -288,6 +312,39 @@ class TestEnvironmentLoading:
                 from config import Config
                 cfg = Config()
                 assert cfg.XAI_API_KEY == "xai-test-key-12345"
+
+    def test_loads_minimax_api_key(self, minimal_model_specs, mock_env_vars):
+        """Given: MINIMAX_API_KEY in env, Then: Config loads it"""
+        import json_utils as json
+        specs_json = json.dumps(minimal_model_specs)
+
+        with patch.dict(os.environ, mock_env_vars, clear=False):
+            with patch("builtins.open", mock_open(read_data=specs_json)):
+                from config import Config
+                cfg = Config()
+                assert cfg.MINIMAX_API_KEY == "minimax-test-key-12345"
+
+    def test_loads_moonshot_api_key(self, minimal_model_specs, mock_env_vars):
+        """Given: MOONSHOT_API_KEY in env, Then: Config loads it"""
+        import json_utils as json
+        specs_json = json.dumps(minimal_model_specs)
+
+        with patch.dict(os.environ, mock_env_vars, clear=False):
+            with patch("builtins.open", mock_open(read_data=specs_json)):
+                from config import Config
+                cfg = Config()
+                assert cfg.MOONSHOT_API_KEY == "moonshot-test-key-12345"
+
+    def test_loads_moonshot_api_key_from_kimi_alias(self, minimal_model_specs):
+        """Given: KIMI_API_KEY in env, Then: Config loads it as MOONSHOT_API_KEY"""
+        import json_utils as json
+        specs_json = json.dumps(minimal_model_specs)
+
+        with patch.dict(os.environ, {"KIMI_API_KEY": "kimi-test-key-12345"}, clear=True):
+            with patch("builtins.open", mock_open(read_data=specs_json)):
+                from config import Config
+                cfg = Config()
+                assert cfg.MOONSHOT_API_KEY == "kimi-test-key-12345"
 
     def test_loads_integer_env_vars(self, minimal_model_specs, mock_env_vars):
         """Given: Integer env vars, Then: Config parses correctly"""
@@ -757,6 +814,32 @@ class TestGetModelInfo:
                 cfg = Config()
                 info = cfg.get_model_info("openrouter-model")
                 assert info["provider"] == "openrouter"
+
+    def test_returns_info_for_minimax_model(self, minimal_model_specs, mock_env_vars):
+        """Given: Known MiniMax model, Then: Returns model info"""
+        import json_utils as json
+        specs_json = json.dumps(minimal_model_specs)
+
+        with patch.dict(os.environ, mock_env_vars, clear=False):
+            with patch("builtins.open", mock_open(read_data=specs_json)):
+                from config import Config
+                cfg = Config()
+                info = cfg.get_model_info("MiniMax-M3")
+                assert info["provider"] == "minimax"
+                assert info["model_id"] == "MiniMax-M3"
+
+    def test_returns_info_for_moonshot_model_alias(self, minimal_model_specs, mock_env_vars):
+        """Given: Kimi alias, Then: Resolves to native Moonshot model"""
+        import json_utils as json
+        specs_json = json.dumps(minimal_model_specs)
+
+        with patch.dict(os.environ, mock_env_vars, clear=False):
+            with patch("builtins.open", mock_open(read_data=specs_json)):
+                from config import Config
+                cfg = Config()
+                info = cfg.get_model_info("kimi-k2.7")
+                assert info["provider"] == "moonshot"
+                assert info["model_id"] == "kimi-k2.7-code"
 
     def test_resolves_alias_to_model(self, minimal_model_specs, mock_env_vars):
         """Given: Model alias, Then: Resolves to actual model"""
@@ -1614,6 +1697,8 @@ class TestGetAvailableModels:
                 assert "openai" in models
                 assert "anthropic" in models
                 assert "google" in models
+                assert "minimax" in models
+                assert "moonshot" in models
 
     def test_returns_model_entries(self, minimal_model_specs, mock_env_vars):
         """Given: Provider with models, Then: Returns model entries"""

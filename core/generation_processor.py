@@ -1479,6 +1479,29 @@ async def _generate_full_content(
                     f"[Tools] Tool loop skipped ({skipped_reason}); falling back to standard generation."
                 )
             else:
+                if getattr(tool_metadata, "output_truncated", False):
+                    session["generation_tool_metadata"] = tool_metadata
+                    session["generation_finish_metadata"] = {
+                        "output_truncated": True,
+                        "truncation_reason": getattr(
+                            tool_metadata,
+                            "truncation_reason",
+                            "output_token_limit",
+                        ),
+                        "finish_reason": getattr(tool_metadata, "finish_reason", None),
+                        "provider_stop_reason": getattr(
+                            tool_metadata,
+                            "provider_stop_reason",
+                            None,
+                        ),
+                        "max_tokens": getattr(tool_metadata, "max_tokens", None),
+                    }
+                    await add_verbose_log(
+                        session_id,
+                        "[Tokens] Tool-loop provider stopped because the output token budget was exhausted."
+                    )
+                    return content or ""
+
                 if not content:
                     raise ValueError(
                         f"Tool loop returned empty content with no tools_skipped_reason "

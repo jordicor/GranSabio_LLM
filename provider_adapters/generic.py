@@ -101,6 +101,6 @@ class GenericProviderAdapter:
             return "response_format.json_object"
         if provider == "gemini":
             return "response_mime_type"
-        if provider in {"openrouter", "xai", "ollama"} and context.supports_json_object:
+        if provider in {"openrouter", "xai", "ollama", "minimax", "moonshot"} and context.supports_json_object:
             return "response_format.json_object"
         return None

@@ -2,7 +2,8 @@
 AI Service Module for Gran Sabio LLM Engine
 ============================================
 
-Handles communication with multiple AI providers (OpenAI, Anthropic, Google).
+Handles communication with multiple AI providers (OpenAI, Anthropic, Google,
+xAI, OpenRouter, MiniMax, Moonshot/Kimi, Ollama).
 Provides unified interface for content generation across different models.
 """
 
@@ -41,6 +42,7 @@ except ImportError:
 # Use optimized JSON (3.6x faster than standard json)
 import json_utils as json
 from ai_runtime import capabilities as runtime_capabilities
+from ai_runtime import parameters as runtime_parameters
 from ai_runtime import schemas as runtime_schemas
 from ai_runtime import usage as runtime_usage
 from ai_runtime import vision as runtime_vision
@@ -78,6 +80,7 @@ from tool_loop_models import (
     ToolLoopContextOverflow,
     ToolLoopContractError,
     ToolLoopEnvelope,
+    ToolLoopOutputTruncated,
     ToolLoopSchemaViolationError,
     ToolLoopTraceEntry,
     ValidationToolInputTooLarge,
@@ -214,6 +217,20 @@ def _build_finish_metadata(
         finish_reason=finish_reason,
         max_tokens=max_tokens,
     )
+
+
+def _extract_output_token_limit(params: Mapping[str, Any]) -> Optional[int]:
+    """Return the configured output token cap from provider request params."""
+
+    for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
+        value = params.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 class AccentGuardError(Exception):
@@ -468,6 +485,8 @@ class AIService:
         self.google_new_client = None
         self.xai_client = None
         self.openrouter_client = None
+        self.minimax_client = None
+        self.moonshot_client = None
         self.ollama_client = None
         self.fake_client = None
         self._ollama_max_concurrent_requests = self._positive_int_config(
@@ -599,6 +618,34 @@ class AIService:
             logger.info("OpenRouter client initialized for unified model access")
         else:
             logger.warning("OpenRouter API key not found")
+
+        # Initialize MiniMax client (OpenAI-compatible API with custom base_url)
+        minimax_api_key = getattr(config, "MINIMAX_API_KEY", "")
+        if minimax_api_key:
+            self.minimax_client = openai.AsyncOpenAI(
+                api_key=minimax_api_key,
+                base_url="https://api.minimax.io/v1",
+                timeout=180.0,
+                max_retries=3,
+                http_client=_openai_async_http_client(),
+            )
+            logger.info("MiniMax client initialized")
+        else:
+            logger.warning("MiniMax API key not found")
+
+        # Initialize Moonshot/Kimi client (OpenAI-compatible API with custom base_url)
+        moonshot_api_key = getattr(config, "MOONSHOT_API_KEY", "")
+        if moonshot_api_key:
+            self.moonshot_client = openai.AsyncOpenAI(
+                api_key=moonshot_api_key,
+                base_url="https://api.moonshot.ai/v1",
+                timeout=180.0,
+                max_retries=3,
+                http_client=_openai_async_http_client(),
+            )
+            logger.info("Moonshot/Kimi client initialized")
+        else:
+            logger.warning("Moonshot API key not found")
 
         # Initialize Ollama client (local models, OpenAI-compatible API)
         if config.OLLAMA_HOST:
@@ -1122,6 +1169,10 @@ class AIService:
             except ToolLoopContextOverflow:
                 # Authoritative provider signal — do not retry, surface to caller.
                 raise
+            except ToolLoopOutputTruncated:
+                # Deterministic provider stop at output limit; retrying the
+                # same request with the same cap would repeat the truncation.
+                raise
             except Exception as exc:
                 if cancellation_token and await cancellation_token.any_cancelled():
                     raise asyncio.CancelledError() from exc
@@ -1214,6 +1265,8 @@ class AIService:
         except AccentGuardError:
             raise
         except ToolLoopContextOverflow:
+            raise
+        except ToolLoopOutputTruncated:
             raise
         except Exception as exc:
             if cancellation_token and await cancellation_token.any_cancelled():
@@ -1746,6 +1799,72 @@ class AIService:
                 )
 
                 # Log full response if extra_verbose is enabled
+                if phase_logger:
+                    phase_logger.log_response(
+                        model=model_id,
+                        response=content,
+                        metadata={
+                            "input_tokens": usage_meta.get("input_tokens"),
+                            "output_tokens": usage_meta.get("output_tokens"),
+                            "provider": provider,
+                        }
+                    )
+                elif extra_verbose:
+                    separator = "=" * 80
+                    logger.info(f"\n{separator}")
+                    logger.info(f"[EXTRA_VERBOSE] AI GENERATION RESPONSE from {model_id}")
+                    logger.info(f"{separator}")
+                    logger.info(content)
+                    logger.info(f"{separator}\n")
+
+                self._emit_usage(usage_callback, model_id, provider, usage_meta, extra_payload)
+                return content
+            elif provider == "minimax":
+                content, usage_meta = await self._generate_minimax(
+                    prompt,
+                    model_id,
+                    temperature,
+                    adjusted_max_tokens,
+                    system_prompt or "",
+                    request_timeout=request_timeout,
+                    json_output=json_output,
+                    json_schema=effective_json_schema,
+                    images=images,
+                )
+
+                if phase_logger:
+                    phase_logger.log_response(
+                        model=model_id,
+                        response=content,
+                        metadata={
+                            "input_tokens": usage_meta.get("input_tokens"),
+                            "output_tokens": usage_meta.get("output_tokens"),
+                            "provider": provider,
+                        }
+                    )
+                elif extra_verbose:
+                    separator = "=" * 80
+                    logger.info(f"\n{separator}")
+                    logger.info(f"[EXTRA_VERBOSE] AI GENERATION RESPONSE from {model_id}")
+                    logger.info(f"{separator}")
+                    logger.info(content)
+                    logger.info(f"{separator}\n")
+
+                self._emit_usage(usage_callback, model_id, provider, usage_meta, extra_payload)
+                return content
+            elif provider == "moonshot":
+                content, usage_meta = await self._generate_moonshot(
+                    prompt,
+                    model_id,
+                    temperature,
+                    adjusted_max_tokens,
+                    system_prompt or "",
+                    request_timeout=request_timeout,
+                    json_output=json_output,
+                    json_schema=effective_json_schema,
+                    images=images,
+                )
+
                 if phase_logger:
                     phase_logger.log_response(
                         model=model_id,
@@ -2376,7 +2495,7 @@ class AIService:
         """
         message = str(exc or "").lower()
 
-        if provider_key in {"openai", "openrouter", "xai"}:
+        if provider_key in {"openai", "openrouter", "xai", "minimax", "moonshot"}:
             if isinstance(exc, openai.BadRequestError):
                 code = getattr(exc, "code", None)
                 if code == "context_length_exceeded":
@@ -2922,7 +3041,7 @@ class AIService:
                 "messages": current_messages,
                 "max_tokens": max_tokens,
             }
-            if provider_key != "openrouter" or self._openrouter_accepts_temperature(model_id):
+            if self._chat_parameter_allowed(provider_key, model_id, "temperature"):
                 create_params["temperature"] = temperature
             if (
                 provider_key == "xai"
@@ -3447,6 +3566,22 @@ class AIService:
                         "status": finish_reason,
                     },
                 )
+                if _is_token_limit_finish_reason(finish_reason):
+                    message_text = (
+                        "OpenAI Chat Completions stream ended with unusable "
+                        f"finish_reason={finish_reason}"
+                    )
+                    raise ToolLoopOutputTruncated(
+                        message_text,
+                        provider=provider_key,
+                        model_id=model_id,
+                        turn=turn,
+                        finish_reason=finish_reason,
+                        max_tokens=_extract_output_token_limit(params),
+                        api_surface="chat_completions",
+                        partial_content_chars=len(message.content or ""),
+                        partial_tool_calls=len(message.tool_calls or []),
+                    )
                 raise RuntimeError(
                     f"OpenAI Chat Completions stream ended with unusable finish_reason={finish_reason}"
                 )
@@ -3603,6 +3738,22 @@ class AIService:
                     "status": finish_reason,
                 },
             )
+            if _is_token_limit_finish_reason(finish_reason):
+                message_text = (
+                    "OpenAI Chat Completions stream ended with unusable "
+                    f"finish_reason={finish_reason}"
+                )
+                raise ToolLoopOutputTruncated(
+                    message_text,
+                    provider=provider_key,
+                    model_id=model_id,
+                    turn=turn,
+                    finish_reason=finish_reason or "",
+                    max_tokens=_extract_output_token_limit(params),
+                    api_surface="chat_completions",
+                    partial_content_chars=sum(len(part) for part in assistant_parts),
+                    partial_tool_calls=len(tool_accumulators),
+                )
             raise RuntimeError(
                 f"OpenAI Chat Completions stream ended with unusable finish_reason={finish_reason}"
             )
@@ -3715,6 +3866,12 @@ class AIService:
             error_obj = getattr(response, "error", None)
             incomplete_details = getattr(response, "incomplete_details", None)
             detail = str(error_obj or incomplete_details or "")[:500]
+            incomplete_reason = None
+            if incomplete_details is not None:
+                incomplete_reason = getattr(incomplete_details, "reason", None)
+                if incomplete_reason is None and isinstance(incomplete_details, dict):
+                    incomplete_reason = incomplete_details.get("reason")
+            stop_reason = _stringify_finish_reason(incomplete_reason) or finish_reason
             await self._emit_tool_event_safe(
                 tool_event_callback,
                 "tool_loop_provider_terminal",
@@ -3728,6 +3885,22 @@ class AIService:
                     "detail": detail,
                 },
             )
+            if _is_token_limit_finish_reason(stop_reason):
+                message_text = (
+                    "OpenAI Responses turn ended before a usable turn completed "
+                    f"(status={finish_reason}, detail={detail or 'n/a'})"
+                )
+                raise ToolLoopOutputTruncated(
+                    message_text,
+                    provider="openai",
+                    model_id=model_id,
+                    turn=turn,
+                    finish_reason=stop_reason or "",
+                    max_tokens=_extract_output_token_limit(params),
+                    api_surface="responses",
+                    partial_content_chars=0,
+                    partial_tool_calls=0,
+                )
             raise RuntimeError(
                 "OpenAI Responses turn ended before a usable turn completed "
                 f"(status={finish_reason}, detail={detail or 'n/a'})"
@@ -3831,6 +4004,7 @@ class AIService:
         finish_reason: Optional[str] = None
         terminal_error_status: Optional[str] = None
         terminal_error_detail: Optional[str] = None
+        terminal_error_reason: Optional[str] = None
         response_completed = False
 
         async for event in stream:
@@ -3984,6 +4158,11 @@ class AIService:
                         if response_obj is not None
                         else getattr(event, "incomplete_details", None)
                     )
+                    if incomplete_details is not None:
+                        reason_value = getattr(incomplete_details, "reason", None)
+                        if reason_value is None and isinstance(incomplete_details, dict):
+                            reason_value = incomplete_details.get("reason")
+                        terminal_error_reason = _stringify_finish_reason(reason_value)
                     terminal_error_detail = str(error_obj or response_error or incomplete_details or "")[:500]
                     await self._emit_tool_event_safe(
                         tool_event_callback,
@@ -4000,6 +4179,23 @@ class AIService:
                     )
 
         if terminal_error_status is not None:
+            stop_reason = terminal_error_reason or terminal_error_status
+            if _is_token_limit_finish_reason(stop_reason):
+                message_text = (
+                    "OpenAI Responses stream ended before a usable turn completed "
+                    f"(status={terminal_error_status}, detail={terminal_error_detail or 'n/a'})"
+                )
+                raise ToolLoopOutputTruncated(
+                    message_text,
+                    provider="openai",
+                    model_id=model_id,
+                    turn=turn,
+                    finish_reason=stop_reason,
+                    max_tokens=_extract_output_token_limit(params),
+                    api_surface="responses",
+                    partial_content_chars=sum(len(part) for part in assistant_parts),
+                    partial_tool_calls=len(tool_accumulators),
+                )
             raise RuntimeError(
                 "OpenAI Responses stream ended before a usable turn completed "
                 f"(status={terminal_error_status}, detail={terminal_error_detail or 'n/a'})"
@@ -4720,7 +4916,6 @@ class AIService:
                     )
 
                     candidate_validated_draft: Optional[str] = None
-                    last_validate_payload: Optional["DraftValidationResult"] = None
                     turn_accent_rejected_text: Optional[str] = None
                     input_too_large_detected = False
                     for call in tool_calls:
@@ -4847,7 +5042,6 @@ class AIService:
                         tool_call_counts["validate_draft"] += 1
                         if tool_payload.approved:
                             candidate_validated_draft = draft
-                            last_validate_payload = tool_payload
                         else:
                             latest_feedback = str(
                                 tool_payload.feedback or "The draft failed deterministic validation."
@@ -7567,6 +7761,53 @@ class AIService:
                 context_size_estimate=overflow_exc.accumulated_chars_estimate,
             )
             return "", envelope
+        except ToolLoopOutputTruncated as trunc_exc:
+            logger.warning(
+                "Tool-loop output truncated for %s via %s at turn %d "
+                "(finish_reason=%s max_tokens=%s partial_content_chars=%d "
+                "partial_tool_calls=%d): %s",
+                model,
+                provider_key,
+                trunc_exc.turn,
+                trunc_exc.finish_reason,
+                trunc_exc.max_tokens,
+                trunc_exc.partial_content_chars,
+                trunc_exc.partial_tool_calls,
+                trunc_exc,
+            )
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_loop_output_truncated",
+                {
+                    "provider": provider_key,
+                    "model": model,
+                    "model_id": model_id,
+                    "turn": trunc_exc.turn,
+                    "loop_scope": loop_scope.value,
+                    "finish_reason": trunc_exc.finish_reason,
+                    "max_tokens": trunc_exc.max_tokens,
+                    "api_surface": trunc_exc.api_surface,
+                    "partial_content_chars": trunc_exc.partial_content_chars,
+                    "partial_tool_calls": trunc_exc.partial_tool_calls,
+                },
+            )
+            envelope = ToolLoopEnvelope(
+                loop_scope=loop_scope,
+                turns=trunc_exc.turn,
+                accepted=False,
+                accepted_via="output_truncated",
+                context_size_estimate=prompt_chars,
+                output_schema_valid=False,
+                output_truncated=True,
+                truncation_reason="output_token_limit",
+                provider_stop_reason=trunc_exc.finish_reason,
+                finish_reason=trunc_exc.finish_reason,
+                max_tokens=trunc_exc.max_tokens,
+                api_surface=trunc_exc.api_surface,
+                partial_content_chars=trunc_exc.partial_content_chars,
+                partial_tool_calls=trunc_exc.partial_tool_calls,
+            )
+            return "", envelope
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -8536,6 +8777,34 @@ class AIService:
                     images=images,
                 ):
                     yield chunk
+            elif provider == "minimax":
+                async for chunk in self._stream_minimax(
+                    prompt,
+                    model_id,
+                    temperature,
+                    adjusted_max_tokens,
+                    system_prompt,
+                    json_output=json_output,
+                    json_schema=effective_json_schema,
+                    usage_callback=usage_callback,
+                    usage_extra=extra_payload,
+                    images=images,
+                ):
+                    yield chunk
+            elif provider == "moonshot":
+                async for chunk in self._stream_moonshot(
+                    prompt,
+                    model_id,
+                    temperature,
+                    adjusted_max_tokens,
+                    system_prompt,
+                    json_output=json_output,
+                    json_schema=effective_json_schema,
+                    usage_callback=usage_callback,
+                    usage_extra=extra_payload,
+                    images=images,
+                ):
+                    yield chunk
             elif provider == "ollama":
                 async for chunk in self._stream_ollama(
                     prompt,
@@ -8701,8 +8970,6 @@ class AIService:
         """
         if not self.anthropic_client:
             raise ValueError("Claude client not initialized")
-
-        thinking_enabled = thinking_budget_tokens is not None and thinking_budget_tokens > 0
 
         # Check if model supports Structured Outputs (Sonnet 4.5+, Opus 4.1+, Haiku 4.5 - beta Nov 2025).
         # Single source of truth lives in `_claude_supports_structured_outputs`; update that helper
@@ -9051,6 +9318,13 @@ class AIService:
     @staticmethod
     def _openrouter_accepts_temperature(model_id: str) -> bool:
         """Return False for OpenRouter models documented to reject sampling params."""
+        if not runtime_parameters.accepts_parameter(
+            "openrouter",
+            model_id,
+            "temperature",
+            specs=getattr(config, "model_specs", {}) or {},
+        ):
+            return False
         normalized = (model_id or "").strip().lower().split(":", 1)[0].replace(".", "-")
         no_temperature_prefixes = (
             "anthropic/claude-opus-4-7",
@@ -9064,6 +9338,49 @@ class AIService:
         return not (
             any(normalized.startswith(marker) for marker in no_temperature_prefixes)
             or any(normalized == marker for marker in no_temperature_models)
+        )
+
+    @staticmethod
+    def _chat_parameter_allowed(provider: str, model_id: str, parameter_name: str) -> bool:
+        """Return whether a chat request parameter should be forwarded."""
+
+        if normalize_provider(provider) == "openrouter" and parameter_name == "temperature":
+            return AIService._openrouter_accepts_temperature(model_id)
+        return runtime_parameters.accepts_parameter(
+            provider,
+            model_id,
+            parameter_name,
+            specs=getattr(config, "model_specs", {}) or {},
+        )
+
+    @staticmethod
+    def _add_chat_parameter_if_allowed(
+        params: Dict[str, Any],
+        *,
+        provider: str,
+        model_id: str,
+        parameter_name: str,
+        value: Any,
+    ) -> bool:
+        """Attach a chat parameter when provider/model policy allows it."""
+
+        return runtime_parameters.add_parameter_if_allowed(
+            params,
+            parameter_name,
+            value,
+            provider=provider,
+            model_id=model_id,
+            specs=getattr(config, "model_specs", {}) or {},
+        )
+
+    @staticmethod
+    def _openai_compatible_token_parameter(provider: str, model_id: str) -> str:
+        """Return the token parameter for OpenAI-compatible chat providers."""
+
+        return runtime_parameters.openai_compatible_token_parameter(
+            provider,
+            model_id,
+            specs=getattr(config, "model_specs", {}) or {},
         )
 
     def _get_thinking_budget_details(self, model_id: str) -> Optional[Dict[str, Any]]:
@@ -9358,6 +9675,150 @@ class AIService:
             max_tokens=max_tokens,
         )
 
+    async def _generate_openai_compatible(
+        self,
+        *,
+        provider_key: str,
+        client: Any,
+        display_name: str,
+        prompt: str,
+        model_id: str,
+        temperature: float,
+        max_tokens: int,
+        system_prompt: str,
+        request_timeout: Optional[float] = None,
+        json_output: bool = False,
+        json_schema: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
+    ) -> Tuple[str, Any]:
+        """Generate content through an OpenAI-compatible Chat Completions provider."""
+
+        if not client:
+            raise ValueError(f"{display_name} client not initialized")
+
+        effective_system = system_prompt or ""
+        if self._should_inject_json_prompt(provider_key, model_id, json_output, json_schema):
+            json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+            if effective_system:
+                effective_system = f"{effective_system}\n\n{json_instructions}"
+            else:
+                effective_system = json_instructions
+
+        if images:
+            image_parts = self._build_openai_image_content(images, use_responses_api=False)
+            image_parts.append({"type": "text", "text": prompt})
+            messages = [{"role": "user", "content": image_parts}]
+        else:
+            messages = [{"role": "user", "content": prompt}]
+
+        if effective_system:
+            messages.insert(0, {"role": "system", "content": effective_system})
+
+        token_param = self._openai_compatible_token_parameter(provider_key, model_id)
+        request_params: Dict[str, Any] = {
+            "model": model_id,
+            "messages": messages,
+            token_param: max_tokens,
+        }
+        self._add_chat_parameter_if_allowed(
+            request_params,
+            provider=provider_key,
+            model_id=model_id,
+            parameter_name="temperature",
+            value=temperature,
+        )
+        if provider_key == "minimax":
+            request_params["extra_body"] = {"reasoning_split": True}
+
+        request_kwargs: Dict[str, Any] = {}
+        if request_timeout and request_timeout > 0:
+            request_kwargs["timeout"] = request_timeout
+
+        if json_output:
+            if json_schema and self._supports_structured_outputs(provider_key, model_id):
+                request_params["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "structured_output",
+                        "strict": True,
+                        "schema": json_schema,
+                    },
+                }
+                logger.info("Using %s JSON Schema structured outputs for %s", display_name, model_id)
+            elif self._supports_json_object(provider_key, model_id):
+                request_params["response_format"] = {"type": "json_object"}
+                logger.info("Using %s JSON mode for %s", display_name, model_id)
+
+        response = await client.chat.completions.create(
+            **request_params,
+            **request_kwargs,
+        )
+
+        return response.choices[0].message.content, self._usage_with_finish_metadata(
+            getattr(response, "usage", None),
+            response,
+            provider=provider_key,
+            max_tokens=max_tokens,
+        )
+
+    async def _generate_minimax(
+        self,
+        prompt: str,
+        model_id: str,
+        temperature: float,
+        max_tokens: int,
+        system_prompt: str,
+        request_timeout: Optional[float] = None,
+        json_output: bool = False,
+        json_schema: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
+    ) -> Tuple[str, Any]:
+        """Generate content using MiniMax's OpenAI-compatible API."""
+
+        return await self._generate_openai_compatible(
+            provider_key="minimax",
+            client=self.minimax_client,
+            display_name="MiniMax",
+            prompt=prompt,
+            model_id=model_id,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+            request_timeout=request_timeout,
+            json_output=json_output,
+            json_schema=json_schema,
+            images=images,
+        )
+
+    async def _generate_moonshot(
+        self,
+        prompt: str,
+        model_id: str,
+        temperature: float,
+        max_tokens: int,
+        system_prompt: str,
+        request_timeout: Optional[float] = None,
+        json_output: bool = False,
+        json_schema: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
+    ) -> Tuple[str, Any]:
+        """Generate content using Moonshot/Kimi's OpenAI-compatible API."""
+
+        return await self._generate_openai_compatible(
+            provider_key="moonshot",
+            client=self.moonshot_client,
+            display_name="Moonshot/Kimi",
+            prompt=prompt,
+            model_id=model_id,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+            request_timeout=request_timeout,
+            json_output=json_output,
+            json_schema=json_schema,
+            images=images,
+        )
+
     async def health_check(self) -> Dict[str, bool]:
         """Check health of all AI service providers"""
         health_status = {}
@@ -9424,6 +9885,42 @@ class AIService:
         except Exception as e:
             logger.error(f"xAI health check failed: {str(e)}")
             health_status["xai"] = False
+
+        # Test MiniMax
+        try:
+            if self.minimax_client:
+                route = resolve_call("health.minimax")
+                await self.minimax_client.chat.completions.create(
+                    model=route.model,
+                    messages=[{"role": "user", "content": "Hello"}],
+                    max_tokens=route.params.get("max_tokens", 5)
+                )
+                health_status["minimax"] = True
+            else:
+                health_status["minimax"] = False
+        except Exception as e:
+            logger.error(f"MiniMax health check failed: {str(e)}")
+            health_status["minimax"] = False
+
+        # Test Moonshot/Kimi
+        try:
+            if self.moonshot_client:
+                route = resolve_call("health.moonshot")
+                token_param = self._openai_compatible_token_parameter(
+                    "moonshot",
+                    route.model,
+                )
+                await self.moonshot_client.chat.completions.create(
+                    model=route.model,
+                    messages=[{"role": "user", "content": "Hello"}],
+                    **{token_param: route.params.get("max_tokens", 5)},
+                )
+                health_status["moonshot"] = True
+            else:
+                health_status["moonshot"] = False
+        except Exception as e:
+            logger.error(f"Moonshot health check failed: {str(e)}")
+            health_status["moonshot"] = False
 
         return health_status
 
@@ -9728,9 +10225,6 @@ class AIService:
             self._initialize_clients()
 
         extra_payload = usage_extra or {}
-
-        # Check if thinking mode is enabled
-        thinking_enabled = thinking_budget_tokens is not None and thinking_budget_tokens > 0
 
         # Check if model supports Structured Outputs (Sonnet 4.5+, Opus 4.1+, Haiku 4.5 - beta Nov 2025).
         # Single source of truth lives in `_claude_supports_structured_outputs`; update that helper
@@ -10370,6 +10864,196 @@ class AIService:
         except Exception as e:
             logger.error(f"OpenRouter streaming error: {e}")
             raise
+
+    async def _stream_openai_compatible(
+        self,
+        *,
+        provider_key: str,
+        client: Any,
+        display_name: str,
+        prompt: str,
+        model_id: str,
+        temperature: float,
+        max_tokens: int,
+        system_prompt: Optional[str],
+        json_output: bool = False,
+        json_schema: Optional[Dict[str, Any]] = None,
+        usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        usage_extra: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
+    ):
+        """Stream content through an OpenAI-compatible Chat Completions provider."""
+
+        if not client:
+            self._initialize_clients()
+            client = getattr(self, f"{provider_key}_client", None)
+        if not client:
+            raise ValueError(f"{display_name} client not initialized")
+
+        extra_payload = usage_extra or {}
+        effective_system = system_prompt or ""
+        if self._should_inject_json_prompt(provider_key, model_id, json_output, json_schema):
+            json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
+            if effective_system:
+                effective_system = f"{effective_system}\n\n{json_instructions}"
+            else:
+                effective_system = json_instructions
+
+        if images:
+            image_parts = self._build_openai_image_content(images, use_responses_api=False)
+            image_parts.append({"type": "text", "text": prompt})
+            messages = [{"role": "user", "content": image_parts}]
+        else:
+            messages = [{"role": "user", "content": prompt}]
+
+        if effective_system:
+            messages.insert(0, {"role": "system", "content": effective_system})
+
+        token_param = self._openai_compatible_token_parameter(provider_key, model_id)
+        create_params: Dict[str, Any] = {
+            "model": model_id,
+            "messages": messages,
+            token_param: max_tokens,
+            "stream": True,
+        }
+        self._add_chat_parameter_if_allowed(
+            create_params,
+            provider=provider_key,
+            model_id=model_id,
+            parameter_name="temperature",
+            value=temperature,
+        )
+        if provider_key == "minimax":
+            create_params["extra_body"] = {"reasoning_split": True}
+
+        if json_output:
+            if json_schema and self._supports_structured_outputs(provider_key, model_id):
+                create_params["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "structured_output",
+                        "strict": True,
+                        "schema": json_schema,
+                    },
+                }
+                logger.info(
+                    "Using %s JSON Schema structured outputs (streaming) for %s",
+                    display_name,
+                    model_id,
+                )
+            elif self._supports_json_object(provider_key, model_id):
+                create_params["response_format"] = {"type": "json_object"}
+                logger.info("Using %s JSON mode (streaming) for %s", display_name, model_id)
+
+        try:
+            stream = await client.chat.completions.create(**create_params)
+
+            usage_obj = None
+            finish_reason = None
+            async for chunk in stream:
+                if chunk.choices and len(chunk.choices) > 0:
+                    if getattr(chunk.choices[0], "finish_reason", None) is not None:
+                        finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+                    if chunk.choices[0].delta.content is not None:
+                        yield chunk.choices[0].delta.content
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage_obj = chunk.usage
+
+            if hasattr(stream, "response"):
+                usage_obj = getattr(stream.response, "usage", usage_obj)
+            elif hasattr(stream, "usage") and stream.usage:
+                usage_obj = stream.usage
+
+            usage_with_finish = self._usage_with_finish_metadata(
+                usage_obj,
+                None,
+                provider=provider_key,
+                max_tokens=max_tokens,
+                fallback_finish_reason=finish_reason,
+            )
+            self._emit_usage(
+                usage_callback,
+                model_id,
+                provider_key,
+                usage_with_finish,
+                extra_payload,
+            )
+            yield StreamChunk(
+                "",
+                is_thinking=False,
+                metadata=_build_finish_metadata(
+                    provider=provider_key,
+                    finish_reason=finish_reason,
+                    max_tokens=max_tokens,
+                ),
+            )
+        except Exception as e:
+            logger.error("%s streaming error: %s", display_name, e)
+            raise
+
+    async def _stream_minimax(
+        self,
+        prompt: str,
+        model_id: str,
+        temperature: float,
+        max_tokens: int,
+        system_prompt: Optional[str],
+        json_output: bool = False,
+        json_schema: Optional[Dict[str, Any]] = None,
+        usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        usage_extra: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
+    ):
+        """Stream MiniMax content generation."""
+
+        async for chunk in self._stream_openai_compatible(
+            provider_key="minimax",
+            client=self.minimax_client,
+            display_name="MiniMax",
+            prompt=prompt,
+            model_id=model_id,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+            json_output=json_output,
+            json_schema=json_schema,
+            usage_callback=usage_callback,
+            usage_extra=usage_extra,
+            images=images,
+        ):
+            yield chunk
+
+    async def _stream_moonshot(
+        self,
+        prompt: str,
+        model_id: str,
+        temperature: float,
+        max_tokens: int,
+        system_prompt: Optional[str],
+        json_output: bool = False,
+        json_schema: Optional[Dict[str, Any]] = None,
+        usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        usage_extra: Optional[Dict[str, Any]] = None,
+        images: Optional[List["ImageData"]] = None,
+    ):
+        """Stream Moonshot/Kimi content generation."""
+
+        async for chunk in self._stream_openai_compatible(
+            provider_key="moonshot",
+            client=self.moonshot_client,
+            display_name="Moonshot/Kimi",
+            prompt=prompt,
+            model_id=model_id,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+            json_output=json_output,
+            json_schema=json_schema,
+            usage_callback=usage_callback,
+            usage_extra=usage_extra,
+            images=images,
+        ):
+            yield chunk
 
     async def _generate_ollama(
         self,

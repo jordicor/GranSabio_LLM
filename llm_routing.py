@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import json_utils as json
-
+from ai_runtime import parameters as runtime_parameters
 
 DEFAULT_ROUTING_FILENAME = "llm_routing.default.json"
 
@@ -105,6 +105,8 @@ LLM_CALL_REGISTRY: Dict[str, LLMCallSpec] = {
     "health.claude": LLMCallSpec("health.claude", description="Claude provider health check"),
     "health.gemini": LLMCallSpec("health.gemini", description="Gemini provider health check"),
     "health.xai": LLMCallSpec("health.xai", description="xAI provider health check"),
+    "health.minimax": LLMCallSpec("health.minimax", description="MiniMax provider health check"),
+    "health.moonshot": LLMCallSpec("health.moonshot", description="Moonshot/Kimi provider health check"),
 }
 
 
@@ -449,6 +451,8 @@ def _validate_required_capabilities(
 def _param_supported(model_info: Mapping[str, Any], param_name: str) -> bool:
     provider = _provider_key(model_info)
     model_id = str(model_info.get("model_id") or "").lower()
+    if not runtime_parameters.accepts_parameter(provider, model_id, param_name):
+        return False
     if param_name == "temperature":
         if "gpt-5" in model_id or model_id.startswith(("o1", "o3", "o4")):
             return False

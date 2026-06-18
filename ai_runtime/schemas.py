@@ -177,7 +177,7 @@ def prepare_structured_output_schema(
         effective_schema = strip_additional_properties(json_schema)
         return convert_nullable_to_gemini_format(effective_schema)
 
-    if provider_key in {"openai", "openrouter", "xai", "ollama"}:
+    if provider_key in {"openai", "openrouter", "xai", "ollama", "minimax", "moonshot"}:
         return normalize_openai_strict_schema(json_schema)
 
     if provider_key in {"claude", "anthropic"} and claude_structured_outputs_supported:
@@ -241,7 +241,7 @@ def validate_schema_for_structured_outputs(
                     "do not allow 'additionalProperties: true'. Set it to false or remove it. "
                     "See https://docs.anthropic.com/en/docs/build-with-claude/structured-outputs"
                 )
-            if provider_key in {"openai", "openrouter", "xai", "ollama"}:
+            if provider_key in {"openai", "openrouter", "xai", "ollama", "minimax", "moonshot"}:
                 is_object_schema = schema_type == "object" or isinstance(node.get("properties"), dict)
                 if is_object_schema and node.get("additionalProperties") is not False:
                     raise ValueError(
@@ -251,7 +251,7 @@ def validate_schema_for_structured_outputs(
 
         properties = node.get("properties")
         if isinstance(properties, dict):
-            if provider_key in {"openai", "openrouter", "xai", "ollama"}:
+            if provider_key in {"openai", "openrouter", "xai", "ollama", "minimax", "moonshot"}:
                 required = node.get("required")
                 missing_required = [
                     prop_name

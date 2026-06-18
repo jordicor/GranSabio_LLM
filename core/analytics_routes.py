@@ -144,6 +144,8 @@ async def get_model_info(model_name: str):
         "google": bool(config.GOOGLE_API_KEY),
         "xai": bool(config.XAI_API_KEY),
         "openrouter": bool(config.OPENROUTER_API_KEY),
+        "minimax": bool(config.MINIMAX_API_KEY),
+        "moonshot": bool(config.MOONSHOT_API_KEY),
         "ollama": True,
         "fake": True,
     }
@@ -198,8 +200,6 @@ async def get_qa_models():
     # Add models from each provider with QA suitability info
     for provider, models in all_models.items():
         for model in models:
-            # Determine if model is good for QA based on capabilities and cost
-            is_qa_suitable = True
             qa_priority = "standard"
 
             # Prioritize models based on speed/cost for QA tasks

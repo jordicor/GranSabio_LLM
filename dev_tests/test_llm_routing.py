@@ -27,6 +27,10 @@ def stub_model_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
             provider = "google"
         elif model_lower.startswith("grok-"):
             provider = "xai"
+        elif model_lower.startswith("kimi-"):
+            provider = "moonshot"
+        elif model_lower.startswith("moonshotai/"):
+            provider = "openrouter"
         else:
             provider = "openai"
         capabilities = ["text"]
@@ -122,5 +126,69 @@ def test_unsupported_optional_param_warns_and_drops_by_default() -> None:
     resolution = resolve_call("generation.main", routing=routing)
 
     assert resolution.params == {"reasoning_effort": "low"}
+    assert resolution.warnings
+    assert "temperature" in resolution.warnings[0]
+
+
+def test_kimi_27_temperature_warns_and_drops_by_default() -> None:
+    routing = merge_routing_documents(
+        get_default_routing(),
+        {
+            "calls": {
+                "generation.main": {
+                    "model": "kimi-k2.7-code",
+                    "params": {"temperature": 0.2},
+                }
+            }
+        },
+    )
+
+    resolution = resolve_call("generation.main", routing=routing)
+
+    assert resolution.params == {}
+    assert resolution.warnings
+    assert "temperature" in resolution.warnings[0]
+
+
+def test_kimi_27_top_p_warns_and_drops_by_default() -> None:
+    routing = merge_routing_documents(
+        get_default_routing(),
+        {
+            "calls": {
+                "generation.main": {
+                    "model": "kimi-k2.7-code",
+                    "params": {"top_p": 0.5},
+                }
+            }
+        },
+    )
+
+    resolution = resolve_call("generation.main", routing=routing)
+
+    assert resolution.params == {}
+    assert resolution.warnings
+    assert any("top_p" in warning for warning in resolution.warnings)
+
+
+def test_openrouter_kimi_27_temperature_warns_and_drops_by_default() -> None:
+    routing = merge_routing_documents(
+        get_default_routing(),
+        {
+            "calls": {
+                "qa.evaluate_layer": {
+                    "models": [
+                        {
+                            "model": "moonshotai/kimi-k2.7-code",
+                            "params": {"temperature": 0.3},
+                        }
+                    ]
+                }
+            }
+        },
+    )
+
+    resolution = resolve_call_models("qa.evaluate_layer", routing=routing)
+
+    assert resolution.models == [{"model": "moonshotai/kimi-k2.7-code"}]
     assert resolution.warnings
     assert "temperature" in resolution.warnings[0]

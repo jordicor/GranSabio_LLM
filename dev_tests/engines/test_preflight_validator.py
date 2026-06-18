@@ -26,6 +26,7 @@ from preflight_validator import (
     _normalise_issues,
     _normalize_qa_models,
     _parse_validator_response,
+    _parse_validator_response_with_diagnostics,
     resolve_preflight_model,
     run_preflight_validation,
 )
@@ -433,6 +434,40 @@ class TestParseValidatorResponse:
 
         assert result == {"decision": "proceed", "summary": "OK"}
 
+    def test_json_wrapped_in_text_is_parsed_by_cleanroom(self):
+        """Given: JSON with AI wrapper text, Then: Extracts the object."""
+        raw = 'Here is the result:\n{"decision": "proceed", "summary": "OK"}\nDone.'
+        result = _parse_validator_response(raw)
+
+        assert result == {"decision": "proceed", "summary": "OK"}
+
+    def test_json_with_trailing_comma_is_repaired_by_cleanroom(self):
+        """Given: Minor JSON syntax slip, Then: Cleanroom repair parses it."""
+        raw = '{"decision": "proceed", "summary": "OK",}'
+        result = _parse_validator_response(raw)
+
+        assert result == {"decision": "proceed", "summary": "OK"}
+
+    def test_truncated_grok_eos_output_is_not_repaired(self):
+        """Given: JSON cut inside a field, Then: It remains fail-closed."""
+        raw = """{
+  "decision": "proceed",
+  "summary": "OK",
+  "user_feedback": "Request approved",
+  "issues": [],
+  "word_count_analysis": {
+    "conflicting_layers": [],
+    "recommended_removals": [],
+    "analysis_reason": "None"
+  },
+  "confidence":<|eos|>"""
+
+        parsed, diagnostics = _parse_validator_response_with_diagnostics(raw)
+
+        assert parsed is None
+        assert diagnostics["likely_truncated"] is True
+        assert diagnostics["errors"][0]["code"] == "parse_error"
+
     def test_invalid_json_returns_none(self):
         """Given: Invalid JSON, Then: Returns None."""
         result = _parse_validator_response("not valid json")
@@ -617,6 +652,28 @@ class TestRunPreflightValidation:
 
             assert result.decision == "reject"
             assert result.issues[0].code == "preflight_invalid_response"
+
+    @pytest.mark.asyncio
+    async def test_truncated_response_returns_specific_reject_summary(
+        self, request_with_qa_layers, mock_ai_service
+    ):
+        """Given: Truncated JSON, Then: Rejects fail-closed with truncation context."""
+        mock_ai_service.generate_content = AsyncMock(
+            return_value='{"decision": "proceed", "confidence":<|eos|>'
+        )
+
+        with patch("preflight_validator.config") as mock_config:
+            mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
+
+            result = await run_preflight_validation(
+                ai_service=mock_ai_service,
+                request=request_with_qa_layers,
+            )
+
+            assert result.decision == "reject"
+            assert result.summary == "Preflight response truncated"
+            assert result.issues[0].code == "preflight_invalid_response"
+            assert "truncated or incomplete JSON" in result.user_feedback
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("raw_output", ['[{}]', '"ok"', '123', 'true'])

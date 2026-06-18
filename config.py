@@ -426,6 +426,8 @@ class Config(BaseModel):
     GOOGLE_API_KEY: str = Field(default="", description="Google Gemini API key")
     XAI_API_KEY: str = Field(default="", description="xAI Grok API key")
     OPENROUTER_API_KEY: str = Field(default="", description="OpenRouter API key for unified model access")
+    MINIMAX_API_KEY: str = Field(default="", description="MiniMax API key")
+    MOONSHOT_API_KEY: str = Field(default="", description="Moonshot AI / Kimi API key")
     OLLAMA_HOST: str = Field(default="http://localhost:11434", description="Ollama server URL for local models")
     OLLAMA_MAX_CONCURRENT_REQUESTS: int = Field(
         default=1,
@@ -858,6 +860,12 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         self.GOOGLE_API_KEY = os.getenv("GEMINI_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
         self.XAI_API_KEY = os.getenv("XAI_API_KEY", "")
         self.OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+        self.MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
+        self.MOONSHOT_API_KEY = (
+            os.getenv("MOONSHOT_API_KEY", "")
+            or os.getenv("KIMI_API_KEY", "")
+            or os.getenv("KIMI_OPEN_PLATFORM_API_KEY", "")
+        )
         self.OLLAMA_HOST = os.getenv("OLLAMA_HOST", self.OLLAMA_HOST)
         ollama_concurrency_override = os.getenv("OLLAMA_MAX_CONCURRENT_REQUESTS")
         if ollama_concurrency_override:
@@ -1419,6 +1427,12 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         elif provider == "openrouter":
             api_key = self.OPENROUTER_API_KEY
             env_hint = "OPENROUTER_API_KEY"
+        elif provider == "minimax":
+            api_key = self.MINIMAX_API_KEY
+            env_hint = "MINIMAX_API_KEY"
+        elif provider == "moonshot":
+            api_key = self.MOONSHOT_API_KEY
+            env_hint = "MOONSHOT_API_KEY"
         elif provider == "ollama":
             api_key = "ollama"
         elif provider == "fake" or resolved["is_test_model"]:
@@ -1444,6 +1458,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "special_features": model_data.get("special_features", []),
             "provider_capabilities": model_data.get("provider_capabilities", {}),
             "supported_parameters": model_data.get("supported_parameters", []),
+            "parameter_constraints": model_data.get("parameter_constraints", {}),
             "sync_metadata": model_data.get("sync_metadata", {}),
             "reasoning_effort": model_data.get("reasoning_effort", {}),
             "thinking_budget": model_data.get("thinking_budget", {}),
@@ -1786,7 +1801,11 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         return {
             "openai": bool(self.OPENAI_API_KEY),
             "claude": bool(self.ANTHROPIC_API_KEY),
-            "gemini": bool(self.GOOGLE_API_KEY)
+            "gemini": bool(self.GOOGLE_API_KEY),
+            "xai": bool(self.XAI_API_KEY),
+            "openrouter": bool(self.OPENROUTER_API_KEY),
+            "minimax": bool(self.MINIMAX_API_KEY),
+            "moonshot": bool(self.MOONSHOT_API_KEY),
         }
 
     def validate_token_limits(

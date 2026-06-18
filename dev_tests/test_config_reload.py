@@ -76,6 +76,8 @@ def test_reload_model_specifications_rebuilds_legacy_maps(tmp_path, minimal_mode
         "GEMINI_KEY": "sk-gemini-test",
         "XAI_API_KEY": "sk-xai-test",
         "OPENROUTER_API_KEY": "sk-or-test",
+        "MINIMAX_API_KEY": "sk-minimax-test",
+        "MOONSHOT_API_KEY": "sk-moonshot-test",
     }
 
     with patch.dict(os.environ, env_patch, clear=False):

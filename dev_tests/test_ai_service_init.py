@@ -57,6 +57,8 @@ def mock_config_with_keys():
     mock_cfg.GOOGLE_API_KEY = "test-google-key"
     mock_cfg.XAI_API_KEY = "xai-test-key"
     mock_cfg.OPENROUTER_API_KEY = "sk-or-test-key"
+    mock_cfg.MINIMAX_API_KEY = "minimax-test-key"
+    mock_cfg.MOONSHOT_API_KEY = "moonshot-test-key"
     mock_cfg.OLLAMA_HOST = None  # Disabled by default
     mock_cfg.FAKE_AI_HOST = None
     return mock_cfg
@@ -71,6 +73,8 @@ def mock_config_no_keys():
     mock_cfg.GOOGLE_API_KEY = None
     mock_cfg.XAI_API_KEY = None
     mock_cfg.OPENROUTER_API_KEY = None
+    mock_cfg.MINIMAX_API_KEY = None
+    mock_cfg.MOONSHOT_API_KEY = None
     mock_cfg.OLLAMA_HOST = None
     mock_cfg.FAKE_AI_HOST = None
     return mock_cfg
@@ -255,7 +259,7 @@ class TestOpenAIClientInit:
             AIService()
 
             openai_async_calls = mock_all_api_clients["openai"].DefaultAsyncHttpxClient.call_args_list
-            assert len(openai_async_calls) == 3  # OpenAI, xAI, OpenRouter
+            assert len(openai_async_calls) == 5  # OpenAI, xAI, OpenRouter, MiniMax, Moonshot
             for call in openai_async_calls:
                 limits = call.kwargs["limits"]
                 assert limits.keepalive_expiry == SDK_HTTP_KEEPALIVE_EXPIRY_SECONDS
@@ -465,6 +469,86 @@ class TestOpenRouterClientInit:
 
                 assert service.openrouter_client is None
                 assert "OpenRouter API key not found" in caplog.text
+
+
+class TestMiniMaxClientInit:
+    """Tests for MiniMax client initialization."""
+
+    def test_minimax_client_initialized_with_key(self, mock_all_api_clients, mock_config_with_keys, reset_singleton):
+        """
+        Given: MINIMAX_API_KEY is set
+        When: AIService is initialized
+        Then: MiniMax client is created with correct base_url
+        """
+        with patch("ai_service.config", mock_config_with_keys):
+            from ai_service import AIService
+
+            service = AIService()
+
+            assert service.minimax_client is not None
+            calls = mock_all_api_clients["openai"].AsyncOpenAI.call_args_list
+            minimax_call = next(
+                (c for c in calls if c[1].get("base_url") == "https://api.minimax.io/v1"),
+                None,
+            )
+            assert minimax_call is not None
+            assert minimax_call[1]["api_key"] == "minimax-test-key"
+
+    def test_minimax_client_none_without_key(self, mock_all_api_clients, mock_config_no_keys, reset_singleton, caplog):
+        """
+        Given: MINIMAX_API_KEY is not set
+        When: AIService is initialized
+        Then: MiniMax client is None and warning is logged
+        """
+        with patch("ai_service.config", mock_config_no_keys):
+            import logging
+            with caplog.at_level(logging.WARNING):
+                from ai_service import AIService
+
+                service = AIService()
+
+                assert service.minimax_client is None
+                assert "MiniMax API key not found" in caplog.text
+
+
+class TestMoonshotClientInit:
+    """Tests for Moonshot/Kimi client initialization."""
+
+    def test_moonshot_client_initialized_with_key(self, mock_all_api_clients, mock_config_with_keys, reset_singleton):
+        """
+        Given: MOONSHOT_API_KEY is set
+        When: AIService is initialized
+        Then: Moonshot client is created with correct base_url
+        """
+        with patch("ai_service.config", mock_config_with_keys):
+            from ai_service import AIService
+
+            service = AIService()
+
+            assert service.moonshot_client is not None
+            calls = mock_all_api_clients["openai"].AsyncOpenAI.call_args_list
+            moonshot_call = next(
+                (c for c in calls if c[1].get("base_url") == "https://api.moonshot.ai/v1"),
+                None,
+            )
+            assert moonshot_call is not None
+            assert moonshot_call[1]["api_key"] == "moonshot-test-key"
+
+    def test_moonshot_client_none_without_key(self, mock_all_api_clients, mock_config_no_keys, reset_singleton, caplog):
+        """
+        Given: MOONSHOT_API_KEY is not set
+        When: AIService is initialized
+        Then: Moonshot client is None and warning is logged
+        """
+        with patch("ai_service.config", mock_config_no_keys):
+            import logging
+            with caplog.at_level(logging.WARNING):
+                from ai_service import AIService
+
+                service = AIService()
+
+                assert service.moonshot_client is None
+                assert "Moonshot API key not found" in caplog.text
 
 
 class TestOllamaClientInit:
@@ -708,6 +792,26 @@ class TestProviderRouting:
         }
 
     @pytest.fixture
+    def mock_model_info_minimax(self):
+        """Model info for MiniMax models."""
+        return {
+            "provider": "minimax",
+            "model_id": "MiniMax-M3",
+            "api_key": "minimax-test",
+            "output_tokens": 131072
+        }
+
+    @pytest.fixture
+    def mock_model_info_moonshot(self):
+        """Model info for Moonshot/Kimi models."""
+        return {
+            "provider": "moonshot",
+            "model_id": "kimi-k2.7-code",
+            "api_key": "moonshot-test",
+            "output_tokens": 65536
+        }
+
+    @pytest.fixture
     def mock_model_info_ollama(self):
         """Model info for Ollama models."""
         return {
@@ -763,6 +867,24 @@ class TestProviderRouting:
         """
         assert mock_model_info_openrouter["provider"] == "openrouter"
 
+    def test_routes_to_minimax_for_minimax_models(self, mock_model_info_minimax):
+        """
+        Given: Model info with provider='minimax'
+        When: generate_content routes the request
+        Then: _generate_minimax is called
+        """
+        assert mock_model_info_minimax["provider"] == "minimax"
+        assert mock_model_info_minimax["model_id"] == "MiniMax-M3"
+
+    def test_routes_to_moonshot_for_kimi_models(self, mock_model_info_moonshot):
+        """
+        Given: Model info with provider='moonshot'
+        When: generate_content routes the request
+        Then: _generate_moonshot is called
+        """
+        assert mock_model_info_moonshot["provider"] == "moonshot"
+        assert "kimi" in mock_model_info_moonshot["model_id"]
+
     def test_routes_to_ollama_for_local_models(self, mock_model_info_ollama):
         """
         Given: Model info with provider='ollama'
@@ -778,7 +900,7 @@ class TestProviderRouting:
         Then: Comparison is case-sensitive (providers are lowercase by convention)
         """
         # The config always returns lowercase provider names
-        providers = ["openai", "claude", "gemini", "xai", "openrouter", "ollama"]
+        providers = ["openai", "claude", "gemini", "xai", "openrouter", "minimax", "moonshot", "ollama"]
         for p in providers:
             assert p == p.lower()
 

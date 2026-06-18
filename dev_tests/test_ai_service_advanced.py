@@ -24,7 +24,7 @@ import json_utils as json
 from ai_service import AIRequestError, AIService, _ensure_aiohttp_compatibility
 from deterministic_validation import DraftValidationResult
 from provider_errors import ProviderErrorKind
-from tool_loop_models import LoopScope, OutputContract, ToolLoopEnvelope
+from tool_loop_models import LoopScope, OutputContract, ToolLoopEnvelope, ToolLoopOutputTruncated
 
 # ============================================================================
 # Fixtures
@@ -94,6 +94,21 @@ class _FakeClaudeStream:
         return self._final_response
 
 
+class _FakeOpenAICompatibleStream:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def __aiter__(self):
+        self._iter = iter(self._chunks)
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._iter)
+        except StopIteration:
+            raise StopAsyncIteration
+
+
 def _claude_message_delta(stop_reason: str):
     return SimpleNamespace(
         type="message_delta",
@@ -141,6 +156,87 @@ def _claude_stream_for_response(response, *, stop_reason="tool_use"):
         events.append(SimpleNamespace(type="content_block_stop", index=index))
     events.extend([_claude_message_delta(stop_reason), SimpleNamespace(type="message_stop")])
     return _FakeClaudeStream(events, response)
+
+
+# ============================================================================
+# Test Class: MiniMax OpenAI-compatible Runtime
+# ============================================================================
+
+class TestMiniMaxOpenAICompatibleRuntime:
+    """MiniMax-specific OpenAI-compatible runtime behavior."""
+
+    @pytest.mark.asyncio
+    async def test_generate_minimax_requests_reasoning_split(self, ai_service_instance):
+        ai_service_instance.minimax_client = Mock()
+        ai_service_instance.minimax_client.chat = Mock()
+        ai_service_instance.minimax_client.chat.completions = Mock()
+        ai_service_instance.minimax_client.chat.completions.create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="hola"),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
+        )
+
+        content, _usage = await ai_service_instance._generate_minimax(
+            prompt="Responde exactamente con: hola",
+            model_id="MiniMax-M3",
+            temperature=1.0,
+            max_tokens=128,
+            system_prompt="Responde de forma minima.",
+        )
+
+        assert content == "hola"
+        request_kwargs = ai_service_instance.minimax_client.chat.completions.create.await_args.kwargs
+        assert request_kwargs["extra_body"] == {"reasoning_split": True}
+
+    @pytest.mark.asyncio
+    async def test_stream_minimax_requests_reasoning_split(self, ai_service_instance):
+        ai_service_instance.minimax_client = Mock()
+        ai_service_instance.minimax_client.chat = Mock()
+        ai_service_instance.minimax_client.chat.completions = Mock()
+        ai_service_instance.minimax_client.chat.completions.create = AsyncMock(
+            return_value=_FakeOpenAICompatibleStream(
+                [
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content="hola"),
+                                finish_reason=None,
+                            )
+                        ],
+                        usage=None,
+                    ),
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content=None),
+                                finish_reason="stop",
+                            )
+                        ],
+                        usage=None,
+                    ),
+                ]
+            )
+        )
+
+        chunks = []
+        async for chunk in ai_service_instance._stream_minimax(
+            prompt="Responde exactamente con: hola",
+            model_id="MiniMax-M3",
+            temperature=1.0,
+            max_tokens=128,
+            system_prompt="Responde de forma minima.",
+        ):
+            chunks.append(chunk)
+
+        assert chunks[0] == "hola"
+        request_kwargs = ai_service_instance.minimax_client.chat.completions.create.await_args.kwargs
+        assert request_kwargs["extra_body"] == {"reasoning_split": True}
 
 
 # ============================================================================
@@ -974,6 +1070,9 @@ class TestSupportsClaudeThinking:
 class TestOpenRouterTemperatureParams:
     """Tests for OpenRouter model-specific temperature compatibility."""
 
+    def test_moonshot_kimi_27_openrouter_omits_temperature(self):
+        assert AIService._openrouter_accepts_temperature("moonshotai/kimi-k2.7-code") is False
+
     def test_claude_opus_47_omits_temperature(self):
         assert AIService._openrouter_accepts_temperature("anthropic/claude-opus-4.7") is False
 
@@ -1040,6 +1139,163 @@ class TestOpenRouterTemperatureParams:
 
         assert params["model"] == "anthropic/claude-opus-4.8"
         assert "temperature" not in params
+
+    def test_openrouter_tool_params_omit_temperature_for_kimi_27(self, ai_service_instance):
+        params = ai_service_instance._build_openai_compatible_tool_params(
+            provider="openrouter",
+            model_id="moonshotai/kimi-k2.7-code",
+            current_messages=[{"role": "user", "content": "Hello"}],
+            temperature=0.4,
+            max_tokens=64,
+            reasoning_effort=None,
+            json_output=False,
+            json_schema=None,
+            tools_enabled=False,
+        )
+
+        assert params["model"] == "moonshotai/kimi-k2.7-code"
+        assert "temperature" not in params
+
+
+class TestMoonshotKimiParameterPolicy:
+    """Tests for Moonshot/Kimi fixed sampling parameter handling."""
+
+    @pytest.mark.asyncio
+    async def test_generate_moonshot_kimi_27_omits_temperature(self, ai_service_instance):
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+                usage=None,
+            )
+        )
+        ai_service_instance.moonshot_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        content, _usage = await ai_service_instance._generate_moonshot(
+            prompt="Hello",
+            model_id="kimi-k2.7-code",
+            temperature=0.2,
+            max_tokens=64,
+            system_prompt="System",
+        )
+
+        assert content == "ok"
+        request_kwargs = create.await_args.kwargs
+        assert request_kwargs["model"] == "kimi-k2.7-code"
+        assert "temperature" not in request_kwargs
+        assert request_kwargs["max_completion_tokens"] == 64
+        assert "max_tokens" not in request_kwargs
+
+    @pytest.mark.asyncio
+    async def test_generate_openrouter_kimi_27_omits_temperature(self, ai_service_instance):
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+                usage=None,
+            )
+        )
+        ai_service_instance.openrouter_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        content, _usage = await ai_service_instance._generate_openrouter(
+            prompt="Hello",
+            model_id="moonshotai/kimi-k2.7-code",
+            temperature=0.2,
+            max_tokens=64,
+            system_prompt="System",
+        )
+
+        assert content == "ok"
+        request_kwargs = create.await_args.kwargs
+        assert request_kwargs["model"] == "moonshotai/kimi-k2.7-code"
+        assert request_kwargs["max_tokens"] == 64
+        assert "temperature" not in request_kwargs
+
+    @pytest.mark.asyncio
+    async def test_stream_moonshot_kimi_27_omits_temperature(self, ai_service_instance):
+        class _AsyncStream:
+            def __aiter__(self):
+                self._chunks = iter(
+                    [
+                        SimpleNamespace(
+                            choices=[
+                                SimpleNamespace(
+                                    delta=SimpleNamespace(content="ok"),
+                                    finish_reason=None,
+                                )
+                            ],
+                            usage=None,
+                        ),
+                        SimpleNamespace(
+                            choices=[
+                                SimpleNamespace(
+                                    delta=SimpleNamespace(content=None),
+                                    finish_reason="stop",
+                                )
+                            ],
+                            usage=None,
+                        ),
+                    ]
+                )
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self._chunks)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        create = AsyncMock(return_value=_AsyncStream())
+        ai_service_instance.moonshot_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        chunks = []
+        async for chunk in ai_service_instance._stream_moonshot(
+            prompt="Hello",
+            model_id="kimi-k2.7-code",
+            temperature=0.2,
+            max_tokens=64,
+            system_prompt="System",
+        ):
+            chunks.append(str(chunk))
+
+        request_kwargs = create.await_args.kwargs
+        assert request_kwargs["model"] == "kimi-k2.7-code"
+        assert "temperature" not in request_kwargs
+        assert request_kwargs["max_completion_tokens"] == 64
+        assert "max_tokens" not in request_kwargs
+        assert "ok" in chunks
+
+    @pytest.mark.asyncio
+    async def test_moonshot_health_check_uses_kimi_token_parameter(self, ai_service_instance):
+        create = AsyncMock(return_value=SimpleNamespace())
+        ai_service_instance.openai_client = None
+        ai_service_instance.anthropic_client = None
+        ai_service_instance.google_new_client = None
+        ai_service_instance.xai_client = None
+        ai_service_instance.minimax_client = None
+        ai_service_instance.moonshot_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        with patch(
+            "ai_service.resolve_call",
+            return_value=SimpleNamespace(
+                model="kimi-k2.7-code",
+                params={"max_tokens": 5},
+            ),
+        ):
+            status = await ai_service_instance.health_check()
+
+        request_kwargs = create.await_args.kwargs
+        assert status["moonshot"] is True
+        assert request_kwargs["model"] == "kimi-k2.7-code"
+        assert request_kwargs["max_completion_tokens"] == 5
+        assert "max_tokens" not in request_kwargs
+        assert "temperature" not in request_kwargs
 
 
 class TestClaudeOpus47And48Compatibility:
@@ -1878,7 +2134,7 @@ class TestClaudeStructuredOutputsParams:
         async def on_event(event_type, payload):
             events.append((event_type, payload))
 
-        with pytest.raises(RuntimeError, match="Chat Completions stream ended"):
+        with pytest.raises(ToolLoopOutputTruncated, match="Chat Completions stream ended") as exc_info:
             await ai_service_instance._stream_openai_compatible_tool_turn(
                 client,
                 {"model": "gpt-5.4-mini", "messages": []},
@@ -1891,6 +2147,8 @@ class TestClaudeStructuredOutputsParams:
                 cancellation_token=None,
             )
 
+        assert exc_info.value.finish_reason == "length"
+        assert exc_info.value.partial_tool_calls == 1
         assert any(event_type == "tool_loop_provider_terminal" for event_type, _ in events)
         assert not any(event_type == "tool_call_ready" for event_type, _ in events)
 

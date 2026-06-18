@@ -47,11 +47,31 @@ def generation_was_truncated(session: dict[str, Any]) -> bool:
 def build_truncation_failure_reason(session: dict[str, Any], request: Any) -> str:
     """Build a user/actionable reason for output-token truncation."""
 
+    def _metadata_get(metadata: Any, key: str) -> Any:
+        if isinstance(metadata, dict):
+            return metadata.get(key)
+        if hasattr(metadata, key):
+            return getattr(metadata, key)
+        return None
+
     finish_metadata = session.get("generation_finish_metadata") or {}
+    tool_metadata = session.get("generation_tool_metadata")
     stop_reason = None
-    if isinstance(finish_metadata, dict):
-        stop_reason = finish_metadata.get("finish_reason") or finish_metadata.get("provider_stop_reason")
-    max_tokens = getattr(request, "max_tokens", None)
+    if finish_metadata:
+        stop_reason = _metadata_get(finish_metadata, "finish_reason") or _metadata_get(
+            finish_metadata,
+            "provider_stop_reason",
+        )
+    if stop_reason is None and tool_metadata is not None:
+        stop_reason = _metadata_get(tool_metadata, "finish_reason") or _metadata_get(
+            tool_metadata,
+            "provider_stop_reason",
+        )
+    max_tokens = (
+        _metadata_get(finish_metadata, "max_tokens")
+        or _metadata_get(tool_metadata, "max_tokens")
+        or getattr(request, "max_tokens", None)
+    )
     details = []
     if stop_reason:
         details.append(f"stop_reason={stop_reason}")

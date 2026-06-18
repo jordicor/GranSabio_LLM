@@ -73,6 +73,10 @@ NDH6SA~M
 # Codex local config
 .codex
 
+# Local AI agent instructions (machine-specific; not versioned)
+AGENTS.md
+CLAUDE.md
+
 # macOS WebDAV metadata (accidentally synced from network drive)
 ._DAV/
 
@@ -98,6 +102,9 @@ backups/
 test_outputs/
 /docs/
 *.test
+
+# Auto-generated model-route benchmark result dumps (regenerated per run)
+dev_tests/model_benchmark_results/
 
 # Database files
 *.db

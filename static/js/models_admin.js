@@ -2,8 +2,8 @@
   /* ═══════════════════════════════════════════════════
    * Constants
    * ═══════════════════════════════════════════════════ */
-  const TABS = ["catalog", "openai", "anthropic", "google", "xai", "openrouter", "ollama"];
-  const PROVIDER_TABS = ["openai", "anthropic", "google", "xai", "openrouter", "ollama"];
+  const TABS = ["catalog", "openai", "anthropic", "google", "xai", "openrouter", "minimax", "moonshot", "ollama"];
+  const PROVIDER_TABS = ["openai", "anthropic", "google", "xai", "openrouter", "minimax", "moonshot", "ollama"];
   const PROVIDER_LABELS = {
     catalog: "Catalog",
     openai: "OpenAI",
@@ -11,17 +11,21 @@
     google: "Google",
     xai: "xAI",
     openrouter: "OpenRouter",
+    minimax: "MiniMax",
+    moonshot: "Moonshot/Kimi",
     ollama: "Ollama",
   };
   const FULL_SYNC_PROVIDERS = new Set(["openrouter", "xai", "ollama"]);
   const REMOVE_MISSING_BY_DEFAULT_PROVIDERS = new Set(["ollama"]);
-  const HEALTH_PROVIDERS = ["openai", "claude", "gemini", "xai", "openrouter", "ollama"];
+  const HEALTH_PROVIDERS = ["openai", "claude", "gemini", "xai", "openrouter", "minimax", "moonshot", "ollama"];
   const HEALTH_PROVIDER_LABELS = {
     openai: "OpenAI",
     claude: "Claude",
     gemini: "Gemini",
     xai: "xAI",
     openrouter: "OpenRouter",
+    minimax: "MiniMax",
+    moonshot: "Moonshot/Kimi",
     ollama: "Ollama",
   };
 
@@ -318,7 +322,7 @@
       }
       try {
         const suffix = refreshOfficial ? "?refresh=true" : "";
-        const payload = await fetchJson(`/api/admin/provider-health${suffix}`);
+        const payload = await this.fetchJson(`/api/admin/provider-health${suffix}`);
         this.providerHealth = payload;
         this.renderProviderHealth();
       } catch (err) {

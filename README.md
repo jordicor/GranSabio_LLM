@@ -103,7 +103,7 @@ Click **"Live Matrix"** to watch the entire process unfold:
 
 ### 200+ Models via OpenRouter
 
-Beyond direct API connections (OpenAI, Anthropic, Google, xAI), you can access **all models available on OpenRouter** - including Mistral, DeepSeek, LLaMA, Qwen, and many more.
+Beyond direct API connections (OpenAI, Anthropic, Google, xAI, MiniMax, and Moonshot/Kimi), you can access **all models available on OpenRouter** - including Mistral, DeepSeek, LLaMA, Qwen, and many more.
 
 ![OpenRouter Models](screenshots/openrouter-models.png)
 *Access hundreds of models through OpenRouter integration*
@@ -530,12 +530,16 @@ Create `.env` file with **your own API keys** from each provider:
 # - Google: https://aistudio.google.com/apikey
 # - xAI: https://console.x.ai/
 # - OpenRouter: https://openrouter.ai/keys
+# - MiniMax: https://platform.minimax.io/
+# - Moonshot/Kimi: https://platform.kimi.ai/console/api-keys
 
 OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-ant-...
 GOOGLE_API_KEY=...
 XAI_API_KEY=xai-...
 OPENROUTER_API_KEY=sk-or-...
+MINIMAX_API_KEY=...
+MOONSHOT_API_KEY=...
 PEPPER=any-random-string-here
 ```
 
@@ -693,7 +697,7 @@ Group multiple sessions under a single project ID:
 | `/api/admin/models/catalog/{provider}` | DELETE | Remove one local catalog model |
 | `/api/admin/models/sync-all` | POST | Sync the provider/model selection supplied in the request body |
 
-Provider sync covers OpenAI, Anthropic, Google, xAI, OpenRouter, and local Ollama models from `OLLAMA_HOST` via Ollama's native `/api/version` and `/api/tags` endpoints.
+Provider sync covers OpenAI, Anthropic, Google, xAI, OpenRouter, MiniMax, Moonshot/Kimi, and local Ollama models from `OLLAMA_HOST` via Ollama's native `/api/version` and `/api/tags` endpoints.
 
 ---
 
@@ -826,7 +830,7 @@ Gran Sabio LLM is currently a **self-hosted solution**. You deploy it on your in
 
 | Aspect | Self-Hosted |
 |--------|-------------|
-| **API Keys** | You obtain and configure keys from OpenAI, Anthropic, Google, xAI, and/or OpenRouter |
+| **API Keys** | You obtain and configure keys from OpenAI, Anthropic, Google, xAI, MiniMax, Moonshot/Kimi, and/or OpenRouter |
 | **Billing** | Each provider bills you directly based on your usage |
 | **Infrastructure** | You host and maintain the server |
 | **Data Privacy** | Your prompts and content stay on your infrastructure |
@@ -843,7 +847,7 @@ Gran Sabio LLM is currently a **self-hosted solution**. You deploy it on your in
 ### Requirements
 
 - Python 3.10+
-- **API keys for at least one provider** (OpenAI, Anthropic, Google, xAI, or OpenRouter)
+- **API keys for at least one provider** (OpenAI, Anthropic, Google, xAI, MiniMax, Moonshot/Kimi, or OpenRouter)
 - ~500MB disk space for dependencies
 - Recommended: 4GB RAM minimum
 - Pillow library (auto-installed, required for vision/image processing)

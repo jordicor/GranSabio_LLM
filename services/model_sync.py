@@ -16,17 +16,32 @@ from urllib.parse import urlsplit, urlunsplit
 import aiohttp
 
 import json_utils as json
+from ai_runtime.parameters import (
+    KIMI_FIXED_SAMPLING_PARAMETER_POLICY,
+    is_kimi_fixed_sampling_model,
+)
 
 MODEL_SPECS_PATH = Path(__file__).resolve().parent.parent / "model_specs.json"
 MODEL_SPECS_BACKUP_DIR = Path(__file__).resolve().parent.parent / "backups"
-SUPPORTED_SYNC_PROVIDERS = ("openrouter", "xai", "openai", "anthropic", "google", "ollama")
+SUPPORTED_SYNC_PROVIDERS = (
+    "openrouter",
+    "xai",
+    "openai",
+    "anthropic",
+    "google",
+    "minimax",
+    "moonshot",
+    "ollama",
+)
 FULL_SYNC_PROVIDERS = {"openrouter", "xai", "ollama"}
-DISCOVERY_SYNC_PROVIDERS = {"openai", "anthropic", "google"}
+DISCOVERY_SYNC_PROVIDERS = {"openai", "anthropic", "google", "minimax", "moonshot"}
 OPENAI_MODEL_LIST_URL = "https://api.openai.com/v1/models"
 ANTHROPIC_MODEL_LIST_URL = "https://api.anthropic.com/v1/models"
 XAI_LANGUAGE_MODELS_URL = "https://api.x.ai/v1/language-models"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 GOOGLE_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+MINIMAX_MODELS_URL = "https://api.minimax.io/v1/models"
+MOONSHOT_MODELS_URL = "https://api.moonshot.ai/v1/models"
 OLLAMA_MODEL_LIST_SOURCE = "local/ollama"
 OLLAMA_DEFAULT_CONTEXT_WINDOW = 32768
 OLLAMA_DEFAULT_OUTPUT_TOKENS = 8192
@@ -93,6 +108,17 @@ def _dedupe_strings(values: Iterable[str]) -> list[str]:
         seen.add(normalized)
         result.append(normalized)
     return result
+
+
+def _parameter_constraints_for_model(provider: str, model_id: str) -> dict[str, Any]:
+    """Return provider/model parameter constraints persisted into model specs."""
+
+    if is_kimi_fixed_sampling_model(provider, model_id):
+        return {
+            name: dict(policy)
+            for name, policy in KIMI_FIXED_SAMPLING_PARAMETER_POLICY.items()
+        }
+    return {}
 
 
 def _remote_json_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str]:
@@ -310,6 +336,7 @@ class ModelSyncService:
                         "output_tokens": model_data.get("output_tokens", 0),
                         "capabilities": model_data.get("capabilities", []),
                         "supported_parameters": model_data.get("supported_parameters", []),
+                        "parameter_constraints": model_data.get("parameter_constraints", {}),
                         "pricing": model_data.get("pricing", {}),
                         "verified_at": model_data.get("verified_at"),
                         "source": model_data.get("source"),
@@ -345,6 +372,8 @@ class ModelSyncService:
             "openai": self._fetch_openai_remote,
             "anthropic": self._fetch_anthropic_remote,
             "google": self._fetch_google_remote,
+            "minimax": self._fetch_minimax_remote,
+            "moonshot": self._fetch_moonshot_remote,
             "ollama": self._fetch_ollama_remote,
         }
         remote_models = await fetchers[provider]()
@@ -412,6 +441,10 @@ class ModelSyncService:
                     },
                     "capabilities": _dedupe_strings(capabilities),
                     "supported_parameters": supported_parameters,
+                    "parameter_constraints": _parameter_constraints_for_model(
+                        "openrouter",
+                        model_id,
+                    ),
                     "supported": True,
                     "needs_review": False,
                     "sync_mode": "full",
@@ -729,6 +762,119 @@ class ModelSyncService:
         self.logger.info("Fetched %d text-generation models from Google API", len(all_models))
         return all_models
 
+    async def _fetch_minimax_remote(self) -> list[dict[str, Any]]:
+        """Fetch MiniMax OpenAI-compatible model discoveries."""
+
+        api_key = getattr(self.config, "MINIMAX_API_KEY", "")
+        if not api_key:
+            raise ModelSyncError("MINIMAX_API_KEY not configured.")
+
+        headers = _remote_json_headers({"Authorization": f"Bearer {api_key}"})
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                MINIMAX_MODELS_URL,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as response:
+                if response.status != 200:
+                    raise ModelSyncError(f"MiniMax API error: {await response.text()}")
+                payload = await response.json()
+
+        current_specs = self._get_provider_specs(self.load_specs(), "minimax")
+        remote_models: list[dict[str, Any]] = []
+        for model in payload.get("data", []) or []:
+            model_id = str(model.get("id", "")).strip()
+            if not model_id:
+                continue
+            remote_models.append(
+                self._build_discovery_entry(
+                    provider="minimax",
+                    model_id=model_id,
+                    display_name=model_id,
+                    remote_created_at=_iso_from_unix_timestamp(model.get("created")),
+                    current_provider_specs=current_specs,
+                )
+            )
+
+        remote_models.sort(key=lambda item: (item.get("remote_created_at") or "", item["model_id"]), reverse=True)
+        return remote_models
+
+    async def _fetch_moonshot_remote(self) -> list[dict[str, Any]]:
+        """Fetch Moonshot/Kimi OpenAI-compatible model discoveries."""
+
+        api_key = getattr(self.config, "MOONSHOT_API_KEY", "")
+        if not api_key:
+            raise ModelSyncError("MOONSHOT_API_KEY / KIMI_API_KEY not configured.")
+
+        headers = _remote_json_headers({"Authorization": f"Bearer {api_key}"})
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                MOONSHOT_MODELS_URL,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as response:
+                if response.status != 200:
+                    raise ModelSyncError(f"Moonshot API error: {await response.text()}")
+                payload = await response.json()
+
+        current_specs = self._get_provider_specs(self.load_specs(), "moonshot")
+        remote_models: list[dict[str, Any]] = []
+        for model in payload.get("data", []) or []:
+            model_id = str(model.get("id", "")).strip()
+            if not model_id:
+                continue
+
+            entry = self._build_discovery_entry(
+                provider="moonshot",
+                model_id=model_id,
+                display_name=model_id,
+                remote_created_at=_iso_from_unix_timestamp(model.get("created")),
+                current_provider_specs=current_specs,
+            )
+
+            context_length = _safe_int(model.get("context_length"), _safe_int(entry.get("context_window")))
+            if context_length > 0:
+                entry["context_window"] = context_length
+                entry["input_tokens"] = context_length
+                if not current_specs.get(model_id):
+                    entry["output_tokens"] = max(context_length // 4, 8192)
+
+            capabilities = ["text"]
+            if model.get("supports_image_in") is True:
+                capabilities.append("vision")
+            if model.get("supports_video_in") is True:
+                capabilities.append("video")
+            if model.get("supports_reasoning") is True:
+                capabilities.append("reasoning")
+            entry["capabilities"] = _dedupe_strings(capabilities)
+            if is_kimi_fixed_sampling_model("moonshot", model_id):
+                entry["supported_parameters"] = _dedupe_strings(
+                    entry.get("supported_parameters")
+                    or [
+                        "max_completion_tokens",
+                        "response_format",
+                        "stream",
+                        "stream_options",
+                        "thinking",
+                        "tool_choice",
+                        "tools",
+                    ]
+                )
+            entry["parameter_constraints"] = _parameter_constraints_for_model(
+                "moonshot",
+                model_id,
+            )
+            entry["raw"] = {
+                "supports_image_in": model.get("supports_image_in"),
+                "supports_video_in": model.get("supports_video_in"),
+                "supports_reasoning": model.get("supports_reasoning"),
+                "owned_by": model.get("owned_by"),
+            }
+            remote_models.append(entry)
+
+        remote_models.sort(key=lambda item: (item.get("remote_created_at") or "", item["model_id"]), reverse=True)
+        return remote_models
+
     def _build_discovery_entry(
         self,
         *,
@@ -780,6 +926,8 @@ class ModelSyncService:
             "openai": "https://developers.openai.com/api/reference/resources/models/methods/list",
             "anthropic": "https://docs.anthropic.com/en/api/models-list",
             "google": GOOGLE_MODELS_URL,
+            "minimax": MINIMAX_MODELS_URL,
+            "moonshot": MOONSHOT_MODELS_URL,
         }
         source_url = source_urls.get(provider, "")
 
@@ -871,6 +1019,7 @@ class ModelSyncService:
                         "pricing": local_spec.get("pricing", {}),
                         "capabilities": local_spec.get("capabilities", []),
                         "supported_parameters": local_spec.get("supported_parameters", []),
+                        "parameter_constraints": local_spec.get("parameter_constraints", {}),
                         "supported": True,
                         "needs_review": False,
                         "sync_mode": self.get_sync_mode(provider),
@@ -887,7 +1036,7 @@ class ModelSyncService:
             if provider == "openrouter"
             else (lambda item: ((item.get("remote_created_at") or ""), item["name"].lower()))
         )
-        merged.sort(key=sort_key, reverse=provider in {"openai", "anthropic", "xai"})
+        merged.sort(key=sort_key, reverse=provider in {"openai", "anthropic", "xai", "minimax", "moonshot"})
         return merged
 
     def _determine_remote_status(
@@ -913,6 +1062,7 @@ class ModelSyncService:
             "pricing",
             "capabilities",
             "supported_parameters",
+            "parameter_constraints",
             "source",
         )
         has_changes = any(local_spec.get(field) != generated_spec.get(field) for field in relevant_fields)
@@ -1165,6 +1315,9 @@ class ModelSyncService:
         supported_parameters = model.get("supported_parameters")
         if supported_parameters is None:
             supported_parameters = current_spec.get("supported_parameters")
+        parameter_constraints = model.get("parameter_constraints")
+        if parameter_constraints is None:
+            parameter_constraints = current_spec.get("parameter_constraints")
         sync_mode = self.get_sync_mode(provider)
         sync_meta = dict(current_spec.get("sync_metadata", {}) or {})
         sync_meta.update(
@@ -1197,6 +1350,11 @@ class ModelSyncService:
                 },
                 "capabilities": _dedupe_strings(capabilities or ["text"]),
                 "supported_parameters": _dedupe_strings(supported_parameters or []),
+                "parameter_constraints": (
+                    dict(parameter_constraints)
+                    if isinstance(parameter_constraints, dict)
+                    else {}
+                ),
                 "verified_at": _utc_now_iso(),
                 "source": _nested_lookup(model, "source", "url") or current_spec.get("source"),
                 "sync_metadata": sync_meta,

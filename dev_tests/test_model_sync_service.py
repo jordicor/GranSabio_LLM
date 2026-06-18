@@ -62,6 +62,26 @@ class _FakeOllamaSession:
         raise AssertionError(f"Unexpected URL: {url}")
 
 
+class _FakeSingleGetSession:
+    def __init__(self, *, payload=None, status=200, text=""):
+        self.payload = payload if payload is not None else {}
+        self.status = status
+        self.text = text
+        self.urls = []
+        self.headers = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def get(self, url, **kwargs):
+        self.urls.append(url)
+        self.headers.append(kwargs.get("headers", {}))
+        return _FakeResponse(status=self.status, payload=self.payload, text=self.text)
+
+
 @pytest.fixture
 def sample_model_specs():
     return {
@@ -135,6 +155,8 @@ def service(tmp_path, sample_model_specs):
             XAI_API_KEY="xai-test",
             OPENAI_API_KEY="openai-test",
             ANTHROPIC_API_KEY="anthropic-test",
+            MINIMAX_API_KEY="minimax-test",
+            MOONSHOT_API_KEY="moonshot-test",
             OLLAMA_HOST="http://localhost:11434",
             model_specs=sample_model_specs,
             reload_model_specifications=MagicMock(),
@@ -272,6 +294,78 @@ def test_remote_json_headers_do_not_request_brotli():
 def test_normalize_ollama_host_rewrites_unspecified_bind_address():
     assert _normalize_ollama_host("0.0.0.0:11434/v1") == "http://127.0.0.1:11434"
     assert _normalize_ollama_host("http://192.168.1.50:11434") == "http://192.168.1.50:11434"
+
+
+@pytest.mark.asyncio
+async def test_fetch_minimax_remote_models_as_discovery_entries(service, monkeypatch):
+    fake_session = _FakeSingleGetSession(
+        payload={
+            "object": "list",
+            "data": [
+                {
+                    "id": "MiniMax-M3",
+                    "object": "model",
+                    "created": 1780272000,
+                    "owned_by": "minimax",
+                }
+            ],
+        }
+    )
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+
+    result = await service.fetch_remote_models("minimax")
+
+    assert fake_session.urls == [model_sync.MINIMAX_MODELS_URL]
+    assert fake_session.headers[0]["Authorization"] == "Bearer minimax-test"
+    assert result["provider"] == "minimax"
+    assert result["sync_mode"] == "discovery-assisted"
+    assert result["stats"]["review"] == 1
+    model = result["models"][0]
+    assert model["id"] == "MiniMax-M3"
+    assert model["capabilities"] == ["text"]
+    assert model["needs_review"] is True
+    assert model["source"] == model_sync.MINIMAX_MODELS_URL
+
+
+@pytest.mark.asyncio
+async def test_fetch_moonshot_remote_models_with_context_and_modalities(service, monkeypatch):
+    fake_session = _FakeSingleGetSession(
+        payload={
+            "object": "list",
+            "data": [
+                {
+                    "id": "kimi-k2.7-code",
+                    "object": "model",
+                    "created": 1781222400,
+                    "owned_by": "moonshot",
+                    "context_length": 262144,
+                    "supports_image_in": True,
+                    "supports_video_in": True,
+                    "supports_reasoning": True,
+                }
+            ],
+        }
+    )
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+
+    result = await service.fetch_remote_models("moonshot")
+
+    assert fake_session.urls == [model_sync.MOONSHOT_MODELS_URL]
+    assert fake_session.headers[0]["Authorization"] == "Bearer moonshot-test"
+    assert result["provider"] == "moonshot"
+    assert result["sync_mode"] == "discovery-assisted"
+    assert result["stats"]["review"] == 1
+    model = result["models"][0]
+    assert model["id"] == "kimi-k2.7-code"
+    assert model["context_window"] == 262144
+    assert model["input_tokens"] == 262144
+    assert model["output_tokens"] == 65536
+    assert model["capabilities"] == ["text", "vision", "video", "reasoning"]
+    assert "temperature" not in model["supported_parameters"]
+    assert model["parameter_constraints"]["temperature"]["mode"] == "omit"
+    assert model["parameter_constraints"]["temperature"]["fixed_value"] == 1.0
+    assert model["raw"]["supports_reasoning"] is True
+    assert model["source"] == model_sync.MOONSHOT_MODELS_URL
 
 
 @pytest.mark.asyncio

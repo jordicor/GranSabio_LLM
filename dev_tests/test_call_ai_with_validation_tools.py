@@ -37,6 +37,7 @@ from tool_loop_models import (
     PayloadScope,
     ToolLoopContractError,
     ToolLoopEnvelope,
+    ToolLoopOutputTruncated,
     ToolLoopSchemaViolationError,
     ValidationToolInputTooLarge,
 )
@@ -246,6 +247,60 @@ async def test_fallback_no_tool_support_when_model_capability_is_unconfirmed():
 
     assert content == ""
     assert envelope.tools_skipped_reason == "no_tool_support"
+
+
+@pytest.mark.asyncio
+async def test_output_truncated_tool_loop_returns_controlled_envelope():
+    """Provider output-token stops surface as metadata, not a generic crash."""
+    service = AIService.__new__(AIService)
+    fake_loop = AsyncMock(
+        side_effect=ToolLoopOutputTruncated(
+            "OpenAI Chat Completions stream ended with unusable finish_reason=length",
+            provider="openai",
+            model_id="gpt-5.4",
+            turn=1,
+            finish_reason="length",
+            max_tokens=1024,
+            api_surface="chat_completions",
+            partial_content_chars=0,
+            partial_tool_calls=1,
+        )
+    )
+    with patch.object(AIService, "_normalize_tool_loop_provider", return_value="openai"), \
+         patch.object(AIService, "_supports_tool_calling", return_value=True), \
+         patch.object(AIService, "_is_openai_responses_api_model", return_value=False), \
+         patch.object(AIService, "_apply_temperature_policies", return_value=(0.7, None, False)), \
+         patch.object(AIService, "_should_inject_json_prompt", return_value=False), \
+         patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
+         patch.object(AIService, "_run_openai_compatible_validation_tool_loop", new=fake_loop), \
+         patch("ai_service.config") as mock_config:
+        mock_config.validate_token_limits.return_value = {
+            "adjusted_tokens": 1024,
+            "adjusted_reasoning_effort": None,
+            "adjusted_thinking_budget_tokens": None,
+            "model_info": {"provider": "openai", "model_id": "gpt-5.4"},
+            "reasoning_timeout_seconds": None,
+        }
+        mock_config.GENERATOR_SYSTEM_PROMPT = "system"
+        mock_config.GENERATOR_SYSTEM_PROMPT_RAW = "raw system"
+        mock_config.TOOL_LOOP_MAX_PROMPT_CHARS = 200_000
+        mock_config.get_model_info.return_value = {"input_tokens": 128_000}
+
+        content, envelope = await service.call_ai_with_validation_tools(
+            prompt="Write something long.",
+            model="gpt-5.4",
+            validation_callback=lambda _: _approved_result(),
+        )
+
+    assert content == ""
+    assert envelope.accepted is False
+    assert envelope.accepted_via == "output_truncated"
+    assert envelope.tools_skipped_reason is None
+    assert envelope.output_truncated is True
+    assert envelope.truncation_reason == "output_token_limit"
+    assert envelope.provider_stop_reason == "length"
+    assert envelope.max_tokens == 1024
+    assert envelope.partial_tool_calls == 1
 
 
 @pytest.mark.asyncio

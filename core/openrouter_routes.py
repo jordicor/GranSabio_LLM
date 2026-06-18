@@ -5,6 +5,7 @@ Unified model admin and provider sync routes for Gran Sabio LLM.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from urllib.parse import urlparse
 
 from fastapi import Depends, HTTPException, Query, Request
@@ -16,6 +17,7 @@ from .app_state import app, config, logger, templates
 from .security import require_internal_ip
 
 _specs_write_lock = asyncio.Lock()
+_MODELS_ADMIN_JS_PATH = Path(__file__).resolve().parents[1] / "static" / "js" / "models_admin.js"
 
 
 def _default_port(scheme: str) -> int | None:
@@ -61,6 +63,13 @@ def _get_model_sync_service() -> ModelSyncService:
     return ModelSyncService(config=config, logger=logger)
 
 
+def _models_admin_asset_version() -> str:
+    try:
+        return str(_MODELS_ADMIN_JS_PATH.stat().st_mtime_ns)
+    except OSError:
+        return "dev"
+
+
 def _normalize_provider(provider: str) -> str:
     normalized = provider.strip().lower()
     if normalized not in SUPPORTED_SYNC_PROVIDERS:
@@ -85,6 +94,7 @@ async def admin_models(
             "request": request,
             "initial_tab": normalized_tab,
             "supported_providers": list(SUPPORTED_SYNC_PROVIDERS),
+            "models_admin_asset_version": _models_admin_asset_version(),
         },
     )
 
