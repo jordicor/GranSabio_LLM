@@ -13,7 +13,14 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import json_utils as json
-from ai_service import AccentGuardError, AIRequestError, AIService, StreamChunk
+from ai_service import (
+    AccentGuardError,
+    AIRequestError,
+    AIService,
+    GenerationOutputTruncated,
+    GenerationStoppedUnexpectedly,
+    StreamChunk,
+)
 from attachments_router import get_attachment_manager
 from config import EDITABLE_CONTENT_TYPES, config
 from deal_breaker_tracker import get_tracker
@@ -59,6 +66,7 @@ from qa_result_utils import (
     is_technical_qa_failure,
     semantic_deal_breakers,
 )
+from request_timeouts import resolve_request_timeout
 from services.attachment_manager import (
     AttachmentError,
     AttachmentManager,
@@ -1150,6 +1158,9 @@ def _get_final_content(session: Dict[str, Any], raw_content: str, request: Conte
 
 def _is_retryable_streaming_error(exc: Exception) -> bool:
     """Determine if a streaming error should trigger a retry."""
+    if isinstance(exc, (GenerationOutputTruncated, GenerationStoppedUnexpectedly)):
+        return False
+
     # AIRequestError already went through retry logic in ai_service
     # but we want to retry at this level too for partial content scenarios
     if isinstance(exc, AIRequestError):
@@ -1183,6 +1194,9 @@ def _is_retryable_streaming_error(exc: Exception) -> bool:
 
 def _extract_error_reason(exc: Exception) -> str:
     """Extract a human-readable error reason from an exception."""
+    if isinstance(exc, (GenerationOutputTruncated, GenerationStoppedUnexpectedly)):
+        return str(exc)
+
     if isinstance(exc, AIRequestError):
         cause = exc.cause
         if hasattr(cause, 'message'):
@@ -1204,6 +1218,9 @@ def _extract_error_reason(exc: Exception) -> str:
 
 def _extract_provider(exc: Exception) -> Optional[str]:
     """Extract provider name from an exception if available."""
+    if isinstance(exc, (GenerationOutputTruncated, GenerationStoppedUnexpectedly)):
+        return getattr(exc, "provider", None)
+
     if isinstance(exc, AIRequestError):
         return getattr(exc, "provider", None)
 
@@ -1218,6 +1235,50 @@ def _extract_provider(exc: Exception) -> Optional[str]:
         return "xai"
 
     return None
+
+
+def _raise_if_stream_finish_unusable(
+    metadata: Dict[str, Any],
+    *,
+    request: ContentRequest,
+    partial_content: str,
+) -> None:
+    """Raise when final stream metadata says the provider output is unusable."""
+
+    stop_reason = metadata.get("provider_stop_reason") or metadata.get("finish_reason")
+    category = metadata.get("finish_reason_category")
+    unknown_empty_finish = (
+        bool(stop_reason)
+        and category == "unknown"
+        and not partial_content
+    )
+    if (
+        metadata.get("output_truncated")
+        or (
+            not metadata.get("finish_unusable")
+            and not unknown_empty_finish
+        )
+    ):
+        return
+
+    provider = str(metadata.get("provider") or "unknown")
+    details = []
+    if stop_reason:
+        details.append(f"stop_reason={stop_reason}")
+    if category:
+        details.append(f"category={category}")
+    details.append(f"partial_content_chars={len(partial_content or '')}")
+    suffix = f" ({', '.join(details)})"
+    raise GenerationStoppedUnexpectedly(
+        "Provider stopped generation with an unusable finish reason"
+        f"{suffix}. The response should not be treated as complete.",
+        provider=provider,
+        model_id=request.generator_model,
+        finish_reason=str(stop_reason) if stop_reason is not None else None,
+        finish_reason_category=str(category) if category is not None else None,
+        partial_content=partial_content or "",
+        usage=dict(metadata),
+    )
 
 
 async def _generate_full_content(
@@ -1282,6 +1343,31 @@ async def _generate_full_content(
 
     async def _generation_cancelled() -> bool:
         return await check_session_cancelled(session_id)
+
+    def _phase_timeout(field_name: str, config_path: Tuple[str, str], fallback: float) -> float:
+        return resolve_request_timeout(
+            request,
+            field_name,
+            settings=getattr(config, "REQUEST_TIMEOUTS", {}) or {},
+            config_path=config_path,
+            fallback=fallback,
+        )
+
+    generation_timeout = _phase_timeout(
+        "generation_seconds",
+        ("process_timeouts", "generation_seconds"),
+        float(getattr(config, "REQUEST_TIMEOUT", 12000) or 12000),
+    )
+    stream_timeout = _phase_timeout(
+        "stream_seconds",
+        ("streaming", "stream_seconds"),
+        generation_timeout,
+    )
+    accent_audit_timeout = _phase_timeout(
+        "accent_audit_seconds",
+        ("process_timeouts", "accent_audit_seconds"),
+        float(getattr(config, "AI_ACCENT_AUDIT_TIMEOUT_SECONDS", 12000) or 12000),
+    )
 
     await _debug_record_event(
         session_id,
@@ -1364,6 +1450,7 @@ async def _generate_full_content(
                 images=images,
                 max_tool_rounds=tool_rounds,
                 accent_guard=accent_guard_for_call,
+                accent_audit_timeout=accent_audit_timeout,
                 extra_system_instructions=accent_snippet,
                 enable_validate_draft=enable_validate_draft,
                 min_global_score=request.min_global_score,
@@ -1371,6 +1458,7 @@ async def _generate_full_content(
                 prompt_safety_parts=prompt_safety_parts,
                 tool_event_callback=generation_tool_event_callback,
                 llm_routing=getattr(request, "_llm_routing", None),
+                request_timeout=generation_timeout,
                 cancellation_token=cancellation_token,
             )
         except AccentGuardError as accent_exc:
@@ -1602,6 +1690,7 @@ async def _generate_full_content(
                 model_alias_registry=getattr(request, "_model_alias_registry", None),
                 prompt_safety_parts=prompt_safety_parts,
                 llm_routing=getattr(request, "_llm_routing", None),
+                request_timeout=stream_timeout,
                 cancellation_token=cancellation_token,
                 cancel_callback=_generation_cancelled,
             ):
@@ -1626,6 +1715,28 @@ async def _generate_full_content(
                         await add_verbose_log(
                             session_id,
                             "[Tokens] Provider stopped because the output token budget was exhausted."
+                        )
+                    unknown_empty_finish = (
+                        chunk_metadata.get("finish_reason_category") == "unknown"
+                        and (
+                            chunk_metadata.get("provider_stop_reason")
+                            or chunk_metadata.get("finish_reason")
+                        )
+                        and not "".join(content_chunks)
+                        and not chunk_text
+                    )
+                    if (
+                        not chunk_metadata.get("output_truncated")
+                        and (chunk_metadata.get("finish_unusable") or unknown_empty_finish)
+                    ):
+                        await add_verbose_log(
+                            session_id,
+                            "[Provider] Provider stopped generation with an unusable finish reason."
+                        )
+                        _raise_if_stream_finish_unusable(
+                            chunk_metadata,
+                            request=request,
+                            partial_content="".join(content_chunks),
                         )
                     if not chunk_text:
                         continue
@@ -2778,10 +2889,9 @@ async def _process_single_layer_with_edits(
                         chunk,
                         session_id=session_id,
                         request_name=session.get("request_name"),
-                    )
+            )
 
             # Update status to indicate Gran Sabio is acting
-            previous_status = session.get("status")
             update_session_status(session, session_id, GenerationStatus.GRAN_SABIO_REVIEW, "inline_deal_breaker_review")
             session["gransabio_content"] = ""  # Initialize Gran Sabio content accumulator
 
@@ -3059,6 +3169,7 @@ async def _process_single_layer_with_edits(
                 model_alias_registry=getattr(request, "_model_alias_registry", None),
                 arbiter_tools_mode=getattr(request, 'arbiter_tools_mode', 'auto'),
                 cancellation_token=cancellation_token,
+                original_request=request,
             )
 
             # Call Arbiter for intelligent conflict resolution
@@ -3298,8 +3409,6 @@ async def _process_all_layers_with_edits(
     layers_summary: Dict[str, Dict[str, Any]] = {}
     current_content = content
     all_passed = True
-    any_deal_breaker_found = False
-    any_majority_deal_breaker = False
     first_deal_breaker_info = None
     stop_processing_layers = False
 
@@ -3465,10 +3574,6 @@ async def _process_all_layers_with_edits(
         layer_has_deal_breaker = deal_breaker_info is not None or any(
             getattr(eval, "deal_breaker", False) for eval in layer_results.values()
         )
-        if layer_has_deal_breaker:
-            any_deal_breaker_found = True
-        if deal_breaker_info:
-            any_majority_deal_breaker = True
 
         # Track layer summary
         avg_score = _calculate_layer_avg_score(layer_results) if layer_results else 0.0
@@ -4709,15 +4814,13 @@ async def process_content_generation(
 
     # Handle max_tokens_percentage if specified
     if request.max_tokens_percentage is not None:
-        token_validation = config.validate_token_limits(
+        token_resolution = config.resolve_output_max_tokens(
             request.generator_model,
-            request.max_tokens,
-            getattr(request, 'reasoning_effort', None),
-            getattr(request, 'thinking_budget_tokens', None),
-            request.max_tokens_percentage
+            requested_max_tokens=request.max_tokens,
+            max_tokens_percentage=request.max_tokens_percentage,
+            call_id="generation.main",
         )
-        # Update request with adjusted tokens
-        request.max_tokens = token_validation["adjusted_tokens"]
+        request.max_tokens = token_resolution["max_tokens"]
 
         token_floor_adjustment = config.apply_external_generation_min_tokens(
             request.generator_model,
@@ -4745,6 +4848,15 @@ async def process_content_generation(
                 session_id,
                 f"💡 Using {request.max_tokens_percentage}% of model's maximum: {request.max_tokens} tokens"
             )
+            if token_resolution.get("was_adjusted"):
+                await add_verbose_log(
+                    session_id,
+                    (
+                        "Generation token budget capped to model safe limit: "
+                        f"{token_resolution.get('original_tokens')} -> "
+                        f"{token_resolution.get('adjusted_tokens')} tokens"
+                    ),
+                )
             if token_floor_adjustment.get("was_adjusted"):
                 await add_verbose_log(
                     session_id,
@@ -5411,6 +5523,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                                         PromptPart(word_instructions, "system_generated", "json_retry.word_instructions")
                                     ] if word_instructions else None,
                                     llm_routing=getattr(request, "_llm_routing", None),
+                                    request_timeout=stream_timeout,
                                     cancellation_token=cancellation_token,
                                     cancel_callback=cancellation_requested,
                                 ):
@@ -5428,6 +5541,28 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
 
                                     if chunk_metadata:
                                         session["generation_finish_metadata"] = dict(chunk_metadata)
+                                        unknown_empty_finish = (
+                                            chunk_metadata.get("finish_reason_category") == "unknown"
+                                            and (
+                                                chunk_metadata.get("provider_stop_reason")
+                                                or chunk_metadata.get("finish_reason")
+                                            )
+                                            and not "".join(content_chunks)
+                                            and not chunk_text
+                                        )
+                                        if (
+                                            not chunk_metadata.get("output_truncated")
+                                            and (chunk_metadata.get("finish_unusable") or unknown_empty_finish)
+                                        ):
+                                            await add_verbose_log(
+                                                session_id,
+                                                "[Provider] Provider stopped JSON retry with an unusable finish reason."
+                                            )
+                                            _raise_if_stream_finish_unusable(
+                                                chunk_metadata,
+                                                request=request,
+                                                partial_content="".join(content_chunks),
+                                            )
                                         if not chunk_text:
                                             continue
 
@@ -5792,7 +5927,8 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
             from qa_engine import calculate_comprehensive_qa_timeout
             comprehensive_timeout = calculate_comprehensive_qa_timeout(
                 qa_layers_to_use,
-                normalized_qa_models
+                normalized_qa_models,
+                original_request=request,
             )
 
             logger.info(f"Session {session_id}: Using comprehensive QA timeout: {comprehensive_timeout}s")
@@ -6896,7 +7032,8 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     from qa_engine import calculate_comprehensive_qa_timeout
                     comprehensive_timeout_gs = calculate_comprehensive_qa_timeout(
                         qa_layers_to_use,
-                        normalized_qa_models_gs
+                        normalized_qa_models_gs,
+                        original_request=request,
                     )
 
                     logger.info(f"Session {session_id}: Using comprehensive QA timeout for Gran Sabio: {comprehensive_timeout_gs}s")
@@ -6938,7 +7075,12 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     # Prepare bypass content for Gran Sabio - algorithmic QA always uses extracted text
                     gs_bypass_content = gs_text_for_processing if gs_json_context else None
 
-                    while qa_retry_count_gs <= config.MAX_QA_TIMEOUT_RETRIES and not qa_evaluation_success_gs:
+                    qa_timeout_retries_gs = getattr(request, "qa_timeout_retries", None)
+                    if qa_timeout_retries_gs is None:
+                        qa_timeout_retries_gs = int(getattr(config, "MAX_QA_TIMEOUT_RETRIES", 2) or 0)
+                    qa_timeout_retries_gs = max(0, int(qa_timeout_retries_gs))
+
+                    while qa_retry_count_gs <= qa_timeout_retries_gs and not qa_evaluation_success_gs:
                         try:
                             qa_comprehensive_result = await asyncio.wait_for(
                                 qa_engine.evaluate_content_comprehensive(
@@ -7159,16 +7301,16 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                         except asyncio.TimeoutError:
                             qa_retry_count_gs += 1
 
-                            if qa_retry_count_gs <= config.MAX_QA_TIMEOUT_RETRIES:
+                            if qa_retry_count_gs <= qa_timeout_retries_gs:
                                 await add_verbose_log(
                                     session_id,
-                                    f"Timeout evaluando Gran Sabio - Reintento {qa_retry_count_gs}/{config.MAX_QA_TIMEOUT_RETRIES} (NO consume iteracion)..."
+                                    f"Timeout evaluando Gran Sabio - Reintento {qa_retry_count_gs}/{qa_timeout_retries_gs} (NO consume iteracion)..."
                                 )
                                 # The while loop will automatically retry
                             else:
                                 await add_verbose_log(
                                     session_id,
-                                    f"Timeout evaluando Gran Sabio despues de {config.MAX_QA_TIMEOUT_RETRIES} reintentos."
+                                    f"Timeout evaluando Gran Sabio despues de {qa_timeout_retries_gs} reintentos."
                                 )
                                 fallback_notes.append("Timeout durante la QA del contenido regenerado")
                                 break  # Exit retry loop

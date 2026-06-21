@@ -53,7 +53,7 @@ except ImportError:
 
 GRANSABIO_API_URL = os.getenv("GRANSABIO_API_URL", "http://localhost:8000")
 GRANSABIO_API_KEY = os.getenv("GRANSABIO_API_KEY", "")
-REQUEST_TIMEOUT = int(os.getenv("GRANSABIO_TIMEOUT", "300"))
+REQUEST_TIMEOUT = int(os.getenv("GRANSABIO_TIMEOUT", "12000"))
 POLL_INTERVAL = float(os.getenv("GRANSABIO_POLL_INTERVAL", "2.0"))
 
 # Optional MCP-level overrides. When unset, the API resolves every model
@@ -104,6 +104,63 @@ REASONING_PARAMS_SCHEMA = {
         "description": "Reasoning effort for QA evaluation models"
     }
 }
+
+
+TIMEOUT_PARAMS_SCHEMA = {
+    "timeout_seconds": {
+        "type": "number",
+        "minimum": 0,
+        "exclusiveMinimum": True,
+        "description": "Request process timeout in seconds. Overrides the MCP default for this tool call."
+    },
+    "timeouts": {
+        "type": "object",
+        "additionalProperties": {"type": "number", "exclusiveMinimum": True, "minimum": 0},
+        "description": "Advanced phase-specific request timeouts, e.g. generation_seconds, qa_model_seconds, gran_sabio_seconds."
+    },
+    "qa_timeout_retries": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Optional retry count for QA evaluator timeouts."
+    }
+}
+
+
+def _coerce_positive_timeout(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _build_timeout_config(args: Dict[str, Any]) -> Dict[str, Any]:
+    config: Dict[str, Any] = {}
+    timeout_seconds = _coerce_positive_timeout(args.get("timeout_seconds"))
+    if timeout_seconds is not None:
+        config["timeout_seconds"] = timeout_seconds
+    timeouts = args.get("timeouts")
+    if isinstance(timeouts, dict):
+        config["timeouts"] = timeouts
+    retries = args.get("qa_timeout_retries")
+    if isinstance(retries, int) and retries >= 0:
+        config["qa_timeout_retries"] = retries
+    return config
+
+
+def _request_timeout_from_payload(payload: Dict[str, Any]) -> float:
+    timeout_seconds = _coerce_positive_timeout(payload.get("timeout_seconds"))
+    if timeout_seconds is not None:
+        return timeout_seconds
+    timeouts = payload.get("timeouts")
+    if isinstance(timeouts, dict):
+        for key in ("default_seconds", "generation_seconds", "stream_seconds"):
+            timeout_value = _coerce_positive_timeout(timeouts.get(key))
+            if timeout_value is not None:
+                return timeout_value
+    return float(REQUEST_TIMEOUT)
 
 
 def _parse_reasoning_effort(value: Optional[str]) -> Optional[str]:
@@ -233,7 +290,8 @@ async def _wait_for_result(
 
 async def _call_gransabio(payload: dict[str, Any]) -> dict[str, Any]:
     """Make a generation request to Gran Sabio LLM and wait for result."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    request_timeout = _request_timeout_from_payload(payload)
+    async with httpx.AsyncClient(timeout=request_timeout) as client:
         # Start generation
         response = await client.post(
             f"{GRANSABIO_API_URL}/generate",
@@ -261,7 +319,7 @@ async def _call_gransabio(payload: dict[str, Any]) -> dict[str, Any]:
             raise Exception(f"No session_id in response: {data}")
 
         # Wait for completion
-        result = await _wait_for_result(client, session_id)
+        result = await _wait_for_result(client, session_id, timeout=request_timeout)
 
         return {
             "success": result.get("approved", False),
@@ -319,7 +377,8 @@ Use this BEFORE implementing fixes to understand the full scope of issues.""",
                         "description": "Specific areas to focus on: security, performance, bugs, style, all",
                         "default": ["all"]
                     },
-                    **REASONING_PARAMS_SCHEMA
+                    **REASONING_PARAMS_SCHEMA,
+                    **TIMEOUT_PARAMS_SCHEMA
                 },
                 "required": ["code"]
             }
@@ -356,7 +415,8 @@ from multiple AI models.""",
                         "description": "Programming language",
                         "default": "auto-detect"
                     },
-                    **REASONING_PARAMS_SCHEMA
+                    **REASONING_PARAMS_SCHEMA,
+                    **TIMEOUT_PARAMS_SCHEMA
                 },
                 "required": ["original_code", "proposed_fix", "issue_description"]
             }
@@ -416,7 +476,8 @@ Returns approved content only when it meets all quality criteria.""",
                         "description": "Maximum generation attempts",
                         "default": 3
                     },
-                    **REASONING_PARAMS_SCHEMA
+                    **REASONING_PARAMS_SCHEMA,
+                    **TIMEOUT_PARAMS_SCHEMA
                 },
                 "required": ["prompt"]
             }
@@ -553,6 +614,7 @@ Provide a comprehensive analysis in JSON format with:
     generator_config = _build_generator_config(args)
     qa_config = _build_qa_config(args)
     arbiter_config = _build_arbiter_config(args)
+    timeout_config = _build_timeout_config(args)
 
     payload = {
         "prompt": prompt,
@@ -561,6 +623,7 @@ Provide a comprehensive analysis in JSON format with:
         **generator_config,
         **qa_config,
         **arbiter_config,
+        **timeout_config,
         "qa_layers": qa_layers,
         "min_global_score": 7.5,
         "max_iterations": 3,
@@ -645,6 +708,7 @@ Analyze and respond in JSON format:
     generator_config = _build_generator_config(args)
     qa_config = _build_qa_config(args)
     arbiter_config = _build_arbiter_config(args)
+    timeout_config = _build_timeout_config(args)
 
     payload = {
         "prompt": prompt,
@@ -653,6 +717,7 @@ Analyze and respond in JSON format:
         **generator_config,
         **qa_config,
         **arbiter_config,
+        **timeout_config,
         "qa_layers": qa_layers,
         "min_global_score": 7.5,
         "max_iterations": 2,
@@ -714,6 +779,7 @@ async def _handle_generate_with_qa(args: dict[str, Any]) -> dict[str, Any]:
     generator_config = _build_generator_config(args)
     qa_config = _build_qa_config(args)
     arbiter_config = _build_arbiter_config(args)
+    timeout_config = _build_timeout_config(args)
 
     payload = {
         "prompt": prompt,
@@ -721,6 +787,7 @@ async def _handle_generate_with_qa(args: dict[str, Any]) -> dict[str, Any]:
         **generator_config,
         **qa_config,
         **arbiter_config,
+        **timeout_config,
         "qa_layers": qa_layers,
         "min_global_score": min_score,
         "max_iterations": max_iterations,

@@ -286,7 +286,7 @@ async def demo_reasoning_models():
         final = await client.wait_for_completion(
             session_id,
             poll_interval=3.0,  # Longer poll for reasoning
-            timeout=300.0,  # 5 minute timeout for complex reasoning
+            timeout=12000.0,
             on_status=print_status
         )
 

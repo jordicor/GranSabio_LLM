@@ -27,6 +27,7 @@ import aiosqlite
 
 import json_utils as json
 from ai_service import get_ai_service
+from config import config as app_config
 from core.cancellation import ProviderCallHandle
 from llm_routing import resolve_call, resolve_temperature
 from model_aliasing import ModelAliasRegistry, PromptPart
@@ -532,11 +533,16 @@ Provide a JSON response with:
         try:
             route = resolve_call("feedback.analyze")
             model_name = self.config.analysis_model or route.model
+            feedback_max_tokens = app_config.resolve_output_max_tokens(
+                model_name,
+                routed_max_tokens=route.params.get("max_tokens"),
+                call_id="feedback.analyze",
+            )["max_tokens"]
             response = await self.ai_service.generate_content(
                 prompt=prompt,
                 model=model_name,
                 temperature=resolve_temperature(route, default=self.config.analysis_temperature),
-                max_tokens=route.params.get("max_tokens", 2000),
+                max_tokens=feedback_max_tokens,
                 reasoning_effort=route.params.get("reasoning_effort"),
                 thinking_budget_tokens=route.params.get("thinking_budget_tokens"),
                 json_output=True,
@@ -674,11 +680,16 @@ Each rule should be imperative and actionable (e.g., "ALWAYS include publication
         try:
             route = resolve_call("feedback.synthesize_rules")
             model_name = self.config.analysis_model or route.model
+            feedback_max_tokens = app_config.resolve_output_max_tokens(
+                model_name,
+                routed_max_tokens=route.params.get("max_tokens"),
+                call_id="feedback.synthesize_rules",
+            )["max_tokens"]
             response = await self.ai_service.generate_content(
                 prompt=prompt,
                 model=model_name,
                 temperature=resolve_temperature(route),
-                max_tokens=route.params.get("max_tokens", 2000),
+                max_tokens=feedback_max_tokens,
                 reasoning_effort=route.params.get("reasoning_effort"),
                 thinking_budget_tokens=route.params.get("thinking_budget_tokens"),
                 json_output=True,
@@ -786,7 +797,6 @@ class FeedbackMemoryManager:
     async def _extract_common_patterns(self, session_ids: List[str]) -> List[Dict]:
         """Extract common patterns from multiple sessions"""
 
-        all_categories = []
         pattern_counts = {}
 
         for session_id in session_ids:

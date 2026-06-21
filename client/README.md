@@ -177,9 +177,28 @@ GRANSABIO_API_KEY=your_api_key            # Optional API key
 client = GranSabioClient(
     base_url="http://custom-host:8000",
     api_key="your_key",
-    timeout=(30, 600)  # (connect, read) in seconds
+    timeout=(30, 12000)  # (connect, read) in seconds
 )
 ```
+
+### Per-Request Timeouts
+
+The SDK forwards timeout controls to the API and also uses them for local wait/stream windows. Defaults are `12000` seconds.
+
+```python
+result = client.generate(
+    prompt="Write a long technical report...",
+    timeout_seconds=12000,
+    timeouts={
+        "generation_seconds": 12000,
+        "qa_model_seconds": 12000,
+        "gran_sabio_seconds": 12000,
+    },
+    qa_timeout_retries=0,
+)
+```
+
+`timeout=(connect, read)` remains the HTTP transport timeout. Use `timeout_seconds` / `timeouts` for Gran Sabio request-process deadlines.
 
 ## Error Handling
 

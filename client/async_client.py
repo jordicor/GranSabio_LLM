@@ -84,9 +84,9 @@ class AsyncGranSabioClient:
     """
 
     DEFAULT_BASE_URL = "http://localhost:8000"
-    DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=600, connect=30)
+    DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=12000, connect=30)
     DEFAULT_POLL_INTERVAL = 2.0
-    DEFAULT_MAX_WAIT = 600.0
+    DEFAULT_MAX_WAIT = 12000.0
 
     def __init__(
         self,
@@ -402,6 +402,9 @@ class AsyncGranSabioClient:
         lexical_diversity: Optional[Dict[str, Any]] = None,
         reasoning_effort: Optional[str] = None,
         thinking_budget_tokens: Optional[int] = None,
+        timeout_seconds: Optional[float] = None,
+        timeouts: Optional[Dict[str, Any]] = None,
+        qa_timeout_retries: Optional[int] = None,
         wait_for_completion: bool = True,
         poll_interval: float = DEFAULT_POLL_INTERVAL,
         max_wait: float = DEFAULT_MAX_WAIT,
@@ -496,6 +499,12 @@ class AsyncGranSabioClient:
             payload["reasoning_effort"] = reasoning_effort
         if thinking_budget_tokens:
             payload["thinking_budget_tokens"] = thinking_budget_tokens
+        if timeout_seconds is not None:
+            payload["timeout_seconds"] = timeout_seconds
+        if timeouts is not None:
+            payload["timeouts"] = timeouts
+        if qa_timeout_retries is not None:
+            payload["qa_timeout_retries"] = qa_timeout_retries
 
         # Additional kwargs
         payload.update(kwargs)
@@ -536,11 +545,19 @@ class AsyncGranSabioClient:
         if not wait_for_completion:
             return result
 
+        effective_max_wait = max_wait
+        if max_wait == self.DEFAULT_MAX_WAIT:
+            requested_wait = timeout_seconds
+            if requested_wait is None and isinstance(timeouts, dict):
+                requested_wait = timeouts.get("generation_seconds") or timeouts.get("default_seconds")
+            if requested_wait is not None:
+                effective_max_wait = float(requested_wait)
+
         # Poll for completion
         return await self.wait_for_result(
             session_id,
             poll_interval=poll_interval,
-            max_wait=max_wait,
+            max_wait=effective_max_wait,
             on_status=on_status
         )
 
@@ -1593,6 +1610,9 @@ class AsyncGranSabioClient:
         lexical_diversity: Optional[Dict[str, Any]] = None,
         reasoning_effort: Optional[str] = None,
         thinking_budget_tokens: Optional[int] = None,
+        timeout_seconds: Optional[float] = None,
+        timeouts: Optional[Dict[str, Any]] = None,
+        qa_timeout_retries: Optional[int] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
         content_callback: Optional[Callable[[str], None]] = None,
         qa_callback: Optional[Callable[[str, str, str], None]] = None,
@@ -1667,6 +1687,9 @@ class AsyncGranSabioClient:
             "lexical_diversity": lexical_diversity,
             "reasoning_effort": reasoning_effort,
             "thinking_budget_tokens": thinking_budget_tokens,
+            "timeout_seconds": timeout_seconds,
+            "timeouts": timeouts,
+            "qa_timeout_retries": qa_timeout_retries,
             "wait_for_completion": False,
         }
         if generator_model is not None:
@@ -1695,6 +1718,8 @@ class AsyncGranSabioClient:
             "content_type": content_type,
             "generator_model": generator_model,
             "reasoning_effort": reasoning_effort,
+            "timeout_seconds": timeout_seconds,
+            "timeouts": timeouts,
         }
 
         # Compute timeout

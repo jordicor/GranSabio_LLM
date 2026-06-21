@@ -71,7 +71,13 @@ def _make_request(**overrides: Any) -> SimpleNamespace:
     return SimpleNamespace(**base)
 
 
-def _patch_model_info(provider: str = "openai", model_id: str = "gpt-4o"):
+def _patch_model_info(
+    provider: str = "openai",
+    model_id: str = "gpt-4o",
+    *,
+    qa_max_tokens: int = 16000,
+    qa_retry_max_tokens: int | None = None,
+):
     """Return a patch context for model metadata used by the helper.
 
     Also pins ``QA_MAX_TOOL_ROUNDS=3`` (the default from ``config.py``) so the
@@ -103,6 +109,12 @@ def _patch_model_info(provider: str = "openai", model_id: str = "gpt-4o"):
             get_model_info=Mock(return_value={"provider": provider, "model_id": model_id}),
             model_specs=model_specs,
             QA_MAX_TOOL_ROUNDS=3,
+            resolve_qa_max_tokens=Mock(
+                side_effect=lambda _model, requested_max_tokens=None: requested_max_tokens or qa_max_tokens
+            ),
+            resolve_qa_truncation_retry_max_tokens=Mock(
+                return_value=qa_retry_max_tokens
+            ),
             QA_SYSTEM_PROMPT="qa system",
             QA_SYSTEM_PROMPT_RAW="qa system raw",
         ),
@@ -595,6 +607,63 @@ async def test_evaluate_content_uses_tool_loop_when_eligible():
     # QAEvaluation should be built from the parsed tool-loop payload.
     assert evaluation.score == 9.5
     assert evaluation.feedback == "Passed"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_retries_tool_loop_after_output_truncation():
+    request = _make_request(json_output=True, json_schema={"type": "object"})
+    layer = _make_layer()
+
+    truncated = ToolLoopEnvelope(
+        loop_scope=LoopScope.QA,
+        turns=1,
+        accepted=False,
+        accepted_via="output_truncated",
+        output_truncated=True,
+        finish_reason="max_tokens",
+        max_tokens=8000,
+    )
+    recovered = ToolLoopEnvelope(
+        loop_scope=LoopScope.QA,
+        turns=1,
+        accepted=True,
+        accepted_via="assistant_final",
+        payload={
+            "score": 9.0,
+            "feedback": "Recovered",
+            "deal_breaker": False,
+            "deal_breaker_reason": None,
+        },
+    )
+
+    ai_service = Mock()
+    ai_service.call_ai_with_validation_tools = AsyncMock(
+        side_effect=[("", truncated), ("{}", recovered)]
+    )
+    bypass_engine = Mock()
+    bypass_engine.can_bypass_layer = Mock(return_value=False)
+
+    service = QAEvaluationService(ai_service)
+
+    with _patch_model_info(qa_max_tokens=8000, qa_retry_max_tokens=32000):
+        evaluation = await service.evaluate_content(
+            content="Generated body.",
+            criteria=layer.criteria,
+            model="gpt-4o",
+            layer_name=layer.name,
+            min_score=layer.min_score,
+            original_request=request,
+            layer=layer,
+            bypass_engine=bypass_engine,
+            request_edit_info=False,
+        )
+
+    assert ai_service.call_ai_with_validation_tools.await_count == 2
+    first_call, second_call = ai_service.call_ai_with_validation_tools.await_args_list
+    assert first_call.kwargs["max_tokens"] == 8000
+    assert second_call.kwargs["max_tokens"] == 32000
+    assert evaluation.score == 9.0
+    assert evaluation.feedback == "Recovered"
 
 
 @pytest.mark.asyncio

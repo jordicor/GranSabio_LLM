@@ -94,6 +94,9 @@ data/users/
 # Generated tracking data (keep folder structure with .gitkeep)
 data/tracking/*.json
 
+# Local request-process timeout overrides
+request_timeouts.json
+
 # Backups
 backups/
 *.bak

@@ -21,7 +21,13 @@ import pytest
 import json_utils as json
 
 # Import the module under test
-from ai_service import AIRequestError, AIService, _ensure_aiohttp_compatibility
+from ai_service import (
+    AIRequestError,
+    AIService,
+    GenerationOutputTruncated,
+    GenerationStoppedUnexpectedly,
+    _ensure_aiohttp_compatibility,
+)
 from deterministic_validation import DraftValidationResult
 from provider_errors import ProviderErrorKind
 from tool_loop_models import LoopScope, OutputContract, ToolLoopEnvelope, ToolLoopOutputTruncated
@@ -1383,6 +1389,103 @@ class TestClaudeOpus47And48Compatibility:
         request_kwargs = create.await_args.kwargs
         assert request_kwargs["output_config"]["effort"] == "max"
         assert request_kwargs["thinking"] == {"type": "adaptive"}
+
+
+class TestNonStreamingFinishReasonHandling:
+    """Tests for terminal finish reasons in non-streaming generation."""
+
+    @pytest.mark.asyncio
+    async def test_generate_content_raises_typed_truncation_on_claude_max_tokens(
+        self,
+        ai_service_instance,
+        mock_config,
+    ):
+        usage_events = []
+        usage_meta = {
+            "provider": "claude",
+            "input_tokens": 100,
+            "output_tokens": 8192,
+            "finish_reason": "max_tokens",
+            "provider_stop_reason": "max_tokens",
+            "finish_reason_category": "output_token_limit",
+            "finish_unusable": True,
+            "output_truncated": True,
+            "truncation_reason": "output_token_limit",
+            "max_tokens": 8192,
+        }
+
+        mock_config.validate_token_limits.return_value = {
+            "adjusted_tokens": 8192,
+            "adjusted_reasoning_effort": None,
+            "adjusted_thinking_budget_tokens": None,
+            "thinking_validation": {},
+            "was_adjusted": False,
+            "model_limit": 32000,
+            "model_info": {"provider": "claude", "model_id": "claude-opus-4-7"},
+            "reasoning_timeout_seconds": None,
+        }
+        mock_config.model_specs = {"model_specifications": {"anthropic": {}}}
+        ai_service_instance._generate_claude = AsyncMock(return_value=("", usage_meta))
+
+        with patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
+             patch.object(AIService, "_record_provider_health_success", new=AsyncMock()):
+            with pytest.raises(GenerationOutputTruncated) as exc_info:
+                await ai_service_instance.generate_content(
+                    prompt="Return a large JSON outline.",
+                    model="claude-opus-4-7",
+                    max_tokens=8192,
+                    json_output=True,
+                    usage_callback=usage_events.append,
+                )
+
+        assert exc_info.value.finish_reason == "max_tokens"
+        assert exc_info.value.max_tokens == 8192
+        assert exc_info.value.partial_content_chars == 0
+        assert usage_events[0]["output_truncated"] is True
+        assert usage_events[0]["provider_stop_reason"] == "max_tokens"
+
+    @pytest.mark.asyncio
+    async def test_generate_content_raises_typed_unusable_stop_on_gemini_safety(
+        self,
+        ai_service_instance,
+        mock_config,
+    ):
+        usage_meta = {
+            "provider": "gemini",
+            "input_tokens": 100,
+            "output_tokens": 0,
+            "finish_reason": "SAFETY",
+            "provider_stop_reason": "SAFETY",
+            "finish_reason_category": "content_filter",
+            "finish_unusable": True,
+            "output_truncated": False,
+        }
+
+        mock_config.validate_token_limits.return_value = {
+            "adjusted_tokens": 1024,
+            "adjusted_reasoning_effort": None,
+            "adjusted_thinking_budget_tokens": None,
+            "thinking_validation": {},
+            "was_adjusted": False,
+            "model_limit": 8192,
+            "model_info": {"provider": "gemini", "model_id": "gemini-2.5-flash"},
+            "reasoning_timeout_seconds": None,
+        }
+        mock_config.model_specs = {"model_specifications": {"google": {}}}
+        ai_service_instance._generate_gemini = AsyncMock(return_value=("", usage_meta))
+
+        with patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
+             patch.object(AIService, "_record_provider_health_success", new=AsyncMock()):
+            with pytest.raises(GenerationStoppedUnexpectedly) as exc_info:
+                await ai_service_instance.generate_content(
+                    prompt="Return JSON.",
+                    model="gemini-2.5-flash",
+                    max_tokens=1024,
+                    json_output=True,
+                )
+
+        assert exc_info.value.finish_reason == "SAFETY"
+        assert exc_info.value.finish_reason_category == "content_filter"
 
 
 class TestReasoningEffortProviderRetry:

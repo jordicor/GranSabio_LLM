@@ -52,6 +52,7 @@ from qa_scheduler import (
     QASchedulerTechnicalFailure,
     QASchedulerUnavailableError,
 )
+from request_timeouts import coerce_timeout_seconds, resolve_request_timeout
 from usage_tracking import UsageTracker
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,40 @@ def calculate_qa_timeout_for_model(
         return timeout
 
 
+def resolve_qa_timeout_for_model(model: Any, original_request: Optional[Any] = None) -> float:
+    """Resolve the effective hard timeout for one QA evaluator attempt."""
+
+    model_name = model if isinstance(model, str) else getattr(model, "model", str(model))
+    explicit_timeout = coerce_timeout_seconds(getattr(model, "timeout_seconds", None))
+    if explicit_timeout is not None:
+        logger.info("QA timeout for %s: %ss (explicit model config)", model_name, explicit_timeout)
+        return explicit_timeout
+
+    if isinstance(model, str):
+        recommended_timeout = calculate_qa_timeout_for_model(model)
+    else:
+        recommended_timeout = calculate_qa_timeout_for_model(
+            model_name,
+            getattr(model, "reasoning_effort", None),
+            getattr(model, "thinking_budget_tokens", None),
+        )
+
+    resolved_timeout = resolve_request_timeout(
+        original_request,
+        "qa_model_seconds",
+        settings=getattr(config, "REQUEST_TIMEOUTS", {}) or {},
+        config_path=("qa_gran_sabio", "qa_model_seconds"),
+        fallback=float(getattr(config, "QA_BASE_TIMEOUT", 12000) or 12000),
+    )
+    logger.info(
+        "QA timeout for %s: %ss (configured hard timeout, recommended=%ss)",
+        model_name,
+        resolved_timeout,
+        recommended_timeout,
+    )
+    return resolved_timeout
+
+
 def _positive_int_config(name: str, default: int) -> int:
     try:
         value = int(getattr(config, name, default) or default)
@@ -168,7 +203,8 @@ def _batched_timeout_total(timeouts: List[float], max_concurrency: int) -> float
 
 def calculate_comprehensive_qa_timeout(
     layers: List[Any],
-    qa_models: List[Any]
+    qa_models: List[Any],
+    original_request: Optional[Any] = None,
 ) -> float:
     """
     Calculate total timeout for comprehensive QA evaluation.
@@ -190,10 +226,11 @@ def calculate_comprehensive_qa_timeout(
             reasoning_effort = getattr(model, 'reasoning_effort', None)
             thinking_budget_tokens = getattr(model, 'thinking_budget_tokens', None)
 
-        individual_timeout = calculate_qa_timeout_for_model(
+        explicit_timeout = coerce_timeout_seconds(getattr(model, "timeout_seconds", None))
+        individual_timeout = explicit_timeout or calculate_qa_timeout_for_model(
             model_name,
             reasoning_effort,
-            thinking_budget_tokens
+            thinking_budget_tokens,
         )
         provider = _provider_for_timeout_model(model_name)
         if provider == "ollama":
@@ -207,7 +244,14 @@ def calculate_comprehensive_qa_timeout(
         _positive_int_config("OLLAMA_MAX_CONCURRENT_REQUESTS", 1),
     )
     max_timeout_per_layer = max(remote_max_timeout_per_layer, ollama_timeout_per_layer)
-    comprehensive_timeout = (max_timeout_per_layer * num_layers) + config.QA_COMPREHENSIVE_TIMEOUT_MARGIN
+    recommended_timeout = (max_timeout_per_layer * num_layers) + config.QA_COMPREHENSIVE_TIMEOUT_MARGIN
+    comprehensive_timeout = resolve_request_timeout(
+        original_request,
+        "qa_comprehensive_seconds",
+        settings=getattr(config, "REQUEST_TIMEOUTS", {}) or {},
+        config_path=("qa_gran_sabio", "qa_comprehensive_seconds"),
+        fallback=float(recommended_timeout or getattr(config, "QA_BASE_TIMEOUT", 12000) or 12000),
+    )
 
     logger.info(
         f"Comprehensive QA timeout: {comprehensive_timeout}s "
@@ -315,6 +359,7 @@ class QAEngine:
         session_id: Optional[str] = None,
         project_id: Optional[str] = None,
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        request_timeout: Optional[float] = None,
     ) -> QAEvaluation:
         """
         Evaluate content using a specific QA layer and AI model
@@ -398,6 +443,7 @@ class QAEngine:
                 session_id=session_id,
                 project_id=project_id,
                 tool_event_callback=tool_event_callback,
+                request_timeout=request_timeout,
             )
         except Exception as e:
             logger.error(f"QA evaluation failed for layer {layer.name} with model {model_config.model}: {str(e)}")
@@ -1623,7 +1669,10 @@ Source QA layers:
         """Resolve public request knobs into the internal scheduler policy."""
 
         max_concurrency = max(1, int(getattr(config, "MAX_CONCURRENT_REQUESTS", 10) or 10))
-        timeout_retries = max(0, int(getattr(config, "MAX_QA_TIMEOUT_RETRIES", 2) or 0))
+        request_timeout_retries = getattr(original_request, "qa_timeout_retries", None) if original_request else None
+        if isinstance(request_timeout_retries, bool) or not isinstance(request_timeout_retries, int):
+            request_timeout_retries = getattr(config, "MAX_QA_TIMEOUT_RETRIES", 2)
+        timeout_retries = max(0, int(request_timeout_retries or 0))
         provider_failure_retries = max(0, int(getattr(config, "MAX_QA_PROVIDER_RETRIES", 1) or 0))
         min_valid_models = (
             getattr(original_request, "min_valid_qa_models", None)
@@ -1712,14 +1761,7 @@ Source QA layers:
         slots: List[QASchedulerSlot] = []
         for index, model in enumerate(qa_models):
             model_name = get_model_name(model)
-            if isinstance(model, QAModelConfig):
-                timeout = calculate_qa_timeout_for_model(
-                    model.model,
-                    model.reasoning_effort,
-                    model.thinking_budget_tokens,
-                )
-            else:
-                timeout = calculate_qa_timeout_for_model(model)
+            timeout = resolve_qa_timeout_for_model(model, original_request)
 
             slot_id = model_alias_registry.qa_slot_id(index) if model_alias_registry else None
             slot_meta = model_alias_registry.slots.get(slot_id) if model_alias_registry and slot_id else None
@@ -1853,6 +1895,7 @@ Source QA layers:
                             session_id=session_id,
                             project_id=project_id,
                             tool_event_callback=tool_event_callback,
+                            request_timeout=slot.timeout_seconds,
                         ),
                         timeout=slot.timeout_seconds,
                     )

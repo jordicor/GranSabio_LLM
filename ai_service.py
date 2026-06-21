@@ -46,7 +46,7 @@ from ai_runtime import parameters as runtime_parameters
 from ai_runtime import schemas as runtime_schemas
 from ai_runtime import usage as runtime_usage
 from ai_runtime import vision as runtime_vision
-from config import config, get_model_parameter_requirements
+from config import DEFAULT_OUTPUT_TOKEN_FALLBACK, config, get_model_parameter_requirements
 from deterministic_validation import DraftValidationResult
 from llm_accent_prompts import (
     build_accent_criteria_block,
@@ -71,6 +71,7 @@ from provider_adapters import (
 from provider_capabilities import CapabilitySupport
 from provider_errors import ProviderErrorKind, ProviderFailure, classify_provider_exception
 from provider_health import record_provider_failure, record_provider_success
+from request_timeouts import coerce_timeout_seconds, resolve_config_timeout
 from schema_utils import json_schema_to_pydantic
 from tool_loop_models import (
     JsonContractError,
@@ -95,6 +96,24 @@ _ollama_concurrency_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
     "ollama_concurrency_depth",
     default=0,
 )
+
+
+def _resolve_ai_process_timeout(
+    explicit_timeout: Optional[float],
+    config_path: Tuple[str, str],
+    *,
+    fallback: Optional[float] = None,
+) -> float:
+    """Resolve a model/process timeout without using catalog hints as a hard cut."""
+
+    explicit = coerce_timeout_seconds(explicit_timeout)
+    if explicit is not None:
+        return explicit
+    return resolve_config_timeout(
+        getattr(config, "REQUEST_TIMEOUTS", {}) or {},
+        config_path,
+        fallback=float(fallback or getattr(config, "REQUEST_TIMEOUT", 12000) or 12000),
+    )
 
 
 def _ensure_aiohttp_compatibility() -> None:
@@ -173,10 +192,10 @@ def _stringify_finish_reason(value: Any) -> Optional[str]:
     return runtime_usage.stringify_finish_reason(value)
 
 
-def _is_token_limit_finish_reason(reason: Any) -> bool:
+def _is_token_limit_finish_reason(reason: Any, provider: Optional[str] = None) -> bool:
     """Detect provider stop reasons that mean output was cut by token budget."""
 
-    return runtime_usage.is_token_limit_finish_reason(reason)
+    return runtime_usage.is_token_limit_finish_reason(reason, provider=provider)
 
 
 def _is_unusable_openai_stream_finish(reason: Any) -> bool:
@@ -285,6 +304,54 @@ class AIRequestError(RuntimeError):
         self.max_attempts = max_attempts
         self.cause = cause
         self.provider_failure = provider_failure
+
+
+class GenerationOutputTruncated(RuntimeError):
+    """Raised when a non-streaming generation ends at the output token limit."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        model_id: str,
+        finish_reason: Optional[str],
+        max_tokens: Optional[int],
+        partial_content: str,
+        usage: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.model_id = model_id
+        self.finish_reason = finish_reason
+        self.max_tokens = max_tokens
+        self.partial_content = partial_content or ""
+        self.partial_content_chars = len(self.partial_content)
+        self.usage = usage or {}
+
+
+class GenerationStoppedUnexpectedly(RuntimeError):
+    """Raised when a provider finishes a non-streaming generation unusably."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        model_id: str,
+        finish_reason: Optional[str],
+        finish_reason_category: Optional[str],
+        partial_content: str,
+        usage: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.model_id = model_id
+        self.finish_reason = finish_reason
+        self.finish_reason_category = finish_reason_category
+        self.partial_content = partial_content or ""
+        self.partial_content_chars = len(self.partial_content)
+        self.usage = usage or {}
 
 
 class StreamChunk:
@@ -545,14 +612,14 @@ class AIService:
         if config.OPENAI_API_KEY:
             self.openai_client = openai.AsyncOpenAI(
                 api_key=config.OPENAI_API_KEY,
-                timeout=180.0,  # Increased timeout for better stability
+                timeout=float(config.SDK_OPENAI_TIMEOUT_SECONDS),
                 max_retries=3,  # Retry failed requests twice
                 http_client=_openai_async_http_client(),
             )
             # Initialize sync OpenAI client for O3-pro (Responses API requirement)
             self.openai_sync_client = openai.OpenAI(
                 api_key=config.OPENAI_API_KEY,
-                timeout=180.0,  # Increased timeout for better stability
+                timeout=float(config.SDK_OPENAI_SYNC_TIMEOUT_SECONDS),
                 max_retries=3,
                 http_client=_openai_sync_http_client(),
             )
@@ -568,7 +635,7 @@ class AIService:
 
             self.anthropic_client = anthropic.AsyncAnthropic(
                 api_key=config.ANTHROPIC_API_KEY,
-                timeout=180.0,    # Increased timeout for better stability
+                timeout=float(config.SDK_ANTHROPIC_TIMEOUT_SECONDS),
                 max_retries=3,   # Retry failed requests twice
                 default_headers=default_headers,
                 http_client=_anthropic_async_http_client(),
@@ -595,7 +662,7 @@ class AIService:
             self.xai_client = openai.AsyncOpenAI(
                 api_key=config.XAI_API_KEY,
                 base_url="https://api.x.ai/v1",
-                timeout=130.0,  # Increased timeout for better stability
+                timeout=float(config.SDK_XAI_TIMEOUT_SECONDS),
                 max_retries=3,
                 http_client=_openai_async_http_client(),
             )
@@ -607,7 +674,7 @@ class AIService:
             self.openrouter_client = openai.AsyncOpenAI(
                 api_key=config.OPENROUTER_API_KEY,
                 base_url="https://openrouter.ai/api/v1",
-                timeout=180.0,  # Increased timeout for better stability
+                timeout=float(config.SDK_OPENROUTER_TIMEOUT_SECONDS),
                 max_retries=3,
                 default_headers={
                     "HTTP-Referer": "https://gransabio-llm.local",
@@ -625,7 +692,7 @@ class AIService:
             self.minimax_client = openai.AsyncOpenAI(
                 api_key=minimax_api_key,
                 base_url="https://api.minimax.io/v1",
-                timeout=180.0,
+                timeout=float(config.SDK_MINIMAX_TIMEOUT_SECONDS),
                 max_retries=3,
                 http_client=_openai_async_http_client(),
             )
@@ -639,7 +706,7 @@ class AIService:
             self.moonshot_client = openai.AsyncOpenAI(
                 api_key=moonshot_api_key,
                 base_url="https://api.moonshot.ai/v1",
-                timeout=180.0,
+                timeout=float(config.SDK_MOONSHOT_TIMEOUT_SECONDS),
                 max_retries=3,
                 http_client=_openai_async_http_client(),
             )
@@ -653,7 +720,7 @@ class AIService:
             self.ollama_client = openai.AsyncOpenAI(
                 api_key="ollama",  # Dummy key, Ollama doesn't require authentication
                 base_url=ollama_base_url,
-                timeout=300.0,  # Longer timeout for local models (can be slow)
+                timeout=float(config.SDK_OLLAMA_TIMEOUT_SECONDS),
                 max_retries=2,
                 http_client=_openai_async_http_client(),
             )
@@ -671,7 +738,7 @@ class AIService:
             self.fake_client = openai.AsyncOpenAI(
                 api_key="fake",  # Dummy key, Fake AI doesn't require authentication
                 base_url=fake_base_url,
-                timeout=30.0,
+                timeout=float(config.SDK_FAKE_TIMEOUT_SECONDS),
                 max_retries=1,
                 http_client=_openai_async_http_client(),
             )
@@ -1173,6 +1240,10 @@ class AIService:
                 # Deterministic provider stop at output limit; retrying the
                 # same request with the same cap would repeat the truncation.
                 raise
+            except GenerationOutputTruncated:
+                raise
+            except GenerationStoppedUnexpectedly:
+                raise
             except Exception as exc:
                 if cancellation_token and await cancellation_token.any_cancelled():
                     raise asyncio.CancelledError() from exc
@@ -1268,6 +1339,10 @@ class AIService:
             raise
         except ToolLoopOutputTruncated:
             raise
+        except GenerationOutputTruncated:
+            raise
+        except GenerationStoppedUnexpectedly:
+            raise
         except Exception as exc:
             if cancellation_token and await cancellation_token.any_cancelled():
                 raise asyncio.CancelledError() from exc
@@ -1332,6 +1407,25 @@ class AIService:
             fallback_finish_reason=fallback_finish_reason,
         )
 
+    @staticmethod
+    def _resolve_effective_output_max_tokens(
+        model: str,
+        max_tokens: Optional[int],
+        *,
+        call_id: str,
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Resolve a concrete output-token budget for direct AIService callers."""
+
+        resolution = config.resolve_output_max_tokens(
+            model,
+            requested_max_tokens=max_tokens,
+            call_id=call_id,
+        )
+        resolved_max_tokens = resolution.get("max_tokens")
+        if resolved_max_tokens is None:
+            resolved_max_tokens = DEFAULT_OUTPUT_TOKEN_FALLBACK
+        return int(resolved_max_tokens), resolution
+
     def _emit_usage(
         self,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]],
@@ -1367,6 +1461,93 @@ class AIService:
             usage_callback(payload)
         except Exception:
             logger.exception("Usage callback failed for model %s", model_id)
+
+    @staticmethod
+    def _raise_if_generation_stopped_unusably(
+        content: str,
+        usage_meta: Optional[Mapping[str, Any]],
+        *,
+        provider: str,
+        model_id: str,
+        max_tokens: Optional[int],
+    ) -> None:
+        """Fail fast when a non-streaming response is known to be unusable."""
+
+        if not usage_meta:
+            return
+
+        finish_reason = (
+            usage_meta.get("provider_stop_reason")
+            or usage_meta.get("finish_reason")
+        )
+        finish_reason_text = _stringify_finish_reason(finish_reason)
+        finish_reason_category = usage_meta.get("finish_reason_category")
+        partial_content = content or ""
+        unknown_empty_finish = (
+            bool(finish_reason_text)
+            and finish_reason_category == "unknown"
+            and not partial_content
+        )
+        if (
+            not finish_reason_text
+            and not usage_meta.get("finish_unusable")
+            and partial_content
+        ):
+            return
+
+        if (
+            not usage_meta.get("output_truncated")
+            and not usage_meta.get("finish_unusable")
+            and not unknown_empty_finish
+        ):
+            return
+
+        resolved_max_tokens = usage_meta.get("max_tokens", max_tokens)
+        try:
+            resolved_max_tokens = (
+                int(resolved_max_tokens)
+                if resolved_max_tokens is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            resolved_max_tokens = max_tokens
+
+        details = []
+        if finish_reason_text:
+            details.append(f"stop_reason={finish_reason_text}")
+        if finish_reason_category:
+            details.append(f"category={finish_reason_category}")
+        if resolved_max_tokens:
+            details.append(f"max_tokens={resolved_max_tokens}")
+        details.append(f"partial_content_chars={len(partial_content)}")
+        suffix = f" ({', '.join(details)})"
+
+        if not usage_meta.get("output_truncated"):
+            raise GenerationStoppedUnexpectedly(
+                "Provider stopped generation with an unusable finish reason"
+                f"{suffix}. The response should not be treated as complete.",
+                provider=provider,
+                model_id=model_id,
+                finish_reason=finish_reason_text,
+                finish_reason_category=(
+                    str(finish_reason_category)
+                    if finish_reason_category is not None
+                    else None
+                ),
+                partial_content=partial_content,
+                usage=dict(usage_meta),
+            )
+
+        raise GenerationOutputTruncated(
+            "Provider output was truncated because the output token budget was "
+            f"exhausted{suffix}. Increase max_tokens or request a shorter response.",
+            provider=provider,
+            model_id=model_id,
+            finish_reason=finish_reason_text,
+            max_tokens=resolved_max_tokens,
+            partial_content=partial_content,
+            usage=dict(usage_meta),
+        )
 
     @asynccontextmanager
     async def _provider_call_scope(
@@ -1451,7 +1632,7 @@ class AIService:
         prompt: str,
         model: str,
         temperature: float = 0.7,
-        max_tokens: int = 8000,
+        max_tokens: Optional[int] = None,
         system_prompt: Optional[str] = None,
         extra_verbose: bool = False,
         reasoning_effort: Optional[str] = None,
@@ -1467,6 +1648,7 @@ class AIService:
         prompt_safety_parts: Optional[List[Any]] = None,
         system_prompt_source: "PromptSource" = "system_generated",
         llm_routing: Optional[Mapping[str, Any]] = None,
+        request_timeout: Optional[float] = None,
         cancellation_token: Optional["CancellationToken"] = None,
     ) -> str:
         """
@@ -1487,6 +1669,12 @@ class AIService:
         Returns:
             Generated content as string
         """
+        max_tokens, _token_budget_resolution = self._resolve_effective_output_max_tokens(
+            model,
+            max_tokens,
+            call_id="ai_service.generate_content",
+        )
+
         # Intelligent validation and adjustment of all token parameters
         token_validation = config.validate_token_limits(
             model, max_tokens, reasoning_effort, thinking_budget_tokens
@@ -1542,6 +1730,16 @@ class AIService:
         extra_payload = {"requested_model": model}
         if usage_extra:
             extra_payload.update(usage_extra)
+        last_usage_meta: Optional[Mapping[str, Any]] = None
+        last_usage_provider = provider
+        last_usage_model_id = model_id
+
+        def _emit_generation_usage(usage_meta: Any) -> None:
+            nonlocal last_usage_meta, last_usage_provider, last_usage_model_id
+            last_usage_provider = provider
+            last_usage_model_id = model_id
+            last_usage_meta = usage_meta if isinstance(usage_meta, Mapping) else None
+            self._emit_usage(usage_callback, model_id, provider, usage_meta, extra_payload)
 
         # Enforce structured-output schema compatibility upfront, using the
         # same provider-normalized schema that native JSON calls will receive.
@@ -1563,11 +1761,17 @@ class AIService:
                     provider,
                 )
                 effective_json_schema = None
-        request_timeout = token_validation.get("reasoning_timeout_seconds")
-        if request_timeout and request_timeout > 0:
+        recommended_timeout = token_validation.get("reasoning_timeout_seconds")
+        if recommended_timeout and recommended_timeout > 0:
             logger.info(
-                f"Applying reasoning timeout of {request_timeout} seconds for model {model_id}"
+                f"Model {model_id} has recommended reasoning timeout of {recommended_timeout} seconds"
             )
+        request_timeout = _resolve_ai_process_timeout(
+            request_timeout,
+            ("per_call_timeout_propagation", "generation_seconds"),
+            fallback=getattr(config, "REQUEST_TIMEOUT", 12000),
+        )
+        logger.debug("Using generation process timeout of %ss for model %s", request_timeout, model_id)
 
         # Use the intelligently adjusted parameters for generation
         reasoning_effort = adjusted_reasoning_effort
@@ -1677,7 +1881,7 @@ class AIService:
                     logger.info(content)
                     logger.info(f"{separator}\n")
 
-                self._emit_usage(usage_callback, model_id, provider, usage_meta, extra_payload)
+                _emit_generation_usage(usage_meta)
                 return content
             elif provider == "claude":
                 content, usage_meta = await self._generate_claude(
@@ -1713,7 +1917,7 @@ class AIService:
                     logger.info(content)
                     logger.info(f"{separator}\n")
 
-                self._emit_usage(usage_callback, model_id, provider, usage_meta, extra_payload)
+                _emit_generation_usage(usage_meta)
                 return content
             elif provider == "gemini":
                 content, usage_meta = await self._generate_gemini(
@@ -1724,6 +1928,7 @@ class AIService:
                     system_prompt or "",
                     reasoning_effort=reasoning_effort,
                     thinking_budget_tokens=thinking_budget_tokens,
+                    request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     images=images,
@@ -1748,7 +1953,7 @@ class AIService:
                     logger.info(content)
                     logger.info(f"{separator}\n")
 
-                self._emit_usage(usage_callback, model_id, provider, usage_meta, extra_payload)
+                _emit_generation_usage(usage_meta)
                 return content
             elif provider == "xai":
                 content, usage_meta = await self._generate_xai(
@@ -1783,7 +1988,7 @@ class AIService:
                     logger.info(content)
                     logger.info(f"{separator}\n")
 
-                self._emit_usage(usage_callback, model_id, provider, usage_meta, extra_payload)
+                _emit_generation_usage(usage_meta)
                 return content
             elif provider == "openrouter":
                 content, usage_meta = await self._generate_openrouter(
@@ -1817,7 +2022,7 @@ class AIService:
                     logger.info(content)
                     logger.info(f"{separator}\n")
 
-                self._emit_usage(usage_callback, model_id, provider, usage_meta, extra_payload)
+                _emit_generation_usage(usage_meta)
                 return content
             elif provider == "minimax":
                 content, usage_meta = await self._generate_minimax(
@@ -1850,7 +2055,7 @@ class AIService:
                     logger.info(content)
                     logger.info(f"{separator}\n")
 
-                self._emit_usage(usage_callback, model_id, provider, usage_meta, extra_payload)
+                _emit_generation_usage(usage_meta)
                 return content
             elif provider == "moonshot":
                 content, usage_meta = await self._generate_moonshot(
@@ -1883,7 +2088,7 @@ class AIService:
                     logger.info(content)
                     logger.info(f"{separator}\n")
 
-                self._emit_usage(usage_callback, model_id, provider, usage_meta, extra_payload)
+                _emit_generation_usage(usage_meta)
                 return content
             elif provider == "ollama":
                 content, usage_meta = await self._generate_ollama(
@@ -1916,7 +2121,7 @@ class AIService:
                     logger.info(content)
                     logger.info(f"{separator}\n")
 
-                self._emit_usage(usage_callback, model_id, provider, usage_meta, extra_payload)
+                _emit_generation_usage(usage_meta)
                 return content
             elif provider == "fake":
                 content, usage_meta = await self._generate_fake(
@@ -1925,6 +2130,7 @@ class AIService:
                     temperature,
                     adjusted_max_tokens,
                     system_prompt or "",
+                    request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                 )
@@ -1948,7 +2154,7 @@ class AIService:
                     logger.info(content)
                     logger.info(f"{separator}\n")
 
-                self._emit_usage(usage_callback, model_id, provider, usage_meta, extra_payload)
+                _emit_generation_usage(usage_meta)
                 return content
             else:
                 raise ValueError(f"Unsupported model provider: {provider}")
@@ -1967,6 +2173,13 @@ class AIService:
                     action="generation",
                     attempted_feature=attempted_feature,
                     cancellation_token=cancellation_token,
+                )
+                self._raise_if_generation_stopped_unusably(
+                    generated_content,
+                    last_usage_meta,
+                    provider=last_usage_provider,
+                    model_id=last_usage_model_id,
+                    max_tokens=adjusted_max_tokens,
                 )
                 if json_output and json_schema and effective_json_schema is None:
                     try:
@@ -1995,6 +2208,12 @@ class AIService:
                 return generated_content
         except asyncio.CancelledError:
             logger.info("Content generation cancelled for %s", model)
+            raise
+        except GenerationOutputTruncated:
+            logger.warning("Content generation truncated for %s", model)
+            raise
+        except GenerationStoppedUnexpectedly:
+            logger.warning("Content generation stopped unusably for %s", model)
             raise
         except Exception as e:
             logger.error(f"Content generation failed for {model}: {str(e)}")
@@ -3566,7 +3785,7 @@ class AIService:
                         "status": finish_reason,
                     },
                 )
-                if _is_token_limit_finish_reason(finish_reason):
+                if _is_token_limit_finish_reason(finish_reason, provider=provider_key):
                     message_text = (
                         "OpenAI Chat Completions stream ended with unusable "
                         f"finish_reason={finish_reason}"
@@ -3738,7 +3957,7 @@ class AIService:
                     "status": finish_reason,
                 },
             )
-            if _is_token_limit_finish_reason(finish_reason):
+            if _is_token_limit_finish_reason(finish_reason, provider=provider_key):
                 message_text = (
                     "OpenAI Chat Completions stream ended with unusable "
                     f"finish_reason={finish_reason}"
@@ -3885,7 +4104,7 @@ class AIService:
                     "detail": detail,
                 },
             )
-            if _is_token_limit_finish_reason(stop_reason):
+            if _is_token_limit_finish_reason(stop_reason, provider="openai"):
                 message_text = (
                     "OpenAI Responses turn ended before a usable turn completed "
                     f"(status={finish_reason}, detail={detail or 'n/a'})"
@@ -4180,7 +4399,7 @@ class AIService:
 
         if terminal_error_status is not None:
             stop_reason = terminal_error_reason or terminal_error_status
-            if _is_token_limit_finish_reason(stop_reason):
+            if _is_token_limit_finish_reason(stop_reason, provider="openai"):
                 message_text = (
                     "OpenAI Responses stream ended before a usable turn completed "
                     f"(status={terminal_error_status}, detail={terminal_error_detail or 'n/a'})"
@@ -4317,6 +4536,7 @@ class AIService:
         extra_verbose: bool = False,
         accent_context: Optional[Dict[str, Any]] = None,
         enable_validate_draft: bool = True,
+        accent_audit_timeout: Optional[float] = None,
         *,
         stop_on_approval: bool = True,
         output_contract: OutputContract = OutputContract.FREE_TEXT,
@@ -4504,7 +4724,7 @@ class AIService:
                         language=None,
                         criteria_block=accent_context["criteria_block"],
                         min_score=resolved_accent_min_score,
-                        timeout_seconds=float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
+                        timeout_seconds=float(accent_audit_timeout or config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
                         max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                         on_error=audit_on_error,
                         llm_routing=llm_routing,
@@ -4933,7 +5153,7 @@ class AIService:
                                     language=None,
                                     criteria_block=accent_context["criteria_block"],
                                     min_score=resolved_accent_min_score,
-                                    timeout_seconds=float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
+                                    timeout_seconds=float(accent_audit_timeout or config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
                                     max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                                     on_error=audit_on_error,
                                     llm_routing=llm_routing,
@@ -5112,14 +5332,25 @@ class AIService:
                         or _draft_hash(candidate_validated_draft) in audit_accent_approved_hashes
                     ):
                         latest_validated_text = candidate_validated_draft
-                        envelope = {
-                            "mode": mode_name,
-                            "turns": turn,
-                            "accepted": "validated_tool_argument",
-                            "trace": trace,
-                        }
-                        envelope.update(_build_accent_envelope())
-                        return latest_validated_text, envelope
+                        if stop_on_approval:
+                            envelope = {
+                                "mode": mode_name,
+                                "turns": turn,
+                                "accepted": "validated_tool_argument",
+                                "trace": trace,
+                            }
+                            envelope.update(_build_accent_envelope())
+                            return latest_validated_text, envelope
+                        latest_feedback = (
+                            "The draft passed deterministic validation. "
+                            "Return the requested final answer without calling validate_draft again."
+                        )
+                        latest_invalid_draft = candidate_validated_draft
+                        trace.append({
+                            "turn": turn,
+                            "event": "validated_tool_argument_continued",
+                            "reason": "stop_on_approval_false",
+                        })
 
                     # Blocked — decide whether to piggyback accent feedback on the next user-turn.
                     if accent_inline_required and candidate_validated_draft is not None and (
@@ -5236,6 +5467,10 @@ class AIService:
                 return forced_result
 
             if latest_validated_text.strip():
+                if not stop_on_approval:
+                    raise ToolLoopSchemaViolationError(
+                        "Tool loop exhausted without final assistant output"
+                    )
                 await _sync_audit_or_fail(latest_validated_text, "path_d", max_rounds)
                 envelope = {
                     "mode": mode_name,
@@ -5553,23 +5788,6 @@ class AIService:
             )
             raise RuntimeError("Claude Messages stream ended without message_stop")
 
-        if self._is_unusable_claude_stream_stop(stop_reason):
-            await self._emit_tool_event_safe(
-                tool_event_callback,
-                "tool_loop_provider_terminal",
-                {
-                    "provider": provider_key,
-                    "model": model_id,
-                    "turn": turn,
-                    "loop_scope": loop_scope.value,
-                    "api_surface": "messages",
-                    "status": stop_reason,
-                },
-            )
-            raise RuntimeError(
-                f"Claude Messages stream ended with unusable stop_reason={stop_reason}"
-            )
-
         if final_response is not None and getattr(final_response, "content", None) is not None:
             content_blocks = list(getattr(final_response, "content") or [])
         else:
@@ -5583,6 +5801,36 @@ class AIService:
             block for block in content_blocks
             if getattr(block, "type", None) == "tool_use"
         ]
+
+        if self._is_unusable_claude_stream_stop(stop_reason):
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_loop_provider_terminal",
+                {
+                    "provider": provider_key,
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "messages",
+                    "status": stop_reason,
+                },
+            )
+            if _is_token_limit_finish_reason(stop_reason, provider=provider_key):
+                raise ToolLoopOutputTruncated(
+                    "Claude Messages stream ended because the output token budget "
+                    f"was exhausted (stop_reason={stop_reason})",
+                    provider=provider_key,
+                    model_id=model_id,
+                    turn=turn,
+                    finish_reason=stop_reason or "",
+                    max_tokens=_extract_output_token_limit(params),
+                    api_surface="messages",
+                    partial_content_chars=len(assistant_text),
+                    partial_tool_calls=len(tool_uses),
+                )
+            raise RuntimeError(
+                f"Claude Messages stream ended with unusable stop_reason={stop_reason}"
+            )
 
         if tool_uses and stop_reason != "tool_use":
             await self._emit_tool_event_safe(
@@ -5698,6 +5946,7 @@ class AIService:
         extra_verbose: bool = False,
         accent_context: Optional[Dict[str, Any]] = None,
         enable_validate_draft: bool = True,
+        accent_audit_timeout: Optional[float] = None,
         *,
         reasoning_effort: Optional[str] = None,
         stop_on_approval: bool = True,
@@ -5882,7 +6131,7 @@ class AIService:
                         language=None,
                         criteria_block=accent_context["criteria_block"],
                         min_score=resolved_accent_min_score,
-                        timeout_seconds=float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
+                        timeout_seconds=float(accent_audit_timeout or config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
                         max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                         on_error=audit_on_error,
                         llm_routing=llm_routing,
@@ -6135,7 +6384,7 @@ class AIService:
                                     language=None,
                                     criteria_block=accent_context["criteria_block"],
                                     min_score=resolved_accent_min_score,
-                                    timeout_seconds=float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
+                                    timeout_seconds=float(accent_audit_timeout or config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
                                     max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                                     on_error=audit_on_error,
                                     llm_routing=llm_routing,
@@ -6309,14 +6558,25 @@ class AIService:
                         or _draft_hash(candidate_validated_draft) in audit_accent_approved_hashes
                     ):
                         latest_validated_text = candidate_validated_draft
-                        envelope = {
-                            "mode": mode_name,
-                            "turns": turn,
-                            "accepted": "validated_tool_argument",
-                            "trace": trace,
-                        }
-                        envelope.update(_build_accent_envelope())
-                        return latest_validated_text, envelope
+                        if stop_on_approval:
+                            envelope = {
+                                "mode": mode_name,
+                                "turns": turn,
+                                "accepted": "validated_tool_argument",
+                                "trace": trace,
+                            }
+                            envelope.update(_build_accent_envelope())
+                            return latest_validated_text, envelope
+                        latest_feedback = (
+                            "The draft passed deterministic validation. "
+                            "Return the requested final answer without calling validate_draft again."
+                        )
+                        latest_invalid_draft = candidate_validated_draft
+                        trace.append({
+                            "turn": turn,
+                            "event": "validated_tool_argument_continued",
+                            "reason": "stop_on_approval_false",
+                        })
 
                     # Blocked/no-validate-approval: append consolidated user turn (tool_results
                     # first, optional accent feedback piggybacked in the same message).
@@ -6440,6 +6700,10 @@ class AIService:
                 return forced_result
 
             if latest_validated_text.strip():
+                if not stop_on_approval:
+                    raise ToolLoopSchemaViolationError(
+                        "Tool loop exhausted without final assistant output"
+                    )
                 await _sync_audit_or_fail(latest_validated_text, "path_d", max_rounds)
                 envelope = {
                     "mode": mode_name,
@@ -6495,6 +6759,8 @@ class AIService:
         extra_verbose: bool = False,
         accent_context: Optional[Dict[str, Any]] = None,
         enable_validate_draft: bool = True,
+        request_timeout: Optional[float] = None,
+        accent_audit_timeout: Optional[float] = None,
         *,
         stop_on_approval: bool = True,
         output_contract: OutputContract = OutputContract.FREE_TEXT,
@@ -6518,6 +6784,12 @@ class AIService:
             raise ValueError("New Gemini client not initialized")
 
         from google.genai import types
+
+        async def _generate_with_timeout(**kwargs: Any) -> Any:
+            call = self.google_new_client.aio.models.generate_content(**kwargs)
+            if request_timeout and request_timeout > 0:
+                return await asyncio.wait_for(call, timeout=float(request_timeout))
+            return await call
 
         mode_name = "gemini_tool_loop"
         effective_system = system_prompt or ""
@@ -6679,7 +6951,7 @@ class AIService:
                         language=None,
                         criteria_block=accent_context["criteria_block"],
                         min_score=resolved_accent_min_score,
-                        timeout_seconds=float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
+                        timeout_seconds=float(accent_audit_timeout or config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
                         max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                         on_error=audit_on_error,
                         llm_routing=llm_routing,
@@ -6736,7 +7008,7 @@ class AIService:
                     )
                 )
                 try:
-                    response = await self.google_new_client.aio.models.generate_content(
+                    response = await _generate_with_timeout(
                         model=model_id,
                         contents=forced_contents,
                         config=_build_generate_config(tools_enabled=False),
@@ -6828,7 +7100,7 @@ class AIService:
                 )
                 any_tools = enable_validate_draft or include_audit_accent
                 try:
-                    response = await self.google_new_client.aio.models.generate_content(
+                    response = await _generate_with_timeout(
                         model=model_id,
                         contents=contents,
                         config=_build_generate_config(
@@ -6941,7 +7213,7 @@ class AIService:
                                     language=None,
                                     criteria_block=accent_context["criteria_block"],
                                     min_score=resolved_accent_min_score,
-                                    timeout_seconds=float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
+                                    timeout_seconds=float(accent_audit_timeout or config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS),
                                     max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                                     on_error=audit_on_error,
                                     llm_routing=llm_routing,
@@ -7104,14 +7376,25 @@ class AIService:
                         or _draft_hash(candidate_validated_draft) in audit_accent_approved_hashes
                     ):
                         latest_validated_text = candidate_validated_draft
-                        envelope = {
-                            "mode": mode_name,
-                            "turns": turn,
-                            "accepted": "validated_tool_argument",
-                            "trace": trace,
-                        }
-                        envelope.update(_build_accent_envelope())
-                        return latest_validated_text, envelope
+                        if stop_on_approval:
+                            envelope = {
+                                "mode": mode_name,
+                                "turns": turn,
+                                "accepted": "validated_tool_argument",
+                                "trace": trace,
+                            }
+                            envelope.update(_build_accent_envelope())
+                            return latest_validated_text, envelope
+                        latest_feedback = (
+                            "The draft passed deterministic validation. "
+                            "Return the requested final answer without calling validate_draft again."
+                        )
+                        latest_invalid_draft = candidate_validated_draft
+                        trace.append({
+                            "turn": turn,
+                            "event": "validated_tool_argument_continued",
+                            "reason": "stop_on_approval_false",
+                        })
 
                     # Blocked/no-approval: one consolidated user turn with function_responses
                     # plus optional accent feedback part.
@@ -7245,6 +7528,10 @@ class AIService:
                 return forced_result
 
             if latest_validated_text.strip():
+                if not stop_on_approval:
+                    raise ToolLoopSchemaViolationError(
+                        "Tool loop exhausted without final assistant output"
+                    )
                 await _sync_audit_or_fail(latest_validated_text, "path_d", max_rounds)
                 envelope = {
                     "mode": mode_name,
@@ -7304,7 +7591,7 @@ class AIService:
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
         initial_measurement_text: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 8000,
+        max_tokens: Optional[int] = None,
         system_prompt: Optional[str] = None,
         extra_verbose: bool = False,
         reasoning_effort: Optional[str] = None,
@@ -7315,6 +7602,7 @@ class AIService:
         phase_logger: Optional["PhaseLogger"] = None,
         images: Optional[List["ImageData"]] = None,
         accent_guard: Optional["LlmAccentGuard"] = None,
+        accent_audit_timeout: Optional[float] = None,
         # CONSTRAINT: extra_system_instructions must remain hardcoded scaffolding
         # with no user/model-derived content. If a future change introduces such
         # content, move it into prompt_safety_parts (tagged user_supplied) instead.
@@ -7323,6 +7611,7 @@ class AIService:
         min_global_score: Optional[float] = None,
         system_prompt_source: "PromptSource" = "system_generated",
         llm_routing: Optional[Mapping[str, Any]] = None,
+        request_timeout: Optional[float] = None,
         cancellation_token: Optional["CancellationToken"] = None,
     ) -> Tuple[str, ToolLoopEnvelope]:
         """Reusable entry point for the shared ``validate_draft`` tool loop.
@@ -7349,6 +7638,11 @@ class AIService:
         """
 
         await self._raise_if_cancelled(cancellation_token)
+        max_tokens, _token_budget_resolution = self._resolve_effective_output_max_tokens(
+            model,
+            max_tokens,
+            call_id="ai_service.call_ai_with_validation_tools",
+        )
 
         # Resolve rounds budget. ``max_tool_rounds`` is the new parameter name;
         # older generator callers passed ``max_rounds`` so we default to the
@@ -7428,7 +7722,17 @@ class AIService:
             )
             return "", envelope
 
-        request_timeout = token_validation.get("reasoning_timeout_seconds")
+        recommended_timeout = token_validation.get("reasoning_timeout_seconds")
+        if recommended_timeout and recommended_timeout > 0:
+            logger.info(
+                f"Tool-loop model {model_id} has recommended reasoning timeout of {recommended_timeout} seconds"
+            )
+        request_timeout = _resolve_ai_process_timeout(
+            request_timeout,
+            ("per_call_timeout_propagation", "tool_loop_seconds"),
+            fallback=getattr(config, "REQUEST_TIMEOUT", 12000),
+        )
+        logger.debug("Using tool-loop process timeout of %ss for model %s", request_timeout, model_id)
         reasoning_effort = adjusted_reasoning_effort
         thinking_budget_tokens = adjusted_thinking_budget
 
@@ -7585,6 +7889,10 @@ class AIService:
                 "criteria_block": build_accent_criteria_block(raw_criteria),
                 "min_score": resolved_min_score,
             }
+        resolved_accent_audit_timeout = (
+            coerce_timeout_seconds(accent_audit_timeout)
+            or float(config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS)
+        )
 
         output_plan = self._plan_output_contract(
             provider_key,
@@ -7671,6 +7979,7 @@ class AIService:
                     extra_verbose=extra_verbose,
                     accent_context=accent_context,
                     enable_validate_draft=enable_validate_draft,
+                    accent_audit_timeout=resolved_accent_audit_timeout,
                     **loop_common_kwargs,
                 )
             elif provider_key == "claude":
@@ -7694,6 +8003,7 @@ class AIService:
                     extra_verbose=extra_verbose,
                     accent_context=accent_context,
                     enable_validate_draft=enable_validate_draft,
+                    accent_audit_timeout=resolved_accent_audit_timeout,
                     **loop_common_kwargs,
                 )
             elif provider_key == "gemini":
@@ -7709,6 +8019,7 @@ class AIService:
                         thinking_budget_tokens=thinking_budget_tokens,
                         json_output=json_output_flag,
                         json_schema=effective_json_schema,
+                        request_timeout=request_timeout,
                         usage_callback=usage_callback,
                         usage_extra=extra_payload,
                         images=images,
@@ -7716,6 +8027,7 @@ class AIService:
                         extra_verbose=extra_verbose,
                         accent_context=accent_context,
                         enable_validate_draft=enable_validate_draft,
+                        accent_audit_timeout=resolved_accent_audit_timeout,
                         **loop_common_kwargs,
                     )
                 else:
@@ -7969,7 +8281,7 @@ class AIService:
                     "JSON_STRUCTURED requires response_format"
                 )
             try:
-                from tools.ai_json_cleanroom import validate_ai_json
+                from tools.ai_json_cleanroom import ErrorCode, validate_ai_json
             except Exception as exc:  # noqa: BLE001 - fail closed on import issue
                 output_schema_valid = False
                 raise ToolLoopSchemaViolationError(
@@ -7996,6 +8308,27 @@ class AIService:
                 raise ToolLoopSchemaViolationError(
                     f"JSON_STRUCTURED output for {model} parsed to "
                     f"{type(validation_result.data).__name__}, expected object"
+                )
+            # Surface when the model emitted undeclared fields/items that were
+            # stripped to fit the schema. Useful to spot models inventing keys.
+            stripped_warnings = [
+                w for w in (validation_result.warnings or [])
+                if w.code == ErrorCode.STRIPPED_ADDITIONAL
+            ]
+            if stripped_warnings:
+                stripped_fields: List[str] = []
+                dropped_items = 0
+                for w in stripped_warnings:
+                    detail = w.detail or {}
+                    stripped_fields.extend(detail.get("stripped", []))
+                    dropped_items += int(detail.get("dropped_count", 0) or 0)
+                logger.info(
+                    "JSON_STRUCTURED (%s): %s returned undeclared content stripped "
+                    "to fit the schema%s%s",
+                    loop_scope.value,
+                    model,
+                    f"; fields: {', '.join(stripped_fields)}" if stripped_fields else "",
+                    f"; array items dropped: {dropped_items}" if dropped_items else "",
                 )
             payload_parsed = validation_result.data
             if _should_normalize_json_contract_content(content, validation_result):
@@ -8511,7 +8844,7 @@ class AIService:
         prompt: str,
         model: str,
         temperature: float = 0.7,
-        max_tokens: int = 8000,
+        max_tokens: Optional[int] = None,
         system_prompt: Optional[str] = None,
         extra_verbose: bool = False,
         reasoning_effort: Optional[str] = None,
@@ -8528,6 +8861,7 @@ class AIService:
         prompt_safety_parts: Optional[List[Any]] = None,
         system_prompt_source: "PromptSource" = "system_generated",
         llm_routing: Optional[Mapping[str, Any]] = None,
+        request_timeout: Optional[float] = None,
         cancellation_token: Optional["CancellationToken"] = None,
     ):
         """
@@ -8548,6 +8882,12 @@ class AIService:
         Yields:
             Generated content chunks as they are produced
         """
+        max_tokens, _token_budget_resolution = self._resolve_effective_output_max_tokens(
+            model,
+            max_tokens,
+            call_id="ai_service.generate_content_stream",
+        )
+
         # Intelligent validation and adjustment of all token parameters
         token_validation = config.validate_token_limits(
             model, max_tokens, reasoning_effort, thinking_budget_tokens
@@ -8626,7 +8966,17 @@ class AIService:
                 effective_json_schema = None
         attempted_feature = output_plan.attempted_feature
 
-        request_timeout = token_validation.get("reasoning_timeout_seconds")
+        recommended_timeout = token_validation.get("reasoning_timeout_seconds")
+        if recommended_timeout and recommended_timeout > 0:
+            logger.info(
+                f"Streaming model {model_id} has recommended reasoning timeout of {recommended_timeout} seconds"
+            )
+        request_timeout = _resolve_ai_process_timeout(
+            request_timeout,
+            ("streaming", "stream_seconds"),
+            fallback=getattr(config, "REQUEST_TIMEOUT", 12000),
+        )
+        logger.debug("Using streaming process timeout of %ss for model %s", request_timeout, model_id)
 
         # Use the intelligently adjusted parameters for generation
         reasoning_effort = adjusted_reasoning_effort
@@ -8722,6 +9072,7 @@ class AIService:
                     extra_verbose,
                     thinking_budget_tokens,
                     reasoning_effort=reasoning_effort,
+                    request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     usage_callback=usage_callback,
@@ -8740,6 +9091,7 @@ class AIService:
                     system_prompt,
                     reasoning_effort=reasoning_effort,
                     thinking_budget_tokens=thinking_budget_tokens,
+                    request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     usage_callback=usage_callback,
@@ -8756,6 +9108,7 @@ class AIService:
                     adjusted_max_tokens,
                     system_prompt,
                     reasoning_effort=reasoning_effort,
+                    request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     usage_callback=usage_callback,
@@ -8770,6 +9123,7 @@ class AIService:
                     temperature,
                     adjusted_max_tokens,
                     system_prompt,
+                    request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     usage_callback=usage_callback,
@@ -8784,6 +9138,7 @@ class AIService:
                     temperature,
                     adjusted_max_tokens,
                     system_prompt,
+                    request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     usage_callback=usage_callback,
@@ -8798,6 +9153,7 @@ class AIService:
                     temperature,
                     adjusted_max_tokens,
                     system_prompt,
+                    request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     usage_callback=usage_callback,
@@ -8812,6 +9168,7 @@ class AIService:
                     temperature,
                     adjusted_max_tokens,
                     system_prompt,
+                    request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     usage_callback=usage_callback,
@@ -8825,6 +9182,7 @@ class AIService:
                     temperature,
                     adjusted_max_tokens,
                     system_prompt,
+                    request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     usage_callback=usage_callback,
@@ -8859,11 +9217,19 @@ class AIService:
                 ):
                     if await _stream_cancel_requested():
                         return
-                    async for chunk in _dispatch_stream():
-                        chunks_emitted += 1
-                        if await _stream_cancel_requested():
-                            return
-                        yield chunk
+                    if request_timeout and request_timeout > 0:
+                        async with asyncio.timeout(float(request_timeout)):
+                            async for chunk in _dispatch_stream():
+                                chunks_emitted += 1
+                                if await _stream_cancel_requested():
+                                    return
+                                yield chunk
+                    else:
+                        async for chunk in _dispatch_stream():
+                            chunks_emitted += 1
+                            if await _stream_cancel_requested():
+                                return
+                            yield chunk
                 await self._record_provider_health_success(provider, model_id, "streaming")
                 return
             except asyncio.CancelledError:
@@ -9088,6 +9454,7 @@ class AIService:
         system_prompt: str,
         reasoning_effort: Optional[str] = None,
         thinking_budget_tokens: Optional[int] = None,
+        request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
@@ -9103,6 +9470,7 @@ class AIService:
             system_prompt,
             reasoning_effort=reasoning_effort,
             thinking_budget_tokens=thinking_budget_tokens,
+            request_timeout=request_timeout,
             json_output=json_output,
             json_schema=json_schema,
             images=images,
@@ -9117,6 +9485,7 @@ class AIService:
         system_prompt: str,
         reasoning_effort: Optional[str] = None,
         thinking_budget_tokens: Optional[int] = None,
+        request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
@@ -9184,11 +9553,15 @@ class AIService:
 
             config = types.GenerateContentConfig(**config_params)
 
-            response = await self.google_new_client.aio.models.generate_content(
+            gemini_call = self.google_new_client.aio.models.generate_content(
                 model=model_id,
                 contents=contents,
                 config=config
             )
+            if request_timeout and request_timeout > 0:
+                response = await asyncio.wait_for(gemini_call, timeout=request_timeout)
+            else:
+                response = await gemini_call
 
             # Extract text from response
             if hasattr(response, 'text') and response.text:
@@ -9823,6 +10196,7 @@ class AIService:
         """Check health of all AI service providers"""
         health_status = {}
 
+        # Health probes intentionally use tiny responses; they are liveness checks.
         # Test OpenAI
         try:
             if self.openai_client:
@@ -10212,6 +10586,7 @@ class AIService:
         extra_verbose: bool,
         thinking_budget_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
+        request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -10289,6 +10664,9 @@ class AIService:
             # pydantic.TypeAdapter and raise `TypeError: unhashable type: 'dict'`.
             if use_structured_outputs:
                 stream_params["stream"] = True
+                request_kwargs: Dict[str, Any] = {}
+                if request_timeout and request_timeout > 0:
+                    request_kwargs["timeout"] = request_timeout
                 create = (
                     self.anthropic_client.beta.messages.create
                     if use_beta_structured_outputs
@@ -10297,9 +10675,12 @@ class AIService:
                 stream_context = await self._call_claude_messages_create_with_reasoning_retry(
                     create,
                     stream_params,
+                    request_kwargs,
                     model_id=model_id,
                 )
             else:
+                if request_timeout and request_timeout > 0:
+                    stream_params["timeout"] = request_timeout
                 stream_context = self.anthropic_client.messages.stream(**stream_params)
 
             async with stream_context as stream:
@@ -10401,6 +10782,7 @@ class AIService:
         system_prompt: Optional[str],
         reasoning_effort: Optional[str] = None,
         thinking_budget_tokens: Optional[int] = None,
+        request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -10420,6 +10802,7 @@ class AIService:
             system_prompt,
             reasoning_effort=reasoning_effort,
             thinking_budget_tokens=thinking_budget_tokens,
+            request_timeout=request_timeout,
             json_output=json_output,
             json_schema=json_schema,
             usage_callback=usage_callback,
@@ -10438,6 +10821,7 @@ class AIService:
         system_prompt: Optional[str],
         reasoning_effort: Optional[str] = None,
         thinking_budget_tokens: Optional[int] = None,
+        request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -10498,11 +10882,15 @@ class AIService:
 
             config = types.GenerateContentConfig(**config_params)
 
-            stream_response = await self.google_new_client.aio.models.generate_content_stream(
+            stream_call = self.google_new_client.aio.models.generate_content_stream(
                 model=model_id,
                 contents=contents,
                 config=config
             )
+            if request_timeout and request_timeout > 0:
+                stream_response = await asyncio.wait_for(stream_call, timeout=request_timeout)
+            else:
+                stream_response = await stream_call
 
             usage_metadata = None
             # Check if stream_response is None or not iterable
@@ -10566,6 +10954,7 @@ class AIService:
                         system_prompt,
                         reasoning_effort=reasoning_effort,
                         thinking_budget_tokens=thinking_budget_tokens,
+                        request_timeout=request_timeout,
                         json_output=json_output,
                         json_schema=json_schema,
                     )
@@ -10615,6 +11004,7 @@ class AIService:
         max_tokens: int,
         system_prompt: Optional[str],
         reasoning_effort: Optional[str] = None,
+        request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -10674,6 +11064,9 @@ class AIService:
 
             # Include usage stats in streaming response (OpenAI-compatible API)
             create_params.setdefault("stream_options", {})["include_usage"] = True
+            request_kwargs: Dict[str, Any] = {}
+            if request_timeout and request_timeout > 0:
+                request_kwargs["timeout"] = request_timeout
 
             # Configure JSON output format
             if json_output:
@@ -10696,6 +11089,7 @@ class AIService:
             stream = await self._call_chat_completions_create_with_reasoning_retry(
                 self.xai_client,
                 create_params,
+                request_kwargs,
                 provider_key="xai",
                 model_id=model_id,
             )
@@ -10752,6 +11146,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: Optional[str],
+        request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -10797,6 +11192,9 @@ class AIService:
 
             # Include usage stats in streaming response (OpenAI-compatible API)
             create_params.setdefault("stream_options", {})["include_usage"] = True
+            request_kwargs: Dict[str, Any] = {}
+            if request_timeout and request_timeout > 0:
+                request_kwargs["timeout"] = request_timeout
 
             # Configure JSON output format (OpenRouter is OpenAI-compatible)
             if json_output:
@@ -10810,15 +11208,18 @@ class AIService:
                             "schema": json_schema
                         }
                     }
-                    create_params["extra_body"] = {"provider": {"require_parameters": True}}
+                    request_kwargs["extra_body"] = {"provider": {"require_parameters": True}}
                     logger.info(f"Using OpenRouter JSON Schema structured outputs (streaming) for {model_id}")
                 elif self._supports_json_object("openrouter", model_id):
                     # Use basic JSON mode (flexible structure)
                     create_params["response_format"] = {"type": "json_object"}
-                    create_params["extra_body"] = {"provider": {"require_parameters": True}}
+                    request_kwargs["extra_body"] = {"provider": {"require_parameters": True}}
                     logger.info(f"Using OpenRouter JSON mode (streaming, flexible) for {model_id}")
 
-            stream = await self.openrouter_client.chat.completions.create(**create_params)
+            stream = await self.openrouter_client.chat.completions.create(
+                **create_params,
+                **request_kwargs,
+            )
 
             usage_obj = None
             finish_reason = None
@@ -10876,6 +11277,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: Optional[str],
+        request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -10925,6 +11327,9 @@ class AIService:
         )
         if provider_key == "minimax":
             create_params["extra_body"] = {"reasoning_split": True}
+        request_kwargs: Dict[str, Any] = {}
+        if request_timeout and request_timeout > 0:
+            request_kwargs["timeout"] = request_timeout
 
         if json_output:
             if json_schema and self._supports_structured_outputs(provider_key, model_id):
@@ -10946,7 +11351,10 @@ class AIService:
                 logger.info("Using %s JSON mode (streaming) for %s", display_name, model_id)
 
         try:
-            stream = await client.chat.completions.create(**create_params)
+            stream = await client.chat.completions.create(
+                **create_params,
+                **request_kwargs,
+            )
 
             usage_obj = None
             finish_reason = None
@@ -10998,6 +11406,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: Optional[str],
+        request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -11015,6 +11424,7 @@ class AIService:
             temperature=temperature,
             max_tokens=max_tokens,
             system_prompt=system_prompt,
+            request_timeout=request_timeout,
             json_output=json_output,
             json_schema=json_schema,
             usage_callback=usage_callback,
@@ -11030,6 +11440,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: Optional[str],
+        request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -11047,6 +11458,7 @@ class AIService:
             temperature=temperature,
             max_tokens=max_tokens,
             system_prompt=system_prompt,
+            request_timeout=request_timeout,
             json_output=json_output,
             json_schema=json_schema,
             usage_callback=usage_callback,
@@ -11144,6 +11556,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: Optional[str],
+        request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -11157,6 +11570,7 @@ class AIService:
             temperature: Generation temperature
             max_tokens: Maximum tokens
             system_prompt: System prompt
+            request_timeout: Optional model-call process timeout in seconds
             json_output: Enable JSON output mode
             json_schema: Optional JSON schema for structured outputs
             usage_callback: Callback for usage tracking
@@ -11191,6 +11605,9 @@ class AIService:
                 "max_tokens": max_tokens,
                 "stream": True
             }
+            request_kwargs: Dict[str, Any] = {}
+            if request_timeout and request_timeout > 0:
+                request_kwargs["timeout"] = request_timeout
 
             # Include usage stats in streaming response (OpenAI-compatible API)
             create_params.setdefault("stream_options", {})["include_usage"] = True
@@ -11212,7 +11629,10 @@ class AIService:
                     logger.info(f"Using Ollama JSON mode (streaming) for {model_id}")
 
             async with self.model_call_concurrency_slot("ollama", model_id, "generate_content_stream"):
-                stream = await self.ollama_client.chat.completions.create(**create_params)
+                stream = await self.ollama_client.chat.completions.create(
+                    **create_params,
+                    **request_kwargs,
+                )
 
                 usage_obj = None
                 finish_reason = None
@@ -11266,6 +11686,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: str,
+        request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
     ) -> tuple:
@@ -11289,11 +11710,16 @@ class AIService:
 
         logger.info(f"[FakeAI] Generating with model: {model_id}")
 
+        request_kwargs: Dict[str, Any] = {}
+        if request_timeout and request_timeout > 0:
+            request_kwargs["timeout"] = request_timeout
+
         response = await self.fake_client.chat.completions.create(
             model=model_id,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            **request_kwargs,
         )
 
         content = response.choices[0].message.content
@@ -11314,6 +11740,7 @@ class AIService:
         temperature: float,
         max_tokens: int,
         system_prompt: Optional[str],
+        request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -11344,12 +11771,17 @@ class AIService:
         logger.info(f"[FakeAI] Streaming with model: {model_id}")
 
         try:
+            request_kwargs: Dict[str, Any] = {}
+            if request_timeout and request_timeout > 0:
+                request_kwargs["timeout"] = request_timeout
+
             stream = await self.fake_client.chat.completions.create(
                 model=model_id,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 stream=True,
+                **request_kwargs,
             )
 
             usage_obj = None

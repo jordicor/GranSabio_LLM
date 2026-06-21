@@ -20,9 +20,10 @@ logger = logging.getLogger(__name__)
 # Timeout constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_STREAM_TIMEOUT_SECONDS = 600
-STREAM_TIMEOUT_GRACE_SECONDS = 180
-RESULT_POLL_GRACE_SECONDS = 120
+DEFAULT_PROCESS_TIMEOUT_SECONDS = 12000
+DEFAULT_STREAM_TIMEOUT_SECONDS = 12000
+STREAM_TIMEOUT_GRACE_SECONDS = 0
+RESULT_POLL_GRACE_SECONDS = 0
 RESULT_POLL_INTERVAL_SECONDS = 5.0
 STREAM_ACTIVITY_CHECK_SECONDS = 30.0
 
@@ -178,6 +179,27 @@ def compute_generation_timeout(
     Returns:
         Timeout in seconds (including grace period).
     """
+    def _coerce_seconds(value: Any) -> Optional[int]:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            seconds = int(float(value))
+        except (TypeError, ValueError):
+            return None
+        return seconds if seconds > 0 else None
+
+    timeouts = payload.get("timeouts")
+    if not isinstance(timeouts, dict):
+        timeouts = {}
+
+    explicit_timeout = (
+        _coerce_seconds(timeouts.get("stream_seconds"))
+        or _coerce_seconds(payload.get("timeout_seconds"))
+        or _coerce_seconds(timeouts.get("default_seconds"))
+    )
+    if explicit_timeout is not None:
+        return explicit_timeout + STREAM_TIMEOUT_GRACE_SECONDS
+
     candidates: list[int] = []
 
     recommended = generation_response.get("recommended_timeout_seconds")
@@ -193,7 +215,7 @@ def compute_generation_timeout(
     if not candidates and catalog_timeout and catalog_timeout > 0:
         candidates.append(catalog_timeout)
 
-    baseline = max(candidates) if candidates else DEFAULT_STREAM_TIMEOUT_SECONDS
+    baseline = max(candidates) if candidates else DEFAULT_PROCESS_TIMEOUT_SECONDS
     return max(DEFAULT_STREAM_TIMEOUT_SECONDS, baseline) + STREAM_TIMEOUT_GRACE_SECONDS
 
 

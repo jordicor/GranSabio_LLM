@@ -77,6 +77,24 @@ def _rejected_result() -> DraftValidationResult:
     )
 
 
+class _FakeClaudeStream:
+    def __init__(self, events):
+        self._events = list(events)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def __aiter__(self):
+        return self._iter_events()
+
+    async def _iter_events(self):
+        for event in self._events:
+            yield event
+
+
 # ---------------------------------------------------------------------------
 # Import / module-level wiring
 # ---------------------------------------------------------------------------
@@ -301,6 +319,59 @@ async def test_output_truncated_tool_loop_returns_controlled_envelope():
     assert envelope.provider_stop_reason == "length"
     assert envelope.max_tokens == 1024
     assert envelope.partial_tool_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_claude_tool_loop_max_tokens_raises_typed_truncation():
+    """Claude ``stop_reason=max_tokens`` must not surface as a generic RuntimeError."""
+    events = [
+        SimpleNamespace(
+            type="message_start",
+            message=SimpleNamespace(usage=SimpleNamespace(input_tokens=10)),
+        ),
+        SimpleNamespace(
+            type="content_block_start",
+            index=0,
+            content_block=SimpleNamespace(type="text", text="partial"),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            index=0,
+            delta=SimpleNamespace(type="text_delta", text=" content"),
+        ),
+        SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(stop_reason="max_tokens"),
+            usage=SimpleNamespace(output_tokens=1024),
+        ),
+        SimpleNamespace(type="message_stop"),
+    ]
+    stream = _FakeClaudeStream(events)
+    service = AIService.__new__(AIService)
+    service.anthropic_client = SimpleNamespace(
+        messages=SimpleNamespace(stream=lambda **kwargs: stream),
+    )
+
+    with pytest.raises(ToolLoopOutputTruncated) as exc_info:
+        await service._stream_claude_tool_turn(
+            {
+                "model": "claude-opus-4-7",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "write"}],
+            },
+            {},
+            provider_key="claude",
+            model_id="claude-opus-4-7",
+            turn=1,
+            loop_scope=LoopScope.GENERATOR,
+            tool_event_callback=None,
+            cancellation_token=None,
+        )
+
+    assert exc_info.value.finish_reason == "max_tokens"
+    assert exc_info.value.max_tokens == 1024
+    assert exc_info.value.api_surface == "messages"
+    assert exc_info.value.partial_content_chars == len("partial content")
 
 
 @pytest.mark.asyncio
@@ -555,6 +626,7 @@ def test_normalize_usage_marks_length_finish_reason_as_truncated():
     usage = service._normalize_usage({
         "prompt_tokens": 10,
         "completion_tokens": 4000,
+        "provider": "openai",
         "finish_reason": "length",
     })
 

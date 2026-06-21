@@ -15,6 +15,7 @@ from inspect import isawaitable
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
 import json_utils as json
+from config import config
 from llm_routing import default_temperature_for_call, resolve_call
 
 if TYPE_CHECKING:
@@ -188,11 +189,16 @@ class TextAnalyzer:
                 if temperature is not None
                 else default_temperature_for_call("smart_edit.analyze")
             )
+        effective_max_tokens = config.resolve_output_max_tokens(
+            model_name,
+            routed_max_tokens=route_params.get("max_tokens"),
+            call_id="smart_edit.analyze",
+        )["max_tokens"]
         kwargs = {
             "model": model_name,
             "prompt": prompt,
             "temperature": effective_temperature,
-            "max_tokens": route_params.get("max_tokens", 4096),
+            "max_tokens": effective_max_tokens,
             "reasoning_effort": route_params.get("reasoning_effort"),
             "thinking_budget_tokens": route_params.get("thinking_budget_tokens"),
             "json_output": True,

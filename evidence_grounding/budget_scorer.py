@@ -26,13 +26,13 @@ from evidence_grounding.evidence_matcher import (
     format_spans_for_prompt,
     scrub_spans,
 )
+from llm_routing import resolve_call, resolve_temperature
 from models import (
     ClaimBudgetResult,
     EvidenceGroundingConfig,
     EvidenceSpan,
     ExtractedClaim,
 )
-from llm_routing import resolve_call, resolve_temperature
 
 logger = logging.getLogger(__name__)
 
@@ -434,6 +434,7 @@ class BudgetScorer:
 
         route = resolve_call("evidence.score_logprobs", request=request)
         model = config_obj.model or route.model
+        # Intentional fixed probe budget: logprob scoring expects a YES/NO-sized answer.
         routed_max_tokens = int(route.params.get("max_tokens", 5))
         routed_temperature = resolve_temperature(route)
 

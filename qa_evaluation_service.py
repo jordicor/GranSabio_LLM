@@ -26,8 +26,8 @@ from model_capability_registry import resolve_model_capability_context
 from models import QAEvaluation, is_json_output_requested
 from phrase_frequency_config import is_phrase_frequency_active
 from qa_bypass_engine import QABypassEngine
-from qa_result_utils import provider_failure_kind
 from qa_response_schemas import QA_SCHEMA_EDITABLE, QA_SCHEMA_SIMPLE
+from qa_result_utils import provider_failure_kind
 from tool_loop_models import LoopScope, OutputContract, PayloadScope, ToolLoopEnvelope
 from tools.ai_json_cleanroom import make_loose_json_validate_options, validate_ai_json
 from validation_context_factory import build_measurement_request_for_layer
@@ -158,7 +158,7 @@ class QAEvaluationService:
         extra_verbose: bool = False,
         stream_callback: Optional[callable] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-        max_tokens: int = 8000,
+        max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
         thinking_budget_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
@@ -176,6 +176,7 @@ class QAEvaluationService:
         session_id: Optional[str] = None,
         project_id: Optional[str] = None,
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        request_timeout: Optional[float] = None,
     ) -> QAEvaluation:
         """
         Evaluate content quality using specified AI model
@@ -189,7 +190,8 @@ class QAEvaluationService:
             deal_breaker_criteria: Specific deal-breaker facts to detect
             output_requirements: Additional instructions appended to the required response format
             original_request: Original content request for context
-            max_tokens: Maximum tokens for QA evaluation (default 8000)
+            max_tokens: Maximum tokens for QA evaluation. If omitted, resolved
+                from QA_DEFAULT_MAX_TOKENS or the model's safe output limit.
             reasoning_effort: Reasoning effort for GPT-5/O1/O3 models
             thinking_budget_tokens: Thinking budget for Claude models
             temperature: Custom temperature (default 0.3 if not specified)
@@ -203,6 +205,24 @@ class QAEvaluationService:
         # Determine appropriate QA system prompt based on content type and request_edit_info
         content_type = getattr(original_request, 'content_type', 'biography') if original_request else 'biography'
         cancellation_token = getattr(original_request, "_cancellation_token", None) if original_request else None
+        resolved_max_tokens = config.resolve_qa_max_tokens(model, max_tokens)
+        if resolved_max_tokens is not None:
+            if max_tokens is None:
+                logger.info(
+                    "Resolved QA max_tokens for %s@%s to %s",
+                    model,
+                    layer_name,
+                    resolved_max_tokens,
+                )
+            elif resolved_max_tokens != max_tokens:
+                logger.warning(
+                    "Adjusted QA max_tokens for %s@%s: %s -> %s",
+                    model,
+                    layer_name,
+                    max_tokens,
+                    resolved_max_tokens,
+                )
+            max_tokens = resolved_max_tokens
 
         # Decide whether to request edit information
         # Smart-edit works in two modes:
@@ -461,6 +481,7 @@ IMPORTANT:
                             label="qa.edit_history",
                         )
                     ] if edit_history else None,
+                    request_timeout=request_timeout,
                     cancellation_token=cancellation_token,
                 ):
                     # Handle StreamChunk (Claude with thinking) vs plain string
@@ -504,6 +525,7 @@ IMPORTANT:
                         label="qa.edit_history",
                     )
                 ] if edit_history else None,
+                request_timeout=request_timeout,
                 cancellation_token=cancellation_token,
             )
 
@@ -578,39 +600,78 @@ IMPORTANT:
                 enriched_payload.setdefault("qa_layer", layer_name)
                 await tool_event_callback(event_type, enriched_payload)
 
-            loop_content, envelope = await self.ai_service.call_ai_with_validation_tools(
-                prompt=evaluation_prompt,
-                model=model,
-                validation_callback=_validation_callback,
-                output_contract=OutputContract.JSON_STRUCTURED,
-                response_format=json_schema,
-                payload_scope=PayloadScope.MEASUREMENT_ONLY,
-                stop_on_approval=False,
-                loop_scope=LoopScope.QA,
-                retries_enabled=False,
-                max_tool_rounds=config.QA_MAX_TOOL_ROUNDS,
-                initial_measurement_text=content,
-                tool_event_callback=bound_tool_event_callback,
-                temperature=eval_temperature,
-                max_tokens=max_tokens,
-                system_prompt=qa_system_prompt,
-                extra_verbose=extra_verbose,
-                content_type=content_type,
-                reasoning_effort=reasoning_effort,
-                thinking_budget_tokens=thinking_budget_tokens,
-                usage_callback=usage_callback,
-                phase_logger=phase_logger,
-                images=input_images,
-                model_alias_registry=model_alias_registry,
-                prompt_safety_parts=[
-                    PromptPart(
-                        text=edit_history or "",
-                        source="user_supplied",
-                        label="qa.edit_history",
+            async def _call_tool_loop(
+                token_budget: Optional[int],
+            ) -> tuple[str, ToolLoopEnvelope]:
+                return await self.ai_service.call_ai_with_validation_tools(
+                    prompt=evaluation_prompt,
+                    model=model,
+                    validation_callback=_validation_callback,
+                    output_contract=OutputContract.JSON_STRUCTURED,
+                    response_format=json_schema,
+                    payload_scope=PayloadScope.MEASUREMENT_ONLY,
+                    stop_on_approval=False,
+                    loop_scope=LoopScope.QA,
+                    retries_enabled=False,
+                    max_tool_rounds=config.QA_MAX_TOOL_ROUNDS,
+                    initial_measurement_text=content,
+                    tool_event_callback=bound_tool_event_callback,
+                    temperature=eval_temperature,
+                    max_tokens=token_budget,
+                    system_prompt=qa_system_prompt,
+                    extra_verbose=extra_verbose,
+                    content_type=content_type,
+                    reasoning_effort=reasoning_effort,
+                    thinking_budget_tokens=thinking_budget_tokens,
+                    usage_callback=usage_callback,
+                    phase_logger=phase_logger,
+                    images=input_images,
+                    model_alias_registry=model_alias_registry,
+                    prompt_safety_parts=[
+                        PromptPart(
+                            text=edit_history or "",
+                            source="user_supplied",
+                            label="qa.edit_history",
+                        )
+                    ] if edit_history else None,
+                    request_timeout=request_timeout,
+                    cancellation_token=cancellation_token,
+                )
+
+            loop_content, envelope = await _call_tool_loop(max_tokens)
+            if isinstance(envelope, ToolLoopEnvelope) and envelope.output_truncated:
+                current_budget = envelope.max_tokens or max_tokens
+                retry_budget = config.resolve_qa_truncation_retry_max_tokens(
+                    model,
+                    current_budget,
+                )
+                if retry_budget is not None:
+                    logger.warning(
+                        "Retrying QA tool loop for %s@%s after output truncation: "
+                        "max_tokens %s -> %s",
+                        model,
+                        layer_name,
+                        current_budget,
+                        retry_budget,
                     )
-                ] if edit_history else None,
-                cancellation_token=cancellation_token,
-            )
+                    await bound_tool_event_callback(
+                        "qa_tool_loop_retry",
+                        {
+                            "reason": "output_token_limit",
+                            "previous_max_tokens": current_budget,
+                            "retry_max_tokens": retry_budget,
+                            "finish_reason": envelope.finish_reason,
+                        },
+                    )
+                    loop_content, envelope = await _call_tool_loop(retry_budget)
+
+                if isinstance(envelope, ToolLoopEnvelope) and envelope.output_truncated:
+                    raise QAResponseParseError(
+                        f"QA tool loop output truncated for {model}@{layer_name}: "
+                        f"finish_reason={envelope.finish_reason or envelope.provider_stop_reason}; "
+                        f"max_tokens={envelope.max_tokens or current_budget}. "
+                        "Increase QA max_tokens or reduce the evaluated content size."
+                    )
 
             if isinstance(envelope, ToolLoopEnvelope) and envelope.payload is not None:
                 # JSON_STRUCTURED parsed dict is available — re-serialize for

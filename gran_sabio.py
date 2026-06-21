@@ -15,14 +15,22 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 if TYPE_CHECKING:
     from logging_utils import PhaseLogger
 
-from ai_service import AIRequestError, AIService, StreamChunk, get_ai_service
-from config import config, get_default_models
+from ai_service import (
+    AIRequestError,
+    AIService,
+    GenerationOutputTruncated,
+    GenerationStoppedUnexpectedly,
+    StreamChunk,
+    get_ai_service,
+)
+from config import DEFAULT_OUTPUT_TOKEN_FALLBACK, config, get_default_models
 from deterministic_validation import DraftValidationResult, validate_generation_candidate
 from json_utils import dumps as json_dumps
 from llm_routing import resolve_call, resolve_temperature
 from model_aliasing import PromptPart, get_evaluator_alias
 from model_capability_registry import resolve_model_capability_context
 from models import ContentRequest, GranSabioResult, is_json_output_requested
+from request_timeouts import resolve_request_timeout
 from tool_loop_models import (
     JsonContractError,
     LoopScope,
@@ -210,6 +218,9 @@ def _normalize_regeneration_json_output(
 
 def _is_retryable_streaming_error(exc: Exception) -> bool:
     """Determine if a streaming error should trigger a retry."""
+    if isinstance(exc, (GenerationOutputTruncated, GenerationStoppedUnexpectedly)):
+        return False
+
     if isinstance(exc, AIRequestError):
         failure = getattr(exc, "provider_failure", None)
         if failure is not None:
@@ -232,6 +243,9 @@ def _is_retryable_streaming_error(exc: Exception) -> bool:
 
 def _extract_error_reason(exc: Exception) -> str:
     """Extract a human-readable error reason from an exception."""
+    if isinstance(exc, (GenerationOutputTruncated, GenerationStoppedUnexpectedly)):
+        return str(exc)
+
     if isinstance(exc, AIRequestError):
         cause = exc.cause
         if hasattr(cause, 'message'):
@@ -300,6 +314,16 @@ class GranSabioEngine:
         """
         self.ai_service = ai_service if ai_service is not None else get_ai_service()
         self._tool_event_callback = tool_event_callback
+
+    @staticmethod
+    def _resolve_request_timeout(request: Optional[Any]) -> float:
+        return resolve_request_timeout(
+            request,
+            "gran_sabio_seconds",
+            settings=getattr(config, "REQUEST_TIMEOUTS", {}) or {},
+            config_path=("qa_gran_sabio", "gran_sabio_seconds"),
+            fallback=float(getattr(config, "REQUEST_TIMEOUT", 12000) or 12000),
+        )
 
     def _get_configured_default_model(self) -> str:
         """Return the configured default model for Gran Sabio operations."""
@@ -370,6 +394,28 @@ class GranSabioEngine:
             route.params.get("thinking_budget_tokens", thinking_tokens),
             resolve_temperature(route),
         )
+
+    def _resolve_gran_sabio_max_tokens(
+        self,
+        *,
+        request: ContentRequest,
+        model: str,
+        call_id: str,
+        requested_max_tokens: Optional[int] = None,
+    ) -> int:
+        """Resolve Gran Sabio output budgets by role-specific call id."""
+
+        route = resolve_call(call_id, request=request)
+        resolution = config.resolve_output_max_tokens(
+            model,
+            requested_max_tokens=requested_max_tokens,
+            routed_max_tokens=(route.params or {}).get("max_tokens"),
+            call_id=call_id,
+        )
+        resolved_max_tokens = resolution.get("max_tokens") if isinstance(resolution, dict) else None
+        if resolved_max_tokens is None:
+            resolved_max_tokens = DEFAULT_OUTPUT_TOKEN_FALLBACK
+        return int(resolved_max_tokens)
 
     def _resolve_model_alias(self, model_name: str) -> str:
         """Resolve aliases defined in model specs."""
@@ -573,6 +619,11 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 "gransabio.escalation",
             )
             adequate_model = self._ensure_adequate_model_capacity(len(content), model, original_request)
+            decision_max_tokens = self._resolve_gran_sabio_max_tokens(
+                request=original_request,
+                model=adequate_model,
+                call_id="gransabio.escalation",
+            )
             logger.info(
                 "Gran Sabio using %s with reasoning_effort=%s for minority deal-breaker check",
                 adequate_model, reasoning_effort
@@ -599,7 +650,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                     system_prompt=None,
                     user_prompt=prompt,
                     temperature=temperature,
-                    max_tokens=original_request.max_tokens,
+                    max_tokens=decision_max_tokens,
                     reasoning_effort=reasoning_effort,
                     thinking_budget_tokens=thinking_tokens
                 )
@@ -625,6 +676,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 stream_stage_label="deal_breakers_review",
                 cancel_callback=cancel_callback,
                 abort_stage="minority_review_stream",
+                max_tokens=decision_max_tokens,
                 tool_event_callback=tool_event_callback,
                 cancellation_token=cancellation_token,
             )
@@ -845,10 +897,17 @@ CRITICAL INSTRUCTIONS:
             adequate_model = self._ensure_adequate_model_capacity(
                 len(original_request.prompt) + len(previous_context), model, original_request
             )
+            regeneration_max_tokens = self._resolve_gran_sabio_max_tokens(
+                request=original_request,
+                model=adequate_model,
+                call_id="gransabio.regenerate",
+                requested_max_tokens=original_request.max_tokens,
+            )
             logger.info(
                 "Gran Sabio using %s with thinking_budget_tokens=%s for content regeneration",
                 adequate_model, thinking_tokens
             )
+            gran_sabio_timeout = self._resolve_request_timeout(original_request)
 
             generated_content = ""
             usage_callback = (
@@ -907,8 +966,8 @@ CRITICAL INSTRUCTIONS:
                         json_options=json_options_for_loop,
                     )
 
-                try:
-                    generated_content, envelope = await self.ai_service.call_ai_with_validation_tools(
+                async def _call_regeneration_tool_loop(token_budget: int):
+                    return await self.ai_service.call_ai_with_validation_tools(
                         prompt=generation_prompt,
                         model=adequate_model,
                         validation_callback=_validate_regeneration_draft,
@@ -922,7 +981,7 @@ CRITICAL INSTRUCTIONS:
                         tool_event_callback=tool_event_callback if tool_event_callback is not None else self._tool_event_callback,
                         initial_measurement_text=None,
                         temperature=temperature,
-                        max_tokens=original_request.max_tokens,
+                        max_tokens=regeneration_max_tokens,
                         extra_verbose=getattr(original_request, "extra_verbose", False),
                         reasoning_effort=reasoning_effort,
                         thinking_budget_tokens=thinking_tokens,
@@ -932,10 +991,39 @@ CRITICAL INSTRUCTIONS:
                         model_alias_registry=model_alias_registry,
                         prompt_safety_parts=prompt_safety_parts,
                         llm_routing=getattr(original_request, "_llm_routing", None),
+                        request_timeout=gran_sabio_timeout,
                         cancellation_token=cancellation_token,
+                    )
+
+                try:
+                    generated_content, envelope = await _call_regeneration_tool_loop(
+                        regeneration_max_tokens
                     )
                 except Exception:
                     raise
+
+                if envelope.output_truncated:
+                    retry_max_tokens = config.resolve_output_truncation_retry_max_tokens(
+                        adequate_model,
+                        envelope.max_tokens or regeneration_max_tokens,
+                    )
+                    if retry_max_tokens is not None:
+                        logger.warning(
+                            "Gran Sabio regeneration tool-loop output truncated for %s at "
+                            "max_tokens=%s; retrying with %s",
+                            adequate_model,
+                            envelope.max_tokens or regeneration_max_tokens,
+                            retry_max_tokens,
+                        )
+                        generated_content, envelope = await _call_regeneration_tool_loop(
+                            retry_max_tokens
+                        )
+                    if envelope.output_truncated:
+                        raise JsonContractError(
+                            "Gran Sabio regeneration output truncated "
+                            f"(finish_reason={envelope.finish_reason} "
+                            f"max_tokens={envelope.max_tokens or regeneration_max_tokens})."
+                        )
 
                 if envelope.tools_skipped_reason or not generated_content:
                     # Tool loop unavailable (no_tool_support or
@@ -946,7 +1034,7 @@ CRITICAL INSTRUCTIONS:
                         prompt=generation_prompt,
                         model=adequate_model,
                         temperature=temperature,
-                        max_tokens=original_request.max_tokens,
+                        max_tokens=regeneration_max_tokens,
                         extra_verbose=getattr(original_request, "extra_verbose", False),
                         reasoning_effort=reasoning_effort,
                         thinking_budget_tokens=thinking_tokens,
@@ -957,6 +1045,7 @@ CRITICAL INSTRUCTIONS:
                         model_alias_registry=model_alias_registry,
                         prompt_safety_parts=prompt_safety_parts,
                         llm_routing=getattr(original_request, "_llm_routing", None),
+                        request_timeout=gran_sabio_timeout,
                         cancellation_token=cancellation_token,
                     )
                     if json_output_effective:
@@ -989,7 +1078,7 @@ CRITICAL INSTRUCTIONS:
                             prompt=generation_prompt,
                             model=adequate_model,
                             temperature=temperature,
-                            max_tokens=original_request.max_tokens,
+                            max_tokens=regeneration_max_tokens,
                             extra_verbose=getattr(original_request, "extra_verbose", False),
                             reasoning_effort=reasoning_effort,
                             thinking_budget_tokens=thinking_tokens,
@@ -1000,15 +1089,24 @@ CRITICAL INSTRUCTIONS:
                             model_alias_registry=model_alias_registry,
                             prompt_safety_parts=prompt_safety_parts,
                             llm_routing=getattr(original_request, "_llm_routing", None),
+                            request_timeout=gran_sabio_timeout,
                             cancellation_token=cancellation_token,
                         ):
                             # Handle StreamChunk (Claude with thinking) vs plain string
                             if isinstance(chunk, StreamChunk):
                                 chunk_text = chunk.text
                                 is_thinking = chunk.is_thinking
+                                metadata = chunk.metadata or {}
                             else:
                                 chunk_text = chunk
                                 is_thinking = False
+                                metadata = {}
+                            if metadata.get("output_truncated"):
+                                raise JsonContractError(
+                                    "Gran Sabio regeneration stream was truncated "
+                                    f"(finish_reason={metadata.get('finish_reason')} "
+                                    f"max_tokens={metadata.get('max_tokens') or regeneration_max_tokens})."
+                                )
                             if chunk_text:
                                 # Only accumulate non-thinking for final content
                                 if not is_thinking:
@@ -1055,7 +1153,7 @@ CRITICAL INSTRUCTIONS:
                     prompt=generation_prompt,
                     model=adequate_model,
                     temperature=temperature,
-                    max_tokens=original_request.max_tokens,
+                    max_tokens=regeneration_max_tokens,
                     extra_verbose=getattr(original_request, "extra_verbose", False),
                     reasoning_effort=reasoning_effort,
                     thinking_budget_tokens=thinking_tokens,
@@ -1066,6 +1164,7 @@ CRITICAL INSTRUCTIONS:
                     model_alias_registry=model_alias_registry,
                     prompt_safety_parts=prompt_safety_parts,
                     llm_routing=getattr(original_request, "_llm_routing", None),
+                    request_timeout=gran_sabio_timeout,
                     cancellation_token=cancellation_token,
                 )
                 if json_output_effective:
@@ -1190,6 +1289,11 @@ CRITICAL INSTRUCTIONS:
                 "gransabio.review",
             )
             adequate_model = self._ensure_adequate_model_capacity(len(best_content), model, original_request)
+            decision_max_tokens = self._resolve_gran_sabio_max_tokens(
+                request=original_request,
+                model=adequate_model,
+                call_id="gransabio.review",
+            )
             logger.info(
                 "Gran Sabio using %s with reasoning_effort=%s for iteration review",
                 adequate_model, reasoning_effort
@@ -1215,7 +1319,7 @@ CRITICAL INSTRUCTIONS:
                     system_prompt=config.GRAN_SABIO_SYSTEM_PROMPT,
                     user_prompt=review_prompt,
                     temperature=temperature,
-                    max_tokens=original_request.max_tokens,
+                    max_tokens=decision_max_tokens,
                     reasoning_effort=reasoning_effort,
                     thinking_budget_tokens=thinking_tokens
                 )
@@ -1241,6 +1345,7 @@ CRITICAL INSTRUCTIONS:
                 stream_stage_label="iterations_review",
                 cancel_callback=cancel_callback,
                 abort_stage="iterations_review_stream",
+                max_tokens=decision_max_tokens,
                 tool_event_callback=tool_event_callback,
                 cancellation_token=cancellation_token,
             )
@@ -1536,6 +1641,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
         stream_stage_label: str,
         cancel_callback: CancelCallback,
         abort_stage: str,
+        max_tokens: int,
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
         cancellation_token: Optional[Any] = None,
     ) -> Tuple[Dict[str, Any], str]:
@@ -1560,6 +1666,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
             stream_callback is None
             and _should_use_gransabio_tools(request, model)
         )
+        gran_sabio_timeout = self._resolve_request_timeout(request)
 
         if tool_loop_enabled:
             measurement_request = _build_gran_sabio_measurement_request(request)
@@ -1583,32 +1690,55 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                     json_options=measurement_json_options,
                 )
 
-            content, envelope = await self.ai_service.call_ai_with_validation_tools(
-                prompt=prompt,
-                model=model,
-                validation_callback=_measurement_validator,
-                stop_on_approval=False,
-                output_contract=OutputContract.JSON_STRUCTURED,
-                response_format=response_schema,
-                payload_scope=PayloadScope.MEASUREMENT_ONLY,
-                max_tool_rounds=max_tool_rounds,
-                loop_scope=LoopScope.GRAN_SABIO,
-                tool_event_callback=tool_event_callback if tool_event_callback is not None else self._tool_event_callback,
-                initial_measurement_text=initial_measurement_text,
-                temperature=temperature,
-                max_tokens=request.max_tokens,
-                system_prompt=system_prompt,
-                extra_verbose=getattr(request, "extra_verbose", False),
-                reasoning_effort=reasoning_effort,
-                thinking_budget_tokens=thinking_tokens,
-                content_type=request.content_type,
-                usage_callback=usage_callback,
-                phase_logger=phase_logger,
-                model_alias_registry=alias_registry,
-                prompt_safety_parts=prompt_safety_parts,
-                llm_routing=getattr(request, "_llm_routing", None),
-                cancellation_token=cancellation_token,
-            )
+            async def _call_tool_loop(token_budget: int):
+                return await self.ai_service.call_ai_with_validation_tools(
+                    prompt=prompt,
+                    model=model,
+                    validation_callback=_measurement_validator,
+                    stop_on_approval=False,
+                    output_contract=OutputContract.JSON_STRUCTURED,
+                    response_format=response_schema,
+                    payload_scope=PayloadScope.MEASUREMENT_ONLY,
+                    max_tool_rounds=max_tool_rounds,
+                    loop_scope=LoopScope.GRAN_SABIO,
+                    tool_event_callback=tool_event_callback if tool_event_callback is not None else self._tool_event_callback,
+                    initial_measurement_text=initial_measurement_text,
+                    temperature=temperature,
+                    max_tokens=token_budget,
+                    system_prompt=system_prompt,
+                    extra_verbose=getattr(request, "extra_verbose", False),
+                    reasoning_effort=reasoning_effort,
+                    thinking_budget_tokens=thinking_tokens,
+                    content_type=request.content_type,
+                    usage_callback=usage_callback,
+                    phase_logger=phase_logger,
+                    model_alias_registry=alias_registry,
+                    prompt_safety_parts=prompt_safety_parts,
+                    llm_routing=getattr(request, "_llm_routing", None),
+                    request_timeout=gran_sabio_timeout,
+                    cancellation_token=cancellation_token,
+                )
+
+            content, envelope = await _call_tool_loop(max_tokens)
+            if envelope is not None and envelope.output_truncated:
+                retry_max_tokens = config.resolve_output_truncation_retry_max_tokens(
+                    model,
+                    envelope.max_tokens or max_tokens,
+                )
+                if retry_max_tokens is not None:
+                    logger.warning(
+                        "Gran Sabio tool-loop output truncated for %s at max_tokens=%s; retrying with %s",
+                        model,
+                        envelope.max_tokens or max_tokens,
+                        retry_max_tokens,
+                    )
+                    content, envelope = await _call_tool_loop(retry_max_tokens)
+                if envelope is not None and envelope.output_truncated:
+                    raise JsonContractError(
+                        "Gran Sabio tool-loop output truncated "
+                        f"(finish_reason={envelope.finish_reason} "
+                        f"max_tokens={envelope.max_tokens or max_tokens})."
+                    )
 
             if envelope.tools_skipped_reason is None and envelope.payload is not None:
                 return envelope.payload, content
@@ -1631,7 +1761,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 prompt=prompt,
                 model=model,
                 temperature=temperature,
-                max_tokens=request.max_tokens,
+                max_tokens=max_tokens,
                 system_prompt=system_prompt,
                 reasoning_effort=reasoning_effort,
                 thinking_budget_tokens=thinking_tokens,
@@ -1643,14 +1773,23 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 model_alias_registry=alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
                 llm_routing=getattr(request, "_llm_routing", None),
+                request_timeout=gran_sabio_timeout,
                 cancellation_token=cancellation_token,
             ):
                 if isinstance(chunk, StreamChunk):
                     chunk_text = chunk.text
                     is_thinking = chunk.is_thinking
+                    metadata = chunk.metadata or {}
                 else:
                     chunk_text = chunk
                     is_thinking = False
+                    metadata = {}
+                if metadata.get("output_truncated"):
+                    raise JsonContractError(
+                        "Gran Sabio streaming JSON response was truncated "
+                        f"(finish_reason={metadata.get('finish_reason')} "
+                        f"max_tokens={metadata.get('max_tokens') or max_tokens})."
+                    )
                 if chunk_text:
                     if not is_thinking:
                         response_text += chunk_text
@@ -1662,7 +1801,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 prompt=prompt,
                 model=model,
                 temperature=temperature,
-                max_tokens=request.max_tokens,
+                max_tokens=max_tokens,
                 system_prompt=system_prompt,
                 reasoning_effort=reasoning_effort,
                 thinking_budget_tokens=thinking_tokens,
@@ -1673,6 +1812,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 model_alias_registry=alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
                 llm_routing=getattr(request, "_llm_routing", None),
+                request_timeout=gran_sabio_timeout,
                 cancellation_token=cancellation_token,
             )
 

@@ -220,7 +220,7 @@ All configuration is via environment variables:
 |----------|---------|-------------|
 | `GRANSABIO_API_URL` | `http://localhost:8000` | Gran Sabio LLM API URL |
 | `GRANSABIO_API_KEY` | (empty) | API key for authenticated access |
-| `GRANSABIO_TIMEOUT` | `300` | Request timeout in seconds |
+| `GRANSABIO_TIMEOUT` | `12000` | Default request-process timeout in seconds |
 | `GRANSABIO_POLL_INTERVAL` | `2.0` | Polling interval for results |
 
 ### Optional Model Overrides
@@ -291,6 +291,26 @@ The AI client can override reasoning settings per-call:
 
 This allows the AI to request deeper analysis for complex or security-critical code.
 
+## Per-Call Timeout Override
+
+Generation tools accept `timeout_seconds`, `timeouts`, and `qa_timeout_retries`. These values are forwarded to the Gran Sabio API and also control the MCP wait-for-result window for that call.
+
+```json
+{
+  "tool": "gransabio_generate_with_qa",
+  "arguments": {
+    "prompt": "Write a long technical design...",
+    "timeout_seconds": 12000,
+    "timeouts": {
+      "generation_seconds": 12000,
+      "qa_model_seconds": 12000,
+      "gran_sabio_seconds": 12000
+    },
+    "qa_timeout_retries": 0
+  }
+}
+```
+
 ## Windows Notes
 
 On Windows, use the `install_mcp.bat` script for automatic setup.
@@ -327,7 +347,7 @@ pip install mcp
 
 Increase the timeout for complex analyses:
 ```bash
-GRANSABIO_TIMEOUT=600 python gransabio_mcp_server.py
+GRANSABIO_TIMEOUT=18000 python gransabio_mcp_server.py
 ```
 
 ### Models not found

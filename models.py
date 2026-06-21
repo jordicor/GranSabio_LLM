@@ -109,10 +109,13 @@ class QALayer(BaseModel):
 class QAModelConfig(BaseModel):
     """Configuration for a specific QA evaluation model"""
     model: str = Field(..., description="Model identifier (e.g., 'gpt-5-mini', 'claude-opus-4')")
-    max_tokens: int = Field(
-        default=8000,
+    max_tokens: Optional[int] = Field(
+        default=None,
         gt=0,
-        description="Maximum tokens for QA evaluation"
+        description=(
+            "Maximum tokens for QA evaluation. If omitted, resolved from "
+            "QA_DEFAULT_MAX_TOKENS or the model's safe output limit."
+        )
     )
     reasoning_effort: Optional[str] = Field(
         default=None,
@@ -129,6 +132,11 @@ class QAModelConfig(BaseModel):
         le=2.0,
         description="Custom temperature for this QA model (default: 0.3 if not specified)"
     )
+    timeout_seconds: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="Maximum seconds allowed for this QA model evaluation attempt"
+    )
 
     class Config:
         json_schema_extra = {
@@ -136,7 +144,8 @@ class QAModelConfig(BaseModel):
                 "model": "gpt-5-mini",
                 "max_tokens": 10000,
                 "reasoning_effort": "medium",
-                "temperature": 0.3
+                "temperature": 0.3,
+                "timeout_seconds": 12000
             }
         }
 
@@ -835,6 +844,66 @@ class AutoQAConfig(BaseModel):
     )
 
 
+class RequestTimeouts(BaseModel):
+    """Per-request process timeout overrides in seconds."""
+
+    default_seconds: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="Fallback process timeout for this request when a phase-specific value is not set.",
+    )
+    generation_seconds: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="Timeout for primary generation model calls.",
+    )
+    stream_seconds: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="Timeout for server-side streaming model calls.",
+    )
+    qa_model_seconds: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="Timeout for one QA model evaluation attempt.",
+    )
+    qa_comprehensive_seconds: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="Timeout for the outer comprehensive QA wrapper.",
+    )
+    gran_sabio_seconds: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="Timeout for Gran Sabio review/regeneration model calls.",
+    )
+    long_text_seconds: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="Fallback timeout for Long Text controller phases.",
+    )
+    preflight_seconds: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="Timeout for preflight validation model calls.",
+    )
+    auto_qa_seconds: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="Timeout for Auto-QA planning model calls.",
+    )
+    arbiter_seconds: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="Timeout for Arbiter model calls.",
+    )
+    accent_audit_seconds: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="Timeout for LLM accent audit model calls.",
+    )
+
+
 class ProjectInitRequest(BaseModel):
     """Optional payload used when allocating or reserving a project identifier."""
 
@@ -901,6 +970,18 @@ class ContentRequest(BaseModel):
         default=None,
         validation_alias=AliasChoices("llm_routing", "llmRouting"),
         description="Optional request-scoped model routing overlay keyed by exact LLM call id.",
+    )
+    timeout_seconds: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Generic process timeout in seconds for this request. "
+            "Specific values in timeouts override it for their phase."
+        ),
+    )
+    timeouts: Optional[RequestTimeouts] = Field(
+        default=None,
+        description="Phase-specific request process timeout overrides in seconds.",
     )
 
     # Context attachments configuration
@@ -1009,6 +1090,11 @@ class ContentRequest(BaseModel):
     ] = Field(
         default="retry_then_skip_if_quorum",
         description="Policy when a QA model times out.",
+    )
+    qa_timeout_retries: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Optional per-request retry count for QA model evaluation timeouts.",
     )
     min_valid_qa_models: Optional[int] = Field(
         default=None,
@@ -1434,6 +1520,12 @@ class ContentRequest(BaseModel):
                     }
                 },
                 "temperature": 0.7,
+                "timeout_seconds": 12000,
+                "timeouts": {
+                    "generation_seconds": 12000,
+                    "qa_model_seconds": 12000,
+                    "gran_sabio_seconds": 12000
+                },
                 "min_words": 800,
                 "max_words": 1200,
                 "reasoning_effort": "medium",
@@ -1442,9 +1534,11 @@ class ContentRequest(BaseModel):
                 "qa_models_config": {
                     "your-qa-model": {
                         "max_tokens": 10000,
-                        "reasoning_effort": "medium"
+                        "reasoning_effort": "medium",
+                        "timeout_seconds": 12000
                     }
                 },
+                "qa_timeout_retries": 2,
                 "qa_layers": [
                     {
                         "name": "Accuracy",
@@ -1935,30 +2029,56 @@ def normalize_qa_models_config(
     """
     result = []
 
+    def _apply_config_values(
+        target: QAModelConfig,
+        values: Optional[Dict[str, Any]],
+        *,
+        explicit_fields: set[str],
+        override_explicit: bool = False,
+        overwrite_existing: bool = False,
+    ) -> None:
+        if not values:
+            return
+        for key, value in values.items():
+            if value is None or not hasattr(target, key):
+                continue
+            if key in explicit_fields and not override_explicit:
+                continue
+            current = getattr(target, key)
+            if overwrite_existing or override_explicit or current is None:
+                setattr(target, key, value)
+
     for model in qa_models:
         if isinstance(model, str):
             # Create QAModelConfig from string with defaults
-            config = QAModelConfig(model=model)
-
-            # Apply per-model configuration if exists (highest priority)
-            if qa_models_config and model in qa_models_config:
-                model_specific = qa_models_config[model]
-                for key, value in model_specific.items():
-                    if hasattr(config, key) and value is not None:
-                        setattr(config, key, value)
-
-            # Apply global configuration if no specific override (lower priority)
-            elif qa_global_config:
-                for key, value in qa_global_config.items():
-                    if hasattr(config, key) and value is not None:
-                        # Only set if still at default value
-                        current = getattr(config, key)
-                        if current is None or (key == 'max_tokens' and current == 8000):
-                            setattr(config, key, value)
+            model_config_obj = QAModelConfig(model=model)
+            explicit_fields: set[str] = set()
         else:
             # Already a QAModelConfig object
-            config = model
+            model_config_obj = model
+            explicit_fields = set(getattr(model_config_obj, "model_fields_set", set()) or set())
 
-        result.append(config)
+        model_name = model_config_obj.model
+        _apply_config_values(
+            model_config_obj,
+            qa_global_config,
+            explicit_fields=explicit_fields,
+            override_explicit=False,
+            overwrite_existing=False,
+        )
+        _apply_config_values(
+            model_config_obj,
+            qa_models_config.get(model_name) if qa_models_config else None,
+            explicit_fields=explicit_fields,
+            override_explicit=False,
+            overwrite_existing=True,
+        )
+
+        if model_config_obj.max_tokens is None:
+            resolved_max_tokens = config.resolve_qa_max_tokens(model_name)
+            if resolved_max_tokens is not None:
+                model_config_obj.max_tokens = resolved_max_tokens
+
+        result.append(model_config_obj)
 
     return result

@@ -720,12 +720,17 @@
 <section id="connection-stability" class="docs-section">
   <h2 class="docs-subheading">Connection Stability &amp; Long-Running Operations</h2>
   <p>Implements SSE heartbeats and JSON heartbeat messages to keep connections alive during long-running reasoning operations.</p>
-  <p>recommended_timeout_seconds is computed from per-iteration budget, max_iterations, and QA/Gran Sabio padding.</p>
+  <p>Process timeouts default to 12000 seconds from request_timeouts.default.json and can be overridden per request with timeout_seconds or timeouts. recommended_timeout_seconds is a hint, not a hard cap when explicit values are supplied.</p>
   <div class="parameter-table">
     <div class="param-row">
       <div class="param-name">recommended_timeout_seconds</div>
       <div class="param-type">integer</div>
       <div class="param-desc">Suggested minimum client timeout based on config.</div>
+    </div>
+    <div class="param-row">
+      <div class="param-name">timeout_seconds / timeouts</div>
+      <div class="param-type">number / object</div>
+      <div class="param-desc">Public request-process timeout overrides for generation, streaming, QA, Gran Sabio, and Long Text phases.</div>
     </div>
     <div class="param-row">
       <div class="param-name">heartbeat_interval</div>

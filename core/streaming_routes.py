@@ -17,37 +17,20 @@ from attachments_router import get_attachment_manager
 from config import config
 from llm_routing import resolve_call
 from models import GenerationStatus
+from request_timeouts import resolve_request_timeout
 from services.attachment_manager import AttachmentError
 from services.project_stream import ProjectStreamManager, SubscriptionError, parse_phases
 from services.runtime_console import bind_console_context, reset_console_context
 from word_count_utils import build_word_count_instructions
 
-from .cancellation import CancellationToken, cancellation_registry
 from .app_state import (
     _ensure_services,
     app,
     logger,
     mutate_session,
 )
+from .cancellation import CancellationToken, cancellation_registry
 from .generation_processor import ai_service, build_context_prompt
-
-DEFAULT_MODEL_MAX_TOKENS_FALLBACK = 8192
-
-
-def _model_default_max_tokens(model_name: str) -> int:
-    """Return model max output tokens from specs, falling back to 8192."""
-
-    try:
-        model_info = config.get_model_info(model_name)
-    except Exception:
-        return DEFAULT_MODEL_MAX_TOKENS_FALLBACK
-
-    value = model_info.get("output_tokens")
-    try:
-        tokens = int(value)
-    except (TypeError, ValueError):
-        return DEFAULT_MODEL_MAX_TOKENS_FALLBACK
-    return tokens if tokens > 0 else DEFAULT_MODEL_MAX_TOKENS_FALLBACK
 
 
 @app.get("/stream-content-direct/{session_id}")
@@ -132,14 +115,24 @@ async def stream_content_direct_v2(session_id: str):
             final_prompt = "\n\n".join(section.strip() for section in prompt_sections if section)
             route = resolve_call("generation.direct_stream", request=request_data)
             route_params = route.params
-            requested_max_tokens = route_params.get("max_tokens", getattr(request_data, 'max_tokens', None))
-            if requested_max_tokens is None:
-                requested_max_tokens = _model_default_max_tokens(
-                    route.model
-                )
+            token_resolution = config.resolve_output_max_tokens(
+                route.model,
+                requested_max_tokens=getattr(request_data, 'max_tokens', None),
+                routed_max_tokens=route_params.get("max_tokens"),
+                call_id="generation.direct_stream",
+            )
+            requested_max_tokens = token_resolution["max_tokens"]
 
             async def direct_stream_cancelled() -> bool:
                 return await cancellation_token.any_cancelled()
+
+            stream_timeout = resolve_request_timeout(
+                request_data,
+                "stream_seconds",
+                settings=getattr(config, "REQUEST_TIMEOUTS", {}) or {},
+                config_path=("streaming", "stream_seconds"),
+                fallback=float(getattr(config, "REQUEST_TIMEOUT", 12000) or 12000),
+            )
 
             async for chunk in ai_service.generate_content_stream(
                 prompt=final_prompt,
@@ -150,6 +143,7 @@ async def stream_content_direct_v2(session_id: str):
                 thinking_budget_tokens=route_params.get("thinking_budget_tokens", getattr(request_data, 'thinking_budget_tokens', None)),
                 content_type=getattr(request_data, 'content_type', 'biography'),
                 llm_routing=getattr(request_data, "_llm_routing", None),
+                request_timeout=stream_timeout,
                 cancellation_token=cancellation_token,
                 cancel_callback=direct_stream_cancelled,
             ):

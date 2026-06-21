@@ -3,7 +3,12 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from ai_service import AccentGuardError, AIRequestError
+from ai_service import (
+    AccentGuardError,
+    AIRequestError,
+    GenerationStoppedUnexpectedly,
+    StreamChunk,
+)
 from core import app_state
 from core.app_state import active_sessions
 from core.generation_processor import (
@@ -165,6 +170,50 @@ async def test_generate_full_content_records_tool_loop_output_truncation():
     assert session["generation_finish_metadata"]["provider_stop_reason"] == "length"
     assert _generation_was_truncated(session) is True
     ai_service.generate_content_stream.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_generate_full_content_raises_on_unusable_stream_finish():
+    request = _tool_request(generator_model="gemini-2.5-pro", max_tokens=1024)
+
+    async def _stream():
+        yield StreamChunk(
+            "",
+            metadata={
+                "provider": "gemini",
+                "finish_reason": "SAFETY",
+                "provider_stop_reason": "SAFETY",
+                "finish_reason_category": "content_filter",
+                "finish_unusable": True,
+                "output_truncated": False,
+            },
+        )
+
+    ai_service = SimpleNamespace(
+        call_ai_with_validation_tools=AsyncMock(),
+        generate_content_stream=Mock(return_value=_stream()),
+    )
+    session = {}
+
+    with patch("core.generation_processor._should_use_generation_tools", return_value=False), \
+         patch("core.generation_processor.check_session_cancelled", new=AsyncMock(return_value=False)), \
+         patch("core.generation_processor.add_verbose_log", new=AsyncMock()), \
+         patch("core.generation_processor._debug_record_event", new=AsyncMock()):
+        with pytest.raises(GenerationStoppedUnexpectedly) as exc_info:
+            await _generate_full_content(
+                final_prompt="Write something.",
+                request=request,
+                ai_service=ai_service,
+                usage_tracker=None,
+                session_id="session-stream-finish-unusable",
+                session=session,
+                iteration=0,
+                json_output_requested=False,
+            )
+
+    assert exc_info.value.finish_reason == "SAFETY"
+    assert exc_info.value.finish_reason_category == "content_filter"
+    assert session["generation_finish_metadata"]["provider_stop_reason"] == "SAFETY"
 
 
 def test_build_generation_error_result_surfaces_provider_quota():

@@ -4,6 +4,81 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+TOKEN_LIMIT_REASONS_BY_PROVIDER = {
+    "openai": {"length", "max_output_tokens", "max_completion_tokens"},
+    "openrouter": {"length"},
+    "xai": {"length", "max_output_tokens"},
+    "moonshot": {"length"},
+    "minimax": {"length"},
+    "claude": {"max_tokens"},
+    "gemini": {"max_tokens"},
+    "ollama": {"length"},
+}
+
+SUCCESS_REASONS_BY_PROVIDER = {
+    "openai": {"stop", "completed"},
+    "openrouter": {"stop"},
+    "xai": {"stop", "completed"},
+    "moonshot": {"stop"},
+    "minimax": {"stop"},
+    "claude": {"end_turn", "stop_sequence"},
+    "gemini": {"stop"},
+    "ollama": {"stop"},
+    "fake": {"stop"},
+}
+
+TOOL_CALL_REASONS_BY_PROVIDER = {
+    "openai": {"tool_calls", "function_call"},
+    "openrouter": {"tool_calls"},
+    "xai": {"tool_calls", "function_call"},
+    "moonshot": {"tool_calls"},
+    "minimax": {"tool_calls"},
+    "claude": {"tool_use"},
+    "gemini": {"malformed_function_call", "unexpected_tool_call"},
+}
+
+CONTENT_FILTER_REASONS_BY_PROVIDER = {
+    "openai": {"content_filter"},
+    "openrouter": {"content_filter"},
+    "xai": {"content_filter"},
+    "moonshot": {"content_filter"},
+    "minimax": {"content_filter"},
+    "claude": {"refusal"},
+    "gemini": {
+        "safety",
+        "recitation",
+        "language",
+        "blocklist",
+        "prohibited_content",
+        "spii",
+        "image_safety",
+    },
+}
+
+CONTEXT_LIMIT_REASONS_BY_PROVIDER = {
+    "openai": {"max_prompt_tokens"},
+    "claude": {"model_context_window_exceeded"},
+}
+
+PAUSE_REASONS_BY_PROVIDER = {
+    "claude": {"pause_turn"},
+}
+
+ERROR_REASONS_BY_PROVIDER = {
+    "openai": {"incomplete"},
+    "openrouter": {"error"},
+    "xai": {"incomplete"},
+    "gemini": {"other", "finish_reason_unspecified"},
+}
+
+PROVIDER_ALIASES = {
+    "anthropic": "claude",
+    "google": "gemini",
+    "grok": "xai",
+    "kimi": "moonshot",
+    "kimi_api": "moonshot",
+}
+
 
 def stringify_finish_reason(value: Any) -> Optional[str]:
     """Return provider finish/stop reasons as stable strings."""
@@ -21,37 +96,140 @@ def stringify_finish_reason(value: Any) -> Optional[str]:
     return str(value)
 
 
-def is_token_limit_finish_reason(reason: Any) -> bool:
+def normalize_provider_key(provider: Optional[str]) -> Optional[str]:
+    """Return the provider family used for finish-reason classification."""
+
+    if provider is None:
+        return None
+    key = str(provider or "").strip().lower().replace("-", "_")
+    return PROVIDER_ALIASES.get(key, key)
+
+
+def normalize_finish_reason(value: Any) -> Optional[str]:
+    """Normalize provider finish reasons for exact table lookup."""
+
+    reason_text = (stringify_finish_reason(value) or "").strip().lower()
+    if not reason_text:
+        return None
+    return reason_text.replace("-", "_").replace(" ", "_")
+
+
+def _provider_reason_set(
+    table: dict[str, set[str]],
+    provider: Optional[str],
+) -> set[str]:
+    provider_key = normalize_provider_key(provider)
+    if provider_key and provider_key in table:
+        return table[provider_key]
+    return set()
+
+
+def is_token_limit_finish_reason(reason: Any, provider: Optional[str] = None) -> bool:
     """Detect provider stop reasons that mean output was cut by token budget."""
 
-    reason_text = (stringify_finish_reason(reason) or "").strip().lower()
-    if not reason_text:
+    normalized = normalize_finish_reason(reason)
+    if not normalized:
         return False
-    normalized = reason_text.replace("-", "_").replace(" ", "_")
-    if normalized in {
-        "length",
-        "max_tokens",
-        "max_output_tokens",
-        "max_token",
-        "token_limit",
-        "output_token_limit",
-        "max_tokens_exceeded",
-        "max_output_tokens_exceeded",
-    }:
-        return True
-    return "max" in normalized and "token" in normalized
+    return normalized in _provider_reason_set(TOKEN_LIMIT_REASONS_BY_PROVIDER, provider)
+
+
+def classify_finish_reason(
+    *,
+    provider: Optional[str],
+    finish_reason: Any,
+) -> dict[str, Any]:
+    """Classify provider finish/stop reasons using explicit provider tables."""
+
+    finish_reason_text = stringify_finish_reason(finish_reason)
+    normalized = normalize_finish_reason(finish_reason)
+    provider_key = normalize_provider_key(provider)
+    result: dict[str, Any] = {
+        "finish_reason": finish_reason_text,
+        "finish_reason_normalized": normalized,
+        "finish_reason_category": "missing" if normalized is None else "unknown",
+        "finish_reason_known": False,
+        "finish_unusable": False,
+        "output_truncated": False,
+    }
+    if normalized is None:
+        return result
+
+    if normalized in _provider_reason_set(TOKEN_LIMIT_REASONS_BY_PROVIDER, provider_key):
+        result.update(
+            {
+                "finish_reason_category": "output_token_limit",
+                "finish_reason_known": True,
+                "finish_unusable": True,
+                "output_truncated": True,
+                "truncation_reason": "output_token_limit",
+            }
+        )
+        return result
+
+    if normalized in _provider_reason_set(SUCCESS_REASONS_BY_PROVIDER, provider_key):
+        result.update({"finish_reason_category": "stop", "finish_reason_known": True})
+        return result
+
+    if normalized in _provider_reason_set(TOOL_CALL_REASONS_BY_PROVIDER, provider_key):
+        result.update(
+            {
+                "finish_reason_category": "tool_calls",
+                "finish_reason_known": True,
+                "finish_unusable": True,
+            }
+        )
+        return result
+
+    if normalized in _provider_reason_set(CONTENT_FILTER_REASONS_BY_PROVIDER, provider_key):
+        result.update(
+            {
+                "finish_reason_category": "content_filter",
+                "finish_reason_known": True,
+                "finish_unusable": True,
+            }
+        )
+        return result
+
+    if normalized in _provider_reason_set(CONTEXT_LIMIT_REASONS_BY_PROVIDER, provider_key):
+        result.update(
+            {
+                "finish_reason_category": "context_limit",
+                "finish_reason_known": True,
+                "finish_unusable": True,
+            }
+        )
+        return result
+
+    if normalized in _provider_reason_set(PAUSE_REASONS_BY_PROVIDER, provider_key):
+        result.update(
+            {
+                "finish_reason_category": "pause_turn",
+                "finish_reason_known": True,
+                "finish_unusable": True,
+            }
+        )
+        return result
+
+    if normalized in _provider_reason_set(ERROR_REASONS_BY_PROVIDER, provider_key):
+        result.update(
+            {
+                "finish_reason_category": "provider_error",
+                "finish_reason_known": True,
+                "finish_unusable": True,
+            }
+        )
+        return result
+
+    return result
 
 
 def is_unusable_openai_stream_finish(reason: Any) -> bool:
     """Return True when an OpenAI streamed turn ended with unusable partial output."""
 
-    reason_text = (stringify_finish_reason(reason) or "").strip().lower()
-    if not reason_text:
+    if normalize_finish_reason(reason) is None:
         return True
-    normalized = reason_text.replace("-", "_").replace(" ", "_")
-    if normalized in {"stop", "tool_calls", "function_call", "completed"}:
-        return False
-    return True
+    classification = classify_finish_reason(provider="openai", finish_reason=reason)
+    return classification.get("finish_reason_category") not in {"stop", "tool_calls"}
 
 
 def build_finish_metadata(
@@ -63,13 +241,20 @@ def build_finish_metadata(
     """Build lightweight streaming finish metadata."""
 
     finish_reason_text = stringify_finish_reason(finish_reason)
+    classification = classify_finish_reason(
+        provider=provider,
+        finish_reason=finish_reason_text,
+    )
     metadata: dict[str, Any] = {
         "provider": provider,
-        "output_truncated": is_token_limit_finish_reason(finish_reason_text),
+        "output_truncated": bool(classification.get("output_truncated")),
     }
     if finish_reason_text is not None:
         metadata["finish_reason"] = finish_reason_text
         metadata["provider_stop_reason"] = finish_reason_text
+    metadata["finish_reason_category"] = classification["finish_reason_category"]
+    metadata["finish_reason_known"] = classification["finish_reason_known"]
+    metadata["finish_unusable"] = classification["finish_unusable"]
     if max_tokens is not None:
         metadata["max_tokens"] = max_tokens
     if metadata["output_truncated"]:
@@ -130,9 +315,21 @@ def normalize_usage(usage_obj: Any) -> Optional[dict[str, Any]]:
     if finish_reason_text is not None:
         normalized["finish_reason"] = finish_reason_text
         normalized["provider_stop_reason"] = finish_reason_text
-    if output_truncated is None:
-        output_truncated = is_token_limit_finish_reason(finish_reason_text)
+    provider = None
+    if isinstance(usage_obj, dict):
+        provider = usage_obj.get("provider")
+    elif hasattr(usage_obj, "provider"):
+        provider = getattr(usage_obj, "provider")
+
+    classification = classify_finish_reason(
+        provider=provider,
+        finish_reason=finish_reason_text,
+    )
+    output_truncated = bool(output_truncated) or bool(classification.get("output_truncated"))
     normalized["output_truncated"] = bool(output_truncated)
+    normalized["finish_reason_category"] = classification["finish_reason_category"]
+    normalized["finish_reason_known"] = classification["finish_reason_known"]
+    normalized["finish_unusable"] = classification["finish_unusable"]
     if normalized["output_truncated"]:
         normalized["truncation_reason"] = "output_token_limit"
     return normalized
@@ -174,6 +371,11 @@ def usage_with_finish_metadata(
             finish_reason = getattr(incomplete_details, "reason", None)
             if finish_reason is None and isinstance(incomplete_details, dict):
                 finish_reason = incomplete_details.get("reason")
+    if finish_reason is None:
+        status = getattr(response, "status", None)
+        status_text = normalize_finish_reason(status)
+        if status_text and status_text not in {"completed", "complete", "stop"}:
+            finish_reason = status
 
     finish_reason_text = stringify_finish_reason(finish_reason)
     if finish_reason_text:
@@ -182,7 +384,14 @@ def usage_with_finish_metadata(
     usage_payload["provider"] = provider
     if max_tokens is not None:
         usage_payload["max_tokens"] = max_tokens
-    if is_token_limit_finish_reason(finish_reason_text):
+    classification = classify_finish_reason(
+        provider=provider,
+        finish_reason=finish_reason_text,
+    )
+    usage_payload["finish_reason_category"] = classification["finish_reason_category"]
+    usage_payload["finish_reason_known"] = classification["finish_reason_known"]
+    usage_payload["finish_unusable"] = classification["finish_unusable"]
+    if classification.get("output_truncated"):
         usage_payload["output_truncated"] = True
         usage_payload["truncation_reason"] = "output_token_limit"
     else:

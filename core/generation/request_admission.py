@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
+from config import DEFAULT_OUTPUT_TOKEN_FALLBACK
 from model_capability_registry import (
     model_supports_long_text_section_tool_loop,
     resolve_model_capability_context,
@@ -18,7 +19,7 @@ QA_LAYER_PADDING_SECONDS = 120
 GRAN_SABIO_PADDING_SECONDS = 600
 SESSION_TIMEOUT_CAP_SECONDS = 8 * 3600
 DEFAULT_WORD_LIMIT_TOKEN_FLOOR = 8000
-DEFAULT_MODEL_MAX_TOKENS_FALLBACK = 8192
+DEFAULT_MODEL_MAX_TOKENS_FALLBACK = DEFAULT_OUTPUT_TOKEN_FALLBACK
 ESTIMATED_TOKENS_PER_WORD = 2.2
 LONG_FORM_TOKEN_BUFFER = 1024
 
@@ -70,19 +71,32 @@ def estimate_tokens_for_word_target(request: ContentRequest) -> Optional[int]:
 
 
 def model_default_max_tokens(model_name: str, config_obj: Any) -> int:
-    """Return model max output tokens from specs, falling back to 8192."""
+    """Return the resolved safe output-token budget for a model."""
+
+    resolver = getattr(config_obj, "resolve_output_max_tokens", None)
+    if callable(resolver):
+        resolution = resolver(
+            model_name,
+            call_id="generation.main",
+        )
+        resolved = resolution.get("max_tokens") if isinstance(resolution, dict) else None
+        if resolved:
+            return int(resolved)
 
     try:
         model_info = config_obj.get_model_info(model_name)
     except Exception:
-        return DEFAULT_MODEL_MAX_TOKENS_FALLBACK
+        return DEFAULT_OUTPUT_TOKEN_FALLBACK
 
     value = model_info.get("output_tokens")
     try:
         tokens = int(value)
     except (TypeError, ValueError):
-        return DEFAULT_MODEL_MAX_TOKENS_FALLBACK
-    return tokens if tokens > 0 else DEFAULT_MODEL_MAX_TOKENS_FALLBACK
+        return DEFAULT_OUTPUT_TOKEN_FALLBACK
+    if tokens > 0:
+        return tokens
+
+    return DEFAULT_OUTPUT_TOKEN_FALLBACK
 
 
 def apply_external_generation_min_tokens(

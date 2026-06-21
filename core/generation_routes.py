@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import Body, HTTPException, Request
@@ -20,6 +19,13 @@ from auto_qa_planner import (
     validate_auto_qa_effective_contract,
 )
 from deal_breaker_tracker import get_tracker
+from llm_routing import (
+    LLMRouteResolution,
+    LLMRoutingError,
+    attach_request_llm_routing,
+    resolve_call,
+    resolve_call_models,
+)
 from logging_utils import create_phase_logger
 from model_aliasing import ModelAliasRegistry
 from model_capability_registry import (
@@ -30,23 +36,16 @@ from models import (
     ContentRequest,
     GenerationInitResponse,
     GenerationStatus,
-    QAModelConfig,
     PreflightIssue,
     ProjectInitRequest,
     ProjectInitResponse,
+    QAModelConfig,
     is_json_output_requested,
 )
 from phrase_frequency_config import is_phrase_frequency_active
 from preflight_validator import resolve_preflight_model, run_preflight_validation
-from llm_routing import (
-    LLMRouteResolution,
-    LLMRoutingError,
-    attach_request_llm_routing,
-    resolve_call,
-    resolve_call_models,
-)
-from usage_tracking import UsageTracker
 from services.runtime_console import bind_console_context
+from usage_tracking import UsageTracker
 from word_count_utils import (
     is_word_count_enforcement_enabled,
     validate_word_count_config,
@@ -61,8 +60,8 @@ from .app_state import (
     _debug_update_status,
     _is_project_reserved,
     _reserve_project_id,
-    apply_session_cancelled_state,
     app,
+    apply_session_cancelled_state,
     config,
     get_project_status,
     hard_stop_project_runtime,
@@ -70,18 +69,18 @@ from .app_state import (
     is_terminal_session,
     logger,
     mutate_session,
+    pause_project_runtime,
     pop_session,
     publish_project_phase_chunk,
     publish_project_session_end,
     register_session,
-    pause_project_runtime,
     start_project_runtime,
 )
 from .cancellation import CancelMode, cancellation_registry
+from .generation import request_admission as admission_helpers
 from .generation.input_resolution import resolve_generation_inputs
 from .generation.prestart_flow import PrestartFlowDeps, run_prestart_flow
 from .generation.session_bootstrap import SessionBootstrapDeps, finalize_generation_session
-from .generation import request_admission as admission_helpers
 from .generation_processor import (
     _attach_json_guard_metadata,
     _build_final_result,
@@ -158,7 +157,6 @@ QA_LAYER_PADDING_SECONDS = admission_helpers.QA_LAYER_PADDING_SECONDS
 GRAN_SABIO_PADDING_SECONDS = admission_helpers.GRAN_SABIO_PADDING_SECONDS
 SESSION_TIMEOUT_CAP_SECONDS = admission_helpers.SESSION_TIMEOUT_CAP_SECONDS
 DEFAULT_WORD_LIMIT_TOKEN_FLOOR = admission_helpers.DEFAULT_WORD_LIMIT_TOKEN_FLOOR
-DEFAULT_MODEL_MAX_TOKENS_FALLBACK = admission_helpers.DEFAULT_MODEL_MAX_TOKENS_FALLBACK
 ESTIMATED_TOKENS_PER_WORD = admission_helpers.ESTIMATED_TOKENS_PER_WORD
 LONG_FORM_TOKEN_BUFFER = admission_helpers.LONG_FORM_TOKEN_BUFFER
 
@@ -508,15 +506,15 @@ async def generate_content(request: ContentRequest):
     _ensure_model_known(request.generator_model, "generator_model")
 
     # If the caller did not provide an output budget, default to the model's
-    # declared max output capacity. This avoids silently capping quality-focused
-    # JSON/multimodal generations at the legacy 4000-token fallback.
+    # resolved safe output budget. This avoids silently capping quality-focused
+    # JSON/multimodal generations at a service-level fallback.
     if (
         request.max_tokens_percentage is None
         and (request.max_tokens is None or "max_tokens" not in request_fields_set)
     ):
         default_max_tokens = _model_default_max_tokens(request.generator_model)
         logger.info(
-            "Defaulting max_tokens from model specs for %s: %s -> %s",
+            "Defaulting max_tokens from output-budget policy for %s: %s -> %s",
             request.generator_model,
             request.max_tokens,
             default_max_tokens,
@@ -640,16 +638,28 @@ async def generate_content(request: ContentRequest):
         and "max_tokens" not in request_fields_set
     ):
         estimated_budget = _estimate_tokens_for_word_target(request)
-        if estimated_budget is not None and estimated_budget > (request.max_tokens or 0):
+        token_resolution = (
+            config.resolve_output_max_tokens(
+                request.generator_model,
+                requested_max_tokens=estimated_budget,
+                call_id="generation.word_target",
+            )
+            if estimated_budget is not None
+            else {}
+        )
+        resolved_estimated_budget = token_resolution.get("max_tokens") if token_resolution else None
+        if resolved_estimated_budget is not None and resolved_estimated_budget > (request.max_tokens or 0):
             logger.info(
                 "Auto-adjusting generation max_tokens for word-targeted request: %s -> %s "
-                "(min_words=%s, max_words=%s)",
+                "(estimated=%s, min_words=%s, max_words=%s, safe_limit=%s)",
                 request.max_tokens,
+                resolved_estimated_budget,
                 estimated_budget,
                 request.min_words,
                 request.max_words,
+                token_resolution.get("safe_limit"),
             )
-            request.max_tokens = estimated_budget
+            request.max_tokens = int(resolved_estimated_budget)
 
     if request.max_tokens_percentage is None:
         token_floor_adjustment = _apply_external_generation_min_tokens(request)

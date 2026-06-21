@@ -1,0 +1,74 @@
+{
+  "_documentation": {
+    "purpose": "Central defaults for request-process timeouts that can cut a model generation, stream, QA phase, Gran Sabio phase, Long Text phase, SDK wait, or MCP wait.",
+    "design_policy": "Defaults are deliberately high because this engine can run against very different AI backends: fast hosted APIs, slow OpenRouter or open-source models, local Ollama/GPU/CPU models, reasoning/thinking models, and long QA or Long Text workflows.",
+    "user_control": "Operators can override these values with request_timeouts.json or environment variables. API, SDK, sidecar, and MCP callers can override them per request with timeout_seconds or the timeouts object. Per-request values may be shorter or longer than these defaults.",
+    "model_recommendations": "Model catalog reasoning/thinking timeout estimates are guidance and observability only. They do not override the configured or per-request hard timeout because users may intentionally want shorter or longer deadlines.",
+    "connection_timeouts": "Low-level socket connect, health-check, model-sync, keepalive, shutdown, and admin/debug timeouts are intentionally separate from this file unless explicitly listed as client connection fields.",
+    "units": "seconds"
+  },
+  "defaults": {
+    "model_call_seconds": 12000,
+    "stream_read_seconds": 12000,
+    "result_wait_seconds": 12000
+  },
+  "process_timeouts": {
+    "generation_seconds": 12000,
+    "preflight_seconds": 12000,
+    "auto_qa_seconds": 12000,
+    "arbiter_seconds": 12000,
+    "accent_audit_seconds": 12000
+  },
+  "sdk_model_timeouts": {
+    "openai_seconds": 12000,
+    "openai_sync_seconds": 12000,
+    "anthropic_seconds": 12000,
+    "xai_seconds": 12000,
+    "openrouter_seconds": 12000,
+    "minimax_seconds": 12000,
+    "moonshot_seconds": 12000,
+    "ollama_seconds": 12000,
+    "fake_seconds": 12000
+  },
+  "per_call_timeout_propagation": {
+    "default_seconds": 12000,
+    "generation_seconds": 12000,
+    "tool_loop_seconds": 12000
+  },
+  "streaming": {
+    "stream_seconds": 12000,
+    "stream_read_seconds": 12000,
+    "stream_timeout_grace_seconds": 0,
+    "result_poll_grace_seconds": 0
+  },
+  "qa_gran_sabio": {
+    "qa_model_seconds": 12000,
+    "qa_comprehensive_seconds": 12000,
+    "qa_comprehensive_margin_seconds": 0,
+    "qa_timeout_retries": 2,
+    "gran_sabio_seconds": 12000
+  },
+  "long_text": {
+    "source_brief_seconds": 12000,
+    "plan_full_seconds": 12000,
+    "plan_balanced_seconds": 12000,
+    "plan_capped_seconds": 12000,
+    "section_full_seconds": 12000,
+    "section_balanced_seconds": 12000,
+    "section_capped_seconds": 12000,
+    "repair_balanced_seconds": 12000,
+    "repair_capped_seconds": 12000,
+    "finalize_capped_seconds": 12000,
+    "total_wall_clock_seconds": 12000
+  },
+  "client_sdk_sidecar": {
+    "read_timeout_seconds": 12000,
+    "stream_timeout_seconds": 12000,
+    "result_wait_seconds": 12000,
+    "connect_timeout_seconds": 30
+  },
+  "mcp": {
+    "request_timeout_seconds": 12000,
+    "result_wait_seconds": 12000
+  }
+}

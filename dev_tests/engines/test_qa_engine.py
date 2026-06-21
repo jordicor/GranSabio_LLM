@@ -1262,7 +1262,7 @@ class TestEvaluateAllLayersWithProgress:
 
         qa_engine.qa_evaluator.evaluate_content = AsyncMock(side_effect=slow_evaluation)
 
-        with patch('qa_engine.calculate_qa_timeout_for_model', return_value=0.01):
+        with patch('qa_engine.resolve_qa_timeout_for_model', return_value=0.01):
             with pytest.raises(QAModelUnavailableError, match="quorum impossible"):
                 await qa_engine.evaluate_all_layers_with_progress(
                     content="Test content",

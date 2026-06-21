@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from model_aliasing import PromptPart
 from model_capability_registry import resolve_model_capability_context
+from request_timeouts import resolve_request_timeout
 
 if TYPE_CHECKING:
     from smart_edit import TextEditRange
@@ -311,6 +312,7 @@ class ArbiterContext:
     # path. Declared here (not on the constructor) so tests and callers can vary
     # it per-arbitration without mutating Arbiter state.
     arbiter_tools_mode: str = "auto"
+    original_request: Optional[Any] = None
 
 
 # =============================================================================
@@ -556,6 +558,40 @@ class Arbiter:
         self._debug_event_callback = debug_event_callback
         self._tool_event_callback = tool_event_callback
         self._logger = __import__('logging').getLogger(__name__)
+
+    @staticmethod
+    def _resolve_request_timeout(context: ArbiterContext) -> float:
+        from config import config
+
+        return resolve_request_timeout(
+            getattr(context, "original_request", None),
+            "arbiter_seconds",
+            settings=getattr(config, "REQUEST_TIMEOUTS", {}) or {},
+            config_path=("process_timeouts", "arbiter_seconds"),
+            fallback=float(getattr(config, "REQUEST_TIMEOUT", 12000) or 12000),
+        )
+
+    @staticmethod
+    def _resolve_output_max_tokens(
+        context: ArbiterContext,
+        selected_model: str,
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Resolve Arbiter output budget from routing, config fallback, and model limits."""
+
+        from config import config
+        from llm_routing import resolve_call
+
+        route = resolve_call("arbiter.resolve", request=getattr(context, "original_request", None))
+        resolution = config.resolve_output_max_tokens(
+            selected_model,
+            routed_max_tokens=(route.params or {}).get("max_tokens"),
+            configured_default=getattr(config, "ARBITER_MAX_TOKENS", None),
+            call_id="arbiter.resolve",
+        )
+        resolved_max_tokens = resolution.get("max_tokens") if isinstance(resolution, dict) else None
+        if resolved_max_tokens is None:
+            resolved_max_tokens = config.ARBITER_MAX_TOKENS
+        return int(resolved_max_tokens), resolution
 
     async def _emit_debug_event(self, event_type: str, payload: Dict[str, Any]) -> None:
         """Persist an arbiter event to the debugger DB if a callback is bound."""
@@ -1360,6 +1396,7 @@ class Arbiter:
         # only happen if the model chooses to call ``validate_draft`` again.
         from deterministic_validation import DraftValidationResult
         from tool_loop_models import (
+            JsonContractError,
             LoopScope,
             OutputContract,
             PayloadScope,
@@ -1382,27 +1419,56 @@ class Arbiter:
             )
 
         max_rounds = getattr(config, "ARBITER_MAX_TOOL_ROUNDS", 2)
-
-        _, envelope = await self.ai_service.call_ai_with_validation_tools(
-            prompt=prompt,
-            model=selected_model,
-            validation_callback=_neutral_validation_callback,
-            output_contract=OutputContract.JSON_STRUCTURED,
-            response_format=ARBITER_RESPONSE_SCHEMA,
-            payload_scope=PayloadScope.MEASUREMENT_ONLY,
-            stop_on_approval=False,
-            loop_scope=LoopScope.ARBITER,
-            retries_enabled=True,
-            max_tool_rounds=max_rounds,
-            initial_measurement_text=context.current_content,
-            tool_event_callback=self._tool_event_callback,
-            temperature=config.ARBITER_TEMPERATURE,
-            max_tokens=config.ARBITER_MAX_TOKENS,
-            system_prompt=ARBITER_SYSTEM_PROMPT,
-            model_alias_registry=context.model_alias_registry,
-            prompt_safety_parts=prompt_safety_parts,
-            cancellation_token=context.cancellation_token,
+        arbiter_timeout = self._resolve_request_timeout(context)
+        max_tokens, _budget_resolution = self._resolve_output_max_tokens(
+            context,
+            selected_model,
         )
+
+        async def _call_with_budget(token_budget: int):
+            return await self.ai_service.call_ai_with_validation_tools(
+                prompt=prompt,
+                model=selected_model,
+                validation_callback=_neutral_validation_callback,
+                output_contract=OutputContract.JSON_STRUCTURED,
+                response_format=ARBITER_RESPONSE_SCHEMA,
+                payload_scope=PayloadScope.MEASUREMENT_ONLY,
+                stop_on_approval=False,
+                loop_scope=LoopScope.ARBITER,
+                retries_enabled=True,
+                max_tool_rounds=max_rounds,
+                initial_measurement_text=context.current_content,
+                tool_event_callback=self._tool_event_callback,
+                temperature=config.ARBITER_TEMPERATURE,
+                max_tokens=token_budget,
+                system_prompt=ARBITER_SYSTEM_PROMPT,
+                model_alias_registry=context.model_alias_registry,
+                prompt_safety_parts=prompt_safety_parts,
+                request_timeout=arbiter_timeout,
+                cancellation_token=context.cancellation_token,
+            )
+
+        _, envelope = await _call_with_budget(max_tokens)
+
+        if envelope is not None and getattr(envelope, "output_truncated", False):
+            retry_max_tokens = config.resolve_output_truncation_retry_max_tokens(
+                selected_model,
+                getattr(envelope, "max_tokens", None) or max_tokens,
+            )
+            if retry_max_tokens is not None:
+                self._logger.warning(
+                    "Arbiter tool-loop output truncated for %s at max_tokens=%s; retrying with %s",
+                    selected_model,
+                    getattr(envelope, "max_tokens", None) or max_tokens,
+                    retry_max_tokens,
+                )
+                _, envelope = await _call_with_budget(retry_max_tokens)
+            if envelope is not None and getattr(envelope, "output_truncated", False):
+                raise JsonContractError(
+                    "Arbiter tool-loop output truncated "
+                    f"(finish_reason={getattr(envelope, 'finish_reason', None)} "
+                    f"max_tokens={getattr(envelope, 'max_tokens', None) or max_tokens})."
+                )
 
         payload = envelope.payload if envelope is not None else None
         if not isinstance(payload, dict):
@@ -1434,28 +1500,43 @@ class Arbiter:
         the strip-markdown logic lives in a single utility.
         """
         from config import config
-        from tool_loop_models import parse_json_with_markdown_fences
+        from tool_loop_models import JsonContractError, parse_json_with_markdown_fences
 
+        arbiter_timeout = self._resolve_request_timeout(context)
+        max_tokens, _budget_resolution = self._resolve_output_max_tokens(
+            context,
+            selected_model,
+        )
         response_content = ""
         if self.stream_callback:
             async for chunk in self.ai_service.generate_content_stream(
                 prompt=prompt,
                 model=selected_model,
                 system_prompt=ARBITER_SYSTEM_PROMPT,
-                max_tokens=config.ARBITER_MAX_TOKENS,
+                max_tokens=max_tokens,
                 temperature=config.ARBITER_TEMPERATURE,
                 json_output=True,
                 json_schema=ARBITER_RESPONSE_SCHEMA,
                 model_alias_registry=context.model_alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                request_timeout=arbiter_timeout,
                 cancellation_token=context.cancellation_token,
             ):
                 if hasattr(chunk, 'text'):
                     chunk_text = chunk.text
                     is_thinking = getattr(chunk, 'is_thinking', False)
+                    metadata = getattr(chunk, "metadata", {}) or {}
                 else:
                     chunk_text = chunk
                     is_thinking = False
+                    metadata = {}
+
+                if metadata.get("output_truncated"):
+                    raise JsonContractError(
+                        "Arbiter streaming response was truncated "
+                        f"(finish_reason={metadata.get('finish_reason')} "
+                        f"max_tokens={metadata.get('max_tokens') or max_tokens})."
+                    )
 
                 if chunk_text:
                     if not is_thinking:
@@ -1466,12 +1547,13 @@ class Arbiter:
                 prompt=prompt,
                 model=selected_model,
                 system_prompt=ARBITER_SYSTEM_PROMPT,
-                max_tokens=config.ARBITER_MAX_TOKENS,
+                max_tokens=max_tokens,
                 temperature=config.ARBITER_TEMPERATURE,
                 json_output=True,
                 json_schema=ARBITER_RESPONSE_SCHEMA,
                 model_alias_registry=context.model_alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                request_timeout=arbiter_timeout,
                 cancellation_token=context.cancellation_token,
             )
 

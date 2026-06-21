@@ -12,14 +12,16 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import json_utils as json
+from config import config
+from llm_routing import resolve_call, resolve_temperature
 from model_aliasing import (
     ModelAliasRegistry,
     ModelIdentityLeakError,
     PromptPart,
     assert_prompt_is_model_blind,
 )
-from llm_routing import resolve_call, resolve_temperature
 from models import ContentRequest, QALayer
+from request_timeouts import resolve_request_timeout
 from tool_loop_models import JsonContractError, parse_json_with_markdown_fences
 
 RIGOR_LIMITS: Dict[str, Dict[str, int]] = {
@@ -625,11 +627,23 @@ async def run_auto_qa_planning(
 
     try:
         route = resolve_call("auto_qa.plan", request=request)
+        auto_qa_max_tokens = config.resolve_output_max_tokens(
+            route.model,
+            routed_max_tokens=route.params.get("max_tokens"),
+            call_id="auto_qa.plan",
+        )["max_tokens"]
+        auto_qa_timeout = resolve_request_timeout(
+            request,
+            "auto_qa_seconds",
+            settings=getattr(config, "REQUEST_TIMEOUTS", {}) or {},
+            config_path=("process_timeouts", "auto_qa_seconds"),
+            fallback=float(getattr(config, "REQUEST_TIMEOUT", 12000) or 12000),
+        )
         raw_output = await ai_service.generate_content(
             prompt=_build_planner_prompt(payload),
             model=route.model,
             temperature=resolve_temperature(route),
-            max_tokens=route.params.get("max_tokens", 6000),
+            max_tokens=auto_qa_max_tokens,
             system_prompt="Plan QA layers for Gran Sabio. Return strict JSON only.",
             content_type="json",
             json_output=True,
@@ -639,6 +653,7 @@ async def run_auto_qa_planning(
             phase_logger=phase_logger,
             model_alias_registry=model_alias_registry,
             prompt_safety_parts=prompt_safety_parts,
+            request_timeout=auto_qa_timeout,
             cancellation_token=cancellation_token,
         )
     except AutoQAPlanningError:

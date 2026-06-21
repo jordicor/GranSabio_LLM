@@ -16,6 +16,13 @@ from pydantic import AliasChoices, BaseModel, Field
 
 # Use optimized JSON (3.6x faster than standard json)
 import json_utils as json
+from request_timeouts import (
+    DEFAULT_PROCESS_TIMEOUT_SECONDS,
+    coerce_timeout_retries,
+    get_config_raw_value,
+    load_request_timeout_settings,
+    resolve_env_timeout,
+)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -35,6 +42,8 @@ _REASONING_EFFORT_ORDER = (
     "xhigh",
     "max",
 )
+
+DEFAULT_OUTPUT_TOKEN_FALLBACK = 8192
 
 
 def _strip_model_prefix(model_name: str) -> str:
@@ -564,21 +573,21 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
     LONG_TEXT_PLAN_SUM_TOLERANCE_PERCENT: int = Field(default=5, description="Allowed drift between section-budget sum and document target")
     LONG_TEXT_MAX_ROLLING_ANCHORS: int = Field(default=3, description="Maximum number of rolling section anchors kept in prompt context")
     LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS: int = Field(default=450, description="Maximum total words carried in rolling section anchors")
-    LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS: int = Field(default=90, description="Timeout for Long Text source-brief distillation")
-    LONG_TEXT_PLAN_TIMEOUT_FULL_SECONDS: int = Field(default=240, description="Timeout for Long Text planning with full profile")
-    LONG_TEXT_PLAN_TIMEOUT_BALANCED_SECONDS: int = Field(default=150, description="Timeout for Long Text planning with balanced profile")
-    LONG_TEXT_PLAN_TIMEOUT_CAPPED_SECONDS: int = Field(default=90, description="Timeout for Long Text planning with capped profile")
-    LONG_TEXT_SECTION_TIMEOUT_FULL_SECONDS: int = Field(default=180, description="Timeout for Long Text section drafting with full profile")
-    LONG_TEXT_SECTION_TIMEOUT_BALANCED_SECONDS: int = Field(default=150, description="Timeout for Long Text section drafting with balanced profile")
-    LONG_TEXT_SECTION_TIMEOUT_CAPPED_SECONDS: int = Field(default=90, description="Timeout for Long Text section drafting with capped profile")
-    LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS: int = Field(default=120, description="Timeout for Long Text targeted repairs with balanced profile")
-    LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS: int = Field(default=75, description="Timeout for Long Text targeted repairs with capped profile")
-    LONG_TEXT_FINALIZE_TIMEOUT_CAPPED_SECONDS: int = Field(default=60, description="Timeout for Long Text candidate finalization")
+    LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS: int = Field(default=12000, description="Timeout for Long Text source-brief distillation")
+    LONG_TEXT_PLAN_TIMEOUT_FULL_SECONDS: int = Field(default=12000, description="Timeout for Long Text planning with full profile")
+    LONG_TEXT_PLAN_TIMEOUT_BALANCED_SECONDS: int = Field(default=12000, description="Timeout for Long Text planning with balanced profile")
+    LONG_TEXT_PLAN_TIMEOUT_CAPPED_SECONDS: int = Field(default=12000, description="Timeout for Long Text planning with capped profile")
+    LONG_TEXT_SECTION_TIMEOUT_FULL_SECONDS: int = Field(default=12000, description="Timeout for Long Text section drafting with full profile")
+    LONG_TEXT_SECTION_TIMEOUT_BALANCED_SECONDS: int = Field(default=12000, description="Timeout for Long Text section drafting with balanced profile")
+    LONG_TEXT_SECTION_TIMEOUT_CAPPED_SECONDS: int = Field(default=12000, description="Timeout for Long Text section drafting with capped profile")
+    LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS: int = Field(default=12000, description="Timeout for Long Text targeted repairs with balanced profile")
+    LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS: int = Field(default=12000, description="Timeout for Long Text targeted repairs with capped profile")
+    LONG_TEXT_FINALIZE_TIMEOUT_CAPPED_SECONDS: int = Field(default=12000, description="Timeout for Long Text candidate finalization")
     LONG_TEXT_SECTION_DRAFT_START_PROFILE: str = Field(default="balanced", description="Starting controller profile for Long Text section drafting")
     LONG_TEXT_MAX_SECTIONS: int = Field(default=8, description="Maximum sections allowed in a Long Text plan")
     LONG_TEXT_MAX_GENERATOR_CALLS_TOTAL: int = Field(default=20, description="Maximum Long Text generator calls per request")
     LONG_TEXT_MAX_SEMANTIC_EVAL_CALLS: int = Field(default=16, description="Maximum Long Text semantic evaluation calls per request")
-    LONG_TEXT_MAX_TOTAL_WALL_CLOCK_SECONDS: int = Field(default=1800, description="Maximum total wall-clock budget for one Long Text request")
+    LONG_TEXT_MAX_TOTAL_WALL_CLOCK_SECONDS: int = Field(default=12000, description="Maximum total wall-clock budget for one Long Text request")
     LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION: int = Field(default=2, description="Maximum tool-loop rounds allowed for one Long Text section draft")
     LONG_TEXT_MAX_PLAN_INVALIDATIONS: int = Field(default=1, description="Maximum Long Text frozen-plan invalidations per request")
     LONG_TEXT_MAX_CONSECUTIVE_POST_REPAIR_ASSEMBLY_FAILURES: int = Field(
@@ -590,7 +599,19 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
 
     # Request limits and timeouts
     MAX_CONCURRENT_REQUESTS: int = Field(default=10, description="Maximum concurrent API requests")
-    REQUEST_TIMEOUT: int = Field(default=120, description="Request timeout in seconds")
+    REQUEST_TIMEOUT: int = Field(default=12000, description="Default request process timeout in seconds")
+    REQUEST_TIMEOUTS_DEFAULT_PATH: str = Field(
+        default="request_timeouts.default.json",
+        description="Tracked JSON file containing default request-process timeouts",
+    )
+    REQUEST_TIMEOUTS_PATH: str = Field(
+        default="request_timeouts.json",
+        description="Optional local JSON file overriding request-process timeouts",
+    )
+    REQUEST_TIMEOUTS: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Resolved request-process timeout settings",
+    )
     MAX_RETRIES: int = Field(default=3, description="Maximum retries for failed requests")
     RETRY_DELAY: float = Field(default=10.0, description="Base delay between retries in seconds")
     RETRY_BACKOFF_MULTIPLIER: float = Field(default=2.0, description="Multiplier for exponential backoff (delay = base * multiplier^attempt)")
@@ -608,7 +629,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         description="Multiplier for reasoning timeouts in QA (QA is more complex than generation)"
     )
     QA_BASE_TIMEOUT: int = Field(
-        default=120,
+        default=12000,
         gt=0,
         description="Base timeout in seconds for non-reasoning QA models"
     )
@@ -623,7 +644,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         description="Maximum retry attempts when a QA evaluator hits a retryable provider/API failure"
     )
     QA_COMPREHENSIVE_TIMEOUT_MARGIN: int = Field(
-        default=60,
+        default=0,
         ge=0,
         description="Additional seconds for processing overhead in comprehensive QA"
     )
@@ -697,9 +718,8 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
 
     # LLM-accent guard configuration (Cambio 1 v5, §5.10)
     AI_ACCENT_AUDIT_TIMEOUT_SECONDS: int = Field(
-        default=30,
-        ge=5,
-        le=300,
+        default=12000,
+        gt=0,
         description="Timeout for a single audit_accent model call."
     )
     AI_ACCENT_AUDIT_MAX_TOKENS: int = Field(
@@ -707,6 +727,14 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         ge=200,
         le=8000,
         description="Maximum tokens for a single audit_accent model response."
+    )
+    QA_DEFAULT_MAX_TOKENS: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional default max_tokens for QA model calls. When unset, QA "
+            "defaults are resolved from the selected model's safe output limit."
+        ),
     )
 
     # Arbiter Configuration (per-layer conflict resolution)
@@ -785,6 +813,18 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         )
     )
 
+    # Provider SDK process/read timeouts. These are intentionally distinct from
+    # low-level socket connect timeouts and can cut slow model calls.
+    SDK_OPENAI_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="OpenAI async SDK process timeout")
+    SDK_OPENAI_SYNC_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="OpenAI sync SDK process timeout")
+    SDK_ANTHROPIC_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="Anthropic SDK process timeout")
+    SDK_XAI_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="xAI SDK process timeout")
+    SDK_OPENROUTER_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="OpenRouter SDK process timeout")
+    SDK_MINIMAX_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="MiniMax SDK process timeout")
+    SDK_MOONSHOT_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="Moonshot SDK process timeout")
+    SDK_OLLAMA_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="Ollama SDK process timeout")
+    SDK_FAKE_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="Fake AI SDK process timeout")
+
     # Session management
     MAX_ACTIVE_SESSIONS: int = Field(default=100, description="Maximum active sessions")
     SESSION_TIMEOUT: int = Field(default=3600, description="Session timeout in seconds")
@@ -841,8 +881,25 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
     def __init__(self):
         super().__init__()
         self.load_model_specifications()
+        self.load_request_timeout_settings()
         self.load_from_environment()
         self.setup_legacy_models()
+
+    def load_request_timeout_settings(self) -> None:
+        """Load central request-process timeout settings."""
+
+        self.REQUEST_TIMEOUTS_DEFAULT_PATH = os.getenv(
+            "REQUEST_TIMEOUTS_DEFAULT_PATH",
+            self.REQUEST_TIMEOUTS_DEFAULT_PATH,
+        )
+        self.REQUEST_TIMEOUTS_PATH = os.getenv(
+            "REQUEST_TIMEOUTS_PATH",
+            self.REQUEST_TIMEOUTS_PATH,
+        )
+        self.REQUEST_TIMEOUTS = load_request_timeout_settings(
+            default_path=self.REQUEST_TIMEOUTS_DEFAULT_PATH,
+            override_path=self.REQUEST_TIMEOUTS_PATH,
+        )
 
     def reload_model_specifications(self) -> None:
         """Reload model specs from disk and rebuild legacy provider maps."""
@@ -969,7 +1026,14 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
 
         # Request Limits
         self.MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))
-        self.REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "120"))
+        self.REQUEST_TIMEOUT = int(
+            resolve_env_timeout(
+                "REQUEST_TIMEOUT",
+                self.REQUEST_TIMEOUTS,
+                ("defaults", "model_call_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
+        )
         self.MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
         self.RETRY_DELAY = float(os.getenv("RETRY_DELAY", "10.0"))
         self.RETRY_BACKOFF_MULTIPLIER = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "2.0"))
@@ -981,12 +1045,36 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
 
         # QA Timeout Configuration
         self.QA_TIMEOUT_MULTIPLIER = float(os.getenv("QA_TIMEOUT_MULTIPLIER", "1.5"))
-        self.QA_BASE_TIMEOUT = int(os.getenv("QA_BASE_TIMEOUT", "120"))
-        self.MAX_QA_TIMEOUT_RETRIES = int(os.getenv("MAX_QA_TIMEOUT_RETRIES", "2"))
+        self.QA_BASE_TIMEOUT = int(
+            resolve_env_timeout(
+                "QA_BASE_TIMEOUT",
+                self.REQUEST_TIMEOUTS,
+                ("qa_gran_sabio", "qa_model_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
+        )
+        self.MAX_QA_TIMEOUT_RETRIES = coerce_timeout_retries(
+            os.getenv("MAX_QA_TIMEOUT_RETRIES"),
+            default=coerce_timeout_retries(
+                get_config_raw_value(
+                    self.REQUEST_TIMEOUTS,
+                    ("qa_gran_sabio", "qa_timeout_retries"),
+                    default=2,
+                ),
+                default=2,
+            ),
+        )
         self.MAX_QA_PROVIDER_RETRIES = int(os.getenv("MAX_QA_PROVIDER_RETRIES", "1"))
         if self.MAX_QA_PROVIDER_RETRIES < 0:
             self.MAX_QA_PROVIDER_RETRIES = 1
-        self.QA_COMPREHENSIVE_TIMEOUT_MARGIN = int(os.getenv("QA_COMPREHENSIVE_TIMEOUT_MARGIN", "60"))
+        self.QA_COMPREHENSIVE_TIMEOUT_MARGIN = int(
+            resolve_env_timeout(
+                "QA_COMPREHENSIVE_TIMEOUT_MARGIN",
+                self.REQUEST_TIMEOUTS,
+                ("qa_gran_sabio", "qa_comprehensive_margin_seconds"),
+                fallback=0,
+            )
+        )
         self.QA_MODEL_FAILURE_THRESHOLD = int(os.getenv("QA_MODEL_FAILURE_THRESHOLD", "5"))
         if self.QA_MODEL_FAILURE_THRESHOLD < 1:
             self.QA_MODEL_FAILURE_THRESHOLD = 5
@@ -1055,11 +1143,21 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
 
         # LLM-accent guard configuration (Cambio 1 v5, §5.10)
         self.AI_ACCENT_AUDIT_TIMEOUT_SECONDS = int(
-            os.getenv("AI_ACCENT_AUDIT_TIMEOUT_SECONDS", str(self.AI_ACCENT_AUDIT_TIMEOUT_SECONDS))
+            resolve_env_timeout(
+                "AI_ACCENT_AUDIT_TIMEOUT_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("process_timeouts", "accent_audit_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
         )
         self.AI_ACCENT_AUDIT_MAX_TOKENS = int(
             os.getenv("AI_ACCENT_AUDIT_MAX_TOKENS", str(self.AI_ACCENT_AUDIT_MAX_TOKENS))
         )
+        qa_default_max_tokens = self._parse_positive_int_config_value(
+            os.getenv("QA_DEFAULT_MAX_TOKENS")
+        )
+        if qa_default_max_tokens is not None:
+            self.QA_DEFAULT_MAX_TOKENS = qa_default_max_tokens
 
         # Arbiter Configuration
         self.ARBITER_MAX_TOKENS = int(os.getenv("ARBITER_MAX_TOKENS", "8000"))
@@ -1102,6 +1200,80 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         )
         self.VALIDATE_DRAFT_MAX_LENGTH = int(
             os.getenv("VALIDATE_DRAFT_MAX_LENGTH", str(self.VALIDATE_DRAFT_MAX_LENGTH))
+        )
+
+        # Provider SDK process/read timeouts
+        self.SDK_OPENAI_TIMEOUT_SECONDS = int(
+            resolve_env_timeout(
+                "SDK_OPENAI_TIMEOUT_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("sdk_model_timeouts", "openai_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
+        )
+        self.SDK_OPENAI_SYNC_TIMEOUT_SECONDS = int(
+            resolve_env_timeout(
+                "SDK_OPENAI_SYNC_TIMEOUT_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("sdk_model_timeouts", "openai_sync_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
+        )
+        self.SDK_ANTHROPIC_TIMEOUT_SECONDS = int(
+            resolve_env_timeout(
+                "SDK_ANTHROPIC_TIMEOUT_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("sdk_model_timeouts", "anthropic_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
+        )
+        self.SDK_XAI_TIMEOUT_SECONDS = int(
+            resolve_env_timeout(
+                "SDK_XAI_TIMEOUT_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("sdk_model_timeouts", "xai_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
+        )
+        self.SDK_OPENROUTER_TIMEOUT_SECONDS = int(
+            resolve_env_timeout(
+                "SDK_OPENROUTER_TIMEOUT_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("sdk_model_timeouts", "openrouter_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
+        )
+        self.SDK_MINIMAX_TIMEOUT_SECONDS = int(
+            resolve_env_timeout(
+                "SDK_MINIMAX_TIMEOUT_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("sdk_model_timeouts", "minimax_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
+        )
+        self.SDK_MOONSHOT_TIMEOUT_SECONDS = int(
+            resolve_env_timeout(
+                "SDK_MOONSHOT_TIMEOUT_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("sdk_model_timeouts", "moonshot_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
+        )
+        self.SDK_OLLAMA_TIMEOUT_SECONDS = int(
+            resolve_env_timeout(
+                "SDK_OLLAMA_TIMEOUT_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("sdk_model_timeouts", "ollama_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
+        )
+        self.SDK_FAKE_TIMEOUT_SECONDS = int(
+            resolve_env_timeout(
+                "SDK_FAKE_TIMEOUT_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("sdk_model_timeouts", "fake_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
         )
 
         # Model Reliability
@@ -1159,34 +1331,84 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             os.getenv("LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS", str(self.LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS))
         )
         self.LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS = int(
-            os.getenv("LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS", str(self.LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS))
+            resolve_env_timeout(
+                "LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("long_text", "source_brief_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
         )
         self.LONG_TEXT_PLAN_TIMEOUT_FULL_SECONDS = int(
-            os.getenv("LONG_TEXT_PLAN_TIMEOUT_FULL_SECONDS", str(self.LONG_TEXT_PLAN_TIMEOUT_FULL_SECONDS))
+            resolve_env_timeout(
+                "LONG_TEXT_PLAN_TIMEOUT_FULL_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("long_text", "plan_full_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
         )
         self.LONG_TEXT_PLAN_TIMEOUT_BALANCED_SECONDS = int(
-            os.getenv("LONG_TEXT_PLAN_TIMEOUT_BALANCED_SECONDS", str(self.LONG_TEXT_PLAN_TIMEOUT_BALANCED_SECONDS))
+            resolve_env_timeout(
+                "LONG_TEXT_PLAN_TIMEOUT_BALANCED_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("long_text", "plan_balanced_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
         )
         self.LONG_TEXT_PLAN_TIMEOUT_CAPPED_SECONDS = int(
-            os.getenv("LONG_TEXT_PLAN_TIMEOUT_CAPPED_SECONDS", str(self.LONG_TEXT_PLAN_TIMEOUT_CAPPED_SECONDS))
+            resolve_env_timeout(
+                "LONG_TEXT_PLAN_TIMEOUT_CAPPED_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("long_text", "plan_capped_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
         )
         self.LONG_TEXT_SECTION_TIMEOUT_FULL_SECONDS = int(
-            os.getenv("LONG_TEXT_SECTION_TIMEOUT_FULL_SECONDS", str(self.LONG_TEXT_SECTION_TIMEOUT_FULL_SECONDS))
+            resolve_env_timeout(
+                "LONG_TEXT_SECTION_TIMEOUT_FULL_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("long_text", "section_full_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
         )
         self.LONG_TEXT_SECTION_TIMEOUT_BALANCED_SECONDS = int(
-            os.getenv("LONG_TEXT_SECTION_TIMEOUT_BALANCED_SECONDS", str(self.LONG_TEXT_SECTION_TIMEOUT_BALANCED_SECONDS))
+            resolve_env_timeout(
+                "LONG_TEXT_SECTION_TIMEOUT_BALANCED_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("long_text", "section_balanced_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
         )
         self.LONG_TEXT_SECTION_TIMEOUT_CAPPED_SECONDS = int(
-            os.getenv("LONG_TEXT_SECTION_TIMEOUT_CAPPED_SECONDS", str(self.LONG_TEXT_SECTION_TIMEOUT_CAPPED_SECONDS))
+            resolve_env_timeout(
+                "LONG_TEXT_SECTION_TIMEOUT_CAPPED_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("long_text", "section_capped_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
         )
         self.LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS = int(
-            os.getenv("LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS", str(self.LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS))
+            resolve_env_timeout(
+                "LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("long_text", "repair_balanced_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
         )
         self.LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS = int(
-            os.getenv("LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS", str(self.LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS))
+            resolve_env_timeout(
+                "LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("long_text", "repair_capped_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
         )
         self.LONG_TEXT_FINALIZE_TIMEOUT_CAPPED_SECONDS = int(
-            os.getenv("LONG_TEXT_FINALIZE_TIMEOUT_CAPPED_SECONDS", str(self.LONG_TEXT_FINALIZE_TIMEOUT_CAPPED_SECONDS))
+            resolve_env_timeout(
+                "LONG_TEXT_FINALIZE_TIMEOUT_CAPPED_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("long_text", "finalize_capped_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
         )
         self.LONG_TEXT_SECTION_DRAFT_START_PROFILE = os.getenv(
             "LONG_TEXT_SECTION_DRAFT_START_PROFILE",
@@ -1202,7 +1424,12 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             os.getenv("LONG_TEXT_MAX_SEMANTIC_EVAL_CALLS", str(self.LONG_TEXT_MAX_SEMANTIC_EVAL_CALLS))
         )
         self.LONG_TEXT_MAX_TOTAL_WALL_CLOCK_SECONDS = int(
-            os.getenv("LONG_TEXT_MAX_TOTAL_WALL_CLOCK_SECONDS", str(self.LONG_TEXT_MAX_TOTAL_WALL_CLOCK_SECONDS))
+            resolve_env_timeout(
+                "LONG_TEXT_MAX_TOTAL_WALL_CLOCK_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("long_text", "total_wall_clock_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
         )
         self.LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION = int(
             os.getenv("LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION", str(self.LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION))
@@ -1244,20 +1471,9 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "LONG_TEXT_PLAN_SUM_TOLERANCE_PERCENT": (1, 10),
             "LONG_TEXT_MAX_ROLLING_ANCHORS": (1, 5),
             "LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS": (150, 800),
-            "LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS": (30, 300),
-            "LONG_TEXT_PLAN_TIMEOUT_FULL_SECONDS": (60, 600),
-            "LONG_TEXT_PLAN_TIMEOUT_BALANCED_SECONDS": (30, 599),
-            "LONG_TEXT_PLAN_TIMEOUT_CAPPED_SECONDS": (15, 598),
-            "LONG_TEXT_SECTION_TIMEOUT_FULL_SECONDS": (60, 600),
-            "LONG_TEXT_SECTION_TIMEOUT_BALANCED_SECONDS": (30, 600),
-            "LONG_TEXT_SECTION_TIMEOUT_CAPPED_SECONDS": (15, 599),
-            "LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS": (30, 300),
-            "LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS": (15, 299),
-            "LONG_TEXT_FINALIZE_TIMEOUT_CAPPED_SECONDS": (15, 180),
             "LONG_TEXT_MAX_SECTIONS": (3, 8),
             "LONG_TEXT_MAX_GENERATOR_CALLS_TOTAL": (4, 40),
             "LONG_TEXT_MAX_SEMANTIC_EVAL_CALLS": (2, 40),
-            "LONG_TEXT_MAX_TOTAL_WALL_CLOCK_SECONDS": (300, 7200),
             "LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION": (1, 5),
             "LONG_TEXT_MAX_PLAN_INVALIDATIONS": (0, 2),
             "LONG_TEXT_MAX_CONSECUTIVE_POST_REPAIR_ASSEMBLY_FAILURES": (1, 3),
@@ -1265,6 +1481,26 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "LONG_TEXT_SECTION_DIAGNOSTIC_CONCURRENCY": (1, 2),
         }
         for field_name, (minimum, maximum) in int_bounds.items():
+            value = getattr(self, field_name)
+            if not isinstance(value, int) or value < minimum or value > maximum:
+                raise RuntimeError(
+                    f"[CONFIG ERROR] {field_name} must be between {minimum} and {maximum}; got {value!r}."
+                )
+
+        timeout_bounds = {
+            "LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS": (1, 2_592_000),
+            "LONG_TEXT_PLAN_TIMEOUT_FULL_SECONDS": (1, 2_592_000),
+            "LONG_TEXT_PLAN_TIMEOUT_BALANCED_SECONDS": (1, 2_592_000),
+            "LONG_TEXT_PLAN_TIMEOUT_CAPPED_SECONDS": (1, 2_592_000),
+            "LONG_TEXT_SECTION_TIMEOUT_FULL_SECONDS": (1, 2_592_000),
+            "LONG_TEXT_SECTION_TIMEOUT_BALANCED_SECONDS": (1, 2_592_000),
+            "LONG_TEXT_SECTION_TIMEOUT_CAPPED_SECONDS": (1, 2_592_000),
+            "LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS": (1, 2_592_000),
+            "LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS": (1, 2_592_000),
+            "LONG_TEXT_FINALIZE_TIMEOUT_CAPPED_SECONDS": (1, 2_592_000),
+            "LONG_TEXT_MAX_TOTAL_WALL_CLOCK_SECONDS": (1, 2_592_000),
+        }
+        for field_name, (minimum, maximum) in timeout_bounds.items():
             value = getattr(self, field_name)
             if not isinstance(value, int) or value < minimum or value > maximum:
                 raise RuntimeError(
@@ -1293,26 +1529,6 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         if self.LONG_TEXT_TARGET_BAND_PERCENT >= self.LONG_TEXT_EMERGENCY_BAND_PERCENT:
             raise RuntimeError(
                 "[CONFIG ERROR] LONG_TEXT_TARGET_BAND_PERCENT must be lower than LONG_TEXT_EMERGENCY_BAND_PERCENT."
-            )
-        if not (
-            self.LONG_TEXT_PLAN_TIMEOUT_CAPPED_SECONDS
-            < self.LONG_TEXT_PLAN_TIMEOUT_BALANCED_SECONDS
-            < self.LONG_TEXT_PLAN_TIMEOUT_FULL_SECONDS
-        ):
-            raise RuntimeError(
-                "[CONFIG ERROR] Long Text plan timeouts must satisfy capped < balanced < full."
-            )
-        if not (
-            self.LONG_TEXT_SECTION_TIMEOUT_CAPPED_SECONDS
-            < self.LONG_TEXT_SECTION_TIMEOUT_BALANCED_SECONDS
-            <= self.LONG_TEXT_SECTION_TIMEOUT_FULL_SECONDS
-        ):
-            raise RuntimeError(
-                "[CONFIG ERROR] Long Text section timeouts must satisfy capped < balanced <= full."
-            )
-        if self.LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS >= self.LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS:
-            raise RuntimeError(
-                "[CONFIG ERROR] LONG_TEXT_REPAIR_TIMEOUT_CAPPED_SECONDS must be lower than LONG_TEXT_REPAIR_TIMEOUT_BALANCED_SECONDS."
             )
         if self.LONG_TEXT_MAX_SECTIONS_PER_REPAIR > self.LONG_TEXT_MAX_SECTIONS:
             raise RuntimeError(
@@ -1796,6 +2012,180 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "reason": "raised_to_external_generation_floor",
         }
 
+    def resolve_model_safe_output_tokens(self, model_name: str) -> Optional[int]:
+        """Return the model's safe output budget without checking provider credentials."""
+
+        resolved = resolve_model_catalog_entry(model_name, self.model_specs)
+        if not resolved["matched"] or not resolved["enabled"]:
+            return None
+
+        model_data = resolved["model_data"] or {}
+        token_validation = self.model_specs.get("token_validation", {}) or {}
+        max_output_tokens = (
+            self._parse_positive_int_config_value(model_data.get("output_tokens"))
+            or self._parse_positive_int_config_value(token_validation.get("default_max_output"))
+            or self._parse_positive_int_config_value(
+                (token_validation.get("fallback_limits") or {}).get("output")
+            )
+        )
+        if max_output_tokens is None:
+            return None
+
+        try:
+            safety_margin = float(token_validation.get("safety_margin", 1.0))
+        except (TypeError, ValueError):
+            safety_margin = 1.0
+        if safety_margin <= 0:
+            safety_margin = 1.0
+        safety_margin = min(safety_margin, 1.0)
+        return max(1, int(max_output_tokens * safety_margin))
+
+    def resolve_output_max_tokens(
+        self,
+        model_name: str,
+        *,
+        requested_max_tokens: Optional[int] = None,
+        routed_max_tokens: Optional[int] = None,
+        configured_default: Optional[int] = None,
+        max_tokens_percentage: Optional[float] = None,
+        fallback_tokens: Optional[int] = DEFAULT_OUTPUT_TOKEN_FALLBACK,
+        fallback_to_model_limit: bool = True,
+        cap_to_model_limit: bool = True,
+        call_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Resolve an LLM output-token budget from request, routing, config, or model metadata."""
+
+        safe_output_tokens = self.resolve_model_safe_output_tokens(model_name)
+        selected_tokens: Optional[int] = None
+        source = "missing"
+        original_tokens: Any = None
+        percentage_used = False
+        percentage_value: Optional[float] = None
+
+        if max_tokens_percentage is not None:
+            try:
+                percentage = float(max_tokens_percentage)
+            except (TypeError, ValueError):
+                percentage = 0.0
+            if percentage > 0:
+                percentage_used = True
+                percentage_value = percentage
+                basis = safe_output_tokens
+                basis_source = "model_safe_limit"
+                if basis is None:
+                    basis = (
+                        self._parse_positive_int_config_value(requested_max_tokens)
+                        or self._parse_positive_int_config_value(routed_max_tokens)
+                        or self._parse_positive_int_config_value(configured_default)
+                        or self._parse_positive_int_config_value(fallback_tokens)
+                    )
+                    basis_source = "fallback_basis"
+                if basis is not None:
+                    selected_tokens = max(1, int(basis * (percentage / 100)))
+                    source = "percentage"
+                    original_tokens = f"{percentage}% of {basis_source}"
+
+        if selected_tokens is None:
+            candidates = (
+                ("requested", requested_max_tokens),
+                ("routing", routed_max_tokens),
+                ("configured_default", configured_default),
+            )
+            for candidate_source, candidate_value in candidates:
+                parsed = self._parse_positive_int_config_value(candidate_value)
+                if parsed is not None:
+                    selected_tokens = parsed
+                    source = candidate_source
+                    original_tokens = candidate_value
+                    break
+
+        if selected_tokens is None and fallback_to_model_limit and safe_output_tokens is not None:
+            selected_tokens = safe_output_tokens
+            source = "model_safe_limit"
+            original_tokens = safe_output_tokens
+
+        if selected_tokens is None:
+            fallback = self._parse_positive_int_config_value(fallback_tokens)
+            if fallback is not None:
+                selected_tokens = fallback
+                source = "fallback"
+                original_tokens = fallback_tokens
+
+        if selected_tokens is None:
+            return {
+                "max_tokens": None,
+                "source": source,
+                "original_tokens": original_tokens,
+                "adjusted_tokens": None,
+                "safe_limit": safe_output_tokens,
+                "was_adjusted": False,
+                "percentage_used": percentage_used,
+                "percentage_value": percentage_value,
+                "call_id": call_id,
+                "reason": "no_output_token_budget_available",
+            }
+
+        adjusted_tokens = max(1, int(selected_tokens))
+        was_adjusted = False
+        reason = source
+        if cap_to_model_limit and safe_output_tokens is not None and adjusted_tokens > safe_output_tokens:
+            adjusted_tokens = safe_output_tokens
+            was_adjusted = True
+            reason = "capped_to_model_safe_limit"
+
+        return {
+            "max_tokens": adjusted_tokens,
+            "source": source,
+            "original_tokens": original_tokens,
+            "adjusted_tokens": adjusted_tokens,
+            "safe_limit": safe_output_tokens,
+            "was_adjusted": was_adjusted,
+            "percentage_used": percentage_used,
+            "percentage_value": percentage_value,
+            "call_id": call_id,
+            "reason": reason,
+        }
+
+    def resolve_output_truncation_retry_max_tokens(
+        self,
+        model_name: str,
+        current_max_tokens: Optional[int],
+    ) -> Optional[int]:
+        """Return the model-safe output budget if it can increase a truncated call."""
+
+        current_tokens = self._parse_positive_int_config_value(current_max_tokens)
+        safe_output_tokens = self.resolve_model_safe_output_tokens(model_name)
+        if current_tokens is None or safe_output_tokens is None:
+            return None
+        if safe_output_tokens <= current_tokens:
+            return None
+        return safe_output_tokens
+
+    def resolve_qa_max_tokens(
+        self,
+        model_name: str,
+        requested_max_tokens: Optional[int] = None,
+    ) -> Optional[int]:
+        """Resolve QA max_tokens from request override, config, then model metadata."""
+
+        resolution = self.resolve_output_max_tokens(
+            model_name,
+            requested_max_tokens=requested_max_tokens,
+            configured_default=self.QA_DEFAULT_MAX_TOKENS,
+            fallback_tokens=None,
+            call_id="qa.evaluate_layer",
+        )
+        return resolution.get("max_tokens")
+
+    def resolve_qa_truncation_retry_max_tokens(
+        self,
+        model_name: str,
+        current_max_tokens: Optional[int],
+    ) -> Optional[int]:
+        """Return a larger safe QA token budget for a single truncation retry."""
+
+        return self.resolve_output_truncation_retry_max_tokens(model_name, current_max_tokens)
+
     def validate_api_keys(self) -> Dict[str, bool]:
         """Validate that required API keys are present (no fallbacks)."""
         return {
@@ -1811,7 +2201,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
     def validate_token_limits(
         self,
         model_name: str,
-        max_tokens: int,
+        max_tokens: Optional[int],
         reasoning_effort: Optional[str] = None,
         thinking_budget_tokens: Optional[int] = None,
         max_tokens_percentage: Optional[float] = None
@@ -1827,6 +2217,15 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             thinking_budget_tokens: Budget tokens for thinking/reasoning
             max_tokens_percentage: Use X% of model's maximum available tokens (1-100)
         """
+        if self._parse_positive_int_config_value(max_tokens) is None:
+            token_resolution = self.resolve_output_max_tokens(
+                model_name,
+                max_tokens_percentage=max_tokens_percentage,
+                fallback_tokens=DEFAULT_OUTPUT_TOKEN_FALLBACK,
+                call_id="validate_token_limits",
+            )
+            max_tokens = token_resolution.get("max_tokens") or DEFAULT_OUTPUT_TOKEN_FALLBACK
+
         model_info = self.get_model_info(model_name)
         max_output_tokens = model_info.get("output_tokens", 8192)
         provider = model_info.get("provider", "unknown")
@@ -2183,19 +2582,31 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         reasoning_effort: Optional[str],
         thinking_budget_tokens: Optional[int]
     ) -> Optional[int]:
-        """Determine request timeout (seconds) for reasoning-capable models."""
+        """Estimate a request timeout (seconds) for models with reasoning signals."""
         capabilities = {
             cap.lower() for cap in (model_info.get("capabilities", []) or []) if isinstance(cap, str)
         }
-        if "reasoning" not in capabilities:
+        thinking_details = self._get_thinking_budget_details(model_info.get("model_id", ""))
+        has_reasoning_signal = (
+            "reasoning" in capabilities
+            or bool(thinking_budget_tokens)
+            or bool(thinking_details and thinking_details.get("supported", False))
+        )
+        if not has_reasoning_signal:
             return None
 
         normalized_effort = self.normalize_reasoning_effort_label(reasoning_effort)
         if not normalized_effort and thinking_budget_tokens:
-            details = self._get_thinking_budget_details(model_info.get("model_id", ""))
             normalized_effort = self._infer_reasoning_effort_from_tokens(
-                thinking_budget_tokens, details
+                thinking_budget_tokens,
+                thinking_details,
             )
+
+        if not normalized_effort and thinking_details:
+            normalized_effort = self.normalize_reasoning_effort_label(thinking_details.get("default_level"))
+            default_tokens = thinking_details.get("default_tokens")
+            if not normalized_effort and default_tokens:
+                normalized_effort = self._infer_reasoning_effort_from_tokens(int(default_tokens), thinking_details)
 
         if not normalized_effort:
             reasoning_config = self._get_reasoning_config(model_info.get("model_id", ""))
@@ -2203,7 +2614,10 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                 reasoning_config.get("default") if reasoning_config else None
             )
 
-        # Doubled timeouts to accommodate long reasoning sessions
+        if not normalized_effort:
+            normalized_effort = "medium"
+
+        # Recommendation only. Real deadlines come from request/config resolution.
         timeout_map = {
             "none": 900,       # 15 minutes
             "minimal": 1200,  # 20 minutes
@@ -2214,7 +2628,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "max": 21600,     # 360 minutes
         }
 
-        return timeout_map.get(normalized_effort, timeout_map["medium"]) if normalized_effort else None
+        return timeout_map.get(normalized_effort, timeout_map["medium"])
 
     def _validate_thinking_budget(
         self,

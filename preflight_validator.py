@@ -20,6 +20,7 @@ from config import config
 from llm_routing import LLMRoutingError, resolve_call, resolve_temperature
 from model_aliasing import ModelAliasRegistry, PromptPart
 from models import ContentRequest, PreflightIssue, PreflightResult, WordCountAnalysis
+from request_timeouts import resolve_request_timeout
 from usage_tracking import UsageTracker
 from word_count_utils import word_count_config_to_dict
 
@@ -690,7 +691,11 @@ async def run_preflight_validation(
         setattr(request, "_preflight_route", preflight_route)
     preflight_params = getattr(preflight_route, "params", {}) or {}
     preflight_temperature = resolve_temperature(preflight_route)
-    preflight_max_tokens = preflight_params.get("max_tokens", 800)
+    preflight_max_tokens = config.resolve_output_max_tokens(
+        selected_model,
+        routed_max_tokens=preflight_params.get("max_tokens"),
+        call_id="preflight.validate",
+    )["max_tokens"]
 
     # Early validation: Check evidence grounding model compatibility (no API call needed)
     evidence_grounding_issue = _validate_evidence_grounding_config(request)
@@ -745,6 +750,13 @@ async def run_preflight_validation(
             if usage_tracker and usage_tracker.enabled
             else None
         )
+        preflight_timeout = resolve_request_timeout(
+            request,
+            "preflight_seconds",
+            settings=getattr(config, "REQUEST_TIMEOUTS", {}) or {},
+            config_path=("process_timeouts", "preflight_seconds"),
+            fallback=float(getattr(config, "REQUEST_TIMEOUT", 12000) or 12000),
+        )
 
         if stream_callback:
             # Use streaming generation
@@ -761,6 +773,7 @@ async def run_preflight_validation(
                 model_alias_registry=model_alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
                 llm_routing=getattr(request, "_llm_routing", None),
+                request_timeout=preflight_timeout,
                 cancellation_token=cancellation_token,
             ):
                 # Handle StreamChunk (Claude with thinking) vs plain string
@@ -792,6 +805,7 @@ async def run_preflight_validation(
                 model_alias_registry=model_alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
                 llm_routing=getattr(request, "_llm_routing", None),
+                request_timeout=preflight_timeout,
                 cancellation_token=cancellation_token,
             )
 

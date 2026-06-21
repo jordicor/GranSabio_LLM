@@ -162,6 +162,33 @@ Define what "quality" means for YOUR use case:
 
 QA scheduling is configurable through `qa_execution_mode`, `on_qa_model_unavailable`, `on_qa_timeout`, `min_valid_qa_models`, `min_valid_qa_model_ratio`, and `qa_replacement_policy`. The default `auto` mode uses progressive quorum for deal-breaker layers, so it may stop once a reliable quorum is guaranteed, and bounded parallel execution for normal scoring layers. Retryable QA provider failures use the bounded `MAX_QA_PROVIDER_RETRIES` budget before the evaluator is marked as a technical failure.
 
+### Request Timeouts
+
+Request process timeouts are centralized in `request_timeouts.default.json`. Create a local `request_timeouts.json` to override defaults without changing tracked files. These values are for model generation, streaming, QA, Gran Sabio, Long Text, SDK waits, and MCP waits; provider connection/health/model-sync timeouts remain separate.
+
+The default process timeout is intentionally high: `12000` seconds. Per request you can override it globally or by phase:
+
+```json
+{
+  "timeout_seconds": 12000,
+  "timeouts": {
+    "generation_seconds": 18000,
+    "qa_model_seconds": 12000,
+    "qa_comprehensive_seconds": 12000,
+    "gran_sabio_seconds": 18000,
+    "long_text_seconds": 12000
+  },
+  "qa_timeout_retries": 0,
+  "qa_models_config": {
+    "claude-sonnet-4": {
+      "timeout_seconds": 18000
+    }
+  }
+}
+```
+
+Precedence is: request phase override, request `timeout_seconds`, local timeout config, tracked defaults. Capability-based `recommended_timeout_seconds` is only a hint and does not shorten explicit user/config values.
+
 ---
 
 ### Final Verification

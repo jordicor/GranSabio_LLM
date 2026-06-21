@@ -18,6 +18,7 @@ import re
 import time
 from typing import TYPE_CHECKING, Any, Callable, List, Literal, Mapping, Optional, Tuple, Union
 
+from config import config
 from llm_routing import default_temperature_for_call, resolve_call
 
 from .locators import (
@@ -701,13 +702,18 @@ class SmartTextEditor:
                 if temperature is not None
                 else default_temperature_for_call("smart_edit.apply")
             )
+        effective_max_tokens = config.resolve_output_max_tokens(
+            model,
+            routed_max_tokens=route_params.get("max_tokens"),
+            call_id="smart_edit.apply",
+        )["max_tokens"]
 
         # Call AI service using generate_content (the actual method name)
         response = await self.ai_service.generate_content(
             model=model,
             prompt=prompt,
             temperature=effective_temperature,
-            max_tokens=route_params.get("max_tokens", 4096),
+            max_tokens=effective_max_tokens,
             reasoning_effort=route_params.get("reasoning_effort"),
             thinking_budget_tokens=route_params.get("thinking_budget_tokens"),
             usage_callback=usage_callback,
