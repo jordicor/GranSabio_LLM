@@ -22,12 +22,11 @@ from typing import Any, Callable, Dict, Optional
 
 from evidence_grounding.budget_scorer import BudgetScorer
 from evidence_grounding.claim_extractor import ClaimExtractor
-from llm_routing import resolve_call
 from evidence_grounding.evidence_matcher import (
     EvidenceMatcher,
     match_claims_to_spans,
-    spanize_context,
 )
+from llm_routing import resolve_call
 from models import (
     EvidenceGroundingConfig,
     EvidenceGroundingResult,
@@ -90,7 +89,7 @@ class GroundingEngine:
         """
         self.ai_service = ai_service
         self.claim_extractor = ClaimExtractor(ai_service)
-        self.evidence_matcher = EvidenceMatcher()
+        self.evidence_matcher = EvidenceMatcher(ai_service=ai_service)
         self.budget_scorer = BudgetScorer(ai_service)
 
     async def run_grounding_check(
@@ -130,9 +129,11 @@ class GroundingEngine:
         tokens_used = 0  # Track across all API calls
 
         extraction_route = resolve_call("evidence.extract_claims", request=original_request)
+        classification_route = resolve_call("evidence.classify_spans", request=original_request)
         scoring_route = resolve_call("evidence.score_logprobs", request=original_request)
         # If user specifies a legacy model in config, use it for both phases.
         extraction_model = grounding_config.model or extraction_route.model
+        classification_model = grounding_config.model or classification_route.model
         scoring_model = grounding_config.model or scoring_route.model
 
         if extra_verbose:
@@ -218,7 +219,23 @@ class GroundingEngine:
         if progress_callback:
             await self._safe_callback(progress_callback, "Matching claims to evidence spans...")
 
-        spans = spanize_context(context)
+        spans = self.evidence_matcher.spanize(context)
+        try:
+            spans = await self.evidence_matcher.classify_spans(
+                model=classification_model,
+                request=original_request,
+                usage_callback=usage_callback,
+                cancellation_token=cancellation_token,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[GROUNDING] Span classification failed: {e}")
+            return self._create_error_result(
+                model=classification_model,
+                error_message=f"Span classification failed: {e}",
+                elapsed_ms=(time.time() - start_time) * 1000,
+            )
         matched_claims = match_claims_to_spans(filtered_claims, spans)
 
         if extra_verbose:

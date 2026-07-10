@@ -37,7 +37,6 @@ from . import (
 # Import shared utilities from _common
 from ._common import (
     POLL_RETRY_BACKOFF_SECONDS,
-    PROVIDER_KEY_ENV_MAP,
     RESULT_POLL_GRACE_SECONDS,
     RESULT_POLL_INTERVAL_SECONDS,
     STREAM_ACTIVITY_CHECK_SECONDS,
@@ -107,27 +106,15 @@ class GranSabioClient:
             api_key: Optional API key (default: GRANSABIO_API_KEY env)
             timeout: Request timeout tuple (connect_timeout, read_timeout)
             provider_keys: Optional dict of provider API keys as HTTP headers.
-                If not provided, keys are loaded from environment variables
-                (OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, etc.).
+                Only keys passed explicitly here are sent to the server; provider
+                credentials are never loaded implicitly from the environment.
         """
         self.base_url = (base_url or os.getenv("GRANSABIO_BASE_URL", self.DEFAULT_BASE_URL)).rstrip("/")
         self.api_key = api_key or os.getenv("GRANSABIO_API_KEY")
         self.timeout = timeout
-        self.provider_keys = provider_keys if provider_keys is not None else self._load_provider_keys()
+        self.provider_keys = dict(provider_keys or {})
         self._model_token_cache: Dict[str, int] = {}
         self._model_timeout_cache: Dict[str, int] = {}
-
-    @staticmethod
-    def _load_provider_keys() -> Dict[str, str]:
-        """Load provider API keys from environment variables."""
-        keys: Dict[str, str] = {}
-        for header, env_names in PROVIDER_KEY_ENV_MAP.items():
-            for env_name in env_names:
-                value = os.getenv(env_name)
-                if value:
-                    keys[header] = value
-                    break
-        return keys
 
     def _headers(self) -> Dict[str, str]:
         """Build request headers including provider API keys."""

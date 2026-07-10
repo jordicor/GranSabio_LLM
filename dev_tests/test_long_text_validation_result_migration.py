@@ -52,9 +52,11 @@ async def test_section_tools_validation_callback_returns_draft_validation_result
     controller.request.system_prompt = "system"
     controller.request.extra_verbose = False
     controller.request.content_type = "article"
+    controller.request.llm_routing = {}
     controller.request._model_alias_registry = None
     controller.phase_logger = None
     controller.used_tool_loop = False
+    controller.cancellation_token = None
     controller._reserve_generator_call = MagicMock(return_value=None)
     controller._usage_callback = MagicMock(return_value=None)
     controller._ensure_not_cancelled = AsyncMock(return_value=None)
@@ -65,6 +67,7 @@ async def test_section_tools_validation_callback_returns_draft_validation_result
         schema={"type": "object"},
         profile="balanced",
         max_tokens=1024,
+        timeout_seconds=120,
     )
 
     validation_callback = captured["validation_callback"]

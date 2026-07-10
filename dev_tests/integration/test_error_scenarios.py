@@ -267,19 +267,17 @@ class TestAPIErrorResponses:
         data = response.json()
         assert "detail" in data
 
-    def test_400_includes_detail(self, base_test_client):
+    def test_omitted_generator_uses_routing_default(self, base_test_client):
         """
-        Given: Invalid request
-        When: POST with missing required field
-        Then: 400 includes detail message
+        Given: A request without the legacy generator_model field
+        When: POST /generate
+        Then: The centrally routed generation.main default is accepted
         """
         response = base_test_client.post("/generate", json={
             "prompt": "Test prompt for error response validation purposes."
-            # Missing generator_model
         })
-        assert response.status_code == 400
-        data = response.json()
-        assert "detail" in data
+        assert response.status_code == 200
+        assert response.json()["status"] == "initialized"
 
     def test_422_includes_validation_details(self, base_test_client):
         """
@@ -388,11 +386,11 @@ class TestEdgeCases:
 class TestQAConfigurationErrors:
     """Tests for QA configuration validation."""
 
-    def test_qa_layers_without_gran_sabio_model(self, base_test_client):
+    def test_qa_layers_use_routed_gran_sabio_default(self, base_test_client):
         """
-        Given: QA layers without gran_sabio_model
+        Given: QA layers without the legacy gran_sabio_model field
         When: POST /generate
-        Then: Returns 400
+        Then: The centrally routed gransabio.review default is accepted
         """
         response = base_test_client.post("/generate", json={
             "prompt": "Write a test article about QA configuration validation.",
@@ -407,9 +405,10 @@ class TestQAConfigurationErrors:
                 }
             ],
             "qa_models": ["gpt-4o"]
-            # Missing gran_sabio_model
         })
-        assert response.status_code == 400
+        assert response.status_code == 200
+        # Reaching preflight proves admission resolved the omitted Gran Sabio model.
+        assert "status" in response.json()
 
     def test_empty_qa_models_with_qa_layers(self, base_test_client):
         """

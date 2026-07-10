@@ -109,6 +109,13 @@
         "max_tokens": 4000
       }
     },
+    "evidence.classify_spans": {
+      "model": "gpt-5-nano",
+      "params": {
+        "reasoning_effort": "low",
+        "max_tokens": 4000
+      }
+    },
     "evidence.score_logprobs": {
       "model": "gpt-4o-mini",
       "requires": [

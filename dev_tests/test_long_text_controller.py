@@ -52,6 +52,23 @@ def _resolved_mode() -> ResolvedLongTextMode:
     )
 
 
+@pytest.mark.parametrize("repair_round", range(1, 6))
+def test_candidate_origin_supports_every_configured_repair_round(
+    repair_round: int,
+) -> None:
+    """The candidate model accepts every round allowed by configuration."""
+    candidate = LongTextCandidate(
+        candidate_id=f"repair-{repair_round}",
+        origin=f"repair_round_{repair_round}",
+        annotated_text="annotated",
+        public_text="public",
+        diagnostics=LongTextDiagnostics(),
+        controller_summary="assembled",
+    )
+
+    assert candidate.origin == f"repair_round_{repair_round}"
+
+
 def _plan() -> LongTextPlan:
     """Return a 3-section frozen plan that matches the 3000-word target."""
 

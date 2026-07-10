@@ -29,7 +29,7 @@ from model_aliasing import (
     prompt_facing_evaluation,
     to_prompt_safe_data,
 )
-from models import ContentRequest, QAEvaluation, QAModelConfig
+from models import ContentRequest, QAEvaluation, QALayer, QAModelConfig
 from preflight_validator import _build_validation_payload, run_preflight_validation
 from qa_engine import _attach_evaluator_identity, _qa_model_result_key
 
@@ -228,6 +228,15 @@ def test_preflight_payload_uses_prompt_safe_roles_and_evaluators():
 @pytest.mark.asyncio
 async def test_preflight_ai_call_receives_source_aware_blinded_payload():
     request = _content_request()
+    request.qa_layers = [
+        QALayer(
+            name="Accuracy",
+            description="Check factual accuracy",
+            criteria="Claims must be supported",
+            min_score=7.0,
+            order=1,
+        )
+    ]
     request._preflight_model = "real-preflight-model"
     registry = ModelAliasRegistry.from_request(request, preflight_model="real-preflight-model")
     ai_service = MagicMock()

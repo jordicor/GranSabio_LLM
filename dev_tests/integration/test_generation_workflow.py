@@ -172,18 +172,18 @@ class TestGenerateEndpoint:
         })
         assert response.status_code == 422
 
-    def test_generate_missing_model_returns_400(self, base_test_client):
+    def test_generate_uses_routed_default_model(self, base_test_client):
         """
-        Given: Request without generator_model
+        Given: Request without the legacy generator_model field
         When: POST /generate
-        Then: Returns 400
+        Then: Uses the centrally routed generation.main default
         """
         response = base_test_client.post("/generate", json={
             "prompt": "Test prompt for generation that is long enough to pass validation.",
             "content_type": "article"
         })
-        assert response.status_code == 400
-        assert "generator_model" in response.json()["detail"].lower()
+        assert response.status_code == 200
+        assert response.json()["status"] == "initialized"
 
     def test_generate_invalid_model_returns_400(self, base_test_client, valid_generation_request):
         """
@@ -511,6 +511,8 @@ class TestWordCountEnforcement:
         }
         valid_generation_request["min_words"] = 500
         valid_generation_request["max_words"] = 1000
+        # Let the synthetic word-count layer use the routed QA model defaults.
+        valid_generation_request.pop("qa_models")
         response = base_test_client.post("/generate", json=valid_generation_request)
         assert response.status_code == 200
 

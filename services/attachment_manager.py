@@ -20,6 +20,7 @@ import httpx
 from fastapi import UploadFile
 
 from config import AttachmentSettings
+from services import attachment_validation
 from services.attachment_store import (
     AttachmentStore,
     AttachmentStoreConflictError,
@@ -37,7 +38,6 @@ from services.attachment_types import (
     CleanupReport,
     ResolvedAttachment,
 )
-from services import attachment_validation
 from services.attachment_url_fetcher import AttachmentUrlFetcher
 
 try:
@@ -411,80 +411,111 @@ class AttachmentManager:
                 "Pillow is required for image processing. Install with: pip install Pillow"
             ) from exc
         import io
+        import warnings
 
         from config import config
-
-        # Check if auto_resize is disabled
-        if not config.IMAGE.auto_resize:
-            # Auto-resize disabled: return original bytes with detected MIME type
-            # Still convert HEIC/HEIF to JPEG for API compatibility
-            mime_type = resolved.record.mime_type
-            if mime_type in ("image/heic", "image/heif"):
-                with Image.open(resolved.binary_path) as img:
-                    if img.mode in ("RGBA", "LA", "P"):
-                        img = img.convert("RGB")
-                    buffer = io.BytesIO()
-                    img.save(buffer, format="JPEG", quality=95)
-                    return buffer.getvalue(), "image/jpeg"
-            # Return original bytes for all other formats
-            with open(resolved.binary_path, "rb") as f:
-                return f.read(), mime_type
 
         if max_edge is None:
             max_edge = config.IMAGE.optimal_max_edge
         if max_size_bytes is None:
             max_size_bytes = config.IMAGE.max_image_size_bytes
+        if max_edge <= 0 or max_size_bytes <= 0:
+            raise AttachmentValidationError("Image limits must be positive")
 
-        with Image.open(resolved.binary_path) as img:
-            # Determine output format based on input MIME type
-            output_format = "JPEG"
-            mime_type = "image/jpeg"
+        max_dimension = config.IMAGE.max_dimension_pixels
+        max_pixels = config.IMAGE.max_image_pixels
 
-            if resolved.record.mime_type == "image/png":
-                output_format = "PNG"
-                mime_type = "image/png"
-            elif resolved.record.mime_type == "image/webp":
-                output_format = "WEBP"
-                mime_type = "image/webp"
-            elif resolved.record.mime_type == "image/gif":
-                # GIF: use first frame, convert to PNG for quality
-                output_format = "PNG"
-                mime_type = "image/png"
-            # HEIC/HEIF -> JPEG for broad API compatibility
+        def _validate_dimensions(width: int, height: int) -> None:
+            if width <= 0 or height <= 0:
+                raise AttachmentValidationError("Image dimensions must be positive")
+            if max(width, height) > max_dimension:
+                raise AttachmentValidationError(
+                    f"Image dimension {width}x{height} exceeds the {max_dimension}px limit"
+                )
+            if width * height > max_pixels:
+                raise AttachmentValidationError(
+                    f"Image contains {width * height} pixels, exceeding the {max_pixels} pixel limit"
+                )
 
-            # Check if resize is needed
-            width, height = img.size
-            needs_resize = max(width, height) > max_edge
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(resolved.binary_path) as img:
+                    width, height = img.size
+                    _validate_dimensions(width, height)
 
-            if needs_resize:
-                ratio = max_edge / max(width, height)
-                new_size = (int(width * ratio), int(height * ratio))
-                img = img.resize(new_size, Image.Resampling.LANCZOS)
+                    if not config.IMAGE.auto_resize:
+                        if resolved.record.mime_type not in ("image/heic", "image/heif"):
+                            if resolved.binary_path.stat().st_size > max_size_bytes:
+                                raise AttachmentTooLargeError(
+                                    f"Image exceeds the {max_size_bytes} byte limit"
+                                )
+                            return resolved.binary_path.read_bytes(), resolved.record.mime_type
 
-            # Prepare for save - JPEG doesn't support alpha channel
-            if output_format == "JPEG":
-                if img.mode in ("RGBA", "LA", "P"):
-                    img = img.convert("RGB")
+                        img.load()
+                        if img.mode in ("RGBA", "LA", "P"):
+                            img = img.convert("RGB")
+                        buffer = io.BytesIO()
+                        img.save(buffer, format="JPEG", quality=95)
+                        image_bytes = buffer.getvalue()
+                        if len(image_bytes) > max_size_bytes:
+                            raise AttachmentTooLargeError(
+                                f"Converted image exceeds the {max_size_bytes} byte limit"
+                            )
+                        return image_bytes, "image/jpeg"
 
-            # Save to buffer with initial quality
-            buffer = io.BytesIO()
-            save_kwargs: Dict[str, Any] = {"format": output_format}
-            if output_format in ("JPEG", "WEBP"):
-                save_kwargs["quality"] = 85
+                    # Determine output format based on input MIME type.
+                    output_format = "JPEG"
+                    mime_type = "image/jpeg"
+                    if resolved.record.mime_type == "image/png":
+                        output_format = "PNG"
+                        mime_type = "image/png"
+                    elif resolved.record.mime_type == "image/webp":
+                        output_format = "WEBP"
+                        mime_type = "image/webp"
+                    elif resolved.record.mime_type == "image/gif":
+                        output_format = "PNG"
+                        mime_type = "image/png"
 
-            img.save(buffer, **save_kwargs)
-            image_bytes = buffer.getvalue()
+                    # Decode only after the header-level safety checks above.
+                    img.load()
+                    if max(width, height) > max_edge:
+                        ratio = max_edge / max(width, height)
+                        new_size = (
+                            max(1, int(width * ratio)),
+                            max(1, int(height * ratio)),
+                        )
+                        img = img.resize(new_size, Image.Resampling.LANCZOS)
 
-            # Reduce quality if still exceeds size limit (JPEG/WEBP only)
-            if len(image_bytes) > max_size_bytes and output_format in ("JPEG", "WEBP"):
-                for quality in [70, 55, 40, 25]:
+                    if output_format == "JPEG" and img.mode in ("RGBA", "LA", "P"):
+                        img = img.convert("RGB")
+
                     buffer = io.BytesIO()
-                    img.save(buffer, format=output_format, quality=quality)
+                    save_kwargs: Dict[str, Any] = {"format": output_format}
+                    if output_format in ("JPEG", "WEBP"):
+                        save_kwargs["quality"] = 85
+                    img.save(buffer, **save_kwargs)
                     image_bytes = buffer.getvalue()
-                    if len(image_bytes) <= max_size_bytes:
-                        break
 
-            return image_bytes, mime_type
+                    if len(image_bytes) > max_size_bytes and output_format in ("JPEG", "WEBP"):
+                        for quality in (70, 55, 40, 25):
+                            buffer = io.BytesIO()
+                            img.save(buffer, format=output_format, quality=quality)
+                            image_bytes = buffer.getvalue()
+                            if len(image_bytes) <= max_size_bytes:
+                                break
+
+                    if len(image_bytes) > max_size_bytes:
+                        raise AttachmentTooLargeError(
+                            f"Processed image exceeds the {max_size_bytes} byte limit"
+                        )
+                    return image_bytes, mime_type
+        except AttachmentError:
+            raise
+        except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+            raise AttachmentValidationError("Image exceeds Pillow decompression safety limits") from exc
+        except (OSError, ValueError) as exc:
+            raise AttachmentValidationError(f"Unable to decode image safely: {exc}") from exc
 
     def run_cleanup(
         self,

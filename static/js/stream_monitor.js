@@ -2168,13 +2168,13 @@ function renderSessionCard(session) {
     card.id = `session-card-${session.session_id}`;
 
     const sessionIdShort = (session.session_id || '').slice(0, 12);
-    const status = session.status || 'unknown';
-    const statusClass = status.toLowerCase().replace(/\s+/g, '_');
+    const status = String(session.status || 'unknown');
+    const statusClass = status.toLowerCase().replace(/[^a-z0-9_-]+/g, '_');
 
     card.innerHTML = `
         <div class="session-card-header">
-            <div class="session-id-label">SESSION: <span>${sessionIdShort}</span></div>
-            <div class="session-status-badge ${statusClass}">${status}</div>
+            <div class="session-id-label">SESSION: <span>${escapeHtml(sessionIdShort)}</span></div>
+            <div class="session-status-badge ${statusClass}">${escapeHtml(status)}</div>
         </div>
         <div class="session-card-body">
             ${renderPhaseTracker(session)}
@@ -2248,7 +2248,7 @@ function renderIterationProgress(session) {
             <div class="progress-bar-container">
                 <div class="progress-bar-fill iteration" style="width: ${percent}%"></div>
             </div>
-            <span class="progress-value">${current}/${max}</span>
+            <span class="progress-value">${escapeHtml(current)}/${escapeHtml(max)}</span>
         </div>
     `;
 }
@@ -2261,9 +2261,9 @@ function renderGenerationInfo(session) {
         <div class="info-section">
             <div class="info-section-title">Generation</div>
             <div class="info-grid">
-                ${gen.model ? `<div class="info-item"><span class="info-item-label">Model:</span><span class="info-item-value">${gen.model}</span></div>` : ''}
-                ${gen.word_count !== undefined ? `<div class="info-item"><span class="info-item-label">Words:</span><span class="info-item-value">${gen.word_count.toLocaleString()}</span></div>` : ''}
-                ${gen.content_length !== undefined ? `<div class="info-item"><span class="info-item-label">Chars:</span><span class="info-item-value">${gen.content_length.toLocaleString()}</span></div>` : ''}
+                ${gen.model ? `<div class="info-item"><span class="info-item-label">Model:</span><span class="info-item-value">${escapeHtml(gen.model)}</span></div>` : ''}
+                ${gen.word_count !== undefined ? `<div class="info-item"><span class="info-item-label">Words:</span><span class="info-item-value">${escapeHtml(gen.word_count.toLocaleString())}</span></div>` : ''}
+                ${gen.content_length !== undefined ? `<div class="info-item"><span class="info-item-label">Chars:</span><span class="info-item-value">${escapeHtml(gen.content_length.toLocaleString())}</span></div>` : ''}
             </div>
         </div>
     `;
@@ -2328,7 +2328,7 @@ function renderQASection(session) {
                 <div class="progress-bar-container">
                     <div class="progress-bar-fill qa" style="width: ${percent}%"></div>
                 </div>
-                <span class="progress-value">${completed}/${total}</span>
+                <span class="progress-value">${escapeHtml(completed)}/${escapeHtml(total)}</span>
             </div>
         `;
     }
@@ -2405,8 +2405,8 @@ function renderGranSabioSection(session) {
                     <span class="gran-sabio-dot ${isActive ? 'active' : 'standby'}"></span>
                     <span>${isActive ? 'ACTIVE' : 'STANDBY'}</span>
                 </div>
-                <div class="gran-sabio-model">Model: <span>${model}</span></div>
-                <div class="gran-sabio-escalations">Escalations: <span>${escalations}/${maxEscalations}</span></div>
+                <div class="gran-sabio-model">Model: <span>${escapeHtml(model)}</span></div>
+                <div class="gran-sabio-escalations">Escalations: <span>${escapeHtml(escalations)}/${maxEscalations}</span></div>
             </div>
         </div>
     `;
@@ -2778,7 +2778,12 @@ function escapeHtml(text) {
  * @returns {string} Escaped text safe for attributes
  */
 function escapeHtmlAttr(text) {
-    return text.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    return String(text ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 // ============================================
@@ -4246,9 +4251,9 @@ function updateSmartEditStats() {
  * Escape HTML for safe display
  */
 function escapeHtml(text) {
-    if (!text) return '';
+    if (text === null || text === undefined) return '';
     const div = document.createElement('div');
-    div.textContent = text;
+    div.textContent = String(text);
     return div.innerHTML;
 }
 

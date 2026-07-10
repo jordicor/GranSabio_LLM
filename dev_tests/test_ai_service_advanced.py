@@ -4391,3 +4391,125 @@ class TestIsOpenAIResponsesApiModel:
 
     def test_empty_model_id_returns_false(self):
         assert AIService._is_openai_responses_api_model("") is False
+
+
+class TestProviderResourceLifecycle:
+    """Regression coverage for provider streaming and shutdown resources."""
+
+    @pytest.mark.asyncio
+    async def test_gemini_partial_stream_failure_is_not_reported_as_success(
+        self,
+        ai_service_instance,
+    ):
+        """A transport error after content started must terminate the stream."""
+
+        class InterruptingStream:
+            def __init__(self):
+                self._step = 0
+                self.aclose = AsyncMock()
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self._step += 1
+                if self._step == 1:
+                    return SimpleNamespace(text="partial")
+                raise ConnectionResetError("connection lost")
+
+        stream = InterruptingStream()
+        generate_content_stream = AsyncMock(return_value=stream)
+        ai_service_instance.google_new_client = SimpleNamespace(
+            aio=SimpleNamespace(
+                models=SimpleNamespace(
+                    generate_content_stream=generate_content_stream,
+                )
+            )
+        )
+
+        received = []
+        with patch.object(
+            ai_service_instance,
+            "_build_gemini_thinking_config_kwargs",
+            return_value={},
+        ):
+            with pytest.raises(ConnectionResetError, match="connection lost"):
+                async for chunk in ai_service_instance._stream_gemini_new_sdk(
+                    prompt="test",
+                    model_id="gemini-test",
+                    temperature=0.2,
+                    max_tokens=128,
+                    system_prompt=None,
+                ):
+                    received.append(chunk)
+
+        assert received == ["partial"]
+        stream.aclose.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_logprobs_runtime_rejects_o4_from_central_capability(
+        self,
+        ai_service_instance,
+    ):
+        """Runtime applies the same o4 capability decision as routing/preflight."""
+        with patch("ai_service.config") as mock_config:
+            mock_config.model_specs = {}
+            mock_config.get_model_info.return_value = {
+                "provider": "openai",
+                "model_id": "o4-mini",
+            }
+
+            with pytest.raises(ValueError, match="verified logprobs support"):
+                await ai_service_instance.generate_with_logprobs(
+                    prompt="Test",
+                    model="o4-mini",
+                )
+
+    @pytest.mark.asyncio
+    async def test_close_attempts_every_provider_after_individual_failure(self, caplog):
+        """One client close error must not leave the remaining pools open."""
+        service = AIService.__new__(AIService)
+
+        failing_close = AsyncMock(side_effect=RuntimeError("close failed"))
+        service.openai_client = SimpleNamespace(close=failing_close)
+
+        async_clients = {}
+        for attribute in (
+            "anthropic_client",
+            "xai_client",
+            "openrouter_client",
+            "minimax_client",
+            "moonshot_client",
+            "ollama_client",
+            "fake_client",
+        ):
+            close = AsyncMock()
+            async_clients[attribute] = close
+            setattr(service, attribute, SimpleNamespace(close=close))
+
+        sync_close = Mock()
+        service.openai_sync_client = SimpleNamespace(close=sync_close)
+
+        google_async_close = AsyncMock()
+        google_sync_close = Mock()
+        service.google_new_client = SimpleNamespace(
+            aio=SimpleNamespace(aclose=google_async_close),
+            close=google_sync_close,
+        )
+
+        session_close = AsyncMock()
+        connector_close = AsyncMock()
+        service.http_session = SimpleNamespace(close=session_close)
+        service.http_connector = SimpleNamespace(close=connector_close)
+
+        await service.close()
+
+        failing_close.assert_awaited_once()
+        sync_close.assert_called_once()
+        for close in async_clients.values():
+            close.assert_awaited_once()
+        google_async_close.assert_awaited_once()
+        google_sync_close.assert_called_once()
+        session_close.assert_awaited_once()
+        connector_close.assert_awaited_once()
+        assert "close failed" in caplog.text

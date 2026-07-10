@@ -103,6 +103,7 @@ from services.attachment_manager import (
     ResolvedAttachment,
 )
 from template_compat import enable_template_response_compat
+
 from .cancellation import CancelMode, cancellation_registry
 
 T = TypeVar("T")
@@ -270,6 +271,7 @@ def _log_project_hard_stop_task_result(task: asyncio.Task) -> None:
 
 # Track project identifiers allocated ahead of generation requests
 reserved_project_ids: Set[str] = set()
+_reserved_project_id_timestamps: Dict[str, float] = {}
 
 # Project-phase streaming subscribers.
 # For each project and phase we keep a list of asyncio.Queue subscribers.
@@ -786,6 +788,7 @@ def _reserve_project_id(project_id: str) -> None:
     """Track project identifiers that clients intend to reuse."""
     if project_id:
         reserved_project_ids.add(project_id)
+        _reserved_project_id_timestamps[project_id] = time.monotonic()
 
 
 def _is_project_reserved(project_id: str) -> bool:
@@ -1918,6 +1921,25 @@ async def perform_session_cleanup() -> Dict[str, Any]:
 
     for session_id in expired_sessions:
         await cancellation_registry.unregister_session(session_id)
+
+    reservation_ttl = timeout_seconds if timeout_seconds > 0 else 3600
+    reservation_ttl = max(60, reservation_ttl)
+    reservation_cutoff = time.monotonic() - reservation_ttl
+    active_project_ids = {
+        session.get("project_id")
+        for session in active_sessions.values()
+        if session.get("project_id")
+    }
+    stale_reservations = [
+        project_id
+        for project_id, reserved_at in _reserved_project_id_timestamps.items()
+        if reserved_at <= reservation_cutoff and project_id not in active_project_ids
+    ]
+    for project_id in stale_reservations:
+        reserved_project_ids.discard(project_id)
+        _reserved_project_id_timestamps.pop(project_id, None)
+
+    await cancellation_registry.cleanup_inactive_projects()
 
     if expired_sessions:
         logger.info('Cleaned up %d expired session(s)', len(expired_sessions))

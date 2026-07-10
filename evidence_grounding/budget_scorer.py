@@ -35,6 +35,7 @@ from models import (
 )
 
 logger = logging.getLogger(__name__)
+DEFAULT_BUDGET_GAP_THRESHOLD = 0.5
 
 
 # =============================================================================
@@ -371,11 +372,7 @@ class BudgetScorer:
         threshold = (
             budget_gap_threshold
             if budget_gap_threshold is not None
-            else (
-                config.EVIDENCE_GROUNDING_BUDGET_GAP_THRESHOLD
-                if hasattr(config, 'EVIDENCE_GROUNDING_BUDGET_GAP_THRESHOLD')
-                else 0.5
-            )
+            else DEFAULT_BUDGET_GAP_THRESHOLD
         )
         flagged = budget_gap > threshold
 

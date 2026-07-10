@@ -19,6 +19,7 @@ MaybeAsyncCallback = Callable[[], Union[None, Awaitable[None]]]
 PROVIDER_CALLBACK_TIMEOUT_SECONDS = 0.25
 HARD_CANCEL_DRAIN_TIMEOUT_SECONDS = 0.5
 TOMBSTONE_TTL_SECONDS = 300
+PROJECT_RUNTIME_TTL_SECONDS = 3600
 
 
 class CancelMode(str, Enum):
@@ -68,6 +69,7 @@ class ProjectRuntime:
     hard_stop_ids: Set[str] = field(default_factory=set)
     cancelled: bool = False
     cancel_mode: Optional[str] = None
+    idle_since: Optional[datetime] = None
 
 
 @dataclass(frozen=True)
@@ -119,10 +121,72 @@ class CancellationRegistry:
         if project is None:
             project = ProjectRuntime(project_id=project_id)
             self._projects[project_id] = project
+        project.idle_since = None
         return project
+
+    def _cleanup_project_if_unused_locked(self, project_id: Optional[str]) -> None:
+        """Mark completed, non-cancelled project state for bounded retention."""
+        if not project_id:
+            return
+        project = self._projects.get(project_id)
+        if project is None:
+            return
+        if (
+            project.cancelled
+            or project.hard_stop_in_progress
+            or project.hard_stop_ids
+            or project.hard_stop_active_count
+        ):
+            return
+        if any(runtime.project_id == project_id for runtime in self._sessions.values()):
+            return
+        if project.idle_since is None:
+            project.idle_since = datetime.utcnow()
+
+    async def cleanup_inactive_projects(self) -> int:
+        """Remove completed project state after its bounded idle retention period."""
+        async with self._lock:
+            for session_id, runtime in list(self._sessions.items()):
+                self._cleanup_expired_tombstone_locked(session_id, runtime)
+
+            cutoff = datetime.utcnow() - timedelta(seconds=PROJECT_RUNTIME_TTL_SECONDS)
+            active_project_ids = {
+                runtime.project_id
+                for runtime in self._sessions.values()
+                if runtime.project_id
+            }
+            expired_project_ids = [
+                project_id
+                for project_id, project in self._projects.items()
+                if project.idle_since is not None
+                and project.idle_since <= cutoff
+                and not project.cancelled
+                and not project.hard_stop_in_progress
+                and not project.hard_stop_ids
+                and project_id not in active_project_ids
+            ]
+            for project_id in expired_project_ids:
+                self._projects.pop(project_id, None)
+            return len(expired_project_ids)
+
+    def _cleanup_expired_tombstone_locked(
+        self,
+        session_id: str,
+        runtime: SessionRuntime,
+    ) -> bool:
+        """Remove an idle hard-stop tombstone only after its full TTL."""
+        if not runtime.dispatch_sealed or runtime.tasks or runtime.provider_calls:
+            return False
+        if runtime.tombstone_until is None or runtime.tombstone_until > datetime.utcnow():
+            return False
+        self._sessions.pop(session_id, None)
+        self._cleanup_project_if_unused_locked(runtime.project_id)
+        return True
 
     def _runtime(self, session_id: str) -> SessionRuntime:
         runtime = self._sessions.get(session_id)
+        if runtime is not None and self._cleanup_expired_tombstone_locked(session_id, runtime):
+            runtime = None
         if runtime is None:
             runtime = SessionRuntime(session_id=session_id, project_id=None)
             self._sessions[session_id] = runtime
@@ -152,6 +216,10 @@ class CancellationRegistry:
         project_epoch: Optional[int],
     ) -> None:
         async with self._lock:
+            runtime = self._sessions.get(session_id)
+            if runtime is not None and self._cleanup_expired_tombstone_locked(session_id, runtime):
+                runtime = None
+
             if project_id:
                 project = self._project(project_id)
                 if project.cancelled or project.hard_stop_in_progress:
@@ -159,7 +227,6 @@ class CancellationRegistry:
                 if project_epoch is not None and project.epoch != project_epoch:
                     raise asyncio.CancelledError(f"Project {project_id} epoch changed")
 
-            runtime = self._sessions.get(session_id)
             if runtime is None:
                 runtime = SessionRuntime(
                     session_id=session_id,
@@ -182,14 +249,21 @@ class CancellationRegistry:
             runtime = self._sessions.get(session_id)
             if runtime is None:
                 return
-            if runtime.dispatch_sealed and (runtime.tasks or runtime.provider_calls):
-                runtime.tombstone_until = datetime.utcnow() + timedelta(seconds=TOMBSTONE_TTL_SECONDS)
+            if runtime.dispatch_sealed:
+                if runtime.tombstone_until is None:
+                    runtime.tombstone_until = datetime.utcnow() + timedelta(
+                        seconds=TOMBSTONE_TTL_SECONDS
+                    )
+                self._cleanup_expired_tombstone_locked(session_id, runtime)
                 return
             self._sessions.pop(session_id, None)
+            self._cleanup_project_if_unused_locked(runtime.project_id)
 
     async def get_session_commit_guard(self, session_id: str) -> SessionCommitGuard:
         async with self._lock:
             runtime = self._sessions.get(session_id)
+            if runtime is not None and self._cleanup_expired_tombstone_locked(session_id, runtime):
+                runtime = None
             if runtime is None:
                 event = asyncio.Event()
                 return SessionCommitGuard(session_id=session_id, dispatch_sealed_event=event)
@@ -198,9 +272,19 @@ class CancellationRegistry:
                 dispatch_sealed_event=runtime.dispatch_sealed_event,
             )
 
+    async def has_session_runtime(self, session_id: str) -> bool:
+        """Check for registered runtime work without creating a session entry."""
+        async with self._lock:
+            runtime = self._sessions.get(session_id)
+            if runtime is not None and self._cleanup_expired_tombstone_locked(session_id, runtime):
+                runtime = None
+            return runtime is not None
+
     async def get_session_project_identity(self, session_id: str) -> Dict[str, Any]:
         async with self._lock:
             runtime = self._sessions.get(session_id)
+            if runtime is not None and self._cleanup_expired_tombstone_locked(session_id, runtime):
+                runtime = None
             if runtime is None:
                 return {"project_id": None, "project_epoch": None}
             return {
@@ -462,6 +546,8 @@ class CancellationRegistry:
             project.cancel_mode = None
             if was_cancelled:
                 project.epoch += 1
+            if not any(runtime.project_id == project_id for runtime in self._sessions.values()):
+                project.idle_since = datetime.utcnow()
             return {
                 "project_id": project_id,
                 "was_cancelled": was_cancelled,
@@ -470,7 +556,15 @@ class CancellationRegistry:
 
     async def get_project_state(self, project_id: str) -> ProjectRuntimeSnapshot:
         async with self._lock:
-            project = self._project(project_id)
+            project = self._projects.get(project_id)
+            if project is None:
+                return ProjectRuntimeSnapshot(
+                    project_id=project_id,
+                    epoch=0,
+                    hard_stop_in_progress=False,
+                    cancelled=False,
+                    cancel_mode=None,
+                )
             return ProjectRuntimeSnapshot(
                 project_id=project.project_id,
                 epoch=project.epoch,
@@ -485,7 +579,9 @@ class CancellationRegistry:
 
     async def should_publish_project_event(self, project_id: str, project_epoch: int) -> bool:
         async with self._lock:
-            project = self._project(project_id)
+            project = self._projects.get(project_id)
+            if project is None:
+                return project_epoch == 0
             return (
                 project.epoch == project_epoch
                 and not project.cancelled
@@ -495,16 +591,22 @@ class CancellationRegistry:
     async def is_hard_cancelled(self, session_id: str) -> bool:
         async with self._lock:
             runtime = self._sessions.get(session_id)
+            if runtime is not None and self._cleanup_expired_tombstone_locked(session_id, runtime):
+                runtime = None
             return bool(runtime and runtime.dispatch_sealed)
 
     async def is_soft_cancelled(self, session_id: str) -> bool:
         async with self._lock:
             runtime = self._sessions.get(session_id)
+            if runtime is not None and self._cleanup_expired_tombstone_locked(session_id, runtime):
+                runtime = None
             return bool(runtime and runtime.soft_cancel_requested)
 
     async def is_cancelled(self, session_id: str) -> bool:
         async with self._lock:
             runtime = self._sessions.get(session_id)
+            if runtime is not None and self._cleanup_expired_tombstone_locked(session_id, runtime):
+                runtime = None
             return bool(runtime and (runtime.soft_cancel_requested or runtime.dispatch_sealed))
 
     async def _cleanup_provider_handles(self, handles: Any) -> int:
@@ -564,12 +666,7 @@ class CancellationRegistry:
             logger.debug("Detached provider cleanup failed", exc_info=True)
 
     def _cleanup_empty_tombstone_locked(self, session_id: str, runtime: SessionRuntime) -> None:
-        if not runtime.dispatch_sealed:
-            return
-        if runtime.tasks or runtime.provider_calls:
-            return
-        if runtime.tombstone_until:
-            self._sessions.pop(session_id, None)
+        self._cleanup_expired_tombstone_locked(session_id, runtime)
 
 
 cancellation_registry = CancellationRegistry()

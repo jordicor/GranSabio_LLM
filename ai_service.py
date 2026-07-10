@@ -548,6 +548,7 @@ class AIService:
     def __init__(self):
         """Initialize AI service with API clients"""
         self.openai_client = None
+        self.openai_sync_client = None
         self.anthropic_client = None
         self.google_new_client = None
         self.xai_client = None
@@ -8723,21 +8724,19 @@ class AIService:
         provider = model_info.get("provider", "")
         model_id = model_info.get("model_id", model)
 
-        # Only OpenAI and xAI models (excluding reasoning models) support logprobs
-        if provider not in ("openai", "xai"):
-            raise ValueError(
-                f"Model {model} (provider: {provider}) does not support logprobs. "
-                f"Only OpenAI and xAI models support logprobs for evidence grounding."
-            )
+        from model_capability_registry import model_supports
 
-        # Check for reasoning models that don't support logprobs
-        model_lower = model_id.lower()
-        # xAI reasoning models (grok-*-reasoning) don't support logprobs
-        # But non-reasoning models (grok-*-non-reasoning) DO support logprobs
-        if provider == "xai" and "reasoning" in model_lower and "non-reasoning" not in model_lower:
+        logprobs_state = model_supports(
+            specs=config.model_specs,
+            provider=provider,
+            model_id=model_id,
+            capability="logprobs",
+            model_data=model_info,
+        )
+        if not logprobs_state.supported:
             raise ValueError(
-                f"Model {model_id} is a reasoning model that does not support logprobs. "
-                f"Use grok-*-non-reasoning models for evidence grounding."
+                f"Model {model} (provider: {provider}) does not have verified "
+                "logprobs support."
             )
 
         # Clamp top_logprobs to API limits
@@ -8779,8 +8778,18 @@ class AIService:
             if not self.xai_client:
                 raise ValueError("xAI client not initialized. Check XAI_API_KEY.")
             client = self.xai_client
-        else:
+        elif provider == "openrouter":
+            if not self.openrouter_client:
+                raise ValueError(
+                    "OpenRouter client not initialized. Check OPENROUTER_API_KEY."
+                )
+            client = self.openrouter_client
+        elif provider == "openai":
             client = self.openai_client
+        else:
+            raise ValueError(
+                f"No logprobs runtime adapter is available for provider {provider!r}."
+            )
 
         try:
             async with self._provider_call_scope(
@@ -10944,6 +10953,13 @@ class AIService:
                     except Exception as close_error:
                         logger.warning(f"Error closing Gemini stream response: {close_error}")
 
+            if fallback_reason is not None and yielded_chunks:
+                # Once content has reached the caller, a fresh fallback would
+                # concatenate two different generations. Surface the
+                # interruption so the outer streaming contract marks the call
+                # as failed instead of publishing a terminal success chunk.
+                raise fallback_reason
+
             if fallback_needed:
                 try:
                     fallback_text, fallback_usage = await self._generate_gemini_new_sdk(
@@ -11973,36 +11989,47 @@ class AIService:
             return None
 
     async def close(self):
-        """Close HTTP connector and cleanup resources"""
-        try:
-            # Close HTTP session if exists
-            if hasattr(self, 'http_session') and self.http_session:
-                await self.http_session.close()
-                logger.info("HTTP session closed successfully")
+        """Close provider clients, HTTP pools, and connector resources."""
 
-            # Close HTTP connector
-            if hasattr(self, 'http_connector') and self.http_connector:
-                await self.http_connector.close()
-                logger.info("HTTP connector closed successfully")
+        async def _close_resource(name: str, resource: Any, method_name: str = "close") -> None:
+            if resource is None:
+                return
+            close_method = getattr(resource, method_name, None)
+            if not callable(close_method):
+                return
+            try:
+                result = close_method()
+                if inspect.isawaitable(result):
+                    await result
+                logger.info("%s closed successfully", name)
+            except Exception as close_error:
+                # Cleanup is best-effort per resource: one broken SDK must not
+                # leave every other provider pool open during shutdown.
+                logger.warning("Error closing %s: %s", name, close_error)
 
-            # Close Google new SDK client (async then sync) if available
-            if hasattr(self, 'google_new_client') and self.google_new_client:
-                async_client = getattr(self.google_new_client, "aio", None)
-                if async_client and hasattr(async_client, "aclose"):
-                    try:
-                        await async_client.aclose()
-                        logger.info("Google GenAI async client closed successfully")
-                    except Exception as async_close_error:
-                        logger.warning(f"Error closing Google GenAI async client: {async_close_error}")
+        provider_clients = (
+            ("OpenAI async client", getattr(self, "openai_client", None)),
+            ("OpenAI sync client", getattr(self, "openai_sync_client", None)),
+            ("Anthropic client", getattr(self, "anthropic_client", None)),
+            ("xAI client", getattr(self, "xai_client", None)),
+            ("OpenRouter client", getattr(self, "openrouter_client", None)),
+            ("MiniMax client", getattr(self, "minimax_client", None)),
+            ("Moonshot client", getattr(self, "moonshot_client", None)),
+            ("Ollama client", getattr(self, "ollama_client", None)),
+            ("Fake AI client", getattr(self, "fake_client", None)),
+        )
+        for name, client in provider_clients:
+            await _close_resource(name, client)
 
-                if hasattr(self.google_new_client, 'close'):
-                    if asyncio.iscoroutinefunction(self.google_new_client.close):
-                        await self.google_new_client.close()
-                        logger.info("Google GenAI client closed successfully")
-                    else:
-                        self.google_new_client.close()
-                        logger.info("Google GenAI client closed successfully")
+        google_client = getattr(self, "google_new_client", None)
+        if google_client is not None:
+            await _close_resource(
+                "Google GenAI async client",
+                getattr(google_client, "aio", None),
+                "aclose",
+            )
+            await _close_resource("Google GenAI client", google_client)
 
-            logger.info("All AI service resources cleaned up successfully")
-        except Exception as e:
-            logger.error(f"Error during AI service cleanup: {e}")
+        await _close_resource("HTTP session", getattr(self, "http_session", None))
+        await _close_resource("HTTP connector", getattr(self, "http_connector", None))
+        logger.info("All AI service resources cleaned up")

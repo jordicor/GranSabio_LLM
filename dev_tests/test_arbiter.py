@@ -728,11 +728,13 @@ class TestExtractProposedEditsFromLayerResults:
         eval1.identified_issues = [issue1]
         eval1.score = 7.5
         eval1.deal_breaker = False
+        eval1.evaluator_alias = "Evaluator A"
 
         eval2 = MagicMock()
         eval2.identified_issues = [issue2]
         eval2.score = 6.0
         eval2.deal_breaker = False
+        eval2.evaluator_alias = "Evaluator B"
 
         layer_results = {
             "gpt-4o": eval1,
@@ -742,15 +744,18 @@ class TestExtractProposedEditsFromLayerResults:
         # Extract proposed edits
         proposed_edits = _extract_proposed_edits_from_layer_results(layer_results)
 
-        # Verify source model is preserved
+        # Verify only prompt-safe evaluator aliases are preserved.
         assert len(proposed_edits) == 2
         models = {pe.source_evaluator for pe in proposed_edits}
-        assert "gpt-4o" in models
-        assert "claude-sonnet" in models
+        assert models == {"Evaluator A", "Evaluator B"}
+        assert "gpt-4o" not in models
+        assert "claude-sonnet" not in models
 
         # Verify source scores are preserved
-        gpt_edit = next(pe for pe in proposed_edits if pe.source_evaluator == "gpt-4o")
-        assert gpt_edit.source_score == 7.5
+        evaluator_a_edit = next(
+            pe for pe in proposed_edits if pe.source_evaluator == "Evaluator A"
+        )
+        assert evaluator_a_edit.source_score == 7.5
 
     def test_sorts_by_severity_and_confidence(self):
         """Should sort edits by severity (higher first) then confidence."""
@@ -984,8 +989,10 @@ class TestContentRequestArbiterField:
         assert "arbiter_model" in ContentRequest.model_fields
 
     def test_content_request_default_arbiter_model(self):
-        """ContentRequest should use default arbiter model."""
-        from models import ContentRequest, _default_arbiter_model
+        """An omitted legacy arbiter field should resolve through routing."""
+        from llm_routing import resolve_call
+        from models import ContentRequest
+
         # Create minimal request
         request = ContentRequest(
             prompt="Test prompt",
@@ -993,7 +1000,10 @@ class TestContentRequestArbiterField:
             qa_models=["gpt-4o"],
             qa_layers=[]
         )
-        assert request.arbiter_model == _default_arbiter_model()
+        assert request.arbiter_model is None
+        resolution = resolve_call("arbiter.resolve", request=request)
+        assert resolution.call_id == "arbiter.resolve"
+        assert resolution.model
 
     def test_content_request_custom_arbiter_model(self):
         """ContentRequest should accept custom arbiter model."""

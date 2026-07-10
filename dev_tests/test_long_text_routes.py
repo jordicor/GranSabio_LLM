@@ -7,15 +7,31 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from models import PreflightResult
+
 
 @pytest.fixture
 def client():
     """Return a TestClient with generation background work disabled."""
 
+    preflight_result = PreflightResult(
+        decision="proceed",
+        user_feedback="Validation passed",
+        summary="Request validated",
+        issues=[],
+        confidence=0.95,
+        word_count_analysis=None,
+        enable_algorithmic_word_count=False,
+        duplicate_word_count_layers_to_remove=[],
+    )
     with patch("core.security.is_ip_allowed", return_value=True), \
          patch("core.app_state._ensure_services"), \
          patch("core.generation_routes.ai_service", MagicMock()), \
          patch("core.generation_processor.ai_service", MagicMock()), \
+         patch(
+             "core.generation_routes.run_preflight_validation",
+             AsyncMock(return_value=preflight_result),
+         ), \
          patch("core.generation_routes.publish_project_phase_chunk", AsyncMock(return_value=None)), \
          patch("core.generation_routes._debug_session_start", AsyncMock(return_value=None)), \
          patch("core.generation_routes.process_content_generation", AsyncMock(return_value=None)), \

@@ -13,6 +13,27 @@ from arbiter import (
     LayerEditHistory,
     ProposedEdit,
 )
+from config import config
+
+
+@pytest.fixture
+def openrouter_unknown_json_schema_catalog(monkeypatch):
+    """Keep UNKNOWN-capability checks independent of the live model catalog."""
+
+    isolated_specs = {
+        "model_specifications": {
+            "openrouter": {
+                "mistralai/mistral-large": {
+                    "model_id": "mistralai/mistral-large",
+                    "enabled": True,
+                    "provider_capabilities": {
+                        "json_schema": {"support": "unknown"},
+                    },
+                },
+            },
+        },
+    }
+    monkeypatch.setattr(config, "spec_catalog", isolated_specs)
 
 
 class TestJsonPromptGate:
@@ -24,7 +45,10 @@ class TestJsonPromptGate:
         assert AIService._should_inject_json_prompt("claude", "claude-sonnet-4-5", True, schema) is False
         assert AIService._should_inject_json_prompt("xai", "grok-2-1212", True, schema) is False
 
-    def test_openrouter_unknown_capabilities_keep_prompt_instructions(self):
+    def test_openrouter_unknown_capabilities_keep_prompt_instructions(
+        self,
+        openrouter_unknown_json_schema_catalog,
+    ):
         schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
 
         assert AIService._should_inject_json_prompt("openrouter", "mistralai/mistral-large", True, schema) is True
@@ -47,7 +71,10 @@ class TestJsonPromptGate:
             {"type": "object", "properties": {}},
         ) is True
 
-    def test_audit_supports_structured_outputs_matches_openai_responses_models(self):
+    def test_audit_supports_structured_outputs_matches_openai_responses_models(
+        self,
+        openrouter_unknown_json_schema_catalog,
+    ):
         assert AIService._audit_model_supports_structured_outputs("openai", "o3-pro") is True
         assert AIService._audit_model_supports_structured_outputs("openai", "gpt-5-pro") is True
         assert AIService._audit_model_supports_structured_outputs("openrouter", "mistralai/mistral-large") is False

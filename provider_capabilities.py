@@ -50,6 +50,7 @@ class ModelCapabilities:
     chat_completions_api: CapabilityState
     reasoning_effort: CapabilityState
     thinking_budget: CapabilityState
+    logprobs: CapabilityState
     streaming: CapabilityState
 
 

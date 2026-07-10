@@ -4,20 +4,23 @@ Tests for evidence_grounding/evidence_matcher.py - Evidence Matching Module.
 Phase 3 of Strawberry Integration: Matches claims to evidence spans,
 implements span classification, and span scrubbing for pseudo-prior calculation.
 
-All tests are pure unit tests with no external dependencies.
+All tests use local mocks and no external provider calls.
 """
+
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from evidence_grounding.evidence_matcher import (
     EvidenceMatcher,
     _is_empty,
-    _is_instruction,
-    _is_question,
     _sequence_similarity,
     _split_into_sentences,
     _word_overlap_ratio,
     classify_span,
+    classify_spans_semantically,
     find_matching_spans,
     format_spans_for_prompt,
     match_claims_to_spans,
@@ -31,7 +34,7 @@ from models import EvidenceSpan, ExtractedClaim, SpanType
 # =============================================================================
 
 class TestClassifySpan:
-    """Tests for span classification logic."""
+    """Tests for the mechanical, zero-latency classification stage."""
 
     def test_classify_declarative_assertion(self):
         """
@@ -51,60 +54,10 @@ class TestClassifySpan:
         text = "The sky is blue. Water is wet. Fire is hot."
         assert classify_span(text) == SpanType.ASSERTION
 
-    def test_classify_question_mark(self):
-        """
-        Given: Text with question mark
-        When: classify_span is called
-        Then: Returns QUESTION
-        """
-        text = "What year was Einstein born?"
-        assert classify_span(text) == SpanType.QUESTION
-
-    def test_classify_question_starter(self):
-        """
-        Given: Text starting with question word
-        When: classify_span is called
-        Then: Returns QUESTION
-        """
-        text = "How did the experiment conclude"
-        # Even without ?, question starters indicate question
-        assert classify_span(text) == SpanType.QUESTION
-
-    def test_classify_multiple_questions(self):
-        """
-        Given: Text with multiple questions
-        When: classify_span is called
-        Then: Returns QUESTION
-        """
-        text = "Who discovered radium? When did this happen?"
-        assert classify_span(text) == SpanType.QUESTION
-
-    def test_classify_imperative_write(self):
-        """
-        Given: Text starting with imperative verb
-        When: classify_span is called
-        Then: Returns INSTRUCTION
-        """
-        text = "Write a biography of Marie Curie focusing on her achievements."
-        assert classify_span(text) == SpanType.INSTRUCTION
-
-    def test_classify_imperative_please(self):
-        """
-        Given: Text starting with 'Please'
-        When: classify_span is called
-        Then: Returns INSTRUCTION
-        """
-        text = "Please generate a summary of the research findings."
-        assert classify_span(text) == SpanType.INSTRUCTION
-
-    def test_classify_imperative_you_should(self):
-        """
-        Given: Text with 'you should' pattern
-        When: classify_span is called
-        Then: Returns INSTRUCTION
-        """
-        text = "You should include all relevant dates in your response."
-        assert classify_span(text) == SpanType.INSTRUCTION
+    def test_non_empty_semantics_are_not_guessed_by_keywords(self):
+        """Questions and instructions remain provisional until LLM classification."""
+        assert classify_span("What year was Einstein born?") == SpanType.ASSERTION
+        assert classify_span("Escribe un informe sobre Einstein.") == SpanType.ASSERTION
 
     def test_classify_empty_string(self):
         """
@@ -130,55 +83,6 @@ class TestClassifySpan:
         """
         assert classify_span("...---...") == SpanType.EMPTY
 
-    def test_classify_mixed_question_declaration(self):
-        """
-        Given: Text with more questions than declarations
-        When: classify_span is called
-        Then: Returns QUESTION
-        """
-        text = "Einstein was a physicist. What did he discover? When?"
-        assert classify_span(text) == SpanType.QUESTION
-
-
-class TestIsQuestion:
-    """Tests for _is_question helper."""
-
-    def test_single_question(self):
-        assert _is_question("What is the capital of France?") is True
-
-    def test_declarative(self):
-        assert _is_question("Paris is the capital of France.") is False
-
-    def test_question_without_mark(self):
-        """Question starters without ? should still be detected."""
-        assert _is_question("Who discovered penicillin") is True
-
-    def test_question_starter_is(self):
-        assert _is_question("Is water wet") is True
-
-    def test_question_starter_can(self):
-        assert _is_question("Can you help me") is True
-
-
-class TestIsInstruction:
-    """Tests for _is_instruction helper."""
-
-    def test_imperative_write(self):
-        assert _is_instruction("Write a poem about nature.") is True
-
-    def test_imperative_generate(self):
-        assert _is_instruction("Generate a list of items.") is True
-
-    def test_imperative_with_please(self):
-        assert _is_instruction("Please explain the concept.") is True
-
-    def test_not_instruction(self):
-        assert _is_instruction("The sun rises in the east.") is False
-
-    def test_you_must(self):
-        assert _is_instruction("You must include citations.") is True
-
-
 class TestIsEmpty:
     """Tests for _is_empty helper."""
 
@@ -196,6 +100,90 @@ class TestIsEmpty:
 
     def test_punctuation_only(self):
         assert _is_empty("...") is True
+
+
+class TestSemanticSpanClassification:
+    """Tests for batched multilingual LLM classification."""
+
+    @pytest.mark.asyncio
+    async def test_classifies_multilingual_spans_from_structured_response(self):
+        spans = [
+            EvidenceSpan(
+                id="S0",
+                text="Write a report about Marie Curie.",
+                start_char=0,
+                end_char=33,
+            ),
+            EvidenceSpan(
+                id="S1",
+                text="Escribe un informe sobre Marie Curie.",
+                start_char=35,
+                end_char=72,
+            ),
+            EvidenceSpan(
+                id="S2",
+                text="Marie Curie nació en Varsovia.",
+                start_char=74,
+                end_char=105,
+            ),
+        ]
+        ai_service = SimpleNamespace(
+            generate_content=AsyncMock(
+                return_value=json.dumps(
+                    {
+                        "spans": [
+                            {"id": "S0", "span_type": "instruction"},
+                            {"id": "S1", "span_type": "instruction"},
+                            {"id": "S2", "span_type": "assertion"},
+                        ]
+                    }
+                )
+            )
+        )
+        route = SimpleNamespace(
+            call_id="evidence.classify_spans",
+            model="classifier",
+            params={"temperature": 0.1, "max_tokens": 1000},
+        )
+
+        with (
+            patch(
+                "evidence_grounding.evidence_matcher.resolve_call",
+                return_value=route,
+            ),
+            patch("evidence_grounding.evidence_matcher.config") as mock_config,
+        ):
+            mock_config.resolve_output_max_tokens.return_value = {"max_tokens": 1000}
+            classified = await classify_spans_semantically(ai_service, spans)
+
+        assert [span.span_type for span in classified] == [
+            SpanType.INSTRUCTION,
+            SpanType.INSTRUCTION,
+            SpanType.ASSERTION,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_rejects_incomplete_structured_response(self):
+        span = EvidenceSpan(id="S0", text="A fact.", start_char=0, end_char=7)
+        ai_service = SimpleNamespace(
+            generate_content=AsyncMock(return_value='{"spans": []}')
+        )
+        route = SimpleNamespace(
+            call_id="evidence.classify_spans",
+            model="classifier",
+            params={"temperature": 0.1, "max_tokens": 1000},
+        )
+
+        with (
+            patch(
+                "evidence_grounding.evidence_matcher.resolve_call",
+                return_value=route,
+            ),
+            patch("evidence_grounding.evidence_matcher.config") as mock_config,
+            pytest.raises(ValueError, match="omitted span ids"),
+        ):
+            mock_config.resolve_output_max_tokens.return_value = {"max_tokens": 1000}
+            await classify_spans_semantically(ai_service, [span])
 
 
 # =============================================================================
@@ -269,19 +257,17 @@ class TestSpanizeContext:
         assert spanize_context("") == []
         assert spanize_context("   ") == []
 
-    def test_spanize_classifies_spans(self):
+    def test_spanize_defers_semantic_classification(self):
         """
         Given: Text with different content types
         When: spanize_context is called
-        Then: Each span is classified correctly
+        Then: Non-empty spans remain provisional until the LLM batch
         """
         text = "Einstein was a physicist.\n\nWhat did he discover?\n\nPlease explain."
         spans = spanize_context(text, max_chars_per_span=650)
 
         assert len(spans) == 3
-        assert spans[0].span_type == SpanType.ASSERTION
-        assert spans[1].span_type == SpanType.QUESTION
-        assert spans[2].span_type == SpanType.INSTRUCTION
+        assert [span.span_type for span in spans] == [SpanType.ASSERTION] * 3
 
     def test_spanize_tracks_offsets(self):
         """
@@ -949,6 +935,9 @@ class TestEvidenceMatcherClass:
         """
         matcher = EvidenceMatcher()
         matcher.spanize("Fact here.\n\nWhat question?")
+        matcher.spans[1] = matcher.spans[1].model_copy(
+            update={"span_type": SpanType.QUESTION}
+        )
 
         result = matcher.format_context(mask_non_assertions=True)
 

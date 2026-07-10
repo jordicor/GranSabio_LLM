@@ -5,13 +5,15 @@ Generation and streaming API routes for Gran Sabio LLM.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import Body, HTTPException, Request
+from fastapi import Body, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+import json_utils as json
 from attachments_router import get_attachment_manager
 from auto_qa_planner import (
     apply_auto_qa_plan,
@@ -74,10 +76,17 @@ from .app_state import (
     publish_project_phase_chunk,
     publish_project_session_end,
     register_session,
+    session_exists,
     start_project_runtime,
 )
 from .cancellation import CancelMode, cancellation_registry
 from .generation import request_admission as admission_helpers
+from .generation.idempotency import (
+    GenerationIdempotencyEntry,
+    GenerationIdempotencyRegistry,
+    IdempotencyCapacityError,
+    IdempotencyConflictError,
+)
 from .generation.input_resolution import resolve_generation_inputs
 from .generation.prestart_flow import PrestartFlowDeps, run_prestart_flow
 from .generation.session_bootstrap import SessionBootstrapDeps, finalize_generation_session
@@ -405,8 +414,13 @@ async def pause_project(project_id: str, request: Request):
     return await pause_project_runtime(project_id)
 
 
-@app.post("/generate", response_model=GenerationInitResponse)
-async def generate_content(request: ContentRequest):
+generation_idempotency_registry = GenerationIdempotencyRegistry(
+    ttl_seconds=config.GENERATION_IDEMPOTENCY_TTL_SECONDS,
+    max_entries=config.GENERATION_IDEMPOTENCY_MAX_ENTRIES,
+)
+
+
+async def _generate_content_once(request: ContentRequest):
     """
     Generate content using the Gran Sabio LLM Engine
 
@@ -873,6 +887,104 @@ async def generate_content(request: ContentRequest):
     )
 
 
+def _normalize_saas_request_id(value: object) -> str | None:
+    """Validate the mechanically structured SaaS idempotency header."""
+    if not isinstance(value, str):
+        return None
+    if not value or len(value) > 128:
+        raise HTTPException(status_code=400, detail="Invalid SaaS request ID")
+    allowed_punctuation = "._:-"
+    if not all(character.isascii() and (character.isalnum() or character in allowed_punctuation) for character in value):
+        raise HTTPException(status_code=400, detail="Invalid SaaS request ID")
+    return value
+
+
+def _generation_request_fingerprint(request: ContentRequest) -> str:
+    payload = request.model_dump(mode="json")
+    serialized = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _replay_idempotent_entry(entry: GenerationIdempotencyEntry) -> GenerationInitResponse:
+    if entry.state == "completed" and entry.response_payload is not None:
+        return GenerationInitResponse.model_validate(entry.response_payload)
+    if entry.state == "error":
+        raise HTTPException(
+            status_code=entry.error_status_code or 500,
+            detail=entry.error_detail,
+            headers=entry.error_headers,
+        )
+    raise RuntimeError("Idempotency entry is not ready for replay")
+
+
+@app.post("/generate", response_model=GenerationInitResponse)
+async def generate_content(
+    request: ContentRequest,
+    saas_request_id: str | None = Header(
+        default=None,
+        alias="X-GranSabio-SaaS-Request-ID",
+    ),
+):
+    """Start a generation, deduplicating SaaS submissions by request ID."""
+    normalized_request_id = _normalize_saas_request_id(saas_request_id)
+    if normalized_request_id is None:
+        return await _generate_content_once(request)
+
+    fingerprint = _generation_request_fingerprint(request)
+    while True:
+        try:
+            claim = await generation_idempotency_registry.claim(
+                normalized_request_id,
+                fingerprint,
+            )
+        except IdempotencyConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="SaaS request ID was already used with a different generation payload",
+            ) from exc
+        except IdempotencyCapacityError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Generation idempotency registry is temporarily full",
+            ) from exc
+
+        if claim.action == "replay":
+            return _replay_idempotent_entry(claim.entry)
+        if claim.action == "wait":
+            await generation_idempotency_registry.wait(claim.entry)
+            continue
+
+        try:
+            response = await _generate_content_once(request)
+            validated_response = GenerationInitResponse.model_validate(response)
+        except HTTPException as exc:
+            await generation_idempotency_registry.fail(
+                claim.entry,
+                status_code=exc.status_code,
+                detail=exc.detail,
+                headers=exc.headers,
+            )
+            raise
+        except BaseException:
+            await generation_idempotency_registry.abort(claim.entry)
+            raise
+
+        await generation_idempotency_registry.complete(
+            claim.entry,
+            validated_response.model_dump(mode="json"),
+        )
+        return validated_response
+
+
+@app.get("/api/saas/requests/{request_id}")
+async def get_saas_generation_request(request_id: str):
+    """Return an internal reconciliation snapshot for one SaaS submission."""
+    normalized_request_id = _normalize_saas_request_id(request_id)
+    if normalized_request_id is None:
+        raise HTTPException(status_code=400, detail="Invalid SaaS request ID")
+    return await generation_idempotency_registry.lookup(normalized_request_id)
+
+
 @app.get("/status/{session_id}")
 async def get_status(session_id: str):
     """Get the current status of a content generation session"""
@@ -951,6 +1063,11 @@ async def get_result(session_id: str):
 
 
 async def _hard_stop_session_runtime(session_id: str) -> Dict[str, Any]:
+    if not await session_exists(session_id) and not await cancellation_registry.has_session_runtime(
+        session_id
+    ):
+        raise HTTPException(status_code=404, detail="Session not found")
+
     seal = await cancellation_registry.seal_session_for_hard_cancel(session_id)
     cancel_result = await cancellation_registry.request_hard_cancel(session_id)
 

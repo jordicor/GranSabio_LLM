@@ -306,25 +306,34 @@ function createActionItem(action, index) {
     item.dataset.index = index;
     item.dataset.actionId = action.id;
 
-    const isAI = action.ai_required || ['rephrase', 'improve', 'fix_grammar', 'fix_style'].includes(action.type);
-    const typeClass = getTypeClass(action.type);
+    const actionType = String(action.type || 'unknown');
+    const isAI = action.ai_required || ['rephrase', 'improve', 'fix_grammar', 'fix_style'].includes(actionType);
+    const typeClass = getTypeClass(actionType);
 
-    item.innerHTML = `
-        <button class="action-play-btn" title="Execute this action">
-            &#9654;
-        </button>
-        <div class="action-info">
-            <span class="action-type ${typeClass}">${action.type}</span>
-            <span class="action-description">${action.description || 'No description'}</span>
-        </div>
-        <span class="action-badge ${isAI ? 'ai' : 'direct'}">
-            ${isAI ? '&#129302; AI' : '&#9889; Direct'}
-        </span>
-        <span class="action-status"></span>
-    `;
+    const playBtn = document.createElement('button');
+    playBtn.className = 'action-play-btn';
+    playBtn.type = 'button';
+    playBtn.title = 'Execute this action';
+    playBtn.textContent = '\u25B6';
 
-    // Add click handler for play button
-    const playBtn = item.querySelector('.action-play-btn');
+    const info = document.createElement('div');
+    info.className = 'action-info';
+    const type = document.createElement('span');
+    type.className = `action-type ${typeClass}`;
+    type.textContent = actionType;
+    const description = document.createElement('span');
+    description.className = 'action-description';
+    description.textContent = action.description || 'No description';
+    info.append(type, description);
+
+    const badge = document.createElement('span');
+    badge.className = `action-badge ${isAI ? 'ai' : 'direct'}`;
+    badge.textContent = isAI ? 'AI' : 'Direct';
+
+    const status = document.createElement('span');
+    status.className = 'action-status';
+
+    item.append(playBtn, info, badge, status);
     playBtn.addEventListener('click', () => executeAction(index));
 
     return item;
@@ -343,7 +352,7 @@ function getTypeClass(type) {
         fix_grammar: 'ai',
         fix_style: 'ai',
     };
-    return typeMap[type.toLowerCase()] || 'replace';
+    return typeMap[String(type || '').toLowerCase()] || 'replace';
 }
 
 function updateStats(stats) {
@@ -363,13 +372,13 @@ function clearActions() {
 // ============================================
 
 async function executeAction(index) {
-    if (state.isRunning) return;
+    if (state.isRunning) return false;
 
     const action = state.actions[index];
-    if (!action) return;
+    if (!action) return false;
 
     const item = elements.actionsQueue.querySelector(`[data-index="${index}"]`);
-    if (!item) return;
+    if (!item) return false;
 
     // Update UI state
     state.isRunning = true;
@@ -396,6 +405,9 @@ async function executeAction(index) {
             }),
         });
 
+        if (!response.ok) {
+            throw new Error(`Action request failed (${response.status})`);
+        }
         const result = await response.json();
 
         if (result.success) {
@@ -422,11 +434,13 @@ async function executeAction(index) {
 
             // Update stats
             elements.statChars.textContent = state.currentText.length - state.originalText.length;
+            return true;
         } else {
             item.classList.remove('running');
             item.classList.add('failed');
             item.querySelector('.action-status').textContent = '\u2717'; // X mark
             showToast(result.error || 'Action failed', 'error');
+            return false;
         }
     } catch (error) {
         console.error('Execute error:', error);
@@ -434,6 +448,7 @@ async function executeAction(index) {
         item.classList.add('failed');
         item.querySelector('.action-status').textContent = '\u2717';
         showToast('Execution failed: ' + error.message, 'error');
+        return false;
     } finally {
         state.isRunning = false;
     }
@@ -453,22 +468,37 @@ async function handleRunAll() {
     }
 
     elements.runAllBtn.disabled = true;
+    let succeeded = 0;
+    let failed = 0;
 
-    for (let i = 0; i < state.actions.length; i++) {
-        const item = elements.actionsQueue.querySelector(`[data-index="${i}"]`);
-        if (item && !item.classList.contains('completed')) {
-            await executeAction(i);
+    try {
+        for (let i = 0; i < state.actions.length; i++) {
+            const item = elements.actionsQueue.querySelector(`[data-index="${i}"]`);
+            if (item && !item.classList.contains('completed')) {
+                const wasSuccessful = await executeAction(i);
+                if (wasSuccessful) {
+                    succeeded += 1;
+                } else {
+                    failed += 1;
+                }
 
-            // Pause between actions if enabled
-            if (state.settings.pauseBetween && i < state.actions.length - 1) {
-                await sleep(500 / state.animationSpeed);
+                // Pause between actions if enabled
+                if (state.settings.pauseBetween && i < state.actions.length - 1) {
+                    await sleep(500 / state.animationSpeed);
+                }
             }
         }
+    } finally {
+        elements.runAllBtn.disabled = false;
     }
 
-    elements.runAllBtn.disabled = false;
-    showToast('All actions completed!', 'success');
-    celebrateCompletion();
+    elements.runAllMeta.textContent = `${succeeded} completed | ${failed} failed`;
+    if (failed === 0) {
+        showToast(`All ${succeeded} actions completed!`, 'success');
+        celebrateCompletion();
+    } else {
+        showToast(`${succeeded} completed, ${failed} failed. Review the marked actions.`, 'error');
+    }
 }
 
 /**

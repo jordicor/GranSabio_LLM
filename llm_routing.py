@@ -61,6 +61,10 @@ LLM_CALL_REGISTRY: Dict[str, LLMCallSpec] = {
     "long_text.section_tools": LLMCallSpec("long_text.section_tools", description="Long Text section tool loop"),
     "long_text.semantic_eval": LLMCallSpec("long_text.semantic_eval", description="Long Text semantic evaluation"),
     "evidence.extract_claims": LLMCallSpec("evidence.extract_claims", description="Evidence claim extraction"),
+    "evidence.classify_spans": LLMCallSpec(
+        "evidence.classify_spans",
+        description="Multilingual semantic evidence-span classification",
+    ),
     "evidence.score_logprobs": LLMCallSpec(
         "evidence.score_logprobs",
         required_capabilities=("logprobs",),
@@ -130,6 +134,7 @@ DEFAULT_TEMPERATURE_BY_CALL: Dict[str, float] = {
     "preflight.validate": 0.2,
     "long_text.semantic_eval": 0.2,
     "evidence.extract_claims": 0.3,
+    "evidence.classify_spans": 0.1,
     "evidence.score_logprobs": 0.1,
     "feedback.analyze": 0.2,
     "feedback.synthesize_rules": 0.2,
@@ -405,20 +410,16 @@ def _validate_known_model(model: str, call_id: str, config_obj: Any) -> Dict[str
 
 
 def _supports_logprobs(model: str, model_info: Mapping[str, Any]) -> bool:
-    provider = _provider_key(model_info)
-    model_id = str(model_info.get("model_id") or model).lower()
-    if provider == "openai":
-        return not (
-            model_id.startswith("o1")
-            or model_id.startswith("o3")
-            or "/o1" in model_id
-            or "/o3" in model_id
-            or "gpt-5-pro" in model_id
-            or "o3-pro" in model_id
-        )
-    if provider == "xai":
-        return "non-reasoning" in model_id
-    return False
+    from model_capability_registry import model_supports
+
+    state = model_supports(
+        specs={},
+        provider=_provider_key(model_info),
+        model_id=str(model_info.get("model_id") or model),
+        capability="logprobs",
+        model_data=model_info,
+    )
+    return state.supported
 
 
 def _supports_embeddings(model: str, model_info: Mapping[str, Any]) -> bool:

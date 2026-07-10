@@ -658,7 +658,10 @@ async def resolve_images_for_generation(
 
         # 3. Load and resize if needed (fail-fast on any error)
         try:
-            image_bytes, mime_type = manager.resize_image_if_needed(resolved)
+            image_bytes, mime_type = await asyncio.to_thread(
+                manager.resize_image_if_needed,
+                resolved,
+            )
         except Exception as exc:
             raise AttachmentError(
                 f"Failed to process image {img_ref.upload_id} "
@@ -1281,6 +1284,25 @@ def _raise_if_stream_finish_unusable(
     )
 
 
+def _resolve_generation_stream_timeout(request: ContentRequest) -> float:
+    """Resolve the request-scoped stream timeout for every generation path."""
+    settings = getattr(config, "REQUEST_TIMEOUTS", {}) or {}
+    generation_timeout = resolve_request_timeout(
+        request,
+        "generation_seconds",
+        settings=settings,
+        config_path=("process_timeouts", "generation_seconds"),
+        fallback=float(getattr(config, "REQUEST_TIMEOUT", 12000) or 12000),
+    )
+    return resolve_request_timeout(
+        request,
+        "stream_seconds",
+        settings=settings,
+        config_path=("streaming", "stream_seconds"),
+        fallback=generation_timeout,
+    )
+
+
 async def _generate_full_content(
     final_prompt: str,
     request: ContentRequest,
@@ -1358,11 +1380,7 @@ async def _generate_full_content(
         ("process_timeouts", "generation_seconds"),
         float(getattr(config, "REQUEST_TIMEOUT", 12000) or 12000),
     )
-    stream_timeout = _phase_timeout(
-        "stream_seconds",
-        ("streaming", "stream_seconds"),
-        generation_timeout,
-    )
+    stream_timeout = _resolve_generation_stream_timeout(request)
     accent_audit_timeout = _phase_timeout(
         "accent_audit_seconds",
         ("process_timeouts", "accent_audit_seconds"),
@@ -4763,6 +4781,7 @@ async def process_content_generation(
     if session is None:
         logger.error(f"Session {session_id} not found - cannot process generation")
         return
+    stream_timeout = _resolve_generation_stream_timeout(request)
     console_context_tokens = bind_console_context(
         session_id=session_id,
         project_id=session.get("project_id"),

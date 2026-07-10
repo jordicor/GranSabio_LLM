@@ -12,6 +12,7 @@ Functions tested:
 - run_preflight_validation(): Main validation function
 """
 
+import json
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -27,6 +28,7 @@ from preflight_validator import (
     _normalize_qa_models,
     _parse_validator_response,
     _parse_validator_response_with_diagnostics,
+    _validate_evidence_grounding_config,
     resolve_preflight_model,
     run_preflight_validation,
 )
@@ -176,6 +178,25 @@ class TestNormalizeQaModels:
         """Given: Unknown type without model attr, Then: Converts to string."""
         result = _normalize_qa_models([123, 456])
         assert result == ["123", "456"]
+
+
+def test_evidence_grounding_uses_central_logprobs_capability_registry():
+    """Reasoning families such as o4 cannot pass preflight then fail at runtime."""
+    unsupported_request = ContentRequest(
+        prompt="Write a grounded report about the supplied source material.",
+        evidence_grounding={"enabled": True, "model": "o4-mini"},
+    )
+    supported_request = ContentRequest(
+        prompt="Write a grounded report about the supplied source material.",
+        evidence_grounding={"enabled": True, "model": "gpt-4o-mini"},
+    )
+
+    unsupported = _validate_evidence_grounding_config(unsupported_request)
+    supported = _validate_evidence_grounding_config(supported_request)
+
+    assert unsupported is not None
+    assert unsupported.code == "evidence_grounding_no_logprobs"
+    assert supported is None
 
 
 # ============================================================================
@@ -756,7 +777,7 @@ class TestRunPreflightValidation:
 
     @pytest.mark.asyncio
     async def test_word_count_analysis_parsed(self, request_with_word_count, mock_ai_service):
-        """Given: AI returns word count analysis, Then: Parsed and applied."""
+        """Given: AI returns a safe word-count conflict, Then: It is validated."""
         mock_ai_service.generate_content = AsyncMock(
             return_value='{"decision": "proceed", "summary": "OK", "user_feedback": "Approved", "word_count_analysis": {"conflicting_layers": ["Word Count Check"], "recommended_removals": ["Word Count Check"], "analysis_reason": "Redundant layer"}}'
         )
@@ -774,7 +795,77 @@ class TestRunPreflightValidation:
             assert result.word_count_analysis.recommended_removals == ["Word Count Check"]
             assert result.enable_algorithmic_word_count is True
             assert result.duplicate_word_count_layers_to_remove == ["Word Count Check"]
-            assert request_with_word_count.qa_layers == []
+            assert [layer.name for layer in request_with_word_count.qa_layers] == ["Word Count Check"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "request_updates,response_analysis",
+        [
+            (
+                {"min_words": None, "max_words": None},
+                {"conflicting_layers": ["Word Count Check"], "recommended_removals": ["Word Count Check"]},
+            ),
+            (
+                {"word_count_enforcement": {"enabled": False}},
+                {"conflicting_layers": ["Word Count Check"], "recommended_removals": ["Word Count Check"]},
+            ),
+            (
+                {},
+                {"conflicting_layers": [], "recommended_removals": ["Word Count Check"]},
+            ),
+        ],
+    )
+    async def test_word_count_removals_require_deterministic_safety_checks(
+        self,
+        request_with_word_count,
+        mock_ai_service,
+        request_updates,
+        response_analysis,
+    ):
+        """LLM recommendations alone cannot remove a QA layer."""
+        for field, value in request_updates.items():
+            setattr(request_with_word_count, field, value)
+        mock_ai_service.generate_content = AsyncMock(
+            return_value=json.dumps(
+                {
+                    "decision": "proceed",
+                    "summary": "OK",
+                    "user_feedback": "Approved",
+                    "word_count_analysis": response_analysis,
+                }
+            )
+        )
+
+        with patch("preflight_validator.config") as mock_config:
+            mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
+            result = await run_preflight_validation(
+                ai_service=mock_ai_service,
+                request=request_with_word_count,
+            )
+
+        assert result.enable_algorithmic_word_count is False
+        assert result.duplicate_word_count_layers_to_remove == []
+        assert [layer.name for layer in request_with_word_count.qa_layers] == ["Word Count Check"]
+
+    @pytest.mark.asyncio
+    async def test_word_count_removal_cannot_drop_mandatory_layer(
+        self, request_with_word_count, mock_ai_service
+    ):
+        """Mandatory QA contracts survive an LLM removal recommendation."""
+        request_with_word_count.qa_layers[0].is_mandatory = True
+        mock_ai_service.generate_content = AsyncMock(
+            return_value='{"decision":"proceed","summary":"OK","user_feedback":"Approved","word_count_analysis":{"conflicting_layers":["Word Count Check"],"recommended_removals":["Word Count Check"],"analysis_reason":"Redundant"}}'
+        )
+
+        with patch("preflight_validator.config") as mock_config:
+            mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
+            result = await run_preflight_validation(
+                ai_service=mock_ai_service,
+                request=request_with_word_count,
+            )
+
+        assert result.duplicate_word_count_layers_to_remove == []
+        assert request_with_word_count.qa_layers[0].is_mandatory is True
 
 
 # ============================================================================

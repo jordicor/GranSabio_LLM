@@ -56,6 +56,8 @@ _CAPABILITY_ALIASES = {
     "reasoning_effort": "reasoning_effort",
     "thinking": "thinking_budget",
     "thinking_budget": "thinking_budget",
+    "logprobs": "logprobs",
+    "top_logprobs": "logprobs",
     "streaming": "streaming",
     "text": "text",
 }
@@ -201,6 +203,22 @@ def _docs_rule_state(provider: str, model_id: str, capability: str) -> Capabilit
         return capability_state(provider_key != "claude" and provider_key != "gemini", source=CapabilitySource.OFFICIAL_DOCS)
     if capability == "streaming":
         return capability_state(True, source=CapabilitySource.OFFICIAL_DOCS)
+    if capability == "logprobs":
+        if provider_key == "openai":
+            unsupported_prefixes = ("o1", "o3", "o4")
+            unsupported_markers = ("gpt-5-pro",)
+            supported = not (
+                model_lower.startswith(unsupported_prefixes)
+                or any(marker in model_lower for marker in unsupported_markers)
+            )
+            return capability_state(supported, source=CapabilitySource.OFFICIAL_DOCS)
+        if provider_key == "xai":
+            return capability_state(
+                "non-reasoning" in model_lower,
+                source=CapabilitySource.OFFICIAL_DOCS,
+            )
+        if provider_key not in {"openrouter"}:
+            return capability_state(False, source=CapabilitySource.OFFICIAL_DOCS)
     if capability == "json_object":
         if provider_key in {"openai", "xai", "ollama", "moonshot"}:
             return capability_state(True, source=CapabilitySource.OFFICIAL_DOCS)
@@ -279,6 +297,12 @@ def _capability_for(
             return _openrouter_parameter_state(model_data, {"tools"}, details_name="supported_parameters")
         if capability == "tool_choice":
             return _openrouter_parameter_state(model_data, {"tool_choice"}, details_name="supported_parameters")
+        if capability == "logprobs":
+            return _openrouter_parameter_state(
+                model_data,
+                {"logprobs", "top_logprobs"},
+                details_name="supported_parameters",
+            )
 
     broad = _broad_capability_state(model_data, capability)
     docs = _docs_rule_state(provider_key, model_id, capability)
@@ -315,6 +339,7 @@ def get_model_capabilities(
         chat_completions_api=_capability_for(provider=provider, model_id=model_id, model_data=data, capability="chat_completions_api"),
         reasoning_effort=_capability_for(provider=provider, model_id=model_id, model_data=data, capability="reasoning_effort"),
         thinking_budget=_capability_for(provider=provider, model_id=model_id, model_data=data, capability="thinking_budget"),
+        logprobs=_capability_for(provider=provider, model_id=model_id, model_data=data, capability="logprobs"),
         streaming=_capability_for(provider=provider, model_id=model_id, model_data=data, capability="streaming"),
     )
 

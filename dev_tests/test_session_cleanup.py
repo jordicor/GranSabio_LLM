@@ -79,3 +79,40 @@ async def test_session_cleanup_loop_enters_idle_cadence(monkeypatch):
         (10, False),
         (60, True),
     ]
+
+
+@pytest.mark.asyncio
+async def test_session_cleanup_releases_finalized_project_reservation(monkeypatch):
+    from core import app_state
+
+    session_id = "expired-project-session"
+    project_id = "expired-project"
+    original_sessions = dict(app_state.active_sessions)
+    original_reserved = set(app_state.reserved_project_ids)
+    original_timestamps = dict(app_state._reserved_project_id_timestamps)
+    app_state.active_sessions.clear()
+    app_state.reserved_project_ids.clear()
+    app_state._reserved_project_id_timestamps.clear()
+    app_state._reserve_project_id(project_id)
+    app_state._reserved_project_id_timestamps[project_id] = app_state.time.monotonic() - 120
+    app_state.active_sessions[session_id] = {
+        "created_at": datetime.now() - timedelta(seconds=10),
+        "status": GenerationStatus.COMPLETED,
+        "project_id": project_id,
+    }
+
+    monkeypatch.setattr(app_state.config, "SESSION_TIMEOUT", 1)
+    monkeypatch.setattr(app_state.config, "VERBOSE_MAX_ENTRIES", 100)
+    monkeypatch.setattr(app_state, "active_sessions_lock", None)
+
+    try:
+        await app_state.perform_session_cleanup()
+        assert project_id not in app_state.reserved_project_ids
+        assert project_id not in app_state._reserved_project_id_timestamps
+    finally:
+        app_state.active_sessions.clear()
+        app_state.active_sessions.update(original_sessions)
+        app_state.reserved_project_ids.clear()
+        app_state.reserved_project_ids.update(original_reserved)
+        app_state._reserved_project_id_timestamps.clear()
+        app_state._reserved_project_id_timestamps.update(original_timestamps)

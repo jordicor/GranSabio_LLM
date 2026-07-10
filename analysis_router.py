@@ -9,12 +9,13 @@ Provides HTTP API endpoints for:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # Import analysis tools
 from tools.lexical_diversity_utils import (
@@ -30,6 +31,12 @@ from word_count_utils import extract_target_field
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/analysis", tags=["analysis"])
+
+MAX_ANALYSIS_TEXT_CHARACTERS = 250_000
+MAX_NGRAM_ORDER = 10
+MAX_ANALYSIS_CHARACTER_ORDERS = 2_000_000
+MAX_ANALYSIS_RESULT_ITEMS = 1_000
+MAX_ANALYSIS_WINDOW_SIZE = 50_000
 
 
 # ============================================================================
@@ -55,7 +62,12 @@ class LexicalDiversityRequest(BaseModel):
     """Request model for lexical diversity analysis endpoint"""
 
     # Input (required)
-    text: str = Field(..., description="Text to analyze", min_length=1)
+    text: str = Field(
+        ...,
+        description="Text to analyze",
+        min_length=1,
+        max_length=MAX_ANALYSIS_TEXT_CHARACTERS,
+    )
 
     # Tokenization
     tokenizer: Literal["word_punct", "alnum"] = Field(
@@ -71,7 +83,12 @@ class LexicalDiversityRequest(BaseModel):
         description="Metrics to compute: 'auto' (auto-select by length), 'all', or CSV like 'mtld,hdd,yulek'"
     )
     include_ttr: bool = Field(default=False, description="Include TTR when metrics='auto'")
-    distinct_max_n: int = Field(default=0, ge=0, description="Compute distinct-n for n=1..N (0=disabled)")
+    distinct_max_n: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_NGRAM_ORDER,
+        description="Compute distinct-n for n=1..N (0=disabled)",
+    )
 
     # Metric-specific parameters
     mtld_threshold: float = Field(default=0.72, description="MTLD factor threshold")
@@ -91,7 +108,12 @@ class LexicalDiversityRequest(BaseModel):
     deal_breaker_on_red: bool = Field(default=False, description="Treat RED grade as deal-breaker")
 
     # Top words analysis
-    top_words: int = Field(default=0, ge=0, description="Top K most frequent words (0=disabled)")
+    top_words: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_ANALYSIS_RESULT_ITEMS,
+        description="Top K most frequent words (0=disabled)",
+    )
     include_positions: bool = Field(default=False, description="Include token positions for top words")
 
     # Target field extraction
@@ -114,10 +136,30 @@ class LexicalDiversityRequest(BaseModel):
         default="tokens",
         description="Window mode: 'tokens' for sliding windows, 'paragraphs' for paragraph-based"
     )
-    window_size: int = Field(default=200, ge=50, description="Token window size (tokens mode only)")
-    window_step: int = Field(default=100, ge=10, description="Token window step (tokens mode only)")
-    window_top_k: int = Field(default=10, ge=1, description="Top words per window")
-    window_preview_chars: int = Field(default=160, ge=0, description="Preview snippet chars per window")
+    window_size: int = Field(
+        default=200,
+        ge=50,
+        le=MAX_ANALYSIS_WINDOW_SIZE,
+        description="Token window size (tokens mode only)",
+    )
+    window_step: int = Field(
+        default=100,
+        ge=10,
+        le=MAX_ANALYSIS_WINDOW_SIZE,
+        description="Token window step (tokens mode only)",
+    )
+    window_top_k: int = Field(
+        default=10,
+        ge=1,
+        le=MAX_ANALYSIS_RESULT_ITEMS,
+        description="Top words per window",
+    )
+    window_preview_chars: int = Field(
+        default=160,
+        ge=0,
+        le=10_000,
+        description="Preview snippet chars per window",
+    )
     include_window_metrics: bool = Field(default=False, description="Compute metrics per window (slower)")
     window_include_positions: bool = Field(default=False, description="Include positions for window top words")
 
@@ -137,6 +179,15 @@ class LexicalDiversityRequest(BaseModel):
         default="full",
         description="Output verbosity: 'full' includes all details, 'compact' is minimal"
     )
+
+    @model_validator(mode="after")
+    def validate_analysis_cost(self) -> "LexicalDiversityRequest":
+        """Reject parameter combinations whose work grows beyond the route budget."""
+        if len(self.text) * self.distinct_max_n > MAX_ANALYSIS_CHARACTER_ORDERS:
+            raise ValueError(
+                "text length combined with distinct_max_n exceeds the analysis cost limit"
+            )
+        return self
 
 
 class LexicalDiversityResponse(BaseModel):
@@ -160,11 +211,16 @@ class RepetitionAnalyzerRequest(BaseModel):
     """Request model for repetition analyzer endpoint"""
 
     # Input (required)
-    text: str = Field(..., description="Text to analyze", min_length=1)
+    text: str = Field(
+        ...,
+        description="Text to analyze",
+        min_length=1,
+        max_length=MAX_ANALYSIS_TEXT_CHARACTERS,
+    )
 
     # N-gram settings
-    min_n: int = Field(default=2, ge=1, description="Minimum n-gram length")
-    max_n: int = Field(default=5, ge=1, description="Maximum n-gram length")
+    min_n: int = Field(default=2, ge=1, le=MAX_NGRAM_ORDER, description="Minimum n-gram length")
+    max_n: int = Field(default=5, ge=1, le=MAX_NGRAM_ORDER, description="Maximum n-gram length")
     min_count: int = Field(default=2, ge=1, description="Report phrases with at least this frequency")
 
     # Tokenization
@@ -224,30 +280,57 @@ class RepetitionAnalyzerRequest(BaseModel):
         default="top_count",
         description="Which phrases to enrich with details"
     )
-    details_top_k: int = Field(default=50, ge=0, description="Phrases per n to enrich")
+    details_top_k: int = Field(
+        default=50,
+        ge=0,
+        le=MAX_ANALYSIS_RESULT_ITEMS,
+        description="Phrases per n to enrich",
+    )
     details_ratios: bool = Field(default=True, description="Include ratio fields in details")
     positions_preview: int = Field(
         default=10,
         ge=0,
+        le=MAX_ANALYSIS_RESULT_ITEMS,
         description="Occurrence start indices to expose"
     )
-    summary_top_k: int = Field(default=50, ge=0, description="Phrases per n in summaries")
+    summary_top_k: int = Field(
+        default=50,
+        ge=0,
+        le=MAX_ANALYSIS_RESULT_ITEMS,
+        description="Phrases per n in summaries",
+    )
     counts_only_limit_per_n: int = Field(
         default=0,
         ge=0,
+        le=10_000,
         description="Cap candidates per n before building summaries (0=unlimited)"
     )
 
     # Clustering
     enable_clusters: bool = Field(default=False, description="Enable cluster computation")
     cluster_gap_tokens: int = Field(default=50, ge=0, description="Max token gap to group occurrences")
-    clusters_top_k: int = Field(default=0, ge=0, description="Cap clusters per phrase (0=unlimited)")
+    clusters_top_k: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_ANALYSIS_RESULT_ITEMS,
+        description="Cap clusters per phrase (0=unlimited)",
+    )
     clusters_top_by: Literal["count", "density"] = Field(default="count", description="Cluster ranking key")
 
     # Dense windows
     enable_windows: bool = Field(default=False, description="Enable dense window search")
-    window_size_tokens: int = Field(default=200, ge=10, description="Sliding window size")
-    top_windows_k: int = Field(default=3, ge=0, description="Top dense windows per phrase")
+    window_size_tokens: int = Field(
+        default=200,
+        ge=10,
+        le=MAX_ANALYSIS_WINDOW_SIZE,
+        description="Sliding window size",
+    )
+    top_windows_k: int = Field(
+        default=3,
+        ge=0,
+        le=MAX_ANALYSIS_RESULT_ITEMS,
+        description="Top dense windows per phrase",
+    )
 
     # Diagnostics
     diagnostics: Literal["off", "basic", "full"] = Field(
@@ -284,8 +367,18 @@ class RepetitionAnalyzerRequest(BaseModel):
         ge=1,
         description="Max span for cluster to be considered dense"
     )
-    diag_top_k: int = Field(default=100, ge=0, description="Max violations returned")
-    diag_digest_k: int = Field(default=10, ge=0, description="Max digest entries per list")
+    diag_top_k: int = Field(
+        default=100,
+        ge=0,
+        le=MAX_ANALYSIS_RESULT_ITEMS,
+        description="Max violations returned",
+    )
+    diag_digest_k: int = Field(
+        default=10,
+        ge=0,
+        le=MAX_ANALYSIS_RESULT_ITEMS,
+        description="Max digest entries per list",
+    )
 
     # Positional bias analysis
     enable_position_metrics: bool = Field(
@@ -311,11 +404,13 @@ class RepetitionAnalyzerRequest(BaseModel):
     pos_report_top_k: int = Field(
         default=100,
         ge=0,
+        le=MAX_ANALYSIS_RESULT_ITEMS,
         description="Cap positional violations reported (0=unlimited)"
     )
     pos_candidates_top_k: int = Field(
         default=0,
         ge=0,
+        le=MAX_ANALYSIS_RESULT_ITEMS,
         description="Cap phrases per n evaluated for position (0=all)"
     )
     paragraph_break_min_blank_lines: int = Field(
@@ -344,6 +439,27 @@ class RepetitionAnalyzerRequest(BaseModel):
         default=False,
         description="Remove stop words from summaries (requires language hint)"
     )
+
+    @model_validator(mode="after")
+    def validate_analysis_cost(self) -> "RepetitionAnalyzerRequest":
+        """Keep n-gram and unbounded-detail combinations within a safe budget."""
+        if self.min_n > self.max_n:
+            raise ValueError("min_n must be less than or equal to max_n")
+
+        ngram_orders = self.max_n - self.min_n + 1
+        if len(self.text) * ngram_orders > MAX_ANALYSIS_CHARACTER_ORDERS:
+            raise ValueError(
+                "text length combined with the n-gram range exceeds the analysis cost limit"
+            )
+
+        large_text = len(self.text) > 50_000
+        if large_text and self.details == "all":
+            raise ValueError("details='all' is limited to texts of 50000 characters or fewer")
+        if large_text and self.enable_clusters and self.clusters_top_k == 0:
+            raise ValueError("clusters_top_k must be bounded for texts over 50000 characters")
+        if large_text and self.enable_position_metrics and self.pos_candidates_top_k == 0:
+            raise ValueError("pos_candidates_top_k must be bounded for texts over 50000 characters")
+        return self
 
 
 class RepetitionAnalyzerResponse(BaseModel):
@@ -456,7 +572,11 @@ async def analyze_lexical_diversity_endpoint(request: LexicalDiversityRequest) -
         )
 
         # Run analysis
-        result = analyze_text_lexical_diversity(text_to_analyze, settings)
+        result = await asyncio.to_thread(
+            analyze_text_lexical_diversity,
+            text_to_analyze,
+            settings,
+        )
 
         # Extract result
         analysis = result.analysis
@@ -573,7 +693,7 @@ async def analyze_repetition_endpoint(request: RepetitionAnalyzerRequest) -> Rep
         )
 
         # Run analysis
-        result = analyze_text(request.text, config)
+        result = await asyncio.to_thread(analyze_text, request.text, config)
 
         processing_time_ms = (time.time() - start_time) * 1000
 

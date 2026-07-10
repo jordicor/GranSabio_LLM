@@ -38,6 +38,7 @@ from .claim_extractor import ClaimExtractor, extract_claims
 from .evidence_matcher import (
     EvidenceMatcher,
     classify_span,
+    classify_spans_semantically,
     find_matching_spans,
     format_spans_for_prompt,
     match_claims_to_spans,
@@ -58,6 +59,7 @@ __all__ = [
     "EvidenceMatcher",
     "spanize_context",
     "classify_span",
+    "classify_spans_semantically",
     "match_claims_to_spans",
     "scrub_spans",
     "find_matching_spans",

@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import aiohttp
 
-from provider_capabilities import CapabilitySupport
 from model_capability_registry import (
     model_qualifies_for_inline_accent_guard,
     model_supports,
@@ -13,6 +12,7 @@ from model_capability_registry import (
     model_uses_responses_api,
     resolve_model_capability_context,
 )
+from provider_capabilities import CapabilitySupport
 from provider_errors import ProviderErrorKind, classify_provider_exception
 
 
@@ -71,6 +71,55 @@ def test_openrouter_supported_parameters_gate_structured_outputs():
         provider="openrouter",
         model_id="vendor/model",
         capability="json_schema",
+    ).support == CapabilitySupport.UNSUPPORTED
+
+
+def test_logprobs_capability_is_centralized_for_runtime_model_families():
+    specs = {"model_specifications": {}}
+
+    assert model_supports(
+        specs=specs,
+        provider="openai",
+        model_id="gpt-4o-mini",
+        capability="logprobs",
+    ).support == CapabilitySupport.SUPPORTED
+    assert model_supports(
+        specs=specs,
+        provider="openai",
+        model_id="o4-mini",
+        capability="logprobs",
+    ).support == CapabilitySupport.UNSUPPORTED
+    assert model_supports(
+        specs=specs,
+        provider="xai",
+        model_id="grok-4-fast-non-reasoning",
+        capability="logprobs",
+    ).support == CapabilitySupport.SUPPORTED
+    assert model_supports(
+        specs=specs,
+        provider="xai",
+        model_id="grok-4-fast-reasoning",
+        capability="logprobs",
+    ).support == CapabilitySupport.UNSUPPORTED
+
+
+def test_openrouter_logprobs_uses_synced_supported_parameters():
+    with_logprobs = {"supported_parameters": ["logprobs", "top_logprobs"]}
+    without_logprobs = {"supported_parameters": ["tools", "response_format"]}
+
+    assert model_supports(
+        specs={},
+        provider="openrouter",
+        model_id="vendor/with-logprobs",
+        capability="logprobs",
+        model_data=with_logprobs,
+    ).support == CapabilitySupport.SUPPORTED
+    assert model_supports(
+        specs={},
+        provider="openrouter",
+        model_id="vendor/without-logprobs",
+        capability="logprobs",
+        model_data=without_logprobs,
     ).support == CapabilitySupport.UNSUPPORTED
 
 

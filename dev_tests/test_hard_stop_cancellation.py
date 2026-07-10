@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -10,7 +11,6 @@ import core.generation_routes as generation_routes_module
 import core.streaming_routes as streaming_routes_module
 from ai_service import AIRequestError, AIService
 from config import config
-from feedback_memory import FeedbackConfig, FeedbackProcessor
 from core.app_state import (
     _store_final_result,
     active_sessions,
@@ -29,6 +29,7 @@ from core.generation_processor import (
     _generate_smart_edits,
 )
 from core.generation_routes import generate_content, pause_session, stop_session
+from feedback_memory import FeedbackConfig, FeedbackProcessor
 from models import ContentRequest, GenerationStatus, PreflightResult
 from services.project_stream import ProjectStreamManager
 from smart_edit import OperationType, SeverityLevel, TextEditRange
@@ -1236,7 +1237,7 @@ async def test_register_session_does_not_replace_terminal_cancelled_session():
 
 
 @pytest.mark.asyncio
-async def test_hard_cancel_runtime_cleans_up_after_tasks_finish():
+async def test_hard_cancel_runtime_keeps_tombstone_after_tasks_finish():
     session_id = f"test-session-{uuid4()}"
     started = asyncio.Event()
 
@@ -1255,6 +1256,10 @@ async def test_hard_cancel_runtime_cleans_up_after_tasks_finish():
         await task
     await asyncio.sleep(0)
 
+    assert await cancellation_registry.is_cancelled(session_id) is True
+    cancellation_registry._sessions[session_id].tombstone_until = (
+        datetime.utcnow() - timedelta(seconds=1)
+    )
     assert await cancellation_registry.is_cancelled(session_id) is False
 
 

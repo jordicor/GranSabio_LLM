@@ -97,6 +97,8 @@ class SmartTextEditor:
         """
         # Normalize target to TextTarget
         if isinstance(target, str):
+            if not target:
+                return None
             target = TextTarget(mode=TargetMode.EXACT, value=target)
         elif isinstance(target, tuple):
             # Position tuple - return as-is if valid
@@ -126,10 +128,62 @@ class SmartTextEditor:
 
         return None
 
+    def locate_all(
+        self,
+        content: str,
+        target: TargetSpec,
+    ) -> List[Tuple[int, int]]:
+        """Locate every selected range when occurrence=-1, otherwise one range."""
+        if isinstance(target, str):
+            if not target:
+                return []
+            normalized = TextTarget(
+                mode=TargetMode.EXACT,
+                value=target,
+                occurrence=1,
+            )
+        elif isinstance(target, tuple):
+            position = self.locate(content, target)
+            return [position] if position is not None else []
+        else:
+            normalized = target
+
+        if normalized.occurrence != -1:
+            position = self.locate(content, normalized)
+            return [position] if position is not None else []
+
+        if normalized.mode == TargetMode.EXACT:
+            search_content = content if normalized.case_sensitive else content.lower()
+            search_value = (
+                normalized.value
+                if normalized.case_sensitive
+                else normalized.value.lower()
+            )
+            positions: List[Tuple[int, int]] = []
+            start = 0
+            while True:
+                position = search_content.find(search_value, start)
+                if position < 0:
+                    break
+                end = position + len(normalized.value)
+                positions.append((position, end))
+                start = end
+            return positions
+
+        if normalized.mode == TargetMode.REGEX:
+            flags = 0 if normalized.case_sensitive else re.IGNORECASE
+            pattern = re.compile(normalized.value, flags)
+            return [(match.start(), match.end()) for match in pattern.finditer(content)]
+
+        position = self.locate(content, normalized)
+        return [position] if position is not None else []
+
     def _locate_exact(
         self, content: str, target: TextTarget
     ) -> Optional[Tuple[int, int]]:
         """Locate exact string match."""
+        if not target.value:
+            return None
         search_content = content if target.case_sensitive else content.lower()
         search_value = (
             target.value if target.case_sensitive else target.value.lower()
@@ -160,6 +214,8 @@ class SmartTextEditor:
         self, content: str, target: TextTarget
     ) -> Optional[Tuple[int, int]]:
         """Locate text matching regex pattern."""
+        if not target.value:
+            return None
         flags = 0 if target.case_sensitive else re.IGNORECASE
         pattern = re.compile(target.value, flags)
 
@@ -325,9 +381,8 @@ class SmartTextEditor:
         """
         start_time = time.perf_counter()
 
-        # Find target position
-        position = self.locate(content, target)
-        if position is None:
+        positions = self.locate_all(content, target)
+        if not positions:
             return EditResult(
                 success=False,
                 content_before=content,
@@ -336,11 +391,9 @@ class SmartTextEditor:
                 execution_time_ms=int((time.perf_counter() - start_time) * 1000),
             )
 
-        start, end = position
-        removed_text = content[start:end]
-
-        # Apply deletion
-        new_content = content[:start] + content[end:]
+        new_content = content
+        for start, end in reversed(positions):
+            new_content = new_content[:start] + new_content[end:]
 
         # Generate diff
         diff = self._generate_diff(content, new_content)
@@ -353,9 +406,10 @@ class SmartTextEditor:
                 ChangeDetail(
                     position_start=start,
                     position_end=end,
-                    removed_text=removed_text,
+                    removed_text=content[start:end],
                     inserted_text="",
                 )
+                for start, end in positions
             ],
             diff=diff,
             execution_time_ms=int((time.perf_counter() - start_time) * 1000),
@@ -386,9 +440,8 @@ class SmartTextEditor:
         """
         start_time = time.perf_counter()
 
-        # Find target position
-        position = self.locate(content, target)
-        if position is None:
+        positions = self.locate_all(content, target)
+        if not positions:
             return EditResult(
                 success=False,
                 content_before=content,
@@ -397,11 +450,13 @@ class SmartTextEditor:
                 execution_time_ms=int((time.perf_counter() - start_time) * 1000),
             )
 
-        start, end = position
-        insert_pos = start if where == "before" else end
-
-        # Apply insertion
-        new_content = content[:insert_pos] + text + content[insert_pos:]
+        insertion_positions = [
+            start if where == "before" else end
+            for start, end in positions
+        ]
+        new_content = content
+        for insert_pos in reversed(insertion_positions):
+            new_content = new_content[:insert_pos] + text + new_content[insert_pos:]
 
         # Generate diff
         diff = self._generate_diff(content, new_content)
@@ -417,6 +472,7 @@ class SmartTextEditor:
                     removed_text="",
                     inserted_text=text,
                 )
+                for insert_pos in insertion_positions
             ],
             diff=diff,
             execution_time_ms=int((time.perf_counter() - start_time) * 1000),
@@ -446,107 +502,41 @@ class SmartTextEditor:
             # result.content_after == "the dog and the dog"
         """
         start_time = time.perf_counter()
-        changes = []
 
-        # Handle simple string replacement
-        if isinstance(old, str) and count == -1:
-            # Replace all occurrences
-            new_content = content.replace(old, new)
-            if new_content == content:
-                return EditResult(
-                    success=False,
-                    content_before=content,
-                    content_after=content,
-                    errors=["Target not found in content"],
-                    execution_time_ms=int(
-                        (time.perf_counter() - start_time) * 1000
-                    ),
-                )
-
-            # Track all changes
-            pos = 0
-            temp_content = content
-            while old in temp_content:
-                idx = temp_content.find(old)
-                actual_pos = pos + idx
-                changes.append(
-                    ChangeDetail(
-                        position_start=actual_pos,
-                        position_end=actual_pos + len(old),
-                        removed_text=old,
-                        inserted_text=new,
-                    )
-                )
-                # Adjust for next search accounting for replacement length diff
-                pos = actual_pos + len(new)
-                temp_content = temp_content[idx + len(old) :]
-
-            diff = self._generate_diff(content, new_content)
-            return EditResult(
-                success=True,
-                content_before=content,
-                content_after=new_content,
-                changes=changes,
-                diff=diff,
-                execution_time_ms=int((time.perf_counter() - start_time) * 1000),
-            )
-
-        # Handle single or counted replacements
         if isinstance(old, str):
-            target = TextTarget(mode=TargetMode.EXACT, value=old)
-        elif isinstance(old, tuple):
-            target = TextTarget(mode=TargetMode.POSITION, value=old)
-        else:
-            target = old
-
-        # For counted replacements, iterate
-        new_content = content
-        replacements_made = 0
-        offset = 0
-
-        while count == -1 or replacements_made < count:
-            position = self.locate(new_content, target)
-            if position is None:
-                break
-
-            start, end = position
-            old_text = new_content[start:end]
-
-            changes.append(
-                ChangeDetail(
-                    position_start=start + offset,
-                    position_end=end + offset,
-                    removed_text=old_text,
-                    inserted_text=new,
+            if not old:
+                positions: List[Tuple[int, int]] = []
+            else:
+                target = TextTarget(
+                    mode=TargetMode.EXACT,
+                    value=old,
+                    occurrence=-1 if count == -1 else 1,
                 )
-            )
-
-            new_content = new_content[:start] + new + new_content[end:]
-            replacements_made += 1
-            offset += len(new) - len(old_text)
-
-            # POSITION mode: single replacement at fixed location, exit immediately
-            # Without this, the loop would run infinitely because locate() always
-            # returns the same valid position for POSITION mode targets
-            if isinstance(target, TextTarget) and target.mode == TargetMode.POSITION:
-                break
-
-            # For exact matches with occurrence=1, we're done after one
+                positions = self.locate_all(content, target)
+                if count >= 0:
+                    positions = positions[:count]
+        else:
+            positions = self.locate_all(content, old)
             if (
-                isinstance(target, TextTarget)
-                and target.mode == TargetMode.EXACT
-                and target.occurrence == 1
+                count >= 0
+                and isinstance(old, TextTarget)
+                and old.occurrence == -1
             ):
-                if count == -1:
-                    # Continue finding more
-                    target = TextTarget(
-                        mode=TargetMode.EXACT,
-                        value=target.value,
-                        occurrence=1,
-                        case_sensitive=target.case_sensitive,
-                    )
-                else:
-                    break
+                positions = positions[:count]
+
+        changes = [
+            ChangeDetail(
+                position_start=start,
+                position_end=end,
+                removed_text=content[start:end],
+                inserted_text=new,
+            )
+            for start, end in positions
+        ]
+
+        new_content = content
+        for start, end in reversed(positions):
+            new_content = new_content[:start] + new + new_content[end:]
 
         if not changes:
             return EditResult(
@@ -608,9 +598,8 @@ class SmartTextEditor:
                     ),
                 )
 
-        # Find target position
-        position = self.locate(content, target)
-        if position is None:
+        positions = self.locate_all(content, target)
+        if not positions:
             return EditResult(
                 success=False,
                 content_before=content,
@@ -618,9 +607,6 @@ class SmartTextEditor:
                 errors=["Target not found in content"],
                 execution_time_ms=int((time.perf_counter() - start_time) * 1000),
             )
-
-        start, end = position
-        original_text = content[start:end]
 
         # Determine markers
         markers = {
@@ -632,10 +618,11 @@ class SmartTextEditor:
         }
 
         prefix, suffix = markers[format_type]
-        formatted_text = f"{prefix}{original_text}{suffix}"
-
-        # Apply formatting
-        new_content = content[:start] + formatted_text + content[end:]
+        new_content = content
+        for start, end in reversed(positions):
+            original_text = content[start:end]
+            formatted_text = f"{prefix}{original_text}{suffix}"
+            new_content = new_content[:start] + formatted_text + new_content[end:]
 
         diff = self._generate_diff(content, new_content)
 
@@ -647,9 +634,10 @@ class SmartTextEditor:
                 ChangeDetail(
                     position_start=start,
                     position_end=end,
-                    removed_text=original_text,
-                    inserted_text=formatted_text,
+                    removed_text=content[start:end],
+                    inserted_text=f"{prefix}{content[start:end]}{suffix}",
                 )
+                for start, end in positions
             ],
             diff=diff,
             execution_time_ms=int((time.perf_counter() - start_time) * 1000),

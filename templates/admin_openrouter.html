@@ -575,74 +575,126 @@
         // Populate provider dropdown
         function populateProviderFilter() {
             const select = document.getElementById('providerFilter');
-            select.innerHTML = '<option value="">All Providers (' + providers.length + ')</option>';
+            select.replaceChildren();
+
+            const allOption = document.createElement('option');
+            allOption.value = '';
+            allOption.textContent = `All Providers (${providers.length})`;
+            select.appendChild(allOption);
+
             providers.forEach(provider => {
                 const count = allModels.filter(m => m.provider === provider).length;
-                select.innerHTML += `<option value="${provider}">${provider} (${count})</option>`;
+                const option = document.createElement('option');
+                option.value = String(provider || '');
+                option.textContent = `${provider || 'Unknown'} (${count})`;
+                select.appendChild(option);
             });
+        }
+
+        function getModelVisualState(modelKey) {
+            const isSelected = enabledModels.has(modelKey);
+            const wasInDb = originalEnabled.has(modelKey);
+
+            if (isSelected && wasInDb) {
+                return { rowClass: 'model-row in-db', badgeClass: 'enabled', badgeText: 'Enabled' };
+            }
+            if (isSelected && !wasInDb) {
+                return { rowClass: 'model-row pending', badgeClass: 'pending', badgeText: 'Pending' };
+            }
+            if (!isSelected && wasInDb) {
+                return { rowClass: 'model-row to-remove', badgeClass: 'to-remove', badgeText: 'To Remove' };
+            }
+            return { rowClass: 'model-row', badgeClass: 'none', badgeText: '-' };
+        }
+
+        function createBadge(className, text) {
+            const badge = document.createElement('span');
+            badge.className = className;
+            badge.textContent = text;
+            return badge;
+        }
+
+        function appendTextCell(row, text, className = '') {
+            const cell = document.createElement('td');
+            if (className) cell.className = className;
+            cell.textContent = text;
+            row.appendChild(cell);
+            return cell;
+        }
+
+        function formatPrice(value) {
+            const price = Number(value);
+            return Number.isFinite(price) ? `$${price.toFixed(4)}` : '-';
         }
 
         // Render models table
         function renderModels() {
             const tbody = document.getElementById('modelsTableBody');
             const filtered = getFilteredModels();
+            tbody.replaceChildren();
 
             if (filtered.length === 0) {
-                tbody.innerHTML = `
-                    <tr>
-                        <td colspan="8" class="empty-state">
-                            <p>No models match your filters</p>
-                        </td>
-                    </tr>
-                `;
+                const row = document.createElement('tr');
+                const cell = document.createElement('td');
+                const message = document.createElement('p');
+                cell.colSpan = 8;
+                cell.className = 'empty-state';
+                message.textContent = 'No models match your filters';
+                cell.appendChild(message);
+                row.appendChild(cell);
+                tbody.appendChild(row);
                 return;
             }
 
-            tbody.innerHTML = filtered.map(model => {
-                // Convert model.id to the key format used in model_specs.json
-                const modelKey = model.id;
-                const isSelected = enabledModels.has(modelKey);
-                const wasInDb = originalEnabled.has(modelKey);
+            filtered.forEach(model => {
+                const modelKey = String(model.id || '');
+                const visualState = getModelVisualState(modelKey);
+                const row = document.createElement('tr');
+                row.className = visualState.rowClass;
+                row.dataset.modelId = modelKey;
 
-                // Determine status
-                let statusBadge, rowClass;
-                if (isSelected && wasInDb) {
-                    statusBadge = '<span class="status-badge enabled">Enabled</span>';
-                    rowClass = 'model-row in-db';
-                } else if (isSelected && !wasInDb) {
-                    statusBadge = '<span class="status-badge pending">Pending</span>';
-                    rowClass = 'model-row pending';
-                } else if (!isSelected && wasInDb) {
-                    statusBadge = '<span class="status-badge to-remove">To Remove</span>';
-                    rowClass = 'model-row to-remove';
+                const checkboxCell = document.createElement('td');
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.className = 'model-checkbox';
+                checkbox.dataset.modelId = modelKey;
+                checkbox.checked = enabledModels.has(modelKey);
+                checkbox.addEventListener('change', () => toggleModel(modelKey));
+                checkboxCell.appendChild(checkbox);
+                row.appendChild(checkboxCell);
+
+                const providerCell = document.createElement('td');
+                providerCell.appendChild(createBadge('provider-badge', model.provider || 'Unknown'));
+                row.appendChild(providerCell);
+
+                const modelCell = document.createElement('td');
+                const modelName = document.createElement('div');
+                const modelId = document.createElement('div');
+                modelName.className = 'model-name';
+                modelName.textContent = model.name || modelKey;
+                modelId.className = 'model-id';
+                modelId.textContent = modelKey;
+                modelCell.append(modelName, modelId);
+                row.appendChild(modelCell);
+
+                appendTextCell(row, formatContext(model.context_length));
+                appendTextCell(row, formatPrice(model.input_price), 'price-cell');
+                appendTextCell(row, formatPrice(model.output_price), 'price-cell');
+
+                const visionCell = document.createElement('td');
+                if (model.vision) {
+                    visionCell.appendChild(createBadge('vision-badge', 'Vision'));
                 } else {
-                    statusBadge = '<span class="status-badge none">-</span>';
-                    rowClass = 'model-row';
+                    visionCell.textContent = '-';
                 }
+                row.appendChild(visionCell);
 
-                const visionBadge = model.vision ? '<span class="vision-badge">Vision</span>' : '-';
-
-                return `
-                    <tr class="${rowClass}" data-model-id="${model.id}">
-                        <td>
-                            <input type="checkbox" class="model-checkbox"
-                                   data-model-id="${model.id}"
-                                   ${isSelected ? 'checked' : ''}
-                                   onchange="toggleModel('${model.id}')">
-                        </td>
-                        <td><span class="provider-badge">${model.provider}</span></td>
-                        <td>
-                            <div class="model-name">${model.name}</div>
-                            <div class="model-id">${model.id}</div>
-                        </td>
-                        <td>${formatContext(model.context_length)}</td>
-                        <td class="price-cell">$${model.input_price.toFixed(4)}</td>
-                        <td class="price-cell">$${model.output_price.toFixed(4)}</td>
-                        <td>${visionBadge}</td>
-                        <td>${statusBadge}</td>
-                    </tr>
-                `;
-            }).join('');
+                const statusCell = document.createElement('td');
+                statusCell.className = 'model-status-cell';
+                statusCell.appendChild(createBadge(`status-badge ${visualState.badgeClass}`, visualState.badgeText));
+                row.appendChild(statusCell);
+                tbody.appendChild(row);
+            });
 
             updateSelectAllState();
         }
@@ -711,32 +763,19 @@
 
         // Update row visual state
         function updateRowState(modelId) {
-            const row = document.querySelector(`tr[data-model-id="${modelId}"]`);
+            const modelKey = String(modelId || '');
+            const row = Array.from(document.querySelectorAll('#modelsTableBody tr.model-row'))
+                .find(candidate => candidate.dataset.modelId === modelKey);
             if (!row) return;
 
-            const modelKey = modelId;
-            const isSelected = enabledModels.has(modelKey);
-            const wasInDb = originalEnabled.has(modelKey);
-
-            // Remove all state classes
-            row.classList.remove('in-db', 'pending', 'to-remove');
-
-            // Determine and apply new state
-            let statusBadge;
-            if (isSelected && wasInDb) {
-                row.classList.add('in-db');
-                statusBadge = '<span class="status-badge enabled">Enabled</span>';
-            } else if (isSelected && !wasInDb) {
-                row.classList.add('pending');
-                statusBadge = '<span class="status-badge pending">Pending</span>';
-            } else if (!isSelected && wasInDb) {
-                row.classList.add('to-remove');
-                statusBadge = '<span class="status-badge to-remove">To Remove</span>';
-            } else {
-                statusBadge = '<span class="status-badge none">-</span>';
+            const visualState = getModelVisualState(modelKey);
+            row.className = visualState.rowClass;
+            const statusCell = row.querySelector('.model-status-cell');
+            if (statusCell) {
+                statusCell.replaceChildren(
+                    createBadge(`status-badge ${visualState.badgeClass}`, visualState.badgeText)
+                );
             }
-
-            row.querySelector('td:last-child').innerHTML = statusBadge;
         }
 
         // Toggle select all visible

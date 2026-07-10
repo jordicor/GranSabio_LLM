@@ -18,6 +18,10 @@ function escapeHtml(str) {
     return div.innerHTML;
 }
 
+const SSE_MAX_ERRORS = 2;
+const SSE_FALLBACK_DELAY_MS = 8000;
+const PROGRESS_POLL_INTERVAL_MS = 3000;
+
 class GranSabioInterface {
     constructor() {
         this.currentSession = null;
@@ -26,6 +30,11 @@ class GranSabioInterface {
         this.currentScreen = 'configuration';
         this.eventSource = null;
         this.modelDefaults = {};
+        this.stopPromise = null;
+        this.sseErrorCount = 0;
+        this.sseFallbackActive = false;
+        this.sseFallbackTimer = null;
+        this.progressRequestInFlight = false;
         
         this.init();
     }
@@ -92,7 +101,7 @@ class GranSabioInterface {
         }
         
         // Stop any active generation
-        this.stopGeneration();
+        void this.stopGeneration({ silent: true });
     }
     
     showProcessingScreen() {
@@ -193,42 +202,26 @@ class GranSabioInterface {
         }
     }
     
-    stopGeneration() {
-        if (this.currentSession) {
-            this.handleStop();
+    async stopGeneration({ silent = false } = {}) {
+        if (this.stopPromise) {
+            return this.stopPromise;
         }
-        
-        // Stop streaming
-        if (this.eventSource) {
-            this.eventSource.close();
-            this.eventSource = null;
+
+        const sessionId = this.currentSession;
+        if (!sessionId) {
+            this.stopProgressTracking();
+            return false;
         }
-        
-        // Stop progress tracking
-        this.stopProgressTracking();
-        
-        // Update status
-        this.updateProcessingStatus('Stopped', 'Generation stopped by user');
+
+        this.stopPromise = this.handleStop(sessionId, { silent })
+            .finally(() => {
+                this.stopPromise = null;
+            });
+        return this.stopPromise;
     }
     
     startContentStreaming() {
-        if (!this.currentSession) return;
-        
-        this.eventSource = new EventSource(`/stream/project/${this.currentSession}`);
-        
-        this.eventSource.onmessage = (event) => {
-            try {
-                const update = JSON.parse(event.data);
-                this.handleStreamUpdate(update);
-            } catch (error) {
-                console.error('Failed to parse stream data:', error);
-            }
-        };
-        
-        this.eventSource.onerror = (error) => {
-            console.error('EventSource error:', error);
-            // Continue with polling as fallback
-        };
+        this.startEventStream();
     }
     
     handleStreamUpdate(update) {
@@ -330,10 +323,6 @@ class GranSabioInterface {
         // 5) Fin de proceso
         const normalizedStatus = this.normalizeStatus(update.status);
         if (this.isFinalStatus(normalizedStatus)) {
-            if (this.eventSource) {
-                this.eventSource.close();
-                this.eventSource = null;
-            }
             this.stopProgressTracking();
             this.handleGenerationComplete({ ...update, status: normalizedStatus });
         }
@@ -391,10 +380,6 @@ class GranSabioInterface {
     }
 
     finishStream(statusValue, reason) {
-        if (this.eventSource) {
-            this.eventSource.close();
-            this.eventSource = null;
-        }
         this.stopProgressTracking();
         this.setLoadingState(false);
 
@@ -437,13 +422,6 @@ class GranSabioInterface {
     }
     
     handleGenerationComplete(update) {
-        // Stop streaming
-        if (this.eventSource) {
-            this.eventSource.close();
-            this.eventSource = null;
-        }
-
-        // Stop progress tracking
         this.stopProgressTracking();
 
         // Reset loading state (hides Stop button)
@@ -496,7 +474,7 @@ class GranSabioInterface {
         
         // Stop generation buttons
         document.getElementById('stopGenerationBtn')?.addEventListener('click', () => {
-            this.stopGeneration();
+            void this.stopGeneration();
         });
 
         // Reset form
@@ -506,7 +484,7 @@ class GranSabioInterface {
 
         // Legacy stop button (if exists)
         document.getElementById('stopBtn')?.addEventListener('click', () => {
-            this.handleStop();
+            void this.stopGeneration();
         });
 
         // Content type change
@@ -528,11 +506,7 @@ class GranSabioInterface {
             this.toggleAutoQAOptions();
         });
 
-        // Copy content buttons
-        document.getElementById('copyContent')?.addEventListener('click', () => {
-            this.copyGeneratedContent();
-        });
-        
+        // Final result actions
         document.getElementById('copyFinalContent')?.addEventListener('click', () => {
             this.copyGeneratedContent();
         });
@@ -845,44 +819,77 @@ class GranSabioInterface {
         }
     }
 
-    async handleStop() {
-        if (!this.currentSession) {
-            this.showError('No active session to stop');
-            return;
+    async handleStop(sessionId = this.currentSession, { silent = false } = {}) {
+        if (!sessionId) {
+            if (!silent) {
+                this.showError('No active session to stop');
+            }
+            return false;
+        }
+
+        const stopBtn = document.getElementById('stopGenerationBtn');
+        if (stopBtn) {
+            stopBtn.disabled = true;
         }
 
         try {
-            const response = await fetch(`/stop/${this.currentSession}`, {
+            const response = await fetch(`/stop/${encodeURIComponent(sessionId)}`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
                 }
             });
 
-            if (response.ok) {
-                const result = await response.json();
-                if (result.stopped) {
-                    this.stopProgressTracking();
-                    this.setLoadingState(false);
-                    
-                    // Update status badge
-                    const statusBadge = document.getElementById('statusBadge');
-                    if (statusBadge) {
-                        statusBadge.textContent = 'Cancelled';
-                        statusBadge.className = 'status-badge failed';
-                    }
-                    
-                    // Show cancellation message in progress log
-                    this.addNewVerboseLogs(['Generation cancelled by user request']);
-                } else {
+            if (!response.ok) {
+                const error = await response.text();
+                throw new Error(`Stop request failed: ${error}`);
+            }
+
+            const result = await response.json();
+            const status = this.normalizeStatus(result.status);
+            const isTerminal = this.isFinalStatus(status);
+            if (!result.stopped && !isTerminal) {
+                if (!silent) {
                     this.showError(result.message || 'Could not stop session');
                 }
-            } else {
-                const error = await response.text();
-                this.showError(`Stop request failed: ${error}`);
+                return false;
             }
+
+            this.stopProgressTracking();
+            this.setLoadingState(false);
+
+            const terminalStatus = status || 'cancelled';
+            const statusText = this.formatStatus(terminalStatus);
+            this.updateProcessingStatus(
+                statusText,
+                result.message || 'Generation cancelled by user request'
+            );
+
+            const statusBadge = document.getElementById('processingStatusBadge');
+            if (statusBadge) {
+                statusBadge.className = `status-badge ${terminalStatus}`;
+            }
+
+            const waitingSection = document.getElementById('waitingSection');
+            if (waitingSection) {
+                waitingSection.style.display = 'none';
+            }
+
+            this.addNewVerboseLogs([result.message || 'Generation cancelled by user request']);
+            if (!silent) {
+                await this.showFinalResults();
+            }
+            return true;
         } catch (error) {
-            this.showError(`Network error: ${error.message}`);
+            console.error('Stop request failed:', error);
+            if (!silent) {
+                this.showError(error.message);
+            }
+            return false;
+        } finally {
+            if (stopBtn) {
+                stopBtn.disabled = false;
+            }
         }
     }
 
@@ -1010,45 +1017,55 @@ class GranSabioInterface {
     }
 
     showResults() {
-        const resultsPanel = document.getElementById('resultsPanel');
-        const finalResults = document.getElementById('finalResults');
-        
-        resultsPanel.style.display = 'block';
-        finalResults.style.display = 'none';
-        
-        // Set session ID
-        document.getElementById('sessionId').textContent = this.currentSession;
-        
-        // Scroll to results
-        resultsPanel.scrollIntoView({ behavior: 'smooth' });
+        this.showProcessingScreen();
     }
 
     startProgressTracking() {
         if (!this.currentSession) return;
 
-        // Use EventSource for real-time status updates
+        this.stopProgressTracking();
+        this.sseFallbackActive = false;
+        this.sseErrorCount = 0;
         this.startEventStream();
 
-        // Fallback polling as last resort
         this.progressInterval = setInterval(() => {
-            if (!this.eventSource || this.eventSource.readyState === EventSource.CLOSED) {
-                this.updateProgress();
+            if (this.sseFallbackActive) {
+                void this.updateProgress();
             }
-        }, 3000);
+        }, PROGRESS_POLL_INTERVAL_MS);
     }
 
     startEventStream() {
         if (!this.currentSession) return;
 
         // Cerrar stream previo si existiera
-        if (this.eventSource) {
-            this.eventSource.close();
-            this.eventSource = null;
+        this.closeEventStream();
+        if (typeof EventSource === 'undefined') {
+            this.activatePollingFallback('EventSource is not supported');
+            return;
         }
 
-        this.eventSource = new EventSource(`/stream/project/${this.currentSession}`);
+        let source;
+        try {
+            source = new EventSource(`/stream/project/${this.currentSession}`);
+        } catch (error) {
+            console.error('Failed to create EventSource:', error);
+            this.activatePollingFallback('SSE could not be initialized');
+            return;
+        }
+        this.eventSource = source;
+        this.scheduleSSEFallback('SSE connection timed out');
 
-        this.eventSource.onmessage = (event) => {
+        source.onopen = () => {
+            if (this.eventSource !== source) return;
+            this.sseErrorCount = 0;
+            this.clearSSEFallbackTimer();
+        };
+
+        source.onmessage = (event) => {
+            if (this.eventSource !== source) return;
+            this.sseErrorCount = 0;
+            this.clearSSEFallbackTimer();
             try {
                 const update = JSON.parse(event.data);
                 // Unificamos: progreso + contenido + QA + logs + cierre
@@ -1058,17 +1075,60 @@ class GranSabioInterface {
             }
         };
 
-        this.eventSource.onerror = (error) => {
+        source.onerror = (error) => {
+            if (this.eventSource !== source) return;
             console.error('EventSource error:', error);
-            // El fallback por polling ya está en startProgressTracking()
+            this.sseErrorCount += 1;
+            if (this.sseErrorCount >= SSE_MAX_ERRORS) {
+                this.activatePollingFallback('SSE repeatedly failed');
+            } else {
+                this.scheduleSSEFallback('SSE did not reconnect in time');
+            }
         };
     }
 
+    scheduleSSEFallback(reason) {
+        this.clearSSEFallbackTimer();
+        this.sseFallbackTimer = setTimeout(() => {
+            this.activatePollingFallback(reason);
+        }, SSE_FALLBACK_DELAY_MS);
+    }
+
+    clearSSEFallbackTimer() {
+        if (this.sseFallbackTimer) {
+            clearTimeout(this.sseFallbackTimer);
+            this.sseFallbackTimer = null;
+        }
+    }
+
+    closeEventStream() {
+        if (!this.eventSource) return;
+        const source = this.eventSource;
+        this.eventSource = null;
+        source.onopen = null;
+        source.onmessage = null;
+        source.onerror = null;
+        source.close();
+    }
+
+    activatePollingFallback(reason) {
+        if (this.sseFallbackActive) return;
+        this.sseFallbackActive = true;
+        this.clearSSEFallbackTimer();
+        this.closeEventStream();
+        console.warn(`${reason}; switching to status polling`);
+        void this.updateProgress();
+    }
+
     async updateProgress() {
-        if (!this.currentSession) return;
+        if (!this.currentSession || this.progressRequestInFlight) return;
+        this.progressRequestInFlight = true;
 
         try {
             const response = await fetch(`/status/${this.currentSession}`);
+            if (!response.ok) {
+                throw new Error(`Status request failed (${response.status})`);
+            }
             const status = await response.json();
 
             this.updateProgressUI(status);
@@ -1088,12 +1148,14 @@ class GranSabioInterface {
             }
         } catch (error) {
             console.error('Failed to fetch progress:', error);
+        } finally {
+            this.progressRequestInFlight = false;
         }
     }
 
     updateProgressUI(status) {
         // Update status badge
-        const statusBadge = document.getElementById('statusBadge') || document.getElementById('processingStatusBadge');
+        const statusBadge = document.getElementById('processingStatusBadge');
         if (statusBadge) {
             statusBadge.textContent = this.formatStatus(status.status);
             statusBadge.className = `status-badge ${status.status}`;
@@ -1139,7 +1201,8 @@ class GranSabioInterface {
             'gran_sabio_review': 90,
             'completed': 100,
             'rejected': 100,
-            'failed': 100
+            'failed': 100,
+            'cancelled': 100
         };
         
         let baseProgress = statusProgress[status.status] || 0;
@@ -1155,7 +1218,7 @@ class GranSabioInterface {
 
     updateProgressFromStream(update) {
         // Update status badge
-        const statusBadge = document.getElementById('statusBadge') || document.getElementById('processingStatusBadge');
+        const statusBadge = document.getElementById('processingStatusBadge');
         if (statusBadge) {
             statusBadge.textContent = this.formatStatus(update.status);
             statusBadge.className = `status-badge ${update.status}`;
@@ -1323,16 +1386,16 @@ class GranSabioInterface {
             clearInterval(this.progressInterval);
             this.progressInterval = null;
         }
-        
-        if (this.eventSource) {
-            this.eventSource.close();
-            this.eventSource = null;
-        }
+
+        this.clearSSEFallbackTimer();
+        this.closeEventStream();
+        this.sseErrorCount = 0;
+        this.sseFallbackActive = false;
     }
 
     setLoadingState(isLoading) {
         const generateBtn = document.getElementById('generateBtn') || document.getElementById('startGenerationBtn');
-        const stopBtn = document.getElementById('stopBtn') || document.getElementById('stopGenerationBtn');
+        const stopBtn = document.getElementById('stopGenerationBtn');
         
         if (!generateBtn) return; // Skip if no generation button found
         
@@ -1343,6 +1406,7 @@ class GranSabioInterface {
             generateBtn.disabled = true;
             if (stopBtn) {
                 stopBtn.style.display = 'inline-flex';
+                stopBtn.disabled = false;
             }
             if (btnText) btnText.textContent = 'Generating...';
             if (btnSpinner) btnSpinner.style.display = 'inline-block';
@@ -1362,22 +1426,39 @@ class GranSabioInterface {
     }
 
     resetForm() {
-        document.getElementById('generationForm').reset();
+        const form = document.getElementById('generationForm');
+        if (form) {
+            form.reset();
+        }
         this.stopProgressTracking();
-        document.getElementById('resultsPanel').style.display = 'none';
+        this.currentSession = null;
+        this.setLoadingState(false);
+
+        const finalResults = document.getElementById('finalResultsSection');
+        const waitingSection = document.getElementById('waitingSection');
+        const finalContent = document.getElementById('finalContentDisplay');
+        if (finalResults) finalResults.style.display = 'none';
+        if (waitingSection) waitingSection.style.display = 'block';
+        if (finalContent) finalContent.textContent = '';
+        document.querySelector('.failure-reason')?.remove();
+
         this.loadDefaultQALayers();
         this.toggleAutoQAOptions();
         
         // Reset sliders
-        document.querySelector('label[for="temperature"] + .slider-container .slider-value').textContent = '0.7';
-        document.querySelector('label[for="minGlobalScore"] + .slider-container .slider-value').textContent = '7.5';
+        const temperatureValue = document.querySelector('label[for="temperature"] + .slider-container .slider-value');
+        const scoreValue = document.querySelector('label[for="minGlobalScore"] + .slider-container .slider-value');
+        if (temperatureValue) temperatureValue.textContent = '0.7';
+        if (scoreValue) scoreValue.textContent = '7.5';
     }
 
-    copyGeneratedContent() {
-        const content = document.getElementById('generatedContent').textContent;
-        navigator.clipboard.writeText(content).then(() => {
-            // Visual feedback for successful copy
-            const copyBtn = document.getElementById('copyContent');
+    async copyGeneratedContent() {
+        const contentElement = document.getElementById('finalContentDisplay');
+        const copyBtn = document.getElementById('copyFinalContent');
+        if (!contentElement || !copyBtn) return;
+
+        try {
+            await navigator.clipboard.writeText(contentElement.textContent || '');
             const originalText = copyBtn.textContent;
             copyBtn.textContent = 'Copied!';
             copyBtn.style.background = 'var(--success-200)';
@@ -1386,9 +1467,10 @@ class GranSabioInterface {
                 copyBtn.textContent = originalText;
                 copyBtn.style.background = '';
             }, 2000);
-        }).catch(err => {
+        } catch (error) {
+            console.error('Clipboard write failed:', error);
             this.showError('Failed to copy content to clipboard');
-        });
+        }
     }
 
     async loadQAModels() {
@@ -1742,8 +1824,7 @@ class GranSabioInterface {
     }
 
     initializeDownloadButton() {
-        // Add download functionality
-        const downloadBtn = document.getElementById('downloadContent');
+        const downloadBtn = document.getElementById('downloadFinalContent');
         if (downloadBtn) {
             downloadBtn.addEventListener('click', () => {
                 this.downloadGeneratedContent();
@@ -1752,8 +1833,12 @@ class GranSabioInterface {
     }
 
     downloadGeneratedContent() {
-        const content = document.getElementById('generatedContent').textContent;
-        const contentType = document.getElementById('contentType').value;
+        const contentElement = document.getElementById('finalContentDisplay');
+        const downloadBtn = document.getElementById('downloadFinalContent');
+        if (!contentElement || !downloadBtn) return;
+
+        const content = contentElement.textContent || '';
+        const contentType = document.getElementById('contentType')?.value || 'content';
         const timestamp = new Date().toISOString().slice(0, -5).replace(/:/g, '-');
         const filename = `gransabio-${contentType}-${timestamp}.txt`;
         

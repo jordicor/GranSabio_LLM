@@ -335,13 +335,17 @@ class TestClaimExtractor:
         When: extract_claims is called
         Then: Uses evidence.extract_claims from llm_routing
         """
-        from types import SimpleNamespace
+        from llm_routing import LLMRouteResolution
 
         mock_ai_service.generate_content.return_value = '{"claims": []}'
 
         with patch(
             "evidence_grounding.claim_extractor.resolve_call",
-            return_value=SimpleNamespace(model="routed-claims-model", params={}),
+            return_value=LLMRouteResolution(
+                call_id="evidence.extract_claims",
+                model="routed-claims-model",
+                params={},
+            ),
         ):
             await extractor.extract_claims(
                 content="Content",

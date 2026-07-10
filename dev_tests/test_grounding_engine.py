@@ -7,6 +7,7 @@ verification pipeline and integrates with the QA engine.
 Tests use mocked AI responses to avoid API calls.
 """
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -117,7 +118,13 @@ class TestGroundingEngineRunCheck:
     @pytest.fixture
     def mock_ai_service(self):
         """Create a mock AI service."""
-        return MagicMock()
+        service = MagicMock()
+        service.generate_content = AsyncMock(
+            return_value=json.dumps(
+                {"spans": [{"id": "S0", "span_type": "assertion"}]}
+            )
+        )
+        return service
 
     @pytest.fixture
     def basic_config(self):

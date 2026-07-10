@@ -65,13 +65,24 @@ class SimpleRateLimiter:
             )
         bucket.append(now)
 
+    def _purge_expired_locked(self, now: float) -> int:
+        """Discard expired events and empty keys while the registry lock is held."""
+        stale: list[str] = []
+        for key, bucket in self._events.items():
+            window = self.ip_window_seconds if key.startswith("ip:") else self.window_seconds
+            cutoff = now - window
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
+            if not bucket:
+                stale.append(key)
+        for key in stale:
+            del self._events[key]
+        return len(stale)
+
     async def purge_stale_keys(self) -> int:
-        """Remove empty buckets from the events dict. Returns count of purged keys."""
+        """Remove expired events and their empty buckets. Return keys purged."""
         async with self._lock:
-            stale = [k for k, v in self._events.items() if not v]
-            for k in stale:
-                del self._events[k]
-            return len(stale)
+            return self._purge_expired_locked(monotonic())
 
     async def check(self, key: str) -> None:
         """Legacy single-key check for backwards compatibility."""
@@ -90,11 +101,9 @@ class SimpleRateLimiter:
         """
         now = monotonic()
         async with self._lock:
-            # Lazy purge: remove stale empty buckets periodically
+            # Lazy global purge keeps one-off user/IP keys from accumulating.
             if len(self._events) > 500:
-                stale = [k for k, v in self._events.items() if not v]
-                for k in stale:
-                    del self._events[k]
+                self._purge_expired_locked(now)
             # Check IP limit first (stricter, non-evadable)
             await self._check_single(f"ip:{ip_key}", self.ip_limit, self.ip_window_seconds, now)
             # Check user limit second (prevents username exhaustion)

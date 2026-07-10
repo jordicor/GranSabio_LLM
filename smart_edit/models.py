@@ -141,10 +141,30 @@ class TextTarget:
 
     def __post_init__(self):
         """Validate target configuration."""
-        if self.mode == TargetMode.POSITION:
+        if self.occurrence != -1 and self.occurrence < 1:
+            raise ValueError("occurrence must be -1 (all) or a positive integer")
+
+        if self.mode in (TargetMode.EXACT, TargetMode.REGEX):
+            if not isinstance(self.value, str) or not self.value:
+                raise ValueError(
+                    f"{self.mode.value.upper()} mode requires a non-empty string"
+                )
+        elif self.mode == TargetMode.POSITION:
             if not isinstance(self.value, (tuple, list)) or len(self.value) != 2:
                 raise ValueError(
                     "POSITION mode requires value to be (start, end) tuple"
+                )
+            start, end = self.value
+            if (
+                not isinstance(start, int)
+                or isinstance(start, bool)
+                or not isinstance(end, int)
+                or isinstance(end, bool)
+                or start < 0
+                or end < start
+            ):
+                raise ValueError(
+                    "POSITION mode requires integer offsets with 0 <= start <= end"
                 )
         elif self.mode in (TargetMode.PARAGRAPH, TargetMode.SENTENCE):
             if not isinstance(self.value, int):

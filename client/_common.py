@@ -45,16 +45,6 @@ REASONING_TIMEOUT_MAP: Dict[str, int] = {
 }
 
 # ---------------------------------------------------------------------------
-# Provider API key environment variable mapping
-# ---------------------------------------------------------------------------
-
-PROVIDER_KEY_ENV_MAP: Dict[str, Tuple[str, ...]] = {
-    "X-OpenAI-Key": ("OPENAI_API_KEY",),
-    "X-Gemini-Key": ("GOOGLE_API_KEY", "GEMINI_KEY"),
-    "X-Anthropic-Key": ("ANTHROPIC_API_KEY",),
-}
-
-# ---------------------------------------------------------------------------
 # Hardcoded fallback token limits for when /models is unreachable
 # ---------------------------------------------------------------------------
 
@@ -248,22 +238,27 @@ def compute_token_budgets(
     Returns:
         ``(max_tokens, thinking_tokens)`` where ``thinking_tokens`` may be ``None``.
     """
-    desired_max = max(int(desired_max_tokens or 0), 0) or 2048
-    desired_thinking = max(int(desired_thinking_tokens or 0), 0)
-    margin = compute_token_margin(model_limit if model_limit > 0 else desired_max)
+    def _non_negative_int(value: Any) -> int:
+        if value is None or isinstance(value, bool):
+            return 0
+        try:
+            return max(int(value), 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
 
-    if model_limit > 0:
-        max_tokens = model_limit
-    else:
-        max_tokens = max(desired_max, desired_thinking + margin)
+    desired_max = _non_negative_int(desired_max_tokens) or 2048
+    desired_thinking = _non_negative_int(desired_thinking_tokens)
+    effective_model_limit = _non_negative_int(model_limit)
+
+    max_tokens = (
+        min(desired_max, effective_model_limit)
+        if effective_model_limit > 0
+        else desired_max
+    )
+    margin = compute_token_margin(max_tokens)
 
     if desired_thinking <= 0:
         return max_tokens, None
-
-    # Ensure max_tokens can accommodate both completion and thinking requirements
-    required = desired_thinking + margin
-    if max_tokens < required:
-        max_tokens = min(model_limit, required) if model_limit > 0 else required
 
     available_gap = max_tokens - margin
     if available_gap <= 0:

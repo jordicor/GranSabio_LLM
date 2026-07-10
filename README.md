@@ -541,6 +541,8 @@ When no other validation surface is active, content is approved immediately. Per
 ```bash
 git clone https://github.com/jordicor/GranSabio_LLM.git
 cd GranSabio_LLM
+python -m pip install --upgrade "pip>=26.1.2"
+python -m pip install -r requirements.txt
 python quick_start.py
 ```
 

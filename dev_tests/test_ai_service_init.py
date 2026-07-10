@@ -61,6 +61,15 @@ def mock_config_with_keys():
     mock_cfg.MOONSHOT_API_KEY = "moonshot-test-key"
     mock_cfg.OLLAMA_HOST = None  # Disabled by default
     mock_cfg.FAKE_AI_HOST = None
+    mock_cfg.SDK_OPENAI_TIMEOUT_SECONDS = 12000
+    mock_cfg.SDK_OPENAI_SYNC_TIMEOUT_SECONDS = 12000
+    mock_cfg.SDK_ANTHROPIC_TIMEOUT_SECONDS = 12000
+    mock_cfg.SDK_XAI_TIMEOUT_SECONDS = 12000
+    mock_cfg.SDK_OPENROUTER_TIMEOUT_SECONDS = 12000
+    mock_cfg.SDK_MINIMAX_TIMEOUT_SECONDS = 12000
+    mock_cfg.SDK_MOONSHOT_TIMEOUT_SECONDS = 12000
+    mock_cfg.SDK_OLLAMA_TIMEOUT_SECONDS = 12000
+    mock_cfg.SDK_FAKE_TIMEOUT_SECONDS = 12000
     return mock_cfg
 
 
@@ -229,7 +238,7 @@ class TestOpenAIClientInit:
             )
             assert openai_call is not None
             assert openai_call[1]["api_key"] == "sk-test-openai-key"
-            assert openai_call[1]["timeout"] == 180.0
+            assert openai_call[1]["timeout"] == 12000.0
             assert openai_call[1]["max_retries"] == 3
 
     def test_openai_sync_client_initialized(self, mock_all_api_clients, mock_config_with_keys, reset_singleton):
@@ -307,7 +316,7 @@ class TestAnthropicClientInit:
             mock_all_api_clients["anthropic"].AsyncAnthropic.assert_called_once()
             call_kwargs = mock_all_api_clients["anthropic"].AsyncAnthropic.call_args[1]
             assert call_kwargs["api_key"] == "sk-ant-test-key"
-            assert call_kwargs["timeout"] == 180.0
+            assert call_kwargs["timeout"] == 12000.0
             assert call_kwargs["max_retries"] == 3
 
     def test_anthropic_client_has_beta_headers(self, mock_all_api_clients, mock_config_with_keys, reset_singleton):

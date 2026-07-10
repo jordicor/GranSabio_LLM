@@ -16,10 +16,11 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 from template_compat import enable_template_response_compat
 
+from .models import TargetMode, TextTarget
 from .operations import SmartTextEditor
 
 router = APIRouter(tags=["Smart Edit"])
@@ -36,8 +37,8 @@ templates = enable_template_response_compat(Jinja2Templates(directory="templates
 class TextTargetRequest(BaseModel):
     """Request model for text targeting."""
 
-    mode: str = Field(
-        default="exact",
+    mode: TargetMode = Field(
+        default=TargetMode.EXACT,
         description="Target mode: exact, regex, position, paragraph, sentence",
     )
     value: Any = Field(
@@ -48,6 +49,32 @@ class TextTargetRequest(BaseModel):
         description="Which occurrence to target (1=first, -1=all)",
     )
     case_sensitive: bool = Field(default=True)
+
+    @model_validator(mode="after")
+    def validate_target(self) -> "TextTargetRequest":
+        """Reject target combinations that cannot be located safely."""
+        TextTarget(
+            mode=self.mode,
+            value=tuple(self.value)
+            if self.mode == TargetMode.POSITION and isinstance(self.value, list)
+            else self.value,
+            occurrence=self.occurrence,
+            case_sensitive=self.case_sensitive,
+        )
+        return self
+
+
+def _build_text_target(target: TextTargetRequest) -> TextTarget:
+    """Convert the API target without discarding its matching semantics."""
+    value = target.value
+    if target.mode == TargetMode.POSITION and isinstance(value, list):
+        value = tuple(value)
+    return TextTarget(
+        mode=target.mode,
+        value=value,
+        occurrence=target.occurrence,
+        case_sensitive=target.case_sensitive,
+    )
 
 
 class ActionRequest(BaseModel):
@@ -465,9 +492,7 @@ async def execute_single_action(request: ExecuteRequest):
             raise ValueError(f"Unknown action type: {action.type}")
 
         # Build target
-        target = action.target.value
-        if action.target.mode == "position" and isinstance(target, list):
-            target = tuple(target)
+        target = _build_text_target(action.target)
 
         # Determine if this is an AI operation
         ai_operations = {"rephrase", "improve", "fix_grammar", "fix_style", "expand", "condense"}
@@ -588,8 +613,6 @@ async def execute_batch_actions(request: BatchExecuteRequest):
     errors_count = 0
 
     for action in request.actions:
-        action_start = time.perf_counter()
-
         # Execute single action
         exec_request = ExecuteRequest(
             text=current_text,

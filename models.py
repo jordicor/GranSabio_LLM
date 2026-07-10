@@ -559,7 +559,8 @@ class EvidenceGroundingConfig(BaseModel):
     model: Optional[str] = Field(
         default=None,
         description="[DEPRECATED] Override model for BOTH extraction and scoring. "
-                    "If None, uses evidence.extract_claims and evidence.score_logprobs from llm_routing. "
+                    "If None, uses evidence.extract_claims, evidence.classify_spans, and "
+                    "evidence.score_logprobs from llm_routing. "
                     "Only set this to force a single model for both phases."
     )
 
@@ -611,7 +612,7 @@ class EvidenceGroundingConfig(BaseModel):
         json_schema_extra = {
             "example": {
                 "enabled": True,
-                "model": None,  # Uses evidence.extract_claims and evidence.score_logprobs routing
+                "model": None,  # Uses the evidence.* routes from llm_routing
                 "filter_trivial": True,
                 "budget_gap_threshold": 0.5,
                 "on_flag": "deal_breaker",

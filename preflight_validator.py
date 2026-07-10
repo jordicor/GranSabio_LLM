@@ -22,7 +22,10 @@ from model_aliasing import ModelAliasRegistry, PromptPart
 from models import ContentRequest, PreflightIssue, PreflightResult, WordCountAnalysis
 from request_timeouts import resolve_request_timeout
 from usage_tracking import UsageTracker
-from word_count_utils import word_count_config_to_dict
+from word_count_utils import (
+    is_word_count_enforcement_enabled,
+    word_count_config_to_dict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +108,42 @@ def _evidence_grounding_enabled(request: ContentRequest) -> bool:
 def _llm_accent_guard_enabled(request: ContentRequest) -> bool:
     guard = getattr(request, "llm_accent_guard", None)
     return bool(guard and getattr(guard, "mode", "off") != "off")
+
+
+def _validated_word_count_removals(
+    request: ContentRequest,
+    conflicting_layers: List[Any],
+    recommended_removals: List[Any],
+) -> List[str]:
+    """Accept only safe, relevant QA-layer removals proposed by preflight."""
+    if not (request.min_words is not None or request.max_words is not None):
+        return []
+    if not is_word_count_enforcement_enabled(request.word_count_enforcement):
+        return []
+
+    conflict_names = {
+        str(name)
+        for name in conflicting_layers
+        if isinstance(name, str) and name
+    }
+    layers_by_name = {layer.name: layer for layer in request.qa_layers}
+    validated: List[str] = []
+
+    for raw_name in recommended_removals:
+        if not isinstance(raw_name, str) or not raw_name or raw_name in validated:
+            continue
+        layer = layers_by_name.get(raw_name)
+        if layer is None or raw_name not in conflict_names:
+            continue
+        if (
+            layer.is_mandatory
+            or layer.is_deal_breaker
+            or bool(layer.deal_breaker_criteria)
+        ):
+            continue
+        validated.append(raw_name)
+
+    return validated
 
 
 def _should_bypass_llm_preflight(
@@ -593,37 +632,23 @@ def _validate_evidence_grounding_config(request: ContentRequest) -> Optional[Pre
             related_requirements=["evidence_grounding"],
         )
 
-    provider = model_info.get("provider", "")
+    from model_capability_registry import model_supports
 
-    # OpenAI and xAI non-reasoning models expose logprobs through the runtime.
-    if provider not in {"openai", "xai"}:
+    logprobs_state = model_supports(
+        specs=config.model_specs,
+        provider=str(model_info.get("provider") or ""),
+        model_id=str(model_info.get("model_id") or eg_scoring_model),
+        capability="logprobs",
+        model_data=model_info,
+    )
+    if not logprobs_state.supported:
         return PreflightIssue(
             code="evidence_grounding_no_logprobs",
             severity="critical",
-            message=f"Evidence grounding model '{eg_scoring_model}' (provider: {provider}) does not support logprobs. "
-                    f"The selected provider does not expose the logprob verification required for evidence grounding.",
-            blockers=True,
-            related_requirements=["evidence_grounding"],
-        )
-
-    # Check for reasoning models that don't support logprobs (o1, o3)
-    model_id = model_info.get("model_id", eg_scoring_model).lower()
-    reasoning_markers = ["o1-", "o1_", "o3-", "o3_", "/o1", "/o3"]
-    is_reasoning_model = any(marker in model_id for marker in reasoning_markers)
-
-    # Also check for standalone "o1" or "o3" but not "gpt-4o" patterns
-    if not is_reasoning_model:
-        # Check for models like "o1", "o1-mini", "o3", "o3-mini" but not "gpt-4o"
-        parts = model_id.replace("-", "_").split("_")
-        if parts and parts[0] in ("o1", "o3"):
-            is_reasoning_model = True
-
-    if is_reasoning_model:
-        return PreflightIssue(
-            code="evidence_grounding_reasoning_model",
-            severity="critical",
-            message=f"Evidence grounding model '{eg_scoring_model}' is a reasoning model that does not expose logprobs. "
-                    f"Reasoning models without token logprobs cannot be used for evidence grounding verification.",
+            message=(
+                f"Evidence grounding model '{eg_scoring_model}' does not have "
+                "verified logprobs support in the central capability registry."
+            ),
             blockers=True,
             related_requirements=["evidence_grounding"],
         )
@@ -906,34 +931,33 @@ async def run_preflight_validation(
         if not isinstance(recommended_removals, list):
             recommended_removals = []
 
+        validated_removals = _validated_word_count_removals(
+            request,
+            conflicting_layers,
+            recommended_removals,
+        )
+        ignored_removals = [
+            str(name)
+            for name in recommended_removals
+            if str(name) not in validated_removals
+        ]
+        if ignored_removals:
+            logger.info(
+                "Ignored unsafe or irrelevant preflight QA-layer removals: %s",
+                ignored_removals,
+            )
+
         word_count_analysis = WordCountAnalysis(
             conflicting_layers=conflicting_layers,
-            recommended_removals=recommended_removals,
+            recommended_removals=validated_removals,
             analysis_reason=str(analysis_reason)
         )
 
-        # Remove recommended QA layers from request
-        if recommended_removals:
-            original_layers = len(request.qa_layers)
-            request.qa_layers = [
-                layer for layer in request.qa_layers
-                if layer.name not in recommended_removals
-            ]
-            removed_count = original_layers - len(request.qa_layers)
-            if removed_count > 0:
-                logger.info(f"Removed {removed_count} conflicting QA layers: {recommended_removals}")
-                auto_qa_layer_names = set(
-                    getattr(request, "_auto_qa_generated_layer_names", []) or []
-                )
-                if auto_qa_layer_names:
-                    removed_auto_qa = sorted(
-                        auto_qa_layer_names.intersection(str(name) for name in recommended_removals)
-                    )
-                    if removed_auto_qa:
-                        logger.info(
-                            "Preflight removed Auto-QA layer(s) due to word-count conflict: %s",
-                            ", ".join(removed_auto_qa),
-                        )
+        if validated_removals:
+            logger.info(
+                "Validated conflicting QA layers for downstream removal: %s",
+                validated_removals,
+            )
 
     llm_recommended_removals = (
         word_count_analysis.recommended_removals

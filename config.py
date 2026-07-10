@@ -397,12 +397,18 @@ class ImageSettings(BaseModel):
     )
     max_image_size_bytes: int = Field(
         default=5 * 1024 * 1024,  # 5 MB (Claude limit, most restrictive)
+        ge=1,
         description="Maximum size per image file in bytes"
     )
     max_dimension_pixels: int = Field(
         default=8000,
         ge=1,
         description="Maximum width or height in pixels"
+    )
+    max_image_pixels: int = Field(
+        default=40_000_000,
+        ge=1,
+        description="Maximum decoded pixel count for one image"
     )
     max_dimension_multi_image: int = Field(
         default=2000,
@@ -828,6 +834,16 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
     # Session management
     MAX_ACTIVE_SESSIONS: int = Field(default=100, description="Maximum active sessions")
     SESSION_TIMEOUT: int = Field(default=3600, description="Session timeout in seconds")
+    GENERATION_IDEMPOTENCY_TTL_SECONDS: int = Field(
+        default=86400,
+        ge=300,
+        description="Seconds to retain generation admission idempotency results",
+    )
+    GENERATION_IDEMPOTENCY_MAX_ENTRIES: int = Field(
+        default=10000,
+        ge=100,
+        description="Maximum generation admission idempotency records retained in memory",
+    )
     SESSION_CLEANUP_INTERVAL: int = Field(default=300, description="Session cleanup interval in seconds")
     SESSION_CLEANUP_IDLE_EMPTY_CHECKS: int = Field(
         default=3,
@@ -1093,6 +1109,14 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         # Session Management
         self.MAX_ACTIVE_SESSIONS = int(os.getenv("MAX_ACTIVE_SESSIONS", "100"))
         self.SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT", "3600"))
+        self.GENERATION_IDEMPOTENCY_TTL_SECONDS = max(
+            300,
+            int(os.getenv("GENERATION_IDEMPOTENCY_TTL_SECONDS", "86400")),
+        )
+        self.GENERATION_IDEMPOTENCY_MAX_ENTRIES = max(
+            100,
+            int(os.getenv("GENERATION_IDEMPOTENCY_MAX_ENTRIES", "10000")),
+        )
         self.SESSION_CLEANUP_INTERVAL = int(os.getenv("SESSION_CLEANUP_INTERVAL", os.getenv("CLEANUP_INTERVAL", "300")))
         self.SESSION_CLEANUP_IDLE_EMPTY_CHECKS = int(os.getenv("SESSION_CLEANUP_IDLE_EMPTY_CHECKS", "3"))
         self.SESSION_CLEANUP_IDLE_INTERVAL = int(os.getenv("SESSION_CLEANUP_IDLE_INTERVAL", "3600"))
@@ -2232,8 +2256,6 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         capabilities = {
             cap.lower() for cap in (model_info.get("capabilities", []) or []) if isinstance(cap, str)
         }
-        is_reasoning_model = "reasoning" in capabilities
-
         # Apply safety margin (uses spec value if present, otherwise a conservative default)
         safety_margin = self.model_specs.get("token_validation", {}).get("safety_margin", 0.95)
         safe_max_tokens = int(max_output_tokens * safety_margin)
@@ -2258,6 +2280,11 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         # Fetch model-specific reasoning / thinking metadata once
         reasoning_config = self._get_reasoning_config(model_info.get("model_id", model_name))
         thinking_details = self._get_thinking_budget_details(model_info.get("model_id", ""))
+        is_reasoning_model = (
+            "reasoning" in capabilities
+            or bool(reasoning_config and reasoning_config.get("supported"))
+            or bool(thinking_details and thinking_details.get("supported"))
+        )
         thinking_uses_named_levels = self._thinking_uses_named_levels(thinking_details)
         adaptive_effort_config = self._reasoning_uses_adaptive_effort(reasoning_config)
 

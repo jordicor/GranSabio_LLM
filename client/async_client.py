@@ -42,7 +42,6 @@ from . import (
 # Import shared utilities from _common
 from ._common import (
     POLL_RETRY_BACKOFF_SECONDS,
-    PROVIDER_KEY_ENV_MAP,
     RESULT_POLL_GRACE_SECONDS,
     RESULT_POLL_INTERVAL_SECONDS,
     STREAM_ACTIVITY_CHECK_SECONDS,
@@ -102,29 +101,18 @@ class AsyncGranSabioClient:
             base_url: API base URL (default: http://localhost:8000 or GRANSABIO_BASE_URL env)
             api_key: Optional API key (default: GRANSABIO_API_KEY env)
             timeout: Request timeout configuration
-            provider_keys: Dict of provider API key headers. If None, loaded from
-                environment variables using PROVIDER_KEY_ENV_MAP.
+            provider_keys: Optional provider API key headers. Only values passed
+                explicitly here are sent; provider credentials are never loaded
+                implicitly from the environment.
         """
         self.base_url = (base_url or os.getenv("GRANSABIO_BASE_URL", self.DEFAULT_BASE_URL)).rstrip("/")
         self.api_key = api_key or os.getenv("GRANSABIO_API_KEY")
         self.timeout = timeout or self.DEFAULT_TIMEOUT
         self._session: Optional[aiohttp.ClientSession] = None
         self._owns_session = True
-        self.provider_keys = provider_keys if provider_keys is not None else self._load_provider_keys()
+        self.provider_keys = dict(provider_keys or {})
         self._model_token_cache: Dict[str, int] = {}
         self._model_timeout_cache: Dict[str, int] = {}
-
-    @staticmethod
-    def _load_provider_keys() -> Dict[str, str]:
-        """Load provider API keys from environment variables."""
-        keys: Dict[str, str] = {}
-        for header, env_names in PROVIDER_KEY_ENV_MAP.items():
-            for env_name in env_names:
-                value = os.getenv(env_name)
-                if value:
-                    keys[header] = value
-                    break
-        return keys
 
     async def connect(self) -> None:
         """Initialize the HTTP session."""

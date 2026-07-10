@@ -117,7 +117,7 @@ class TestAsyncClientInitialization:
         """Given: No timeout, Then: Uses default ClientTimeout."""
         from client import AsyncGranSabioClient
         client = AsyncGranSabioClient()
-        assert client.timeout.total == 600
+        assert client.timeout.total == 12000
         assert client.timeout.connect == 30
 
     def test_custom_timeout(self):
@@ -212,6 +212,35 @@ class TestAsyncHeaders:
         headers = client._headers()
         assert headers["Content-Type"] == "application/json"
         assert "Authorization" not in headers
+
+    def test_provider_keys_are_not_loaded_from_environment(self):
+        """Provider secrets in the process environment must not be forwarded."""
+        from client import AsyncGranSabioClient
+
+        provider_env = {
+            "OPENAI_API_KEY": "openai-secret",
+            "GOOGLE_API_KEY": "google-secret",
+            "ANTHROPIC_API_KEY": "anthropic-secret",
+        }
+        with patch.dict(os.environ, provider_env, clear=True):
+            client = AsyncGranSabioClient(base_url="https://untrusted.example")
+
+        headers = client._headers()
+        assert client.provider_keys == {}
+        assert "X-OpenAI-Key" not in headers
+        assert "X-Gemini-Key" not in headers
+        assert "X-Anthropic-Key" not in headers
+
+    def test_explicit_provider_keys_are_preserved(self):
+        """Callers can still opt in by passing the existing explicit argument."""
+        from client import AsyncGranSabioClient
+
+        client = AsyncGranSabioClient(
+            base_url="https://trusted.example",
+            provider_keys={"X-Gemini-Key": "explicit-secret"},
+        )
+
+        assert client._headers()["X-Gemini-Key"] == "explicit-secret"
 
 
 # ==============================================================================

@@ -6,6 +6,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# These are manual/live smoke scripts: they require a running server and, in
+# some cases, real provider credentials.  Keep them directly executable, but
+# do not let their historical ``test_*.py`` names pull them into the automated
+# pytest suite.
+collect_ignore = [
+    "test_providers_quick.py",
+    "test_vision_basic.py",
+    "test_vision_multiimage.py",
+    "test_vision_preflight.py",
+    "test_vision_qa.py",
+]
+
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

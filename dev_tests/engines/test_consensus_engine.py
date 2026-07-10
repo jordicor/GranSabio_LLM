@@ -307,7 +307,8 @@ class TestCalculateConsensus:
 
         assert len(result.deal_breakers) == 1
         assert "Accuracy" in result.deal_breakers[0]
-        assert "gpt-4o" in result.deal_breakers[0]
+        assert "Evaluator" in result.deal_breakers[0]
+        assert "gpt-4o" not in result.deal_breakers[0]
 
     @pytest.mark.asyncio
     async def test_approved_when_all_criteria_met(

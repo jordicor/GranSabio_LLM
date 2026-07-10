@@ -123,7 +123,8 @@ async def list_active_connections(
 
     # Reserved ids can be useful for manual connection, but they are noisy for
     # the default active-only operator view.
-    if include_reserved:
+    if include_reserved and requested_status in {"idle", "all"}:
+        reservations_added = 0
         for pid in reserved_project_ids:
             if pid not in projects_map:
                 projects_map[pid] = {
@@ -133,6 +134,9 @@ async def list_active_connections(
                     "active_sessions": 0,
                     "last_activity": None
                 }
+                reservations_added += 1
+                if reservations_added >= limit:
+                    break
 
     terminal_statuses = {"completed", "rejected", "failed", "error", "cancelled"}
 

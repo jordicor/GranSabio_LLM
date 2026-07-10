@@ -431,7 +431,8 @@
                             <!-- Configuration Actions -->
                             <div class="config-actions">
                                 <button type="button" id="resetBtn" class="btn-secondary">Reset Configuration</button>
-                                <button type="button" id="saveConfigBtn" class="btn-tertiary">Save as Preset</button>
+                                <!-- Preset persistence is not part of the current product contract. -->
+                                <button type="button" id="saveConfigBtn" class="btn-tertiary" hidden disabled aria-hidden="true">Save as Preset</button>
                                 <button type="submit" id="startGenerationBtn" class="btn-primary btn-large">
                                     <span class="btn-text">Start Generation</span>
                                     <span class="btn-icon">→</span>
@@ -526,7 +527,8 @@
                             <div class="content-actions">
                                 <button type="button" id="copyFinalContent" class="btn-copy">Copy</button>
                                 <button type="button" id="downloadFinalContent" class="btn-download">Download</button>
-                                <button type="button" id="refineContentBtn" class="btn-secondary">Refine</button>
+                                <!-- Refinement has no defined backend workflow yet. -->
+                                <button type="button" id="refineContentBtn" class="btn-secondary" hidden disabled aria-hidden="true">Refine</button>
                             </div>
                         </div>
                         
