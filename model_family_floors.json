@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "families": {
+    "openai_direct_text_v1": {
+      "enabled": true,
+      "provider": "openai",
+      "model_prefixes": [
+        "gpt-4o",
+        "gpt-4.1",
+        "gpt-5",
+        "o1",
+        "o3",
+        "o4"
+      ],
+      "required_capabilities": [
+        "text"
+      ],
+      "excluded_model_markers": [
+        "audio",
+        "embedding",
+        "image",
+        "moderation",
+        "realtime",
+        "search",
+        "transcribe",
+        "tts"
+      ],
+      "min_total_context_tokens": 128000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "unknown",
+      "provenance": "family_floor",
+      "verified_at": "2026-07-31",
+      "expires_at": "2027-01-31",
+      "source": "https://platform.openai.com/docs/models",
+      "note": "Conservative floor for explicitly listed direct OpenAI text-generation families. Exact curated or provider-reported limits always win."
+    },
+    "anthropic_direct_text_v1": {
+      "enabled": true,
+      "provider": "anthropic",
+      "model_prefixes": [
+        "claude-3-5",
+        "claude-3-7",
+        "claude-haiku-4",
+        "claude-opus-4",
+        "claude-sonnet-4"
+      ],
+      "required_capabilities": [
+        "text"
+      ],
+      "excluded_model_markers": [
+        "audio",
+        "embedding",
+        "image",
+        "realtime",
+        "transcribe",
+        "tts"
+      ],
+      "min_total_context_tokens": 200000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "unknown",
+      "provenance": "family_floor",
+      "verified_at": "2026-07-31",
+      "expires_at": "2027-01-31",
+      "source": "https://platform.claude.com/docs/en/about-claude/models/overview",
+      "note": "Conservative floor for explicitly listed direct Claude text-generation families. Exact curated or provider-reported limits always win."
+    },
+    "google_gemini_direct_text_v1": {
+      "enabled": true,
+      "provider": "google",
+      "model_prefixes": [
+        "gemini-2",
+        "gemini-3"
+      ],
+      "required_capabilities": [
+        "text"
+      ],
+      "excluded_model_markers": [
+        "audio",
+        "embedding",
+        "image-generation",
+        "live",
+        "realtime",
+        "transcribe",
+        "tts"
+      ],
+      "min_input_tokens": 128000,
+      "output_accounting": "separate",
+      "reasoning_accounting": "unknown",
+      "provenance": "family_floor",
+      "verified_at": "2026-07-31",
+      "expires_at": "2027-01-31",
+      "source": "https://ai.google.dev/gemini-api/docs/models",
+      "note": "Conservative fallback only. The Gemini Models API inputTokenLimit and outputTokenLimit metadata has higher precedence."
+    },
+    "xai_grok_direct_text_v1": {
+      "enabled": true,
+      "provider": "xai",
+      "model_prefixes": [
+        "grok-3",
+        "grok-4"
+      ],
+      "required_capabilities": [
+        "text"
+      ],
+      "excluded_model_markers": [
+        "audio",
+        "embedding",
+        "image",
+        "realtime",
+        "transcribe",
+        "tts"
+      ],
+      "min_total_context_tokens": 131072,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "unknown",
+      "provenance": "family_floor",
+      "verified_at": "2026-07-31",
+      "expires_at": "2027-01-31",
+      "source": "https://docs.x.ai/developers/models",
+      "note": "Conservative floor for explicitly listed direct Grok text-generation families. Exact curated or provider-reported limits always win."
+    }
+  }
+}

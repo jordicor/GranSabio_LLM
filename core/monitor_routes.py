@@ -20,6 +20,11 @@ async def list_active_connections(
     """
     List all active projects and standalone sessions for the monitor UI.
 
+    Each project carries its sessions with the phase they are in, so the
+    operator sees WHERE a project is without opening a stream. The list is
+    bounded by ``limit`` (same knob that bounds the projects); ``session_count``
+    stays authoritative, so a shorter list means the project has more sessions.
+
     Returns:
         {
             "projects": [
@@ -28,6 +33,16 @@ async def list_active_connections(
                     "status": str,  # idle, running, completed, rejected, failed, cancelled
                     "session_count": int,
                     "active_sessions": int,
+                    "sessions": [
+                        {
+                            "session_id": str,
+                            "request_name": str | None,
+                            "status": str,
+                            "phase": str,
+                            "current_iteration": int,
+                            "max_iterations": int
+                        }
+                    ],
                     "last_activity": str (ISO timestamp)
                 }
             ],
@@ -76,11 +91,21 @@ async def list_active_connections(
                         "status": "idle",
                         "session_count": 0,
                         "active_sessions": 0,
+                        "sessions": [],
                         "last_activity": None
                     }
 
                 proj = projects_map[project_id]
                 proj["session_count"] += 1
+                if len(proj["sessions"]) < limit:
+                    proj["sessions"].append({
+                        "session_id": session_id,
+                        "request_name": session.get("request_name"),
+                        "status": status_str,
+                        "phase": phase,
+                        "current_iteration": session.get("current_iteration", 0),
+                        "max_iterations": session.get("max_iterations", 0),
+                    })
 
                 # Count active
                 if (
@@ -132,6 +157,7 @@ async def list_active_connections(
                     "status": "idle",
                     "session_count": 0,
                     "active_sessions": 0,
+                    "sessions": [],
                     "last_activity": None
                 }
                 reservations_added += 1

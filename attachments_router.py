@@ -19,6 +19,7 @@ from services.attachment_manager import (
     AttachmentRecord,
     AttachmentTooLargeError,
     AttachmentValidationError,
+    _env_int,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,11 @@ class SimpleRateLimiter:
     """Naive in-memory sliding window limiter for attachment ingestion.
 
     Supports dual-key rate limiting: a stricter limit per IP and a secondary
-    limit per username. This prevents both IP-based abuse and username spoofing.
+    limit per username. The global and per-IP buckets are counted before any
+    validation; the per-user bucket is only counted after the request passed
+    validation, so spoofed usernames cannot drain a victim's quota with
+    trivially invalid requests. The global bucket caps total ingestion
+    regardless of the client key.
     """
 
     def __init__(
@@ -38,6 +43,7 @@ class SimpleRateLimiter:
         window_seconds: int,
         ip_limit: Optional[int] = None,
         ip_window_seconds: Optional[int] = None,
+        global_limit: Optional[int] = None,
     ) -> None:
         # Per-username limit (legacy behavior)
         self.limit = limit
@@ -46,24 +52,42 @@ class SimpleRateLimiter:
         # Default: 2x the per-user limit to allow multiple users behind NAT
         self.ip_limit = ip_limit if ip_limit is not None else (limit * 2 if limit > 0 else 0)
         self.ip_window_seconds = ip_window_seconds if ip_window_seconds is not None else self.window_seconds
+        # Process-wide limit independent of the client key (defense in depth)
+        self.global_limit = global_limit if global_limit is not None else 0
         self._events: Dict[str, Deque[float]] = {}
         self._lock = asyncio.Lock()
 
-    async def _check_single(self, key: str, limit: int, window: int, now: float) -> None:
-        """Check rate limit for a single key. Must be called with lock held."""
-        if limit <= 0:
-            return
+    def _prune_bucket(self, key: str, window: int, now: float) -> Deque[float]:
+        """Return the bucket for a key after discarding expired events."""
         bucket = self._events.setdefault(key, deque())
         cutoff = now - window
         while bucket and bucket[0] <= cutoff:
             bucket.popleft()
+        return bucket
+
+    def _verify_single(self, key: str, limit: int, window: int, now: float) -> None:
+        """Raise 429 when the bucket is full, without recording an event."""
+        if limit <= 0:
+            return
+        bucket = self._prune_bucket(key, window, now)
         if len(bucket) >= limit:
             logger.warning("Rate limit exceeded for attachment key %s", key)
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Attachment ingestion rate limit exceeded",
             )
+
+    def _record_single(self, key: str, limit: int, window: int, now: float) -> None:
+        """Record an event in the bucket. Never raises."""
+        if limit <= 0:
+            return
+        bucket = self._prune_bucket(key, window, now)
         bucket.append(now)
+
+    async def _check_single(self, key: str, limit: int, window: int, now: float) -> None:
+        """Check rate limit for a single key. Must be called with lock held."""
+        self._verify_single(key, limit, window, now)
+        self._record_single(key, limit, window, now)
 
     def _purge_expired_locked(self, now: float) -> int:
         """Discard expired events and empty keys while the registry lock is held."""
@@ -109,6 +133,29 @@ class SimpleRateLimiter:
             # Check user limit second (prevents username exhaustion)
             await self._check_single(f"user:{user_key}", self.limit, self.window_seconds, now)
 
+    async def check_ingress(self, ip_key: str, user_key: str) -> None:
+        """Pre-validation checks for ingestion endpoints.
+
+        Counts the global and per-IP buckets and verifies the per-user bucket
+        without counting it: the user event is only recorded via count_user()
+        once the request has passed validation, so invalid requests with a
+        spoofed username cannot exhaust a victim's quota.
+        """
+        now = monotonic()
+        async with self._lock:
+            # Lazy global purge keeps one-off user/IP keys from accumulating.
+            if len(self._events) > 500:
+                self._purge_expired_locked(now)
+            await self._check_single("global:all", self.global_limit, self.window_seconds, now)
+            await self._check_single(f"ip:{ip_key}", self.ip_limit, self.ip_window_seconds, now)
+            self._verify_single(f"user:{user_key}", self.limit, self.window_seconds, now)
+
+    async def count_user(self, user_key: str) -> None:
+        """Record a validated ingestion in the per-user bucket."""
+        now = monotonic()
+        async with self._lock:
+            self._record_single(f"user:{user_key}", self.limit, self.window_seconds, now)
+
 
 def _get_rate_limit_keys(request: Request, username: Optional[str]) -> Tuple[str, str]:
     """Extract rate limit keys from request.
@@ -148,6 +195,10 @@ def get_rate_limiter() -> SimpleRateLimiter:
         _rate_limiter = SimpleRateLimiter(
             limit=settings.rate_limit_per_minute,
             window_seconds=settings.rate_limit_window_seconds,
+            global_limit=max(
+                _env_int("GRANSABIO_ATTACHMENTS_GLOBAL_RATE_LIMIT_PER_MINUTE", 300),
+                0,
+            ),
         )
     return _rate_limiter
 
@@ -187,7 +238,7 @@ async def upload_attachment(
 ) -> AttachmentUploadResponse:
     """Ingest a multipart/form-data attachment for later reuse."""
     ip_key, user_key = _get_rate_limit_keys(request, username)
-    await rate_limiter.check_dual(ip_key, user_key)
+    await rate_limiter.check_ingress(ip_key, user_key)
     try:
         record = await manager.store_upload(
             username=username,
@@ -202,6 +253,7 @@ async def upload_attachment(
         logger.exception("Unexpected error storing attachment", exc_info=exc)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unable to store attachment") from exc
 
+    await rate_limiter.count_user(user_key)
     return AttachmentUploadResponse(upload_id=record.upload_id, metadata=record)
 
 
@@ -214,7 +266,7 @@ async def upload_attachment_base64(
 ) -> AttachmentUploadResponse:
     """Ingest an attachment supplied as base64 encoded content."""
     ip_key, user_key = _get_rate_limit_keys(request, payload.username)
-    await rate_limiter.check_dual(ip_key, user_key)
+    await rate_limiter.check_ingress(ip_key, user_key)
     try:
         data = AttachmentManager.decode_base64_payload(
             payload.content_base64,
@@ -236,6 +288,7 @@ async def upload_attachment_base64(
         logger.exception("Unexpected error storing base64 attachment", exc_info=exc)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unable to store attachment") from exc
 
+    await rate_limiter.count_user(user_key)
     return AttachmentUploadResponse(upload_id=record.upload_id, metadata=record)
 
 
@@ -248,7 +301,7 @@ async def upload_attachment_url(
 ) -> AttachmentUploadResponse:
     """Download and store an attachment supplied via URL."""
     ip_key, user_key = _get_rate_limit_keys(request, payload.username)
-    await rate_limiter.check_dual(ip_key, user_key)
+    await rate_limiter.check_ingress(ip_key, user_key)
     try:
         record = await manager.store_from_url(
             username=payload.username,
@@ -263,6 +316,7 @@ async def upload_attachment_url(
         logger.exception("Unexpected error storing URL attachment", exc_info=exc)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unable to store attachment") from exc
 
+    await rate_limiter.count_user(user_key)
     return AttachmentUploadResponse(upload_id=record.upload_id, metadata=record)
 
 

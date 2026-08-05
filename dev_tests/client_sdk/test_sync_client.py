@@ -731,11 +731,11 @@ class TestAttachments:
 
     def test_upload_attachment(self, client):
         """Given: File content, Then: Uploads as multipart."""
-        with patch('client.sync_client.requests.post') as mock_post:
+        with patch('client.sync_client.requests.request') as mock_request:
             mock_response = Mock()
             mock_response.status_code = 200
             mock_response.json.return_value = {"upload_id": "att-123"}
-            mock_post.return_value = mock_response
+            mock_request.return_value = mock_response
 
             result = client.upload_attachment(
                 username="test-user",
@@ -745,17 +745,17 @@ class TestAttachments:
             )
 
             assert result["upload_id"] == "att-123"
-            mock_post.assert_called_once()
+            mock_request.assert_called_once()
 
     def test_upload_attachment_failure(self, client):
         """Given: Upload fails, Then: Raises GranSabioClientError."""
         from client import GranSabioClientError
 
-        with patch('client.sync_client.requests.post') as mock_post:
+        with patch('client.sync_client.requests.request') as mock_request:
             mock_response = Mock()
             mock_response.status_code = 400
             mock_response.text = "Invalid file"
-            mock_post.return_value = mock_response
+            mock_request.return_value = mock_response
 
             with pytest.raises(GranSabioClientError):
                 client.upload_attachment("user", b"content", "file.txt")

@@ -1,19 +1,6 @@
 const defaultProjectId = (document.body.dataset.projectId || "").trim();
 
-/**
- * Escapes HTML special characters to prevent XSS attacks.
- * @param {string} str - The string to escape
- * @returns {string} - The escaped string safe for innerHTML
- */
-function escapeHtml(str) {
-    if (str === null || str === undefined) {
-        return '';
-    }
-    const text = String(str);
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-}
+// escapeHtml / escapeHtmlAttr come from /static/js/escape_utils.js (loaded first by the template).
 
 const state = {
     sessions: [],
@@ -21,6 +8,8 @@ const state = {
     selectedSession: null,
     eventOffset: 0,
     eventLimit: 50,
+    traceOffset: 0,
+    traceLimit: 25,
     projectId: defaultProjectId,
 };
 
@@ -72,9 +61,10 @@ function renderSessions() {
     list.innerHTML = "";
     state.filteredSessions.forEach((session) => {
         const item = document.createElement("li");
+        const phaseLabel = session.phase ? ` | ${session.phase}` : "";
         const projectLabel = session.project_id ? ` | project ${session.project_id}` : "";
         const requestNameLabel = session.request_name ? ` | ${session.request_name}` : "";
-        item.textContent = `${session.session_id} | ${session.status || "unknown"}${projectLabel}${requestNameLabel}`;
+        item.textContent = `${session.session_id} | ${session.status || "unknown"}${phaseLabel}${projectLabel}${requestNameLabel}`;
         item.dataset.sessionId = session.session_id;
         if (state.selectedSession === session.session_id) {
             item.classList.add("active");
@@ -152,7 +142,7 @@ function renderGroundingPanel(grounding) {
             ${grounding.triggered_action ? `
             <div class="metric">
                 <span class="metric-label">Triggered Action</span>
-                <span class="metric-value action-${grounding.triggered_action}">${grounding.triggered_action}</span>
+                <span class="metric-value action-${escapeHtmlAttr(grounding.triggered_action)}">${escapeHtml(grounding.triggered_action)}</span>
             </div>
             ` : ''}
         </div>
@@ -194,7 +184,7 @@ function renderGroundingPanel(grounding) {
             : escapeHtml(claimText);
 
         claimsHtml += `
-            <tr class="${rowClass}" title="${escapeHtml(claimText)}">
+            <tr class="${rowClass}" title="${escapeHtmlAttr(claimText)}">
                 <td>${claim.idx}</td>
                 <td class="claim-text">${displayClaim}</td>
                 <td>${(claim.posterior_yes || 0).toFixed(3)}</td>
@@ -217,6 +207,7 @@ async function selectSession(sessionId) {
     renderSessions();
     await loadSessionDetails(sessionId);
     await loadEvents(true);
+    await loadTraces(true);
 }
 
 async function loadSessionDetails(sessionId) {
@@ -228,12 +219,14 @@ async function loadSessionDetails(sessionId) {
         const details = await response.json();
         document.getElementById("session-title").textContent = `Session ${details.session_id}`;
         const safeStatus = escapeHtml(details.status || "unknown");
+        const safePhase = escapeHtml(details.phase || "—");
         const safeCreated = escapeHtml(details.created_at || "n/a");
         const safeUpdated = escapeHtml(details.updated_at || "n/a");
         const safeProject = escapeHtml(details.project_id || "—");
         const safeRequestName = escapeHtml(details.request_name || "—");
         document.getElementById("session-summary").innerHTML = `
             <span><strong>Status:</strong> ${safeStatus}</span>
+            <span><strong>Phase:</strong> ${safePhase}</span>
             <span><strong>Created:</strong> ${safeCreated}</span>
             <span><strong>Updated:</strong> ${safeUpdated}</span>
             <span><strong>Project:</strong> ${safeProject}</span>
@@ -305,6 +298,156 @@ function renderEvents(events, reset) {
         wrapper.appendChild(header);
         wrapper.appendChild(body);
         container.appendChild(wrapper);
+    });
+}
+
+/**
+ * Builds the content-traces panel once, next to the events panel.
+ *
+ * The markup lives here instead of in the template because the panel is part
+ * of this reader and has no other consumer; it reuses the events panel styling
+ * (.event-entry rows, .hidden toggle) so both timelines look the same.
+ * @returns {{list: HTMLElement, more: HTMLElement}|null} - Panel handles
+ */
+function ensureTracesPanel() {
+    const existing = document.getElementById("traces-list");
+    if (existing) {
+        return { list: existing, more: document.getElementById("load-more-traces") };
+    }
+    const detailsPanel = document.getElementById("details-panel");
+    const eventsPanel = document.getElementById("events-panel");
+    if (!detailsPanel) {
+        return null;
+    }
+
+    const panel = document.createElement("div");
+    panel.id = "traces-panel";
+    const heading = document.createElement("h2");
+    heading.textContent = "Content Traces";
+    heading.style.marginTop = "0";
+    heading.style.fontSize = "16px";
+    const list = document.createElement("div");
+    list.id = "traces-list";
+    const more = document.createElement("button");
+    more.id = "load-more-traces";
+    more.textContent = "Load More";
+    more.className = "hidden";
+    // The stylesheet targets #load-more-events by id, so the twin button gets
+    // the same look from here rather than from a second CSS rule.
+    more.style.marginTop = "12px";
+    more.style.padding = "8px 12px";
+    more.style.border = "1px solid #2563eb";
+    more.style.backgroundColor = "#1d4ed8";
+    more.style.color = "#fff";
+    more.style.borderRadius = "4px";
+    more.addEventListener("click", () => loadTraces(false));
+
+    panel.appendChild(heading);
+    panel.appendChild(list);
+    panel.appendChild(more);
+    if (eventsPanel) {
+        panel.style.borderTop = "1px solid #1f2933";
+        panel.style.padding = "16px 20px";
+        panel.style.backgroundColor = "#0f172a";
+        panel.style.overflowY = "auto";
+        // #details-panel is a flex column with overflow hidden: without a flex
+        // basis the panel would collapse instead of sharing the leftover height.
+        panel.style.flex = "1";
+        eventsPanel.insertAdjacentElement("afterend", panel);
+    } else {
+        detailsPanel.appendChild(panel);
+    }
+    return { list, more };
+}
+
+async function loadTraces(reset = false) {
+    const panel = ensureTracesPanel();
+    if (!panel || !state.selectedSession) {
+        return;
+    }
+    if (reset) {
+        state.traceOffset = 0;
+        panel.list.innerHTML = "";
+    }
+    try {
+        const response = await fetch(
+            `/debugger/sessions/${encodeURIComponent(state.selectedSession)}/content-traces` +
+            `?offset=${state.traceOffset}&limit=${state.traceLimit}`
+        );
+        if (!response.ok) {
+            throw new Error(`Failed to load content traces (${response.status})`);
+        }
+        const data = await response.json();
+        const traces = data.traces || [];
+        renderTraces(traces, reset, panel.list);
+        if (traces.length === state.traceLimit) {
+            state.traceOffset += state.traceLimit;
+            panel.more.classList.remove("hidden");
+        } else {
+            panel.more.classList.add("hidden");
+        }
+    } catch (error) {
+        console.error(error);
+    }
+}
+
+/**
+ * Describes one trace row: what produced the text and how it ended up labelled.
+ * @param {Object} trace - One row of GET /debugger/sessions/{id}/content-traces
+ * @returns {string} - Single metadata line
+ */
+function formatTraceMeta(trace) {
+    const parts = [`phase=${trace.phase || "?"}`, `attempt=${trace.attempt}`];
+    if (trace.model) {
+        parts.push(`model=${trace.model}`);
+    }
+    if (trace.layer) {
+        parts.push(`layer=${trace.layer}`);
+    }
+    if (trace.iteration !== null && trace.iteration !== undefined) {
+        parts.push(`iteration=${trace.iteration}`);
+    }
+    if (trace.subphase) {
+        parts.push(`subphase=${trace.subphase}`);
+    }
+    parts.push(`status=${trace.content_status || "draft"}`);
+    parts.push(`chars=${trace.content_chars}`);
+    const segments = trace.segments || [];
+    if (segments.length) {
+        parts.push(`segments=${segments.length}`);
+    }
+    return parts.join(" | ");
+}
+
+function renderTraces(traces, reset, list) {
+    if (reset) {
+        list.innerHTML = "";
+    }
+    if (reset && traces.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "event-entry";
+        empty.textContent = "No content trace was persisted for this session.";
+        list.appendChild(empty);
+        return;
+    }
+    traces.forEach((trace) => {
+        const wrapper = document.createElement("div");
+        wrapper.className = "event-entry";
+
+        const header = document.createElement("header");
+        const title = document.createElement("h4");
+        title.textContent = formatTraceMeta(trace);
+        const timestamp = document.createElement("span");
+        timestamp.textContent = trace.updated_at || trace.created_at || "";
+        header.appendChild(title);
+        header.appendChild(timestamp);
+
+        const body = document.createElement("pre");
+        body.textContent = trace.content || "";
+
+        wrapper.appendChild(header);
+        wrapper.appendChild(body);
+        list.appendChild(wrapper);
     });
 }
 

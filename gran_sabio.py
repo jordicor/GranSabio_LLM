@@ -7,8 +7,11 @@ decisions when the standard QA process cannot reach consensus.
 """
 
 import asyncio
+import copy
 import logging
+import math
 import re
+import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -22,8 +25,18 @@ from ai_service import (
     GenerationStoppedUnexpectedly,
     StreamChunk,
     get_ai_service,
+    is_content_filter_stop,
 )
 from config import DEFAULT_OUTPUT_TOKEN_FALLBACK, config, get_default_models
+from content_events import (
+    ContentEvent,
+    ContentEventSink,
+    ContentEventTemplate,
+    ContentPhase,
+    ContentStatus,
+    ContentSubphase,
+)
+from context_budget import ContextAdmissionError, context_budget_error_from_overflow
 from deterministic_validation import DraftValidationResult, validate_generation_candidate
 from json_utils import dumps as json_dumps
 from llm_routing import resolve_call, resolve_temperature
@@ -214,7 +227,322 @@ def _normalize_regeneration_json_output(
     return json_dumps(validation.data, ensure_ascii=False)
 
 
+def _finalize_review_payload_for_release(
+    payload: Dict[str, Any],
+    original_request: ContentRequest,
+    *,
+    modifications_made: bool,
+    final_content: Optional[str],
+) -> Tuple[Dict[str, Any], str, Optional[str]]:
+    """Validate nested review content before callbacks or operator logs.
+
+    The GranSabio review envelope has its own JSON schema, but a model-supplied
+    ``final_content`` can itself be JSON governed by the caller's output
+    contract. Both boundaries must pass before the envelope is externally
+    visible. Irrelevant ``final_content`` is removed when no modification was
+    requested.
+    """
+
+    releasable_payload = dict(payload)
+    releasable_final_content: Optional[str] = None
+    if modifications_made:
+        releasable_final_content = final_content or ""
+        if is_json_output_requested(original_request):
+            json_options = (
+                make_loose_json_validate_options()
+                if getattr(original_request, "json_schema", None) is None
+                else None
+            )
+            releasable_final_content = _normalize_regeneration_json_output(
+                releasable_final_content,
+                original_request,
+                json_options=json_options,
+            )
+        releasable_payload["final_content"] = releasable_final_content
+    else:
+        releasable_payload["final_content"] = None
+
+    releasable_response = json_dumps(
+        releasable_payload,
+        ensure_ascii=False,
+    )
+    return (
+        releasable_payload,
+        releasable_response,
+        releasable_final_content,
+    )
+
+
+REVIEW_ATTEMPT_REJECTED_EVENT = "review_attempt_rejected"
+
+# Layer names carried by every Gran Sabio content event: they tell a subscriber
+# which of the three operations produced the chunk it is reading.
+_GRAN_SABIO_REGENERATION_LAYER = "content_regeneration"
+_GRAN_SABIO_MINORITY_REVIEW_LAYER = "deal_breakers_review"
+_GRAN_SABIO_ITERATIONS_REVIEW_LAYER = "iterations_review"
+
+
+def _gran_sabio_accepted_event(
+    content: str,
+    *,
+    model: str,
+    layer: str,
+    attempt: Optional[int],
+) -> ContentEvent:
+    """Build the canonical commit event of one Gran Sabio operation.
+
+    Accepted emissions are full snapshots, never deltas: they carry the whole
+    validated body so a consumer replaces the draft it was following instead of
+    appending the commit to it (C0.7). For that replacement to be unambiguous
+    the commit must carry the SAME ``attempt`` as the drafts it supersedes
+    (C0.2), which is why the id travels from the streamed attempt instead of
+    being left empty. ``None`` means the operation streamed no draft on this
+    sink; the consumer then labels it from the live attempt of the field.
+    """
+    return ContentEvent(
+        phase=ContentPhase.GRAN_SABIO,
+        content=content,
+        model=model,
+        layer=layer,
+        attempt=attempt,
+        subphase=ContentSubphase.ACCEPTED_STREAM,
+        content_status=ContentStatus.ACCEPTED,
+    )
+
+
+class _StreamedAttemptRecorder:
+    """Forward content events and remember the attempt its drafts carried.
+
+    The provider attempt of a Gran Sabio operation is opened deep inside the
+    streaming loops (a truncation retry or a transient-failure retry opens a new
+    one), while the canonical commit is emitted by the public method, after the
+    envelope passed its own schema and the caller's nested output contract. This
+    wrapper is what carries the id of the last streamed attempt back to that
+    commit site, so ``accepted`` replaces exactly the drafts the consumer was
+    following instead of arriving unlabelled.
+    """
+
+    __slots__ = ("_sink", "attempt")
+
+    def __init__(self, sink: Optional[ContentEventSink]) -> None:
+        self._sink = sink
+        self.attempt: Optional[int] = None
+
+    @property
+    def sink(self) -> Optional[ContentEventSink]:
+        """Return the wrapped sink, or ``None`` when there is nothing to wrap."""
+        if self._sink is None:
+            return None
+        return self._forward
+
+    async def _forward(self, event: ContentEvent) -> None:
+        if event.attempt is not None:
+            self.attempt = event.attempt
+        await self._sink(event)
+
+
+def _gran_sabio_content_filter_terminal_event(
+    template: ContentEventTemplate,
+    exc: GenerationStoppedUnexpectedly,
+) -> ContentEvent:
+    """Build the terminal ``filtered`` verdict of one Gran Sabio attempt.
+
+    Whatever the provider streamed before the policy stop went out labelled
+    ``draft``; this event closes that attempt with its honest label and reason
+    so a consumer is not left following a draft that never resolves. It carries
+    no content - the draft is never resent - and the terminal, non-retryable
+    stop keeps propagating untouched.
+    """
+    finish_reason = str(getattr(exc, "finish_reason", None) or "").strip()
+    reason = "Provider content policy stopped the Gran Sabio operation."
+    if finish_reason:
+        reason = (
+            "Provider content policy stopped the Gran Sabio operation "
+            f"(finish_reason={finish_reason})."
+        )
+    return ContentEvent(
+        phase=template.phase,
+        model=template.model,
+        layer=template.layer,
+        attempt=template.attempt,
+        content_status=ContentStatus.FILTERED,
+        reason=reason,
+        data={
+            "error_code": "content_filter",
+            "finish_reason": getattr(exc, "finish_reason", None),
+            "finish_reason_category": "content_filter",
+            "retryable": False,
+        },
+    )
+
+
+class _ReviewToolEventStream:
+    """Forward review tool-loop telemetry live, labelled by outcome (C5-bis).
+
+    There is no buffering and no redaction any more. Every tool event of a
+    Gran Sabio review reaches the consumer as it happens, tagged
+    ``content_status="draft"`` because the review envelope has not passed its
+    output contract yet; a subscriber watching a review can therefore see the
+    model call its measurement tools, reason and write, and stop it early.
+
+    Canonicity is untouched by this: only ``_finalize_review_payload_for_release``
+    decides what the review actually returns. What used to be a "commit" is now
+    only a label change - :meth:`mark_committed` records that the envelope
+    passed, and :meth:`close` announces an explicit rejection when it did not,
+    so the drafts the consumer already saw are superseded on the record instead
+    of vanishing without a trace.
+    """
+
+    __slots__ = ("_callback", "_committed", "_emitted", "_closed", "_filtered")
+
+    def __init__(
+        self,
+        callback: Optional[
+            Callable[[str, Dict[str, Any]], Awaitable[None]]
+        ],
+    ) -> None:
+        self._callback = callback
+        self._committed = False
+        self._emitted = False
+        self._closed = False
+        self._filtered = False
+
+    @property
+    def capture_callback(
+        self,
+    ) -> Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]]:
+        if self._callback is None:
+            return None
+        return self.capture
+
+    async def capture(
+        self,
+        event_type: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        """Publish one tool-loop event immediately, labelled as a draft.
+
+        Events that ARE the verdict of a dead attempt reach here already
+        labelled by the loop, so the label is preserved rather than downgraded.
+        A ``filtered`` one is also remembered: it is the terminal verdict of the
+        attempt and :meth:`close` must not contradict it.
+        """
+        if self._callback is None:
+            return
+        live_payload = copy.deepcopy(payload)
+        live_payload.setdefault("content_status", ContentStatus.DRAFT)
+        if live_payload["content_status"] == ContentStatus.FILTERED:
+            self._filtered = True
+        self._emitted = True
+        await AIService._emit_tool_event_safe(
+            self._callback,
+            event_type,
+            live_payload,
+        )
+
+    def mark_committed(self) -> None:
+        """Record that the review envelope passed its output contract."""
+        self._committed = True
+
+    def mark_filtered(self) -> None:
+        """Record a ``filtered`` verdict published on the CONTENT surface.
+
+        The tool loop labels its own content-policy stop and :meth:`capture`
+        sees it, but the streaming review publishes that verdict as a content
+        event instead, which never reaches this recorder. The streaming path
+        does emit tool telemetry of its own (the truncation retry), so without
+        this the recorder would close a filtered attempt as ``rejected``.
+        """
+        self._filtered = True
+
+    async def close(self, *, reason: Optional[str] = None) -> None:
+        """Announce an explicit rejection when no commit ever happened.
+
+        Idempotent: the review methods call this from ``finally``, which also
+        runs after a successful commit and after an early return.
+
+        An attempt the provider stopped by content policy is NOT announced as
+        rejected: ``filtered`` is a different, non-retryable verdict and it was
+        already published as the terminal event of the attempt (by the tool loop
+        through :meth:`capture`, or by the streaming path through
+        :meth:`mark_filtered`), so the drafts are superseded on the record.
+        Adding a ``rejected`` event after it would make the LAST verdict of the
+        attempt the wrong one.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if (
+            self._callback is None
+            or self._committed
+            or not self._emitted
+            or self._filtered
+        ):
+            return
+        await AIService._emit_tool_event_safe(
+            self._callback,
+            REVIEW_ATTEMPT_REJECTED_EVENT,
+            {
+                "content_status": ContentStatus.REJECTED,
+                "reason": reason or "Review envelope did not pass its contract",
+            },
+        )
+
+
 # --- Streaming Retry Helpers ---
+
+def _gran_sabio_monotonic() -> float:
+    """Return the monotonic clock used by Gran Sabio operation deadlines."""
+
+    return time.monotonic()
+
+
+def _remaining_gran_sabio_timeout(
+    deadline: float,
+    *,
+    operation: str,
+    previous_timeout: Optional[float] = None,
+) -> float:
+    """Return the operation's remaining provider-call budget.
+
+    Gran Sabio can cross several provider surfaces (tool loop, fallback,
+    streaming retry). Every surface must consume one shared process budget;
+    no retry receives a fresh request timeout.
+    """
+
+    remaining = float(deadline) - _gran_sabio_monotonic()
+    if previous_timeout is not None and remaining >= previous_timeout:
+        # Windows' monotonic clock can expose the same tick across two fast
+        # calls. Keep every issued retry budget strictly below the prior one
+        # without extending the absolute deadline.
+        remaining = math.nextafter(float(previous_timeout), 0.0)
+    if remaining <= 0:
+        raise asyncio.TimeoutError(
+            f"{operation} exceeded its process deadline"
+        )
+    return remaining
+
+
+async def _sleep_before_gran_sabio_retry(
+    delay_seconds: float,
+    *,
+    deadline: float,
+    operation: str,
+) -> None:
+    """Sleep for a transient retry only when the shared deadline permits it."""
+
+    delay = max(0.0, float(delay_seconds))
+    remaining = _remaining_gran_sabio_timeout(
+        deadline,
+        operation=operation,
+    )
+    if delay >= remaining:
+        raise asyncio.TimeoutError(
+            f"{operation} exceeded its process deadline before retry"
+        )
+    if delay:
+        await asyncio.sleep(delay)
+
 
 def _is_retryable_streaming_error(exc: Exception) -> bool:
     """Determine if a streaming error should trigger a retry."""
@@ -225,7 +553,9 @@ def _is_retryable_streaming_error(exc: Exception) -> bool:
         failure = getattr(exc, "provider_failure", None)
         if failure is not None:
             return bool(failure.retryable)
-        return True
+        # Without failure metadata do NOT assume retryable: fall through to
+        # the explicit transience signals (status/message) below so a
+        # deterministic 4xx does not burn MAX_RETRIES attempts (audit ORQ-06).
 
     status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
     if status in {408, 425, 429, 500, 502, 503, 504}:
@@ -243,6 +573,8 @@ def _is_retryable_streaming_error(exc: Exception) -> bool:
 
 def _extract_error_reason(exc: Exception) -> str:
     """Extract a human-readable error reason from an exception."""
+    if is_content_filter_stop(exc):
+        return "Provider content policy stopped generation."
     if isinstance(exc, (GenerationOutputTruncated, GenerationStoppedUnexpectedly)):
         return str(exc)
 
@@ -262,6 +594,46 @@ def _extract_error_reason(exc: Exception) -> str:
             pass
 
     return str(exc)[:200]
+
+
+def _resolve_output_truncation_retry_plan(
+    request: ContentRequest,
+    *,
+    model: str,
+    effective_max_tokens: Optional[int],
+) -> Optional[Dict[str, Any]]:
+    """Resolve one bounded retry while retaining the caller's original budget."""
+
+    adjustment = getattr(
+        request,
+        "_external_generation_min_tokens_adjustment",
+        None,
+    )
+    requested_max_tokens = (
+        adjustment.get("original_tokens")
+        if isinstance(adjustment, dict)
+        else getattr(request, "max_tokens", None)
+    )
+    plan = config.resolve_bounded_output_truncation_retry(
+        model,
+        effective_max_tokens,
+        requested_max_tokens=requested_max_tokens,
+    )
+    return plan if isinstance(plan, dict) else None
+
+
+async def _emit_output_truncation_retry(
+    callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]],
+    payload: Dict[str, Any],
+) -> None:
+    """Emit retry telemetry without making observability a generation dependency."""
+
+    if callback is None:
+        return
+    try:
+        await callback("output_truncation_retry_scheduled", payload)
+    except Exception:
+        logger.debug("Failed to emit output truncation retry telemetry", exc_info=True)
 
 
 def _extract_provider(exc: Exception) -> Optional[str]:
@@ -417,99 +789,6 @@ class GranSabioEngine:
             resolved_max_tokens = DEFAULT_OUTPUT_TOKEN_FALLBACK
         return int(resolved_max_tokens)
 
-    def _resolve_model_alias(self, model_name: str) -> str:
-        """Resolve aliases defined in model specs."""
-        aliases = config.model_specs.get("aliases", {})
-        return aliases.get(model_name, model_name)
-
-    def _ensure_adequate_model_capacity(
-        self, content_length: int, requested_model: str, original_request: Any
-    ) -> str:
-        """
-        Ensure the Gran Sabio model has adequate token capacity for the content
-
-        Args:
-            content_length: Length of content in characters
-            requested_model: Originally requested Gran Sabio model
-            original_request: Original content request for context
-
-        Returns:
-            Model name that can handle the content size
-        """
-        # Estimate tokens (rough approximation: 1 token ≈ 4 characters)
-        estimated_tokens = content_length // 4
-        # Add overhead for prompts/instructions/output
-        total_tokens_needed = int(estimated_tokens * 1.5)
-
-        try:
-            model_info = config.get_model_info(requested_model)
-        except RuntimeError as exc:
-            logger.error(
-                "Unable to resolve model '%s' for Gran Sabio capacity check: %s",
-                requested_model,
-                exc,
-            )
-            raise
-
-        model_input_capacity = model_info.get("input_tokens", 0)
-
-        logger.info(
-            "Gran Sabio capacity check: content ~%s tokens, needed ~%s, model %s capacity: %s",
-            estimated_tokens,
-            total_tokens_needed,
-            requested_model,
-            model_input_capacity,
-        )
-
-        # If model has sufficient capacity, use it
-        if model_input_capacity >= total_tokens_needed:
-            return requested_model
-
-        resolved_requested = self._resolve_model_alias(requested_model)
-        provider_preference_map = {
-            "claude": "anthropic",
-            "openai": "openai",
-            "gemini": "google",
-            "xai": "xai",
-        }
-        preferred_provider = provider_preference_map.get(model_info.get("provider"))
-
-        candidate_entries: List[Tuple[int, int, str]] = []
-        specs = config.model_specs.get("model_specifications", {})
-        for provider, models in specs.items():
-            for model_name, model_data in models.items():
-                resolved_name = model_name
-                if resolved_name == resolved_requested:
-                    continue
-                capacity = model_data.get("input_tokens", 0)
-                if capacity < total_tokens_needed:
-                    continue
-                priority = 0 if (preferred_provider and provider == preferred_provider) else 1
-                candidate_entries.append((priority, capacity, model_name))
-
-        candidate_entries.sort(key=lambda entry: (entry[0], entry[1]))
-
-        for _, capacity, candidate in candidate_entries:
-            try:
-                candidate_info = config.get_model_info(candidate)
-            except RuntimeError:
-                continue
-            if candidate_info.get("input_tokens", 0) >= total_tokens_needed:
-                logger.warning(
-                    "Gran Sabio model upgraded from %s to %s due to content size (%s tokens needed)",
-                    requested_model,
-                    candidate,
-                    total_tokens_needed,
-                )
-                return candidate
-
-        logger.error(
-            "No model found with sufficient capacity for %s tokens. Using %s and proceeding; result may fail.",
-            total_tokens_needed,
-            requested_model,
-        )
-        return requested_model
-
     # ============================
     # Minority Deal-Breakers Review
     # ============================
@@ -519,7 +798,7 @@ class GranSabioEngine:
         content: str,
         minority_deal_breakers: Dict[str, Any],
         original_request: ContentRequest,
-        stream_callback: Optional[callable] = None,
+        stream_callback: Optional[ContentEventSink] = None,
         cancel_callback: CancelCallback = None,
         usage_tracker: Optional[UsageTracker] = None,
         phase_logger: Optional["PhaseLogger"] = None,
@@ -529,10 +808,17 @@ class GranSabioEngine:
         """
         Review content when a MINORITY of QA evaluators flagged deal-breakers.
         Provide a decision ensuring the flags align with configured QA criteria.
+
+        ``stream_callback`` receives labelled content events: one draft per
+        provider chunk while the review is being written, and a single
+        ``accepted`` snapshot once the envelope has passed its schema and the
+        caller's nested output contract.
         """
         separator = "=" * 80
         count = len(minority_deal_breakers.get("details", []))
         total = minority_deal_breakers.get("total_evaluations", 0)
+        attempt_recorder = _StreamedAttemptRecorder(stream_callback)
+        stream_callback = attempt_recorder.sink
 
         if phase_logger:
             phase_logger.info(f"Reviewing minority deal-breakers ({count}/{total})")
@@ -612,21 +898,25 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
 }}
 """.strip()
 
+        review_tool_events = _ReviewToolEventStream(
+            tool_event_callback
+            if tool_event_callback is not None
+            else self._tool_event_callback
+        )
         try:
             model, reasoning_effort, thinking_tokens, temperature = self._get_default_critical_analysis_model(
                 original_request.gran_sabio_model,
                 original_request,
                 "gransabio.escalation",
             )
-            adequate_model = self._ensure_adequate_model_capacity(len(content), model, original_request)
             decision_max_tokens = self._resolve_gran_sabio_max_tokens(
                 request=original_request,
-                model=adequate_model,
+                model=model,
                 call_id="gransabio.escalation",
             )
             logger.info(
                 "Gran Sabio using %s with reasoning_effort=%s for minority deal-breaker check",
-                adequate_model, reasoning_effort
+                model, reasoning_effort
             )
 
             usage_callback = (
@@ -646,7 +936,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
             # Log prompt if phase_logger available
             if phase_logger:
                 phase_logger.log_prompt(
-                    model=adequate_model,
+                    model=model,
                     system_prompt=None,
                     user_prompt=prompt,
                     temperature=temperature,
@@ -660,7 +950,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
             payload, response_content = await self._invoke_gran_sabio_llm(
                 request=original_request,
                 prompt=prompt,
-                model=adequate_model,
+                model=model,
                 reasoning_effort=reasoning_effort,
                 thinking_tokens=thinking_tokens,
                 temperature=temperature,
@@ -677,26 +967,24 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 cancel_callback=cancel_callback,
                 abort_stage="minority_review_stream",
                 max_tokens=decision_max_tokens,
-                tool_event_callback=tool_event_callback,
+                review_tool_events=review_tool_events,
                 cancellation_token=cancellation_token,
             )
             await _abort_if_cancelled("minority_review_after_generation")
 
-            # Log full Gran Sabio response
-            if phase_logger:
-                phase_logger.log_response(
-                    model=adequate_model,
-                    response=response_content
-                )
-            elif getattr(original_request, "extra_verbose", False):
-                logger.info(f"\n{separator}")
-                logger.info(f"[EXTRA_VERBOSE] GRAN SABIO RESPONSE - Minority Deal-Breakers Review")
-                logger.info(f"Session: {session_id}")
-                logger.info(f"{separator}")
-                logger.info(response_content)
-                logger.info(f"{separator}\n")
-
             decision, score, reason, modifications_made, llm_final_content = _parse_minority_payload(payload)
+            (
+                payload,
+                response_content,
+                releasable_final_content,
+            ) = _finalize_review_payload_for_release(
+                payload,
+                original_request,
+                modifications_made=modifications_made,
+                final_content=llm_final_content,
+            )
+            if modifications_made:
+                llm_final_content = releasable_final_content
             approved = decision == "APPROVED"
 
             # Matrix §3.4.3 adapter for review_minority_deal_breakers:
@@ -709,6 +997,34 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 final_content = content
             else:
                 final_content = content
+
+            await _abort_if_cancelled("minority_review_before_commit")
+            await AIService._raise_if_cancelled(cancellation_token)
+            review_tool_events.mark_committed()
+            if stream_callback is not None:
+                await stream_callback(
+                    _gran_sabio_accepted_event(
+                        response_content,
+                        model=model,
+                        layer=_GRAN_SABIO_MINORITY_REVIEW_LAYER,
+                        attempt=attempt_recorder.attempt,
+                    )
+                )
+
+            # Review envelopes become loggable only after both their own
+            # schema and any nested caller JSON contract have passed.
+            if phase_logger:
+                phase_logger.log_response(
+                    model=model,
+                    response=response_content
+                )
+            elif getattr(original_request, "extra_verbose", False):
+                logger.info(f"\n{separator}")
+                logger.info(f"[EXTRA_VERBOSE] GRAN SABIO RESPONSE - Minority Deal-Breakers Review")
+                logger.info(f"Session: {session_id}")
+                logger.info(f"{separator}")
+                logger.info(response_content)
+                logger.info(f"{separator}\n")
 
             # Log decision
             if phase_logger:
@@ -737,7 +1053,20 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
 
         except GranSabioProcessCancelled:
             raise
+        except GenerationOutputTruncated:
+            raise
+        except ContextAdmissionError:
+            # Context overflow must surface as a typed context_admission failure,
+            # never be masked as a review result that keeps the original content.
+            raise
         except Exception as e:
+            if is_content_filter_stop(e):
+                logger.warning(
+                    "Gran Sabio minority review stopped by provider content policy "
+                    "for session %s",
+                    session_id,
+                )
+                raise
             logger.error("Gran Sabio review failed for session %s: %s", session_id, str(e))
             failure_reason = f"Gran Sabio review failed: {str(e)}"
             # Matrix row 8: exception path for review_minority_deal_breakers keeps `content` as defensive default.
@@ -749,6 +1078,10 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 modifications_made=False,
                 error=str(e),
             )
+        finally:
+            await review_tool_events.close(
+                reason="Minority deal-breaker review did not reach a valid envelope"
+            )
 
     # ========================
     # Content Regeneration Fallback
@@ -759,7 +1092,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
         original_request: ContentRequest,
         previous_attempts: List[str] = None,
         images: Optional[List[Any]] = None,
-        stream_callback: Optional[callable] = None,
+        stream_callback: Optional[ContentEventSink] = None,
         cancel_callback: CancelCallback = None,
         usage_tracker: Optional[UsageTracker] = None,
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
@@ -768,6 +1101,11 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
     ) -> GranSabioResult:
         """
         Final fallback: generate new content from scratch when iterations are exhausted.
+
+        ``stream_callback`` receives labelled content events: one draft per
+        provider chunk as the regeneration is written, and a single
+        ``accepted`` snapshot once the body has been generated and (for JSON
+        requests) normalized against the caller's schema.
         """
         separator = "=" * 80
         logger.info(separator)
@@ -778,6 +1116,8 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
         )
         logger.info("Model: %s", original_request.gran_sabio_model or "default")
         logger.info(separator)
+        attempt_recorder = _StreamedAttemptRecorder(stream_callback)
+        stream_callback = attempt_recorder.sink
 
         try:
             async def _abort_if_cancelled(stage: str) -> None:
@@ -894,20 +1234,30 @@ CRITICAL INSTRUCTIONS:
                 original_request,
                 "gransabio.regenerate",
             )
-            adequate_model = self._ensure_adequate_model_capacity(
-                len(original_request.prompt) + len(previous_context), model, original_request
-            )
             regeneration_max_tokens = self._resolve_gran_sabio_max_tokens(
                 request=original_request,
-                model=adequate_model,
+                model=model,
                 call_id="gransabio.regenerate",
                 requested_max_tokens=original_request.max_tokens,
             )
             logger.info(
                 "Gran Sabio using %s with thinking_budget_tokens=%s for content regeneration",
-                adequate_model, thinking_tokens
+                model, thinking_tokens
             )
             gran_sabio_timeout = self._resolve_request_timeout(original_request)
+            gran_sabio_deadline = (
+                _gran_sabio_monotonic() + float(gran_sabio_timeout)
+            )
+            last_provider_timeout: Optional[float] = None
+
+            def _next_provider_timeout() -> float:
+                nonlocal last_provider_timeout
+                last_provider_timeout = _remaining_gran_sabio_timeout(
+                    gran_sabio_deadline,
+                    operation="Gran Sabio regeneration",
+                    previous_timeout=last_provider_timeout,
+                )
+                return last_provider_timeout
 
             generated_content = ""
             usage_callback = (
@@ -917,7 +1267,7 @@ CRITICAL INSTRUCTIONS:
                     operation="content_regeneration",
                     metadata={
                         "session_id": session_id,
-                        "model": adequate_model,
+                        "model": model,
                     },
                 )
                 if usage_tracker
@@ -942,7 +1292,7 @@ CRITICAL INSTRUCTIONS:
             # checked and normalized through the same JSON_LOOSE /
             # JSON_STRUCTURED contract as normal generation.
             tool_loop_enabled = (
-                _should_use_gransabio_tools(original_request, adequate_model)
+                _should_use_gransabio_tools(original_request, model)
                 and (stream_callback is None or json_output_effective)
             )
 
@@ -966,10 +1316,14 @@ CRITICAL INSTRUCTIONS:
                         json_options=json_options_for_loop,
                     )
 
-                async def _call_regeneration_tool_loop(token_budget: int):
+                async def _call_regeneration_tool_loop(
+                    token_budget: int,
+                    *,
+                    timeout_seconds: float,
+                ):
                     return await self.ai_service.call_ai_with_validation_tools(
                         prompt=generation_prompt,
-                        model=adequate_model,
+                        model=model,
                         validation_callback=_validate_regeneration_draft,
                         stop_on_approval=True,
                         output_contract=output_contract,
@@ -981,7 +1335,7 @@ CRITICAL INSTRUCTIONS:
                         tool_event_callback=tool_event_callback if tool_event_callback is not None else self._tool_event_callback,
                         initial_measurement_text=None,
                         temperature=temperature,
-                        max_tokens=regeneration_max_tokens,
+                        max_tokens=token_budget,
                         extra_verbose=getattr(original_request, "extra_verbose", False),
                         reasoning_effort=reasoning_effort,
                         thinking_budget_tokens=thinking_tokens,
@@ -991,48 +1345,98 @@ CRITICAL INSTRUCTIONS:
                         model_alias_registry=model_alias_registry,
                         prompt_safety_parts=prompt_safety_parts,
                         llm_routing=getattr(original_request, "_llm_routing", None),
-                        request_timeout=gran_sabio_timeout,
+                        request_timeout=timeout_seconds,
                         cancellation_token=cancellation_token,
                     )
 
                 try:
                     generated_content, envelope = await _call_regeneration_tool_loop(
-                        regeneration_max_tokens
+                        regeneration_max_tokens,
+                        timeout_seconds=_next_provider_timeout(),
                     )
                 except Exception:
                     raise
 
                 if envelope.output_truncated:
-                    retry_max_tokens = config.resolve_output_truncation_retry_max_tokens(
-                        adequate_model,
-                        envelope.max_tokens or regeneration_max_tokens,
+                    retry_plan = _resolve_output_truncation_retry_plan(
+                        original_request,
+                        model=model,
+                        effective_max_tokens=(
+                            envelope.max_tokens or regeneration_max_tokens
+                        ),
                     )
-                    if retry_max_tokens is not None:
+                    if retry_plan is not None:
+                        retry_max_tokens = int(retry_plan["retry_max_tokens"])
+                        retry_telemetry = {
+                            **retry_plan,
+                            "operation": "gransabio.regenerate.tool_loop",
+                            "session_id": session_id,
+                            "model": model,
+                            "finish_reason": envelope.finish_reason,
+                            "provider_stop_reason": envelope.provider_stop_reason,
+                        }
                         logger.warning(
                             "Gran Sabio regeneration tool-loop output truncated for %s at "
-                            "max_tokens=%s; retrying with %s",
-                            adequate_model,
+                            "max_tokens=%s; retrying once with %s",
+                            model,
                             envelope.max_tokens or regeneration_max_tokens,
                             retry_max_tokens,
                         )
+                        await _emit_output_truncation_retry(
+                            tool_event_callback,
+                            retry_telemetry,
+                        )
                         generated_content, envelope = await _call_regeneration_tool_loop(
-                            retry_max_tokens
+                            retry_max_tokens,
+                            timeout_seconds=_next_provider_timeout(),
                         )
                     if envelope.output_truncated:
-                        raise JsonContractError(
+                        raise GenerationOutputTruncated(
                             "Gran Sabio regeneration output truncated "
                             f"(finish_reason={envelope.finish_reason} "
-                            f"max_tokens={envelope.max_tokens or regeneration_max_tokens})."
+                            f"max_tokens={envelope.max_tokens or regeneration_max_tokens}).",
+                            provider="unknown",
+                            model_id=model,
+                            finish_reason=envelope.finish_reason,
+                            max_tokens=(
+                                envelope.max_tokens or regeneration_max_tokens
+                            ),
+                            partial_content=generated_content or "",
+                            usage={
+                                "output_truncated": True,
+                                "finish_reason": envelope.finish_reason,
+                                "provider_stop_reason": (
+                                    envelope.provider_stop_reason
+                                ),
+                                "max_tokens": (
+                                    envelope.max_tokens
+                                    or regeneration_max_tokens
+                                ),
+                            },
                         )
 
+                if envelope.tools_skipped_reason == "context_too_large":
+                    # Context overflow is fatal: never re-send an oversized
+                    # payload as a single-shot call. Surface a typed
+                    # ContextAdmissionError carrying the envelope's overflow
+                    # nature (ProviderContextOverflow for provider-reported
+                    # mid-loop, ContextBudgetExceeded for local entry).
+                    raise context_budget_error_from_overflow(
+                        call_id="gransabio.regenerate",
+                        public_label="gransabio.regenerate",
+                        overflow_kind=envelope.context_overflow_kind,
+                        overflow_details=envelope.context_overflow_details,
+                        context_size_estimate=envelope.context_size_estimate,
+                    )
+
                 if envelope.tools_skipped_reason or not generated_content:
-                    # Tool loop unavailable (no_tool_support or
-                    # context_too_large). Fall back to a single-shot call
-                    # rather than returning an empty draft.
+                    # Tool loop unavailable (no_tool_support) or empty content.
+                    # Fall back to a single-shot call rather than returning an
+                    # empty draft.
                     await _abort_if_cancelled("regeneration_before_single_shot_fallback")
                     generated_content = await self.ai_service.generate_content(
                         prompt=generation_prompt,
-                        model=adequate_model,
+                        model=model,
                         temperature=temperature,
                         max_tokens=regeneration_max_tokens,
                         extra_verbose=getattr(original_request, "extra_verbose", False),
@@ -1045,7 +1449,7 @@ CRITICAL INSTRUCTIONS:
                         model_alias_registry=model_alias_registry,
                         prompt_safety_parts=prompt_safety_parts,
                         llm_routing=getattr(original_request, "_llm_routing", None),
-                        request_timeout=gran_sabio_timeout,
+                        request_timeout=_next_provider_timeout(),
                         cancellation_token=cancellation_token,
                     )
                     if json_output_effective:
@@ -1054,18 +1458,26 @@ CRITICAL INSTRUCTIONS:
                             original_request,
                             json_options=json_options_for_loop,
                         )
-                if stream_callback is not None and generated_content:
-                    await stream_callback(
-                        generated_content,
-                        adequate_model,
-                        "content_regeneration",
-                    )
             elif stream_callback:
                 await _abort_if_cancelled("regeneration_before_stream")
 
-                for stream_attempt in range(1, max_stream_attempts + 1):
+                max_provider_attempts = max_stream_attempts + 1
+                transient_failures = 0
+                truncation_retry_used = False
+
+                for stream_attempt in range(1, max_provider_attempts + 1):
                     # Reset state for each attempt
                     generated_content = ""
+                    streamed_labelled_chunk = False
+                    # Every provider attempt is its own labelled attempt so a
+                    # consumer resets its cursor instead of concatenating a
+                    # retry on top of the text it already showed.
+                    chunk_template = ContentEventTemplate(
+                        phase=ContentPhase.GRAN_SABIO,
+                        model=model,
+                        layer=_GRAN_SABIO_REGENERATION_LAYER,
+                        attempt=stream_attempt,
+                    )
 
                     if stream_attempt > 1:
                         logger.info(
@@ -1076,7 +1488,7 @@ CRITICAL INSTRUCTIONS:
                     try:
                         async for chunk in self.ai_service.generate_content_stream(
                             prompt=generation_prompt,
-                            model=adequate_model,
+                            model=model,
                             temperature=temperature,
                             max_tokens=regeneration_max_tokens,
                             extra_verbose=getattr(original_request, "extra_verbose", False),
@@ -1089,7 +1501,7 @@ CRITICAL INSTRUCTIONS:
                             model_alias_registry=model_alias_registry,
                             prompt_safety_parts=prompt_safety_parts,
                             llm_routing=getattr(original_request, "_llm_routing", None),
-                            request_timeout=gran_sabio_timeout,
+                            request_timeout=_next_provider_timeout(),
                             cancellation_token=cancellation_token,
                         ):
                             # Handle StreamChunk (Claude with thinking) vs plain string
@@ -1101,28 +1513,147 @@ CRITICAL INSTRUCTIONS:
                                 chunk_text = chunk
                                 is_thinking = False
                                 metadata = {}
+                            candidate_generated_content = generated_content
+                            if chunk_text and not is_thinking:
+                                candidate_generated_content += chunk_text
+
                             if metadata.get("output_truncated"):
-                                raise JsonContractError(
-                                    "Gran Sabio regeneration stream was truncated "
-                                    f"(finish_reason={metadata.get('finish_reason')} "
-                                    f"max_tokens={metadata.get('max_tokens') or regeneration_max_tokens})."
+                                raise GenerationOutputTruncated(
+                                    "Gran Sabio regeneration stream was truncated",
+                                    provider=str(metadata.get("provider") or "unknown"),
+                                    model_id=model,
+                                    finish_reason=metadata.get("finish_reason"),
+                                    max_tokens=(
+                                        metadata.get("max_tokens")
+                                        or regeneration_max_tokens
+                                    ),
+                                    partial_content=generated_content,
+                                    usage=dict(metadata),
                                 )
+
+                            if (
+                                metadata.get("finish_unusable")
+                                and not metadata.get("output_truncated")
+                            ):
+                                try:
+                                    AIService._raise_if_generation_stopped_unusably(
+                                        candidate_generated_content,
+                                        metadata,
+                                        provider=str(metadata.get("provider") or "unknown"),
+                                        model_id=model,
+                                        max_tokens=(
+                                            metadata.get("max_tokens")
+                                            or regeneration_max_tokens
+                                        ),
+                                    )
+                                except GenerationStoppedUnexpectedly as exc:
+                                    if is_content_filter_stop(exc):
+                                        if streamed_labelled_chunk:
+                                            # Close the attempt with its
+                                            # verdict: the draft already shown
+                                            # must not stay labelled `draft`.
+                                            # A failing sink must not replace
+                                            # the stop the caller classifies.
+                                            try:
+                                                await stream_callback(
+                                                    _gran_sabio_content_filter_terminal_event(
+                                                        chunk_template,
+                                                        exc,
+                                                    )
+                                                )
+                                            except Exception:
+                                                logger.warning(
+                                                    "Failed to publish the Gran Sabio "
+                                                    "regeneration content-filter verdict "
+                                                    "for session %s",
+                                                    session_id,
+                                                    exc_info=True,
+                                                )
+                                        raise
+                                    # Preserve the historical streaming fallback
+                                    # for every non-filter finish category.
+                                    pass
+
+                            if chunk_text and not is_thinking:
+                                generated_content = candidate_generated_content
                             if chunk_text:
-                                # Only accumulate non-thinking for final content
-                                if not is_thinking:
-                                    generated_content += chunk_text
-                                # Stream all for live monitoring
-                                await stream_callback(chunk_text, adequate_model, "content_regeneration")
+                                streamed_labelled_chunk = True
+                                # Live labelled draft (C5-bis): the fallback
+                                # regeneration is the longest, most expensive
+                                # Gran Sabio operation, so it is exactly the
+                                # one an operator must be able to watch and
+                                # abort. Thinking comes from the provider
+                                # adapter and is never inferred.
+                                await stream_callback(
+                                    chunk_template.chunk(
+                                        chunk_text,
+                                        is_thinking=is_thinking,
+                                        subphase=(
+                                            ContentSubphase.THINKING
+                                            if is_thinking
+                                            else ContentSubphase.DRAFT_STREAM
+                                        ),
+                                    )
+                                )
                             await _abort_if_cancelled("regeneration_stream")
 
                         # Success - exit retry loop
                         break
 
+                    except GenerationOutputTruncated as truncation:
+                        retry_plan = None
+                        if not truncation_retry_used:
+                            retry_plan = _resolve_output_truncation_retry_plan(
+                                original_request,
+                                model=model,
+                                effective_max_tokens=(
+                                    truncation.max_tokens
+                                    or regeneration_max_tokens
+                                ),
+                            )
+                        if retry_plan is not None:
+                            retry_telemetry = {
+                                **retry_plan,
+                                "operation": "gransabio.regenerate.streaming",
+                                "session_id": session_id,
+                                "model": model,
+                                "finish_reason": truncation.finish_reason,
+                                "provider_stop_reason": (
+                                    truncation.usage.get("provider_stop_reason")
+                                    if isinstance(truncation.usage, dict)
+                                    else None
+                                ),
+                                "partial_content_chars": truncation.partial_content_chars,
+                            }
+                            regeneration_max_tokens = int(
+                                retry_plan["retry_max_tokens"]
+                            )
+                            truncation_retry_used = True
+                            logger.warning(
+                                "Gran Sabio regeneration stream truncated for %s; "
+                                "retrying once with max_tokens=%s",
+                                model,
+                                regeneration_max_tokens,
+                            )
+                            await _emit_output_truncation_retry(
+                                tool_event_callback,
+                                retry_telemetry,
+                            )
+                            await _abort_if_cancelled(
+                                "regeneration_stream_truncation_retry"
+                            )
+                            continue
+                        raise
                     except GranSabioProcessCancelled:
                         raise
+                    except ContextAdmissionError:
+                        # Context overflow is non-retryable and must surface;
+                        # never fold it into the streaming-retry ladder.
+                        raise
                     except (AIRequestError, Exception) as stream_error:
+                        transient_failures += 1
                         is_retryable = _is_retryable_streaming_error(stream_error)
-                        is_last_attempt = stream_attempt >= max_stream_attempts
+                        is_last_attempt = transient_failures >= max_stream_attempts
 
                         if is_retryable and not is_last_attempt:
                             error_reason = _extract_error_reason(stream_error)
@@ -1130,7 +1661,11 @@ CRITICAL INSTRUCTIONS:
                                 "Gran Sabio regeneration API error on attempt %d/%d for session %s: %s. Retrying in %ss...",
                                 stream_attempt, max_stream_attempts, session_id, error_reason, stream_delay
                             )
-                            await asyncio.sleep(stream_delay)
+                            await _sleep_before_gran_sabio_retry(
+                                stream_delay,
+                                deadline=gran_sabio_deadline,
+                                operation="Gran Sabio regeneration",
+                            )
                             continue
                         else:
                             error_reason = _extract_error_reason(stream_error)
@@ -1151,7 +1686,7 @@ CRITICAL INSTRUCTIONS:
                 await _abort_if_cancelled("regeneration_before_generation")
                 generated_content = await self.ai_service.generate_content(
                     prompt=generation_prompt,
-                    model=adequate_model,
+                    model=model,
                     temperature=temperature,
                     max_tokens=regeneration_max_tokens,
                     extra_verbose=getattr(original_request, "extra_verbose", False),
@@ -1164,7 +1699,7 @@ CRITICAL INSTRUCTIONS:
                     model_alias_registry=model_alias_registry,
                     prompt_safety_parts=prompt_safety_parts,
                     llm_routing=getattr(original_request, "_llm_routing", None),
-                    request_timeout=gran_sabio_timeout,
+                    request_timeout=_next_provider_timeout(),
                     cancellation_token=cancellation_token,
                 )
                 if json_output_effective:
@@ -1174,6 +1709,7 @@ CRITICAL INSTRUCTIONS:
                         json_options=json_options_for_loop,
                     )
             await _abort_if_cancelled("regeneration_after_generation")
+            await AIService._raise_if_cancelled(cancellation_token)
 
             # Log full Gran Sabio response if extra_verbose is enabled
             if getattr(original_request, "extra_verbose", False):
@@ -1193,6 +1729,22 @@ CRITICAL INSTRUCTIONS:
             logger.info("Note: Content will now go through QA evaluation")
             logger.info(separator)
 
+            if stream_callback is not None and generated_content:
+                # Canonical commit: the draft above streamed live, but only
+                # this emission is labelled ``accepted`` - it happens after
+                # provider finish, after the cancellation check, and after JSON
+                # (when requested) passed normalization/schema validation. It
+                # carries the whole normalized body and REPLACES the draft the
+                # consumer was following (C0.7), it is not a delta.
+                await stream_callback(
+                    _gran_sabio_accepted_event(
+                        generated_content,
+                        model=model,
+                        layer=_GRAN_SABIO_REGENERATION_LAYER,
+                        attempt=attempt_recorder.attempt,
+                    )
+                )
+
             return GranSabioResult(
                 approved=True,
                 final_content=generated_content,
@@ -1204,7 +1756,21 @@ CRITICAL INSTRUCTIONS:
 
         except GranSabioProcessCancelled:
             raise
+        except GenerationOutputTruncated:
+            raise
+        except ContextAdmissionError:
+            # Context overflow must surface as a typed context_admission failure,
+            # never be masked as a "regeneration failed" result with recovered
+            # fallback content.
+            raise
         except Exception as e:
+            if is_content_filter_stop(e):
+                logger.warning(
+                    "Gran Sabio regeneration stopped by provider content policy "
+                    "for session %s",
+                    session_id,
+                )
+                raise
             logger.error("Gran Sabio content regeneration failed for session %s: %s", session_id, str(e))
             # Matrix row 9: exception path preserves last previous attempt when available.
             fallback_content = previous_attempts[-1] if previous_attempts else ""
@@ -1226,7 +1792,7 @@ CRITICAL INSTRUCTIONS:
         iterations: List[Dict[str, Any]],
         original_request: ContentRequest,
         fallback_notes: Optional[List[str]] = None,
-        stream_callback: Optional[callable] = None,
+        stream_callback: Optional[ContentEventSink] = None,
         cancel_callback: CancelCallback = None,
         usage_tracker: Optional[UsageTracker] = None,
         phase_logger: Optional["PhaseLogger"] = None,
@@ -1235,8 +1801,20 @@ CRITICAL INSTRUCTIONS:
     ) -> GranSabioResult:
         """
         Review all iterations when max iterations are reached without consensus.
+
+        ``stream_callback`` receives labelled content events: one draft per
+        provider chunk while the verdict is being written, and a single
+        ``accepted`` snapshot once the envelope has passed its schema and the
+        caller's nested output contract.
         """
         separator = "=" * 80
+        attempt_recorder = _StreamedAttemptRecorder(stream_callback)
+        stream_callback = attempt_recorder.sink
+        review_tool_events = _ReviewToolEventStream(
+            tool_event_callback
+            if tool_event_callback is not None
+            else self._tool_event_callback
+        )
 
         if phase_logger:
             phase_logger.info(f"Reviewing {len(iterations)} iterations for final decision...")
@@ -1288,15 +1866,14 @@ CRITICAL INSTRUCTIONS:
                 original_request,
                 "gransabio.review",
             )
-            adequate_model = self._ensure_adequate_model_capacity(len(best_content), model, original_request)
             decision_max_tokens = self._resolve_gran_sabio_max_tokens(
                 request=original_request,
-                model=adequate_model,
+                model=model,
                 call_id="gransabio.review",
             )
             logger.info(
                 "Gran Sabio using %s with reasoning_effort=%s for iteration review",
-                adequate_model, reasoning_effort
+                model, reasoning_effort
             )
 
             usage_callback = (
@@ -1315,7 +1892,7 @@ CRITICAL INSTRUCTIONS:
             # Log prompt if phase_logger available
             if phase_logger:
                 phase_logger.log_prompt(
-                    model=adequate_model,
+                    model=model,
                     system_prompt=config.GRAN_SABIO_SYSTEM_PROMPT,
                     user_prompt=review_prompt,
                     temperature=temperature,
@@ -1329,7 +1906,7 @@ CRITICAL INSTRUCTIONS:
             payload, gran_sabio_response = await self._invoke_gran_sabio_llm(
                 request=original_request,
                 prompt=review_prompt,
-                model=adequate_model,
+                model=model,
                 reasoning_effort=reasoning_effort,
                 thinking_tokens=thinking_tokens,
                 temperature=temperature,
@@ -1346,27 +1923,25 @@ CRITICAL INSTRUCTIONS:
                 cancel_callback=cancel_callback,
                 abort_stage="iterations_review_stream",
                 max_tokens=decision_max_tokens,
-                tool_event_callback=tool_event_callback,
+                review_tool_events=review_tool_events,
                 cancellation_token=cancellation_token,
             )
 
             await _abort_if_cancelled("iterations_review_after_generation")
 
-            # Log full Gran Sabio response
-            if phase_logger:
-                phase_logger.log_response(
-                    model=adequate_model,
-                    response=gran_sabio_response
-                )
-            elif getattr(original_request, "extra_verbose", False):
-                logger.info(f"\n{separator}")
-                logger.info(f"[EXTRA_VERBOSE] GRAN SABIO RESPONSE - Iterations Review")
-                logger.info(f"Session: {session_id}")
-                logger.info(f"{separator}")
-                logger.info(gran_sabio_response)
-                logger.info(f"{separator}\n")
-
             decision, score, reason, modifications_made, llm_final_content = _parse_escalation_payload(payload)
+            (
+                payload,
+                gran_sabio_response,
+                releasable_final_content,
+            ) = _finalize_review_payload_for_release(
+                payload,
+                original_request,
+                modifications_made=modifications_made,
+                final_content=llm_final_content,
+            )
+            if modifications_made:
+                llm_final_content = releasable_final_content
             approved = decision in {"APPROVE", "APPROVE_WITH_MODIFICATIONS"}
 
             # Matrix §3.4.3 adapter for review_iterations:
@@ -1386,6 +1961,34 @@ CRITICAL INSTRUCTIONS:
                 modifications_made=modifications_made,
                 error=None,
             )
+
+            await _abort_if_cancelled("iterations_review_before_commit")
+            await AIService._raise_if_cancelled(cancellation_token)
+            review_tool_events.mark_committed()
+            if stream_callback is not None:
+                await stream_callback(
+                    _gran_sabio_accepted_event(
+                        gran_sabio_response,
+                        model=model,
+                        layer=_GRAN_SABIO_ITERATIONS_REVIEW_LAYER,
+                        attempt=attempt_recorder.attempt,
+                    )
+                )
+
+            # Review envelopes become loggable only after both their own
+            # schema and any nested caller JSON contract have passed.
+            if phase_logger:
+                phase_logger.log_response(
+                    model=model,
+                    response=gran_sabio_response
+                )
+            elif getattr(original_request, "extra_verbose", False):
+                logger.info(f"\n{separator}")
+                logger.info(f"[EXTRA_VERBOSE] GRAN SABIO RESPONSE - Iterations Review")
+                logger.info(f"Session: {session_id}")
+                logger.info(f"{separator}")
+                logger.info(gran_sabio_response)
+                logger.info(f"{separator}\n")
 
             # Log final decision
             if phase_logger:
@@ -1407,7 +2010,20 @@ CRITICAL INSTRUCTIONS:
 
         except GranSabioProcessCancelled:
             raise
+        except GenerationOutputTruncated:
+            raise
+        except ContextAdmissionError:
+            # Context overflow must surface as a typed context_admission failure,
+            # never be masked as a review result that keeps the best iteration.
+            raise
         except Exception as e:
+            if is_content_filter_stop(e):
+                logger.warning(
+                    "Gran Sabio iterations review stopped by provider content policy "
+                    "for session %s",
+                    session_id,
+                )
+                raise
             logger.error("Gran Sabio review failed for session %s: %s", session_id, str(e))
             # Matrix row 10: exception path preserves best iteration content when available.
             best_iteration_exc = self._pick_best_iteration(iterations)
@@ -1421,6 +2037,10 @@ CRITICAL INSTRUCTIONS:
                 reason=f"Gran Sabio review failed: {str(e)}",
                 modifications_made=False,
                 error=str(e),
+            )
+        finally:
+            await review_tool_events.close(
+                reason="Iterations review did not reach a valid envelope"
             )
 
     def _analyze_iteration_patterns(self, iterations: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1637,20 +2257,24 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
         phase_logger: Optional["PhaseLogger"],
         alias_registry: Optional[Any],
         prompt_safety_parts: Optional[List[Any]],
-        stream_callback: Optional[Callable[..., Awaitable[None]]],
+        stream_callback: Optional[ContentEventSink],
         stream_stage_label: str,
         cancel_callback: CancelCallback,
         abort_stage: str,
         max_tokens: int,
-        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        review_tool_events: Optional[_ReviewToolEventStream] = None,
         cancellation_token: Optional[Any] = None,
     ) -> Tuple[Dict[str, Any], str]:
         """Run a GranSabio JSON_STRUCTURED call with tool-loop or single-shot fallback.
 
-        Returns ``(parsed_payload, raw_response_text)``. The tool loop is used
-        when ``_should_use_gransabio_tools`` is True **and** no
-        ``stream_callback`` is provided; otherwise (streaming request, or
-        tools disabled/unsupported) we fall back to ``generate_content`` /
+        Returns ``(parsed_payload, raw_response_text)`` without committing it.
+        The streaming path publishes every provider chunk live as a labelled
+        DRAFT (C5-bis); the public review method still owns the canonical
+        commit, which it emits only after validating its own schema and any
+        nested caller output contract. The tool loop is used when
+        ``_should_use_gransabio_tools`` is True **and** no ``stream_callback``
+        is provided; otherwise (streaming request, or tools
+        disabled/unsupported) we fall back to ``generate_content`` /
         ``generate_content_stream`` and parse the response here.
         """
 
@@ -1662,11 +2286,34 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 )
                 raise GranSabioProcessCancelled(stage)
 
+        # The review's telemetry recorder owns the whole tool-event surface of
+        # the attempt: it publishes what the loop emits AND it remembers the
+        # verdicts its ``close`` must not contradict. Taking the callback from it
+        # (instead of receiving a bare one) is what keeps both directions wired.
+        tool_event_callback = (
+            review_tool_events.capture_callback
+            if review_tool_events is not None
+            else None
+        )
+
         tool_loop_enabled = (
             stream_callback is None
             and _should_use_gransabio_tools(request, model)
         )
         gran_sabio_timeout = self._resolve_request_timeout(request)
+        gran_sabio_deadline = (
+            _gran_sabio_monotonic() + float(gran_sabio_timeout)
+        )
+        last_provider_timeout: Optional[float] = None
+
+        def _next_provider_timeout() -> float:
+            nonlocal last_provider_timeout
+            last_provider_timeout = _remaining_gran_sabio_timeout(
+                gran_sabio_deadline,
+                operation="Gran Sabio review",
+                previous_timeout=last_provider_timeout,
+            )
+            return last_provider_timeout
 
         if tool_loop_enabled:
             measurement_request = _build_gran_sabio_measurement_request(request)
@@ -1690,7 +2337,11 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                     json_options=measurement_json_options,
                 )
 
-            async def _call_tool_loop(token_budget: int):
+            async def _call_tool_loop(
+                token_budget: int,
+                *,
+                timeout_seconds: float,
+            ):
                 return await self.ai_service.call_ai_with_validation_tools(
                     prompt=prompt,
                     model=model,
@@ -1706,46 +2357,81 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                     temperature=temperature,
                     max_tokens=token_budget,
                     system_prompt=system_prompt,
-                    extra_verbose=getattr(request, "extra_verbose", False),
+                    # The outer review owns response logging after it validates
+                    # any nested caller contract. Internal verbose logging can
+                    # otherwise expose an envelope before that second guard.
+                    extra_verbose=False,
                     reasoning_effort=reasoning_effort,
                     thinking_budget_tokens=thinking_tokens,
                     content_type=request.content_type,
                     usage_callback=usage_callback,
-                    phase_logger=phase_logger,
+                    phase_logger=None,
                     model_alias_registry=alias_registry,
                     prompt_safety_parts=prompt_safety_parts,
                     llm_routing=getattr(request, "_llm_routing", None),
-                    request_timeout=gran_sabio_timeout,
+                    request_timeout=timeout_seconds,
                     cancellation_token=cancellation_token,
                 )
 
-            content, envelope = await _call_tool_loop(max_tokens)
+            content, envelope = await _call_tool_loop(
+                max_tokens,
+                timeout_seconds=_next_provider_timeout(),
+            )
             if envelope is not None and envelope.output_truncated:
-                retry_max_tokens = config.resolve_output_truncation_retry_max_tokens(
+                retry_plan = config.resolve_bounded_output_truncation_retry(
                     model,
                     envelope.max_tokens or max_tokens,
+                    requested_max_tokens=max_tokens,
                 )
-                if retry_max_tokens is not None:
+                if isinstance(retry_plan, dict):
+                    retry_max_tokens = int(retry_plan["retry_max_tokens"])
                     logger.warning(
                         "Gran Sabio tool-loop output truncated for %s at max_tokens=%s; retrying with %s",
                         model,
                         envelope.max_tokens or max_tokens,
                         retry_max_tokens,
                     )
-                    content, envelope = await _call_tool_loop(retry_max_tokens)
+                    content, envelope = await _call_tool_loop(
+                        retry_max_tokens,
+                        timeout_seconds=_next_provider_timeout(),
+                    )
                 if envelope is not None and envelope.output_truncated:
-                    raise JsonContractError(
+                    raise GenerationOutputTruncated(
                         "Gran Sabio tool-loop output truncated "
                         f"(finish_reason={envelope.finish_reason} "
-                        f"max_tokens={envelope.max_tokens or max_tokens})."
+                        f"max_tokens={envelope.max_tokens or max_tokens}).",
+                        provider="unknown",
+                        model_id=model,
+                        finish_reason=envelope.finish_reason,
+                        max_tokens=envelope.max_tokens or max_tokens,
+                        partial_content=content or "",
+                        usage={
+                            "output_truncated": True,
+                            "finish_reason": envelope.finish_reason,
+                            "provider_stop_reason": envelope.provider_stop_reason,
+                            "max_tokens": envelope.max_tokens or max_tokens,
+                        },
                     )
 
             if envelope.tools_skipped_reason is None and envelope.payload is not None:
                 return envelope.payload, content
 
-            # Tools skipped (no_tool_support / context_too_large):
-            # fall back to a single-shot JSON call rather than returning an
-            # empty envelope payload.
+            if envelope.tools_skipped_reason == "context_too_large":
+                # Context overflow is fatal: never re-send an oversized payload
+                # as a single-shot call. Surface a typed ContextAdmissionError
+                # carrying the envelope's overflow nature (ProviderContextOverflow
+                # for provider-reported mid-loop, ContextBudgetExceeded for local
+                # entry).
+                raise context_budget_error_from_overflow(
+                    call_id="gransabio.review",
+                    public_label="gransabio.review",
+                    overflow_kind=envelope.context_overflow_kind,
+                    overflow_details=envelope.context_overflow_details,
+                    context_size_estimate=envelope.context_size_estimate,
+                )
+
+            # Tools skipped (no_tool_support): fall back to a single-shot JSON
+            # call rather than returning an empty envelope payload.
             logger.info(
                 "Gran Sabio tool loop skipped (%s); falling back to single-shot JSON call",
                 envelope.tools_skipped_reason,
@@ -1756,45 +2442,182 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
         # matching the schema; the prompt contract instructs the model.
         response_text = ""
         if stream_callback is not None:
-            await _abort(f"{abort_stage}_before_stream")
-            async for chunk in self.ai_service.generate_content_stream(
-                prompt=prompt,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                system_prompt=system_prompt,
-                reasoning_effort=reasoning_effort,
-                thinking_budget_tokens=thinking_tokens,
-                content_type=request.content_type,
-                json_output=True,
-                json_schema=response_schema,
-                usage_callback=usage_callback,
-                phase_logger=phase_logger,
-                model_alias_registry=alias_registry,
-                prompt_safety_parts=prompt_safety_parts,
-                llm_routing=getattr(request, "_llm_routing", None),
-                request_timeout=gran_sabio_timeout,
-                cancellation_token=cancellation_token,
-            ):
-                if isinstance(chunk, StreamChunk):
-                    chunk_text = chunk.text
-                    is_thinking = chunk.is_thinking
-                    metadata = chunk.metadata or {}
-                else:
-                    chunk_text = chunk
-                    is_thinking = False
-                    metadata = {}
-                if metadata.get("output_truncated"):
-                    raise JsonContractError(
-                        "Gran Sabio streaming JSON response was truncated "
-                        f"(finish_reason={metadata.get('finish_reason')} "
-                        f"max_tokens={metadata.get('max_tokens') or max_tokens})."
-                    )
-                if chunk_text:
-                    if not is_thinking:
-                        response_text += chunk_text
-                    await stream_callback(chunk_text, model, stream_stage_label)
-                await _abort(abort_stage)
+            stream_max_tokens = max_tokens
+            truncation_retry_used = False
+            stream_attempt = 0
+            while True:
+                await _abort(f"{abort_stage}_before_stream")
+                response_text = ""
+                streamed_labelled_chunk = False
+                # A truncation retry restarts the envelope from scratch: label
+                # it as a new attempt so consumers reset instead of gluing the
+                # second try onto the first.
+                stream_attempt += 1
+                chunk_template = ContentEventTemplate(
+                    phase=ContentPhase.GRAN_SABIO,
+                    model=model,
+                    layer=stream_stage_label,
+                    attempt=stream_attempt,
+                )
+                try:
+                    async for chunk in self.ai_service.generate_content_stream(
+                        prompt=prompt,
+                        model=model,
+                        temperature=temperature,
+                        max_tokens=stream_max_tokens,
+                        system_prompt=system_prompt,
+                        reasoning_effort=reasoning_effort,
+                        thinking_budget_tokens=thinking_tokens,
+                        content_type=request.content_type,
+                        json_output=True,
+                        json_schema=response_schema,
+                        usage_callback=usage_callback,
+                        phase_logger=None,
+                        model_alias_registry=alias_registry,
+                        prompt_safety_parts=prompt_safety_parts,
+                        llm_routing=getattr(request, "_llm_routing", None),
+                        request_timeout=_next_provider_timeout(),
+                        cancellation_token=cancellation_token,
+                    ):
+                        if isinstance(chunk, StreamChunk):
+                            chunk_text = chunk.text
+                            is_thinking = chunk.is_thinking
+                            metadata = chunk.metadata or {}
+                        else:
+                            chunk_text = chunk
+                            is_thinking = False
+                            metadata = {}
+                        candidate_response_text = response_text
+                        if chunk_text and not is_thinking:
+                            candidate_response_text += chunk_text
+                        if metadata.get("output_truncated"):
+                            raise GenerationOutputTruncated(
+                                "Gran Sabio streaming JSON response was truncated "
+                                f"(finish_reason={metadata.get('finish_reason')} "
+                                f"max_tokens={metadata.get('max_tokens') or stream_max_tokens}).",
+                                provider=str(metadata.get("provider") or "unknown"),
+                                model_id=model,
+                                finish_reason=metadata.get("finish_reason"),
+                                max_tokens=(
+                                    metadata.get("max_tokens") or stream_max_tokens
+                                ),
+                                partial_content=response_text,
+                                usage=dict(metadata),
+                            )
+
+                        if (
+                            metadata.get("finish_unusable")
+                            and not metadata.get("output_truncated")
+                        ):
+                            try:
+                                AIService._raise_if_generation_stopped_unusably(
+                                    candidate_response_text,
+                                    metadata,
+                                    provider=str(metadata.get("provider") or "unknown"),
+                                    model_id=model,
+                                    max_tokens=metadata.get("max_tokens") or stream_max_tokens,
+                                )
+                            except GenerationStoppedUnexpectedly as exc:
+                                if is_content_filter_stop(exc):
+                                    if streamed_labelled_chunk:
+                                        # Close the attempt with its verdict:
+                                        # the draft already shown must not stay
+                                        # labelled `draft`. A failing sink must
+                                        # not replace the stop the caller
+                                        # classifies.
+                                        try:
+                                            await stream_callback(
+                                                _gran_sabio_content_filter_terminal_event(
+                                                    chunk_template,
+                                                    exc,
+                                                )
+                                            )
+                                        except Exception:
+                                            logger.warning(
+                                                "Failed to publish the Gran Sabio review "
+                                                "content-filter verdict (stage %s)",
+                                                stream_stage_label,
+                                                exc_info=True,
+                                            )
+                                        else:
+                                            if review_tool_events is not None:
+                                                # The verdict travelled on the
+                                                # content surface, so the tool-event
+                                                # recorder learns it from here: this
+                                                # attempt may already have emitted
+                                                # truncation-retry telemetry, and its
+                                                # close() must not add a `rejected`
+                                                # after a `filtered`.
+                                                review_tool_events.mark_filtered()
+                                    raise
+                                # Preserve historical parsing/fallback for every
+                                # non-filter finish category.
+                                pass
+
+                        if chunk_text and not is_thinking:
+                            response_text = candidate_response_text
+                        if chunk_text:
+                            streamed_labelled_chunk = True
+                            # Live labelled draft (C5-bis): the review envelope
+                            # has not been parsed yet, so nothing here is
+                            # canonical - it is exactly the in-flight reasoning
+                            # an operator needs in order to stop a runaway
+                            # review early.
+                            await stream_callback(
+                                chunk_template.chunk(
+                                    chunk_text,
+                                    is_thinking=is_thinking,
+                                    subphase=(
+                                        ContentSubphase.THINKING
+                                        if is_thinking
+                                        else ContentSubphase.DRAFT_STREAM
+                                    ),
+                                )
+                            )
+                        await _abort(abort_stage)
+                except GenerationOutputTruncated as truncation:
+                    retry_plan = None
+                    if not truncation_retry_used:
+                        retry_plan = _resolve_output_truncation_retry_plan(
+                            request,
+                            model=model,
+                            effective_max_tokens=(
+                                truncation.max_tokens or stream_max_tokens
+                            ),
+                        )
+                    if retry_plan is not None:
+                        retry_telemetry = {
+                            **retry_plan,
+                            "operation": "gransabio.review.streaming",
+                            "model": model,
+                            "finish_reason": truncation.finish_reason,
+                            "provider_stop_reason": (
+                                truncation.usage.get("provider_stop_reason")
+                                if isinstance(truncation.usage, dict)
+                                else None
+                            ),
+                            "partial_content_chars": (
+                                truncation.partial_content_chars
+                            ),
+                        }
+                        stream_max_tokens = int(
+                            retry_plan["retry_max_tokens"]
+                        )
+                        truncation_retry_used = True
+                        logger.warning(
+                            "Gran Sabio review stream truncated for %s; "
+                            "retrying once with max_tokens=%s",
+                            model,
+                            stream_max_tokens,
+                        )
+                        await _emit_output_truncation_retry(
+                            tool_event_callback,
+                            retry_telemetry,
+                        )
+                        await _abort(f"{abort_stage}_truncation_retry")
+                        continue
+                    raise
+                break
         else:
             await _abort(f"{abort_stage}_before_single_shot")
             response_text = await self.ai_service.generate_content(
@@ -1808,11 +2631,11 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 json_output=True,
                 json_schema=response_schema,
                 usage_callback=usage_callback,
-                phase_logger=phase_logger,
+                phase_logger=None,
                 model_alias_registry=alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
                 llm_routing=getattr(request, "_llm_routing", None),
-                request_timeout=gran_sabio_timeout,
+                request_timeout=_next_provider_timeout(),
                 cancellation_token=cancellation_token,
             )
 

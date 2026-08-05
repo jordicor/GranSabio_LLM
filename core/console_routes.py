@@ -7,6 +7,7 @@ These endpoints expose the raw process output captured by
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from typing import Optional
 
@@ -24,6 +25,18 @@ from services.runtime_console import (
 
 from .app_state import app
 from .security import require_internal_ip
+
+
+def require_console_exposed() -> None:
+    """FastAPI dependency: 404 when console endpoints are disabled (API-11).
+
+    The IP filter gives no isolation between users of the same deployment;
+    multi-user setups can set CONSOLE_EXPOSE_ENABLED=false to take the raw
+    process console (stdout/stderr of every session) off the API entirely.
+    Default is enabled so the local operator UI keeps working.
+    """
+    if os.getenv("CONSOLE_EXPOSE_ENABLED", "true").strip().lower() not in {"1", "true", "yes", "on"}:
+        raise HTTPException(status_code=404, detail="Console endpoints are disabled")
 
 
 def _validate_filter_value(label: str, value: Optional[str], *, max_length: int = 128) -> Optional[str]:
@@ -74,6 +87,7 @@ async def recent_console_output(
     stream: Optional[str] = Query(default=None),
     level: Optional[str] = Query(default=None),
     _client_ip: str = Depends(require_internal_ip),
+    _exposed: None = Depends(require_console_exposed),
 ):
     """Return recent captured stdout/stderr/logging output."""
 
@@ -100,6 +114,7 @@ async def stream_console_output(
     stream: Optional[str] = Query(default=None),
     level: Optional[str] = Query(default=None),
     _client_ip: str = Depends(require_internal_ip),
+    _exposed: None = Depends(require_console_exposed),
 ):
     """Stream captured runtime console output as Server-Sent Events."""
 

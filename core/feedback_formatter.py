@@ -29,11 +29,11 @@ def _format_layer_feedback_lines(layer_entries: Any, qa_results: Dict[str, Dict[
             if not isinstance(entry, dict):
                 continue
 
-            layer_name = entry.get("layer", "Capa")
+            layer_name = entry.get("layer", "Layer")
             avg_score = entry.get("average_score")
             header = f"- {layer_name}"
             if isinstance(avg_score, (int, float)):
-                header += f" (promedio {avg_score:.2f}/10)"
+                header += f" (average {avg_score:.2f}/10)"
 
             formatted.append(header)
 
@@ -53,7 +53,7 @@ def _format_layer_feedback_lines(layer_entries: Any, qa_results: Dict[str, Dict[
             if detail_lines:
                 formatted.extend(detail_lines)
             else:
-                formatted.append("  - sin comentarios adicionales")
+                formatted.append("  - no additional comments")
 
     if formatted:
         return formatted
@@ -372,11 +372,11 @@ def create_user_friendly_reason(
             friendly_layer_name = layer_name
             if "Word Count" in layer_name:
                 friendly_layer_name = "Word count requirements"
-            elif "VerificaciÃ³n de Hechos" in layer_name or "Fact" in layer_name:
+            elif "Verificación de Hechos" in layer_name or "Fact" in layer_name:
                 friendly_layer_name = "Fact verification"
             elif "Calidad Narrativa" in layer_name or "Narrative" in layer_name:
                 friendly_layer_name = "Writing quality"
-            elif "PrecisiÃ³n TÃ©cnica" in layer_name or "Technical" in layer_name:
+            elif "Precisión Técnica" in layer_name or "Technical" in layer_name:
                 friendly_layer_name = "Technical accuracy"
 
             layer_failures.append(f"{friendly_layer_name} (Avg: {avg_score:.1f}/10): {main_reason}")

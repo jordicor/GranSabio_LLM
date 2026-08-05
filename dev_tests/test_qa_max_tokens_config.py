@@ -63,9 +63,9 @@ def test_qa_request_overrides_take_precedence_over_config_default(monkeypatch):
     assert normalized[0].max_tokens == 7000
 
 
-def test_qa_truncation_retry_uses_larger_safe_model_limit(monkeypatch):
+def test_qa_truncation_retry_uses_one_bounded_growth_step(monkeypatch):
     _set_model_specs(monkeypatch, output_tokens=20000, safety_margin=0.5)
     monkeypatch.setattr(config, "QA_DEFAULT_MAX_TOKENS", None)
 
-    assert config.resolve_qa_truncation_retry_max_tokens("qa-model", 4000) == 10000
+    assert config.resolve_qa_truncation_retry_max_tokens("qa-model", 4000) == 8000
     assert config.resolve_qa_truncation_retry_max_tokens("qa-model", 10000) is None

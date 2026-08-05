@@ -7,20 +7,44 @@ and write it simultaneously to both console and rotating log files.
 
 Features:
 - Hourly log rotation (logs/yyyy-mm-dd/HH_00_00.log)
+- Retention: dated log directories older than FILE_LOGGING_RETENTION_DAYS
+  (default: 14 days) are deleted at each rotation boundary
 - Automatic directory creation
 - Transparent interception of stdout/stderr
 - Thread-safe file operations
 - Captures Python logging module output
+- File failures degrade to console-only output instead of raising into
+  application code (a warning is printed once until writing recovers)
+
+WARNING: with --file-logging (and especially EXTRA_VERBOSE) full prompts and
+responses are persisted in clear text under the log directory. Do not process
+sensitive data with file logging enabled on shared machines.
 
 Author: Gran Sabio LLM Team
 """
 
 import logging
+import os
+import shutil
 import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, TextIO
+
+DEFAULT_LOG_RETENTION_DAYS = 14
+
+
+def _get_log_retention_days() -> int:
+    """Return log retention in days from FILE_LOGGING_RETENTION_DAYS (default 14)."""
+    raw_value = os.getenv("FILE_LOGGING_RETENTION_DAYS")
+    if raw_value is None:
+        return DEFAULT_LOG_RETENTION_DAYS
+    try:
+        days = int(raw_value)
+    except ValueError:
+        return DEFAULT_LOG_RETENTION_DAYS
+    return days if days > 0 else DEFAULT_LOG_RETENTION_DAYS
 
 
 class TeeOutput:
@@ -42,6 +66,9 @@ class TeeOutput:
         self.current_file: Optional[TextIO] = None
         self.current_hour: Optional[str] = None
         self.lock = threading.Lock()
+        self.retention_days = _get_log_retention_days()
+        # Set when opening/writing the log file failed; cleared on recovery.
+        self._file_write_failed: bool = False
 
         # Initialize first log file
         self._rotate_if_needed()
@@ -65,22 +92,69 @@ class TeeOutput:
 
         return log_dir / hour_file
 
+    def _cleanup_old_logs(self):
+        """
+        Delete dated log directories older than the retention period.
+
+        Best-effort: a cleanup failure is reported to the console stream and
+        never interrupts logging.
+        """
+        try:
+            base_dir = Path(self.base_log_dir)
+            if not base_dir.is_dir():
+                return
+            cutoff = (datetime.now() - timedelta(days=self.retention_days)).date()
+            for entry in base_dir.iterdir():
+                if not entry.is_dir():
+                    continue
+                try:
+                    dir_date = datetime.strptime(entry.name, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                if dir_date >= cutoff:
+                    continue
+                try:
+                    shutil.rmtree(entry)
+                except Exception as e:
+                    self.stream.write(f"\n[FILE LOGGER CLEANUP WARNING: could not delete {entry}: {e}]\n")
+        except Exception as e:
+            self.stream.write(f"\n[FILE LOGGER CLEANUP WARNING: {e}]\n")
+
     def _rotate_if_needed(self):
-        """Check if we need to rotate to a new log file (new hour)."""
+        """
+        Check if we need to rotate to a new log file (new hour).
+
+        On failure (permissions, full disk, ...) degrades to console-only
+        output instead of raising into the application; the next rotation
+        boundary retries opening the file.
+        """
         current_hour_key = self._get_current_hour_key()
 
-        if current_hour_key != self.current_hour:
-            # Close previous file if open
-            if self.current_file:
-                try:
-                    self.current_file.close()
-                except:
-                    pass
+        if current_hour_key == self.current_hour:
+            return
 
-            # Open new log file
+        # Close previous file if open
+        if self.current_file:
+            try:
+                self.current_file.close()
+            except Exception:
+                pass
+            self.current_file = None
+
+        # Rotation boundary is the natural point to enforce retention
+        self._cleanup_old_logs()
+
+        # Open new log file
+        try:
             log_path = self._get_log_file_path()
             self.current_file = open(log_path, 'a', encoding='utf-8', buffering=1)
-            self.current_hour = current_hour_key
+            self._file_write_failed = False
+        except Exception as e:
+            self.current_file = None
+            if not self._file_write_failed:
+                self.stream.write(f"\n[FILE LOGGER DISABLED: {e} - logging to console only]\n")
+                self._file_write_failed = True
+        self.current_hour = current_hour_key
 
     def write(self, message: str):
         """
@@ -103,8 +177,15 @@ class TeeOutput:
                     self.current_file.write(message)
                     self.current_file.flush()
                 except Exception as e:
-                    # If file write fails, at least show in console
-                    self.stream.write(f"\n[FILE LOGGER ERROR: {e}]\n")
+                    # Degrade to console-only until the next rotation retries
+                    try:
+                        self.current_file.close()
+                    except Exception:
+                        pass
+                    self.current_file = None
+                    if not self._file_write_failed:
+                        self.stream.write(f"\n[FILE LOGGER DISABLED: {e} - logging to console only]\n")
+                        self._file_write_failed = True
 
     def flush(self):
         """Flush both streams."""
@@ -112,7 +193,7 @@ class TeeOutput:
         if self.current_file:
             try:
                 self.current_file.flush()
-            except:
+            except Exception:
                 pass
 
     def close(self):
@@ -120,7 +201,7 @@ class TeeOutput:
         if self.current_file:
             try:
                 self.current_file.close()
-            except:
+            except Exception:
                 pass
 
     def fileno(self):

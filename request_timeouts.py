@@ -18,6 +18,24 @@ import json_utils as json
 
 DEFAULT_PROCESS_TIMEOUT_SECONDS = 12000.0
 
+# Ceiling for client-supplied per-phase timeouts (audit API-09). Request fields
+# keep their precedence, but values above this are clamped so a client cannot
+# pin tasks/connections for days on a hung provider. Sized at 2x the default
+# process timeout to still allow legitimately slow backends. Operator-owned
+# values (request_timeouts.json, env, code fallbacks) are not clamped.
+MAX_CLIENT_TIMEOUT_SECONDS = 24000.0
+
+
+def clamp_client_timeout(
+    value: Optional[float],
+    ceiling: float = MAX_CLIENT_TIMEOUT_SECONDS,
+) -> Optional[float]:
+    """Clamp a client-supplied timeout to the ceiling, preserving None."""
+
+    if value is None:
+        return None
+    return min(float(value), ceiling)
+
 
 def _repo_path(path: Optional[str], fallback: str) -> Path:
     raw_path = path or fallback
@@ -179,14 +197,18 @@ def resolve_request_timeout(
     3. request.timeouts.default_seconds
     4. dedicated config file path
     5. supplied fallback
+
+    Client-supplied values (precedence 1-3) are clamped to
+    MAX_CLIENT_TIMEOUT_SECONDS (audit API-09); operator config and fallbacks
+    are returned as configured.
     """
 
     specific = get_request_timeout_field(request, field_name)
     if specific is not None:
-        return specific
+        return clamp_client_timeout(specific)
     request_default = get_request_default_timeout(request)
     if request_default is not None:
-        return request_default
+        return clamp_client_timeout(request_default)
     if config_path:
         configured = get_timeout_config_value(settings, config_path, fallback=None)
         if configured is not None:

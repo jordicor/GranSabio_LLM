@@ -378,7 +378,12 @@ def _normalize_models(value: Any, inherited_params: Mapping[str, Any]) -> List[D
             continue
         if not isinstance(item, Mapping) or not item.get("model"):
             raise LLMRoutingError("Each multi-model routing entry must include a model.")
-        params = _deep_merge(dict(inherited_params), item.get("params", {}) or {})
+        item_params = item.get("params", {}) or {}
+        if not isinstance(item_params, Mapping):
+            raise LLMRoutingError(
+                f"LLM routing 'params' for model '{item.get('model')}' must be an object."
+            )
+        params = _deep_merge(dict(inherited_params), item_params)
         entry = dict(item)
         entry["model"] = str(item["model"])
         if params:
@@ -473,6 +478,8 @@ def _sanitize_params(
     params: Mapping[str, Any],
     policy: Mapping[str, Any],
 ) -> tuple[Dict[str, Any], List[str]]:
+    if params is not None and not isinstance(params, Mapping):
+        raise LLMRoutingError(f"LLM routing 'params' for '{call_id}' must be an object.")
     clean: Dict[str, Any] = {}
     warnings: List[str] = []
     unsupported_policy = str(policy.get("unsupported_optional_params") or "warn_and_drop")
@@ -538,11 +545,16 @@ def resolve_call(
     )
     if request is not None and warnings:
         getattr(request, "_llm_routing_warnings", []).extend(warnings)
+    provider_options = cfg.get("provider_options", {}) or {}
+    if not isinstance(provider_options, Mapping):
+        raise LLMRoutingError(
+            f"LLM routing 'provider_options' for '{call_id}' must be an object."
+        )
     return LLMRouteResolution(
         call_id=call_id,
         model=model_name,
         params=params,
-        provider_options=dict(cfg.get("provider_options", {}) or {}),
+        provider_options=dict(provider_options),
         source=source,
         warnings=warnings,
     )
@@ -562,6 +574,8 @@ def resolve_call_models(
         raise LLMRoutingError(f"Unknown LLM call id '{call_id}'.")
     cfg, source = _call_config(active_routing, call_id)
     inherited_params = cfg.get("params", {}) or {}
+    if not isinstance(inherited_params, Mapping):
+        raise LLMRoutingError(f"LLM routing 'params' for '{call_id}' must be an object.")
     raw_models = cfg.get("models")
     if raw_models is None:
         model = cfg.get("model")

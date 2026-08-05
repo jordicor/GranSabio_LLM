@@ -42,6 +42,20 @@ def test_claude_4_6_is_json_schema_supported():
     assert state.support == CapabilitySupport.SUPPORTED
 
 
+def test_new_claude_families_are_json_schema_supported():
+    specs = {"model_specifications": {"anthropic": {}}}
+
+    for model_id in ("claude-fable-5", "claude-sonnet-5", "claude-mythos-5"):
+        state = model_supports(
+            specs=specs,
+            provider="anthropic",
+            model_id=model_id,
+            capability="json_schema",
+        )
+
+        assert state.support == CapabilitySupport.SUPPORTED, model_id
+
+
 def test_openrouter_supported_parameters_gate_structured_outputs():
     specs = {
         "model_specifications": {

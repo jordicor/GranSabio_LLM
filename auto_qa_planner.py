@@ -8,10 +8,12 @@ real provider/model identifiers stay internal to routing and usage tracking.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import json_utils as json
+from ai_service import is_content_filter_stop
 from config import config
 from llm_routing import resolve_call, resolve_temperature
 from model_aliasing import (
@@ -29,6 +31,10 @@ RIGOR_LIMITS: Dict[str, Dict[str, int]] = {
     "strict": {"min": 2, "max": 4},
     "max": {"min": 4, "max": 6},
 }
+
+AUTO_QA_CONTENT_FILTER_MESSAGE = (
+    "Provider content policy stopped Auto-QA planning."
+)
 
 AUTO_QA_REQUEST_OVERRIDE_FIELDS = [
     "min_global_score",
@@ -126,6 +132,15 @@ class AutoQAPlanningError(Exception):
         self.details = details or {}
 
     def to_feedback(self) -> Dict[str, Any]:
+        if self.code == "content_filter":
+            return {
+                "code": "content_filter",
+                "message": AUTO_QA_CONTENT_FILTER_MESSAGE,
+                "details": {
+                    "finish_reason_category": "content_filter",
+                    "retryable": False,
+                },
+            }
         payload = {"code": self.code, "message": self.message}
         if self.details:
             payload["details"] = self.details
@@ -599,7 +614,7 @@ async def run_auto_qa_planning(
     context_documents: Optional[List[Dict[str, Any]]] = None,
     image_info: Optional[Dict[str, Any]] = None,
     model_alias_registry: ModelAliasRegistry,
-    stream_callback: Optional[Callable[[str], None]] = None,
+    stream_callback: Optional[Callable[[str], Any]] = None,
     usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     phase_logger: Optional[Any] = None,
     cancellation_token: Optional[Any] = None,
@@ -621,9 +636,6 @@ async def run_auto_qa_planning(
             "Auto-QA planner prompt contained a real model or provider identity.",
             details={"error": str(exc)},
         ) from exc
-
-    if stream_callback:
-        stream_callback("Auto-QA planning started.\n")
 
     try:
         route = resolve_call("auto_qa.plan", request=request)
@@ -661,6 +673,15 @@ async def run_auto_qa_planning(
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        if is_content_filter_stop(exc):
+            raise AutoQAPlanningError(
+                "content_filter",
+                AUTO_QA_CONTENT_FILTER_MESSAGE,
+                details={
+                    "finish_reason_category": "content_filter",
+                    "retryable": False,
+                },
+            ) from exc
         raise AutoQAPlanningError(
             "auto_qa_planner_failed",
             "Auto-QA planner failed before producing a valid QA contract.",
@@ -676,7 +697,12 @@ async def run_auto_qa_planning(
     )
 
     if stream_callback:
-        stream_callback(f"Auto-QA planned {len(result.qa_layers)} QA layer(s).\n")
+        callback_result = stream_callback(
+            "Auto-QA planning started.\n"
+            f"Auto-QA planned {len(result.qa_layers)} QA layer(s).\n"
+        )
+        if inspect.isawaitable(callback_result):
+            await callback_result
 
     return result
 

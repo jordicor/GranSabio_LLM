@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import mimetypes
 import os
 import shutil
@@ -12,9 +13,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from config import AttachmentSettings
+
+logger = logging.getLogger(__name__)
 
 
 class AttachmentStoreError(Exception):
@@ -229,123 +232,141 @@ class AttachmentStore:
         final_path = self.blob_path(storage_key)
         moved_to_final = False
         committed = False
+        row: Optional[AttachmentUploadRow] = None
+        pending_moves: List[Tuple[Path, Path]] = []
+        orphan_quarantine: Optional[Dict[str, Any]] = None
 
         try:
-            with self._connection(immediate=True) as conn:
-                if self.deletion_exists(user_hash=user_hash, upload_id=upload_id, conn=conn):
-                    raise AttachmentStoreConflictError("Attachment upload_id is tombstoned")
+            try:
+                with self._connection(immediate=True) as conn:
+                    if self.deletion_exists(user_hash=user_hash, upload_id=upload_id, conn=conn):
+                        raise AttachmentStoreConflictError("Attachment upload_id is tombstoned")
 
-                existing_upload = self._get_upload(
-                    user_hash=user_hash,
-                    upload_id=upload_id,
-                    conn=conn,
-                )
-                if existing_upload is not None:
-                    raise AttachmentStoreConflictError("Attachment upload_id already exists")
+                    existing_upload = self._get_upload(
+                        user_hash=user_hash,
+                        upload_id=upload_id,
+                        conn=conn,
+                    )
+                    if existing_upload is not None:
+                        raise AttachmentStoreConflictError("Attachment upload_id already exists")
 
-                blob = self._find_reusable_blob(
-                    conn=conn,
-                    sha256=digest,
-                    size_bytes=size_bytes,
-                    kind=normalized_kind,
-                )
-                if blob is None:
-                    final_path.parent.mkdir(parents=True, exist_ok=True)
-                    final_preexisted = final_path.exists()
-                    blob_id = self._insert_pending_blob(
+                    blob = self._find_reusable_blob(
                         conn=conn,
                         sha256=digest,
                         size_bytes=size_bytes,
                         kind=normalized_kind,
-                        mime_type=mime_type,
-                        storage_key=storage_key,
-                        created_at=created_at,
-                        updated_at=now,
+                        pending_moves=pending_moves,
                     )
-                    if final_preexisted:
-                        existing_hash, existing_size = self.compute_file_digest(final_path)
-                        if existing_hash != digest or existing_size != size_bytes:
-                            self._quarantine_blob(
-                                conn=conn,
-                                blob_id=blob_id,
-                                reason="Canonical blob path existed with different content",
-                                now=now,
-                            )
-                            raise AttachmentStoreIntegrityError(
-                                "Canonical blob path exists with different content"
-                            )
-                        temp_path.unlink(missing_ok=True)
-                    else:
-                        os.replace(temp_path, final_path)
-                        moved_to_final = True
-
-                    final_hash, final_size = self.compute_file_digest(final_path)
-                    if final_hash != digest or final_size != size_bytes:
-                        self._quarantine_blob(
+                    if blob is None:
+                        final_path.parent.mkdir(parents=True, exist_ok=True)
+                        final_preexisted = final_path.exists()
+                        blob_id = self._insert_pending_blob(
                             conn=conn,
-                            blob_id=blob_id,
-                            reason="Final blob checksum or size mismatch",
-                            now=now,
+                            sha256=digest,
+                            size_bytes=size_bytes,
+                            kind=normalized_kind,
+                            mime_type=mime_type,
+                            storage_key=storage_key,
+                            created_at=created_at,
+                            updated_at=now,
                         )
-                        raise AttachmentStoreIntegrityError("Final blob verification failed")
+                        if final_preexisted:
+                            existing_hash, existing_size = self.compute_file_digest(final_path)
+                            if existing_hash != digest or existing_size != size_bytes:
+                                orphan_quarantine = {
+                                    "path": final_path,
+                                    "reason": "Canonical blob path existed with different content",
+                                    "sha256": existing_hash,
+                                    "size_bytes": existing_size,
+                                    "kind": normalized_kind,
+                                    "mime_type": mime_type,
+                                }
+                                raise AttachmentStoreIntegrityError(
+                                    "Canonical blob path exists with different content"
+                                )
+                            temp_path.unlink(missing_ok=True)
+                        else:
+                            os.replace(temp_path, final_path)
+                            moved_to_final = True
+
+                        final_hash, final_size = self.compute_file_digest(final_path)
+                        if final_hash != digest or final_size != size_bytes:
+                            orphan_quarantine = {
+                                "path": final_path,
+                                "reason": "Final blob checksum or size mismatch",
+                                "sha256": final_hash,
+                                "size_bytes": final_size,
+                                "kind": normalized_kind,
+                                "mime_type": mime_type,
+                            }
+                            raise AttachmentStoreIntegrityError("Final blob verification failed")
+
+                        conn.execute(
+                            """
+                            UPDATE attachment_blobs
+                            SET status = 'ready', updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (now, blob_id),
+                        )
+                        blob = self._get_blob_by_id(conn=conn, blob_id=blob_id)
+                    else:
+                        temp_path.unlink(missing_ok=True)
+
+                    if blob is None:
+                        raise AttachmentStoreIntegrityError("Unable to resolve attachment blob")
 
                     conn.execute(
                         """
-                        UPDATE attachment_blobs
-                        SET status = 'ready', updated_at = ?
-                        WHERE id = ?
+                        INSERT INTO attachment_uploads (
+                            upload_id, blob_id, user_hash, hash_prefix1, hash_prefix2,
+                            origin, intended_usage, original_filename, stored_filename, mime_type,
+                            declared_size, declared_mime, detected_mime, original_url,
+                            metadata_signature, status, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
                         """,
-                        (now, blob_id),
+                        (
+                            upload_id,
+                            blob.id,
+                            user_hash,
+                            hash_prefix1,
+                            hash_prefix2,
+                            origin,
+                            intended_usage,
+                            original_filename,
+                            stored_filename,
+                            mime_type,
+                            declared_size,
+                            declared_mime,
+                            detected_mime,
+                            original_url,
+                            metadata_signature,
+                            created_at,
+                            now,
+                        ),
                     )
-                    blob = self._get_blob_by_id(conn=conn, blob_id=blob_id)
-                else:
-                    temp_path.unlink(missing_ok=True)
-
-                if blob is None:
-                    raise AttachmentStoreIntegrityError("Unable to resolve attachment blob")
-
-                conn.execute(
-                    """
-                    INSERT INTO attachment_uploads (
-                        upload_id, blob_id, user_hash, hash_prefix1, hash_prefix2,
-                        origin, intended_usage, original_filename, stored_filename, mime_type,
-                        declared_size, declared_mime, detected_mime, original_url,
-                        metadata_signature, status, created_at, updated_at
+                    committed = True
+                    row = self._get_upload(
+                        user_hash=user_hash,
+                        upload_id=upload_id,
+                        conn=conn,
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
-                    """,
-                    (
-                        upload_id,
-                        blob.id,
-                        user_hash,
-                        hash_prefix1,
-                        hash_prefix2,
-                        origin,
-                        intended_usage,
-                        original_filename,
-                        stored_filename,
-                        mime_type,
-                        declared_size,
-                        declared_mime,
-                        detected_mime,
-                        original_url,
-                        metadata_signature,
-                        created_at,
-                        now,
-                    ),
-                )
-                committed = True
-                return self._get_upload(
-                    user_hash=user_hash,
-                    upload_id=upload_id,
-                    conn=conn,
-                )  # type: ignore[return-value]
-        except sqlite3.IntegrityError as exc:
-            raise AttachmentStoreConflictError(str(exc)) from exc
-        finally:
-            temp_path.unlink(missing_ok=True)
-            if moved_to_final and not committed:
-                final_path.unlink(missing_ok=True)
+            except sqlite3.IntegrityError as exc:
+                raise AttachmentStoreConflictError(str(exc)) from exc
+            finally:
+                temp_path.unlink(missing_ok=True)
+                if moved_to_final and not committed and orphan_quarantine is None:
+                    final_path.unlink(missing_ok=True)
+        except Exception:
+            # The transaction rolled back: register quarantined leftovers in a
+            # fresh transaction so no orphaned file is left without a DB row.
+            if orphan_quarantine is not None:
+                self._quarantine_orphan_file(**orphan_quarantine)
+            raise
+
+        self._apply_quarantine_moves(pending_moves)
+        return row  # type: ignore[return-value]
 
     def get_upload(self, *, user_hash: str, upload_id: str) -> Optional[AttachmentUploadRow]:
         """Fetch one upload row with its blob, regardless of status."""
@@ -540,6 +561,15 @@ class AttachmentStore:
             ).fetchone()
             return int(row["count"])
 
+    def total_blob_bytes(self) -> int:
+        """Return the total size in bytes accounted for every tracked blob."""
+        self.ensure_schema()
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(size_bytes), 0) AS total FROM attachment_blobs"
+            ).fetchone()
+            return int(row["total"])
+
     def gc_unreferenced_blobs(self, *, dry_run: bool = True, limit: int = 100) -> Dict[str, int]:
         """Remove ready blobs that have no uploads, using gc_pending claims."""
         self.ensure_schema()
@@ -667,6 +697,7 @@ class AttachmentStore:
         sha256: str,
         size_bytes: int,
         kind: str,
+        pending_moves: List[Tuple[Path, Path]],
     ) -> Optional[AttachmentBlobRow]:
         """Find a ready reusable blob, quarantining unsafe rows on the way."""
         while True:
@@ -694,6 +725,7 @@ class AttachmentStore:
                         blob_id=blob.id,
                         reason="Ready blob file is missing",
                         now=self._utc_now(),
+                        pending_moves=pending_moves,
                     )
                     continue
                 existing_hash, existing_size = self.compute_file_digest(path)
@@ -703,6 +735,7 @@ class AttachmentStore:
                         blob_id=blob.id,
                         reason="Ready blob file checksum or size mismatch",
                         now=self._utc_now(),
+                        pending_moves=pending_moves,
                     )
                     continue
                 return blob
@@ -741,7 +774,10 @@ class AttachmentStore:
         blob_id: int,
         reason: str,
         now: str,
+        pending_moves: List[Tuple[Path, Path]],
     ) -> None:
+        """Mark a blob as quarantined; the file move is deferred until commit."""
+
         blob = self._get_blob_by_id(conn=conn, blob_id=blob_id)
         if blob is None:
             return
@@ -749,12 +785,6 @@ class AttachmentStore:
         new_key = self._quarantine_storage_key(blob_id, old_key)
         old_path = self.blob_path(old_key)
         new_path = self.blob_path(new_key)
-        if old_path.exists():
-            new_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                shutil.move(str(old_path), str(new_path))
-            except OSError as exc:
-                raise AttachmentStoreIntegrityError(f"Unable to quarantine blob: {exc}") from exc
         conn.execute(
             """
             UPDATE attachment_blobs
@@ -766,6 +796,58 @@ class AttachmentStore:
             """,
             (reason, new_key, now, blob_id),
         )
+        if old_path.exists():
+            pending_moves.append((old_path, new_path))
+
+    def _apply_quarantine_moves(self, pending_moves: List[Tuple[Path, Path]]) -> None:
+        """Move quarantined files once their rows have been committed."""
+
+        for old_path, new_path in pending_moves:
+            try:
+                if not old_path.exists():
+                    continue
+                new_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(old_path), str(new_path))
+            except OSError as exc:
+                logger.warning("Unable to move quarantined blob %s to %s: %s", old_path, new_path, exc)
+
+    def _quarantine_orphan_file(
+        self,
+        *,
+        path: Path,
+        reason: str,
+        sha256: str,
+        size_bytes: int,
+        kind: str,
+        mime_type: str,
+    ) -> None:
+        """Register and move a file quarantined after a rolled-back transaction."""
+
+        now = self._utc_now()
+        new_key = f"quarantine/orphan/{time.time_ns()}-{path.name}"
+        try:
+            with self._connection(immediate=True) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO attachment_blobs (
+                        sha256, size_bytes, kind, mime_type, storage_key,
+                        status, quarantine_reason, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, 'quarantined', ?, ?, ?)
+                    """,
+                    (sha256, size_bytes, kind, mime_type, new_key, reason, now, now),
+                )
+        except sqlite3.Error as exc:
+            logger.warning("Unable to register quarantined orphan %s: %s", path, exc)
+            return
+        if not path.exists():
+            return
+        new_path = self.blob_path(new_key)
+        try:
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(new_path))
+        except OSError as exc:
+            logger.warning("Unable to move quarantined orphan %s to %s: %s", path, new_path, exc)
 
     def _get_blob_by_id(
         self,
@@ -901,7 +983,7 @@ class AttachmentStore:
 
     def _quarantine_storage_key(self, blob_id: int, storage_key: str) -> str:
         name = Path(storage_key).name or f"blob-{blob_id}"
-        return f"quarantine/{blob_id}/{int(time.time())}-{name}"
+        return f"quarantine/{blob_id}/{time.time_ns()}-{name}"
 
     @staticmethod
     def _utc_now() -> str:

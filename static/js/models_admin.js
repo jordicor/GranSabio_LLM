@@ -33,15 +33,7 @@
    * Utility functions (kept from previous version)
    * ═══════════════════════════════════════════════════ */
 
-  function escapeHtml(value) {
-    if (value === null || value === undefined) return "";
-    return String(value)
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("'", "&#39;");
-  }
+  // escapeHtml / escapeHtmlAttr come from /static/js/escape_utils.js (loaded first by the template).
 
   function toArray(value) {
     if (Array.isArray(value)) return value;
@@ -656,17 +648,26 @@
         const isEnabled = model.enabled !== false;
         const disabledClass = isEnabled ? "" : " disabled";
         const checked = isEnabled ? "checked" : "";
-        const providerClass = escapeHtml(model.provider);
+        const providerClass = escapeHtmlAttr(model.provider);
         const inputPrice = model.pricing?.input_per_million;
         const outputPrice = model.pricing?.output_per_million;
 
-        return `<tr class="${disabledClass}" data-provider="${escapeHtml(model.provider)}" data-model-id="${escapeHtml(model.id)}">
+        let contextBadge = "";
+        if (model.context_suspect) {
+          contextBadge = `<span class="badge-context-suspect">context suspect</span>`;
+        } else if (model.stale) {
+          contextBadge = `<span class="badge-context-stale">stale limits</span>`;
+        } else if (model.curated) {
+          contextBadge = `<span class="badge-context-curated">curated</span>`;
+        }
+
+        return `<tr class="${disabledClass}" data-provider="${escapeHtmlAttr(model.provider)}" data-model-id="${escapeHtmlAttr(model.id)}">
           <td>
             <label class="toggle"><input type="checkbox" ${checked}><span class="slider"></span></label>
           </td>
           <td><span class="provider-pill ${providerClass}">${escapeHtml(model.provider)}</span></td>
           <td>
-            <span class="model-name">${escapeHtml(model.name)}</span>
+            <span class="model-name">${escapeHtml(model.name)}${contextBadge}</span>
             <span class="model-id">${escapeHtml(model.id)}</span>
           </td>
           <td class="ctx">${formatNumber(model.context_window || model.input_tokens)}</td>
@@ -690,7 +691,7 @@
       const currentValue = select.value;
       select.innerHTML = '<option value="">All providers</option>';
       [...providerSet].sort().forEach((p) => {
-        select.innerHTML += `<option value="${escapeHtml(p)}">${escapeHtml(PROVIDER_LABELS[p] || p)}</option>`;
+        select.innerHTML += `<option value="${escapeHtmlAttr(p)}">${escapeHtml(PROVIDER_LABELS[p] || p)}</option>`;
       });
       if ([...providerSet].includes(currentValue)) {
         select.value = currentValue;
@@ -1105,7 +1106,7 @@
       models.forEach((model, idx) => {
         const isChecked = selectedSet ? selectedSet.has(model.id) : false;
         const checkboxHtml = showCheckboxes
-          ? `<input type="checkbox" data-model-id="${escapeHtml(model.id)}" ${isChecked ? "checked" : ""}>`
+          ? `<input type="checkbox" data-model-id="${escapeHtmlAttr(model.id)}" ${isChecked ? "checked" : ""}>`
           : "";
 
         let diffHtml = "";
@@ -1130,7 +1131,7 @@
       });
 
       return `
-        <div class="section ${escapeHtml(type)}${openClass}" data-section-type="${escapeHtml(type)}">
+        <div class="section ${escapeHtmlAttr(type)}${openClass}" data-section-type="${escapeHtmlAttr(type)}">
           <div class="section-header">
             <div class="left">
               <span class="chevron">&#9654;</span>
@@ -1407,7 +1408,7 @@
 
       // Build initial rows with spinners
       bodyEl.innerHTML = PROVIDER_TABS.map((p) => `
-        <div class="sync-all-row" data-provider="${escapeHtml(p)}">
+        <div class="sync-all-row" data-provider="${escapeHtmlAttr(p)}">
           <span class="provider-name">${escapeHtml(PROVIDER_LABELS[p] || p)}</span>
           <span class="stats">Loading...</span>
           <span class="status-icon"><span class="spinner"></span></span>

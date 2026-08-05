@@ -32,6 +32,7 @@ class FetchedAttachmentStream:
     declared_mime: Optional[str]
     filename: str
     data_stream: AsyncIterator[bytes]
+    content_encoded: bool = False
 
 
 class AttachmentUrlFetcher:
@@ -62,7 +63,12 @@ class AttachmentUrlFetcher:
             raise AttachmentValidationError("URL port is invalid") from exc
         port = self.determine_port(parsed.scheme.lower(), port_value)
 
-        headers = {"User-Agent": self.settings.url_user_agent}
+        headers = {
+            "User-Agent": self.settings.url_user_agent,
+            # Ask servers not to compress so network bytes match persisted bytes
+            # and Content-Length remains comparable to what we store.
+            "Accept-Encoding": "identity",
+        }
         timeout = httpx.Timeout(
             timeout=self.settings.url_timeout_seconds,
             connect=self.settings.url_connect_timeout_seconds,
@@ -133,6 +139,7 @@ class AttachmentUrlFetcher:
                         declared_mime=declared_mime,
                         filename=filename,
                         data_stream=self.iter_http_response(response),
+                        content_encoded=self._has_content_encoding(response),
                     )
                     yield fetched
                     return
@@ -328,6 +335,13 @@ class AttachmentUrlFetcher:
             ipaddress.ip_network("2001:db8::/32"),
         ]
         return tuple(networks)
+
+    @staticmethod
+    def _has_content_encoding(response: httpx.Response) -> bool:
+        """Return True when the server applied a transfer/content encoding."""
+
+        encoding = (response.headers.get("Content-Encoding") or "").strip().lower()
+        return bool(encoding) and encoding != "identity"
 
     def extract_declared_size(self, response: httpx.Response) -> Optional[int]:
         header = response.headers.get("Content-Length")

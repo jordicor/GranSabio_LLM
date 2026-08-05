@@ -17,20 +17,23 @@ Features:
 import asyncio
 import hashlib
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiosqlite
 
 import json_utils as json
-from ai_service import get_ai_service
+from ai_service import get_ai_service, is_content_filter_stop
 from config import config as app_config
+from context_budget import ContextAdmissionError, admit_embedding_texts
 from core.cancellation import ProviderCallHandle
 from llm_routing import resolve_call, resolve_temperature
 from model_aliasing import ModelAliasRegistry, PromptPart
+from model_capability_registry import resolve_model_capability_context
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,37 @@ logger = logging.getLogger(__name__)
 FB_CLEANUP_INTERVAL_SECONDS = 3600  # 1 hour between opportunistic cleanups
 FB_CLEANUP_RETENTION_DAYS = 30      # Delete sessions older than 30 days
 FB_CLEANUP_ARCHIVE_DAYS = 14        # Archive sessions older than 14 days
+
+# Defensive cap for in-memory cache entries of sessions that never reached
+# complete_session (FAILED/REJECTED/CANCELLED); purged on session init (GEN-03).
+FB_MEMORY_CACHE_TTL_SECONDS = 24 * 3600
+
+# Providers with an embeddings HTTP dispatch implemented in FeedbackProcessor.
+_EMBEDDING_HTTP_PROVIDERS = ("openai", "gemini")
+
+
+class FeedbackEmbeddingSupportError(RuntimeError):
+    """Raised when 'feedback.embed' routing cannot be served by this deployment."""
+
+
+def _embedding_support_error(embedding_model: Optional[str], provider: str) -> FeedbackEmbeddingSupportError:
+    """Build the explicit unsupported-embedding-route error (audit ORQ-01)."""
+    return FeedbackEmbeddingSupportError(
+        f"'feedback.embed' resolved to model '{embedding_model}' (provider "
+        f"'{provider or 'unknown'}') without embeddings dispatch support; "
+        f"supported providers: {', '.join(_EMBEDDING_HTTP_PROVIDERS)}. "
+        "Route 'feedback.embed' to an embedding model of a supported provider."
+    )
+
+
+def _cross_session_learning_enabled() -> bool:
+    """Whether cross-session rule seeding is enabled.
+
+    Read from the environment on each call so operators and tests can toggle
+    it without restarting or touching config.py (audit ORQ-04).
+    """
+    raw = os.getenv("FEEDBACK_CROSS_SESSION_ENABLED", "true").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 
 # ---------- Configuration ----------
@@ -195,13 +229,14 @@ class FeedbackDatabase:
 
     # Session Management
 
-    async def create_session(self, session_id: str, request_hash: str, metadata: Dict = None):
+    async def create_session(self, session_id: str, request_hash: str, metadata: Dict = None,
+                             user_id: Optional[str] = None):
         """Create new session entry"""
         await self._pool.execute("""
             INSERT INTO session_metadata
-            (session_id, request_hash, metadata_json, status)
-            VALUES (?, ?, ?, 'active')
-        """, (session_id, request_hash, json.dumps(metadata or {})))
+            (session_id, request_hash, metadata_json, status, user_id)
+            VALUES (?, ?, ?, 'active', ?)
+        """, (session_id, request_hash, json.dumps(metadata or {}), user_id))
         await self._pool.commit()
         asyncio.create_task(self._maybe_piggyback_cleanup())
 
@@ -243,17 +278,24 @@ class FeedbackDatabase:
         await self._pool.commit()
         asyncio.create_task(self._maybe_piggyback_cleanup())
 
-    async def find_similar_sessions(self, request_hash: str, limit: int = 5) -> List[str]:
-        """Find sessions with similar request hash"""
+    async def find_similar_sessions(self, request_hash: str, limit: int = 5,
+                                    user_id: Optional[str] = None) -> List[str]:
+        """Find sessions with similar request hash.
+
+        Isolated per user: a session only learns from past sessions with the
+        same ``user_id`` (``IS`` matches NULL with NULL), so feedback from
+        other users never leaks into the generation prompt (audit ORQ-04).
+        """
         async with self._pool.execute("""
             SELECT session_id
             FROM session_metadata
             WHERE request_hash = ?
             AND final_success = TRUE
             AND status != 'deleted'
+            AND user_id IS ?
             ORDER BY created_at DESC
             LIMIT ?
-        """, (request_hash, limit)) as cursor:
+        """, (request_hash, user_id, limit)) as cursor:
             return [row[0] for row in await cursor.fetchall()]
 
     # Iteration Management
@@ -261,9 +303,15 @@ class FeedbackDatabase:
     async def add_iteration(self, session_id: str, iteration_num: int,
                            feedback_text: str, content_snapshot: str,
                            summaries: Dict, issues: List, analysis: Dict):
-        """Add iteration feedback to database"""
+        """Add iteration feedback to database.
+
+        Uses INSERT OR REPLACE so a retry of the same
+        ``(session_id, iteration_num)`` updates the row instead of raising
+        IntegrityError and silently losing the iteration feedback (audit
+        ORQ-05); the most recent write is the correct one on a retry.
+        """
         await self._pool.execute("""
-            INSERT INTO iterations
+            INSERT OR REPLACE INTO iterations
             (session_id, iteration_num, feedback_text, content_snapshot,
              summaries_json, issues_json, analysis_json)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -574,7 +622,17 @@ Provide a JSON response with:
 
             return analysis
 
+        except ContextAdmissionError:
+            # A context overflow must surface, never degrade to fallback
+            # summaries that hide the fact the feedback was never analyzed.
+            raise
         except Exception as e:
+            if is_content_filter_stop(e):
+                logger.warning(
+                    "Feedback analysis stopped by provider content policy; "
+                    "fallback summaries are disabled for this failure"
+                )
+                raise
             logger.error(f"Failed to analyze feedback: {e}")
             return {
                 'tiered_summaries': self._create_fallback_summaries(feedback_text),
@@ -592,6 +650,60 @@ Provide a JSON response with:
             'one_liner': sentences[0] if sentences else "Feedback provided"
         }
 
+    def _resolve_embedding_route(self) -> Tuple[Optional[str], str]:
+        """Resolve the 'feedback.embed' route to (model, provider).
+
+        The provider comes from the model catalog via
+        ``resolve_model_capability_context`` (the same resolution other
+        engines use), with the name-based fallback llm_routing itself
+        applies to embedding models absent from the catalog. The endpoint is
+        never hardcoded to OpenAI (audit ORQ-01).
+        """
+        route = resolve_call("feedback.embed")
+        embedding_model = self.config.embedding_model or route.model
+        specs = getattr(app_config, "model_specs", {}) or {}
+        context = resolve_model_capability_context(embedding_model or "", specs)
+        provider = context.provider
+        if not provider:
+            model_lower = (embedding_model or "").lower()
+            if "embedding" in model_lower:
+                provider = "gemini" if model_lower.startswith("models/") else "openai"
+        return embedding_model, provider
+
+    def validate_embedding_support(self) -> None:
+        """Fail fast when 'feedback.embed' cannot be served by this deployment.
+
+        Called once per session initialization so a misconfigured embedding
+        route (unsupported provider or missing credentials) surfaces
+        explicitly instead of degrading call by call into empty vectors
+        (audit ORQ-01).
+        """
+        embedding_model, provider = self._resolve_embedding_route()
+        if provider not in _EMBEDDING_HTTP_PROVIDERS:
+            raise _embedding_support_error(embedding_model, provider)
+        credential_attr = "OPENAI_API_KEY" if provider == "openai" else "GOOGLE_API_KEY"
+        if not getattr(app_config, credential_attr, ""):
+            raise FeedbackEmbeddingSupportError(
+                f"'feedback.embed' resolved to {provider} model '{embedding_model}' "
+                f"but {credential_attr} is not set; set the key or route "
+                "'feedback.embed' to an embedding model of a provider with credentials."
+            )
+
+    async def _request_gemini_embeddings(self, model: str, texts: List[str]) -> Any:
+        """Dispatch a batch request to the Gemini embeddings endpoint."""
+        resource = model if model.startswith("models/") else f"models/{model}"
+        return await self.ai_service._make_request(
+            'POST',
+            f'https://generativelanguage.googleapis.com/v1beta/{resource}:batchEmbedContents',
+            headers={'x-goog-api-key': app_config.GOOGLE_API_KEY},
+            json={
+                'requests': [
+                    {'model': resource, 'content': {'parts': [{'text': text}]}}
+                    for text in texts
+                ]
+            },
+        )
+
     async def get_embeddings(
         self,
         texts: List[str],
@@ -605,9 +717,15 @@ Provide a JSON response with:
                 return
             current_task.cancel()
 
+        embedding_model, provider = self._resolve_embedding_route()
+        if provider not in _EMBEDDING_HTTP_PROVIDERS:
+            # Defensive: validate_embedding_support() normally fails fast at
+            # session initialization; never degrade silently here either.
+            raise _embedding_support_error(embedding_model, provider)
+
         async def request_embeddings() -> Any:
-            route = resolve_call("feedback.embed")
-            embedding_model = self.config.embedding_model or route.model
+            if provider == "gemini":
+                return await self._request_gemini_embeddings(embedding_model, texts)
             return await self.ai_service._make_request(
                 'POST',
                 'https://api.openai.com/v1/embeddings',
@@ -617,16 +735,26 @@ Provide a JSON response with:
                 }
             )
 
+        # Context admission guard BEFORE dispatch. This is an independent
+        # provider call (_make_request bypasses ai_service.get_embeddings), so
+        # it does not inherit that frontier guard on its own. The shared
+        # per-input loop lives in context_budget so this module never depends
+        # on private AIService internals (test doubles only need
+        # _make_request). A verdict is fatal and must never be swallowed into
+        # empty vectors (plan 12.1); it is raised outside the resilience try
+        # below. The guard is evaluated with the real routed provider.
+        await admit_embedding_texts(
+            texts, provider=provider, model=embedding_model, call_id="feedback.embed"
+        )
+
         try:
             if cancellation_token and await cancellation_token.any_cancelled():
                 raise asyncio.CancelledError()
 
             if cancellation_token:
-                route = resolve_call("feedback.embed")
-                embedding_model = self.config.embedding_model or route.model
                 handle = ProviderCallHandle(
                     call_id="",
-                    provider="openai",
+                    provider=provider,
                     model_id=embedding_model,
                     session_id=cancellation_token.session_id,
                     phase=cancellation_token.phase,
@@ -640,9 +768,18 @@ Provide a JSON response with:
             else:
                 response = await request_embeddings()
 
-            if response and 'data' in response:
-                return [item['embedding'] for item in response['data']]
+            if response:
+                if provider == "gemini":
+                    gemini_embeddings = response.get('embeddings') or []
+                    if gemini_embeddings:
+                        return [list(item['values']) for item in gemini_embeddings]
+                elif 'data' in response:
+                    return [item['embedding'] for item in response['data']]
 
+        except ContextAdmissionError:
+            # Defensive: a context-admission verdict is fatal and never an
+            # empty-vector fallback (the guard above already raises pre-dispatch).
+            raise
         except Exception as e:
             logger.error(f"Failed to get embeddings: {e}")
 
@@ -704,7 +841,17 @@ Each rule should be imperative and actionable (e.g., "ALWAYS include publication
 
             return result.get('rules', [])[:self.config.max_rules]
 
+        except ContextAdmissionError:
+            # A context overflow must surface, never degrade to label-derived
+            # fallback rules that hide the fact synthesis never ran.
+            raise
         except Exception as e:
+            if is_content_filter_stop(e):
+                logger.warning(
+                    "Feedback rule synthesis stopped by provider content policy; "
+                    "label-derived fallback rules are disabled for this failure"
+                )
+                raise
             logger.error(f"Failed to synthesize rules: {e}")
             # Fallback: create simple rules from labels
             return [
@@ -758,16 +905,33 @@ class FeedbackMemoryManager:
         # Ensure initialized
         await self.initialize()
 
+        # Defensive purge of cache entries from sessions that never
+        # completed (FAILED/REJECTED/CANCELLED) so the in-memory cache stays
+        # bounded in long-lived processes (audit GEN-03).
+        self._purge_stale_memory_cache()
+
+        # Fail fast on an unservable embedding route instead of degrading
+        # call by call into empty vectors later (audit ORQ-01).
+        self.processor.validate_embedding_support()
+
         request_hash = self._hash_request(request)
+        # ContentRequest exposes ``username`` (models.py), not ``user_id``;
+        # fall back to it so per-user isolation is actually populated in
+        # production instead of everything staying NULL (audit ORQ-04).
+        user_id = getattr(request, 'user_id', None) or getattr(request, 'username', None)
 
         # Create session in database
         await self.db.create_session(session_id, request_hash, {
             'generator_model': getattr(request, 'generator_model', ''),
             'content_type': getattr(request, 'content_type', '')
-        })
+        }, user_id=user_id)
 
-        # Find similar successful sessions
-        similar_sessions = await self.db.find_similar_sessions(request_hash)
+        # Find similar successful sessions of the same user; cross-session
+        # learning can be disabled via FEEDBACK_CROSS_SESSION_ENABLED=false
+        # (audit ORQ-04).
+        similar_sessions = []
+        if _cross_session_learning_enabled():
+            similar_sessions = await self.db.find_similar_sessions(request_hash, user_id=user_id)
 
         # Extract common patterns from similar sessions
         initial_rules = []
@@ -784,7 +948,8 @@ class FeedbackMemoryManager:
             'rules': initial_rules,
             'categories': {},
             'recent_summaries': [],
-            'iteration_count': 0
+            'iteration_count': 0,
+            'started_at': time.time()
         }
 
         logger.info(f"Initialized feedback memory for session {session_id} with {len(initial_rules)} initial rules")
@@ -978,9 +1143,15 @@ class FeedbackMemoryManager:
 
         # 2. Recurring issues section
         if categories:
+            # last_seen is stored in the same 1-based base as
+            # total_iterations (iteration_num + 1 at upsert time), so compare
+            # against the real current iteration number derived from the most
+            # recent row, not against the number of rows fetched (audit
+            # ORQ-02).
+            current_iteration = iterations[0]['iteration_num'] + 1 if iterations else 0
             active_categories = [
                 cat for cat in categories
-                if cat['last_seen'] >= len(iterations) - 5  # Active in last 5 iterations
+                if cat['last_seen'] >= current_iteration - 5  # Active in last 5 iterations
             ]
 
             if active_categories:
@@ -1067,6 +1238,25 @@ class FeedbackMemoryManager:
                 sections.append("These MUST be addressed in this iteration.")
 
         return "\n".join(sections)
+
+    def _purge_stale_memory_cache(self) -> None:
+        """Release cache entries of sessions that never completed.
+
+        ``complete_session`` is the primary release path, but sessions ending
+        FAILED/REJECTED/CANCELLED may skip it; without a cap the cache grows
+        monotonically in long-lived processes (audit GEN-03). Entries missing
+        ``started_at`` (created before this guard existed) are treated as
+        fresh.
+        """
+        now = time.time()
+        stale = [
+            sid for sid, entry in self.memory_cache.items()
+            if now - entry.get('started_at', now) > FB_MEMORY_CACHE_TTL_SECONDS
+        ]
+        for sid in stale:
+            del self.memory_cache[sid]
+        if stale:
+            logger.info(f"Purged {len(stale)} stale feedback memory cache entries")
 
     async def complete_session(self, session_id: str, success: bool):
         """Mark session as completed"""

@@ -232,7 +232,7 @@ async def test_generator_handles_context_too_large_envelope():
     from tool_loop_models import ToolLoopEnvelope
 
     # Build an envelope the same way ``call_ai_with_validation_tools`` does
-    # when ``estimate_prompt_overflow`` flags the prompt.
+    # when the universal context-admission guard flags the prompt.
     envelope = ToolLoopEnvelope(
         loop_scope=LoopScope.GENERATOR,
         tools_skipped_reason="context_too_large",
@@ -501,8 +501,10 @@ async def test_openai_loop_catches_validate_draft_input_too_large():
              return_value="Return your best answer.",
          ):
         # Set VALIDATE_DRAFT_MAX_LENGTH lower than the huge text so the
-        # oversize enforcement fires.
+        # oversize enforcement fires. Keep the unrelated context hard cap
+        # above this synthetic payload so this test isolates that recovery.
         mock_config.VALIDATE_DRAFT_MAX_LENGTH = 200_000
+        mock_config.TOOL_LOOP_MAX_PROMPT_CHARS = 1_000_000
 
         content, metadata = await service._run_openai_compatible_validation_tool_loop(
             provider="openai",

@@ -1,7 +1,7 @@
 """Phase 2 regression coverage for the QA tool-loop adapter.
 
-Covers the scope described in PROPOSAL_TOOLS_FOR_QA_ARBITER_GRANSABIO.md
-§3.4.1, §4.3, §4.11 and §4.14:
+Covers QA activation, measurement whitelisting and the shared tool-loop
+integration contract:
 
 - ``_should_use_qa_tools`` activation matrix (structured validators present,
   ``qa_tools_mode="never"``, bypassable layer, OpenAI Responses API models
@@ -645,7 +645,13 @@ async def test_evaluate_content_retries_tool_loop_after_output_truncation():
 
     service = QAEvaluationService(ai_service)
 
-    with _patch_model_info(qa_max_tokens=8000, qa_retry_max_tokens=32000):
+    with _patch_model_info(
+        qa_max_tokens=8000,
+        qa_retry_max_tokens=32000,
+    ), patch(
+        "qa_evaluation_service.time.monotonic",
+        side_effect=[100.0, 100.5],
+    ):
         evaluation = await service.evaluate_content(
             content="Generated body.",
             criteria=layer.criteria,
@@ -656,12 +662,14 @@ async def test_evaluate_content_retries_tool_loop_after_output_truncation():
             layer=layer,
             bypass_engine=bypass_engine,
             request_edit_info=False,
+            request_timeout=2.0,
         )
 
     assert ai_service.call_ai_with_validation_tools.await_count == 2
     first_call, second_call = ai_service.call_ai_with_validation_tools.await_args_list
     assert first_call.kwargs["max_tokens"] == 8000
     assert second_call.kwargs["max_tokens"] == 32000
+    assert second_call.kwargs["request_timeout"] == pytest.approx(1.5)
     assert evaluation.score == 9.0
     assert evaluation.feedback == "Recovered"
 
@@ -883,7 +891,9 @@ async def test_evaluate_content_context_too_large_tool_skip_fails_fast():
 
     service = QAEvaluationService(ai_service)
 
-    with _patch_model_info(), pytest.raises(RuntimeError, match="context too large"):
+    from context_budget import ContextBudgetExceeded
+
+    with _patch_model_info(), pytest.raises(ContextBudgetExceeded, match="context too large"):
         await service.evaluate_content(
             content="Body.",
             criteria=layer.criteria,

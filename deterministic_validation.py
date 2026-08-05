@@ -601,6 +601,7 @@ def evaluate_cumulative_repetition_check(text: str, request: Any) -> Optional[De
     full_text = cumulative_text + "\n\n" + text
     settings = config.to_settings()
     result = analyze_phrase_frequency(full_text, settings)
+    layer = config.build_layer(order=1)
     total_word_count = (
         getattr(request, "cumulative_word_count", None) or count_words(cumulative_text)
     ) + count_words(text)
@@ -608,7 +609,7 @@ def evaluate_cumulative_repetition_check(text: str, request: Any) -> Optional[De
     issues = result.issues
     deal_breaker = any(issue.severity == "deal_breaker" for issue in issues)
     score = 10.0 if not issues else (2.0 if deal_breaker else max(5.0, 8.0 - (len(issues) * 0.5)))
-    passed = score >= 8.0
+    passed = score >= float(layer.min_score or 8.0)
 
     if not issues:
         summary = f"No cumulative repetition issues detected across {total_word_count} words."
@@ -640,7 +641,7 @@ def evaluate_cumulative_repetition_check(text: str, request: Any) -> Optional[De
     return DeterministicCheckResult(
         name="Cumulative Repetition Guard",
         score=score,
-        pass_threshold=8.0,
+        pass_threshold=float(layer.min_score or 8.0),
         passed=passed,
         deal_breaker=deal_breaker,
         summary=summary,

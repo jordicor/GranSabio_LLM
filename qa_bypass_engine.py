@@ -415,36 +415,36 @@ class QABypassEngine:
             score = check_result.score
             deal_breaker = False
             summary_lines = [
-                "No se detectaron repeticiones problemáticas en las reglas configuradas.",
-                f"Reglas analizadas: {check_result.metadata.get('rules_total', 0)}",
+                "No problematic repetitions detected for the configured rules.",
+                f"Rules analyzed: {check_result.metadata.get('rules_total', 0)}",
             ]
             deal_breaker_reason = None
         else:
             deal_breaker = check_result.deal_breaker
             score = check_result.score
             summary_lines = [
-                "Frases con repeticiones por encima del límite:",
+                "Phrases repeated above the configured limit:",
             ]
             for issue in issues[:10]:
-                severity_label = "DEAL-BREAKER" if issue.get("severity") == "deal_breaker" else "AVISO"
+                severity_label = "DEAL-BREAKER" if issue.get("severity") == "deal_breaker" else "WARNING"
                 ratio_text = (
-                    f" (ratio tokens {issue.get('repeat_ratio_tokens'):.3f})"
+                    f" (token ratio {issue.get('repeat_ratio_tokens'):.3f})"
                     if issue.get("repeat_ratio_tokens") is not None
                     else ""
                 )
-                rule_name = issue.get("rule") or "regla"
+                rule_name = issue.get("rule") or "rule"
                 summary_lines.append(
-                    f"- [{severity_label}] '{issue.get('phrase')}' ({issue.get('n')} tokens) aparece {issue.get('count')} veces (límite {issue.get('limit')}) [{rule_name}]{ratio_text}."
+                    f"- [{severity_label}] '{issue.get('phrase')}' ({issue.get('n')} tokens) appears {issue.get('count')} times (limit {issue.get('limit')}) [{rule_name}]{ratio_text}."
                 )
                 if issue.get("guidance"):
-                    summary_lines.append(f"  · Recomendación: {issue.get('guidance')}")
+                    summary_lines.append(f"  · Recommendation: {issue.get('guidance')}")
 
             if len(issues) > 10:
-                summary_lines.append(f"(Se detectaron {len(issues) - 10} frases adicionales por encima del límite)")
+                summary_lines.append(f"({len(issues) - 10} additional phrases detected above the limit)")
 
             first_issue = deal_breaker_issues[0] if deal_breaker_issues else issues[0]
             deal_breaker_reason = (
-                f"'{first_issue.get('phrase')}' excede el límite ({first_issue.get('count')}/{first_issue.get('limit')})"
+                f"'{first_issue.get('phrase')}' exceeds the limit ({first_issue.get('count')}/{first_issue.get('limit')})"
                 if first_issue
                 else None
             )
@@ -452,10 +452,10 @@ class QABypassEngine:
         meta = analysis.get("meta", {}) if analysis else {}
         total_tokens = meta.get("total_tokens")
         if total_tokens:
-            summary_lines.append(f"Tokens analizados: {total_tokens}")
+            summary_lines.append(f"Tokens analyzed: {total_tokens}")
         if target_field_paths:
             summary_lines.append(
-                f"Texto analizado via JSON extraction: {', '.join(target_field_paths)}"
+                f"Text analyzed via JSON extraction: {', '.join(target_field_paths)}"
             )
 
         feedback = (

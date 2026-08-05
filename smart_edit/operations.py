@@ -19,6 +19,7 @@ import time
 from typing import TYPE_CHECKING, Any, Callable, List, Literal, Mapping, Optional, Tuple, Union
 
 from config import config
+from context_budget import ContextAdmissionError
 from llm_routing import default_temperature_for_call, resolve_call
 
 from .locators import (
@@ -153,16 +154,21 @@ class SmartTextEditor:
             return [position] if position is not None else []
 
         if normalized.mode == TargetMode.EXACT:
-            search_content = content if normalized.case_sensitive else content.lower()
-            search_value = (
-                normalized.value
-                if normalized.case_sensitive
-                else normalized.value.lower()
-            )
+            if not normalized.case_sensitive:
+                # Case-insensitive matching must run on the original text:
+                # str.lower() can expand characters (e.g. 'İ' -> 'i' +
+                # combining dot), shifting every offset after it (AUX-15).
+                # re.IGNORECASE matches 1:1 on the original indices.
+                return [
+                    (match.start(), match.end())
+                    for match in re.finditer(
+                        re.escape(normalized.value), content, re.IGNORECASE
+                    )
+                ]
             positions: List[Tuple[int, int]] = []
             start = 0
             while True:
-                position = search_content.find(search_value, start)
+                position = content.find(normalized.value, start)
                 if position < 0:
                     break
                 end = position + len(normalized.value)
@@ -184,21 +190,29 @@ class SmartTextEditor:
         """Locate exact string match."""
         if not target.value:
             return None
-        search_content = content if target.case_sensitive else content.lower()
-        search_value = (
-            target.value if target.case_sensitive else target.value.lower()
-        )
+
+        if not target.case_sensitive:
+            # Case-insensitive matching must run on the original text so the
+            # returned offsets stay valid for it: str.lower() can expand
+            # characters (e.g. 'İ'), shifting positions after it (AUX-15).
+            wanted = 0 if target.occurrence == -1 else target.occurrence - 1
+            for index, match in enumerate(
+                re.finditer(re.escape(target.value), content, re.IGNORECASE)
+            ):
+                if index == wanted:
+                    return (match.start(), match.end())
+            return None
 
         if target.occurrence == -1:
             # Find all occurrences - return first one
             # (batch operations should handle multiple)
-            pos = search_content.find(search_value)
+            pos = content.find(target.value)
         elif target.occurrence > 0:
             # Find Nth occurrence
             pos = -1
             start = 0
             for _ in range(target.occurrence):
-                pos = search_content.find(search_value, start)
+                pos = content.find(target.value, start)
                 if pos == -1:
                     break
                 start = pos + 1
@@ -507,10 +521,13 @@ class SmartTextEditor:
             if not old:
                 positions: List[Tuple[int, int]] = []
             else:
+                # count=1 locates only the first occurrence; any other count
+                # locates all occurrences and truncates to count, so N>1
+                # actually replaces N occurrences (AUX-09).
                 target = TextTarget(
                     mode=TargetMode.EXACT,
                     value=old,
-                    occurrence=-1 if count == -1 else 1,
+                    occurrence=1 if count == 1 else -1,
                 )
                 positions = self.locate_all(content, target)
                 if count >= 0:
@@ -843,7 +860,18 @@ class SmartTextEditor:
                 execution_time_ms=int((time.perf_counter() - start_time) * 1000),
             )
 
+        except ContextAdmissionError:
+            # A context overflow is fatal and must propagate untouched. If it
+            # were folded into EditResult(success=False) the caller would raise a
+            # generic SmartEditError and silently fall back to the original
+            # content, masking the overflow.
+            raise
         except Exception as e:
+            # Lazy import avoids ai_service -> models -> smart_edit import cycles.
+            from ai_service import is_content_filter_stop
+
+            if is_content_filter_stop(e):
+                raise
             return EditResult(
                 success=False,
                 content_before=content,

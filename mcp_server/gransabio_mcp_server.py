@@ -247,6 +247,20 @@ def _build_headers() -> dict[str, str]:
     return headers
 
 
+# Maximum characters of an engine error body forwarded to the MCP client.
+# Engine error responses can embed internal traces, paths, or config
+# fragments; the full body goes to this process's stderr only, never to the
+# assistant's context.
+MAX_ERROR_BODY_CHARS = 500
+
+
+def _bounded_error_message(prefix: str, status_code: int, body: str) -> str:
+    """Build an MCP-safe error message, logging the full engine response to stderr."""
+    text = body or ""
+    print(f"{prefix}: HTTP {status_code}: {text}", file=sys.stderr)
+    return f"{prefix}: HTTP {status_code} - {text[:MAX_ERROR_BODY_CHARS]}"
+
+
 async def _wait_for_result(
     client: httpx.AsyncClient,
     session_id: str,
@@ -280,7 +294,7 @@ async def _wait_for_result(
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
-            raise Exception(f"API error: {response.status_code} - {response.text}")
+            raise Exception(_bounded_error_message("API error", response.status_code, response.text))
 
         except httpx.RequestError as e:
             raise Exception(f"Connection error: {e}")
@@ -300,7 +314,7 @@ async def _call_gransabio(payload: dict[str, Any]) -> dict[str, Any]:
         )
 
         if response.status_code != 200:
-            raise Exception(f"Generation failed: {response.status_code} - {response.text}")
+            raise Exception(_bounded_error_message("Generation failed", response.status_code, response.text))
 
         data = response.json()
 
@@ -316,7 +330,8 @@ async def _call_gransabio(payload: dict[str, Any]) -> dict[str, Any]:
 
         session_id = data.get("session_id")
         if not session_id:
-            raise Exception(f"No session_id in response: {data}")
+            print(f"No session_id in /generate response: {data}", file=sys.stderr)
+            raise Exception("No session_id in /generate response from Gran Sabio API")
 
         # Wait for completion
         result = await _wait_for_result(client, session_id, timeout=request_timeout)

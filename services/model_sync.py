@@ -5,9 +5,11 @@ Model synchronization services for the Gran Sabio LLM admin UI.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import shutil
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -15,7 +17,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 
+import context_budget
 import json_utils as json
+
+logger = logging.getLogger(__name__)
 from ai_runtime.parameters import (
     KIMI_FIXED_SAMPLING_PARAMETER_POLICY,
     is_kimi_fixed_sampling_model,
@@ -23,6 +28,14 @@ from ai_runtime.parameters import (
 
 MODEL_SPECS_PATH = Path(__file__).resolve().parent.parent / "model_specs.json"
 MODEL_SPECS_BACKUP_DIR = Path(__file__).resolve().parent.parent / "backups"
+
+# Serializes every read-modify-write of model_specs.json in this process so a
+# background ``mark_model_context_suspect`` and a UI-driven sync/delete/toggle
+# never interleave and clobber each other (lost-update protection). Reentrant so
+# the sync flows may hold it across ``load_specs`` -> ``_write_specs_atomic``
+# (which re-acquires it) without deadlocking. In-process only, matching the
+# existing single-process design.
+_SPECS_WRITE_LOCK = threading.RLock()
 SUPPORTED_SYNC_PROVIDERS = (
     "openrouter",
     "xai",
@@ -282,6 +295,22 @@ def _output_length_from_remote(model: dict[str, Any], fallback: int = 0) -> int:
     return fallback
 
 
+# Token-limit provenance values recorded in sync_metadata. "provider_api" is
+# used only when the token value truly came from the remote API; template /
+# hardcoded / context//4 fallbacks are "inferred"; Ollama is "local_config".
+TOKEN_PROVENANCE_PROVIDER_API = "provider_api"
+TOKEN_PROVENANCE_INFERRED = "inferred"
+TOKEN_PROVENANCE_LOCAL_CONFIG = "local_config"
+
+
+def _default_token_provenance(provider: str) -> str:
+    """Fail-closed default when a remote payload carried no provenance hint."""
+
+    if provider == "ollama":
+        return TOKEN_PROVENANCE_LOCAL_CONFIG
+    return TOKEN_PROVENANCE_INFERRED
+
+
 class ModelSyncService:
     """Coordinates provider fetch, diff, and sync workflows."""
 
@@ -323,6 +352,14 @@ class ModelSyncService:
                 elif sync_meta.get("managed_by_ui"):
                     status = "synced"
 
+                try:
+                    resolution = context_budget.resolve_token_limits(key)
+                    curated = resolution.provenance == "manual_curated"
+                    stale = bool(resolution.stale)
+                except Exception:
+                    curated = False
+                    stale = False
+
                 models.append(
                     {
                         "provider": provider,
@@ -346,6 +383,10 @@ class ModelSyncService:
                         "remote_created_at": sync_meta.get("remote_created_at"),
                         "created_at": sync_meta.get("remote_created_at"),
                         "enabled": model_data.get("enabled", True),
+                        "context_suspect": bool(sync_meta.get("context_suspect")),
+                        "token_limits_provenance": sync_meta.get("token_limits_provenance"),
+                        "curated": curated,
+                        "stale": stale,
                     }
                 )
 
@@ -422,6 +463,9 @@ class ModelSyncService:
                 top_provider,
                 fallback=max(context_length // 4, 8192) if context_length else 8192,
             )
+            token_provenance = (
+                TOKEN_PROVENANCE_PROVIDER_API if context_length > 0 else TOKEN_PROVENANCE_INFERRED
+            )
 
             remote_models.append(
                 {
@@ -435,6 +479,7 @@ class ModelSyncService:
                     "context_window": context_length,
                     "input_tokens": context_length,
                     "output_tokens": output_tokens,
+                    "token_limits_provenance": token_provenance,
                     "pricing": {
                         "input_per_million": _price_per_million_from_token_price(pricing.get("prompt")),
                         "output_per_million": _price_per_million_from_token_price(pricing.get("completion")),
@@ -480,12 +525,16 @@ class ModelSyncService:
                 continue
 
             local_template = self._find_best_local_template("xai", model_id, current_xai_specs)
-            context_length = _context_length_from_remote(model, fallback=_safe_int(local_template.get("context_window")))
+            remote_context = _context_length_from_remote(model)
+            context_length = remote_context or _safe_int(local_template.get("context_window"))
             output_tokens = _output_length_from_remote(model, fallback=_safe_int(local_template.get("output_tokens")))
             if context_length <= 0:
                 context_length = _safe_int(local_template.get("context_window"), 128000)
             if output_tokens <= 0:
                 output_tokens = _safe_int(local_template.get("output_tokens"), max(context_length // 4, 16384))
+            token_provenance = (
+                TOKEN_PROVENANCE_PROVIDER_API if remote_context > 0 else TOKEN_PROVENANCE_INFERRED
+            )
 
             input_modalities = model.get("input_modalities", []) or []
             capabilities = _capabilities_from_input_modalities(input_modalities)
@@ -503,6 +552,7 @@ class ModelSyncService:
                     "context_window": context_length,
                     "input_tokens": context_length,
                     "output_tokens": output_tokens,
+                    "token_limits_provenance": token_provenance,
                     "pricing": {
                         "input_per_million": _price_per_million_from_cents_per_100m(model.get("prompt_text_token_price")),
                         "output_per_million": _price_per_million_from_cents_per_100m(model.get("completion_text_token_price")),
@@ -542,15 +592,16 @@ class ModelSyncService:
             model_id = str(model.get("id", "")).strip()
             if not model_id or not _is_openai_text_candidate(model_id):
                 continue
-            remote_models.append(
-                self._build_discovery_entry(
-                    provider="openai",
-                    model_id=model_id,
-                    display_name=model_id,
-                    remote_created_at=_iso_from_unix_timestamp(model.get("created")),
-                    current_provider_specs=current_specs,
-                )
+            entry = self._build_discovery_entry(
+                provider="openai",
+                model_id=model_id,
+                display_name=model_id,
+                remote_created_at=_iso_from_unix_timestamp(model.get("created")),
+                current_provider_specs=current_specs,
             )
+            # OpenAI's model-list API does not publish token limits.
+            entry["token_limits_provenance"] = TOKEN_PROVENANCE_INFERRED
+            remote_models.append(entry)
 
         remote_models.sort(key=lambda item: (item.get("remote_created_at") or "", item["model_id"]), reverse=True)
         return remote_models
@@ -639,6 +690,7 @@ class ModelSyncService:
                     "context_window": context_window,
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
+                    "token_limits_provenance": TOKEN_PROVENANCE_LOCAL_CONFIG,
                     "pricing": {
                         "input_per_million": 0.0,
                         "output_per_million": 0.0,
@@ -689,15 +741,25 @@ class ModelSyncService:
             model_id = str(model.get("id", "")).strip()
             if not model_id or not model_id.startswith("claude-"):
                 continue
-            remote_models.append(
-                self._build_discovery_entry(
-                    provider="anthropic",
-                    model_id=model_id,
-                    display_name=model.get("display_name", model_id),
-                    remote_created_at=model.get("created_at"),
-                    current_provider_specs=current_specs,
-                )
+            entry = self._build_discovery_entry(
+                provider="anthropic",
+                model_id=model_id,
+                display_name=model.get("display_name", model_id),
+                remote_created_at=model.get("created_at"),
+                current_provider_specs=current_specs,
             )
+            # The Anthropic Models API now returns per-model context/output limits.
+            api_max_input = _safe_int(model.get("max_input_tokens"))
+            api_max_output = _safe_int(_nested_lookup(model, "max_tokens", "max_output_tokens"))
+            if api_max_input > 0:
+                entry["context_window"] = api_max_input
+                entry["input_tokens"] = api_max_input
+                entry["token_limits_provenance"] = TOKEN_PROVENANCE_PROVIDER_API
+            else:
+                entry["token_limits_provenance"] = TOKEN_PROVENANCE_INFERRED
+            if api_max_output > 0:
+                entry["output_tokens"] = api_max_output
+            remote_models.append(entry)
 
         remote_models.sort(key=lambda item: (item.get("remote_created_at") or "", item["model_id"]), reverse=True)
         return remote_models
@@ -752,6 +814,11 @@ class ModelSyncService:
                     entry["output_tokens"] = output_tokens
                     entry["context_window"] = input_tokens
                     entry["source"] = GOOGLE_MODELS_URL
+                    entry["token_limits_provenance"] = (
+                        TOKEN_PROVENANCE_PROVIDER_API
+                        if (input_tokens > 0 or output_tokens > 0)
+                        else TOKEN_PROVENANCE_INFERRED
+                    )
 
                     all_models.append(entry)
 
@@ -786,15 +853,16 @@ class ModelSyncService:
             model_id = str(model.get("id", "")).strip()
             if not model_id:
                 continue
-            remote_models.append(
-                self._build_discovery_entry(
-                    provider="minimax",
-                    model_id=model_id,
-                    display_name=model_id,
-                    remote_created_at=_iso_from_unix_timestamp(model.get("created")),
-                    current_provider_specs=current_specs,
-                )
+            entry = self._build_discovery_entry(
+                provider="minimax",
+                model_id=model_id,
+                display_name=model_id,
+                remote_created_at=_iso_from_unix_timestamp(model.get("created")),
+                current_provider_specs=current_specs,
             )
+            # MiniMax's model-list API does not publish token limits.
+            entry["token_limits_provenance"] = TOKEN_PROVENANCE_INFERRED
+            remote_models.append(entry)
 
         remote_models.sort(key=lambda item: (item.get("remote_created_at") or "", item["model_id"]), reverse=True)
         return remote_models
@@ -832,12 +900,16 @@ class ModelSyncService:
                 current_provider_specs=current_specs,
             )
 
-            context_length = _safe_int(model.get("context_length"), _safe_int(entry.get("context_window")))
+            remote_context = _safe_int(model.get("context_length"))
+            context_length = remote_context or _safe_int(entry.get("context_window"))
             if context_length > 0:
                 entry["context_window"] = context_length
                 entry["input_tokens"] = context_length
                 if not current_specs.get(model_id):
                     entry["output_tokens"] = max(context_length // 4, 8192)
+            entry["token_limits_provenance"] = (
+                TOKEN_PROVENANCE_PROVIDER_API if remote_context > 0 else TOKEN_PROVENANCE_INFERRED
+            )
 
             capabilities = ["text"]
             if model.get("supports_image_in") is True:
@@ -1090,52 +1162,54 @@ class ModelSyncService:
         if not isinstance(selected_models, list):
             raise ModelSyncError("Invalid sync payload: 'models' must be a list.")
 
-        specs = self.load_specs()
-        current_provider_specs = self._get_provider_specs(specs, provider)
-        current_keys = set(current_provider_specs.keys())
-        new_provider_specs: dict[str, dict[str, Any]]
+        with _SPECS_WRITE_LOCK:
+            specs = self.load_specs()
+            current_provider_specs = self._get_provider_specs(specs, provider)
+            current_keys = set(current_provider_specs.keys())
+            new_provider_specs: dict[str, dict[str, Any]]
 
-        if provider in FULL_SYNC_PROVIDERS:
-            new_provider_specs = {}
-            for model in selected_models:
-                key = str(
-                    _nested_lookup(model, "key", "model_id", "id", "model")
-                    or ""
-                ).strip()
-                if not key:
-                    continue
-                current_spec = current_provider_specs.get(key)
-                if bool(_nested_lookup(model, "local_only")) and current_spec:
-                    new_provider_specs[key] = dict(current_spec)
-                    continue
-                new_provider_specs[key] = self._build_provider_spec(provider, model, current_spec)
-        else:
-            new_provider_specs = dict(current_provider_specs)
-            for model in selected_models:
-                key = str(
-                    _nested_lookup(model, "key", "model_id", "id", "model")
-                    or ""
-                ).strip()
-                if not key:
-                    continue
-                current_spec = new_provider_specs.get(key)
-                new_provider_specs[key] = self._build_provider_spec(provider, model, current_spec)
+            if provider in FULL_SYNC_PROVIDERS:
+                new_provider_specs = {}
+                for model in selected_models:
+                    key = str(
+                        _nested_lookup(model, "key", "model_id", "id", "model")
+                        or ""
+                    ).strip()
+                    if not key:
+                        continue
+                    current_spec = current_provider_specs.get(key)
+                    if bool(_nested_lookup(model, "local_only")) and current_spec:
+                        new_provider_specs[key] = dict(current_spec)
+                        continue
+                    new_provider_specs[key] = self._build_provider_spec(provider, model, current_spec)
+            else:
+                new_provider_specs = dict(current_provider_specs)
+                for model in selected_models:
+                    key = str(
+                        _nested_lookup(model, "key", "model_id", "id", "model")
+                        or ""
+                    ).strip()
+                    if not key:
+                        continue
+                    current_spec = new_provider_specs.get(key)
+                    new_provider_specs[key] = self._build_provider_spec(provider, model, current_spec)
 
-        if "model_specifications" not in specs:
-            specs["model_specifications"] = {}
-        specs["model_specifications"][provider] = new_provider_specs
-        self._validate_model_references(specs)
+            if "model_specifications" not in specs:
+                specs["model_specifications"] = {}
+            specs["model_specifications"][provider] = new_provider_specs
+            self._enforce_token_invariants(provider, new_provider_specs)
+            self._validate_model_references(specs)
 
-        added_keys = set(new_provider_specs.keys()) - current_keys
-        removed_keys = current_keys - set(new_provider_specs.keys())
-        updated = 0
-        for key in set(new_provider_specs.keys()) & current_keys:
-            if current_provider_specs.get(key) != new_provider_specs.get(key):
-                updated += 1
+            added_keys = set(new_provider_specs.keys()) - current_keys
+            removed_keys = current_keys - set(new_provider_specs.keys())
+            updated = 0
+            for key in set(new_provider_specs.keys()) & current_keys:
+                if current_provider_specs.get(key) != new_provider_specs.get(key):
+                    updated += 1
 
-        backup_path = self._create_backup()
-        self._write_specs_atomic(specs)
-        self.config.reload_model_specifications()
+            backup_path = self._create_backup()
+            self._write_specs_atomic(specs)
+            self.config.reload_model_specifications()
 
         self.logger.info(
             "Model sync complete for provider=%s added=%d updated=%d removed=%d backup=%s",
@@ -1170,18 +1244,19 @@ class ModelSyncService:
         if provider not in SUPPORTED_SYNC_PROVIDERS:
             raise ModelSyncError(f"Unsupported provider '{provider}'.")
 
-        specs = self.load_specs()
-        provider_specs = self._get_provider_specs(specs, provider)
-        if model_id not in provider_specs:
-            raise ModelSyncError(f"Model '{model_id}' not found in {provider}.")
+        with _SPECS_WRITE_LOCK:
+            specs = self.load_specs()
+            provider_specs = self._get_provider_specs(specs, provider)
+            if model_id not in provider_specs:
+                raise ModelSyncError(f"Model '{model_id}' not found in {provider}.")
 
-        del provider_specs[model_id]
-        specs["model_specifications"][provider] = provider_specs
-        self._validate_model_references(specs)
+            del provider_specs[model_id]
+            specs["model_specifications"][provider] = provider_specs
+            self._validate_model_references(specs)
 
-        backup_path = self._create_backup()
-        self._write_specs_atomic(specs)
-        self.config.reload_model_specifications()
+            backup_path = self._create_backup()
+            self._write_specs_atomic(specs)
+            self.config.reload_model_specifications()
 
         self.logger.info("Deleted model %s from provider %s, backup=%s", model_id, provider, backup_path)
         return {"success": True, "deleted": model_id, "provider": provider}
@@ -1195,86 +1270,89 @@ class ModelSyncService:
         if provider not in SUPPORTED_SYNC_PROVIDERS:
             raise ModelSyncError(f"Unsupported provider '{provider}'.")
 
-        specs = self.load_specs()
-        provider_specs = self._get_provider_specs(specs, provider)
-        if model_id not in provider_specs:
-            raise ModelSyncError(f"Model '{model_id}' not found in {provider}.")
+        with _SPECS_WRITE_LOCK:
+            specs = self.load_specs()
+            provider_specs = self._get_provider_specs(specs, provider)
+            if model_id not in provider_specs:
+                raise ModelSyncError(f"Model '{model_id}' not found in {provider}.")
 
-        if not enabled:
-            # Prevent disabling models referenced by defaults or aliases.
-            # Temporarily remove and validate (same pattern as delete_model).
-            test_specs = json.loads(json.dumps(specs))
-            del test_specs["model_specifications"][provider][model_id]
-            self._validate_model_references(test_specs)
+            if not enabled:
+                # Prevent disabling models referenced by defaults or aliases.
+                # Temporarily remove and validate (same pattern as delete_model).
+                test_specs = json.loads(json.dumps(specs))
+                del test_specs["model_specifications"][provider][model_id]
+                self._validate_model_references(test_specs)
 
-        provider_specs[model_id]["enabled"] = enabled
-        self._create_backup()
-        self._write_specs_atomic(specs)
-        self.config.reload_model_specifications()
+            provider_specs[model_id]["enabled"] = enabled
+            self._create_backup()
+            self._write_specs_atomic(specs)
+            self.config.reload_model_specifications()
 
         self.logger.info("Toggled model %s in %s: enabled=%s", model_id, provider, enabled)
         return {"success": True, "model_id": model_id, "provider": provider, "enabled": enabled}
 
     def sync_providers_bulk(self, providers: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
         """Sync multiple providers in a single atomic operation."""
-        specs = self.load_specs()
-        per_provider_stats: dict[str, dict[str, Any]] = {}
+        with _SPECS_WRITE_LOCK:
+            specs = self.load_specs()
+            per_provider_stats: dict[str, dict[str, Any]] = {}
 
-        for provider, selected_models in providers.items():
-            provider = provider.strip().lower()
-            if provider not in SUPPORTED_SYNC_PROVIDERS:
-                raise ModelSyncError(f"Unsupported provider '{provider}'.")
-            if not isinstance(selected_models, list):
-                raise ModelSyncError(f"Invalid payload for '{provider}': must be a list.")
+            for provider, selected_models in providers.items():
+                provider = provider.strip().lower()
+                if provider not in SUPPORTED_SYNC_PROVIDERS:
+                    raise ModelSyncError(f"Unsupported provider '{provider}'.")
+                if not isinstance(selected_models, list):
+                    raise ModelSyncError(f"Invalid payload for '{provider}': must be a list.")
 
-            current_provider_specs = self._get_provider_specs(specs, provider)
-            current_keys = set(current_provider_specs.keys())
-            new_provider_specs: dict[str, dict[str, Any]]
+                current_provider_specs = self._get_provider_specs(specs, provider)
+                current_keys = set(current_provider_specs.keys())
+                new_provider_specs: dict[str, dict[str, Any]]
 
-            if provider in FULL_SYNC_PROVIDERS:
-                new_provider_specs = {}
-                for model in selected_models:
-                    key = str(
-                        _nested_lookup(model, "key", "model_id", "id", "model") or ""
-                    ).strip()
-                    if not key:
-                        continue
-                    current_spec = current_provider_specs.get(key)
-                    if bool(_nested_lookup(model, "local_only")) and current_spec:
-                        new_provider_specs[key] = dict(current_spec)
-                        continue
-                    new_provider_specs[key] = self._build_provider_spec(provider, model, current_spec)
-            else:
-                new_provider_specs = dict(current_provider_specs)
-                for model in selected_models:
-                    key = str(
-                        _nested_lookup(model, "key", "model_id", "id", "model") or ""
-                    ).strip()
-                    if not key:
-                        continue
-                    current_spec = new_provider_specs.get(key)
-                    new_provider_specs[key] = self._build_provider_spec(provider, model, current_spec)
+                if provider in FULL_SYNC_PROVIDERS:
+                    new_provider_specs = {}
+                    for model in selected_models:
+                        key = str(
+                            _nested_lookup(model, "key", "model_id", "id", "model") or ""
+                        ).strip()
+                        if not key:
+                            continue
+                        current_spec = current_provider_specs.get(key)
+                        if bool(_nested_lookup(model, "local_only")) and current_spec:
+                            new_provider_specs[key] = dict(current_spec)
+                            continue
+                        new_provider_specs[key] = self._build_provider_spec(provider, model, current_spec)
+                else:
+                    new_provider_specs = dict(current_provider_specs)
+                    for model in selected_models:
+                        key = str(
+                            _nested_lookup(model, "key", "model_id", "id", "model") or ""
+                        ).strip()
+                        if not key:
+                            continue
+                        current_spec = new_provider_specs.get(key)
+                        new_provider_specs[key] = self._build_provider_spec(provider, model, current_spec)
 
-            if "model_specifications" not in specs:
-                specs["model_specifications"] = {}
-            specs["model_specifications"][provider] = new_provider_specs
+                if "model_specifications" not in specs:
+                    specs["model_specifications"] = {}
+                specs["model_specifications"][provider] = new_provider_specs
+                self._enforce_token_invariants(provider, new_provider_specs)
 
-            added_keys = set(new_provider_specs.keys()) - current_keys
-            removed_keys = current_keys - set(new_provider_specs.keys())
-            updated = sum(
-                1 for key in set(new_provider_specs.keys()) & current_keys
-                if current_provider_specs.get(key) != new_provider_specs.get(key)
-            )
-            per_provider_stats[provider] = {
-                "added": len(added_keys),
-                "updated": updated,
-                "removed": len(removed_keys),
-            }
+                added_keys = set(new_provider_specs.keys()) - current_keys
+                removed_keys = current_keys - set(new_provider_specs.keys())
+                updated = sum(
+                    1 for key in set(new_provider_specs.keys()) & current_keys
+                    if current_provider_specs.get(key) != new_provider_specs.get(key)
+                )
+                per_provider_stats[provider] = {
+                    "added": len(added_keys),
+                    "updated": updated,
+                    "removed": len(removed_keys),
+                }
 
-        self._validate_model_references(specs)
-        backup_path = self._create_backup()
-        self._write_specs_atomic(specs)
-        self.config.reload_model_specifications()
+            self._validate_model_references(specs)
+            backup_path = self._create_backup()
+            self._write_specs_atomic(specs)
+            self.config.reload_model_specifications()
 
         self.logger.info(
             "Bulk sync complete: %s, backup=%s",
@@ -1319,7 +1397,10 @@ class ModelSyncService:
         if parameter_constraints is None:
             parameter_constraints = current_spec.get("parameter_constraints")
         sync_mode = self.get_sync_mode(provider)
+        # dict(current_spec.get(...)) preserves prior sync_metadata keys such as
+        # context_suspect; the update below never overwrites them.
         sync_meta = dict(current_spec.get("sync_metadata", {}) or {})
+        token_provenance = _nested_lookup(model, "token_limits_provenance") or _default_token_provenance(provider)
         sync_meta.update(
             {
                 "managed_by_ui": True,
@@ -1327,6 +1408,7 @@ class ModelSyncService:
                 "sync_mode": sync_mode,
                 "last_synced_at": _utc_now_iso(),
                 "remote_created_at": _nested_lookup(model, "remote_created_at", "created_at"),
+                "token_limits_provenance": token_provenance,
                 "needs_review": bool(
                     _nested_lookup(model, "needs_review")
                     if _nested_lookup(model, "needs_review") is not None
@@ -1336,6 +1418,9 @@ class ModelSyncService:
         )
 
         new_spec = dict(current_spec)
+        # Preserve a curated per-model token_limits sub-object across syncs.
+        if isinstance(current_spec.get("token_limits"), dict):
+            new_spec["token_limits"] = current_spec["token_limits"]
         new_spec.update(
             {
                 "model_id": model_id,
@@ -1368,6 +1453,57 @@ class ModelSyncService:
                 ).strip()
 
         return new_spec
+
+    def _enforce_token_invariants(
+        self, provider: str, provider_specs: dict[str, dict[str, Any]]
+    ) -> None:
+        """
+        Enforce save-time token-limit invariants for one provider's specs.
+
+        Non-positive input/output/context values raise ``ModelSyncError``
+        (fail-closed). Comparable output>total or input>total violations set
+        ``needs_review: true`` on the offending entry; they are never silently
+        fixed.
+        """
+
+        for key, spec in provider_specs.items():
+            if not isinstance(spec, dict):
+                continue
+            input_tokens = spec.get("input_tokens")
+            output_tokens = spec.get("output_tokens")
+            context_window = spec.get("context_window")
+
+            for field_name, value in (
+                ("input_tokens", input_tokens),
+                ("output_tokens", output_tokens),
+                ("context_window", context_window),
+            ):
+                if value is None:
+                    continue
+                if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                    raise ModelSyncError(
+                        f"Sync blocked: model '{provider}/{key}' has a non-positive "
+                        f"{field_name}: {value!r}."
+                    )
+
+            needs_review = False
+            if (
+                isinstance(output_tokens, int)
+                and isinstance(context_window, int)
+                and output_tokens > context_window
+            ):
+                needs_review = True
+            if (
+                isinstance(input_tokens, int)
+                and isinstance(context_window, int)
+                and input_tokens > context_window
+            ):
+                needs_review = True
+
+            if needs_review:
+                sync_meta = dict(spec.get("sync_metadata", {}) or {})
+                sync_meta["needs_review"] = True
+                spec["sync_metadata"] = sync_meta
 
     def _collect_model_identifiers(self, specs: dict[str, Any]) -> set[str]:
         return set(self._collect_model_identifier_states(specs))
@@ -1419,10 +1555,85 @@ class ModelSyncService:
         return backup_path
 
     def _write_specs_atomic(self, specs: dict[str, Any]) -> None:
-        temp_path = self.specs_path.with_suffix(".json.tmp")
+        with _SPECS_WRITE_LOCK:
+            temp_path = self.specs_path.with_suffix(".json.tmp")
+            payload = json.dumps(specs, indent=2, ensure_ascii=False)
+            with open(temp_path, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                if not payload.endswith("\n"):
+                    handle.write("\n")
+            temp_path.replace(self.specs_path)
+
+
+def mark_model_context_suspect(model_id: str, *, specs_path: Path | None = None) -> None:
+    """Persist ``sync_metadata.context_suspect = true`` for a catalog entry.
+
+    Called (fire-and-forget) after a provider reports a context overflow despite
+    the local admission guard, so the entry is flagged for review (D14). Atomic
+    read-modify-write of model_specs.json, then reload config. The entry is
+    resolved by catalog key or by its ``model_id`` field across every provider.
+    A model that cannot be located, or an already-flagged entry, is a logged
+    no-op — never a crash.
+    """
+
+    identifier = str(model_id or "").strip()
+    if not identifier:
+        return
+
+    path = specs_path or MODEL_SPECS_PATH
+    # Hold the shared write lock across the whole read-modify-write so a
+    # concurrent sync/delete/toggle cannot slip a stale write in between our
+    # read and write and drop the suspect flag (lost-update protection).
+    with _SPECS_WRITE_LOCK:
+        with open(path, "r", encoding="utf-8") as handle:
+            specs = json.load(handle)
+
+        providers = specs.get("model_specifications", {}) or {}
+        target: tuple[str, str] | None = None
+        for provider, provider_models in providers.items():
+            if not isinstance(provider_models, dict):
+                continue
+            for key, model_data in provider_models.items():
+                if not isinstance(model_data, dict):
+                    continue
+                if key == identifier or str(model_data.get("model_id") or "") == identifier:
+                    target = (provider, key)
+                    break
+            if target is not None:
+                break
+
+        if target is None:
+            logger.warning(
+                "mark_model_context_suspect: model '%s' not found in catalog; skipping.",
+                identifier,
+            )
+            return
+
+        provider, key = target
+        entry = specs["model_specifications"][provider][key]
+        sync_meta = dict(entry.get("sync_metadata", {}) or {})
+        if sync_meta.get("context_suspect") is True:
+            # Already flagged; avoid a redundant rewrite + reload.
+            return
+        sync_meta["context_suspect"] = True
+        entry["sync_metadata"] = sync_meta
+
+        temp_path = path.with_suffix(".json.tmp")
         payload = json.dumps(specs, indent=2, ensure_ascii=False)
         with open(temp_path, "w", encoding="utf-8") as handle:
             handle.write(payload)
             if not payload.endswith("\n"):
                 handle.write("\n")
-        temp_path.replace(self.specs_path)
+        temp_path.replace(path)
+
+    # Reload the in-memory catalog so the suspect flag takes effect immediately.
+    from config import config  # late import: avoid an import cycle at module load
+
+    config.reload_model_specifications()
+    logger.warning(
+        "Marked model '%s' (provider %s, key %s) context_suspect after a provider "
+        "context overflow despite the local admission guard.",
+        identifier,
+        provider,
+        key,
+    )

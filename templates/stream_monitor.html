@@ -634,6 +634,19 @@
             color: #a78bfa;
         }
 
+        /* Content labels (C0.1): a draft can never be read as the final text. */
+        .monitor-line-draft {
+            color: #9ca3af;
+        }
+
+        .monitor-line-accepted {
+            color: var(--green);
+        }
+
+        .monitor-line-rejected {
+            color: var(--amber);
+        }
+
         .monitor-token {
             display: inline-block;
             margin-right: 6px;
@@ -669,6 +682,21 @@
         .monitor-token-grounding {
             border: 1px solid #a78bfa;
             color: #a78bfa;
+        }
+
+        .monitor-token-draft {
+            border: 1px solid #9ca3af;
+            color: #9ca3af;
+        }
+
+        .monitor-token-accepted {
+            border: 1px solid var(--green);
+            color: var(--green);
+        }
+
+        .monitor-token-rejected {
+            border: 1px solid var(--amber);
+            color: var(--amber);
         }
 
         .monitor-key {
@@ -2445,6 +2473,7 @@
         </div>
     </div>
 
+    <script src="/static/js/escape_utils.js"></script>
     <script src="/static/js/stream_monitor.js?v=runtime-console-scope-20260530"></script>
 </body>
 </html>

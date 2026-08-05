@@ -1,4 +1,4 @@
-"""LLM-accent guard prompt artifacts (Cambio 1 v5, Sections 5.6, 5.7, 5.8).
+"""LLM-accent guard prompt artifacts.
 
 Two distinct artifacts:
 - DEFAULT_ACCENT_RUBRIC: shared, rubric-only text. No schema, no <draft>, no output directive.

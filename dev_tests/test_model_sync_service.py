@@ -155,6 +155,7 @@ def service(tmp_path, sample_model_specs):
             XAI_API_KEY="xai-test",
             OPENAI_API_KEY="openai-test",
             ANTHROPIC_API_KEY="anthropic-test",
+            GOOGLE_API_KEY="google-test",
             MINIMAX_API_KEY="minimax-test",
             MOONSHOT_API_KEY="moonshot-test",
             OLLAMA_HOST="http://localhost:11434",
@@ -325,6 +326,45 @@ async def test_fetch_minimax_remote_models_as_discovery_entries(service, monkeyp
     assert model["capabilities"] == ["text"]
     assert model["needs_review"] is True
     assert model["source"] == model_sync.MINIMAX_MODELS_URL
+
+
+@pytest.mark.asyncio
+async def test_fetch_google_uses_exact_models_api_token_limits(service, monkeypatch):
+    fake_session = _FakeSingleGetSession(
+        payload={
+            "models": [
+                {
+                    "name": "models/gemini-3.99-flash",
+                    "displayName": "Gemini 3.99 Flash",
+                    "description": "Text generation model",
+                    "inputTokenLimit": 1048576,
+                    "outputTokenLimit": 65536,
+                    "supportedGenerationMethods": ["generateContent", "countTokens"],
+                },
+                {
+                    "name": "models/gemini-embedding-999",
+                    "inputTokenLimit": 8192,
+                    "outputTokenLimit": 0,
+                    "supportedGenerationMethods": ["embedContent"],
+                },
+            ]
+        }
+    )
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+
+    result = await service.fetch_remote_models("google")
+
+    assert fake_session.urls == [model_sync.GOOGLE_MODELS_URL]
+    assert fake_session.headers[0]["x-goog-api-key"] == "google-test"
+    assert result["stats"]["review"] == 1
+    assert len(result["models"]) == 1
+    model = result["models"][0]
+    assert model["id"] == "gemini-3.99-flash"
+    assert model["input_tokens"] == 1048576
+    assert model["context_window"] == 1048576
+    assert model["output_tokens"] == 65536
+    assert model["token_limits_provenance"] == "provider_api"
+    assert model["source"] == model_sync.GOOGLE_MODELS_URL
 
 
 @pytest.mark.asyncio

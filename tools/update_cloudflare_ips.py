@@ -14,6 +14,7 @@ Options:
 """
 
 import argparse
+import ipaddress
 import sys
 import urllib.request
 from datetime import datetime
@@ -59,6 +60,23 @@ def fetch_ip_ranges(url: str) -> list[str]:
     except Exception as e:
         print(f"Error fetching {url}: {e}", file=sys.stderr)
         return []
+
+
+def validate_cidr_ranges(ranges: list[str], label: str) -> list[str]:
+    """Validate that every fetched line is a legitimate CIDR network.
+
+    The output feeds a security configuration file (trusted proxies), so any
+    unexpected line (an error page from a TLS-inspecting proxy, a format
+    change) must abort the update instead of being written. Returns the
+    canonical form of each network. Raises ValueError on the first bad line.
+    """
+    validated = []
+    for line in ranges:
+        try:
+            validated.append(str(ipaddress.ip_network(line, strict=False)))
+        except ValueError:
+            raise ValueError(f"Invalid CIDR in {label} response: {line!r}") from None
+    return validated
 
 
 def generate_trusted_proxies_content(ipv4_ranges: list[str], ipv6_ranges: list[str]) -> str:
@@ -114,6 +132,13 @@ def main():
         print("Failed to fetch IPv6 ranges. Aborting.", file=sys.stderr)
         sys.exit(1)
     print(f"  Found {len(ipv6_ranges)} IPv6 ranges")
+
+    try:
+        ipv4_ranges = validate_cidr_ranges(ipv4_ranges, "IPv4")
+        ipv6_ranges = validate_cidr_ranges(ipv6_ranges, "IPv6")
+    except ValueError as e:
+        print(f"Error: {e}. Aborting without modifying the file.", file=sys.stderr)
+        sys.exit(1)
 
     content = generate_trusted_proxies_content(ipv4_ranges, ipv6_ranges)
 

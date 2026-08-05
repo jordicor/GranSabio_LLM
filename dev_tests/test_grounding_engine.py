@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from ai_service import GenerationStoppedUnexpectedly
 from evidence_grounding.grounding_engine import (
     GroundingEngine,
     get_effective_order,
@@ -23,6 +24,21 @@ from models import (
     EvidenceGroundingResult,
     ExtractedClaim,
 )
+
+
+def _content_filter_stop() -> GenerationStoppedUnexpectedly:
+    """Return a typed provider content-filter stop for propagation tests."""
+
+    return GenerationStoppedUnexpectedly(
+        "provider-private filter detail",
+        provider="test-provider",
+        model_id="test-model",
+        finish_reason="refusal",
+        finish_reason_category="content_filter",
+        partial_content="blocked partial content",
+        usage={"finish_unusable": True},
+    )
+
 
 # =============================================================================
 # Tests for get_effective_order
@@ -331,6 +347,57 @@ class TestGroundingEngineRunCheck:
         )
 
         assert result.passed is True  # Conservative pass
+
+    @pytest.mark.parametrize(
+        "on_flag",
+        ["warn", "deal_breaker", "regenerate"],
+    )
+    @pytest.mark.parametrize(
+        "failing_stage",
+        ["extraction", "classification", "scoring"],
+    )
+    @pytest.mark.asyncio
+    async def test_content_filter_is_repropagated_from_every_provider_stage(
+        self,
+        mock_ai_service,
+        sample_claims,
+        on_flag,
+        failing_stage,
+    ):
+        """A provider filter is terminal, independent of grounding policy."""
+
+        engine = GroundingEngine(mock_ai_service)
+        stop = _content_filter_stop()
+        extraction = AsyncMock(return_value=sample_claims)
+        classification = AsyncMock(return_value=[])
+        scoring = AsyncMock(return_value=[])
+        engine.claim_extractor.extract_claims = extraction
+        engine.evidence_matcher.classify_spans = classification
+        engine.budget_scorer.score_claims = scoring
+
+        stage_call = {
+            "extraction": extraction,
+            "classification": classification,
+            "scoring": scoring,
+        }[failing_stage]
+        stage_call.side_effect = stop
+
+        with pytest.raises(GenerationStoppedUnexpectedly) as raised:
+            await engine.run_grounding_check(
+                content="Test content",
+                context="Test context.",
+                grounding_config=EvidenceGroundingConfig(
+                    enabled=True,
+                    on_flag=on_flag,
+                ),
+            )
+
+        assert raised.value is stop
+        if failing_stage == "extraction":
+            classification.assert_not_awaited()
+            scoring.assert_not_awaited()
+        elif failing_stage == "classification":
+            scoring.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_grounding_check_with_progress_callback(

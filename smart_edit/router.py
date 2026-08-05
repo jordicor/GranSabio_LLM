@@ -11,7 +11,10 @@ Endpoints:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import asyncio
+import logging
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
@@ -20,13 +23,20 @@ from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 from template_compat import enable_template_response_compat
 
-from .models import TargetMode, TextTarget
+from .models import EditResult, TargetMode, TextTarget
 from .operations import SmartTextEditor
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Smart Edit"])
 
 # Templates for demo page
 templates = enable_template_response_compat(Jinja2Templates(directory="templates"))
+
+# ReDoS guards (AUX-02): user-supplied regexes run off the event loop with a
+# hard timeout, and batch execution caps the number of queued actions.
+REGEX_MATCH_TIMEOUT_SECONDS = 5.0
+MAX_BATCH_ACTIONS = 50
 
 
 # =============================================================================
@@ -74,6 +84,28 @@ def _build_text_target(target: TextTargetRequest) -> TextTarget:
         value=value,
         occurrence=target.occurrence,
         case_sensitive=target.case_sensitive,
+    )
+
+
+async def _run_editor_op(
+    method: Callable[..., EditResult],
+    *args: Any,
+    run_in_thread: bool,
+) -> EditResult:
+    """
+    Run a synchronous editor operation.
+
+    When the operation locates a user-supplied regex (run_in_thread=True) it
+    runs in a worker thread with a hard timeout so a pathological pattern
+    cannot freeze the event loop (AUX-02). Patterns with nested quantifiers
+    are already rejected by TextTarget validation; the timeout is defense in
+    depth for overlapping-alternation cases like ``(a|aa)+$``.
+    """
+    if not run_in_thread:
+        return method(*args)
+    return await asyncio.wait_for(
+        asyncio.to_thread(method, *args),
+        timeout=REGEX_MATCH_TIMEOUT_SECONDS,
     )
 
 
@@ -152,7 +184,10 @@ class BatchExecuteRequest(BaseModel):
     """Request to execute multiple actions."""
 
     text: str = Field(description="Original text content", max_length=50000)
-    actions: List[ActionRequest] = Field(description="Actions to execute")
+    actions: List[ActionRequest] = Field(
+        description="Actions to execute",
+        max_length=MAX_BATCH_ACTIONS,
+    )
     llm_routing: Optional[Dict[str, Any]] = Field(
         default=None,
         validation_alias=AliasChoices("llm_routing", "llmRouting"),
@@ -376,10 +411,8 @@ async def analyze_text(request: AnalyzeRequest):
     - Formatting suggestions
 
     Phase 6: Full AI analysis implementation.
-    Falls back to basic pattern matching if AI service unavailable.
+    Falls back to mechanical duplicate-word detection if AI is unavailable.
     """
-    import time
-
     start_time = time.perf_counter()
 
     actions = []
@@ -424,7 +457,8 @@ async def analyze_text(request: AnalyzeRequest):
         stats = calculate_stats(actions)
 
     except Exception as e:
-        # Fallback to basic pattern matching
+        # Fallback to mechanical duplicate-word detection (no semantic
+        # pattern matching, per repo policy - see AUX-10)
         from .analyzer import TextAnalyzer, calculate_stats
 
         # Use dummy analyzer with basic method
@@ -434,10 +468,7 @@ async def analyze_text(request: AnalyzeRequest):
         analysis_model_used = "pattern-matching (fallback)"
 
         # Log the error for debugging
-        import logging
-        logging.getLogger(__name__).warning(
-            f"AI analysis failed, using fallback: {e}"
-        )
+        logger.warning(f"AI analysis failed, using fallback: {e}")
 
     analysis_time_ms = int((time.perf_counter() - start_time) * 1000)
 
@@ -461,8 +492,6 @@ async def execute_single_action(request: ExecuteRequest):
 
     Supports both direct operations (instant) and AI-assisted operations.
     """
-    import time
-
     start_time = time.perf_counter()
     action = request.action
 
@@ -493,6 +522,8 @@ async def execute_single_action(request: ExecuteRequest):
 
         # Build target
         target = _build_text_target(action.target)
+        # User regexes run off-thread with a timeout (ReDoS guard, AUX-02)
+        run_in_thread = target.mode == TargetMode.REGEX
 
         # Determine if this is an AI operation
         ai_operations = {"rephrase", "improve", "fix_grammar", "fix_style", "expand", "condense"}
@@ -507,15 +538,36 @@ async def execute_single_action(request: ExecuteRequest):
 
         # Execute based on operation type
         if op_type == "delete":
-            result = editor.delete(request.text, target)
+            result = await _run_editor_op(
+                editor.delete, request.text, target, run_in_thread=run_in_thread
+            )
         elif op_type in ("insert_before", "insert_after"):
             where = "before" if op_type == "insert_before" else "after"
-            result = editor.insert(request.text, action.content or "", target, where)
+            result = await _run_editor_op(
+                editor.insert,
+                request.text,
+                action.content or "",
+                target,
+                where,
+                run_in_thread=run_in_thread,
+            )
         elif op_type == "replace":
-            result = editor.replace(request.text, target, action.content or "")
+            result = await _run_editor_op(
+                editor.replace,
+                request.text,
+                target,
+                action.content or "",
+                run_in_thread=run_in_thread,
+            )
         elif op_type == "format":
             format_type = action.metadata.get("format_type", "bold")
-            result = editor.format(request.text, target, format_type)
+            result = await _run_editor_op(
+                editor.format,
+                request.text,
+                target,
+                format_type,
+                run_in_thread=run_in_thread,
+            )
         elif op_type == "rephrase":
             result = await editor.rephrase(
                 request.text,
@@ -586,12 +638,35 @@ async def execute_single_action(request: ExecuteRequest):
             execution_time_ms=int((time.perf_counter() - start_time) * 1000),
         )
 
-    except Exception as e:
+    except TimeoutError:
+        return ExecuteResponse(
+            success=False,
+            text_before=request.text,
+            text_after=request.text,
+            error=(
+                f"Regex evaluation timed out after "
+                f"{REGEX_MATCH_TIMEOUT_SECONDS:.0f}s "
+                f"(possible catastrophic backtracking)"
+            ),
+            execution_time_ms=int((time.perf_counter() - start_time) * 1000),
+        )
+    except ValueError as e:
+        # Validation errors describe bad caller input and are safe to surface.
         return ExecuteResponse(
             success=False,
             text_before=request.text,
             text_after=request.text,
             error=str(e),
+            execution_time_ms=int((time.perf_counter() - start_time) * 1000),
+        )
+    except Exception:
+        # Do not leak raw internal exception details to API callers (AUX-17).
+        logger.exception("Unexpected error executing smart-edit action")
+        return ExecuteResponse(
+            success=False,
+            text_before=request.text,
+            text_after=request.text,
+            error="Internal error while executing the action",
             execution_time_ms=int((time.perf_counter() - start_time) * 1000),
         )
 
@@ -604,8 +679,6 @@ async def execute_batch_actions(request: BatchExecuteRequest):
     Actions are applied in order, with each action operating on
     the result of the previous one.
     """
-    import time
-
     start_time = time.perf_counter()
 
     current_text = request.text

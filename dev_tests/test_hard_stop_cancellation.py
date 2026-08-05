@@ -1,9 +1,16 @@
 import asyncio
+import sys
 from datetime import datetime, timedelta
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+
+# The venv's libmagic native DLL crashes on import in this Windows environment
+# (pre-existing); attachment_manager treats python-magic as optional. Stub it
+# before importing core.* (same pattern as dev_tests/test_audit_genproc.py).
+sys.modules.setdefault("magic", MagicMock())
 
 import core.app_state as app_state_module
 import core.generation_processor as generation_processor_module
@@ -366,22 +373,28 @@ async def test_project_cancel_closes_direct_stream_provider_call(monkeypatch, ca
                 await asyncio.sleep(30)
                 yield "late content"
 
+    # API-04: the direct-stream claim rejects terminal sessions with 409, so
+    # the session must be active for the stream (and its provider call) to
+    # exist when the project cancel lands.
     await register_session(
         session_id,
         {
             "session_id": session_id,
             "project_id": project_id,
             "project_epoch": 0,
-            "status": GenerationStatus.COMPLETED,
-            "current_phase": "completed",
+            "status": GenerationStatus.GENERATING,
+            "current_phase": "generation",
             "current_iteration": 1,
             "verbose_log": [],
             "request": request,
             "resolved_context": [],
-            "final_result": {"content": "done", "status": "completed"},
         },
     )
     monkeypatch.setattr(streaming_routes_module, "ai_service", SlowDirectStreamAI())
+    # resolve_call("generation.direct_stream") validates the routed model
+    # against the catalog; register the fake specs so the fake generator
+    # resolves (same pattern as the other fake-model tests in this file).
+    monkeypatch.setattr(config, "model_specs", _fake_model_specs())
 
     response = await streaming_routes_module.stream_content_direct_v2(session_id)
     stream_task = asyncio.create_task(response.body_iterator.__anext__())
@@ -883,10 +896,13 @@ async def test_direct_stream_rejects_session_from_old_project_epoch(monkeypatch)
     assert start_result["project_epoch"] == epoch + 1
     monkeypatch.setattr(streaming_routes_module, "ai_service", UnexpectedDirectStreamAI())
 
-    response = await streaming_routes_module.stream_content_direct_v2(session_id)
+    # API-04: a terminal session from a previous project epoch is rejected at
+    # claim time with 409, before any paid provider call can start.
+    with pytest.raises(HTTPException) as exc_info:
+        await streaming_routes_module.stream_content_direct_v2(session_id)
 
-    with pytest.raises(StopAsyncIteration):
-        await response.body_iterator.__anext__()
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "Session already finished"
     assert not provider_called.is_set()
     await pop_session(session_id)
 

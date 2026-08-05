@@ -33,6 +33,12 @@ from starlette.middleware.gzip import GZipMiddleware
 
 # Use optimized JSON (3.6x faster than standard json)
 import json_utils as json
+from content_events import (
+    CONTENT_STATUSES,
+    ContentStatus,
+    SessionPhase,
+    Visibility,
+)
 from debug_logger import (
     DebugLogger,
     get_debug_logger,
@@ -122,9 +128,23 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 # Add IP filter middleware (restricts access to internal networks only)
 # This provides temporary protection until user authentication is implemented
 # See core/security.py for configuration and allowed networks
-from .security import IPFilterMiddleware
+from .security import (
+    CrossSiteRequestGuardMiddleware,
+    IPFilterMiddleware,
+    RequestBodyLimitMiddleware,
+    SecurityHeadersMiddleware,
+)
 
 app.add_middleware(IPFilterMiddleware)
+# Reject cross-site browser mutations on state-changing endpoints (audit FE-01)
+app.add_middleware(CrossSiteRequestGuardMiddleware)
+# Reject oversized request bodies before parsing (audit API-02)
+app.add_middleware(
+    RequestBodyLimitMiddleware,
+    attachment_max_bytes=config.ATTACHMENTS.max_size_bytes,
+)
+# Outermost: security headers on every response, including early rejections (audit FE-03)
+app.add_middleware(SecurityHeadersMiddleware)
 
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -180,8 +200,19 @@ _session_cleanup_activity_counter = 0
 _project_hard_stop_completion_tasks: Set[asyncio.Task] = set()
 _project_session_end_tasks: Set[asyncio.Task] = set()
 _debug_status_update_tasks: Set[asyncio.Task] = set()
+# Coalesced project-status publisher state (audit GEN-04): at most one
+# publisher task per project; the latest pending snapshot always wins.
+_project_status_event_tasks: Dict[str, asyncio.Task] = {}
+_project_status_event_pending: Dict[str, Tuple[str, str, Optional[int]]] = {}
+_project_status_event_task_set: Set[asyncio.Task] = set()
 _BACKGROUND_DRAIN_TIMEOUT_SECONDS = 2.0
 _DEBUG_STATUS_UPDATE_TIMEOUT_SECONDS = 2.0
+
+# Zombie sweep tuning (audit GEN-02): a non-terminal session only becomes a
+# zombie when its inactivity dwarfs the worst-case silent window of a single
+# provider call, so legitimately long generations are never touched.
+_ZOMBIE_SESSION_AGE_MULTIPLIER = 24
+_ZOMBIE_SESSION_CALL_TIMEOUT_MULTIPLIER = 4
 
 
 def _track_background_task(task: asyncio.Task, task_set: Set[asyncio.Task]) -> None:
@@ -393,8 +424,9 @@ async def _debug_update_status(
     *,
     status: Optional[str] = None,
     final_payload: Any = None,
+    phase: Optional[str] = None,
 ) -> None:
-    """Update debugger session status."""
+    """Update debugger session status and current phase."""
     if not debug_logger:
         return
     try:
@@ -402,6 +434,7 @@ async def _debug_update_status(
             session_id,
             status=status,
             final_payload=_serialize_for_debug(final_payload) if final_payload is not None else None,
+            phase=phase,
         )
     except Exception:
         logger.exception("Failed to update debugger status for %s", session_id)
@@ -429,6 +462,7 @@ async def _debug_update_status_with_timeout(
     *,
     status: Optional[str] = None,
     final_payload: Any = None,
+    phase: Optional[str] = None,
     timeout: float = _DEBUG_STATUS_UPDATE_TIMEOUT_SECONDS,
 ) -> None:
     """Run a debugger status update with a small upper bound."""
@@ -438,6 +472,7 @@ async def _debug_update_status_with_timeout(
                 session_id,
                 status=status,
                 final_payload=final_payload,
+                phase=phase,
             ),
             timeout=timeout,
         )
@@ -455,9 +490,19 @@ async def _debug_record_session_transition(
     status: Optional[str] = None,
     phase: Optional[str] = None,
 ) -> None:
-    """Persist relevant non-terminal lifecycle transitions in the debugger DB."""
-    if status is not None:
-        await _debug_update_status_with_timeout(session_id, status=status)
+    """Persist relevant non-terminal lifecycle transitions in the debugger DB.
+
+    The phase is denormalized onto the session row (C13.5) so ``GET
+    /debugger/sessions`` can show what each run was doing without replaying its
+    event timeline. A pure phase change carries no status and must still be
+    written.
+    """
+    if status is not None or phase is not None:
+        await _debug_update_status_with_timeout(
+            session_id,
+            status=status,
+            phase=phase,
+        )
     await _debug_record_event(
         session_id,
         "session_transition",
@@ -534,18 +579,20 @@ async def startup_event():
         debug_logger = await get_debug_logger(
             enabled=config.DEBUGGER.enabled,
             db_path=config.DEBUGGER.db_path,
+            retention_days=config.DEBUGGER.retention_days,
         )
+        # Retention is owned entirely by the debugger (C13.1): with
+        # DEBUGGER_RETENTION_DAYS unset or 0 nothing is ever deleted, and
+        # initialize() only runs cleanup when a window is configured. There is
+        # deliberately no startup cleanup call here.
         await debug_logger.initialize()
         if config.DEBUGGER.enabled and debug_logger.storage_available:
-            logger.info("Debugger persistence initialized")
-            # Cleanup old sessions on startup (older than 7 days)
-            cleanup_result = await debug_logger.cleanup_old_sessions(retention_days=7)
-            if cleanup_result.get("deleted_sessions", 0) > 0:
-                logger.info(
-                    "Debugger cleanup: removed %d sessions and %d events",
-                    cleanup_result["deleted_sessions"],
-                    cleanup_result["deleted_events"]
-                )
+            logger.info(
+                "Debugger persistence initialized (retention: %s)",
+                f"{debug_logger.retention_days} days"
+                if debug_logger.retention_days is not None
+                else "unlimited",
+            )
         elif config.DEBUGGER.enabled and debug_logger.storage_disabled_reason:
             logger.warning(
                 "Debugger persistence disabled during startup: %s",
@@ -610,6 +657,10 @@ async def shutdown_event():
         await _drain_background_tasks(
             _project_session_end_tasks,
             label="project session-end",
+        )
+        await _drain_background_tasks(
+            _project_status_event_task_set,
+            label="project status event",
         )
         await _drain_background_tasks(
             _debug_status_update_tasks,
@@ -774,6 +825,48 @@ def _store_final_result(
         session["late_writes_blocked"] = session.get("late_writes_blocked", 0) + 1
         logger.debug("Blocked final_result overwrite after hard stop for session %s", session_id or session.get("session_id"))
         return
+    last_generation_error = session.get("last_generation_error")
+    finish_metadata = session.get("generation_finish_metadata")
+    existing_error_code = (
+        final_result.get("error_code") or session.get("error_code")
+    )
+    has_conflicting_terminal_error = bool(
+        existing_error_code and existing_error_code != "output_token_limit"
+    )
+    if (
+        final_status_value
+        in {
+            GenerationStatus.REJECTED.value,
+            GenerationStatus.FAILED.value,
+        }
+        and not session.get("iterations")
+        and not has_conflicting_terminal_error
+        and isinstance(last_generation_error, dict)
+        and last_generation_error.get("reason") == "output_token_limit"
+    ):
+        finish_reason = None
+        if isinstance(finish_metadata, dict):
+            finish_reason = finish_metadata.get(
+                "finish_reason"
+            ) or finish_metadata.get("provider_stop_reason")
+
+        if not final_result.get("error_type"):
+            final_result["error_type"] = "generation_error"
+        if not final_result.get("error_code"):
+            final_result["error_code"] = "output_token_limit"
+        if final_result.get("output_truncated") is not True:
+            final_result["output_truncated"] = True
+        if finish_reason and not final_result.get("finish_reason"):
+            final_result["finish_reason"] = finish_reason
+
+        if not session.get("error_type"):
+            session["error_type"] = final_result["error_type"]
+        if not session.get("error_code"):
+            session["error_code"] = final_result["error_code"]
+        if session.get("output_truncated") is not True:
+            session["output_truncated"] = True
+        if finish_reason and not session.get("finish_reason"):
+            session["finish_reason"] = finish_reason
     project_id = session.get("project_id")
     if project_id:
         final_result.setdefault("project_id", project_id)
@@ -817,7 +910,10 @@ def _build_cancelled_final_result(
     *,
     reason: str,
 ) -> Dict[str, Any]:
-    raw_content = session.get("last_generated_content") or session.get("generation_content") or ""
+    # Only accepted content may reach a canonical payload: ``generation_content``
+    # now carries the live draft of the attempt in progress (C2), so a
+    # cancellation must never promote it to the result.
+    raw_content = session.get("last_generated_content") or ""
     if not raw_content:
         raw_content = "No content generated before cancellation"
     original_request = session.get("request")
@@ -875,7 +971,8 @@ def apply_session_cancelled_state(
         queue_session_end=queue_events,
     )
     session["status"] = GenerationStatus.CANCELLED
-    session["current_phase"] = "cancelled"
+    session["completed_at"] = datetime.now()
+    session["current_phase"] = SessionPhase.CANCELLED
     if queue_events:
         queue_project_status_event(session, session_id, "status_change")
     return final_result
@@ -1239,6 +1336,27 @@ async def unsubscribe_project_phase(project_id: str, phase: str, queue: asyncio.
 _PROJECT_PHASE_DATA_MAX_BYTES = 8192
 _MONITOR_CONTENT_SNAPSHOT_MAX_CHARS = 50000
 
+# Monotonic content-event sequence per (session_id, phase). Subscribers use it
+# to DETECT loss: the project bus is best-effort fan-out and drops events when
+# a subscriber queue is full, so a gap in this sequence is the only honest
+# signal that something was missed. Numbers are only spent when at least one
+# subscriber is attached to the phase; counters are released with the session
+# in ``cleanup_session_sidecars``.
+_session_phase_sequences: Dict[str, Dict[str, int]] = {}
+
+
+def _next_content_sequence(session_id: str, phase: str) -> int:
+    """Return the next monotonic sequence number for a session/phase stream."""
+    phase_counters = _session_phase_sequences.setdefault(session_id, {})
+    sequence = phase_counters.get(phase, 0) + 1
+    phase_counters[phase] = sequence
+    return sequence
+
+
+def reset_session_event_sequences(session_id: str) -> None:
+    """Release the sequence counters of a session leaving the runtime."""
+    _session_phase_sequences.pop(session_id, None)
+
 
 def _build_monitor_text_snapshot(value: Any) -> Optional[Dict[str, Any]]:
     """Return a bounded text snapshot for late `/monitor` connections."""
@@ -1253,22 +1371,73 @@ def _build_monitor_text_snapshot(value: Any) -> Optional[Dict[str, Any]]:
     }
 
 
-def _build_monitor_content_snapshot(session: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """Collect bounded per-phase text already accumulated in the session."""
-    generation_text = session.get("generation_content") or session.get("last_generated_content")
-    phase_values = {
-        "auto_qa": session.get("auto_qa_content"),
-        "preflight": session.get("preflight_content"),
-        "generation": generation_text,
-        "qa": session.get("qa_content"),
-        "arbiter": session.get("arbiter_content"),
-        "gran_sabio": session.get("gransabio_content"),
-    }
+def _session_stopped_by_content_filter(session: Dict[str, Any]) -> bool:
+    """Return whether this session ended on a provider content-filter stop."""
+    category = session.get("finish_reason_category")
+    if not isinstance(category, str):
+        return False
+    return category.strip().casefold() == "content_filter"
+
+
+def _build_monitor_content_snapshot(
+    session: Dict[str, Any],
+    *,
+    visibility: str = Visibility.FULL,
+) -> Dict[str, Dict[str, Any]]:
+    """Collect bounded per-phase text already accumulated in the session.
+
+    Every entry carries the ``content_status`` of the text it exposes (C0.1), so
+    a late-joining subscriber reads the snapshot with the same honest labels the
+    live stream carries instead of guessing. After a provider content-filter
+    stop the live draft surfaces survive labelled ``filtered`` (C16); the
+    accepted generation text and the Auto-QA summary are the two things labelled
+    ``accepted``.
+
+    With ``visibility=canonical`` the snapshot only exposes the accepted
+    generation text: every other live field is an in-progress draft surface
+    (thinking, auto-QA, preflight, QA, Arbiter, Gran Sabio) and a canonical
+    subscriber asked not to see drafts, including on late join.
+    """
+    if visibility == Visibility.CANONICAL:
+        phase_values = {"generation": session.get("last_generated_content")}
+        phase_statuses = {"generation": ContentStatus.ACCEPTED}
+    else:
+        live_generation = session.get("generation_content")
+        accepted_generation = session.get("last_generated_content")
+        phase_values = {
+            "auto_qa": session.get("auto_qa_content"),
+            "preflight": session.get("preflight_content"),
+            "generation": live_generation or accepted_generation,
+            "thinking": session.get("thinking_content"),
+            "qa": session.get("qa_content"),
+            "arbiter": session.get("arbiter_content"),
+            "gran_sabio": session.get("gransabio_content"),
+        }
+        filtered = _session_stopped_by_content_filter(session)
+        live_status = (
+            ContentStatus.FILTERED if filtered else ContentStatus.DRAFT
+        )
+        phase_statuses = {phase: live_status for phase in phase_values}
+        # ``auto_qa_content`` never holds a draft: the planner writes it once,
+        # AFTER validating the QA contract, and the live stream publishes that
+        # same text labelled ``accepted``. A generation content-filter stop does
+        # not retroactively filter a summary that was already validated.
+        phase_statuses["auto_qa"] = ContentStatus.ACCEPTED
+        if filtered:
+            generation_status = ContentStatus.FILTERED
+        elif not live_generation or live_generation == accepted_generation:
+            # The live field is empty (so the text below comes from the accepted
+            # snapshot) or holds exactly the body that was committed.
+            generation_status = ContentStatus.ACCEPTED
+        else:
+            generation_status = ContentStatus.DRAFT
+        phase_statuses["generation"] = generation_status
 
     snapshot: Dict[str, Dict[str, Any]] = {}
     for phase, value in phase_values.items():
         text_snapshot = _build_monitor_text_snapshot(value)
         if text_snapshot is not None:
+            text_snapshot["content_status"] = phase_statuses[phase]
             snapshot[phase] = text_snapshot
     return snapshot
 
@@ -1284,6 +1453,11 @@ def _build_project_phase_event(
     content: Optional[str] = None,
     is_thinking: Optional[bool] = None,
     status: Optional[str] = None,
+    # Content contract fields (C0): honest label of what this content is.
+    content_status: Optional[str] = None,
+    iteration: Optional[int] = None,
+    attempt_id: Optional[int] = None,
+    sequence: Optional[int] = None,
     # Retry-specific fields
     attempt: Optional[int] = None,
     max_attempts: Optional[int] = None,
@@ -1301,13 +1475,28 @@ def _build_project_phase_event(
 ) -> str:
     """Create a JSON event string for project/phase streams.
 
+    ``content_status`` labels the content itself (``draft`` | ``accepted`` |
+    ``rejected`` | ``filtered``) and is orthogonal to ``status``, which carries
+    session/project lifecycle. ``iteration`` and ``attempt_id`` identify which
+    generation attempt the content belongs to, and ``sequence`` is monotonic
+    per (session, phase) so a subscriber can detect dropped events.
+
     The ``data`` field carries free-form structured telemetry (e.g. tool-loop
     turn events from QA / Arbiter / GranSabio). If the serialized payload
     exceeds ``_PROJECT_PHASE_DATA_MAX_BYTES``, the field is replaced by a
     degraded ``{"truncated": True, "preview_keys": [...], "size_bytes": N}``
     summary and a warning is logged. The full payload is still available via
     the debugger DB (when ``debug_event_callback`` is bound at the caller).
+
+    Raises:
+        ValueError: if ``content_status`` is not a contract value. Consumers
+            filter on it (``visibility=canonical``), so a typo must fail fast
+            instead of emitting an unfilterable label.
     """
+    if content_status is not None and content_status not in CONTENT_STATUSES:
+        raise ValueError(
+            f"Invalid content_status: {content_status!r}. Valid: {sorted(CONTENT_STATUSES)}"
+        )
     obj: Dict[str, Any] = {
         "type": event,
         "phase": phase,
@@ -1327,6 +1516,15 @@ def _build_project_phase_event(
         obj["content"] = content
     if is_thinking is not None:
         obj["is_thinking"] = is_thinking
+    # Content contract fields
+    if content_status is not None:
+        obj["content_status"] = content_status
+    if iteration is not None:
+        obj["iteration"] = iteration
+    if attempt_id is not None:
+        obj["attempt_id"] = attempt_id
+    if sequence is not None:
+        obj["sequence"] = sequence
     # Retry fields
     if attempt is not None:
         obj["attempt"] = attempt
@@ -1404,6 +1602,10 @@ async def publish_project_phase_chunk(
     event: str = "chunk",
     status: Optional[str] = None,
     end_stream: bool = False,
+    # Content contract fields (C0)
+    content_status: Optional[str] = None,
+    iteration: Optional[int] = None,
+    attempt_id: Optional[int] = None,
     # Retry-specific fields
     attempt: Optional[int] = None,
     max_attempts: Optional[int] = None,
@@ -1424,9 +1626,26 @@ async def publish_project_phase_chunk(
 
     - If end_stream=True, a sentinel is sent after the event to close the stream.
     - If the queue is full, the event is dropped to avoid blocking producers.
+      Terminal events (``session_end``/``project_end``/``stream_end``) are the
+      exception: they evict an older event rather than being dropped, because a
+      subscriber that loses its terminal never learns the run finished.
     - Events with ``data`` > 8KB are truncated to a summary preview; the full
       payload is available via the debugger DB (when ``debug_event_callback``
       is bound at the caller site).
+
+    Content labelling (C0): ``content_status`` says what the content IS
+    (``draft`` | ``accepted`` | ``rejected`` | ``filtered``) and never replaces
+    ``status``, which is session/project lifecycle. ``iteration`` and
+    ``attempt_id`` locate the emission inside the pipeline. Events published
+    with a ``session_id`` also carry a ``sequence`` that is monotonic per
+    (session, phase).
+
+    **Delivery is best effort**: a subscriber whose queue is full loses events
+    silently at the transport level, which is why the sequence exists — a gap
+    means "you missed something", never "nothing happened". Producers of live
+    content must publish through ``core.content_stream.publish_content_event``
+    instead of calling this function directly, so drafts are sampled and the
+    debugger trace is persisted.
     """
     if not project_id:
         return
@@ -1473,6 +1692,8 @@ async def publish_project_phase_chunk(
     if not targets:
         return
 
+    sequence = _next_content_sequence(session_id, phase) if session_id else None
+
     payload = _build_project_phase_event(
         event=event,
         phase=phase,
@@ -1483,6 +1704,10 @@ async def publish_project_phase_chunk(
         content=content,
         is_thinking=is_thinking,
         status=status,
+        content_status=content_status,
+        iteration=iteration,
+        attempt_id=attempt_id,
+        sequence=sequence,
         attempt=attempt,
         max_attempts=max_attempts,
         reason=reason,
@@ -1501,6 +1726,20 @@ async def publish_project_phase_chunk(
             sentinel_enqueued = _put_project_phase_queue_item(q, None)
             if not event_enqueued or not sentinel_enqueued:
                 logger.debug("Unable to enqueue project-phase close event for project %s phase %s", project_id, phase)
+            continue
+        if terminal_event:
+            # A terminal that does NOT close the channel (``session_end``: the
+            # phase stays open for sibling sessions) is still the only terminal
+            # a session-scoped subscriber gets. Dropping it under backpressure
+            # would leave that subscriber open until the project ends, so it
+            # evicts an older event instead of being dropped itself.
+            if not _put_project_phase_terminal_item(q, payload):
+                logger.debug(
+                    "Unable to enqueue project-phase terminal %s for project %s phase %s",
+                    event,
+                    project_id,
+                    phase,
+                )
             continue
         try:
             q.put_nowait(payload)
@@ -1525,6 +1764,41 @@ def _put_project_phase_queue_item(q: asyncio.Queue[str], item: Optional[str]) ->
             return False
 
 
+def _put_project_phase_terminal_item(q: asyncio.Queue[str], item: str) -> bool:
+    """Enqueue a non-closing terminal, evicting an older event if needed.
+
+    Same eviction as ``_put_project_phase_queue_item`` with one guarantee added:
+    a close sentinel (``None``) already queued is NEVER the item evicted. That
+    sentinel is what ends the stream for good (§4); trading it for a
+    ``session_end`` would leave the subscriber hanging forever instead of one
+    event short.
+    """
+    try:
+        q.put_nowait(item)
+        return True
+    except asyncio.QueueFull:
+        pass
+    try:
+        evicted = q.get_nowait()
+    except asyncio.QueueEmpty:
+        return False
+    if evicted is None:
+        # The head is a close sentinel: put it back (the slot is free now) and
+        # give up on the terminal. The stream is already closing anyway.
+        try:
+            q.put_nowait(evicted)  # type: ignore[arg-type]
+        except asyncio.QueueFull:
+            logger.error(
+                "Lost a project-phase close sentinel while enqueueing a terminal"
+            )
+        return False
+    try:
+        q.put_nowait(item)
+        return True
+    except asyncio.QueueFull:
+        return False
+
+
 def _put_project_status_queue_item(q: asyncio.Queue[str], item: Optional[str]) -> bool:
     """Best-effort status queue put that preserves terminal stream_end sentinels."""
     return _put_project_phase_queue_item(q, item)
@@ -1537,9 +1811,21 @@ async def publish_project_session_end(
     request_name: Optional[str] = None,
     project_epoch: Optional[int] = None,
 ) -> None:
-    """Publish a session_end event to all phases for a project."""
+    """Publish a session_end event to every channel of a project.
+
+    Pending draft buffers are flushed first (C0.4): a terminal event must never
+    overtake the content it terminates, and the debugger trace of the session
+    is closed here even when nobody was subscribed.
+
+    The terminal is fanned out over the eight content phases AND over the status
+    channel, so every subscriber of the session learns the session ended
+    whatever it subscribed to (C9).
+    """
     if not project_id:
         return
+    from content_stream import flush_content_events
+
+    await flush_content_events(session_id)
     phases = ["auto_qa", "preflight", "generation", "qa", "arbiter", "smart_edit", "consensus", "gran_sabio"]
     for phase in phases:
         await publish_project_phase_chunk(
@@ -1553,6 +1839,72 @@ async def publish_project_session_end(
             status=status,
             end_stream=False,
         )
+    await _publish_status_channel_session_end(
+        project_id,
+        session_id,
+        status,
+        request_name,
+        project_epoch,
+    )
+
+
+async def _publish_status_channel_session_end(
+    project_id: str,
+    session_id: str,
+    status: str,
+    request_name: Optional[str],
+    project_epoch: Optional[int],
+) -> None:
+    """Deliver the session terminal to the project STATUS subscribers (C9).
+
+    The status channel keeps its own subscription registry, so the content-phase
+    fan-out never reaches it. Without this copy a ``phases=status`` subscription
+    would have no session terminal to close on and would live until the project
+    itself ends.
+
+    The payload is session-scoped on purpose - it carries no project aggregate -
+    so a session-scoped adapter can tell whose terminal it is and never mistakes
+    a sibling's terminal for its own.
+    """
+    if project_epoch is not None:
+        project_state = await cancellation_registry.get_project_state(project_id)
+        if project_state.epoch != project_epoch:
+            return
+
+    lock = project_status_streams_lock
+    targets: List[asyncio.Queue[str]] = []
+
+    if lock is None:
+        targets = list(project_status_streams.get(project_id, []))
+    else:
+        async with lock:
+            targets = list(project_status_streams.get(project_id, []))
+
+    if not targets:
+        return
+
+    payload: Dict[str, Any] = {
+        "type": "session_end",
+        "phase": "status",
+        "session_id": session_id,
+        "status": status,
+        "timestamp": int(time.time() * 1000),
+    }
+    if project_epoch is not None:
+        payload["project_epoch"] = project_epoch
+    if request_name:
+        payload["request_name"] = request_name
+    payload_str = json.dumps(payload, ensure_ascii=True)
+
+    for q in targets:
+        # A terminal must survive backpressure: the queue helper evicts the
+        # oldest pending event instead of dropping the end of the session.
+        if not _put_project_status_queue_item(q, payload_str):
+            logger.debug(
+                "Unable to enqueue status session_end for project %s session %s",
+                project_id,
+                session_id,
+            )
 
 
 def queue_project_session_end(session: Dict[str, Any], session_id: str, status: str) -> None:
@@ -1701,23 +2053,68 @@ async def close_project_status_stream(
             logger.debug("Unable to close status stream queue for project %s", project_id)
 
 
+async def _publish_coalesced_project_status(project_id: str) -> None:
+    """Drain pending status snapshots for a project, publishing only the latest.
+
+    Waits one loop tick so that bursts of session mutations collapse into a
+    single ``get_project_status`` rebuild instead of one task per update.
+    """
+    await asyncio.sleep(0)
+    while True:
+        pending = _project_status_event_pending.pop(project_id, None)
+        if pending is None:
+            return
+        session_id, event_type, project_epoch = pending
+        await publish_project_status_event(
+            project_id,
+            session_id,
+            event_type,
+            expected_project_epoch=project_epoch,
+        )
+
+
+def _clear_project_status_publisher(project_id: str, task: asyncio.Task) -> None:
+    """Forget a finished publisher task unless it was already replaced."""
+    if _project_status_event_tasks.get(project_id) is task:
+        _project_status_event_tasks.pop(project_id, None)
+
+
 def queue_project_status_event(session: Dict[str, Any], session_id: str, event_type: str = "status_change") -> None:
-    """Schedule a project-level status update without blocking."""
+    """Schedule a coalesced project-level status update without blocking.
+
+    At most one publisher task runs per project; repeated updates while it is
+    pending simply overwrite the snapshot it will publish, so a burst of N
+    mutations produces a single ``get_project_status`` rebuild. Tasks are
+    tracked and their results logged like the other lifecycle tasks.
+    """
     project_id = session.get("project_id")
     if not project_id:
         return
-    project_epoch = session.get("project_epoch")
+    _project_status_event_pending[project_id] = (
+        session_id,
+        event_type,
+        session.get("project_epoch"),
+    )
+    publisher = _project_status_event_tasks.get(project_id)
+    if publisher is not None and not publisher.done():
+        return
     try:
-        asyncio.create_task(
-            publish_project_status_event(
-                project_id,
-                session_id,
-                event_type,
-                expected_project_epoch=project_epoch,
-            )
+        task = asyncio.create_task(
+            _publish_coalesced_project_status(project_id),
+            name=f"project-status-event:{project_id}",
         )
     except RuntimeError:
+        _project_status_event_pending.pop(project_id, None)
         logger.debug("Unable to schedule project status event (no running loop)")
+        return
+    _project_status_event_tasks[project_id] = task
+    _track_background_task(task, _project_status_event_task_set)
+    task.add_done_callback(_log_background_task_result)
+    task.add_done_callback(
+        lambda _done, pid=project_id, publisher_task=task: _clear_project_status_publisher(
+            pid, publisher_task
+        )
+    )
 
 
 def update_session_status(
@@ -1750,8 +2147,19 @@ def update_session_status(
             next_value,
         )
         return
-    if current_value in final_status_values and next_value != current_value:
-        logger.debug(
+    # Terminal states are sticky, except that a soft-cancelled session must be
+    # allowed to record a real teardown error as FAILED (audit DOC-03).
+    cancelled_to_failed_with_error = (
+        current_value == GenerationStatus.CANCELLED.value
+        and next_value == GenerationStatus.FAILED.value
+        and bool(session.get("error"))
+    )
+    if (
+        current_value in final_status_values
+        and next_value != current_value
+        and not cancelled_to_failed_with_error
+    ):
+        logger.warning(
             "Ignoring status transition for terminal session %s: %s -> %s",
             session_id,
             current_value,
@@ -1759,6 +2167,10 @@ def update_session_status(
         )
         return
     session["status"] = status
+    if next_value in final_status_values:
+        # Expiration of terminal sessions is measured from the moment they
+        # reach the terminal state, never from session creation (audit GEN-01).
+        session["completed_at"] = datetime.now()
     if phase is not None:
         session["current_phase"] = phase
         set_console_phase(phase)
@@ -1793,17 +2205,30 @@ def update_qa_progress_reset(
     session_id: str,
     total_evaluations: int,
 ) -> None:
-    """Reset QA progress tracking for a new QA phase."""
+    """Reset QA progress tracking for a new QA phase.
+
+    Clears the per-evaluation bookkeeping (completion keys and stream
+    headers) so a new QA run starts from zero instead of inheriting the
+    keys of the previous one.
+    """
     session["qa_evaluations_total"] = total_evaluations
     session["qa_evaluations_completed"] = 0
+    session["qa_completed_evaluations"] = {}
+    session["qa_stream_headers"] = {}
     session["current_qa_model"] = None
     session["current_qa_layer"] = None
     queue_project_status_event(session, session_id)
 
 
 def update_qa_evaluation_started(session: Dict[str, Any], session_id: str, model: str, layer: str) -> None:
-    """
-    Track current QA model/layer and trigger event only when it changes.
+    """Track the QA evaluation just dispatched and emit an event on change.
+
+    QA evaluations run CONCURRENTLY (the scheduler dispatches its slots
+    behind a semaphore and gathers them), so ``current_qa_model`` and
+    ``current_qa_layer`` are a single value that cannot represent all the
+    evaluations in flight: their semantics are "last dispatched". The real
+    per-model/per-layer live detail travels with the QA content chunks,
+    which carry ``qa_model``/``qa_layer`` on every emission.
     """
     prev_model = session.get("current_qa_model")
     prev_layer = session.get("current_qa_layer")
@@ -1814,10 +2239,52 @@ def update_qa_evaluation_started(session: Dict[str, Any], session_id: str, model
     queue_project_status_event(session, session_id)
 
 
-def update_qa_evaluation_completed(session: Dict[str, Any], session_id: str) -> None:
-    """Increment QA completion counter and trigger project status hook."""
-    session["qa_evaluations_completed"] = session.get("qa_evaluations_completed", 0) + 1
+def update_qa_evaluation_completed(
+    session: Dict[str, Any],
+    session_id: str,
+    evaluation_key: str,
+) -> None:
+    """Count one finished QA evaluation exactly once.
+
+    Completion is reported by the QA scheduler lifecycle (dispatch/finish),
+    not by streamed chunks, so it must be idempotent: an evaluation can
+    finish through retries, through an exception, or without ever emitting a
+    chunk, and every one of those paths reports the same
+    ``evaluation_key``. The keys are kept in a plain dict (never a set) so
+    the session state stays JSON-serializable.
+    """
+    completed = session.get("qa_completed_evaluations")
+    if not isinstance(completed, dict):
+        completed = {}
+        session["qa_completed_evaluations"] = completed
+    if evaluation_key in completed:
+        return
+    completed[evaluation_key] = True
+    session["qa_evaluations_completed"] = len(completed)
     queue_project_status_event(session, session_id)
+
+
+def claim_qa_stream_header(
+    session: Dict[str, Any],
+    model: Optional[str],
+    layer: Optional[str],
+) -> bool:
+    """Return True the first time a (model, layer) pair streams QA content.
+
+    The header that labels QA text in the flat session surface must be keyed
+    per (model, layer): concurrent evaluations interleave their chunks, so a
+    shared counter would label whichever evaluation streamed first and leave
+    the rest of the text unattributed.
+    """
+    headers = session.get("qa_stream_headers")
+    if not isinstance(headers, dict):
+        headers = {}
+        session["qa_stream_headers"] = headers
+    key = f"{model or ''}::{layer or ''}"
+    if key in headers:
+        return False
+    headers[key] = True
+    return True
 
 
 def update_consensus_result(
@@ -1837,6 +2304,15 @@ def update_consensus_result(
 
 def cleanup_session_sidecars(session_id: str) -> None:
     """Release per-session auxiliary state after the session is removed."""
+    reset_session_event_sequences(session_id)
+
+    try:
+        from content_stream import discard_session_content_state
+
+        discard_session_content_state(session_id)
+    except Exception as exc:
+        logger.warning("Failed to release content stream state for session %s: %s", session_id, exc)
+
     try:
         get_tracker().clear_session(session_id)
     except Exception as exc:
@@ -1862,6 +2338,44 @@ async def _get_active_session_count() -> int:
         return len(active_sessions)
 
 
+async def _sweep_zombie_session(session_id: str, *, max_age_seconds: float) -> bool:
+    """Cooperatively cancel a non-terminal session idle beyond the worst case.
+
+    Defensive sweep for sessions whose admission or pipeline died without
+    reaching a terminal state (audit GEN-02): requests a soft cancel first so
+    stuck provider calls close, then forces the cancelled terminal state so
+    the regular expiry path releases the session and its registry entry.
+    """
+    try:
+        await cancellation_registry.request_soft_cancel(session_id)
+    except Exception:
+        logger.exception("Zombie sweep: soft cancel failed for session %s", session_id)
+
+    def _mark_cancelled(session: Dict[str, Any]) -> bool:
+        if is_terminal_session(session):
+            return False
+        apply_session_cancelled_state(
+            session,
+            session_id,
+            cancel_mode=CancelMode.SOFT.value,
+            reason=(
+                "Session expired: no activity for more than "
+                f"{int(max_age_seconds)}s (zombie sweep)"
+            ),
+            hard=False,
+        )
+        return True
+
+    marked = await mutate_session(session_id, _mark_cancelled)
+    if marked:
+        logger.warning(
+            "Zombie sweep: cancelled non-terminal session %s idle beyond %ds",
+            session_id,
+            int(max_age_seconds),
+        )
+    return bool(marked)
+
+
 async def perform_session_cleanup() -> Dict[str, Any]:
     """Remove expired sessions and trim verbose logs respecting configuration."""
     lock = active_sessions_lock
@@ -1875,30 +2389,60 @@ async def perform_session_cleanup() -> Dict[str, Any]:
             "remaining_sessions": await _get_active_session_count(),
         }
 
+    # Non-terminal sessions idle far beyond the worst-case silent window of a
+    # single provider call are zombies (audit GEN-02): their admission or
+    # pipeline died without reaching a terminal state. They are cancelled
+    # cooperatively and forced into a terminal state below.
+    call_timeout_seconds = max(1, getattr(config, 'REQUEST_TIMEOUT', 12000))
+    zombie_age_seconds = max(
+        timeout_seconds * _ZOMBIE_SESSION_AGE_MULTIPLIER,
+        call_timeout_seconds * _ZOMBIE_SESSION_CALL_TIMEOUT_MULTIPLIER,
+    )
+
     expired_sessions: List[str] = []
+    zombie_sessions: List[str] = []
     trimmed_logs: List[tuple[str, int]] = []
     remaining_sessions = 0
 
     def _cleanup_sessions(items):
-        nonlocal expired_sessions, trimmed_logs
+        nonlocal expired_sessions, zombie_sessions, trimmed_logs
         for session_id, session in items:
-            created_at = session.get('created_at')
             status = session.get('status')
-            if isinstance(created_at, datetime) and timeout_seconds > 0:
+            is_final = status in {
+                GenerationStatus.COMPLETED,
+                GenerationStatus.REJECTED,
+                GenerationStatus.FAILED,
+                GenerationStatus.CANCELLED
+            }
+            # Terminal sessions expire from the moment they reached the
+            # terminal state (completed_at) or their last activity, never from
+            # creation (audit GEN-01); sessions predating completed_at fall
+            # back to last_activity_at and then created_at.
+            if is_final:
+                reference_at = (
+                    session.get('completed_at')
+                    or session.get('last_activity_at')
+                    or session.get('created_at')
+                )
+            else:
+                reference_at = session.get('last_activity_at') or session.get('created_at')
+            if isinstance(reference_at, datetime):
                 try:
-                    age_seconds = (now - created_at).total_seconds()
+                    age_seconds = (now - reference_at).total_seconds()
                 except Exception:
                     age_seconds = timeout_seconds + 1
-                is_final = status in {
-                    GenerationStatus.COMPLETED,
-                    GenerationStatus.REJECTED,
-                    GenerationStatus.FAILED,
-                    GenerationStatus.CANCELLED
-                }
-                if age_seconds > timeout_seconds and is_final:
+                if is_final and timeout_seconds > 0 and age_seconds > timeout_seconds:
                     expired_sessions.append(session_id)
                     continue
+                if not is_final and age_seconds > zombie_age_seconds:
+                    zombie_sessions.append(session_id)
+                    continue
 
+            # Trimming only ever drops the OLDEST entries, which is what keeps
+            # the C12 cursor honest: 'verbose_log_next_offset' counts every
+            # entry ever appended and is never rewound, so the base offset
+            # reported by /status (next_offset - len(verbose_log)) advances by
+            # exactly trim_count here, the same way it does on the append path.
             verbose_log = session.get('verbose_log')
             if isinstance(verbose_log, list) and len(verbose_log) > max_entries:
                 trim_count = len(verbose_log) - max_entries
@@ -1921,6 +2465,11 @@ async def perform_session_cleanup() -> Dict[str, Any]:
 
     for session_id in expired_sessions:
         await cancellation_registry.unregister_session(session_id)
+
+    zombies_swept = 0
+    for session_id in zombie_sessions:
+        if await _sweep_zombie_session(session_id, max_age_seconds=zombie_age_seconds):
+            zombies_swept += 1
 
     reservation_ttl = timeout_seconds if timeout_seconds > 0 else 3600
     reservation_ttl = max(60, reservation_ttl)
@@ -1950,6 +2499,7 @@ async def perform_session_cleanup() -> Dict[str, Any]:
 
     return {
         "expired_count": len(expired_sessions),
+        "zombie_count": zombies_swept,
         "trimmed_log_count": len(trimmed_logs),
         "remaining_sessions": remaining_sessions,
     }
@@ -2013,9 +2563,18 @@ async def session_cleanup_loop() -> None:
 
 # --- Project Status Utilities ---
 
-async def get_project_status(project_id: str, *, include_content_snapshot: bool = False) -> dict:
+async def get_project_status(
+    project_id: str,
+    *,
+    include_content_snapshot: bool = False,
+    visibility: str = Visibility.FULL,
+) -> dict:
     """
     Retrieve the status of all sessions belonging to a project.
+
+    ``visibility`` mirrors the stream parameter (C0.6): with ``canonical`` the
+    optional content snapshot only carries accepted content, so a late-joining
+    canonical subscriber never receives drafts through the initial snapshot.
 
     Returns a JSON-serializable dict with the structure:
     {
@@ -2171,8 +2730,28 @@ async def get_project_status(project_id: str, *, include_content_snapshot: bool 
                     if isinstance(final_result, dict)
                     else None
                 ) or session.get("error_code") or provider_error.get("kind")
+            for key in (
+                "error_type",
+                "error_code",
+                "finish_reason",
+            ):
+                value = (
+                    final_result.get(key)
+                    if isinstance(final_result, dict)
+                    else None
+                ) or session.get(key)
+                if value:
+                    session_info[key] = value
+            output_truncated = (
+                final_result.get("output_truncated")
+                if isinstance(final_result, dict)
+                and final_result.get("output_truncated") is not None
+                else session.get("output_truncated")
+            )
+            if output_truncated is not None:
+                session_info["output_truncated"] = output_truncated
             if include_content_snapshot:
-                content_snapshot = _build_monitor_content_snapshot(session)
+                content_snapshot = _build_monitor_content_snapshot(session, visibility=visibility)
                 if content_snapshot:
                     session_info["content_snapshot"] = content_snapshot
             sessions_data.append(session_info)

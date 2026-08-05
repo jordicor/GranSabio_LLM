@@ -64,7 +64,21 @@ const KNOWN_STRUCTURED_EVENTS = new Set([
     'tool_loop_provider_terminal',
     'tool_loop_error',
     'tool_loop_complete',
+    // Verdicts of an attempt that died (C3/C5-bis/C6). The drafts the operator
+    // was reading are superseded on the record instead of vanishing.
+    'iteration_rejected',
+    'tool_loop_rejected',
+    'review_attempt_rejected',
 ]);
+// Content labels of the event contract (C0.1). `draft` is work in progress;
+// every other value closes an attempt.
+const CONTENT_STATUS_DRAFT = 'draft';
+const CONTENT_STATUS_TAGS = {
+    draft: 'DRAFT',
+    accepted: 'ACCEPTED',
+    rejected: 'REJECTED',
+    filtered: 'FILTERED',
+};
 const DEFAULT_PANEL_MAX_CHARS = 80000;
 const EVERYTHING_PANEL_MAX_CHARS = 40000;
 const THINKING_EVENT_TYPES = new Set(['thinking_delta']);
@@ -82,6 +96,10 @@ const MONITOR_LINE_CLASS_BY_TAG = {
     ERROR: 'error',
     RETRY_ERROR: 'error',
     GROUNDING: 'grounding',
+    DRAFT: 'draft',
+    ACCEPTED: 'accepted',
+    REJECTED: 'rejected',
+    FILTERED: 'rejected',
     SESSION_END: 'status',
     STATUS_CHANGE: 'status',
     STATUS: 'status',
@@ -511,11 +529,7 @@ function clearLog() {
     log('Log cleared', 'info');
 }
 
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-}
+// escapeHtml / escapeHtmlAttr come from /static/js/escape_utils.js (loaded first by the template).
 
 // ============================================
 // UI UPDATES
@@ -670,13 +684,23 @@ function updateAnalysisStats(iterData) {
     if (analysisBytesEl) analysisBytesEl.textContent = totals.bytes;
 }
 
-function indexQAContent(iterData, data, content) {
+/**
+ * Index QA content by layer and model for the filtered views.
+ * @param {Object} iterData - Iteration store of the request
+ * @param {Object} data - Parsed stream event carrying qa_layer/qa_model
+ * @param {string} content - Text to index
+ * @param {Object} [options] - `replace: true` when `content` is the full body
+ *   of the attempt (a labelled commit, C0.7) instead of a delta
+ */
+function indexQAContent(iterData, data, content, options = {}) {
     if (!iterData || !data || !content || !data.qa_layer || !data.qa_model) {
         return;
     }
 
     const layer = data.qa_layer;
     const model = data.qa_model;
+    const replace = options.replace === true;
+    const merge = (previous) => (replace ? content : (previous || '') + content);
 
     if (!iterData.qaLayers.includes(layer)) {
         iterData.qaLayers.push(layer);
@@ -685,14 +709,13 @@ function indexQAContent(iterData, data, content) {
         iterData.qaModels.push(model);
     }
 
-    iterData.qaByLayer[layer] = (iterData.qaByLayer[layer] || '') + content;
-    iterData.qaByModel[model] = (iterData.qaByModel[model] || '') + content;
+    iterData.qaByLayer[layer] = merge(iterData.qaByLayer[layer]);
+    iterData.qaByModel[model] = merge(iterData.qaByModel[model]);
 
     if (!iterData.qaByLayerModel[layer]) {
         iterData.qaByLayerModel[layer] = {};
     }
-    iterData.qaByLayerModel[layer][model] =
-        (iterData.qaByLayerModel[layer][model] || '') + content;
+    iterData.qaByLayerModel[layer][model] = merge(iterData.qaByLayerModel[layer][model]);
 }
 
 function buildGroupedQAContent(iterData) {
@@ -1258,6 +1281,33 @@ function appendContent(phase, text) {
     showReceiving(phase);
 }
 
+/**
+ * Re-render a panel from its stored text after a labelled commit replaced it.
+ *
+ * Accepted/rejected/filtered chunks are full snapshots (C0.7), so the panel is
+ * rebuilt instead of appended to. Muted panels keep counting bytes without
+ * rendering, exactly like appendContent().
+ * @param {string} phase - Display panel name
+ * @param {string} storedText - Full text now held for the panel
+ * @param {number} byteCount - Size of the emission that triggered the replace
+ */
+function replacePanelContent(phase, storedText, byteCount) {
+    const content = document.getElementById(`content-${phase}`);
+    if (!content) return;
+
+    const state = panelStates[phase];
+    if (state === 'soft' || state === 'hard') {
+        updatePhaseStats(phase, byteCount);
+        setBadge(phase, 'muted');
+        return;
+    }
+
+    clearThinkingIndicator(phase, { finishBlock: true });
+    setPanelStoredContent(phase, storedText);
+    updatePhaseStats(phase, byteCount);
+    showReceiving(phase);
+}
+
 function getPanelMaxChars(phase) {
     return phase === 'everything' ? EVERYTHING_PANEL_MAX_CHARS : DEFAULT_PANEL_MAX_CHARS;
 }
@@ -1524,6 +1574,9 @@ function initializeIteration(request, iteration) {
         request.iterations[iteration] = {
             content: content,
             stats: phaseStats,
+            // Last (content_status|attempt|iteration|subphase) banner written per
+            // phase, so a new attempt or a commit is announced exactly once.
+            contentMarkers: {},
             // QA filter structures - indexed content for filtering
             qaByLayer: {},       // { "Layer Name": "accumulated content..." }
             qaByModel: {},       // { "model-name": "accumulated content..." }
@@ -2761,31 +2814,6 @@ function resetAnalysisFilter() {
     document.querySelectorAll('.analysis-pill').forEach(p => p.classList.remove('active'));
 }
 
-/**
- * Escape HTML for safe display
- * @param {string} text - Text to escape
- * @returns {string} Escaped text
- */
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-}
-
-/**
- * Escape text for use in HTML attributes
- * @param {string} text - Text to escape
- * @returns {string} Escaped text safe for attributes
- */
-function escapeHtmlAttr(text) {
-    return String(text ?? '')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
-}
-
 // ============================================
 // MESSAGE HANDLING (PROJECT MODE)
 // ============================================
@@ -2817,6 +2845,14 @@ function summarizeStructuredPayload(payload) {
         'status',
         'reason',
         'error',
+        // Verdict payloads of a discarded attempt (iteration_rejected,
+        // tool_loop_rejected, review_attempt_rejected).
+        'average_score',
+        'deal_breakers',
+        'final_rejection',
+        'turns',
+        'accepted_via',
+        'content_chars',
         'claims_count',
         'grounded_claims',
         'unsupported_claims',
@@ -2866,7 +2902,10 @@ function describeEventForLog(data) {
     const tool = firstPresent(payload.tool_name, payload.tool);
     const turn = firstPresent(payload.turn);
     const surface = firstPresent(payload.api_surface);
+    // Content label (C0.1): tells a discarded attempt from a committed one.
+    const contentStatus = firstPresent(data?.content_status, payload.content_status);
 
+    if (contentStatus) parts.push(`content_status=${contentStatus}`);
     if (model) parts.push(`model=${model}`);
     if (layer) parts.push(`layer=${layer}`);
     if (tool) parts.push(`tool=${tool}`);
@@ -2907,6 +2946,94 @@ function getThinkingTextFromEvent(data) {
 
 function isThinkingEvent(data) {
     return data?.is_thinking === true || THINKING_EVENT_TYPES.has(data?.type);
+}
+
+/**
+ * Content label of an event (C0.1), defaulting to draft.
+ * @param {Object} data - Parsed stream event
+ * @returns {string} - draft | accepted | rejected | filtered
+ */
+function contentStatusOf(data) {
+    const status = data?.content_status;
+    return typeof status === 'string' && status ? status : CONTENT_STATUS_DRAFT;
+}
+
+/**
+ * Whether a chunk carries the FULL body of its attempt instead of a delta.
+ *
+ * Anything labelled other than `draft` closes the attempt and publishes the
+ * whole text (C0.7): the accepted commits (`accepted_stream`, `accepted_json`,
+ * `tool_loop_final`) and the candidate a later guard republished as rejected
+ * (`rejected_json`). A consumer that appends must REPLACE what it accumulated
+ * for that (session, phase), or it shows the dead draft glued to the text that
+ * supersedes it.
+ * @param {Object} data - Parsed chunk event
+ * @returns {boolean}
+ */
+function isSnapshotChunk(data) {
+    return contentStatusOf(data) !== CONTENT_STATUS_DRAFT;
+}
+
+/**
+ * Build the banner line that labels one content emission for the operator.
+ * @param {Object} data - Parsed stream event
+ * @param {number} chars - Length of the emitted body
+ * @returns {string} - Monitor line, newline terminated
+ */
+function buildContentStatusLine(data, chars) {
+    const status = contentStatusOf(data);
+    const tag = CONTENT_STATUS_TAGS[status] || 'EVENT';
+    const parts = [`phase=${normalizePhaseName(data.phase, 'generation')}`];
+    if (data.iteration !== undefined && data.iteration !== null) {
+        parts.push(`iteration=${data.iteration}`);
+    }
+    if (data.attempt_id !== undefined && data.attempt_id !== null) {
+        parts.push(`attempt=${data.attempt_id}`);
+    }
+    if (data.subphase) {
+        parts.push(`subphase=${data.subphase}`);
+    }
+    if (data.qa_layer) {
+        parts.push(`layer=${data.qa_layer}`);
+    }
+    if (data.qa_model) {
+        parts.push(`model=${data.qa_model}`);
+    }
+    parts.push(`chars=${chars}`);
+    if (data.reason) {
+        parts.push(`reason=${data.reason}`);
+    }
+    return `\n[${tag}] ${parts.join(' ')}\n`;
+}
+
+/**
+ * Return the banner to prepend when a phase starts a new labelled emission.
+ *
+ * Drafts stream unannotated once the attempt is announced; a new attempt_id,
+ * iteration or content_status opens a new banner so the operator can tell a
+ * live draft from the committed text and see where an attempt was replaced.
+ * @param {Object} iterData - Iteration store of the request
+ * @param {string} phase - Normalized content phase
+ * @param {Object} data - Parsed chunk event
+ * @param {number} chars - Length of the emitted body
+ * @returns {string} - Banner line, or '' when the marker did not change
+ */
+function contentAttemptBanner(iterData, phase, data, chars) {
+    // Keyed by producer, not just by phase: QA runs several models in parallel
+    // on the same phase, and a shared key would re-announce the same attempt on
+    // every alternation between them.
+    const key = `${phase}|${data.qa_model || ''}|${data.qa_layer || ''}`;
+    const marker = [
+        contentStatusOf(data),
+        data.attempt_id ?? '',
+        data.iteration ?? '',
+        data.subphase || '',
+    ].join('|');
+    if (iterData.contentMarkers[key] === marker) {
+        return '';
+    }
+    iterData.contentMarkers[key] = marker;
+    return buildContentStatusLine(data, chars);
 }
 
 function storeThinkingForRequest(request, data, thinkingText, displayPhase) {
@@ -3030,6 +3157,25 @@ function formatStructuredEventLine(data) {
         const label = data.phase === 'generation' ? 'RETRY_ERROR' : 'ERROR';
         const reason = data.reason || data.message || payloadSummary || 'unknown';
         return `[${label}] phase=${data.phase || 'status'} ${reason}\n`;
+    }
+
+    if (eventType === 'iteration_rejected') {
+        const iteration = data.iteration !== undefined && data.iteration !== null
+            ? ` iteration=${data.iteration}`
+            : '';
+        const attempt = data.attempt_id !== undefined && data.attempt_id !== null
+            ? ` attempt=${data.attempt_id}`
+            : '';
+        const reason = data.reason ? ` reason=${data.reason}` : '';
+        // `reason` already summarizes scores and deal-breakers; only the flag
+        // that says whether the run gave up is not in it.
+        const final = data.data && data.data.final_rejection ? ' final_rejection=true' : '';
+        return `[REJECTED] iteration_rejected${iteration}${attempt}${reason}${final}\n`;
+    }
+
+    if (eventType === 'tool_loop_rejected' || eventType === 'review_attempt_rejected') {
+        const reason = data.reason ? ` reason=${data.reason}` : '';
+        return `[REJECTED] ${eventType} phase=${data.phase || 'unknown'}${reason}${payloadSummary ? ' ' + payloadSummary : ''}\n`;
     }
 
     if (eventType === 'project_end') {
@@ -3299,6 +3445,11 @@ function handleChunk(data) {
 
     if (!content) return;
 
+    // A labelled commit (accepted/rejected/filtered) is the whole body of the
+    // attempt, so it REPLACES the drafts accumulated for this phase (C0.7).
+    const isSnapshot = isSnapshotChunk(data);
+    let banner = '';
+
     // Store content in request's iteration-specific data structure
     if (request && phase !== 'status') {
         const iteration = request.currentIteration;
@@ -3310,14 +3461,21 @@ function handleChunk(data) {
 
         // Store in the correct iteration
         if (iterData.content.hasOwnProperty(phase)) {
-            iterData.content[phase] += content;
-            iterData.stats[phase].chunks++;
-            iterData.stats[phase].bytes += content.length;
+            banner = contentAttemptBanner(iterData, phase, data, content.length);
+            if (isSnapshot) {
+                iterData.content[phase] = banner + content;
+                iterData.stats[phase].chunks = 1;
+                iterData.stats[phase].bytes = content.length;
+            } else {
+                iterData.content[phase] += banner + content;
+                iterData.stats[phase].chunks++;
+                iterData.stats[phase].bytes += content.length;
+            }
         }
 
         // Index QA content by layer and model for filtering/grouped display
         if (phase === 'qa' && data.qa_layer && data.qa_model) {
-            indexQAContent(iterData, data, content);
+            indexQAContent(iterData, data, banner + content, { replace: isSnapshot });
         }
     }
 
@@ -3351,9 +3509,18 @@ function handleChunk(data) {
                 }
                 // Flash the analysis badge
                 showReceiving('analysis');
+            } else if (isSnapshot) {
+                // Commit: rebuild the panel from the stored text, which the
+                // snapshot already replaced, instead of appending to the draft.
+                const iterData = request.iterations[request.currentIteration];
+                replacePanelContent(
+                    displayPhase,
+                    iterData ? iterData.content[phase] : banner + content,
+                    content.length,
+                );
             } else {
                 // Normal append behavior
-                appendContent(displayPhase, content);
+                appendContent(displayPhase, banner + content);
             }
         } else {
             // Viewing history - show activity indicator that live data is coming
@@ -3361,15 +3528,22 @@ function handleChunk(data) {
         }
     } else if (!request) {
         // No session_id in data - still show (legacy behavior)
+        const standaloneBanner = isSnapshot ? buildContentStatusLine(data, content.length) : '';
         if (ANALYSIS_CONTENT_KEYS.includes(phase)) {
             // For legacy mode, append to analysis panel with separator
             const analysisEl = document.getElementById('content-analysis');
             if (analysisEl) {
                 if (analysisFilterState === null || analysisFilterState === phase) {
-                    analysisEl.textContent += content;
+                    if (isSnapshot) {
+                        analysisEl.textContent = standaloneBanner + content;
+                    } else {
+                        analysisEl.textContent += content;
+                    }
                     analysisEl.scrollTop = analysisEl.scrollHeight;
                 }
             }
+        } else if (isSnapshot) {
+            replacePanelContent(displayPhase, standaloneBanner + content, content.length);
         } else {
             appendContent(displayPhase, content);
         }
@@ -4245,16 +4419,6 @@ function updateSmartEditStats() {
         deltaEl.textContent = delta > 0 ? `+${delta}` : delta.toString();
         deltaEl.style.color = delta > 0 ? '#10b981' : (delta < 0 ? '#ef4444' : 'inherit');
     }
-}
-
-/**
- * Escape HTML for safe display
- */
-function escapeHtml(text) {
-    if (text === null || text === undefined) return '';
-    const div = document.createElement('div');
-    div.textContent = String(text);
-    return div.innerHTML;
 }
 
 // Cleanup on page unload

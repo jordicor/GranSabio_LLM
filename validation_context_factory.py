@@ -1,8 +1,7 @@
 """
 Validation context factory for non-generator tool loops (QA, Arbiter, GranSabio).
 
-Responsibility (Fase 2, PROPOSAL_TOOLS_FOR_QA_ARBITER_GRANSABIO.md §3.4.1, §4.11):
-give the shared ``call_ai_with_validation_tools`` loop a **lightweight,
+Responsibility: give the shared ``call_ai_with_validation_tools`` loop a **lightweight,
 measurement-only** representation of the original request so that deterministic
 validators (word count, phrase frequency, lexical diversity, JSON schema) can
 run against the candidate text without dragging in generator-only concepts

@@ -74,16 +74,16 @@ def print_separator(title: str):
 
 def print_result(scenario: str, content: str, elapsed: float, error: str = None):
     """Print test result in a formatted way."""
-    print(f"\n📋 Scenario: {scenario}")
-    print(f"⏱️  Elapsed: {elapsed:.2f}s")
+    print(f"\n[INFO] Scenario: {scenario}")
+    print(f"[TIME] Elapsed: {elapsed:.2f}s")
 
     if error:
-        print(f"❌ ERROR: {error}")
+        print(f"[FAIL] ERROR: {error}")
     elif content:
         word_count = len(content.split())
         char_count = len(content)
-        print(f"✅ SUCCESS: {word_count} words, {char_count} chars")
-        print(f"📄 Content preview (first 300 chars):")
+        print(f"[OK] SUCCESS: {word_count} words, {char_count} chars")
+        print(f"[INFO] Content preview (first 300 chars):")
         print("-" * 40)
         print(content[:300] + ("..." if len(content) > 300 else ""))
         print("-" * 40)
@@ -91,11 +91,11 @@ def print_result(scenario: str, content: str, elapsed: float, error: str = None)
         # Try to parse as JSON
         try:
             parsed = json.loads(content)
-            print(f"✅ Valid JSON: {json.dumps(parsed, indent=2)[:200]}...")
+            print(f"[OK] Valid JSON: {json.dumps(parsed, indent=2)[:200]}...")
         except json.JSONDecodeError as e:
-            print(f"⚠️  JSON parse error: {e}")
+            print(f"[WARN] JSON parse error: {e}")
     else:
-        print(f"⚠️  EMPTY RESPONSE (0 words)")
+        print(f"[WARN] EMPTY RESPONSE (0 words)")
 
 
 async def test_scenario_streaming(
@@ -107,7 +107,7 @@ async def test_scenario_streaming(
 ) -> dict:
     """Test a specific scenario using streaming API."""
 
-    print(f"\n🔄 Testing: {scenario_name}")
+    print(f"\n[INFO] Testing: {scenario_name}")
     print(f"   json_output={json_output}, json_schema={'YES' if json_schema else 'NO'}, thinking_budget={thinking_budget}")
 
     start_time = datetime.now()
@@ -153,7 +153,7 @@ async def test_scenario_non_streaming(
 ) -> dict:
     """Test a specific scenario using non-streaming API."""
 
-    print(f"\n🔄 Testing (non-streaming): {scenario_name}")
+    print(f"\n[INFO] Testing (non-streaming): {scenario_name}")
     print(f"   json_output={json_output}, json_schema={'YES' if json_schema else 'NO'}, thinking_budget={thinking_budget}")
 
     start_time = datetime.now()
@@ -202,7 +202,7 @@ async def run_all_tests():
 
     # Check if Gemini is available
     if not ai_service.google_new_client:
-        print("\n❌ ERROR: Google Gemini client not initialized. Check API key.")
+        print("\n[FAIL] ERROR: Google Gemini client not initialized. Check API key.")
         return
 
     results = []
@@ -226,7 +226,7 @@ async def run_all_tests():
     # Scenario 2: JSON Schema WITH thinking (THIS IS THE SUSPECTED PROBLEM)
     result = await test_scenario_streaming(
         ai_service,
-        "JSON Schema + WITH Thinking (streaming) ⚠️ SUSPECTED ISSUE",
+        "JSON Schema + WITH Thinking (streaming) [WARN] SUSPECTED ISSUE",
         json_output=True,
         json_schema=JSON_SCHEMA,
         thinking_budget=THINKING_BUDGET
@@ -275,7 +275,7 @@ async def run_all_tests():
     # Scenario 6: JSON Schema WITH thinking (non-streaming) - SUSPECTED PROBLEM
     result = await test_scenario_non_streaming(
         ai_service,
-        "JSON Schema + WITH Thinking (non-streaming) ⚠️ SUSPECTED ISSUE",
+        "JSON Schema + WITH Thinking (non-streaming) [WARN] SUSPECTED ISSUE",
         json_output=True,
         json_schema=JSON_SCHEMA,
         thinking_budget=THINKING_BUDGET
@@ -316,7 +316,7 @@ async def run_all_tests():
     for r in results:
         schema_str = "YES" if r["json_schema"] else "NO"
         thinking_str = "YES" if r["thinking_budget"] > 0 else "NO"
-        status = "✅ OK" if r["word_count"] > 0 and not r["error"] else "❌ FAIL"
+        status = "[OK]" if r["word_count"] > 0 and not r["error"] else "[FAIL]"
         print(f"| {r['scenario'][:40]:<40} | {schema_str:^11} | {thinking_str:^8} | {r['word_count']:>5} | {r['elapsed']:>4.1f}s | {status} |")
 
     # Analysis
@@ -333,17 +333,17 @@ async def run_all_tests():
     no_schema_thinking_ok = all(r["word_count"] > 0 for r in no_schema_thinking_results)
 
     if schema_thinking_fail and schema_no_thinking_ok and no_schema_thinking_ok:
-        print("\n🎯 CONFIRMED: The issue is specifically JSON Schema + Thinking combination!")
+        print("\n[OK] CONFIRMED: The issue is specifically JSON Schema + Thinking combination!")
         print("   - JSON Schema WITHOUT Thinking: WORKS")
         print("   - JSON Schema WITH Thinking: FAILS (empty response)")
         print("   - JSON Mode (flexible) WITH Thinking: WORKS")
-        print("\n💡 RECOMMENDATION: When thinking is enabled, use JSON mode (flexible)")
+        print("\n[INFO] RECOMMENDATION: When thinking is enabled, use JSON mode (flexible)")
         print("   instead of JSON Schema, and let json_guard handle validation.")
     elif schema_thinking_fail:
-        print("\n⚠️  JSON Schema + Thinking appears to fail, but other scenarios also had issues.")
+        print("\n[WARN] JSON Schema + Thinking appears to fail, but other scenarios also had issues.")
         print("   Manual review of results recommended.")
     else:
-        print("\n🤔 Results don't match expected pattern. Manual analysis needed.")
+        print("\n[INFO] Results don't match expected pattern. Manual analysis needed.")
         print("   Check individual test results above.")
 
     # Save results to file
@@ -355,7 +355,7 @@ async def run_all_tests():
             "thinking_budget": THINKING_BUDGET,
             "results": results
         }, f, indent=2, ensure_ascii=False)
-    print(f"\n📁 Results saved to: {output_file}")
+    print(f"\n[INFO] Results saved to: {output_file}")
 
 
 if __name__ == "__main__":

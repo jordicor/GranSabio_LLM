@@ -563,24 +563,21 @@ class TestBudgetScorer:
         """
         Given: AI service raises an error
         When: score_claims is called
-        Then: Returns fallback result without crashing
+        Then: The error propagates so the grounding engine can apply the
+              configured on_flag policy (audit AUX-01: a scoring error must
+              not be masked as a zero-gap, unflagged claim)
         """
         mock_ai_service.generate_with_logprobs.side_effect = Exception("API Error")
 
         scorer = BudgetScorer(mock_ai_service)
         config_obj = EvidenceGroundingConfig(enabled=True, model="gpt-4o-mini")
 
-        results = await scorer.score_claims(
-            claims=[sample_claim],
-            spans=sample_spans,
-            config_obj=config_obj,
-        )
-
-        # Should return a result even on error
-        assert len(results) == 1
-        # Conservative: don't flag on error, budget_gap should be 0
-        assert results[0].budget_gap == 0.0
-        assert not results[0].flagged
+        with pytest.raises(Exception, match="API Error"):
+            await scorer.score_claims(
+                claims=[sample_claim],
+                spans=sample_spans,
+                config_obj=config_obj,
+            )
 
     @pytest.mark.asyncio
     async def test_score_claims_passes_budget_gap_threshold_from_config(self, mock_ai_service, sample_claim, sample_spans):

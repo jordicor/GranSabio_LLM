@@ -97,6 +97,10 @@ data/tracking/*.json
 # Local request-process timeout overrides
 request_timeouts.json
 
+# Local model-capacity policy overrides
+model_limits.curated.local.json
+model_family_floors.local.json
+
 # Backups
 backups/
 *.bak
@@ -109,11 +113,21 @@ test_outputs/
 # Auto-generated model-route benchmark result dumps (regenerated per run)
 dev_tests/model_benchmark_results/
 
+# Ad-hoc benchmark / test-output dumps in dev_tests (regenerated per run by
+# generator scripts; no value, and they capture arbitrary prompt/response
+# content). Also excluded from the GitHub sync via HARD_EXCLUDE_FILE_PATTERNS.
+dev_tests/*_results.json
+dev_tests/gpt52_smartedit_debug.json
+
 # Database files
 *.db
 *.sqlite
+*.sqlite3
 *.db-shm
 *.db-wal
+
+# Native/runtime crash dumps (may contain local paths and stack frames)
+*.stackdump
 
 # API response cache
 cache/

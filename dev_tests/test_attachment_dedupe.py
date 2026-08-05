@@ -226,7 +226,10 @@ async def test_cleanup_expires_old_uploads_and_collects_unreferenced_blobs(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_cleanup_keeps_unreferenced_blobs_when_gc_is_disabled(tmp_path):
+async def test_cleanup_keeps_unreferenced_blobs_when_gc_is_disabled(tmp_path, monkeypatch):
+    # GC is enabled by default since ADJ-03; disable it explicitly to test the
+    # opt-out path (config flag off + env override off).
+    monkeypatch.setenv("GRANSABIO_ATTACHMENTS_GC_ENABLED", "0")
     manager = AttachmentManager(settings=_settings(tmp_path), pepper="test-pepper")
     record = await manager.store_bytes(
         username="alice",

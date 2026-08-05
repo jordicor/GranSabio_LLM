@@ -268,14 +268,12 @@ class TestModelCapacityValidation:
         engine = GranSabioEngine(ai_service=MagicMock())
         assert engine._get_default_thinking_tokens("claude-sonnet-4-20250514") == 10000
 
-    def test_ensure_adequate_model_capacity_sufficient(self, mock_config):
-        engine = GranSabioEngine(ai_service=MagicMock())
-        assert engine._ensure_adequate_model_capacity(1000, "claude-sonnet-4-20250514", None) == "claude-sonnet-4-20250514"
-
-    def test_resolve_model_alias(self, mock_config):
-        mock_config.model_specs = {"aliases": {"claude": "claude-sonnet-4-20250514"}}
-        engine = GranSabioEngine(ai_service=MagicMock())
-        assert engine._resolve_model_alias("claude") == "claude-sonnet-4-20250514"
+    # NOTE: _ensure_adequate_model_capacity and _resolve_model_alias were removed
+    # in the Context Admission Policy work (Batch 4). Silent model swaps on large
+    # content are gone; admission is enforced by the AIService frontier guard, and
+    # a model change is only legitimate via explicit routing. Their tests were
+    # deleted with the code (no legacy shims). Absence-based coverage lives in
+    # dev_tests/test_context_degradations.py.
 
 
 # ============================================================================

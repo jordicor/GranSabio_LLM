@@ -247,7 +247,10 @@ class TestGenerateEndpoint:
         Then: Returns 403
         """
         project_id = "cancelled-project-test"
-        # Cancel the project first
+        # Activate the project first, then cancel it: since GEN-06, stopping an
+        # unknown project no longer creates a cancelled runtime (it 404s), so
+        # the cancelled state must come from a project that actually existed.
+        base_test_client.post(f"/project/start/{project_id}")
         base_test_client.post(f"/project/stop/{project_id}")
 
         # Try to generate with cancelled project

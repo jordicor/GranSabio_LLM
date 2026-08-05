@@ -8,6 +8,9 @@ Provides structured evaluation with scores, feedback, and edit suggestions.
 
 import asyncio
 import logging
+import math
+import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 
 # Use optimized JSON (3.6x faster than standard json)
@@ -17,8 +20,23 @@ if TYPE_CHECKING:
     from logging_utils import PhaseLogger
     from models import ImageData
 
-from ai_service import AIRequestError, AIService, StreamChunk
+from ai_service import (
+    AIRequestError,
+    AIService,
+    GenerationStoppedUnexpectedly,
+    StreamChunk,
+    is_content_filter_stop,
+)
 from config import EDITABLE_CONTENT_TYPES, config
+from content_events import (
+    ContentEvent,
+    ContentEventSink,
+    ContentEventTemplate,
+    ContentPhase,
+    ContentStatus,
+    ContentSubphase,
+)
+from context_budget import ContextBudgetExceeded
 from deterministic_validation import DraftValidationResult, validate_generation_candidate
 from llm_routing import default_temperature_for_call
 from model_aliasing import ModelAliasRegistry, PromptPart
@@ -35,6 +53,16 @@ from validation_context_factory import build_measurement_request_for_layer
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class RenderedQAPrompt:
+    """The rendered QA prompt pair plus the response schema to request."""
+
+    system_prompt: str
+    evaluation_prompt: str
+    response_schema: Any
+    should_request_edits: bool
+
+
 class MissingScoreTagError(ValueError):
     """Raised when a QA response does not include the required [SCORE] tag."""
 
@@ -43,12 +71,50 @@ class QAResponseParseError(ValueError):
     """Raised when a QA model response cannot be parsed as QA JSON."""
 
 
+def _qa_content_filter_terminal_event(
+    template: ContentEventTemplate,
+    exc: GenerationStoppedUnexpectedly,
+) -> ContentEvent:
+    """Build the terminal ``filtered`` verdict of a QA evaluation attempt.
+
+    The chunks the evaluator already streamed went out labelled ``draft``; this
+    event is what tells the consumer that attempt is dead and why. It carries no
+    content on purpose - the draft is never resent - and the terminal stop keeps
+    propagating untouched.
+    """
+    finish_reason = str(getattr(exc, "finish_reason", None) or "").strip()
+    reason = "Provider content policy stopped the QA evaluation."
+    if finish_reason:
+        reason = (
+            "Provider content policy stopped the QA evaluation "
+            f"(finish_reason={finish_reason})."
+        )
+    return ContentEvent(
+        phase=template.phase,
+        model=template.model,
+        layer=template.layer,
+        attempt=template.attempt,
+        session_id=template.session_id,
+        project_id=template.project_id,
+        content_status=ContentStatus.FILTERED,
+        reason=reason,
+        data={
+            "error_code": "content_filter",
+            "finish_reason": getattr(exc, "finish_reason", None),
+            "finish_reason_category": "content_filter",
+            "retryable": False,
+        },
+    )
+
+
 def _has_structured_request_validators(original_request: Any) -> bool:
     """Return True when the request has at least one request-level measurable validator.
 
     Decision is based EXCLUSIVELY on structured ``ContentRequest`` fields.
-    NEVER parses ``layer.criteria`` (which is free text). See §3.4.1 of
-    PROPOSAL_TOOLS_FOR_QA_ARBITER_GRANSABIO.md for rationale.
+    NEVER parses ``layer.criteria`` (which is free text): criteria are natural
+    language written by the caller, so any keyword/regex reading of them would
+    be a semantic inference and could silently enable or disable the tool loop.
+    Fail-closed by design — when no structured validator is present, tools stay off.
     """
     if original_request is None:
         return False
@@ -144,11 +210,11 @@ class QAEvaluationService:
         """
         self.ai_service = ai_service
 
-    async def evaluate_content(
-        self,
+    @staticmethod
+    def render_qa_evaluation_prompt(
+        *,
         content: str,
         criteria: str,
-        model: str,
         layer_name: str,
         min_score: float,
         deal_breaker_criteria: Optional[str] = None,
@@ -156,74 +222,23 @@ class QAEvaluationService:
         concise_on_pass: bool = True,
         original_request: Optional[Any] = None,
         extra_verbose: bool = False,
-        stream_callback: Optional[callable] = None,
-        usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-        max_tokens: Optional[int] = None,
-        reasoning_effort: Optional[str] = None,
-        thinking_budget_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
         request_edit_info: bool = True,
-        phase_logger: Optional["PhaseLogger"] = None,
         marker_mode: str = "phrase",
         marker_length: Optional[int] = None,
         word_map_formatted: Optional[str] = None,
         draft_map_formatted: Optional[str] = None,
         input_images: Optional[List["ImageData"]] = None,
         edit_history: Optional[str] = None,
-        model_alias_registry: Optional[ModelAliasRegistry] = None,
-        layer: Optional[Any] = None,
-        bypass_engine: Optional[QABypassEngine] = None,
-        session_id: Optional[str] = None,
-        project_id: Optional[str] = None,
-        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
-        request_timeout: Optional[float] = None,
-    ) -> QAEvaluation:
-        """
-        Evaluate content quality using specified AI model
+    ) -> "RenderedQAPrompt":
+        """Render the QA (system_prompt, evaluation_prompt) pair.
 
-        Args:
-            content: Content to evaluate
-            criteria: Evaluation criteria
-            model: AI model for evaluation
-            layer_name: Name of the QA layer
-            min_score: Minimum score required for this layer
-            deal_breaker_criteria: Specific deal-breaker facts to detect
-            output_requirements: Additional instructions appended to the required response format
-            original_request: Original content request for context
-            max_tokens: Maximum tokens for QA evaluation. If omitted, resolved
-                from QA_DEFAULT_MAX_TOKENS or the model's safe output limit.
-            reasoning_effort: Reasoning effort for GPT-5/O1/O3 models
-            thinking_budget_tokens: Thinking budget for Claude models
-            temperature: Custom temperature (default 0.3 if not specified)
-            input_images: Optional list of ImageData for vision-enabled QA evaluation.
-                         When provided, images are included in the evaluation context
-                         to help validate image descriptions or visual accuracy.
-
-        Returns:
-            QAEvaluation object with score and feedback
+        Single source of QA prompt rendering: consumed both by
+        ``evaluate_content`` for the live call AND by the QA fan-out
+        context-admission barrier, so both measure the exact same payload
+        with no drift.
         """
-        # Determine appropriate QA system prompt based on content type and request_edit_info
         content_type = getattr(original_request, 'content_type', 'biography') if original_request else 'biography'
-        cancellation_token = getattr(original_request, "_cancellation_token", None) if original_request else None
-        resolved_max_tokens = config.resolve_qa_max_tokens(model, max_tokens)
-        if resolved_max_tokens is not None:
-            if max_tokens is None:
-                logger.info(
-                    "Resolved QA max_tokens for %s@%s to %s",
-                    model,
-                    layer_name,
-                    resolved_max_tokens,
-                )
-            elif resolved_max_tokens != max_tokens:
-                logger.warning(
-                    "Adjusted QA max_tokens for %s@%s: %s -> %s",
-                    model,
-                    layer_name,
-                    max_tokens,
-                    resolved_max_tokens,
-                )
-            max_tokens = resolved_max_tokens
-
+        request_prompt = getattr(original_request, 'prompt', '') if original_request else ''
         # Decide whether to request edit information
         # Smart-edit works in two modes:
         # - ids mode: requires draft_map_formatted
@@ -290,16 +305,16 @@ ORIGINAL SOURCE TEXT FOR VALIDATION:
 {source_preview}
 
 GENERATION REQUEST:
-Content type: {original_request.content_type}
-Instructions: {original_request.prompt}"""
+Content type: {content_type}
+Instructions: {request_prompt}"""
             else:
                 # Standard context without source text - include COMPLETE prompt (no truncation)
                 context_section = f"""
 {generation_mode_context}
 
 ORIGINAL REQUEST CONTEXT:
-User's original request: "{original_request.prompt}"
-Content type: {original_request.content_type}
+User's original request: "{request_prompt}"
+Content type: {content_type}
 """
 
         # Build image context section for vision-enabled QA
@@ -427,6 +442,122 @@ IMPORTANT:
 - Always respond in the same language as the original user request, regardless of the language used in these evaluation instructions.
 """
 
+        return RenderedQAPrompt(
+            system_prompt=qa_system_prompt,
+            evaluation_prompt=evaluation_prompt,
+            response_schema=qa_response_schema,
+            should_request_edits=should_request_edits,
+        )
+
+    async def evaluate_content(
+        self,
+        content: str,
+        criteria: str,
+        model: str,
+        layer_name: str,
+        min_score: float,
+        deal_breaker_criteria: Optional[str] = None,
+        output_requirements: Optional[str] = None,
+        concise_on_pass: bool = True,
+        original_request: Optional[Any] = None,
+        extra_verbose: bool = False,
+        stream_callback: Optional[ContentEventSink] = None,
+        usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
+        thinking_budget_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        request_edit_info: bool = True,
+        phase_logger: Optional["PhaseLogger"] = None,
+        marker_mode: str = "phrase",
+        marker_length: Optional[int] = None,
+        word_map_formatted: Optional[str] = None,
+        draft_map_formatted: Optional[str] = None,
+        input_images: Optional[List["ImageData"]] = None,
+        edit_history: Optional[str] = None,
+        model_alias_registry: Optional[ModelAliasRegistry] = None,
+        layer: Optional[Any] = None,
+        bypass_engine: Optional[QABypassEngine] = None,
+        session_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        request_timeout: Optional[float] = None,
+    ) -> QAEvaluation:
+        """
+        Evaluate content quality using specified AI model
+
+        Args:
+            content: Content to evaluate
+            criteria: Evaluation criteria
+            model: AI model for evaluation
+            layer_name: Name of the QA layer
+            min_score: Minimum score required for this layer
+            deal_breaker_criteria: Specific deal-breaker facts to detect
+            output_requirements: Additional instructions appended to the required response format
+            original_request: Original content request for context
+            stream_callback: Content-event sink invoked once per provider
+                chunk AS IT ARRIVES. Every emission is a labelled draft
+                (``content_status="draft"``) carrying its model, layer,
+                attempt and the provider-reported ``is_thinking`` flag. Parse
+                and scoring are unchanged: if the response never parses, the
+                consumer simply saw QA work in progress, and the evaluation
+                resolves exactly as the QA contract dictates.
+            max_tokens: Maximum tokens for QA evaluation. If omitted, resolved
+                from QA_DEFAULT_MAX_TOKENS or the model's safe output limit.
+            reasoning_effort: Reasoning effort for GPT-5/O1/O3 models
+            thinking_budget_tokens: Thinking budget for Claude models
+            temperature: Custom temperature (default 0.3 if not specified)
+            input_images: Optional list of ImageData for vision-enabled QA evaluation.
+                         When provided, images are included in the evaluation context
+                         to help validate image descriptions or visual accuracy.
+
+        Returns:
+            QAEvaluation object with score and feedback
+        """
+        # Determine appropriate QA system prompt based on content type and request_edit_info
+        content_type = getattr(original_request, 'content_type', 'biography') if original_request else 'biography'
+        cancellation_token = getattr(original_request, "_cancellation_token", None) if original_request else None
+        resolved_max_tokens = config.resolve_qa_max_tokens(model, max_tokens)
+        if resolved_max_tokens is not None:
+            if max_tokens is None:
+                logger.info(
+                    "Resolved QA max_tokens for %s@%s to %s",
+                    model,
+                    layer_name,
+                    resolved_max_tokens,
+                )
+            elif resolved_max_tokens != max_tokens:
+                logger.warning(
+                    "Adjusted QA max_tokens for %s@%s: %s -> %s",
+                    model,
+                    layer_name,
+                    max_tokens,
+                    resolved_max_tokens,
+                )
+            max_tokens = resolved_max_tokens
+
+        rendered_prompt = QAEvaluationService.render_qa_evaluation_prompt(
+            content=content,
+            criteria=criteria,
+            layer_name=layer_name,
+            min_score=min_score,
+            deal_breaker_criteria=deal_breaker_criteria,
+            output_requirements=output_requirements,
+            concise_on_pass=concise_on_pass,
+            original_request=original_request,
+            extra_verbose=extra_verbose,
+            request_edit_info=request_edit_info,
+            marker_mode=marker_mode,
+            marker_length=marker_length,
+            word_map_formatted=word_map_formatted,
+            draft_map_formatted=draft_map_formatted,
+            input_images=input_images,
+            edit_history=edit_history,
+        )
+        qa_system_prompt = rendered_prompt.system_prompt
+        evaluation_prompt = rendered_prompt.evaluation_prompt
+        qa_response_schema = rendered_prompt.response_schema
+
         eval_temperature = (
             temperature
             if temperature is not None
@@ -450,14 +581,28 @@ IMPORTANT:
             logger.info(f"[QA PROMPT DEBUG] --- END QA PROMPT PREVIEW ---")
 
         streamed_response_started = False
+        stream_attempt = 0
 
         async def _generate_qa_response(json_schema: Optional[Dict[str, Any]]) -> str:
             """Call the configured QA model once and return its final text."""
-            nonlocal streamed_response_started
+            nonlocal streamed_response_started, stream_attempt
             streamed_response_started = False
+            # Every provider call of this evaluation is its own attempt: the
+            # schema-less retry must be labelled apart from the first try so a
+            # consumer can reset its cursor instead of concatenating both.
+            stream_attempt += 1
 
             if stream_callback:
                 response_chunks = []
+                streamed_labelled_chunk = False
+                chunk_template = ContentEventTemplate(
+                    phase=ContentPhase.QA,
+                    session_id=session_id,
+                    project_id=project_id,
+                    model=model,
+                    layer=layer_name,
+                    attempt=stream_attempt,
+                )
                 async for chunk in self.ai_service.generate_content_stream(
                     prompt=evaluation_prompt,
                     model=model,
@@ -488,17 +633,77 @@ IMPORTANT:
                     if isinstance(chunk, StreamChunk):
                         chunk_text = chunk.text
                         is_thinking = chunk.is_thinking
+                        metadata = chunk.metadata or {}
                     else:
                         chunk_text = chunk
                         is_thinking = False
+                        metadata = {}
 
                     # Only accumulate non-thinking content for final response
                     if not is_thinking:
                         response_chunks.append(chunk_text)
                         if chunk_text:
                             streamed_response_started = True
-                    # Send all chunks (including thinking) to callback for real-time display
-                    await stream_callback(chunk_text, model, layer_name)
+                    if chunk_text:
+                        # Live labelled emission: the evaluation is in
+                        # progress, so the chunk is a draft. Thinking keeps
+                        # its own subphase and is never inferred from text -
+                        # it comes from the provider adapter.
+                        streamed_labelled_chunk = True
+                        await stream_callback(
+                            chunk_template.chunk(
+                                chunk_text,
+                                is_thinking=is_thinking,
+                                subphase=(
+                                    ContentSubphase.THINKING
+                                    if is_thinking
+                                    else ContentSubphase.DRAFT_STREAM
+                                ),
+                            )
+                        )
+
+                    if metadata:
+                        try:
+                            AIService._raise_if_generation_stopped_unusably(
+                                "".join(response_chunks),
+                                metadata,
+                                provider=str(metadata.get("provider") or "unknown"),
+                                model_id=model,
+                                max_tokens=metadata.get("max_tokens") or max_tokens,
+                            )
+                        except GenerationStoppedUnexpectedly as exc:
+                            if is_content_filter_stop(exc):
+                                if streamed_labelled_chunk:
+                                    # The chunks already shown must not stay
+                                    # labelled `draft` forever: close the
+                                    # attempt with the filtered verdict before
+                                    # the terminal stop propagates. No content
+                                    # travels with it - the draft is not resent.
+                                    # A failing sink must never replace the stop
+                                    # itself: the caller classifies the failure
+                                    # from THIS exception.
+                                    try:
+                                        await stream_callback(
+                                            _qa_content_filter_terminal_event(
+                                                chunk_template,
+                                                exc,
+                                            )
+                                        )
+                                    except Exception:
+                                        logger.warning(
+                                            "Failed to publish the QA content-filter "
+                                            "verdict for %s on layer %s",
+                                            model,
+                                            layer_name,
+                                            exc_info=True,
+                                        )
+                                raise
+                            # Non-filter finish categories retain their parse
+                            # path: the chunks already travelled labelled
+                            # `draft`, so there is nothing to retract here -
+                            # the evaluation simply resolves as the parse
+                            # contract dictates.
+                            pass
 
                 return "".join(response_chunks)
 
@@ -600,8 +805,16 @@ IMPORTANT:
                 enriched_payload.setdefault("qa_layer", layer_name)
                 await tool_event_callback(event_type, enriched_payload)
 
+            qa_tool_deadline = (
+                time.monotonic() + float(request_timeout)
+                if request_timeout is not None
+                else None
+            )
+
             async def _call_tool_loop(
                 token_budget: Optional[int],
+                *,
+                timeout_seconds: Optional[float],
             ) -> tuple[str, ToolLoopEnvelope]:
                 return await self.ai_service.call_ai_with_validation_tools(
                     prompt=evaluation_prompt,
@@ -634,11 +847,14 @@ IMPORTANT:
                             label="qa.edit_history",
                         )
                     ] if edit_history else None,
-                    request_timeout=request_timeout,
+                    request_timeout=timeout_seconds,
                     cancellation_token=cancellation_token,
                 )
 
-            loop_content, envelope = await _call_tool_loop(max_tokens)
+            loop_content, envelope = await _call_tool_loop(
+                max_tokens,
+                timeout_seconds=request_timeout,
+            )
             if isinstance(envelope, ToolLoopEnvelope) and envelope.output_truncated:
                 current_budget = envelope.max_tokens or max_tokens
                 retry_budget = config.resolve_qa_truncation_retry_max_tokens(
@@ -663,7 +879,20 @@ IMPORTANT:
                             "finish_reason": envelope.finish_reason,
                         },
                     )
-                    loop_content, envelope = await _call_tool_loop(retry_budget)
+                    remaining_timeout = (
+                        qa_tool_deadline - time.monotonic()
+                        if qa_tool_deadline is not None
+                        else None
+                    )
+                    if remaining_timeout is not None and remaining_timeout <= 0:
+                        raise asyncio.TimeoutError(
+                            "QA tool-loop exceeded its process deadline before "
+                            "the truncation retry"
+                        )
+                    loop_content, envelope = await _call_tool_loop(
+                        retry_budget,
+                        timeout_seconds=remaining_timeout,
+                    )
 
                 if isinstance(envelope, ToolLoopEnvelope) and envelope.output_truncated:
                     raise QAResponseParseError(
@@ -692,9 +921,25 @@ IMPORTANT:
                 )
                 return await _generate_qa_response(json_schema)
             if skipped_reason == "context_too_large":
-                raise RuntimeError(
-                    f"QA tool loop context too large for {model}@{layer_name}; "
-                    "cannot safely fall back without losing validation context."
+                # A context-admission overflow is a hard, non-retryable failure:
+                # it must surface as a typed ``ContextBudgetExceeded`` (never a
+                # bare RuntimeError that the scheduler would absorb into quorum
+                # as an "unexpected" technical failure). This is a local
+                # pre-dispatch decision by the tool-loop entry guard.
+                overflow_kind = (
+                    envelope.context_overflow_kind
+                    if isinstance(envelope, ToolLoopEnvelope)
+                    else None
+                )
+                raise ContextBudgetExceeded(
+                    (
+                        f"QA tool loop context too large for {model}@{layer_name} "
+                        f"(kind={overflow_kind or 'model_context_overflow'}); "
+                        "cannot safely fall back without losing validation context."
+                    ),
+                    call_id="qa.evaluate_layer",
+                    public_label=layer_name,
+                    local_or_provider="local",
                 )
             return loop_content
 
@@ -727,7 +972,16 @@ IMPORTANT:
                 else:
                     raise
 
-            # Log full QA response if extra_verbose is enabled
+            # Parse JSON response
+            parsed = self._parse_qa_json_response(
+                response,
+                model,
+                layer_name,
+            )
+
+            # The response becomes loggable only after the QA JSON contract
+            # accepts it. Invalid provider bodies stay private just like
+            # failed stream attempts and never enter phase/verbose logs.
             if phase_logger:
                 phase_logger.log_response(
                     model=model,
@@ -743,13 +997,6 @@ IMPORTANT:
                 logger.info(response)
                 logger.info(separator)
                 logger.info("")
-
-            # Parse JSON response
-            parsed = self._parse_qa_json_response(
-                response,
-                model,
-                layer_name,
-            )
 
             logger.info(f"QA evaluation completed: {model} -> {layer_name}: Score {parsed['score']}")
 
@@ -785,6 +1032,14 @@ IMPORTANT:
         except QAResponseParseError:
             raise
         except Exception as e:
+            if is_content_filter_stop(e):
+                logger.warning(
+                    "Content evaluation stopped by provider content policy for %s "
+                    "on layer %s",
+                    model,
+                    layer_name,
+                )
+                raise
             logger.error(f"Content evaluation failed for {model}: {str(e)}")
             raise
 
@@ -846,11 +1101,11 @@ IMPORTANT:
                 ) or "unknown JSON validation error"
                 logger.error(
                     "Invalid QA JSON response for %s@%s: %s. "
-                    "Response preview: %r. Extraction info: %s",
+                    "Response chars: %s. Extraction info: %s",
                     model,
                     layer_name,
                     error_details,
-                    response[:500] if isinstance(response, str) else response,
+                    len(response) if isinstance(response, str) else 0,
                     extraction_info,
                 )
                 raise QAResponseParseError(
@@ -888,8 +1143,14 @@ IMPORTANT:
                 score = float(data['score'])
             except (TypeError, ValueError) as exc:
                 raise QAResponseParseError(
-                    f"Field 'score' from {model}@{layer_name} is not numeric: {data['score']!r}"
+                    f"Field 'score' from {model}@{layer_name} is not numeric "
+                    f"(type={type(data['score']).__name__})"
                 ) from exc
+
+            if math.isnan(score) or math.isinf(score):
+                raise QAResponseParseError(
+                    f"Field 'score' from {model}@{layer_name} is not finite"
+                )
 
             edit_groups = data.get('edit_groups', [])
             if not isinstance(edit_groups, list):
@@ -904,10 +1165,11 @@ IMPORTANT:
             edit_strategy = data.get('edit_strategy')
             if edit_strategy not in (None, "incremental", "regenerate"):
                 logger.warning(
-                    "QA response from %s@%s returned unknown edit_strategy=%r; normalizing to null.",
+                    "QA response from %s@%s returned an unknown edit_strategy "
+                    "(type=%s); normalizing to null.",
                     model,
                     layer_name,
-                    edit_strategy,
+                    type(edit_strategy).__name__,
                 )
                 edit_strategy = None
 
@@ -931,11 +1193,12 @@ IMPORTANT:
             raise
         except Exception as e:
             logger.error(
-                "Unexpected error parsing QA response for %s@%s: %s. Response preview: %r",
+                "Unexpected error parsing QA response for %s@%s: %s. "
+                "Response chars: %s",
                 model,
                 layer_name,
                 e,
-                response[:500] if isinstance(response, str) else response,
+                len(response) if isinstance(response, str) else 0,
                 exc_info=True,
             )
             raise QAResponseParseError(

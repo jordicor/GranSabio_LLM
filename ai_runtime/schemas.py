@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Optional
 
+from schema_utils import validate_json_schema_complexity
+
 logger = logging.getLogger(__name__)
 
 
@@ -172,23 +174,36 @@ def prepare_structured_output_schema(
     if not json_schema:
         return json_schema
 
-    provider_key = (provider or "").lower()
-    if provider_key in {"gemini", "google"}:
-        effective_schema = strip_additional_properties(json_schema)
-        return convert_nullable_to_gemini_format(effective_schema)
+    # Audit PER-01: bound the conversion cost before any normalization runs;
+    # the recursive helpers below would otherwise hang the event loop or die
+    # with an unhandled RecursionError on adversarial schemas.
+    try:
+        validate_json_schema_complexity(json_schema)
 
-    if provider_key in {"openai", "openrouter", "xai", "ollama", "minimax", "moonshot"}:
-        return normalize_openai_strict_schema(json_schema)
+        provider_key = (provider or "").lower()
+        if provider_key in {"gemini", "google"}:
+            effective_schema = strip_additional_properties(json_schema)
+            return convert_nullable_to_gemini_format(effective_schema)
 
-    if provider_key in {"claude", "anthropic"} and claude_structured_outputs_supported:
-        try:
-            claude_schema = json_schema_to_pydantic_fn(json_schema).model_json_schema()
-            return normalize_openai_strict_schema(claude_schema)
-        except Exception as exc:
-            raise ValueError(
-                f"Schema validation error for {model_id}: failed to normalize "
-                f"Claude structured-output schema: {exc}"
-            ) from exc
+        if provider_key in {"openai", "openrouter", "xai", "ollama", "minimax", "moonshot"}:
+            return normalize_openai_strict_schema(json_schema)
+
+        if provider_key in {"claude", "anthropic"} and claude_structured_outputs_supported:
+            try:
+                claude_schema = json_schema_to_pydantic_fn(json_schema).model_json_schema()
+                return normalize_openai_strict_schema(claude_schema)
+            except Exception as exc:
+                raise ValueError(
+                    f"Schema validation error for {model_id}: failed to normalize "
+                    f"Claude structured-output schema: {exc}"
+                ) from exc
+    except RecursionError as exc:
+        # Residual defense: complexity limits should make this unreachable, but
+        # a recursion overflow must surface as a validation error, not a 500.
+        raise ValueError(
+            f"Schema validation error for {model_id}: schema nesting exceeds "
+            "the supported recursion limits"
+        ) from exc
 
     return json_schema
 

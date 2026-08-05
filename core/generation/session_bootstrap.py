@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+from content_events import SessionPhase
 from models import ContentRequest, GenerationInitResponse, GenerationStatus
 
 from ..cancellation import CancelMode
@@ -22,6 +23,7 @@ class SessionBootstrapDeps:
     debug_session_start: Any
     process_content_generation: Any
     logger: Any
+    background_task_hook: Any = None
 
 
 def build_session_payload(
@@ -73,11 +75,12 @@ def build_session_payload(
         "generation_content": "",
         "generation_content_length": 0,
         "generation_content_word_count": 0,
+        "thinking_content": "",
         "qa_content": "",
         "auto_qa_content": temp_session.get("auto_qa_content", ""),
         "auto_qa_plan": auto_qa_plan_payload,
         "preflight_content": temp_session.get("preflight_content", ""),
-        "current_phase": "initializing",
+        "current_phase": SessionPhase.INITIALIZING,
         "preflight_result": preflight_result,
         "recommended_timeout_seconds": recommended_timeout_seconds,
         "gran_sabio_escalations": [],
@@ -258,6 +261,9 @@ async def finalize_generation_session(
             advisories=(long_text_advisories or None),
             auto_qa_plan=auto_qa_plan_payload,
         )
+
+    if deps.background_task_hook is not None:
+        deps.background_task_hook(task)
 
     return GenerationInitResponse(
         status="initialized",

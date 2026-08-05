@@ -8,6 +8,7 @@ No HTTP calls are made from this module.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -34,6 +35,22 @@ STREAM_ACTIVITY_CHECK_SECONDS = 30.0
 # working on. POST /generate is not retried here because retrying it would start
 # duplicate sessions.
 POLL_RETRY_BACKOFF_SECONDS: Tuple[int, ...] = (5, 10, 20, 40, 60, 60, 60, 60, 60, 60)
+
+
+def payload_error_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Build non-sensitive metadata about a request payload for error details.
+
+    The full payload (which contains the user's prompt, potentially PII or
+    confidential business data) must never be attached to exceptions, because
+    consumers routinely ship exceptions to logs and telemetry. Only the key
+    names, the prompt size, and a short hash for correlation are exposed.
+    """
+    prompt = payload.get("prompt")
+    metadata: Dict[str, Any] = {"payload_keys": sorted(str(key) for key in payload)}
+    if isinstance(prompt, str):
+        metadata["prompt_chars"] = len(prompt)
+        metadata["prompt_sha256_16"] = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
+    return metadata
 
 # Timeouts for reasoning models - significantly increased for multi-iteration reasoning.
 # These models can iterate many times and take hours to complete.
@@ -330,6 +347,11 @@ def validate_result(result: Dict[str, Any]) -> None:
             details={
                 "status": raw_status,
                 "failure_reason": result.get("failure_reason"),
+                "error_type": result.get("error_type"),
+                "error_code": result.get("error_code"),
+                "output_truncated": result.get("output_truncated"),
+                "finish_reason": result.get("finish_reason"),
+                "provider_error": result.get("provider_error"),
                 "qa_summary": result.get("qa_summary"),
                 "qa_results": result.get("qa_results"),
                 "final_score": result.get("final_score"),
@@ -351,6 +373,8 @@ def validate_result(result: Dict[str, Any]) -> None:
                 "failure_reason": result.get("failure_reason"),
                 "error_type": result.get("error_type"),
                 "error_code": result.get("error_code"),
+                "output_truncated": result.get("output_truncated"),
+                "finish_reason": result.get("finish_reason"),
                 "provider_error": result.get("provider_error"),
                 "session_id": result.get("session_id"),
             },
@@ -370,6 +394,8 @@ def validate_result(result: Dict[str, Any]) -> None:
                 "failure_reason": result.get("failure_reason"),
                 "error_type": result.get("error_type"),
                 "error_code": result.get("error_code"),
+                "output_truncated": result.get("output_truncated"),
+                "finish_reason": result.get("finish_reason"),
                 "provider_error": result.get("provider_error"),
                 "session_id": result.get("session_id"),
             },

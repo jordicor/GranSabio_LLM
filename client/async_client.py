@@ -48,15 +48,29 @@ from ._common import (
     ActivityMonitor,
     compute_generation_timeout,
     compute_token_budgets,
-    is_heartbeat,
+    payload_error_metadata,
     resolve_model_token_fallback,
     validate_result,
+)
+from ._sse import (
+    SessionEventRouter,
+    SSEParser,
+    StreamCallbacks,
+    StreamError,
+    decode_event_json,
 )
 
 logger = logging.getLogger(__name__)
 
 
 _POLL_RETRY_BACKOFF_SECONDS = POLL_RETRY_BACKOFF_SECONDS
+
+# HTTP statuses on the polling endpoints that mean "try again later" rather
+# than a fatal error: 202/425 (result not ready), 429 (rate limited), 503
+# (transient overload / proxy flap). get_status and get_result map them to
+# TransientGranSabioError so _call_with_retry retries them within the
+# max_wait budget, consistent with _fetch_result_polling.
+_RETRYABLE_POLL_STATUS_CODES = (202, 425, 429, 503)
 
 
 # Generic return type for _call_with_retry so it can wrap any idempotent async
@@ -113,6 +127,11 @@ class AsyncGranSabioClient:
         self.provider_keys = dict(provider_keys or {})
         self._model_token_cache: Dict[str, int] = {}
         self._model_timeout_cache: Dict[str, int] = {}
+        # Streaming failures of the last generate_streaming call. A stream is
+        # the visibility channel, not the result channel: failures are
+        # surfaced here (and through error_callback) instead of aborting a
+        # generation the engine is still running.
+        self.last_stream_errors: List[Dict[str, str]] = []
 
     async def connect(self) -> None:
         """Initialize the HTTP session."""
@@ -501,7 +520,7 @@ class AsyncGranSabioClient:
         async with await self._request("POST", "/generate", json_data=payload) as response:
             if response.status != 200:
                 text = await self._read_error_text(response, "/generate")
-                error_details = {"payload": payload}
+                error_details = {"payload_metadata": payload_error_metadata(payload)}
                 raise GranSabioClientError(
                     f"Generation request failed: {text}",
                     status_code=response.status,
@@ -553,6 +572,11 @@ class AsyncGranSabioClient:
         """Get current status of a generation session."""
         endpoint = f"/status/{session_id}"
         async with await self._request("GET", endpoint) as response:
+            if response.status in _RETRYABLE_POLL_STATUS_CODES:
+                raise TransientGranSabioError(
+                    f"Transient HTTP {response.status} getting status of session {session_id}",
+                    status_code=response.status,
+                )
             if response.status != 200:
                 text = await self._read_error_text(response, endpoint)
                 raise GranSabioClientError(
@@ -567,6 +591,12 @@ class AsyncGranSabioClient:
         async with await self._request("GET", endpoint) as response:
             if response.status == 202:
                 return {"status": "in_progress", "session_id": session_id}
+
+            if response.status in _RETRYABLE_POLL_STATUS_CODES:
+                raise TransientGranSabioError(
+                    f"Transient HTTP {response.status} getting result of session {session_id}",
+                    status_code=response.status,
+                )
 
             if response.status != 200:
                 text = await self._read_error_text(response, endpoint)
@@ -672,11 +702,12 @@ class AsyncGranSabioClient:
         """
         Poll until generation completes and return result.
 
-        Transient network errors (connection drops, timeouts, mid-response
-        protocol errors) during status or result polling are retried with
-        exponential backoff (_POLL_RETRY_BACKOFF_SECONDS) before giving up.
-        Retry sleeps count against max_wait. Non-transient errors (HTTP
-        4xx/5xx, etc.) fail fast.
+        Transient failures during status or result polling are retried with
+        exponential backoff (_POLL_RETRY_BACKOFF_SECONDS) before giving up:
+        network errors (connection drops, timeouts, mid-response protocol
+        errors) and retryable HTTP statuses (202/425/429/503, e.g. a brief
+        proxy flap or rate limit). Retry sleeps count against max_wait.
+        Other non-transient errors (HTTP 4xx/5xx, etc.) fail fast.
 
         Args:
             session_id: Session to wait for
@@ -1010,14 +1041,20 @@ class AsyncGranSabioClient:
             content_type=content_type
         )
 
+        # Multipart uploads cannot reuse the default JSON Content-Type header,
+        # but they must go through _request so connection/timeout failures map
+        # to the documented GranSabioClientError/TransientGranSabioError
+        # hierarchy instead of leaking raw aiohttp exceptions.
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        headers.update(self.provider_keys)
 
-        async with self.session.post(
-            f"{self.base_url}/attachments",
+        async with await self._request(
+            "POST",
+            "/attachments",
+            headers=headers,
             data=data,
-            headers=headers
         ) as response:
             if response.status != 200:
                 text = await self._read_error_text(response, "/attachments")
@@ -1402,173 +1439,100 @@ class AsyncGranSabioClient:
             sleep_interval = poll_interval if remaining is None else max(0.0, min(poll_interval, remaining))
             await asyncio.sleep(sleep_interval)
 
-    async def _stream_progress(
+    def _record_stream_error(
+        self,
+        stream: str,
+        url: str,
+        exc: Exception,
+        error_callback: Optional[Callable[[str, Exception], None]],
+    ) -> None:
+        """Surface a streaming failure: log, client state and callback.
+
+        Never raises: the generation keeps running on the server and the
+        result is still fetched by polling. Silence is what made the dead
+        stream endpoint invisible for months, so this is a warning, not a
+        debug line.
+        """
+        logger.warning("Stream '%s' failed (%s): %s", stream, url, exc)
+        self.last_stream_errors.append(
+            StreamError(
+                stream=stream,
+                url=url,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            ).as_dict()
+        )
+        if error_callback is None:
+            return
+        try:
+            error_callback(stream, exc)
+        except Exception:
+            logger.exception("error_callback raised while reporting a stream failure")
+
+    async def _stream_session_events(
         self,
         session_id: str,
-        progress_callback: Optional[Callable[[str], None]],
-        qa_callback: Optional[Callable[[str, str, str], None]],
+        callbacks: StreamCallbacks,
         activity_monitor: ActivityMonitor,
         result_queue: "asyncio.Queue[str]",
         timeout: float,
         verbose: bool,
+        error_callback: Optional[Callable[[str, Exception], None]] = None,
     ) -> None:
-        """Consume the SSE progress stream and route events to callbacks.
+        """Consume ``GET /stream/{session_id}`` and route events to callbacks.
 
-        Puts a terminal status string onto ``result_queue`` when the generation
-        reaches a terminal state (completed, failed, cancelled).
+        One connection carries everything the session produces (status,
+        generation drafts and commits, QA / preflight / Arbiter / Gran Sabio
+        text, thinking, control events, ``session_end``), each emission
+        labelled with ``content_status``/``iteration``/``attempt_id``. The
+        terminal status is put onto ``result_queue`` when the session ends.
+
+        Failures are surfaced through ``_record_stream_error`` (warning log,
+        ``last_stream_errors``, ``error_callback``) and never abort the run:
+        the result is still fetched by polling.
         """
         url = f"{self.base_url}/stream/{session_id}"
+        router = SessionEventRouter(callbacks, activity=activity_monitor)
+        parser = SSEParser()
         try:
             timeout_cfg = aiohttp.ClientTimeout(total=timeout, connect=30)
             async with self.session.get(url, headers=self._headers(), timeout=timeout_cfg) as response:
                 if response.status != 200:
-                    logger.warning("Progress stream returned status %s", response.status)
-                    return
-                activity_monitor.mark(message="progress_stream_connected")
+                    body = await response.text()
+                    raise GranSabioClientError(
+                        f"Session stream returned status {response.status}: {body[:200]}",
+                        status_code=response.status,
+                    )
+                activity_monitor.mark(message="session_stream_connected")
 
-                while not response.content.at_eof():
-                    line_bytes = await response.content.readline()
-                    line = line_bytes.decode("utf-8", errors="replace").rstrip("\n\r")
-                    if not line.startswith("data: "):
-                        continue
-                    try:
-                        data = json.loads(line[6:])
-                    except json.JSONDecodeError:
+                terminal: Optional[str] = None
+                async for chunk_bytes in response.content.iter_any():
+                    for sse_event in parser.feed(chunk_bytes):
+                        if sse_event.is_comment:
+                            activity_monitor.mark(message="heartbeat")
+                            continue
+                        payload = decode_event_json(sse_event)
+                        if payload is None:
+                            continue
                         if verbose:
-                            logger.warning("Failed to parse progress SSE: %s", line[:120])
-                        continue
-
-                    if verbose:
-                        logger.debug("Progress event: %s", data)
-
-                    # Track activity from iteration / message fields
-                    current_iteration = data.get("current_iteration")
-                    progress_message = data.get("message") or data.get("status")
-                    if isinstance(current_iteration, int):
-                        activity_monitor.mark(
-                            iteration=current_iteration,
-                            message=progress_message,
-                        )
-                    elif progress_message:
-                        activity_monitor.mark(message=progress_message)
-
-                    # Mark activity for verbose_log entries
-                    verbose_log = data.get("verbose_log", [])
-                    if verbose_log:
-                        activity_monitor.mark(message=f"verbose_log[{len(verbose_log)}]")
-
-                    # Classify message as QA vs progress
-                    message = data.get("message", "")
-                    is_qa_message = any(kw in message for kw in [
-                        "quality evaluation", "QA evaluation", "Evaluating layer",
-                        "Score:", "/10", "Deal-breaker", "consensus", "accuracy",
-                        "QA", "qa_evaluation",
-                    ])
-
-                    # Route non-QA messages to progress callback
-                    if progress_callback and "message" in data and not is_qa_message:
-                        progress_callback(data["message"])
-
-                    # Route QA messages to qa_callback
-                    if qa_callback and is_qa_message and message:
-                        agent = "QA System"
-                        status = "evaluating"
-
-                        for model_name in ["gpt-5", "gpt-4", "claude", "gemini", "o3"]:
-                            if model_name in message.lower():
-                                agent = model_name.upper()
-                                break
-
-                        if "score:" in message.lower() or "/10" in message:
-                            status = "score"
-                        elif "deal-breaker" in message.lower():
-                            status = "critical"
-                        elif "consensus" in message.lower():
-                            agent = "Consensus"
-                            status = "calculating"
-                        elif "completed" in message.lower() or "passed" in message.lower():
-                            status = "success"
-                        elif "failed" in message.lower() or "rejected" in message.lower():
-                            status = "error"
-
-                        qa_callback(message, agent, status)
-                        activity_monitor.mark(message=f"qa:{agent}:{status}")
-
-                    # Route verbose_log QA entries
-                    current_status = data.get("status", "")
-                    if qa_callback and (current_status == "qa_evaluation" or verbose_log):
-                        for log_entry in verbose_log:
-                            if not isinstance(log_entry, str):
-                                continue
-                            clean_entry = log_entry.strip()
-                            if any(kw in clean_entry for kw in [
-                                "quality evaluation", "QA evaluation", "Evaluating layer",
-                                "Score:", "/10", "Deal-breaker", "consensus", "accuracy",
-                            ]):
-                                entry_agent = "QA System"
-                                entry_status = "evaluating"
-                                for model_name in ["gpt-5", "gpt-4", "claude", "gemini", "o3"]:
-                                    if model_name in clean_entry.lower():
-                                        entry_agent = model_name.upper()
-                                        break
-                                if "score:" in clean_entry.lower() or "/10" in clean_entry:
-                                    entry_status = "score"
-                                elif "deal-breaker" in clean_entry.lower():
-                                    entry_status = "critical"
-                                elif "consensus" in clean_entry.lower():
-                                    entry_agent = "Consensus"
-                                    entry_status = "calculating"
-                                qa_callback(clean_entry, entry_agent, entry_status)
-                            elif current_status == "qa_evaluation" and any(term in clean_entry for term in [
-                                "Querying", "evaluation", "processing", "analyzing",
-                            ]):
-                                qa_callback(clean_entry, "QA System", "info")
-
-                    # Check for terminal status
-                    if data.get("status") in ("completed", "rejected", "failed", "cancelled"):
-                        await result_queue.put(data.get("status"))
+                            logger.debug("Session event: %s", payload.get("type"))
+                        terminal = router.handle(payload) or terminal
+                    if terminal:
                         break
 
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error("Progress stream error for session %s: %s", session_id, e)
+                if not terminal:
+                    for sse_event in parser.close():
+                        payload = decode_event_json(sse_event)
+                        if payload is not None:
+                            terminal = router.handle(payload) or terminal
 
-    async def _stream_content(
-        self,
-        url: str,
-        callback: Optional[Callable[[str], None]],
-        activity_monitor: ActivityMonitor,
-        timeout: float,
-        verbose: bool,
-        stream_name: str,
-    ) -> None:
-        """Consume a raw content stream (generation, QA, or preflight).
-
-        Each chunk is forwarded to ``callback`` if provided. Heartbeat messages
-        are silently skipped.
-        """
-        try:
-            timeout_cfg = aiohttp.ClientTimeout(total=timeout, connect=30)
-            async with self.session.get(url, headers=self._headers(), timeout=timeout_cfg) as response:
-                if response.status != 200:
-                    logger.warning("%s stream returned status %s", stream_name, response.status)
-                    return
-
-                async for chunk_bytes in response.content.iter_any():
-                    chunk = chunk_bytes.decode("utf-8", errors="replace")
-                    if not chunk or is_heartbeat(chunk):
-                        continue
-                    activity_monitor.mark(message=f"{stream_name}_chunk")
-                    if callback:
-                        callback(chunk)
-                    if verbose:
-                        logger.debug("%s chunk: %s...", stream_name, chunk[:60])
+                if terminal:
+                    await result_queue.put(terminal)
 
         except asyncio.CancelledError:
             pass
-        except Exception as e:
-            logger.error("%s stream error: %s", stream_name, e)
+        except Exception as exc:
+            self._record_stream_error("session", url, exc, error_callback)
 
     async def generate_streaming(
         self,
@@ -1603,16 +1567,26 @@ class AsyncGranSabioClient:
         qa_timeout_retries: Optional[int] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
         content_callback: Optional[Callable[[str], None]] = None,
+        content_reset_callback: Optional[Callable[[], None]] = None,
         qa_callback: Optional[Callable[[str, str, str], None]] = None,
         on_session_start: Optional[Callable[[str], None]] = None,
+        error_callback: Optional[Callable[[str, Exception], None]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """Generate content with real-time SSE streaming.
 
         Starts generation via ``generate(wait_for_completion=False)`` and then
-        opens four parallel SSE connections (progress, generation content,
-        QA content, preflight content) to surface live updates through the
-        provided callbacks.
+        opens ONE SSE connection, ``GET /stream/{session_id}``, which carries
+        everything the session produces already labelled: status snapshots and
+        changes, generation drafts and accepted commits, QA / preflight /
+        Arbiter / Gran Sabio text, thinking, control events and the terminal
+        ``session_end``.
+
+        Streaming errors do NOT abort the run: the stream is the visibility
+        channel and the result still arrives through polling. Each failure is
+        logged at warning level, appended to ``self.last_stream_errors`` (a
+        list of dicts with ``stream``/``url``/``error``/``error_type``) and
+        reported to ``error_callback`` when one is given.
 
         Args:
             prompt: The generation prompt.
@@ -1642,16 +1616,38 @@ class AsyncGranSabioClient:
             lexical_diversity: Vocabulary diversity guard config.
             reasoning_effort: For reasoning models (low/medium/high).
             thinking_budget_tokens: For Claude thinking models (min 1024).
-            progress_callback: Called with progress message strings.
-            content_callback: Called with raw content chunks as they stream.
-            qa_callback: Called with ``(message, agent, status)`` for QA events.
+            progress_callback: Called with lifecycle messages (str). Never
+                called with an empty string.
+            content_callback: Called with generation text as it streams. Drafts
+                arrive as deltas to append; the accepted commit arrives as the
+                FULL snapshot of its attempt and replaces what came before it.
+            content_reset_callback: Called with no arguments when everything
+                delivered so far for the phase becomes dead text: right before
+                the delivery that REPLACES it (accepted commit after its drafts,
+                or a new attempt superseding the previous one), or on its own
+                when the attempt closes with no body to replace it (a
+                ``filtered`` provider stop). Provide it to accumulate
+                correctly - clear the buffer, then append what arrives next.
+                Omitting it keeps the append-everything behaviour, which
+                concatenates the dead draft with its replacement (and produces
+                unparseable text when ``json_output`` is set).
+            qa_callback: Called with ``(text, agent, status)`` for every other
+                text channel (QA, preflight, Arbiter, Gran Sabio). ``agent`` is
+                the producing model when the engine reports one, otherwise the
+                phase; ``status`` is the content label (``draft``,
+                ``accepted``, ``rejected``, ``filtered``) or ``thinking``.
             on_session_start: Called with session_id immediately after the
                 generation session is created. May be sync or async.
+            error_callback: Called with ``(stream_name, exception)`` when the
+                event stream fails. The run continues on polling.
             **kwargs: Additional parameters passed to API.
 
         Returns:
             Final generation result dict with content, score, and metadata.
         """
+        # Errors of a previous run must not be mistaken for this one's.
+        self.last_stream_errors = []
+
         # Build the kwargs dict for generate(), forwarding all explicit params
         gen_kwargs: Dict[str, Any] = {
             "content_type": content_type,
@@ -1723,49 +1719,24 @@ class AsyncGranSabioClient:
         activity_monitor.mark(message="streams_initializing")
         result_queue: asyncio.Queue[str] = asyncio.Queue()
 
-        # Build stream URLs
-        gen_url = f"{self.base_url}/stream-generation/{session_id}"
-        qa_url = f"{self.base_url}/stream-qa/{session_id}"
-        preflight_url = f"{self.base_url}/stream-preflight/{session_id}"
-
-        # QA content wrapper: route raw chunks through qa_callback with special markers
-        def _qa_content_cb(chunk: str) -> None:
-            if qa_callback:
-                qa_callback(chunk, "QA_CONTENT_STREAM", "raw_chunk")
-
-        def _preflight_content_cb(chunk: str) -> None:
-            if qa_callback:
-                qa_callback(chunk, "PREFLIGHT_CONTENT_STREAM", "raw_chunk")
-
-        # Launch streaming tasks
+        # Launch the single session event stream
         tasks = [
             asyncio.create_task(
-                self._stream_progress(
-                    session_id, progress_callback, qa_callback,
-                    activity_monitor, result_queue, stream_timeout, verbose,
+                self._stream_session_events(
+                    session_id,
+                    StreamCallbacks(
+                        progress=progress_callback,
+                        content=content_callback,
+                        qa=qa_callback,
+                        content_reset=content_reset_callback,
+                    ),
+                    activity_monitor,
+                    result_queue,
+                    stream_timeout,
+                    verbose,
+                    error_callback,
                 ),
-                name=f"progress-{session_id[:8]}",
-            ),
-            asyncio.create_task(
-                self._stream_content(
-                    gen_url, content_callback, activity_monitor,
-                    stream_timeout, verbose, "generation",
-                ),
-                name=f"gen-content-{session_id[:8]}",
-            ),
-            asyncio.create_task(
-                self._stream_content(
-                    qa_url, _qa_content_cb, activity_monitor,
-                    stream_timeout, verbose, "qa",
-                ),
-                name=f"qa-content-{session_id[:8]}",
-            ),
-            asyncio.create_task(
-                self._stream_content(
-                    preflight_url, _preflight_content_cb, activity_monitor,
-                    stream_timeout, verbose, "preflight",
-                ),
-                name=f"preflight-{session_id[:8]}",
+                name=f"session-stream-{session_id[:8]}",
             ),
         ]
 
@@ -1779,6 +1750,16 @@ class AsyncGranSabioClient:
                 await asyncio.wait_for(result_queue.get(), timeout=STREAM_ACTIVITY_CHECK_SECONDS)
                 break
             except asyncio.TimeoutError:
+                if all(task.done() for task in tasks) and result_queue.empty():
+                    # The event stream ended without a terminal signal (it
+                    # failed, or the server closed it): there is nothing left
+                    # to wait for, so go straight to polling instead of
+                    # burning the whole inactivity budget in silence.
+                    logger.debug(
+                        "Session stream ended without a terminal signal for %s",
+                        session_id,
+                    )
+                    break
                 latest = activity_monitor.last_activity_timestamp()
                 if latest > last_activity:
                     # Server is still active -- reset the inactivity window

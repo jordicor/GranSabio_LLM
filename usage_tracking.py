@@ -7,9 +7,9 @@ can include per-phase breakdowns and aggregated totals.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
-import time
 from typing import Any, Callable, Dict, List, Optional
 
 # Use optimized JSON helper
@@ -45,7 +45,26 @@ class UsageRecord:
     attempt: Optional[int] = None
     finish_reason: Optional[str] = None
     output_truncated: Optional[bool] = None
+    context_utilization: Optional[float] = None
+    context_admission_decision: Optional[str] = None
+    context_count_method: Optional[str] = None
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+    def _context_admission_fields(self) -> Dict[str, Any]:
+        """Return the context-admission telemetry keys, only when populated.
+
+        Keeps the serialized shape stable for the vast majority of records
+        (which carry no admission report) by omitting the keys entirely when
+        every value is None.
+        """
+        fields: Dict[str, Any] = {}
+        if self.context_utilization is not None:
+            fields["context_utilization"] = self.context_utilization
+        if self.context_admission_decision is not None:
+            fields["context_admission_decision"] = self.context_admission_decision
+        if self.context_count_method is not None:
+            fields["context_count_method"] = self.context_count_method
+        return fields
 
     def as_dict(self) -> Dict[str, Any]:
         """Convert record to serializable dictionary."""
@@ -76,6 +95,7 @@ class UsageRecord:
             "output_truncated": self.output_truncated,
             "timestamp": self.timestamp,
         }
+        payload.update(self._context_admission_fields())
         return payload
 
     def as_query_call_dict(self) -> Dict[str, Any]:
@@ -107,6 +127,8 @@ class UsageRecord:
             "started_at": self.started_at,
             "ended_at": self.ended_at,
         }
+
+        payload.update(self._context_admission_fields())
 
         safe_metadata = {}
         for key in (
@@ -256,6 +278,9 @@ class UsageTracker:
                         or usage_payload.get("provider_stop_reason")
                     ),
                     output_truncated=usage_payload.get("output_truncated"),
+                    context_utilization=usage_payload.get("context_utilization"),
+                    context_admission_decision=usage_payload.get("context_admission_decision"),
+                    context_count_method=usage_payload.get("context_count_method"),
                 )
                 last_started_at = ended_at_dt
                 last_perf = ended_perf
@@ -311,6 +336,9 @@ class UsageTracker:
         attempt: Optional[int] = None,
         finish_reason: Optional[str] = None,
         output_truncated: Optional[bool] = None,
+        context_utilization: Optional[float] = None,
+        context_admission_decision: Optional[str] = None,
+        context_count_method: Optional[str] = None,
         kind: str = "llm_call",
     ) -> None:
         """Record a usage event and compute its cost when possible."""
@@ -359,6 +387,15 @@ class UsageTracker:
             finish_reason=str(finish_reason) if finish_reason is not None else None,
             output_truncated=bool(output_truncated)
             if output_truncated is not None
+            else None,
+            context_utilization=float(context_utilization)
+            if context_utilization is not None
+            else None,
+            context_admission_decision=str(context_admission_decision)
+            if context_admission_decision is not None
+            else None,
+            context_count_method=str(context_count_method)
+            if context_count_method is not None
             else None,
         )
 

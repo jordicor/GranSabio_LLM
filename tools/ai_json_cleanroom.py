@@ -28,6 +28,26 @@ Features
       - object/array/string: allow_empty
       - accepts camelCase or snake_case keywords (e.g., minLength or min_length)
 
+   Input-safety limits (audit UTL-02):
+      - The schema itself is admitted only after a complexity pre-pass
+        (schema_utils.validate_json_schema_complexity: max nesting depth, max
+        node count, max combinatorial product of nested oneOf/anyOf/type
+        unions). Over-complex schemas are rejected with a structured
+        ``schema_too_complex`` issue before any work starts, preventing
+        RecursionError and combinatorial-probe explosions.
+      - User regexes (``pattern``, ``patternProperties``, expectation
+        ``pattern``) are refused when longer than MAX_PATTERN_LENGTH (500) or
+        when they nest a variable-width quantifier inside another quantifier
+        (e.g. ``(a+)+$``), the classic catastrophic-backtracking shape.
+        Residual risk: overlapping-alternation ReDoS such as ``(a|aa)+$`` is
+        not statically detectable with the stdlib ``re`` engine and remains
+        possible within the length cap; a bounded regex engine is not
+        available as a dependency, so this is accepted and documented rather
+        than fully closed.
+      - Any RecursionError from deeply nested input/schema is converted into
+        a structured ``recursion_limit`` issue, preserving the non-throwing
+        contract.
+
    b) Expectations (path-based checks):
       - Each expectation is a dict with:
         {
@@ -94,11 +114,100 @@ import re
 import sys
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+
+try:  # Python 3.11+
+    from re import _parser as _re_parser
+except ImportError:  # pragma: no cover - Python <= 3.10 fallback
+    import sre_parse as _re_parser  # type: ignore[no-redef]
+
+# Keep the standalone CLI working (python tools/ai_json_cleanroom.py):
+# schema_utils lives at the repo root, which is not on sys.path in that case
+# (same pattern as tools/attachments_cli.py).
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from schema_utils import validate_json_schema_complexity  # noqa: E402
 
 
 def _reject_invalid_constant(value: str):
     raise ValueError(f"Invalid constant '{value}' in JSON input.")
+
+
+# --------------------- User-regex safety (audit UTL-02) ---------------------
+
+# Ceiling for the length of any user-supplied regex (schema ``pattern`` /
+# ``patternProperties`` keys, expectation ``pattern``). Bounds both compile
+# cost and the search space of pathological expressions.
+MAX_PATTERN_LENGTH = 500
+
+
+def _iter_regex_subpatterns(value: Any) -> Iterable[Any]:
+    """Yield SubPattern objects nested inside a parsed-regex token argument."""
+    if isinstance(value, _re_parser.SubPattern):
+        yield value
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_regex_subpatterns(item)
+
+
+def _has_nested_repeat(tokens: list, inside_repeat: bool) -> bool:
+    """Recursively detect a variable-width quantifier inside another quantifier."""
+    for op, arg in tokens:
+        if op in (_re_parser.MAX_REPEAT, _re_parser.MIN_REPEAT):
+            min_repeat, max_repeat, subpattern = arg
+            variable = (
+                max_repeat == _re_parser.MAXREPEAT or max_repeat != min_repeat
+            )
+            if inside_repeat and variable:
+                return True
+            if _has_nested_repeat(subpattern.data, inside_repeat or variable):
+                return True
+        else:
+            for subpattern in _iter_regex_subpatterns(arg):
+                if _has_nested_repeat(subpattern.data, inside_repeat):
+                    return True
+    return False
+
+
+def _regex_has_nested_quantifiers(pattern: str) -> bool:
+    """
+    Detect variable-width quantifiers nested inside another quantifier.
+
+    Patterns like ``(a+)+`` cause catastrophic backtracking in the stdlib
+    ``re`` engine (ReDoS, audit UTL-02). Fixed-width inner repeats such as
+    ``(\\d{4})+`` are safe and allowed. Mirrors
+    ``smart_edit.models.regex_has_nested_quantifiers`` (audit AUX-02); ported
+    here instead of imported so this module stays self-contained (importing
+    the smart_edit package would pull in config/json_utils and make orjson a
+    hard dependency).
+    """
+    try:
+        parsed = _re_parser.parse(pattern)
+    except Exception:
+        # Not a safety concern: re.compile() raises the syntax error later.
+        return False
+    return _has_nested_repeat(parsed.data, inside_repeat=False)
+
+
+def _pattern_rejection_reason(pattern: Any) -> Optional[str]:
+    """
+    Return why a user-supplied regex is refused, or None when it is accepted.
+
+    Rejects non-strings, patterns longer than MAX_PATTERN_LENGTH, and nested
+    quantifiers. Residual risk (documented in the module docstring):
+    overlapping-alternation ReDoS such as ``(a|aa)+$`` is not detectable
+    statically and remains possible on patterns within the length cap.
+    """
+    if not isinstance(pattern, str):
+        return f"expected a string, got {type(pattern).__name__}"
+    if len(pattern) > MAX_PATTERN_LENGTH:
+        return f"length {len(pattern)} exceeds the limit of {MAX_PATTERN_LENGTH}"
+    if _regex_has_nested_quantifiers(pattern):
+        return "quantifiers nested inside another quantifier (catastrophic backtracking)"
+    return None
 
 
 # --------------------------- JSON Engine (orjson-first) ---------------------------
@@ -257,6 +366,9 @@ class ErrorCode(str, Enum):
     PATH_NOT_FOUND = "path_not_found"
     EXPECTATION_FAILED = "expectation_failed"
     UNKNOWN = "unknown"
+    SCHEMA_TOO_COMPLEX = "schema_too_complex"  # user schema breached complexity ceilings
+    RECURSION_LIMIT = "recursion_limit"  # nesting too deep to process safely
+    UNSAFE_PATTERN = "unsafe_pattern"  # user regex refused (length / nested quantifiers)
     REPAIRED = "repaired"  # non-error warning indicating a repair was applied
     STRIPPED_ADDITIONAL = "stripped_additional"  # non-error warning: undeclared props/items dropped
 
@@ -1315,9 +1427,21 @@ class SimpleJSONSchemaValidator:
         self._dry_run = False
 
     def validate(self, data: Any, schema: Dict[str, Any], path: str = "$") -> List[ValidationIssue]:
+        """Validate data against the schema, never raising.
+
+        A RecursionError from deeply nested schema/data is converted into a
+        structured issue (audit UTL-02), preserving the non-throwing contract.
+        """
         self.errors = []
         self.warnings = []
-        self._validate(data, schema, path)
+        try:
+            self._validate(data, schema, path)
+        except RecursionError:
+            self._err(
+                ErrorCode.RECURSION_LIMIT,
+                path,
+                "Validation aborted: schema/data nesting exceeded the recursion budget.",
+            )
         return self.errors
 
     # --- Core dispatcher ---
@@ -1419,6 +1543,15 @@ class SimpleJSONSchemaValidator:
         pattern_compiled: List[Tuple[re.Pattern, Dict[str, Any]]] = []
         if isinstance(pattern_props, dict):
             for patt, subschema in pattern_props.items():
+                rejection = _pattern_rejection_reason(patt)
+                if rejection is not None:
+                    self._err(
+                        ErrorCode.UNSAFE_PATTERN,
+                        path,
+                        f"Rejected patternProperties key: {rejection}.",
+                        detail={"pattern_preview": patt[:80] if isinstance(patt, str) else None},
+                    )
+                    continue
                 try:
                     pattern_compiled.append((re.compile(patt), subschema))
                 except re.error:
@@ -1536,11 +1669,20 @@ class SimpleJSONSchemaValidator:
             self._err(ErrorCode.MAX_LENGTH, path, f"String length {len(s)} > maxLength {max_len}.")
         patt = schema.get("pattern")
         if patt is not None:
-            try:
-                if re.search(patt, s) is None:
-                    self._err(ErrorCode.PATTERN_MISMATCH, path, f"String does not match pattern {patt!r}.")
-            except re.error:
-                self._err(ErrorCode.PATTERN_MISMATCH, path, f"Invalid regex in pattern: {patt!r}.")
+            rejection = _pattern_rejection_reason(patt)
+            if rejection is not None:
+                self._err(
+                    ErrorCode.UNSAFE_PATTERN,
+                    path,
+                    f"Rejected pattern: {rejection}.",
+                    detail={"pattern_preview": patt[:80] if isinstance(patt, str) else None},
+                )
+            else:
+                try:
+                    if re.search(patt, s) is None:
+                        self._err(ErrorCode.PATTERN_MISMATCH, path, f"String does not match pattern {patt!r}.")
+                except re.error:
+                    self._err(ErrorCode.PATTERN_MISMATCH, path, f"Invalid regex in pattern: {patt!r}.")
         allow_empty = _kw(schema, "allow_empty", "allowEmpty", default=True)
         if allow_empty is False and len(s.strip()) == 0:
             self._err(ErrorCode.NOT_ALLOWED_EMPTY, path, "String is empty but allow_empty is False.")
@@ -1900,6 +2042,15 @@ def validate_expectations(
                 continue
 
             if pattern is not None and isinstance(node, str):
+                rejection = _pattern_rejection_reason(pattern)
+                if rejection is not None:
+                    if record(ValidationIssue(
+                        code=ErrorCode.UNSAFE_PATTERN,
+                        path=full_path,
+                        message=f"Rejected pattern: {rejection}."
+                    )):
+                        return errors
+                    continue
                 try:
                     matched = re.search(pattern, node) is not None
                 except re.error:
@@ -1981,6 +2132,13 @@ def validate_ai_json(
     """
     Validate AI output against JSON parseability + optional schema + expectations.
     Returns a non-throwing ValidationResult.
+
+    Input-safety limits (audit UTL-02): a user-supplied ``schema`` is rejected
+    up front when it breaches the shared complexity ceilings of
+    ``schema_utils.validate_json_schema_complexity`` (nesting depth, node
+    count, combinatorial product of nested oneOf/anyOf/type unions), and any
+    RecursionError from deeply nested input is converted into a structured
+    issue instead of propagating.
     """
     options = options or ValidateOptions()
     errors: List[ValidationIssue] = []
@@ -1988,6 +2146,29 @@ def validate_ai_json(
     info: Dict[str, Any] = {}
     likely_truncated = False
     parsed: Optional[Union[Dict[str, Any], List[Any]]] = None
+
+    # 0) Reject an over-complex schema before any parse/validation work: deep
+    # nesting leads to RecursionError in the recursive validator, and nested
+    # combinators multiply the combinator probes exponentially (audit UTL-02).
+    # Non-dict schemas are a no-op for the pre-pass; they are reported as a
+    # structured error by the validator itself, as before.
+    if schema is not None:
+        try:
+            validate_json_schema_complexity(schema)
+        except ValueError as exc:
+            errors.append(ValidationIssue(
+                code=ErrorCode.SCHEMA_TOO_COMPLEX,
+                path="$",
+                message=f"JSON Schema rejected: {exc}",
+            ))
+            return ValidationResult(
+                json_valid=False,
+                likely_truncated=False,
+                errors=errors,
+                warnings=warnings,
+                data=None,
+                info=info,
+            )
 
     # 1) Normalize input into a JSON object/array
     raw_str: Optional[str] = None
@@ -1997,7 +2178,22 @@ def validate_ai_json(
         # object — especially important when validation ultimately fails (the
         # caller sees json_valid=False and must find its input untouched). The
         # string/bytes path below parses a fresh object and needs no copy.
-        parsed = copy.deepcopy(input_data)
+        try:
+            parsed = copy.deepcopy(input_data)
+        except RecursionError:
+            errors.append(ValidationIssue(
+                code=ErrorCode.RECURSION_LIMIT,
+                path="$",
+                message="Input nesting exceeded the recursion budget.",
+            ))
+            return ValidationResult(
+                json_valid=False,
+                likely_truncated=False,
+                errors=errors,
+                warnings=warnings,
+                data=None,
+                info=info,
+            )
         info["source"] = "object"
         info["parse_backend"] = "python_object"
     elif isinstance(input_data, (str, bytes, bytearray)):
@@ -2119,7 +2315,17 @@ def validate_ai_json(
 
     # If we got here, parsing succeeded (possibly after repair)
     if options.normalize_curly_quotes.lower() != "never":
-        parsed, normalized_in_data = _normalize_curly_quotes_in_data(parsed)
+        try:
+            parsed, normalized_in_data = _normalize_curly_quotes_in_data(parsed)
+        except RecursionError:
+            # Deeply nested data: skip the cosmetic normalization rather than
+            # breaking the non-throwing contract (audit UTL-02).
+            normalized_in_data = False
+            warnings.append(ValidationIssue(
+                code=ErrorCode.RECURSION_LIMIT,
+                path="$",
+                message="Curly-quote normalization skipped: data nesting exceeded the recursion budget.",
+            ))
         if normalized_in_data:
             info["curly_quotes_normalization_used"] = True
 

@@ -68,7 +68,8 @@ def mock_config():
         # Tool-loop constants used by call_ai_with_validation_tools defensive gates.
         mock_cfg.TOOL_LOOP_MAX_PROMPT_CHARS = 200_000
         mock_cfg.VALIDATE_DRAFT_MAX_LENGTH = 200_000
-        # Default: unknown model → estimate_prompt_overflow falls back to hard cap.
+        # Default: unknown model → capacity_unknown; observe mode (the test-suite
+        # default) falls back to the TOOL_LOOP_MAX_PROMPT_CHARS hard cap.
         mock_cfg.get_model_info = Mock(side_effect=RuntimeError("unknown model for tests"))
         yield mock_cfg
 
@@ -180,7 +181,7 @@ class TestMiniMaxOpenAICompatibleRuntime:
             return_value=SimpleNamespace(
                 choices=[
                     SimpleNamespace(
-                        message=SimpleNamespace(content="hola"),
+                        message=SimpleNamespace(content="hello"),
                         finish_reason="stop",
                     )
                 ],
@@ -189,14 +190,14 @@ class TestMiniMaxOpenAICompatibleRuntime:
         )
 
         content, _usage = await ai_service_instance._generate_minimax(
-            prompt="Responde exactamente con: hola",
+            prompt="Reply with exactly: hello",
             model_id="MiniMax-M3",
             temperature=1.0,
             max_tokens=128,
-            system_prompt="Responde de forma minima.",
+            system_prompt="Reply minimally.",
         )
 
-        assert content == "hola"
+        assert content == "hello"
         request_kwargs = ai_service_instance.minimax_client.chat.completions.create.await_args.kwargs
         assert request_kwargs["extra_body"] == {"reasoning_split": True}
 
@@ -211,7 +212,7 @@ class TestMiniMaxOpenAICompatibleRuntime:
                     SimpleNamespace(
                         choices=[
                             SimpleNamespace(
-                                delta=SimpleNamespace(content="hola"),
+                                delta=SimpleNamespace(content="hello"),
                                 finish_reason=None,
                             )
                         ],
@@ -232,15 +233,15 @@ class TestMiniMaxOpenAICompatibleRuntime:
 
         chunks = []
         async for chunk in ai_service_instance._stream_minimax(
-            prompt="Responde exactamente con: hola",
+            prompt="Reply with exactly: hello",
             model_id="MiniMax-M3",
             temperature=1.0,
             max_tokens=128,
-            system_prompt="Responde de forma minima.",
+            system_prompt="Reply minimally.",
         ):
             chunks.append(chunk)
 
-        assert chunks[0] == "hola"
+        assert chunks[0] == "hello"
         request_kwargs = ai_service_instance.minimax_client.chat.completions.create.await_args.kwargs
         assert request_kwargs["extra_body"] == {"reasoning_split": True}
 
@@ -1022,7 +1023,7 @@ class TestApplyTemperaturePolicies:
 
 
 class TestSupportsClaudeThinking:
-    """Tests for _supports_claude_thinking() static method."""
+    """Tests for _supports_claude_thinking()."""
 
     def test_claude_37_supports_thinking(self):
         """
@@ -1072,6 +1073,18 @@ class TestSupportsClaudeThinking:
         """
         assert AIService._supports_claude_thinking(None) is False
 
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "claude-fable-5",
+            "claude-sonnet-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+        ],
+    )
+    def test_new_adaptive_models_support_thinking(self, model_id):
+        assert AIService._supports_claude_thinking(model_id) is True
+
 
 class TestOpenRouterTemperatureParams:
     """Tests for OpenRouter model-specific temperature compatibility."""
@@ -1093,6 +1106,19 @@ class TestOpenRouterTemperatureParams:
     def test_claude_sonnet_46_omits_temperature(self):
         assert AIService._openrouter_accepts_temperature("anthropic/claude-sonnet-4.6") is False
 
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "anthropic/claude-fable-5",
+            "anthropic/claude-sonnet-5",
+            "anthropic/claude-mythos-5",
+            "anthropic/claude-mythos-preview:thinking",
+            "~anthropic/claude-fable-latest",
+        ],
+    )
+    def test_new_claude_models_omit_temperature(self, model_id):
+        assert AIService._openrouter_accepts_temperature(model_id) is False
+
     def test_other_openrouter_models_keep_temperature(self):
         assert AIService._openrouter_accepts_temperature("google/gemini-3.1-pro-preview") is True
         assert AIService._openrouter_accepts_temperature("x-ai/grok-4-fast") is True
@@ -1101,11 +1127,19 @@ class TestOpenRouterTemperatureParams:
     @pytest.mark.parametrize(
         "model_id",
         [
+            "anthropic/claude-fable-5",
+            "anthropic/claude-mythos-5",
             "anthropic/claude-opus-4.7",
             "anthropic/claude-opus-4.8",
+            "anthropic/claude-sonnet-5",
+            "~anthropic/claude-fable-latest",
         ],
     )
-    async def test_generate_openrouter_does_not_send_temperature_for_restricted_opus(self, ai_service_instance, model_id):
+    async def test_generate_openrouter_does_not_send_temperature_for_restricted_claude(
+        self,
+        ai_service_instance,
+        model_id,
+    ):
         create = AsyncMock(
             return_value=SimpleNamespace(
                 choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
@@ -1304,16 +1338,41 @@ class TestMoonshotKimiParameterPolicy:
         assert "temperature" not in request_kwargs
 
 
-class TestClaudeOpus47And48Compatibility:
-    """Tests for Opus 4.7+ Anthropic Messages API constraints."""
+class TestClaudeAdaptiveModelCompatibility:
+    """Tests for Anthropic Messages API sampling and adaptive-thinking constraints."""
 
-    def test_direct_claude_restricted_models_omit_sampling_params(self):
-        assert AIService._claude_omits_sampling_params("claude-opus-4-7") is True
-        assert AIService._claude_omits_sampling_params("claude-opus-4-8") is True
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+        ],
+    )
+    def test_direct_claude_restricted_models_omit_sampling_params(self, model_id):
+        assert AIService._claude_omits_sampling_params(model_id) is True
+
+    def test_direct_claude_legacy_model_keeps_sampling_params(self):
         assert AIService._claude_omits_sampling_params("claude-opus-4-6") is False
 
     @pytest.mark.asyncio
-    async def test_generate_claude_omits_temperature_for_opus_48(self, ai_service_instance):
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+        ],
+    )
+    async def test_generate_claude_omits_restricted_params_by_default(
+        self,
+        ai_service_instance,
+        model_id,
+    ):
         create = AsyncMock(
             return_value=SimpleNamespace(
                 content=[SimpleNamespace(type="text", text="ok")],
@@ -1327,7 +1386,7 @@ class TestClaudeOpus47And48Compatibility:
 
         content, _usage = await ai_service_instance._generate_claude(
             prompt="Hello",
-            model_id="claude-opus-4-8",
+            model_id=model_id,
             temperature=0.4,
             max_tokens=64,
             system_prompt="System",
@@ -1335,11 +1394,25 @@ class TestClaudeOpus47And48Compatibility:
 
         assert content == "ok"
         request_kwargs = create.await_args.kwargs
-        assert request_kwargs["model"] == "claude-opus-4-8"
+        assert request_kwargs["model"] == model_id
         assert "temperature" not in request_kwargs
+        assert "thinking" not in request_kwargs
 
     @pytest.mark.asyncio
-    async def test_generate_claude_translates_opus_48_thinking_budget_to_adaptive(self, ai_service_instance):
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+        ],
+    )
+    async def test_generate_claude_translates_manual_thinking_budget_to_adaptive(
+        self,
+        ai_service_instance,
+        model_id,
+    ):
         create = AsyncMock(
             return_value=SimpleNamespace(
                 content=[SimpleNamespace(type="text", text="ok")],
@@ -1353,7 +1426,7 @@ class TestClaudeOpus47And48Compatibility:
 
         await ai_service_instance._generate_claude(
             prompt="Hello",
-            model_id="claude-opus-4-8",
+            model_id=model_id,
             temperature=1.0,
             max_tokens=64,
             system_prompt="System",
@@ -3613,7 +3686,9 @@ class TestGenerationToolLoop:
         request_kwargs = ai_service_instance.openrouter_client.chat.completions.create.await_args.kwargs
         assert request_kwargs["stream"] is True
         assert request_kwargs["stream_options"] == {"include_usage": True}
-        assert request_kwargs["extra_body"] == {"provider": {"require_parameters": True}}
+        # OpenRouter payloads now also disable provider context compression (D15).
+        assert request_kwargs["extra_body"]["provider"] == {"require_parameters": True}
+        assert {"id": "context-compression", "enabled": False} in request_kwargs["extra_body"]["plugins"]
         event_types = [event_type for event_type, _payload in events]
         assert "tool_call_delta" in event_types
         assert "tool_call_ready" in event_types
@@ -4131,6 +4206,86 @@ class TestGenerationToolLoop:
         assert envelope.accepted is True
         assert ai_service_instance.anthropic_client.messages.stream.call_count == 3
         ai_service_instance.anthropic_client.messages.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_claude_forced_final_turn_revalidates_context(
+        self, ai_service_instance, mock_config
+    ):
+        """Batch-2 finding 3: the extra forced-final SDK dispatch is revalidated.
+
+        Drives the Claude loop to budget exhaustion (2 tool rounds -> one
+        no-tools forced-final turn). Context revalidation must fire twice: the
+        turn-2 per-round check plus the forced-final dispatch (previously the
+        forced-final turn skipped revalidation entirely).
+        """
+
+        async def passthrough(operation, **kwargs):
+            return await operation()
+
+        tool_response = SimpleNamespace(
+            content=[
+                SimpleNamespace(
+                    type="tool_use",
+                    id="toolu_1",
+                    name="validate_draft",
+                    input={"text": "draft that still fails"},
+                )
+            ],
+            usage=None,
+        )
+        final_response = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="valid claude final answer")],
+            usage=None,
+        )
+
+        ai_service_instance.anthropic_client = Mock()
+        ai_service_instance.anthropic_client.messages = Mock()
+        ai_service_instance.anthropic_client.messages.stream = Mock(
+            side_effect=[
+                _claude_stream_for_response(tool_response),
+                _claude_stream_for_response(tool_response),
+                _claude_stream_for_response(final_response, stop_reason="end_turn"),
+            ]
+        )
+        ai_service_instance.anthropic_client.messages.create = AsyncMock()
+        ai_service_instance._execute_with_retries = AsyncMock(side_effect=passthrough)
+
+        mock_config.validate_token_limits = Mock(
+            return_value={
+                "adjusted_tokens": 512,
+                "adjusted_reasoning_effort": None,
+                "adjusted_thinking_budget_tokens": None,
+                "model_info": {"provider": "claude", "model_id": "claude-sonnet-4-5"},
+                "reasoning_timeout_seconds": None,
+            }
+        )
+
+        revalidation_calls: list = []
+        real_revalidate = AIService._revalidate_tool_loop_context
+
+        async def _spy(self_arg, **kwargs):
+            revalidation_calls.append(kwargs)
+            return await real_revalidate(self_arg, **kwargs)
+
+        def validation_callback(candidate: str):
+            return _result_for_target(candidate, "valid claude final answer")
+
+        with patch.object(AIService, "_revalidate_tool_loop_context", new=_spy):
+            content, envelope = await ai_service_instance.call_ai_with_validation_tools(
+                prompt="Write something long.",
+                model="claude-sonnet-4-5",
+                validation_callback=validation_callback,
+                max_tool_rounds=2,
+            )
+
+        assert content == "valid claude final answer"
+        assert envelope.accepted_via == "forced_final_turn"
+        # Turn-2 per-round revalidation + the forced-final dispatch = 2 calls.
+        assert len(revalidation_calls) == 2
+        # Every revalidation carries the out-of-band system prompt + tool defs.
+        for kwargs in revalidation_calls:
+            names = {name for name, _text, _kind in (kwargs.get("extra_texts") or ())}
+            assert "tool_definitions" in names
 
     @pytest.mark.asyncio
     async def test_claude_tool_loop_overflow_prefers_validate_draft_tool(

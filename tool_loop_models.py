@@ -171,6 +171,7 @@ class ToolLoopContextOverflow(Exception):
         turn: int,
         accumulated_chars_estimate: int,
         provider_error: Optional[BaseException] = None,
+        provider_reported: bool = False,
     ) -> None:
         super().__init__(
             f"Tool loop context overflow at turn {turn} "
@@ -179,6 +180,10 @@ class ToolLoopContextOverflow(Exception):
         self.turn = turn
         self.accumulated_chars_estimate = accumulated_chars_estimate
         self.provider_error = provider_error
+        # True only when a PROVIDER SDK reported the overflow mid-loop (catalog
+        # drift -> mark suspect, D14). A locally-raised revalidation overflow is
+        # our own budget math and must NOT mark the catalog suspect.
+        self.provider_reported = provider_reported
 
 
 class ToolLoopOutputTruncated(RuntimeError):

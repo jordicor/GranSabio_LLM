@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import ipaddress
 import json as std_json
 import logging
 import mimetypes
+import os
 import secrets
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -47,6 +50,40 @@ except ImportError:  # pragma: no cover - optional dependency
 
 logger = logging.getLogger(__name__)
 
+# Environment knobs with safe defaults. They live here (instead of config.py)
+# so the hardening applies to every deployment without requiring config edits;
+# each one can be overridden explicitly when needed.
+_FACTORY_RETENTION_DAYS = 32850
+_CLEANUP_STARTUP_DELAY_SECONDS = 30
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer environment knob, falling back to the safe default."""
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; using default %s", name, raw, default)
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean environment knob, falling back to the safe default."""
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    logger.warning("Invalid boolean for %s=%r; using default %s", name, raw, default)
+    return default
+
 
 class AttachmentManager:
     """Persist attachments with hashed per-user storage layout and metadata."""
@@ -72,8 +109,31 @@ class AttachmentManager:
             logger=logger,
         )
         self._denied_networks = self.url_fetcher.denied_networks
+        # Dedicated signing key derived from the pepper (domain-separated) so
+        # metadata signatures no longer rely on a plain SHA-256.
+        self._metadata_signing_key = hashlib.sha256(
+            f"attachment-metadata-signing:{pepper}".encode("utf-8")
+        ).digest()
+        self._signature_accept_legacy = _env_bool(
+            "GRANSABIO_ATTACHMENTS_SIGNATURE_ACCEPT_LEGACY", True
+        )
+        self._gc_enabled_default = _env_bool("GRANSABIO_ATTACHMENTS_GC_ENABLED", True)
+        self._default_retention_days = max(
+            _env_int("GRANSABIO_ATTACHMENTS_RETENTION_DAYS", 30), 1
+        )
+        self.max_total_storage_bytes = max(
+            _env_int("GRANSABIO_ATTACHMENTS_MAX_TOTAL_BYTES", 10 * 1024**3), 0
+        )
+        self._tmp_max_age_seconds = max(
+            _env_int("GRANSABIO_ATTACHMENTS_TMP_MAX_AGE_SECONDS", 3600), 0
+        )
+        self._cleanup_interval_seconds = max(
+            _env_int("GRANSABIO_ATTACHMENTS_CLEANUP_INTERVAL_SECONDS", 3600), 0
+        )
+        self._cleanup_thread: Optional[threading.Thread] = None
         if magic is None:
             logger.warning("python-magic is not available; attachment MIME hardening is degraded")
+        self._start_cleanup_thread()
 
     async def store_upload(
         self,
@@ -203,7 +263,11 @@ class AttachmentManager:
 
         cached = await self._get_cached_url_record(username=username, url=normalized_url)
         if cached:
-            logger.info("Using cached attachment %s for URL %s", cached.upload_id, normalized_url)
+            logger.info(
+                "Using cached attachment %s for URL %s",
+                cached.upload_id,
+                attachment_validation.redact_url(normalized_url),
+            )
             return cached
 
         async with self.url_fetcher.fetch(normalized_url) as fetched:
@@ -236,9 +300,14 @@ class AttachmentManager:
                 origin="url",
                 resolved_mime=resolved_mime,
                 declared_mime=declared_mime,
-                declared_size=declared_size,
+                # When the server applied a Content-Encoding, Content-Length
+                # describes encoded bytes while the stream yields decoded ones;
+                # skip the strict equality check in that case.
+                declared_size=None if fetched.content_encoded else declared_size,
                 data_stream=fetched.data_stream,
-                source_url=fetched.url,
+                # Persist the URL without query string: presigned URLs carry
+                # credentials in query parameters that must not be stored.
+                source_url=attachment_validation.redact_url(fetched.url),
             )
 
         await self._update_url_cache(username=username, url=normalized_url, record=record)
@@ -260,6 +329,7 @@ class AttachmentManager:
             raise AttachmentNotFoundError("Attachment metadata not found")
         if row.status != "active" or row.blob.status != "ready":
             raise AttachmentNotFoundError("Attachment is not available")
+        self._verify_row_signature(row)
         return self._record_from_store_row(row)
 
     def resolve_attachment(
@@ -278,6 +348,7 @@ class AttachmentManager:
             raise AttachmentNotFoundError("Attachment metadata not found")
         if row.status != "active" or row.blob.status != "ready":
             raise AttachmentNotFoundError("Attachment is not available")
+        self._verify_row_signature(row)
 
         record = self._record_from_store_row(row)
         binary_path = self.store.blob_path(row.blob.storage_key)
@@ -539,7 +610,7 @@ class AttachmentManager:
             target_hash = normalized
 
         report = CleanupReport(dry_run=dry_run)
-        effective_retention_days = retention_days if retention_days is not None else self.settings.retention_days
+        effective_retention_days = retention_days if retention_days is not None else self._effective_retention_days()
         if effective_retention_days and effective_retention_days > 0:
             cutoff = datetime.utcnow() - timedelta(days=effective_retention_days)
             cutoff_text = cutoff.replace(microsecond=0).isoformat() + "Z"
@@ -562,10 +633,10 @@ class AttachmentManager:
                     )
                 )
 
-        gc_dry_run = dry_run or not self.settings.blob_gc_enabled
+        gc_dry_run = dry_run or not self._blob_gc_enabled()
         gc_result = self.store.gc_unreferenced_blobs(dry_run=gc_dry_run)
         if gc_result["scanned"]:
-            if not dry_run and not self.settings.blob_gc_enabled:
+            if not dry_run and not self._blob_gc_enabled():
                 report.issues.append("Blob garbage collection is disabled; unreferenced blobs were left in place")
             action = "Would remove" if gc_dry_run else "Removed"
             detail = (
@@ -576,7 +647,95 @@ class AttachmentManager:
                 CleanupAction("garbage_collect_blobs", str(self.store.blob_base_path), detail)
             )
 
+        tmp_removed = self._sweep_temp_files(dry_run=dry_run)
+        report.tmp_files_removed += tmp_removed
+        if tmp_removed:
+            action = "Would remove" if dry_run else "Removed"
+            report.actions.append(
+                CleanupAction(
+                    "sweep_temp_files",
+                    str(self.store.blob_base_path / "_tmp"),
+                    f"{action} {tmp_removed} stale temporary upload file(s)",
+                )
+            )
+
         return report
+
+    def _blob_gc_enabled(self) -> bool:
+        """Effective blob GC flag: enabled by default unless explicitly disabled."""
+
+        if self.settings.blob_gc_enabled:
+            return True
+        return self._gc_enabled_default
+
+    def _effective_retention_days(self) -> int:
+        """Effective retention: explicit config wins; the factory default is capped."""
+
+        configured = self.settings.retention_days
+        if configured != _FACTORY_RETENTION_DAYS:
+            return configured
+        return self._default_retention_days
+
+    def _sweep_temp_files(self, *, dry_run: bool) -> int:
+        """Remove stale temporary upload files left by interrupted ingestions."""
+
+        temp_dir = self.store.blob_base_path / "_tmp"
+        try:
+            entries = list(temp_dir.glob("upload-*.tmp"))
+        except OSError as exc:
+            logger.warning("Unable to list temporary attachment directory %s: %s", temp_dir, exc)
+            return 0
+        cutoff = time.time() - self._tmp_max_age_seconds
+        removed = 0
+        for entry in entries:
+            try:
+                if entry.stat().st_mtime > cutoff:
+                    continue
+                if not dry_run:
+                    entry.unlink(missing_ok=True)
+                removed += 1
+            except OSError as exc:
+                logger.warning("Unable to sweep temporary attachment %s: %s", entry, exc)
+        return removed
+
+    def _start_cleanup_thread(self) -> None:
+        """Start the periodic maintenance thread (retention, GC, temp sweep)."""
+
+        if self._cleanup_interval_seconds <= 0:
+            return
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_loop,
+            name="attachment-cleanup",
+            daemon=True,
+        )
+        self._cleanup_thread.start()
+
+    def _cleanup_loop(self) -> None:
+        """Run scheduled cleanup after a startup delay, then on each interval."""
+
+        time.sleep(min(_CLEANUP_STARTUP_DELAY_SECONDS, self._cleanup_interval_seconds))
+        while True:
+            try:
+                report = self._run_scheduled_cleanup()
+                if report.attachments_removed or report.issues:
+                    logger.info("Scheduled attachment cleanup: %s", report.to_dict())
+            except Exception:
+                logger.exception("Scheduled attachment cleanup failed")
+            time.sleep(self._cleanup_interval_seconds)
+
+    def _run_scheduled_cleanup(self) -> CleanupReport:
+        """Execute one real (non dry-run) cleanup pass with effective settings."""
+
+        return self.run_cleanup(dry_run=False)
+
+    def _enforce_storage_quota(self, *, incoming_bytes: int) -> None:
+        """Reject ingestion when the global blob storage quota would be exceeded."""
+
+        if self.max_total_storage_bytes <= 0:
+            return
+        current = self.store.total_blob_bytes()
+        if current + incoming_bytes > self.max_total_storage_bytes:
+            raise AttachmentTooLargeError("Attachment storage quota exceeded")
 
     async def _persist_content(
         self,
@@ -661,14 +820,11 @@ class AttachmentManager:
             raise AttachmentError("Unable to persist attachment contents") from exc
 
         try:
+            self._enforce_storage_quota(incoming_bytes=total_bytes)
             self._validate_declared_size(actual=total_bytes, declared=declared_size)
-        except AttachmentValidationError:
-            temp_path.unlink(missing_ok=True)
-            raise
 
-        detected_mime = self._detect_mime(bytes(sample), temp_path)
-        final_mime = resolved_mime
-        try:
+            detected_mime = self._detect_mime(bytes(sample), temp_path)
+            final_mime = resolved_mime
             if detected_mime:
                 self._validate_mime(detected_mime, source="detected")
                 if declared_mime and not self._mime_equivalent(detected_mime, declared_mime):
@@ -682,17 +838,26 @@ class AttachmentManager:
                 final_mime = detected_mime
             else:
                 self._validate_mime(resolved_mime, source="declared")
-        except AttachmentValidationError:
+
+            if magic is None:
+                safe_mime = (final_mime or "").lower()
+                if safe_mime not in attachment_validation.SAFE_MIME_WHEN_MAGIC_MISSING:
+                    raise AttachmentValidationError("MIME type is not permitted without python-magic")
+                # Degraded mode: never trust a client-declared text/* type for
+                # content that does not actually look textual.
+                if (
+                    safe_mime.startswith("text/")
+                    and total_bytes > 0
+                    and not self._looks_textual(bytes(sample))
+                ):
+                    raise AttachmentValidationError(
+                        "Declared text MIME type does not match binary content"
+                    )
+
+            blob_kind = self._attachment_kind(final_mime=final_mime, stored_filename=sanitized_filename)
+        except Exception:
             temp_path.unlink(missing_ok=True)
             raise
-
-        if magic is None:
-            safe_mime = (final_mime or "").lower()
-            if safe_mime not in attachment_validation.SAFE_MIME_WHEN_MAGIC_MISSING:
-                temp_path.unlink(missing_ok=True)
-                raise AttachmentValidationError("MIME type is not permitted without python-magic")
-
-        blob_kind = self._attachment_kind(final_mime=final_mime, stored_filename=sanitized_filename)
         public_storage_path = f"dedupe/{upload_id}/{sanitized_filename}"
         public_metadata_path = f"dedupe/{upload_id}/metadata.json"
 
@@ -772,12 +937,6 @@ class AttachmentManager:
         )
 
     def _validate_declared_size(self, *, actual: int, declared: Optional[int]) -> None:
-        if declared is not None and actual != declared and actual <= declared * self.settings.max_compression_ratio:
-            logger.warning(
-                "Declared size %s does not match actual bytes %s",
-                declared,
-                actual,
-            )
         attachment_validation.validate_declared_size(
             actual=actual,
             declared=declared,
@@ -802,9 +961,61 @@ class AttachmentManager:
         return attachment_validation.mime_equivalent(detected, declared)
 
     def _compute_metadata_signature(self, payload: Dict[str, Any]) -> str:
+        """Compute the HMAC-SHA256 metadata signature with a dedicated key."""
+
+        data = {k: v for k, v in payload.items() if k != "metadata_signature"}
+        canonical = std_json.dumps(data, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        return hmac.new(
+            self._metadata_signing_key, canonical.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+
+    def _compute_legacy_metadata_signature(self, payload: Dict[str, Any]) -> str:
+        """Legacy unsalted SHA-256 signature, kept only for migration reads."""
+
         data = {k: v for k, v in payload.items() if k != "metadata_signature"}
         canonical = std_json.dumps(data, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _metadata_signature_payload(self, row: AttachmentUploadRow) -> Dict[str, Any]:
+        """Rebuild the canonical payload signed when the upload was persisted."""
+
+        return {
+            "upload_id": row.upload_id,
+            "origin": row.origin,
+            "intended_usage": row.intended_usage,
+            "original_filename": row.original_filename,
+            "stored_filename": row.stored_filename,
+            "mime_type": row.mime_type,
+            "detected_mime": row.detected_mime,
+            "size_bytes": row.blob.size_bytes,
+            "declared_size": row.declared_size,
+            "declared_mime": row.declared_mime,
+            "sha256": row.blob.sha256,
+            "original_url": row.original_url,
+            "created_at": row.created_at,
+            "hash_prefix1": row.hash_prefix1,
+            "hash_prefix2": row.hash_prefix2,
+            "user_hash": row.user_hash,
+            "storage_path": f"dedupe/{row.upload_id}/{row.stored_filename}",
+            "metadata_path": f"dedupe/{row.upload_id}/metadata.json",
+        }
+
+    def _verify_row_signature(self, row: AttachmentUploadRow) -> None:
+        """Reject stored rows whose metadata signature does not match their content."""
+
+        payload = self._metadata_signature_payload(row)
+        expected = self._compute_metadata_signature(payload)
+        if secrets.compare_digest(expected, row.metadata_signature):
+            return
+        if self._signature_accept_legacy:
+            legacy = self._compute_legacy_metadata_signature(payload)
+            if secrets.compare_digest(legacy, row.metadata_signature):
+                return
+        logger.warning(
+            "Attachment metadata signature mismatch for upload %s; refusing to serve it",
+            row.upload_id,
+        )
+        raise AttachmentNotFoundError("Attachment metadata failed integrity verification")
 
     def _sanitize_filename(self, filename: str) -> str:
         return attachment_validation.sanitize_filename(filename)

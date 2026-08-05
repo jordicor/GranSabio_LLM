@@ -3,7 +3,7 @@
 """
 Repetition Analyzer (exact n-gram repetition analytics with distances, clustering, diagnostics)
 Version: 2.3.3
-Author: ChatGPT (GPT-5 Pro)
+Author: Gran Sabio LLM Team
 License: MIT
 
 What's new in 2.3.3
@@ -336,7 +336,7 @@ def _physical_cores_windows() -> Optional[int]:
     try:
         cmd = [
             "powershell", "-NoProfile", "-Command",
-            "(Get-CimInstance Win32_Processor | Measure-Object - Property NumberOfCores -Sum).Sum"
+            "(Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum"
         ]
         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
         val = int(out.decode("utf-8", "ignore").strip() or "0")
@@ -1546,9 +1546,9 @@ def main():
         text = read_text_from_file(args.file)
     else:
         text = (
-            "Este es un pequeño texto de demostración. Este texto es solo un ejemplo, "
-            "pero este texto tiene repeticiones: a veces; también: usa dos puntos. "
-            "Este texto tiene repeticiones... ¿Ves? ¡Sí!"
+            "This is a small demo text. This text is just an example, "
+            "but this text has repetitions: sometimes; also: it uses colons. "
+            "This text has repetitions... See? Yes!"
         )
 
     cfg = AnalysisConfig(

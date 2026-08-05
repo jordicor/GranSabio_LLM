@@ -5,18 +5,18 @@ Word Count Utilities for Gran Sabio LLM Engine
 Utilities for word count validation and enforcement.
 """
 
-import json as json_stdlib
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+import json_utils
 from models import ContentRequest, QALayer
 from phrase_frequency_config import is_phrase_frequency_active
 
 logger = logging.getLogger(__name__)
 
 
-# Reserved order for synthetic accent-guard layer (see proposal Cambio 1 v5 §5.7).
+# Reserved order for the synthetic accent-guard layer.
 LAYER_ORDER_LLM_ACCENT_GUARD = 999_999
 
 
@@ -79,9 +79,10 @@ def extract_target_field(content: str, target_field: Optional[str]) -> Tuple[str
     if not target_field:
         return content, False
 
-    # Try to parse content as JSON
+    # Try to parse content as JSON (orjson raises JSONDecodeError instead of
+    # RecursionError on pathologically nested input, so the fallback applies)
     try:
-        data = json_stdlib.loads(content)
+        data = json_utils.loads(content)
 
         # Navigate nested fields using dot notation (e.g., "data.content")
         field_parts = target_field.split('.')
@@ -103,7 +104,7 @@ def extract_target_field(content: str, target_field: Optional[str]) -> Tuple[str
         logger.info(f"Successfully extracted field '{target_field}' from JSON for word count")
         return extracted_text, True
 
-    except (json_stdlib.JSONDecodeError, TypeError, ValueError) as e:
+    except (json_utils.JSONDecodeError, TypeError, ValueError) as e:
         # Not valid JSON, use entire content as fallback
         logger.warning(
             f"Failed to parse content as JSON (target_field='{target_field}'): {e}. "
@@ -570,7 +571,7 @@ def prepare_qa_layers_with_word_count(request: ContentRequest, preflight_result=
                 cumulative_words,
             )
 
-    # Synthetic LLM-accent guard layer (post / inline_post modes) (Cambio 1 v5, §5.7)
+    # Synthetic LLM-accent guard layer (post / inline_post modes)
     if request.llm_accent_guard.mode in {"post", "inline_post"}:
         # Runtime collision defense: no pre-existing layer may occupy the reserved slot.
         for existing in qa_layers:

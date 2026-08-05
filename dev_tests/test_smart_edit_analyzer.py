@@ -45,8 +45,13 @@ class TestAnalyzeBasic:
         categories = [a["category"] for a in actions]
         assert all(c == "redundancy" for c in categories)
 
-    def test_detects_redundant_phrases(self):
-        """Should detect common redundant phrases."""
+    def test_ignores_semantic_redundant_phrases(self):
+        """Semantic phrase detection was removed per repo policy (AUX-10).
+
+        Patterns like "in the year X" or "due to the fact that" are natural
+        language style judgments, not mechanical checks, so the fallback must
+        no longer flag them; only the AI analysis path may suggest them.
+        """
         from smart_edit.analyzer import TextAnalyzer
 
         analyzer = TextAnalyzer.__new__(TextAnalyzer)
@@ -54,10 +59,7 @@ class TestAnalyzeBasic:
 
         actions = analyzer.analyze_basic(text)
 
-        # Should find "in the year" and "due to the fact that"
-        assert len(actions) >= 2
-        descriptions = [a["description"].lower() for a in actions]
-        assert any("year" in d or "simplify" in d for d in descriptions)
+        assert actions == []
 
     def test_respects_max_issues_limit(self):
         """Should respect the max_issues parameter."""

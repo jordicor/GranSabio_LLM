@@ -1043,8 +1043,13 @@ class TestGetModelInfo:
                 from config import Config
                 cfg = Config()
                 info = cfg.get_model_info("minimal-model")
-                assert info["input_tokens"] == 100000  # default
-                assert info["output_tokens"] == 8192  # default
+                # Input/output capacity is fail-closed: no invented default
+                # window (audit CFG-04). The old invented 8192 output default
+                # was the finding being fixed; resolvers apply the explicit
+                # DEFAULT_OUTPUT_TOKEN_FALLBACK instead.
+                assert info["input_tokens"] is None
+                assert info["context_window"] is None
+                assert info["output_tokens"] is None
                 assert info["capabilities"] == []  # default
 
     def test_validate_api_keys_method(self, minimal_model_specs, mock_env_vars):

@@ -117,6 +117,17 @@ Use `/admin/models` to manage the local model catalog without hand-editing `mode
 - Fetch remote provider catalogs
 - Run **Sync All** for the selected provider/model entries
 
+Context admission prefers exact per-model limits from `model_limits.curated.json`
+or provider metadata cached by model sync. If a newly discovered direct-provider
+text-generation model has no trusted numeric capacity, the versioned and expiring
+`model_family_floors.json` policy may supply a conservative family floor. It
+never applies to OpenRouter, embeddings, realtime/audio/image surfaces, unknown
+families, lookalike names, or expired rules. Machine-specific overrides belong
+in ignored `model_limits.curated.local.json` and
+`model_family_floors.local.json` files. For capacity without any usable numeric
+limit, the risk bands count serialized input plus reserved output and thinking
+tokens.
+
 ---
 
 ### Session Debugger: Full Transparency

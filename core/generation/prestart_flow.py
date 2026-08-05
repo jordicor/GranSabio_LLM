@@ -9,10 +9,31 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from auto_qa_planner import AutoQAPlanningError
+from content_events import (
+    ContentEvent,
+    ContentPhase,
+    ContentStatus,
+    ContentSubphase,
+    SessionPhase,
+    live_attempt_key,
+)
+from content_stream import flush_content_events, publish_content_event
 from logging_utils import Phase
 from models import ContentRequest, GenerationInitResponse, GenerationStatus
 
-from ..cancellation import CancelMode, CancellationToken
+from ..cancellation import CancellationToken, CancelMode
+
+# The preflight validator runs exactly once per session, so its live field only
+# ever holds one attempt; the id still travels because the per-session endpoint
+# resets its cursor on it.
+_PREFLIGHT_ATTEMPT_ID = 1
+_PREFLIGHT_ATTEMPT_KEY = live_attempt_key("preflight_content")
+
+# Auto-QA planning also runs exactly once per session and publishes a single
+# post-validation summary, so its live field holds one attempt too.
+_AUTO_QA_ATTEMPT_ID = 1
+_AUTO_QA_ATTEMPT_KEY = live_attempt_key("auto_qa_content")
+_AUTO_QA_LAYER = "auto_qa.planning"
 
 
 @dataclass
@@ -24,7 +45,6 @@ class PrestartFlowDeps:
     pop_session: Any
     is_terminal_session: Any
     apply_session_cancelled_state: Any
-    publish_project_phase_chunk: Any
     publish_project_session_end: Any
     debug_record_event: Any
     create_phase_logger: Any
@@ -82,7 +102,11 @@ async def run_prestart_flow(
         "preflight_content": "",
         "generation_content": "",
         "qa_content": "",
-        "current_phase": "auto_qa_planning" if auto_qa_requested else "preflight_validation",
+        "current_phase": (
+            SessionPhase.AUTO_QA_PLANNING
+            if auto_qa_requested
+            else SessionPhase.PREFLIGHT_VALIDATION
+        ),
         "usage_tracker": usage_tracker,
         "show_query_stats": getattr(request, "show_query_stats", 0),
     }
@@ -153,17 +177,29 @@ async def run_prestart_flow(
     )
     auto_qa_plan_payload: Optional[Dict[str, Any]] = None
 
-    def auto_qa_stream_callback(chunk: str) -> None:
+    async def auto_qa_stream_callback(chunk: str) -> None:
+        """Publish the Auto-QA planning summary, labelled as the commit it is.
+
+        The planner emits this once, AFTER validating the QA contract, so it is
+        not a draft: it is the accepted outcome of the planning phase. Routing
+        it through the central handler is what puts the label on the event
+        itself instead of leaving the emission unlabelled on the bus.
+        """
         if temp_session.get("hard_cancelled"):
             return
         temp_session["auto_qa_content"] += chunk
+        temp_session[_AUTO_QA_ATTEMPT_KEY] = _AUTO_QA_ATTEMPT_ID
         if project_id and chunk:
-            asyncio.create_task(
-                deps.publish_project_phase_chunk(
-                    project_id,
-                    "auto_qa",
-                    chunk,
+            await publish_content_event(
+                ContentEvent(
+                    phase=ContentPhase.AUTO_QA,
+                    content=chunk,
+                    layer=_AUTO_QA_LAYER,
+                    attempt=_AUTO_QA_ATTEMPT_ID,
+                    subphase=ContentSubphase.ACCEPTED_STREAM,
+                    content_status=ContentStatus.ACCEPTED,
                     session_id=session_id,
+                    project_id=project_id,
                     project_epoch=project_epoch,
                     request_name=request.request_name,
                 )
@@ -216,7 +252,7 @@ async def run_prestart_flow(
                 "auto_qa_plan_applied",
                 auto_qa_plan_payload,
             )
-            temp_session["current_phase"] = "preflight_validation"
+            temp_session["current_phase"] = SessionPhase.PREFLIGHT_VALIDATION
         except asyncio.CancelledError:
             return PrestartFlowResult(
                 temp_session=temp_session,
@@ -256,21 +292,22 @@ async def run_prestart_flow(
                 ),
             )
 
-    def preflight_stream_callback(chunk: str) -> None:
+    async def preflight_stream_callback(event: ContentEvent) -> None:
+        """Publish one live preflight chunk, labelled as the draft it is (C5-ter).
+
+        The validator runs exactly once per session, so the live field carries a
+        single attempt; its id is stamped anyway because the per-session
+        endpoint resets its cursor on that field and must never see it missing.
+        """
         if temp_session.get("hard_cancelled"):
             return
-        temp_session["preflight_content"] += chunk
-        if project_id and chunk:
-            asyncio.create_task(
-                deps.publish_project_phase_chunk(
-                    project_id,
-                    "preflight",
-                    chunk,
-                    session_id=session_id,
-                    project_epoch=project_epoch,
-                    request_name=request.request_name,
-                )
-            )
+        temp_session["preflight_content"] += event.content
+        temp_session[_PREFLIGHT_ATTEMPT_KEY] = _PREFLIGHT_ATTEMPT_ID
+        event.session_id = session_id
+        event.project_id = project_id
+        event.project_epoch = project_epoch
+        event.request_name = request.request_name
+        await publish_content_event(event)
 
     try:
         with (usage_tracker.span(phase="preflight", operation="preflight_validation") if usage_tracker else nullcontext()):
@@ -292,6 +329,11 @@ async def run_prestart_flow(
             auto_qa_plan_payload=auto_qa_plan_payload,
             response=await cancel_pre_start_from_token("Generation cancelled during preflight validation"),
         )
+    finally:
+        # Drain the sampled preflight drafts before the pipeline moves on, so
+        # the tail of the validator can never arrive after a later phase's
+        # events - however preflight ended (decision, cancellation or error).
+        await flush_content_events(session_id, phase=ContentPhase.PREFLIGHT)
 
     if preflight_result.decision != "proceed":
         if auto_qa_requested and auto_qa_plan_payload is not None:

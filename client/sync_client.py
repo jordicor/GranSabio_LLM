@@ -43,15 +43,30 @@ from ._common import (
     ActivityMonitor,
     compute_generation_timeout,
     compute_token_budgets,
-    is_heartbeat,
+    payload_error_metadata,
     resolve_model_token_fallback,
     validate_result,
+)
+from ._sse import (
+    SessionEventRouter,
+    SSEEvent,
+    SSEParser,
+    StreamCallbacks,
+    StreamError,
+    decode_event_json,
 )
 
 logger = logging.getLogger(__name__)
 
 
 _POLL_RETRY_BACKOFF_SECONDS = POLL_RETRY_BACKOFF_SECONDS
+
+# HTTP statuses on the polling endpoints that mean "try again later" rather
+# than a fatal error: 202/425 (result not ready), 429 (rate limited), 503
+# (transient overload / proxy flap). get_status and get_result map them to
+# TransientGranSabioError so _call_with_retry retries them within the
+# max_wait budget, consistent with _fetch_result_polling.
+_RETRYABLE_POLL_STATUS_CODES = (202, 425, 429, 503)
 
 # Generic return type for _call_with_retry so it can wrap any idempotent GET
 # (requests.Response, parsed JSON dict, etc.).
@@ -115,6 +130,11 @@ class GranSabioClient:
         self.provider_keys = dict(provider_keys or {})
         self._model_token_cache: Dict[str, int] = {}
         self._model_timeout_cache: Dict[str, int] = {}
+        # Streaming failures of the last generate_streaming call. A stream is
+        # the visibility channel, not the result channel: failures are
+        # surfaced here (and through error_callback) instead of aborting a
+        # generation the engine is still running.
+        self.last_stream_errors: List[Dict[str, str]] = []
 
     def _headers(self) -> Dict[str, str]:
         """Build request headers including provider API keys."""
@@ -471,7 +491,7 @@ class GranSabioClient:
             raise GranSabioClientError(
                 f"Generation request failed: {text}",
                 status_code=response.status_code,
-                details={"payload": payload}
+                details={"payload_metadata": payload_error_metadata(payload)}
             )
 
         result = self._read_json_no_retry(response, "/generate")
@@ -518,6 +538,11 @@ class GranSabioClient:
     def get_status(self, session_id: str) -> Dict[str, Any]:
         """Get current status of a generation session."""
         response = self._request("GET", f"/status/{session_id}")
+        if response.status_code in _RETRYABLE_POLL_STATUS_CODES:
+            raise TransientGranSabioError(
+                f"Transient HTTP {response.status_code} getting status of session {session_id}",
+                status_code=response.status_code,
+            )
         if response.status_code != 200:
             endpoint = f"/status/{session_id}"
             text = self._read_error_text(response, endpoint)
@@ -534,6 +559,12 @@ class GranSabioClient:
         if response.status_code == 202:
             # Still in progress
             return {"status": "in_progress", "session_id": session_id}
+
+        if response.status_code in _RETRYABLE_POLL_STATUS_CODES:
+            raise TransientGranSabioError(
+                f"Transient HTTP {response.status_code} getting result of session {session_id}",
+                status_code=response.status_code,
+            )
 
         if response.status_code != 200:
             endpoint = f"/result/{session_id}"
@@ -640,11 +671,12 @@ class GranSabioClient:
         """
         Poll until generation completes and return result.
 
-        Transient network errors (connection drops, timeouts) during status or
-        result polling are retried with exponential backoff
-        (_POLL_RETRY_BACKOFF_SECONDS) before giving up. Retry sleeps count
-        against max_wait. Non-transient errors (HTTP 4xx/5xx, protocol errors)
-        fail fast.
+        Transient failures during status or result polling are retried with
+        exponential backoff (_POLL_RETRY_BACKOFF_SECONDS) before giving up:
+        network errors (connection drops, timeouts) and retryable HTTP
+        statuses (202/425/429/503, e.g. a brief proxy flap or rate limit).
+        Retry sleeps count against max_wait. Other non-transient errors
+        (HTTP 4xx/5xx, protocol errors) fail fast.
 
         Args:
             session_id: Session to wait for
@@ -706,6 +738,55 @@ class GranSabioClient:
     # Streaming Generation
     # =========================================================================
 
+    def _dispatch_stream_event(
+        self,
+        router: SessionEventRouter,
+        sse_event: SSEEvent,
+        activity_monitor: ActivityMonitor,
+    ) -> Optional[str]:
+        """Route one parsed SSE frame; return the terminal status if any.
+
+        Comments (the engine's heartbeats) only refresh the activity monitor:
+        they prove the connection is alive without pretending progress.
+        """
+        if sse_event.is_comment:
+            activity_monitor.mark(message="heartbeat")
+            return None
+        payload = decode_event_json(sse_event)
+        if payload is None:
+            return None
+        return router.handle(payload)
+
+    def _record_stream_error(
+        self,
+        stream: str,
+        url: str,
+        exc: Exception,
+        error_callback: Optional[Callable[[str, Exception], None]],
+    ) -> None:
+        """Surface a streaming failure: log, client state and callback.
+
+        Never raises: the generation keeps running on the server and the
+        result is still fetched by polling. Silence is what made the dead
+        stream endpoint invisible for months, so this is a warning, not a
+        debug line.
+        """
+        logger.warning("Stream '%s' failed (%s): %s", stream, url, exc)
+        self.last_stream_errors.append(
+            StreamError(
+                stream=stream,
+                url=url,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            ).as_dict()
+        )
+        if error_callback is None:
+            return
+        try:
+            error_callback(stream, exc)
+        except Exception:
+            logger.exception("error_callback raised while reporting a stream failure")
+
     def generate_streaming(
         self,
         prompt: str,
@@ -739,17 +820,28 @@ class GranSabioClient:
         qa_timeout_retries: Optional[int] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
         content_callback: Optional[Callable[[str], None]] = None,
+        content_reset_callback: Optional[Callable[[], None]] = None,
         qa_callback: Optional[Callable[[str, str, str], None]] = None,
         on_session_start: Optional[Callable[[str], None]] = None,
+        error_callback: Optional[Callable[[str, Exception], None]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
         Generate content with real-time streaming of progress, content, and QA.
 
-        This method starts a generation session and then consumes four SSE
-        endpoints in parallel (progress, generation content, QA content,
-        preflight content), forwarding data to the provided callbacks.
-        Once generation completes, the final result is fetched and returned.
+        This method starts a generation session and consumes ONE SSE endpoint,
+        ``GET /stream/{session_id}``, which carries everything the session
+        produces already labelled: status snapshots and changes, generation
+        drafts and accepted commits, QA / preflight / Arbiter / Gran Sabio
+        text, thinking, control events and the terminal ``session_end``.
+        Once generation completes, the final result is fetched by polling and
+        returned.
+
+        Streaming errors do NOT abort the run: the stream is the visibility
+        channel and the result still arrives through polling. Each failure is
+        logged at warning level, appended to ``self.last_stream_errors`` (a
+        list of dicts with ``stream``/``url``/``error``/``error_type``) and
+        reported to ``error_callback`` when one is given.
 
         Args:
             prompt: The generation prompt.
@@ -779,12 +871,29 @@ class GranSabioClient:
             lexical_diversity: Vocabulary diversity guard config.
             reasoning_effort: For reasoning models (low/medium/high).
             thinking_budget_tokens: For Claude thinking models (min 1024).
-            progress_callback: Called with progress messages (str).
-            content_callback: Called with raw content text chunks (str).
-            qa_callback: Called with (chunk, event_type, detail).
-                event_type is one of: "QA_PROGRESS", "QA_CONTENT_STREAM",
-                "PREFLIGHT_CONTENT_STREAM".
+            progress_callback: Called with lifecycle messages (str). Never
+                called with an empty string.
+            content_callback: Called with generation text (str). Drafts arrive
+                as deltas to append; the accepted commit arrives as the FULL
+                snapshot of its attempt and replaces what came before it.
+            content_reset_callback: Called with no arguments when everything
+                delivered so far for the phase becomes dead text: right before
+                the delivery that REPLACES it (accepted commit after its drafts,
+                or a new attempt superseding the previous one), or on its own
+                when the attempt closes with no body to replace it (a
+                ``filtered`` provider stop). Provide it to accumulate
+                correctly - clear the buffer, then append what arrives next.
+                Omitting it keeps the append-everything behaviour, which
+                concatenates the dead draft with its replacement (and produces
+                unparseable text when ``json_output`` is set).
+            qa_callback: Called with ``(text, agent, status)`` for every other
+                text channel (QA, preflight, Arbiter, Gran Sabio). ``agent`` is
+                the producing model when the engine reports one, otherwise the
+                phase; ``status`` is the content label (``draft``,
+                ``accepted``, ``rejected``, ``filtered``) or ``thinking``.
             on_session_start: Called with session_id once the session starts.
+            error_callback: Called with ``(stream_name, exception)`` when the
+                event stream fails. The run continues on polling.
             **kwargs: Additional parameters passed to API.
 
         Returns:
@@ -795,6 +904,9 @@ class GranSabioClient:
             GranSabioGenerationCancelled: If the session was cancelled.
             GranSabioGenerationRejected: If QA rejected the final output.
         """
+        # Errors of a previous run must not be mistaken for this one's.
+        self.last_stream_errors = []
+
         # Build payload (same as generate())
         payload: Dict[str, Any] = {
             "prompt": prompt,
@@ -885,13 +997,21 @@ class GranSabioClient:
         )
 
         # -----------------------------------------------------------------
-        # 4. Launch SSE consumer threads
+        # 4. Launch the session event stream
         # -----------------------------------------------------------------
         completion_queue: queue.Queue[Optional[str]] = queue.Queue()
-        thread_errors: List[Exception] = []
+        router = SessionEventRouter(
+            StreamCallbacks(
+                progress=progress_callback,
+                content=content_callback,
+                qa=qa_callback,
+                content_reset=content_reset_callback,
+            ),
+            activity=activity_monitor,
+        )
 
-        def _run_progress_stream() -> None:
-            """Consume SSE progress events from /stream/{session_id}."""
+        def _run_session_stream() -> None:
+            """Consume the unified session event stream."""
             url = f"{self.base_url}/stream/{session_id}"
             try:
                 resp = requests.get(
@@ -900,52 +1020,30 @@ class GranSabioClient:
                     stream=True,
                     timeout=(30, stream_timeout),
                 )
-                resp.raise_for_status()
-                for raw_line in resp.iter_lines(decode_unicode=True):
-                    if raw_line is None:
-                        continue
-                    line = raw_line.strip()
-                    if not line or not line.startswith("data: "):
-                        continue
-
-                    json_str = line[6:]  # strip "data: " prefix
-                    try:
-                        event = json.loads(json_str)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-
-                    if not isinstance(event, dict):
-                        continue
-
-                    activity_monitor.mark(
-                        iteration=event.get("iteration"),
-                        message=event.get("message"),
-                    )
-
-                    msg = event.get("message", "")
-                    event_type = event.get("type", "")
-
-                    # Route QA-related progress to qa_callback
-                    is_qa_event = (
-                        event_type in ("qa_evaluation", "qa_result", "qa_summary")
-                        or "QA" in msg
-                        or "qa" in event_type
-                    )
-
-                    if is_qa_event and qa_callback:
-                        qa_callback(msg, "QA_PROGRESS", json_str)
-                    elif progress_callback:
-                        progress_callback(msg)
-
-                    # Detect completion signals
-                    status = event.get("status", "")
-                    if status in ("completed", "rejected", "failed", "cancelled"):
-                        completion_queue.put(status)
-                        return
-
+                try:
+                    resp.raise_for_status()
+                    parser = SSEParser()
+                    terminal: Optional[str] = None
+                    for chunk in resp.iter_content(chunk_size=None):
+                        for sse_event in parser.feed(chunk):
+                            terminal = self._dispatch_stream_event(
+                                router, sse_event, activity_monitor,
+                            ) or terminal
+                        if terminal:
+                            break
+                    if not terminal:
+                        for sse_event in parser.close():
+                            terminal = self._dispatch_stream_event(
+                                router, sse_event, activity_monitor,
+                            ) or terminal
+                    if terminal:
+                        completion_queue.put(terminal)
+                finally:
+                    # The session terminal closes the loop before EOF: release
+                    # the connection instead of leaving it to the collector.
+                    resp.close()
             except Exception as exc:
-                logger.debug("Progress stream ended: %s", exc)
-                thread_errors.append(exc)
+                self._record_stream_error("session", url, exc, error_callback)
             finally:
                 # Ensure queue always gets a signal so main thread never blocks forever
                 try:
@@ -953,87 +1051,12 @@ class GranSabioClient:
                 except queue.Full:
                     pass
 
-        def _run_content_stream() -> None:
-            """Consume raw text chunks from /stream-generation/{session_id}."""
-            url = f"{self.base_url}/stream-generation/{session_id}"
-            try:
-                resp = requests.get(
-                    url,
-                    headers=self._headers(),
-                    stream=True,
-                    timeout=(30, stream_timeout),
-                )
-                resp.raise_for_status()
-                for chunk in resp.iter_content(chunk_size=None, decode_unicode=True):
-                    if not chunk:
-                        continue
-                    if is_heartbeat(chunk):
-                        activity_monitor.mark(message="heartbeat")
-                        continue
-                    activity_monitor.mark()
-                    if content_callback:
-                        content_callback(chunk)
-            except Exception as exc:
-                logger.debug("Content stream ended: %s", exc)
-
-        def _run_qa_stream() -> None:
-            """Consume raw QA evaluation chunks from /stream-qa/{session_id}."""
-            url = f"{self.base_url}/stream-qa/{session_id}"
-            try:
-                resp = requests.get(
-                    url,
-                    headers=self._headers(),
-                    stream=True,
-                    timeout=(30, stream_timeout),
-                )
-                resp.raise_for_status()
-                for chunk in resp.iter_content(chunk_size=None, decode_unicode=True):
-                    if not chunk:
-                        continue
-                    if is_heartbeat(chunk):
-                        activity_monitor.mark(message="heartbeat")
-                        continue
-                    activity_monitor.mark()
-                    if qa_callback:
-                        qa_callback(chunk, "QA_CONTENT_STREAM", "raw_chunk")
-            except Exception as exc:
-                logger.debug("QA stream ended: %s", exc)
-
-        def _run_preflight_stream() -> None:
-            """Consume preflight validation chunks from /stream-preflight/{session_id}."""
-            url = f"{self.base_url}/stream-preflight/{session_id}"
-            try:
-                resp = requests.get(
-                    url,
-                    headers=self._headers(),
-                    stream=True,
-                    timeout=(30, stream_timeout),
-                )
-                resp.raise_for_status()
-                for chunk in resp.iter_content(chunk_size=None, decode_unicode=True):
-                    if not chunk:
-                        continue
-                    if is_heartbeat(chunk):
-                        activity_monitor.mark(message="heartbeat")
-                        continue
-                    activity_monitor.mark()
-                    if qa_callback:
-                        qa_callback(chunk, "PREFLIGHT_CONTENT_STREAM", "raw_chunk")
-            except Exception as exc:
-                logger.debug("Preflight stream ended: %s", exc)
-
-        threads: List[threading.Thread] = []
-        for target, name in (
-            (_run_progress_stream, f"progress-{session_id[:8]}"),
-            (_run_content_stream, f"content-{session_id[:8]}"),
-            (_run_qa_stream, f"qa-{session_id[:8]}"),
-            (_run_preflight_stream, f"preflight-{session_id[:8]}"),
-        ):
-            t = threading.Thread(target=target, name=name, daemon=True)
-            t.start()
-            threads.append(t)
-
-        content_threads = threads[1:]
+        stream_thread = threading.Thread(
+            target=_run_session_stream,
+            name=f"session-stream-{session_id[:8]}",
+            daemon=True,
+        )
+        stream_thread.start()
 
         # -----------------------------------------------------------------
         # 5. Wait for completion signal with activity-aware deadline
@@ -1057,17 +1080,16 @@ class GranSabioClient:
             try:
                 wait_time = min(remaining, STREAM_ACTIVITY_CHECK_SECONDS)
                 completion_queue.get(timeout=wait_time)
-                # Got a signal from the progress thread
+                # Got a signal from the stream thread
                 break
             except queue.Empty:
                 # No signal yet - check activity and continue waiting
                 continue
 
         # -----------------------------------------------------------------
-        # 6. Join content threads (short grace period)
+        # 6. Let the stream thread finish its last events
         # -----------------------------------------------------------------
-        for t in content_threads:
-            t.join(timeout=5.0)
+        stream_thread.join(timeout=5.0)
 
         # -----------------------------------------------------------------
         # 7. Fetch final result via polling
@@ -1560,12 +1582,21 @@ class GranSabioClient:
         }
         data = {"username": username}
 
-        response = requests.post(
-            f"{self.base_url}/attachments",
+        # Multipart uploads cannot reuse the default JSON Content-Type header,
+        # but they must go through _request so connection/timeout failures map
+        # to the documented GranSabioClientError/TransientGranSabioError
+        # hierarchy instead of leaking raw requests exceptions.
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        headers.update(self.provider_keys)
+
+        response = self._request(
+            "POST",
+            "/attachments",
+            headers=headers,
             files=files,
             data=data,
-            headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {},
-            timeout=self.timeout
         )
 
         if response.status_code != 200:

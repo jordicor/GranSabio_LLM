@@ -16,18 +16,19 @@ Covers the minimum set of scenarios required by the Phase 1 refactor:
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 from typing import Any, Dict
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import context_budget
 from ai_service import (
     AIRequestError,
     AIService,
     StreamChunk,
     call_ai_with_validation_tools,
-    estimate_prompt_overflow,
 )
 from deterministic_validation import DraftValidationResult
 from tool_loop_models import (
@@ -435,46 +436,57 @@ def test_runtime_tool_loop_gate_can_be_force_enabled_by_supports_tool_calling_pa
 
 
 # ---------------------------------------------------------------------------
-# estimate_prompt_overflow helper
+# Tool-loop entry context admission (migrated from the legacy estimator)
 # ---------------------------------------------------------------------------
 
 
-def test_estimate_prompt_overflow_unknown_model_returns_none():
-    """Unknown models degrade gracefully (no context-window info available)."""
-    with patch("ai_service.config") as mock_config:
-        mock_config.get_model_info.side_effect = RuntimeError("unknown model")
-        assert estimate_prompt_overflow("fake-model", 100_000, 4000) is None
+def _verified_limits(
+    *,
+    max_input=None,
+    max_total=None,
+    output_accounting="within_total",
+    provider="gemini",
+    model="model",
+) -> "context_budget.TokenLimitsResolution":
+    """Build a VERIFIED capacity resolution for entry-guard tests."""
+
+    return context_budget.TokenLimitsResolution(
+        model=model,
+        provider=provider,
+        max_input_tokens=max_input,
+        max_output_tokens=None,
+        max_total_context_tokens=max_total,
+        output_accounting=output_accounting,
+        reasoning_accounting="within_output",
+        provenance="manual_curated",
+        confidence=context_budget.CapacityConfidence.VERIFIED,
+    )
 
 
-def test_estimate_prompt_overflow_fits_returns_none():
-    """When estimated tokens fit comfortably, return ``None``."""
-    with patch("ai_service.config") as mock_config:
-        mock_config.get_model_info.return_value = {"input_tokens": 128_000}
-        # 4000 chars ~= 1000 tokens, well below 128k.
-        assert estimate_prompt_overflow("gpt-4o", 4000, 2000) is None
+def _unknown_limits(model="model", provider="") -> "context_budget.TokenLimitsResolution":
+    """Build an UNKNOWN capacity resolution (fail-closed in enforce mode)."""
 
-
-def test_estimate_prompt_overflow_exceeds_returns_flag():
-    """Overflow produces the tagged string."""
-    with patch("ai_service.config") as mock_config:
-        mock_config.get_model_info.return_value = {"input_tokens": 1000}
-        # 100_000 chars ~= 25_000 tokens, far above 1000.
-        assert estimate_prompt_overflow("tiny-model", 100_000, 100) == "context_too_large"
+    return context_budget.TokenLimitsResolution(
+        model=model,
+        provider=provider,
+        max_input_tokens=None,
+        max_output_tokens=None,
+        max_total_context_tokens=None,
+        output_accounting="unknown",
+        reasoning_accounting="unknown",
+        provenance="unknown",
+        confidence=context_budget.CapacityConfidence.UNKNOWN,
+    )
 
 
 @pytest.mark.asyncio
-async def test_known_large_context_model_over_hard_cap_uses_model_window():
-    """A known 1M-token model must not be rejected by the generic 200k char cap."""
+async def test_known_large_context_model_fits_proceeds():
+    """A known 1M-token model must not be rejected for a large-but-fitting prompt."""
     service = AIService.__new__(AIService)
     service.google_new_client = object()
     fake_loop = AsyncMock(return_value=(
         "provider called",
-        {
-            "mode": "gemini_tool_loop",
-            "turns": 1,
-            "accepted": "assistant_final",
-            "trace": [],
-        },
+        {"mode": "gemini_tool_loop", "turns": 1, "accepted": "assistant_final", "trace": []},
     ))
 
     with patch.object(AIService, "_normalize_tool_loop_provider", return_value="gemini"), \
@@ -483,17 +495,19 @@ async def test_known_large_context_model_over_hard_cap_uses_model_window():
          patch.object(AIService, "_should_inject_json_prompt", return_value=False), \
          patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
          patch.object(AIService, "_run_gemini_new_sdk_validation_tool_loop", new=fake_loop), \
+         patch.object(
+             context_budget,
+             "resolve_token_limits",
+             return_value=_verified_limits(
+                 max_input=1_048_576, output_accounting="separate", model="gemini-3.1-flash-lite"
+             ),
+         ), \
          patch("ai_service.config") as mock_config:
         mock_config.validate_token_limits.return_value = {
             "adjusted_tokens": 16_000,
             "adjusted_reasoning_effort": None,
             "adjusted_thinking_budget_tokens": None,
-            "model_info": {
-                "provider": "gemini",
-                "model_id": "gemini-3.1-flash-lite",
-                "input_tokens": 1_048_576,
-                "context_window": 1_048_576,
-            },
+            "model_info": {"provider": "gemini", "model_id": "gemini-3.1-flash-lite"},
             "reasoning_timeout_seconds": None,
         }
         mock_config.GENERATOR_SYSTEM_PROMPT = "system"
@@ -514,17 +528,12 @@ async def test_known_large_context_model_over_hard_cap_uses_model_window():
 
 @pytest.mark.asyncio
 async def test_known_model_context_overflow_rejects_with_model_details():
-    """A known model that truly exceeds its resolved window still fails fast."""
+    """A known model that truly exceeds its resolved window fails fast in both modes."""
     service = AIService.__new__(AIService)
     service.google_new_client = object()
     fake_loop = AsyncMock(return_value=(
         "should not run",
-        {
-            "mode": "gemini_tool_loop",
-            "turns": 1,
-            "accepted": "assistant_final",
-            "trace": [],
-        },
+        {"mode": "gemini_tool_loop", "turns": 1, "accepted": "assistant_final", "trace": []},
     ))
 
     with patch.object(AIService, "_normalize_tool_loop_provider", return_value="gemini"), \
@@ -533,17 +542,19 @@ async def test_known_model_context_overflow_rejects_with_model_details():
          patch.object(AIService, "_should_inject_json_prompt", return_value=False), \
          patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
          patch.object(AIService, "_run_gemini_new_sdk_validation_tool_loop", new=fake_loop), \
+         patch.object(
+             context_budget,
+             "resolve_token_limits",
+             return_value=_verified_limits(
+                 max_input=1_048_576, output_accounting="separate", model="gemini-3.1-flash-lite"
+             ),
+         ), \
          patch("ai_service.config") as mock_config:
         mock_config.validate_token_limits.return_value = {
             "adjusted_tokens": 16_000,
             "adjusted_reasoning_effort": None,
             "adjusted_thinking_budget_tokens": None,
-            "model_info": {
-                "provider": "gemini",
-                "model_id": "gemini-3.1-flash-lite",
-                "input_tokens": 1_048_576,
-                "context_window": 1_048_576,
-            },
+            "model_info": {"provider": "gemini", "model_id": "gemini-3.1-flash-lite"},
             "reasoning_timeout_seconds": None,
         }
         mock_config.GENERATOR_SYSTEM_PROMPT = "system"
@@ -560,49 +571,262 @@ async def test_known_model_context_overflow_rejects_with_model_details():
     assert content == ""
     assert envelope.tools_skipped_reason == "context_too_large"
     assert envelope.context_overflow_kind == "model_context_overflow"
-    assert envelope.context_overflow_details["context_window"] == 1_048_576
     assert (
-        envelope.context_overflow_details["estimated_input_tokens"]
-        > envelope.context_overflow_details["available_input_tokens"]
+        envelope.context_overflow_details["required_tokens"]
+        > envelope.context_overflow_details["available_tokens"]
     )
+    assert envelope.context_overflow_details["confidence"] == "verified"
     fake_loop.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_unknown_model_over_hard_cap_rejects_with_hard_cap_details():
-    """The generic hard cap still protects unknown models with no resolved window."""
+async def test_capacity_unknown_model_rejects_in_enforce_mode():
+    """An uncurated model above the reject threshold fails closed in enforce mode."""
     service = AIService.__new__(AIService)
     fake_loop = AsyncMock(return_value=(
         "should not run",
-        {
-            "mode": "openai_tool_loop",
-            "turns": 1,
-            "accepted": "assistant_final",
-            "trace": [],
-        },
+        {"mode": "openai_tool_loop", "turns": 1, "accepted": "assistant_final", "trace": []},
     ))
 
-    with patch.object(AIService, "_normalize_tool_loop_provider", return_value="openai"), \
+    with patch.dict(
+        os.environ,
+        {
+            "CONTEXT_ADMISSION_MODE": "enforce",
+            # ~1250 prompt tokens: pin the band so this exercises the
+            # reject-eligible branch, not the silent-pass one.
+            "CONTEXT_UNKNOWN_PASS_TOKENS": "500",
+            "CONTEXT_UNKNOWN_REJECT_TOKENS": "1000",
+        },
+    ), \
+         patch.object(AIService, "_normalize_tool_loop_provider", return_value="openrouter"), \
          patch.object(AIService, "_supports_generation_validation_tool_loop", return_value=True), \
          patch.object(AIService, "_apply_temperature_policies", return_value=(0.7, None, False)), \
          patch.object(AIService, "_should_inject_json_prompt", return_value=False), \
          patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
          patch.object(AIService, "_run_openai_compatible_validation_tool_loop", new=fake_loop), \
+         patch.object(
+             context_budget,
+             "resolve_token_limits",
+             return_value=_unknown_limits(model="unknown-tool-model"),
+         ), \
          patch("ai_service.config") as mock_config:
         mock_config.validate_token_limits.return_value = {
             "adjusted_tokens": 1024,
             "adjusted_reasoning_effort": None,
             "adjusted_thinking_budget_tokens": None,
-            "model_info": {
-                "provider": "openai",
-                "model_id": "unknown-tool-model",
-            },
+            "model_info": {"provider": "openrouter", "model_id": "unknown-tool-model"},
             "reasoning_timeout_seconds": None,
         }
         mock_config.GENERATOR_SYSTEM_PROMPT = "system"
         mock_config.GENERATOR_SYSTEM_PROMPT_RAW = "raw system"
         mock_config.TOOL_LOOP_MAX_PROMPT_CHARS = 200_000
-        mock_config.get_model_info.side_effect = RuntimeError("unknown model")
+
+        content, envelope = await service.call_ai_with_validation_tools(
+            prompt="x" * 4_000,
+            model="unknown-tool-model",
+            max_tokens=1024,
+            validation_callback=lambda _: _approved_result(),
+        )
+
+    assert content == ""
+    assert envelope.tools_skipped_reason == "context_too_large"
+    assert envelope.context_overflow_kind == "capacity_unknown"
+    assert envelope.context_overflow_details["confidence"] == "unknown"
+    fake_loop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_capacity_unknown_tolerated_band_proceeds_in_enforce_mode():
+    """Inside the tolerated band an uncurated model is admitted, not skipped."""
+    service = AIService.__new__(AIService)
+    fake_loop = AsyncMock(return_value=(
+        "provider called",
+        {"mode": "openai_tool_loop", "turns": 1, "accepted": "assistant_final", "trace": []},
+    ))
+
+    with patch.dict(
+        os.environ,
+        {
+            "CONTEXT_ADMISSION_MODE": "enforce",
+            "CONTEXT_UNKNOWN_PASS_TOKENS": "500",
+            "CONTEXT_UNKNOWN_REJECT_TOKENS": "100000",
+        },
+    ), \
+         patch.object(AIService, "_normalize_tool_loop_provider", return_value="openrouter"), \
+         patch.object(AIService, "_supports_generation_validation_tool_loop", return_value=True), \
+         patch.object(AIService, "_apply_temperature_policies", return_value=(0.7, None, False)), \
+         patch.object(AIService, "_should_inject_json_prompt", return_value=False), \
+         patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
+         patch.object(AIService, "_run_openai_compatible_validation_tool_loop", new=fake_loop), \
+         patch.object(
+             context_budget,
+             "resolve_token_limits",
+             return_value=_unknown_limits(model="unknown-tool-model"),
+         ), \
+         patch("ai_service.config") as mock_config:
+        mock_config.validate_token_limits.return_value = {
+            "adjusted_tokens": 1024,
+            "adjusted_reasoning_effort": None,
+            "adjusted_thinking_budget_tokens": None,
+            "model_info": {"provider": "openrouter", "model_id": "unknown-tool-model"},
+            "reasoning_timeout_seconds": None,
+        }
+        mock_config.GENERATOR_SYSTEM_PROMPT = "system"
+        mock_config.GENERATOR_SYSTEM_PROMPT_RAW = "raw system"
+        mock_config.TOOL_LOOP_MAX_PROMPT_CHARS = 200_000
+
+        content, envelope = await service.call_ai_with_validation_tools(
+            prompt="x" * 4_000,
+            model="unknown-tool-model",
+            max_tokens=1024,
+            validation_callback=lambda _: _approved_result(),
+        )
+
+    assert content == "provider called"
+    assert envelope.tools_skipped_reason is None
+    fake_loop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_capacity_unknown_pass_band_still_honors_hard_cap():
+    """Even in the silent-pass band an unknown window keeps the char hard cap."""
+    service = AIService.__new__(AIService)
+    fake_loop = AsyncMock(return_value=(
+        "should not run",
+        {"mode": "openai_tool_loop", "turns": 1, "accepted": "assistant_final", "trace": []},
+    ))
+
+    with patch.dict(
+        os.environ,
+        {
+            "CONTEXT_ADMISSION_MODE": "enforce",
+            # The whole payload stays inside the silent-pass band...
+            "CONTEXT_UNKNOWN_PASS_TOKENS": "1000000",
+            "CONTEXT_UNKNOWN_REJECT_TOKENS": "2000000",
+        },
+    ), \
+         patch.object(AIService, "_normalize_tool_loop_provider", return_value="openrouter"), \
+         patch.object(AIService, "_supports_generation_validation_tool_loop", return_value=True), \
+         patch.object(AIService, "_apply_temperature_policies", return_value=(0.7, None, False)), \
+         patch.object(AIService, "_should_inject_json_prompt", return_value=False), \
+         patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
+         patch.object(AIService, "_run_openai_compatible_validation_tool_loop", new=fake_loop), \
+         patch.object(
+             context_budget,
+             "resolve_token_limits",
+             return_value=_unknown_limits(model="unknown-tool-model"),
+         ), \
+         patch("ai_service.config") as mock_config:
+        mock_config.validate_token_limits.return_value = {
+            "adjusted_tokens": 1024,
+            "adjusted_reasoning_effort": None,
+            "adjusted_thinking_budget_tokens": None,
+            "model_info": {"provider": "openrouter", "model_id": "unknown-tool-model"},
+            "reasoning_timeout_seconds": None,
+        }
+        mock_config.GENERATOR_SYSTEM_PROMPT = "system"
+        mock_config.GENERATOR_SYSTEM_PROMPT_RAW = "raw system"
+        # ...but the operator's paranoid char cap is far below it.
+        mock_config.TOOL_LOOP_MAX_PROMPT_CHARS = 1_000
+
+        content, envelope = await service.call_ai_with_validation_tools(
+            prompt="x" * 4_000,
+            model="unknown-tool-model",
+            max_tokens=1024,
+            validation_callback=lambda _: _approved_result(),
+        )
+
+    assert content == ""
+    assert envelope.context_overflow_kind == "unknown_model_hard_cap_overflow"
+    assert envelope.context_overflow_details["hard_cap_chars"] == 1_000
+    fake_loop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_capacity_unknown_tolerated_band_still_honors_hard_cap():
+    """The char hard cap remains the last guard when an unknown window is admitted."""
+    service = AIService.__new__(AIService)
+    fake_loop = AsyncMock(return_value=(
+        "should not run",
+        {"mode": "openai_tool_loop", "turns": 1, "accepted": "assistant_final", "trace": []},
+    ))
+
+    with patch.dict(
+        os.environ,
+        {
+            "CONTEXT_ADMISSION_MODE": "enforce",
+            "CONTEXT_UNKNOWN_PASS_TOKENS": "500",
+            "CONTEXT_UNKNOWN_REJECT_TOKENS": "1000000",
+        },
+    ), \
+         patch.object(AIService, "_normalize_tool_loop_provider", return_value="openrouter"), \
+         patch.object(AIService, "_supports_generation_validation_tool_loop", return_value=True), \
+         patch.object(AIService, "_apply_temperature_policies", return_value=(0.7, None, False)), \
+         patch.object(AIService, "_should_inject_json_prompt", return_value=False), \
+         patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
+         patch.object(AIService, "_run_openai_compatible_validation_tool_loop", new=fake_loop), \
+         patch.object(
+             context_budget,
+             "resolve_token_limits",
+             return_value=_unknown_limits(model="unknown-tool-model"),
+         ), \
+         patch("ai_service.config") as mock_config:
+        mock_config.validate_token_limits.return_value = {
+            "adjusted_tokens": 1024,
+            "adjusted_reasoning_effort": None,
+            "adjusted_thinking_budget_tokens": None,
+            "model_info": {"provider": "openrouter", "model_id": "unknown-tool-model"},
+            "reasoning_timeout_seconds": None,
+        }
+        mock_config.GENERATOR_SYSTEM_PROMPT = "system"
+        mock_config.GENERATOR_SYSTEM_PROMPT_RAW = "raw system"
+        mock_config.TOOL_LOOP_MAX_PROMPT_CHARS = 200_000
+
+        content, envelope = await service.call_ai_with_validation_tools(
+            prompt="x" * 250_000,
+            model="unknown-tool-model",
+            max_tokens=1024,
+            validation_callback=lambda _: _approved_result(),
+        )
+
+    assert content == ""
+    assert envelope.context_overflow_kind == "unknown_model_hard_cap_overflow"
+    assert envelope.context_overflow_details["hard_cap_chars"] == 200_000
+    fake_loop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unknown_model_over_hard_cap_rejects_with_hard_cap_details_observe():
+    """In observe mode, the paranoid hard cap still protects capacity_unknown models."""
+    service = AIService.__new__(AIService)
+    fake_loop = AsyncMock(return_value=(
+        "should not run",
+        {"mode": "openai_tool_loop", "turns": 1, "accepted": "assistant_final", "trace": []},
+    ))
+
+    with patch.dict(os.environ, {"CONTEXT_ADMISSION_MODE": "observe"}), \
+         patch.object(AIService, "_normalize_tool_loop_provider", return_value="openrouter"), \
+         patch.object(AIService, "_supports_generation_validation_tool_loop", return_value=True), \
+         patch.object(AIService, "_apply_temperature_policies", return_value=(0.7, None, False)), \
+         patch.object(AIService, "_should_inject_json_prompt", return_value=False), \
+         patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
+         patch.object(AIService, "_run_openai_compatible_validation_tool_loop", new=fake_loop), \
+         patch.object(
+             context_budget,
+             "resolve_token_limits",
+             return_value=_unknown_limits(model="unknown-tool-model"),
+         ), \
+         patch("ai_service.config") as mock_config:
+        mock_config.validate_token_limits.return_value = {
+            "adjusted_tokens": 1024,
+            "adjusted_reasoning_effort": None,
+            "adjusted_thinking_budget_tokens": None,
+            "model_info": {"provider": "openrouter", "model_id": "unknown-tool-model"},
+            "reasoning_timeout_seconds": None,
+        }
+        mock_config.GENERATOR_SYSTEM_PROMPT = "system"
+        mock_config.GENERATOR_SYSTEM_PROMPT_RAW = "raw system"
+        mock_config.TOOL_LOOP_MAX_PROMPT_CHARS = 200_000
 
         content, envelope = await service.call_ai_with_validation_tools(
             prompt="x" * 250_000,
@@ -614,7 +838,6 @@ async def test_unknown_model_over_hard_cap_rejects_with_hard_cap_details():
     assert content == ""
     assert envelope.tools_skipped_reason == "context_too_large"
     assert envelope.context_overflow_kind == "unknown_model_hard_cap_overflow"
-    assert envelope.context_overflow_details["context_window"] is None
     assert envelope.context_overflow_details["hard_cap_chars"] == 200_000
     assert envelope.context_overflow_details["prompt_chars"] > 200_000
     fake_loop.assert_not_awaited()
@@ -864,6 +1087,7 @@ async def _invoke_call_ai_with_fake_loop(
     response_format: Any = _SIMPLE_SCHEMA,
     json_expectations: Any = None,
     output_contract: OutputContract = OutputContract.JSON_STRUCTURED,
+    phase_logger: Any = None,
 ):
     """Invoke ``call_ai_with_validation_tools`` with a mocked provider loop."""
     service = AIService.__new__(AIService)
@@ -898,6 +1122,7 @@ async def _invoke_call_ai_with_fake_loop(
             output_contract=output_contract,
             response_format=response_format,
             json_expectations=json_expectations,
+            phase_logger=phase_logger,
         )
 
 
@@ -1199,6 +1424,42 @@ async def test_call_ai_raises_on_schema_violation():
             fake_metadata=fake_metadata,
             response_format=_SIMPLE_SCHEMA,
         )
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_invalid_json_never_reaches_phase_logger():
+    """A provider-final body is not loggable until its JSON contract passes."""
+
+    phase_logger = MagicMock()
+    private_invalid_json = "INVALID_TOOL_JSON_PRIVATE"
+
+    with pytest.raises(ToolLoopSchemaViolationError):
+        await _invoke_call_ai_with_fake_loop(
+            fake_content=private_invalid_json,
+            fake_metadata=_accepted_metadata(),
+            response_format=_SIMPLE_SCHEMA,
+            phase_logger=phase_logger,
+        )
+
+    phase_logger.log_response.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_valid_json_logs_validated_terminal_body_once():
+    """Accepted structured JSON reaches its phase log exactly once."""
+
+    phase_logger = MagicMock()
+    content, envelope = await _invoke_call_ai_with_fake_loop(
+        fake_content=' { "decision" : "APPLY" } ',
+        fake_metadata=_accepted_metadata(),
+        response_format=_SIMPLE_SCHEMA,
+        phase_logger=phase_logger,
+    )
+
+    assert envelope.accepted is True
+    assert content == ' { "decision" : "APPLY" } '
+    phase_logger.log_response.assert_called_once()
+    assert phase_logger.log_response.call_args.kwargs["response"] == content
 
 
 # ---------------------------------------------------------------------------

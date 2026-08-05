@@ -15,8 +15,18 @@ import json_utils as json
 if TYPE_CHECKING:
     from logging_utils import PhaseLogger
 
-from ai_service import StreamChunk
+from ai_service import (
+    AIService,
+    StreamChunk,
+    is_content_filter_stop,
+)
 from config import config
+from content_events import (
+    ContentEventSink,
+    ContentEventTemplate,
+    ContentPhase,
+    ContentSubphase,
+)
 from llm_routing import LLMRoutingError, resolve_call, resolve_temperature
 from model_aliasing import ModelAliasRegistry, PromptPart
 from models import ContentRequest, PreflightIssue, PreflightResult, WordCountAnalysis
@@ -28,6 +38,10 @@ from word_count_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Layer name carried by every preflight content event, so a subscriber can tell
+# validator chunks apart from the phases that stream afterwards.
+_PREFLIGHT_STREAM_LAYER = "preflight_validation"
 
 
 def _normalise_model_name(value: Any) -> Optional[str]:
@@ -303,7 +317,7 @@ def _build_validation_payload(
     if lexical_diversity_info:
         payload["lexical_diversity"] = lexical_diversity_info
 
-    # Accent-vs-AI-style-request conflict detection (Cambio 1 v5, §6).
+    # Accent-vs-AI-style-request conflict detection.
     # Only the mode enum value is serialized - never the user-supplied criteria.
     guard = getattr(request, "llm_accent_guard", None)
     if guard is not None and getattr(guard, "mode", "off") != "off":
@@ -663,7 +677,7 @@ async def run_preflight_validation(
     request: ContentRequest,
     context_documents: Optional[List[Dict[str, Any]]] = None,
     image_info: Optional[Dict[str, Any]] = None,
-    stream_callback: Optional[callable] = None,
+    stream_callback: Optional[ContentEventSink] = None,
     usage_tracker: Optional[UsageTracker] = None,
     phase_logger: Optional["PhaseLogger"] = None,
     model_alias_registry: Optional[ModelAliasRegistry] = None,
@@ -676,7 +690,11 @@ async def run_preflight_validation(
         request: The content generation request to validate.
         context_documents: Optional list of context document summaries.
         image_info: Optional dict with image metadata for vision-enabled requests.
-        stream_callback: Optional callback for streaming validation output.
+        stream_callback: Optional content-event sink invoked once per provider
+            chunk AS IT ARRIVES (C5-ter). Every emission is a labelled draft
+            (``content_status="draft"``) carrying the provider-reported
+            ``is_thinking`` flag; the decision itself is still parsed and
+            validated afterwards and nothing streamed here becomes canonical.
         usage_tracker: Optional usage tracker for cost tracking.
         phase_logger: Optional phase logger for structured logging.
 
@@ -716,6 +734,10 @@ async def run_preflight_validation(
         setattr(request, "_preflight_route", preflight_route)
     preflight_params = getattr(preflight_route, "params", {}) or {}
     preflight_temperature = resolve_temperature(preflight_route)
+    preflight_reasoning_effort = preflight_params.get("reasoning_effort")
+    preflight_thinking_budget_tokens = preflight_params.get(
+        "thinking_budget_tokens"
+    )
     preflight_max_tokens = config.resolve_output_max_tokens(
         selected_model,
         routed_max_tokens=preflight_params.get("max_tokens"),
@@ -786,6 +808,12 @@ async def run_preflight_validation(
         if stream_callback:
             # Use streaming generation
             accumulated_content = ""
+            chunk_template = ContentEventTemplate(
+                phase=ContentPhase.PREFLIGHT,
+                model=selected_model,
+                layer=_PREFLIGHT_STREAM_LAYER,
+                attempt=1,
+            )
             async for chunk in ai_service.generate_content_stream(
                 prompt=validator_prompt,
                 model=selected_model,
@@ -793,6 +821,8 @@ async def run_preflight_validation(
                 max_tokens=preflight_max_tokens,
                 system_prompt=config.PREFLIGHT_SYSTEM_PROMPT,
                 extra_verbose=False,
+                reasoning_effort=preflight_reasoning_effort,
+                thinking_budget_tokens=preflight_thinking_budget_tokens,
                 usage_callback=usage_callback,
                 phase_logger=phase_logger,
                 model_alias_registry=model_alias_registry,
@@ -805,15 +835,39 @@ async def run_preflight_validation(
                 if isinstance(chunk, StreamChunk):
                     chunk_text = chunk.text
                     is_thinking = chunk.is_thinking
+                    metadata = chunk.metadata or {}
                 else:
                     chunk_text = chunk
                     is_thinking = False
+                    metadata = {}
                 # Only accumulate non-thinking for final output
                 if not is_thinking:
                     accumulated_content += chunk_text
-                # Stream all (including thinking) for live monitoring
-                if stream_callback and chunk_text:
-                    stream_callback(chunk_text)
+                if chunk_text:
+                    # Live labelled draft (C5-ter/C8): preflight is the first
+                    # thing a caller waits on, so it streams as it is written.
+                    # Thinking keeps its own subphase and comes from the
+                    # provider adapter, never inferred from the text.
+                    await stream_callback(
+                        chunk_template.chunk(
+                            chunk_text,
+                            is_thinking=is_thinking,
+                            subphase=(
+                                ContentSubphase.THINKING
+                                if is_thinking
+                                else ContentSubphase.DRAFT_STREAM
+                            ),
+                        )
+                    )
+
+                if metadata:
+                    AIService._raise_if_generation_stopped_unusably(
+                        accumulated_content,
+                        metadata,
+                        provider=str(metadata.get("provider") or "unknown"),
+                        model_id=selected_model,
+                        max_tokens=metadata.get("max_tokens") or preflight_max_tokens,
+                    )
 
             raw_output = accumulated_content
         else:
@@ -825,6 +879,8 @@ async def run_preflight_validation(
                 max_tokens=preflight_max_tokens,
                 system_prompt=config.PREFLIGHT_SYSTEM_PROMPT,
                 extra_verbose=False,
+                reasoning_effort=preflight_reasoning_effort,
+                thinking_budget_tokens=preflight_thinking_budget_tokens,
                 usage_callback=usage_callback,
                 phase_logger=phase_logger,
                 model_alias_registry=model_alias_registry,
@@ -834,18 +890,23 @@ async def run_preflight_validation(
                 cancellation_token=cancellation_token,
             )
 
-        # Log response if phase_logger is available
-        if phase_logger:
-            phase_logger.log_response(
-                model=selected_model,
-                response=raw_output
-            )
-        else:
-            logger.info(f"Preflight validator raw output: {raw_output}")
-
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        if is_content_filter_stop(exc):
+            logger.warning(
+                "Preflight validation stopped by provider content policy for model %s",
+                selected_model,
+            )
+            return _build_preflight_failure_result(
+                code="content_filter",
+                message=(
+                    "Preflight validation was stopped by provider content policy "
+                    "and cannot proceed."
+                ),
+                summary="Preflight blocked by provider content policy",
+                model=selected_model,
+            )
         logger.error("Preflight validation request failed: %s", exc, exc_info=True)
         return _build_preflight_failure_result(
             code="preflight_llm_call_failed",
@@ -860,8 +921,9 @@ async def run_preflight_validation(
     parsed, parse_diagnostics = _parse_validator_response_with_diagnostics(raw_output)
     if not parsed:
         logger.warning(
-            "Preflight validator returned unparseable output: %s | diagnostics=%s",
-            raw_output,
+            "Preflight validator returned unparseable output "
+            "(chars=%s) | diagnostics=%s",
+            len(raw_output) if isinstance(raw_output, str) else 0,
             parse_diagnostics,
         )
         likely_truncated = bool(parse_diagnostics.get("likely_truncated"))
@@ -888,7 +950,11 @@ async def run_preflight_validation(
     decision_raw = parsed.get("decision")
     decision = str(decision_raw).strip().lower() if decision_raw is not None else ""
     if decision not in {"proceed", "reject"}:
-        logger.warning("Preflight validator returned invalid decision: %s", decision_raw)
+        logger.warning(
+            "Preflight validator returned an invalid decision field "
+            "(type=%s)",
+            type(decision_raw).__name__,
+        )
         return _build_preflight_failure_result(
             code="preflight_invalid_decision",
             message=(
@@ -975,6 +1041,20 @@ async def run_preflight_validation(
         enable_algorithmic_word_count=bool(llm_recommended_removals),
         duplicate_word_count_layers_to_remove=llm_recommended_removals,
     )
+
+    # Preflight output becomes loggable only after parse and decision
+    # validation. Rejected local JSON never enters phase or console logs.
+    if phase_logger:
+        phase_logger.log_response(
+            model=selected_model,
+            response=raw_output,
+        )
+    else:
+        logger.info(
+            "Preflight validator accepted response: decision=%s chars=%s",
+            decision,
+            len(raw_output) if isinstance(raw_output, str) else 0,
+        )
 
     # Log decision using phase_logger if available
     if phase_logger:

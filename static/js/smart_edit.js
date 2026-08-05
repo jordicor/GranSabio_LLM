@@ -989,8 +989,4 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-}
+// escapeHtml / escapeHtmlAttr come from /static/js/escape_utils.js (loaded first by the template).

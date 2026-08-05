@@ -113,6 +113,28 @@ class QASchedulerUnavailableError(RuntimeError):
 
 EvaluateSlot = Callable[[QASchedulerSlot, int], Awaitable[QAEvaluation]]
 
+# Notified when one evaluator slot is dispatched and when it finishes, so the
+# QA progress counter follows the real scheduler lifecycle instead of the
+# chunks an evaluation happens to stream.
+QAEvaluationLifecycleHook = Callable[[QASchedulerSlot, str], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class QAEvaluationLifecycleEvent:
+    """One QA evaluation entering or leaving the scheduler.
+
+    ``dispatched`` discriminates the two moments: True when the evaluator is
+    handed to the provider, False when it finishes (success, technical
+    failure, cancellation, or never dispatched because the layer already
+    reached quorum). ``evaluation_key`` identifies the (layer, slot) pair and
+    is the idempotency key of the progress counter.
+    """
+
+    layer_name: str
+    model_name: str
+    evaluation_key: str
+    dispatched: bool
+
 
 class QAScheduler:
     """Execute QA models with bounded parallelism and progressive DB quorum."""
@@ -127,6 +149,8 @@ class QAScheduler:
         has_deal_breaker_criteria: bool,
         slots: List[QASchedulerSlot],
         evaluate_slot: EvaluateSlot,
+        on_evaluation_dispatched: Optional[QAEvaluationLifecycleHook] = None,
+        on_evaluation_finished: Optional[QAEvaluationLifecycleHook] = None,
     ) -> QASchedulerResult:
         configured_count = len(slots)
         if configured_count == 0:
@@ -149,10 +173,26 @@ class QAScheduler:
                         current_results=layer_results,
                         evaluate_slot=evaluate_slot,
                         required_valid=required_valid,
+                        on_evaluation_dispatched=on_evaluation_dispatched,
+                        on_evaluation_finished=on_evaluation_finished,
                     )
                     layer_results[slot.result_key] = result
 
-            await asyncio.gather(*(guarded(slot) for slot in batch))
+            tasks = [asyncio.create_task(guarded(slot)) for slot in batch]
+            try:
+                await asyncio.gather(*tasks)
+            except BaseException:
+                # Any failure (context admission, scheduler policy abort, or
+                # cancellation) must stop the whole batch immediately. gather
+                # does NOT cancel siblings on a first raise, so explicitly
+                # cancel any in-flight slot tasks and drain them before
+                # re-raising; otherwise they keep burning paid API calls (or
+                # local Ollama slots) after the layer has already aborted.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
 
         if mode == "parallel":
             await run_batch(remaining)
@@ -194,6 +234,13 @@ class QAScheduler:
                 await run_batch(batch)
 
         skipped = len(remaining)
+        if on_evaluation_finished is not None:
+            # Slots the layer never needed (quorum reached, majority stop) are
+            # finished too: progress must reach the configured total instead of
+            # freezing at the number of evaluators that happened to run.
+            for slot in remaining:
+                await on_evaluation_finished(slot, layer_name)
+
         consensus = build_deal_breaker_consensus(
             layer_results,
             [slot.model_name for slot in slots],
@@ -243,39 +290,63 @@ class QAScheduler:
         current_results: Dict[str, QAEvaluation],
         evaluate_slot: EvaluateSlot,
         required_valid: int,
+        on_evaluation_dispatched: Optional[QAEvaluationLifecycleHook] = None,
+        on_evaluation_finished: Optional[QAEvaluationLifecycleHook] = None,
     ) -> QAEvaluation:
         attempts = 0
+        timeout_attempts = 0
+        parse_attempts = 0
+        provider_failure_attempts = 0
         max_timeout_attempts = 1
         if self.policy.on_timeout in {"retry_then_fail", "retry_then_skip_if_quorum"}:
             max_timeout_attempts += max(0, self.policy.timeout_retries)
         max_provider_failure_attempts = 1 + max(0, self.policy.provider_failure_retries)
         max_parse_attempts = 1 + max(0, self.policy.parse_error_retries)
 
-        while True:
-            attempts += 1
-            try:
-                evaluation = await evaluate_slot(slot, attempts)
-                return evaluation
-            except QASchedulerTechnicalFailure as failure:
-                if failure.error_type == "timeout" and attempts < max_timeout_attempts:
-                    continue
-                if failure.error_type == "parse_error" and attempts < max_parse_attempts:
-                    continue
-                if (
-                    failure.error_type in {"api_failure", "model_unavailable"}
-                    and failure.retryable
-                    and attempts < max_provider_failure_attempts
-                ):
-                    continue
-                return self._handle_technical_failure(
-                    layer_name=layer_name,
-                    slot=slot,
-                    configured_count=configured_count,
-                    current_results=current_results,
-                    required_valid=required_valid,
-                    failure=failure,
-                    attempts=attempts,
-                )
+        if on_evaluation_dispatched is not None:
+            await on_evaluation_dispatched(slot, layer_name)
+
+        # The whole retry budget of one evaluator is a SINGLE evaluation for
+        # progress purposes, so completion is reported once, in ``finally``,
+        # whatever the outcome: result, absorbed technical failure, raised
+        # policy abort, or cancellation.
+        try:
+            while True:
+                attempts += 1
+                try:
+                    evaluation = await evaluate_slot(slot, attempts)
+                    return evaluation
+                except QASchedulerTechnicalFailure as failure:
+                    # Each failure category spends its own retry budget: a
+                    # timeout must not consume the parse-error retries and
+                    # vice versa.
+                    if failure.error_type == "timeout":
+                        timeout_attempts += 1
+                        if timeout_attempts < max_timeout_attempts:
+                            continue
+                    elif failure.error_type == "parse_error":
+                        parse_attempts += 1
+                        if parse_attempts < max_parse_attempts:
+                            continue
+                    elif (
+                        failure.error_type in {"api_failure", "model_unavailable"}
+                        and failure.retryable
+                    ):
+                        provider_failure_attempts += 1
+                        if provider_failure_attempts < max_provider_failure_attempts:
+                            continue
+                    return self._handle_technical_failure(
+                        layer_name=layer_name,
+                        slot=slot,
+                        configured_count=configured_count,
+                        current_results=current_results,
+                        required_valid=required_valid,
+                        failure=failure,
+                        attempts=attempts,
+                    )
+        finally:
+            if on_evaluation_finished is not None:
+                await on_evaluation_finished(slot, layer_name)
 
     def _handle_technical_failure(
         self,

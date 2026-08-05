@@ -7,12 +7,21 @@ All model fallbacks have been removed by design. If something is missing or
 misconfigured, this module will print a clear error to stderr and raise.
 """
 
+import copy
+import logging
+import math
 import os
 import sys
+from datetime import date
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from pydantic import AliasChoices, BaseModel, Field
+
+# context_budget owns the single source of truth for admission knobs/defaults.
+# It does NOT import config at module load time, so this import is cycle-safe.
+import context_budget
 
 # Use optimized JSON (3.6x faster than standard json)
 import json_utils as json
@@ -23,6 +32,8 @@ from request_timeouts import (
     load_request_timeout_settings,
     resolve_env_timeout,
 )
+
+logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -161,6 +172,198 @@ def resolve_model_catalog_entry(model_name: str, model_specs: Optional[Dict[str,
         "model_data": matched_model_data,
         "is_test_model": is_test_model,
     }
+
+
+def _curated_repo_path(path: Optional[str], fallback: str) -> Path:
+    """Resolve a curated-limits path relative to this module when not absolute."""
+
+    candidate = Path(path or fallback)
+    if candidate.is_absolute():
+        return candidate
+    return Path(__file__).resolve().parent / candidate
+
+
+def _deep_merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge ``override`` onto a deep copy of ``base``."""
+
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _load_curated_json(path: Path, *, required: bool) -> Dict[str, Any]:
+    """
+    Load a curated-limits JSON object (fail-fast, matching request_timeouts.py).
+
+    A missing file raises only when ``required`` (the tracked default). A file
+    that exists but does not contain a JSON object is always a config error,
+    even for the optional local override (it exists but is broken).
+    """
+
+    if not path.exists():
+        if required:
+            raise RuntimeError(f"[CONFIG ERROR] Curated model-limits file not found: {path}")
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:  # noqa: BLE001 - fail fast with a clear message
+        raise RuntimeError(
+            f"[CONFIG ERROR] Curated model-limits file could not be parsed: {path}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"[CONFIG ERROR] Curated model-limits file must contain a JSON object: {path}"
+        )
+    return payload
+
+
+def load_model_token_limits_file(
+    *,
+    default_path: Optional[str] = None,
+    override_path: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Load the tracked curated limits plus an optional untracked local override.
+
+    Returns the merged ``models`` mapping (model key -> semantic limits object).
+    A payload without a valid ``models`` object yields an empty mapping.
+    """
+
+    default_file = _curated_repo_path(default_path, "model_limits.curated.json")
+    override_file = _curated_repo_path(override_path, "model_limits.curated.local.json")
+    default_payload = _load_curated_json(default_file, required=True)
+    override_payload = _load_curated_json(override_file, required=False)
+    merged = _deep_merge_dicts(default_payload, override_payload) if override_payload else default_payload
+    models = merged.get("models")
+    if not isinstance(models, dict):
+        return {}
+    return {str(key): value for key, value in models.items() if isinstance(value, dict)}
+
+
+MODEL_FAMILY_FLOORS_SCHEMA_VERSION = 1
+
+
+def load_model_family_floors_file(
+    *,
+    default_path: Optional[str] = None,
+    override_path: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Load versioned family floors plus an optional local override.
+
+    The payload uses a mapping keyed by stable rule ID so a local file can
+    disable or tighten one rule without copying the whole tracked policy.
+    """
+
+    default_file = _curated_repo_path(default_path, "model_family_floors.json")
+    override_file = _curated_repo_path(override_path, "model_family_floors.local.json")
+    default_payload = _load_curated_json(default_file, required=True)
+    override_payload = _load_curated_json(override_file, required=False)
+
+    for label, payload, path in (
+        ("default", default_payload, default_file),
+        ("override", override_payload, override_file),
+    ):
+        if not payload:
+            continue
+        version = payload.get("version")
+        if version != MODEL_FAMILY_FLOORS_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"[CONFIG ERROR] Model-family floor {label} file has unsupported "
+                f"version {version!r}; expected {MODEL_FAMILY_FLOORS_SCHEMA_VERSION}: {path}"
+            )
+        if not isinstance(payload.get("families"), dict):
+            raise RuntimeError(
+                f"[CONFIG ERROR] Model-family floor {label} file must contain a "
+                f"'families' object: {path}"
+            )
+
+    merged = (
+        _deep_merge_dicts(default_payload, override_payload)
+        if override_payload
+        else default_payload
+    )
+    families = merged.get("families")
+    if not isinstance(families, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in families.items()
+        if isinstance(value, dict)
+    }
+
+
+def _match_model_family_floor(
+    rules: Dict[str, Dict[str, Any]],
+    resolved: Dict[str, Any],
+    *,
+    today: Optional[date] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return the first active direct-provider family floor that matches.
+
+    Matching is deliberately mechanical: exact catalog provider, explicit
+    model-ID prefixes, capabilities, exclusion markers, and an expiry date.
+    An unrecognised or indirect-provider model never inherits a floor merely
+    because its display name resembles a well-known family.
+    """
+
+    if not resolved.get("matched") or not resolved.get("enabled"):
+        return None
+
+    catalog_provider = str(resolved.get("catalog_provider") or "").strip().lower()
+    model_id = str(
+        resolved.get("catalog_model_id") or resolved.get("model_id") or ""
+    ).strip().lower()
+    model_data = resolved.get("model_data") or {}
+    capabilities = {
+        str(capability).strip().lower()
+        for capability in (model_data.get("capabilities") or [])
+        if str(capability).strip()
+    }
+    current_date = today or date.today()
+
+    for rule_id, rule in rules.items():
+        if rule.get("enabled", True) is False:
+            continue
+        if str(rule.get("provider") or "").strip().lower() != catalog_provider:
+            continue
+
+        expires_at = date.fromisoformat(str(rule.get("expires_at")))
+        if current_date > expires_at:
+            continue
+
+        prefixes = tuple(
+            str(prefix).strip().lower()
+            for prefix in (rule.get("model_prefixes") or [])
+            if str(prefix).strip()
+        )
+        if not prefixes or not model_id.startswith(prefixes):
+            continue
+
+        excluded_markers = {
+            str(marker).strip().lower()
+            for marker in (rule.get("excluded_model_markers") or [])
+            if str(marker).strip()
+        }
+        if any(marker in model_id for marker in excluded_markers):
+            continue
+
+        required_capabilities = {
+            str(capability).strip().lower()
+            for capability in (rule.get("required_capabilities") or [])
+            if str(capability).strip()
+        }
+        if not required_capabilities.issubset(capabilities):
+            continue
+
+        matched = copy.deepcopy(rule)
+        matched["rule_id"] = rule_id
+        return matched
+    return None
 
 
 class AttachmentSettings(BaseModel):
@@ -378,6 +581,14 @@ class DebuggerSettings(BaseModel):
     db_path: str = Field(
         default="debugger_history.db",
         description="SQLite database file for debugger storage"
+    )
+    retention_days: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Inactive days after which debugger telemetry is deleted. "
+            "Unset or 0 keeps every session forever and creates no cleanup task"
+        )
     )
     max_session_list: int = Field(
         default=100,
@@ -618,6 +829,68 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         default_factory=dict,
         description="Resolved request-process timeout settings",
     )
+    MODEL_LIMITS_CURATED_DEFAULT_PATH: str = Field(
+        default="model_limits.curated.json",
+        description="Tracked JSON file with manually curated model token limits",
+    )
+    MODEL_LIMITS_CURATED_PATH: str = Field(
+        default="model_limits.curated.local.json",
+        description="Optional untracked JSON file overriding curated model token limits",
+    )
+    MODEL_TOKEN_LIMITS: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Resolved curated model token-limit overlay (model key -> limits)",
+    )
+    MODEL_FAMILY_FLOORS_DEFAULT_PATH: str = Field(
+        default="model_family_floors.json",
+        description="Tracked versioned policy for conservative direct-provider family floors",
+    )
+    MODEL_FAMILY_FLOORS_PATH: str = Field(
+        default="model_family_floors.local.json",
+        description="Optional untracked local override for model-family floors",
+    )
+    MODEL_FAMILY_FLOORS: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Resolved model-family floor policy (stable rule ID -> rule)",
+    )
+    # Context Admission Policy knobs. Defaults live in context_budget.py (single
+    # source of truth); env overrides are resolved there and surfaced here.
+    CONTEXT_ADMISSION_MODE: str = Field(
+        default=context_budget.DEFAULT_ADMISSION_MODE,
+        description="Context admission mode: 'enforce' (default) or 'observe'",
+    )
+    CONTEXT_NEAR_LIMIT_THRESHOLD: float = Field(
+        default=context_budget.DEFAULT_NEAR_LIMIT_THRESHOLD,
+        description="Utilization fraction that flags a call as near_limit (never blocks)",
+    )
+    CONTEXT_MARGIN_EXACT_PROVIDER: float = Field(
+        default=context_budget.DEFAULT_MARGIN_EXACT_PROVIDER,
+        description="Safety margin applied to exact_provider token counts",
+    )
+    CONTEXT_MARGIN_EXACT_LOCAL: float = Field(
+        default=context_budget.DEFAULT_MARGIN_EXACT_LOCAL,
+        description="Safety margin applied to exact_local (tiktoken) token counts",
+    )
+    CONTEXT_MARGIN_CONSERVATIVE: float = Field(
+        default=context_budget.DEFAULT_MARGIN_CONSERVATIVE,
+        description="Safety margin applied to conservative token estimates",
+    )
+    CONTEXT_NATIVE_COUNT_CACHE_SIZE: int = Field(
+        default=context_budget.DEFAULT_NATIVE_COUNT_CACHE_SIZE,
+        description="LRU size for cached native provider token counts",
+    )
+    CONTEXT_CAPACITY_STALE_DAYS: int = Field(
+        default=context_budget.DEFAULT_CAPACITY_STALE_DAYS,
+        description="Soft expiry (days) before verified capacity degrades to stale",
+    )
+    CONTEXT_UNKNOWN_PASS_TOKENS: int = Field(
+        default=context_budget.DEFAULT_UNKNOWN_PASS_TOKENS,
+        description="Input plus reserved-generation tokens below which unverified capacity is admitted silently",
+    )
+    CONTEXT_UNKNOWN_REJECT_TOKENS: int = Field(
+        default=context_budget.DEFAULT_UNKNOWN_REJECT_TOKENS,
+        description="Input plus reserved-generation tokens above which unverified capacity is reject-eligible",
+    )
     MAX_RETRIES: int = Field(default=3, description="Maximum retries for failed requests")
     RETRY_DELAY: float = Field(default=10.0, description="Base delay between retries in seconds")
     RETRY_BACKOFF_MULTIPLIER: float = Field(default=2.0, description="Multiplier for exponential backoff (delay = base * multiplier^attempt)")
@@ -722,7 +995,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         description="Maximum depth for recursive JSON field search in smart-edit extraction"
     )
 
-    # LLM-accent guard configuration (Cambio 1 v5, §5.10)
+    # LLM-accent guard configuration
     AI_ACCENT_AUDIT_TIMEOUT_SECONDS: int = Field(
         default=12000,
         gt=0,
@@ -897,9 +1170,45 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
     def __init__(self):
         super().__init__()
         self.load_model_specifications()
+        self.load_model_token_limits()
+        self.load_model_family_floors()
         self.load_request_timeout_settings()
         self.load_from_environment()
         self.setup_legacy_models()
+
+    def load_model_token_limits(self) -> None:
+        """Load the curated model token-limit overlay and validate invariants."""
+
+        self.MODEL_LIMITS_CURATED_DEFAULT_PATH = os.getenv(
+            "MODEL_LIMITS_CURATED_DEFAULT_PATH",
+            self.MODEL_LIMITS_CURATED_DEFAULT_PATH,
+        )
+        self.MODEL_LIMITS_CURATED_PATH = os.getenv(
+            "MODEL_LIMITS_CURATED_PATH",
+            self.MODEL_LIMITS_CURATED_PATH,
+        )
+        self.MODEL_TOKEN_LIMITS = load_model_token_limits_file(
+            default_path=self.MODEL_LIMITS_CURATED_DEFAULT_PATH,
+            override_path=self.MODEL_LIMITS_CURATED_PATH,
+        )
+        self._validate_model_token_limits()
+
+    def load_model_family_floors(self) -> None:
+        """Load and validate the expiring direct-provider family policy."""
+
+        self.MODEL_FAMILY_FLOORS_DEFAULT_PATH = os.getenv(
+            "MODEL_FAMILY_FLOORS_DEFAULT_PATH",
+            self.MODEL_FAMILY_FLOORS_DEFAULT_PATH,
+        )
+        self.MODEL_FAMILY_FLOORS_PATH = os.getenv(
+            "MODEL_FAMILY_FLOORS_PATH",
+            self.MODEL_FAMILY_FLOORS_PATH,
+        )
+        self.MODEL_FAMILY_FLOORS = load_model_family_floors_file(
+            default_path=self.MODEL_FAMILY_FLOORS_DEFAULT_PATH,
+            override_path=self.MODEL_FAMILY_FLOORS_PATH,
+        )
+        self._validate_model_family_floors()
 
     def load_request_timeout_settings(self) -> None:
         """Load central request-process timeout settings."""
@@ -920,10 +1229,124 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
     def reload_model_specifications(self) -> None:
         """Reload model specs from disk and rebuild legacy provider maps."""
         self.load_model_specifications()
+        self.load_model_token_limits()
+        self.load_model_family_floors()
         self.OPENAI_MODELS = {}
         self.CLAUDE_MODELS = {}
         self.GEMINI_MODELS = {}
         self.setup_legacy_models()
+
+    @staticmethod
+    def _warn_env_override(env_var: str, raw: Any, reason: str) -> None:
+        """Report a rejected or clamped numeric env override to the operator."""
+        print(f"[CONFIG WARNING] {env_var}={raw!r}: {reason}", file=sys.stderr, flush=True)
+
+    def _declared_numeric_bounds(self, field_name: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
+        """Return the (minimum, maximum) bounds declared on a model Field.
+
+        Reads the ge/gt/le/lt constraints from the pydantic field metadata so
+        env overrides re-apply the same limits the constructor enforces, without
+        duplicating constants. gt/lt are nudged to the nearest admissible value.
+        """
+        if not field_name:
+            return None, None
+        field = type(self).model_fields.get(field_name)
+        if field is None:
+            return None, None
+        is_int = field.annotation is int
+        lower: Optional[float] = None
+        upper: Optional[float] = None
+        for constraint in field.metadata:
+            for attr in ("ge", "gt", "le", "lt"):
+                bound = getattr(constraint, attr, None)
+                if bound is None:
+                    continue
+                value = float(bound)
+                if attr == "gt":
+                    value = math.floor(value) + 1 if is_int else math.nextafter(value, math.inf)
+                elif attr == "lt":
+                    value = math.ceil(value) - 1 if is_int else math.nextafter(value, -math.inf)
+                if attr in ("ge", "gt"):
+                    lower = value if lower is None else max(lower, value)
+                else:
+                    upper = value if upper is None else min(upper, value)
+        return lower, upper
+
+    def _clamp_env_number(
+        self,
+        env_var: str,
+        raw: str,
+        value: float,
+        *,
+        field_name: Optional[str],
+        minimum: Optional[float],
+        maximum: Optional[float],
+    ) -> float:
+        """Clamp one parsed env override to the tighter declared/explicit bounds."""
+        lower, upper = self._declared_numeric_bounds(field_name)
+        if minimum is not None:
+            lower = float(minimum) if lower is None else max(lower, float(minimum))
+        if maximum is not None:
+            upper = float(maximum) if upper is None else min(upper, float(maximum))
+        if lower is not None and value < lower:
+            self._warn_env_override(env_var, raw, f"below minimum {lower:g}; clamped")
+            return lower
+        if upper is not None and value > upper:
+            self._warn_env_override(env_var, raw, f"above maximum {upper:g}; clamped")
+            return upper
+        return value
+
+    def _parse_env_int(
+        self,
+        env_var: str,
+        raw: Optional[str],
+        default: int,
+        *,
+        field_name: Optional[str] = None,
+        minimum: Optional[int] = None,
+        maximum: Optional[int] = None,
+    ) -> int:
+        """Parse an integer env override with fallback and clamping.
+
+        Follows the ``context_budget._resolve_positive_int_env`` pattern:
+        unparsable values fall back to ``default`` with a warning, and
+        out-of-range values are clamped to the tighter of the explicit bounds
+        and the bounds declared on the pydantic Field, so an env override can
+        neither crash the import nor silently widen a declared cap.
+        """
+        if raw is None or raw == "":
+            return default
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            self._warn_env_override(env_var, raw, f"not an integer; using default {default}")
+            return default
+        clamped = self._clamp_env_number(
+            env_var, raw, value, field_name=field_name, minimum=minimum, maximum=maximum
+        )
+        return int(clamped)
+
+    def _parse_env_float(
+        self,
+        env_var: str,
+        raw: Optional[str],
+        default: float,
+        *,
+        field_name: Optional[str] = None,
+        minimum: Optional[float] = None,
+        maximum: Optional[float] = None,
+    ) -> float:
+        """Parse a float env override with fallback and clamping (see _parse_env_int)."""
+        if raw is None or raw == "":
+            return default
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            self._warn_env_override(env_var, raw, f"not a number; using default {default}")
+            return default
+        return self._clamp_env_number(
+            env_var, raw, value, field_name=field_name, minimum=minimum, maximum=maximum
+        )
 
     def load_from_environment(self):
         """Load configuration from environment variables."""
@@ -954,6 +1377,28 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "LLM_ROUTING_DEFAULT_PATH",
             self.LLM_ROUTING_DEFAULT_PATH,
         )
+
+        # Context Admission Policy knobs (resolved by context_budget so the
+        # numeric defaults are never duplicated here).
+        self.CONTEXT_ADMISSION_MODE = context_budget.resolve_admission_mode()
+        self.CONTEXT_NEAR_LIMIT_THRESHOLD = context_budget.resolve_near_limit_threshold()
+        self.CONTEXT_MARGIN_EXACT_PROVIDER = context_budget.resolve_margin(
+            context_budget.CountMethod.EXACT_PROVIDER
+        )
+        self.CONTEXT_MARGIN_EXACT_LOCAL = context_budget.resolve_margin(
+            context_budget.CountMethod.EXACT_LOCAL
+        )
+        self.CONTEXT_MARGIN_CONSERVATIVE = context_budget.resolve_margin(
+            context_budget.CountMethod.CONSERVATIVE_ESTIMATE
+        )
+        self.CONTEXT_NATIVE_COUNT_CACHE_SIZE = context_budget.resolve_native_count_cache_size()
+        self.CONTEXT_CAPACITY_STALE_DAYS = context_budget.resolve_capacity_stale_days()
+        # Fails fast on a misconfigured band (non-positive, or pass >= reject):
+        # an admission threshold must never silently fall back to its default.
+        (
+            self.CONTEXT_UNKNOWN_PASS_TOKENS,
+            self.CONTEXT_UNKNOWN_REJECT_TOKENS,
+        ) = context_budget.resolve_unknown_capacity_thresholds()
 
         max_size_override = os.getenv("ATTACHMENTS_MAX_SIZE_BYTES")
         if max_size_override:
@@ -1026,6 +1471,19 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         if debugger_path_override:
             self.DEBUGGER.db_path = debugger_path_override
 
+        # Single retention setting for the debugger (C13.1). Unset or 0 means
+        # keep every session forever; a positive value restores time-based
+        # cleanup of sessions, events and content traces.
+        debugger_retention_override = os.getenv("DEBUGGER_RETENTION_DAYS")
+        if debugger_retention_override:
+            parsed_retention = self._parse_env_int(
+                "DEBUGGER_RETENTION_DAYS",
+                debugger_retention_override,
+                0,
+                minimum=0,
+            )
+            self.DEBUGGER.retention_days = parsed_retention or None
+
         debugger_list_override = os.getenv("DEBUGGER_MAX_SESSION_LIST")
         if debugger_list_override:
             try:
@@ -1037,11 +1495,16 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
 
         # FastAPI Configuration
         self.APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
-        self.APP_PORT = int(os.getenv("APP_PORT", "8000"))
+        self.APP_PORT = self._parse_env_int(
+            "APP_PORT", os.getenv("APP_PORT"), 8000, field_name="APP_PORT", minimum=1, maximum=65535
+        )
         self.APP_RELOAD = os.getenv("APP_RELOAD", "false").lower() == "true"
 
         # Request Limits
-        self.MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))
+        self.MAX_CONCURRENT_REQUESTS = self._parse_env_int(
+            "MAX_CONCURRENT_REQUESTS", os.getenv("MAX_CONCURRENT_REQUESTS"), 10,
+            field_name="MAX_CONCURRENT_REQUESTS", minimum=1,
+        )
         self.REQUEST_TIMEOUT = int(
             resolve_env_timeout(
                 "REQUEST_TIMEOUT",
@@ -1050,17 +1513,28 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                 fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
             )
         )
-        self.MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
-        self.RETRY_DELAY = float(os.getenv("RETRY_DELAY", "10.0"))
-        self.RETRY_BACKOFF_MULTIPLIER = float(os.getenv("RETRY_BACKOFF_MULTIPLIER", "2.0"))
-        self.RETRY_MAX_DELAY = float(os.getenv("RETRY_MAX_DELAY", "120.0"))
+        self.MAX_RETRIES = self._parse_env_int(
+            "MAX_RETRIES", os.getenv("MAX_RETRIES"), 3, field_name="MAX_RETRIES", minimum=0
+        )
+        self.RETRY_DELAY = self._parse_env_float(
+            "RETRY_DELAY", os.getenv("RETRY_DELAY"), 10.0, field_name="RETRY_DELAY", minimum=0.0
+        )
+        self.RETRY_BACKOFF_MULTIPLIER = self._parse_env_float(
+            "RETRY_BACKOFF_MULTIPLIER", os.getenv("RETRY_BACKOFF_MULTIPLIER"), 2.0,
+            field_name="RETRY_BACKOFF_MULTIPLIER", minimum=1.0,
+        )
+        self.RETRY_MAX_DELAY = self._parse_env_float(
+            "RETRY_MAX_DELAY", os.getenv("RETRY_MAX_DELAY"), 120.0, field_name="RETRY_MAX_DELAY", minimum=0.0
+        )
         self.RETRY_JITTER = os.getenv("RETRY_JITTER", "true").lower() in {"1", "true", "yes", "on"}
         self.RETRY_STREAMING_AFTER_PARTIAL = os.getenv(
             "RETRY_STREAMING_AFTER_PARTIAL", "true"
         ).lower() in {"1", "true", "yes", "on"}
 
         # QA Timeout Configuration
-        self.QA_TIMEOUT_MULTIPLIER = float(os.getenv("QA_TIMEOUT_MULTIPLIER", "1.5"))
+        self.QA_TIMEOUT_MULTIPLIER = self._parse_env_float(
+            "QA_TIMEOUT_MULTIPLIER", os.getenv("QA_TIMEOUT_MULTIPLIER"), 1.5, field_name="QA_TIMEOUT_MULTIPLIER"
+        )
         self.QA_BASE_TIMEOUT = int(
             resolve_env_timeout(
                 "QA_BASE_TIMEOUT",
@@ -1080,9 +1554,11 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                 default=2,
             ),
         )
-        self.MAX_QA_PROVIDER_RETRIES = int(os.getenv("MAX_QA_PROVIDER_RETRIES", "1"))
-        if self.MAX_QA_PROVIDER_RETRIES < 0:
-            self.MAX_QA_PROVIDER_RETRIES = 1
+        # Declared ge=0 is re-applied by the helper, so no manual fixup is needed.
+        self.MAX_QA_PROVIDER_RETRIES = self._parse_env_int(
+            "MAX_QA_PROVIDER_RETRIES", os.getenv("MAX_QA_PROVIDER_RETRIES"), 1,
+            field_name="MAX_QA_PROVIDER_RETRIES",
+        )
         self.QA_COMPREHENSIVE_TIMEOUT_MARGIN = int(
             resolve_env_timeout(
                 "QA_COMPREHENSIVE_TIMEOUT_MARGIN",
@@ -1091,81 +1567,114 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                 fallback=0,
             )
         )
-        self.QA_MODEL_FAILURE_THRESHOLD = int(os.getenv("QA_MODEL_FAILURE_THRESHOLD", "5"))
-        if self.QA_MODEL_FAILURE_THRESHOLD < 1:
-            self.QA_MODEL_FAILURE_THRESHOLD = 5
-        self.QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS = int(
-            os.getenv(
-                "QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS",
-                str(self.QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS),
-            )
+        # Declared ge=1 is re-applied by the helper, so no manual fixup is needed.
+        self.QA_MODEL_FAILURE_THRESHOLD = self._parse_env_int(
+            "QA_MODEL_FAILURE_THRESHOLD", os.getenv("QA_MODEL_FAILURE_THRESHOLD"), 5,
+            field_name="QA_MODEL_FAILURE_THRESHOLD",
         )
-        if self.QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS < 1:
-            self.QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS = 12000
+        # Declared ge=1 is re-applied by the helper, so no manual fixup is needed.
+        self.QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS = self._parse_env_int(
+            "QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS",
+            os.getenv("QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS"),
+            self.QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS,
+            field_name="QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS",
+        )
 
         # JSON Retry Configuration
-        self.MAX_JSON_RETRY_ATTEMPTS = int(os.getenv("MAX_JSON_RETRY_ATTEMPTS", "2"))
+        self.MAX_JSON_RETRY_ATTEMPTS = self._parse_env_int(
+            "MAX_JSON_RETRY_ATTEMPTS", os.getenv("MAX_JSON_RETRY_ATTEMPTS"), 2,
+            field_name="MAX_JSON_RETRY_ATTEMPTS",
+        )
 
         # Session Management
-        self.MAX_ACTIVE_SESSIONS = int(os.getenv("MAX_ACTIVE_SESSIONS", "100"))
-        self.SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT", "3600"))
-        self.GENERATION_IDEMPOTENCY_TTL_SECONDS = max(
+        self.MAX_ACTIVE_SESSIONS = self._parse_env_int(
+            "MAX_ACTIVE_SESSIONS", os.getenv("MAX_ACTIVE_SESSIONS"), 100,
+            field_name="MAX_ACTIVE_SESSIONS", minimum=1,
+        )
+        self.SESSION_TIMEOUT = self._parse_env_int(
+            "SESSION_TIMEOUT", os.getenv("SESSION_TIMEOUT"), 3600, field_name="SESSION_TIMEOUT", minimum=1
+        )
+        self.GENERATION_IDEMPOTENCY_TTL_SECONDS = self._parse_env_int(
+            "GENERATION_IDEMPOTENCY_TTL_SECONDS", os.getenv("GENERATION_IDEMPOTENCY_TTL_SECONDS"), 86400,
+            field_name="GENERATION_IDEMPOTENCY_TTL_SECONDS",
+        )
+        self.GENERATION_IDEMPOTENCY_MAX_ENTRIES = self._parse_env_int(
+            "GENERATION_IDEMPOTENCY_MAX_ENTRIES", os.getenv("GENERATION_IDEMPOTENCY_MAX_ENTRIES"), 10000,
+            field_name="GENERATION_IDEMPOTENCY_MAX_ENTRIES",
+        )
+        self.SESSION_CLEANUP_INTERVAL = self._parse_env_int(
+            "SESSION_CLEANUP_INTERVAL",
+            os.getenv("SESSION_CLEANUP_INTERVAL", os.getenv("CLEANUP_INTERVAL")),
             300,
-            int(os.getenv("GENERATION_IDEMPOTENCY_TTL_SECONDS", "86400")),
+            field_name="SESSION_CLEANUP_INTERVAL",
+            minimum=1,
         )
-        self.GENERATION_IDEMPOTENCY_MAX_ENTRIES = max(
-            100,
-            int(os.getenv("GENERATION_IDEMPOTENCY_MAX_ENTRIES", "10000")),
+        self.SESSION_CLEANUP_IDLE_EMPTY_CHECKS = self._parse_env_int(
+            "SESSION_CLEANUP_IDLE_EMPTY_CHECKS", os.getenv("SESSION_CLEANUP_IDLE_EMPTY_CHECKS"), 3,
+            field_name="SESSION_CLEANUP_IDLE_EMPTY_CHECKS", minimum=0,
         )
-        self.SESSION_CLEANUP_INTERVAL = int(os.getenv("SESSION_CLEANUP_INTERVAL", os.getenv("CLEANUP_INTERVAL", "300")))
-        self.SESSION_CLEANUP_IDLE_EMPTY_CHECKS = int(os.getenv("SESSION_CLEANUP_IDLE_EMPTY_CHECKS", "3"))
-        self.SESSION_CLEANUP_IDLE_INTERVAL = int(os.getenv("SESSION_CLEANUP_IDLE_INTERVAL", "3600"))
+        self.SESSION_CLEANUP_IDLE_INTERVAL = self._parse_env_int(
+            "SESSION_CLEANUP_IDLE_INTERVAL", os.getenv("SESSION_CLEANUP_IDLE_INTERVAL"), 3600,
+            field_name="SESSION_CLEANUP_IDLE_INTERVAL", minimum=1,
+        )
         # Backward compatibility for legacy references
         self.CLEANUP_INTERVAL = self.SESSION_CLEANUP_INTERVAL
 
         # Logging
         self.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-        self.VERBOSE_MAX_ENTRIES = int(os.getenv("VERBOSE_MAX_ENTRIES", "100"))
+        self.VERBOSE_MAX_ENTRIES = self._parse_env_int(
+            "VERBOSE_MAX_ENTRIES", os.getenv("VERBOSE_MAX_ENTRIES"), 100,
+            field_name="VERBOSE_MAX_ENTRIES", minimum=1,
+        )
         self.PREFLIGHT_SYSTEM_PROMPT = os.getenv("PREFLIGHT_SYSTEM_PROMPT", self.PREFLIGHT_SYSTEM_PROMPT)
 
         # Gran Sabio Limits
-        self.DEFAULT_GRAN_SABIO_LIMIT_PER_ITERATION = int(
-            os.getenv("GRAN_SABIO_LIMIT_PER_ITERATION", "3")
+        self.DEFAULT_GRAN_SABIO_LIMIT_PER_ITERATION = self._parse_env_int(
+            "GRAN_SABIO_LIMIT_PER_ITERATION", os.getenv("GRAN_SABIO_LIMIT_PER_ITERATION"), 3,
+            field_name="DEFAULT_GRAN_SABIO_LIMIT_PER_ITERATION", minimum=1,
         )
-        self.DEFAULT_GRAN_SABIO_LIMIT_PER_SESSION = int(
-            os.getenv("GRAN_SABIO_LIMIT_PER_SESSION", "15")
+        self.DEFAULT_GRAN_SABIO_LIMIT_PER_SESSION = self._parse_env_int(
+            "GRAN_SABIO_LIMIT_PER_SESSION", os.getenv("GRAN_SABIO_LIMIT_PER_SESSION"), 15,
+            field_name="DEFAULT_GRAN_SABIO_LIMIT_PER_SESSION", minimum=1,
         )
 
         # Smart Edit Configuration
-        self.MAX_PARAGRAPHS_PER_INCREMENTAL_RUN = int(
-            os.getenv("MAX_PARAGRAPHS_PER_INCREMENTAL_RUN", "12")
+        self.MAX_PARAGRAPHS_PER_INCREMENTAL_RUN = self._parse_env_int(
+            "MAX_PARAGRAPHS_PER_INCREMENTAL_RUN", os.getenv("MAX_PARAGRAPHS_PER_INCREMENTAL_RUN"), 12,
+            field_name="MAX_PARAGRAPHS_PER_INCREMENTAL_RUN",
         )
-        self.DEFAULT_MAX_CONSECUTIVE_SMART_EDITS = int(
-            os.getenv("DEFAULT_MAX_CONSECUTIVE_SMART_EDITS", "50")
+        self.DEFAULT_MAX_CONSECUTIVE_SMART_EDITS = self._parse_env_int(
+            "DEFAULT_MAX_CONSECUTIVE_SMART_EDITS", os.getenv("DEFAULT_MAX_CONSECUTIVE_SMART_EDITS"), 50,
+            field_name="DEFAULT_MAX_CONSECUTIVE_SMART_EDITS",
         )
 
         # Smart Edit Marker Configuration
-        self.SMART_EDIT_MIN_PHRASE_LENGTH = int(
-            os.getenv("SMART_EDIT_MIN_PHRASE_LENGTH", "4")
+        self.SMART_EDIT_MIN_PHRASE_LENGTH = self._parse_env_int(
+            "SMART_EDIT_MIN_PHRASE_LENGTH", os.getenv("SMART_EDIT_MIN_PHRASE_LENGTH"), 4,
+            field_name="SMART_EDIT_MIN_PHRASE_LENGTH",
         )
-        self.SMART_EDIT_MAX_PHRASE_LENGTH = int(
-            os.getenv("SMART_EDIT_MAX_PHRASE_LENGTH", "64")
+        self.SMART_EDIT_MAX_PHRASE_LENGTH = self._parse_env_int(
+            "SMART_EDIT_MAX_PHRASE_LENGTH", os.getenv("SMART_EDIT_MAX_PHRASE_LENGTH"), 64,
+            field_name="SMART_EDIT_MAX_PHRASE_LENGTH",
         )
-        self.SMART_EDIT_DEFAULT_PHRASE_LENGTH = int(
-            os.getenv("SMART_EDIT_DEFAULT_PHRASE_LENGTH", "5")
+        self.SMART_EDIT_DEFAULT_PHRASE_LENGTH = self._parse_env_int(
+            "SMART_EDIT_DEFAULT_PHRASE_LENGTH", os.getenv("SMART_EDIT_DEFAULT_PHRASE_LENGTH"), 5,
+            field_name="SMART_EDIT_DEFAULT_PHRASE_LENGTH",
         )
 
         # Smart Edit Per-Layer Configuration
-        self.MAX_EDIT_ROUNDS_PER_LAYER = int(
-            os.getenv("MAX_EDIT_ROUNDS_PER_LAYER", "5")
+        self.MAX_EDIT_ROUNDS_PER_LAYER = self._parse_env_int(
+            "MAX_EDIT_ROUNDS_PER_LAYER", os.getenv("MAX_EDIT_ROUNDS_PER_LAYER"), 5,
+            field_name="MAX_EDIT_ROUNDS_PER_LAYER",
         )
 
         # JSON Field Extraction
-        self.MAX_JSON_RECURSION_DEPTH = int(
-            os.getenv("MAX_JSON_RECURSION_DEPTH", "3")
+        self.MAX_JSON_RECURSION_DEPTH = self._parse_env_int(
+            "MAX_JSON_RECURSION_DEPTH", os.getenv("MAX_JSON_RECURSION_DEPTH"), 3,
+            field_name="MAX_JSON_RECURSION_DEPTH",
         )
 
-        # LLM-accent guard configuration (Cambio 1 v5, §5.10)
+        # LLM-accent guard configuration
         self.AI_ACCENT_AUDIT_TIMEOUT_SECONDS = int(
             resolve_env_timeout(
                 "AI_ACCENT_AUDIT_TIMEOUT_SECONDS",
@@ -1174,8 +1683,9 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                 fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
             )
         )
-        self.AI_ACCENT_AUDIT_MAX_TOKENS = int(
-            os.getenv("AI_ACCENT_AUDIT_MAX_TOKENS", str(self.AI_ACCENT_AUDIT_MAX_TOKENS))
+        self.AI_ACCENT_AUDIT_MAX_TOKENS = self._parse_env_int(
+            "AI_ACCENT_AUDIT_MAX_TOKENS", os.getenv("AI_ACCENT_AUDIT_MAX_TOKENS"),
+            self.AI_ACCENT_AUDIT_MAX_TOKENS, field_name="AI_ACCENT_AUDIT_MAX_TOKENS",
         )
         qa_default_max_tokens = self._parse_positive_int_config_value(
             os.getenv("QA_DEFAULT_MAX_TOKENS")
@@ -1184,46 +1694,53 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             self.QA_DEFAULT_MAX_TOKENS = qa_default_max_tokens
 
         # Arbiter Configuration
-        self.ARBITER_MAX_TOKENS = int(os.getenv("ARBITER_MAX_TOKENS", "8000"))
-        self.ARBITER_TEMPERATURE = float(os.getenv("ARBITER_TEMPERATURE", "0.3"))
+        self.ARBITER_MAX_TOKENS = self._parse_env_int(
+            "ARBITER_MAX_TOKENS", os.getenv("ARBITER_MAX_TOKENS"), 8000, field_name="ARBITER_MAX_TOKENS"
+        )
+        self.ARBITER_TEMPERATURE = self._parse_env_float(
+            "ARBITER_TEMPERATURE", os.getenv("ARBITER_TEMPERATURE"), 0.3, field_name="ARBITER_TEMPERATURE"
+        )
         # EDIT_HISTORY_MAX_ROUNDS: -1 means "use MAX_EDIT_ROUNDS_PER_LAYER"
-        _history_rounds_env = os.getenv("EDIT_HISTORY_MAX_ROUNDS", "-1")
-        _history_rounds = int(_history_rounds_env)
+        _history_rounds = self._parse_env_int(
+            "EDIT_HISTORY_MAX_ROUNDS", os.getenv("EDIT_HISTORY_MAX_ROUNDS"), -1,
+            field_name="EDIT_HISTORY_MAX_ROUNDS",
+        )
         self.EDIT_HISTORY_MAX_ROUNDS = (
             _history_rounds if _history_rounds > 0 else self.MAX_EDIT_ROUNDS_PER_LAYER
         )
-        self.EDIT_HISTORY_MAX_CHARS = int(os.getenv("EDIT_HISTORY_MAX_CHARS", "10000"))
+        self.EDIT_HISTORY_MAX_CHARS = self._parse_env_int(
+            "EDIT_HISTORY_MAX_CHARS", os.getenv("EDIT_HISTORY_MAX_CHARS"), 10000,
+            field_name="EDIT_HISTORY_MAX_CHARS",
+        )
 
         # Reusable tool-loop budgets
-        self.QA_MAX_TOOL_ROUNDS = int(
-            os.getenv("QA_MAX_TOOL_ROUNDS", str(self.QA_MAX_TOOL_ROUNDS))
+        self.QA_MAX_TOOL_ROUNDS = self._parse_env_int(
+            "QA_MAX_TOOL_ROUNDS", os.getenv("QA_MAX_TOOL_ROUNDS"),
+            self.QA_MAX_TOOL_ROUNDS, field_name="QA_MAX_TOOL_ROUNDS",
         )
-        self.ARBITER_MAX_TOOL_ROUNDS = int(
-            os.getenv("ARBITER_MAX_TOOL_ROUNDS", str(self.ARBITER_MAX_TOOL_ROUNDS))
+        self.ARBITER_MAX_TOOL_ROUNDS = self._parse_env_int(
+            "ARBITER_MAX_TOOL_ROUNDS", os.getenv("ARBITER_MAX_TOOL_ROUNDS"),
+            self.ARBITER_MAX_TOOL_ROUNDS, field_name="ARBITER_MAX_TOOL_ROUNDS",
         )
-        self.GRAN_SABIO_REGENERATE_MAX_TOOL_ROUNDS = int(
-            os.getenv(
-                "GRAN_SABIO_REGENERATE_MAX_TOOL_ROUNDS",
-                str(self.GRAN_SABIO_REGENERATE_MAX_TOOL_ROUNDS),
-            )
+        self.GRAN_SABIO_REGENERATE_MAX_TOOL_ROUNDS = self._parse_env_int(
+            "GRAN_SABIO_REGENERATE_MAX_TOOL_ROUNDS", os.getenv("GRAN_SABIO_REGENERATE_MAX_TOOL_ROUNDS"),
+            self.GRAN_SABIO_REGENERATE_MAX_TOOL_ROUNDS, field_name="GRAN_SABIO_REGENERATE_MAX_TOOL_ROUNDS",
         )
-        self.GRAN_SABIO_DECISION_MAX_TOOL_ROUNDS = int(
-            os.getenv(
-                "GRAN_SABIO_DECISION_MAX_TOOL_ROUNDS",
-                str(self.GRAN_SABIO_DECISION_MAX_TOOL_ROUNDS),
-            )
+        self.GRAN_SABIO_DECISION_MAX_TOOL_ROUNDS = self._parse_env_int(
+            "GRAN_SABIO_DECISION_MAX_TOOL_ROUNDS", os.getenv("GRAN_SABIO_DECISION_MAX_TOOL_ROUNDS"),
+            self.GRAN_SABIO_DECISION_MAX_TOOL_ROUNDS, field_name="GRAN_SABIO_DECISION_MAX_TOOL_ROUNDS",
         )
-        self.GRAN_SABIO_ESCALATION_MAX_TOOL_ROUNDS = int(
-            os.getenv(
-                "GRAN_SABIO_ESCALATION_MAX_TOOL_ROUNDS",
-                str(self.GRAN_SABIO_ESCALATION_MAX_TOOL_ROUNDS),
-            )
+        self.GRAN_SABIO_ESCALATION_MAX_TOOL_ROUNDS = self._parse_env_int(
+            "GRAN_SABIO_ESCALATION_MAX_TOOL_ROUNDS", os.getenv("GRAN_SABIO_ESCALATION_MAX_TOOL_ROUNDS"),
+            self.GRAN_SABIO_ESCALATION_MAX_TOOL_ROUNDS, field_name="GRAN_SABIO_ESCALATION_MAX_TOOL_ROUNDS",
         )
-        self.TOOL_LOOP_MAX_PROMPT_CHARS = int(
-            os.getenv("TOOL_LOOP_MAX_PROMPT_CHARS", str(self.TOOL_LOOP_MAX_PROMPT_CHARS))
+        self.TOOL_LOOP_MAX_PROMPT_CHARS = self._parse_env_int(
+            "TOOL_LOOP_MAX_PROMPT_CHARS", os.getenv("TOOL_LOOP_MAX_PROMPT_CHARS"),
+            self.TOOL_LOOP_MAX_PROMPT_CHARS, field_name="TOOL_LOOP_MAX_PROMPT_CHARS",
         )
-        self.VALIDATE_DRAFT_MAX_LENGTH = int(
-            os.getenv("VALIDATE_DRAFT_MAX_LENGTH", str(self.VALIDATE_DRAFT_MAX_LENGTH))
+        self.VALIDATE_DRAFT_MAX_LENGTH = self._parse_env_int(
+            "VALIDATE_DRAFT_MAX_LENGTH", os.getenv("VALIDATE_DRAFT_MAX_LENGTH"),
+            self.VALIDATE_DRAFT_MAX_LENGTH, field_name="VALIDATE_DRAFT_MAX_LENGTH",
         )
 
         # Provider SDK process/read timeouts
@@ -1301,59 +1818,33 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         )
 
         # Model Reliability
-        self.MODEL_RELIABILITY_MIN_SAMPLES = int(
-            os.getenv("MODEL_RELIABILITY_MIN_SAMPLES", "5")
+        self.MODEL_RELIABILITY_MIN_SAMPLES = self._parse_env_int(
+            "MODEL_RELIABILITY_MIN_SAMPLES", os.getenv("MODEL_RELIABILITY_MIN_SAMPLES"), 5,
+            field_name="MODEL_RELIABILITY_MIN_SAMPLES", minimum=1,
         )
-        self.MODEL_RELIABILITY_FALSE_POSITIVE_THRESHOLD = float(
-            os.getenv("MODEL_RELIABILITY_FP_THRESHOLD", "0.70")
+        self.MODEL_RELIABILITY_FALSE_POSITIVE_THRESHOLD = self._parse_env_float(
+            "MODEL_RELIABILITY_FP_THRESHOLD", os.getenv("MODEL_RELIABILITY_FP_THRESHOLD"), 0.70,
+            field_name="MODEL_RELIABILITY_FALSE_POSITIVE_THRESHOLD",
         )
 
         # Tracking
         self.TRACKING_DATA_PATH = os.getenv("TRACKING_DATA_PATH", "data/tracking")
 
         # Long Text Mode
-        self.LONG_TEXT_AUTO_MIN_WORDS = int(
-            os.getenv("LONG_TEXT_AUTO_MIN_WORDS", str(self.LONG_TEXT_AUTO_MIN_WORDS))
-        )
-        self.LONG_TEXT_HARD_CAP_WORDS = int(
-            os.getenv("LONG_TEXT_HARD_CAP_WORDS", str(self.LONG_TEXT_HARD_CAP_WORDS))
-        )
-        self.LONG_TEXT_TARGET_BAND_PERCENT = int(
-            os.getenv("LONG_TEXT_TARGET_BAND_PERCENT", str(self.LONG_TEXT_TARGET_BAND_PERCENT))
-        )
-        self.LONG_TEXT_EMERGENCY_BAND_PERCENT = int(
-            os.getenv("LONG_TEXT_EMERGENCY_BAND_PERCENT", str(self.LONG_TEXT_EMERGENCY_BAND_PERCENT))
-        )
-        self.LONG_TEXT_MAX_OUTER_ITERATIONS = int(
-            os.getenv("LONG_TEXT_MAX_OUTER_ITERATIONS", str(self.LONG_TEXT_MAX_OUTER_ITERATIONS))
-        )
-        self.LONG_TEXT_MAX_INTERNAL_REPAIRS = int(
-            os.getenv("LONG_TEXT_MAX_INTERNAL_REPAIRS", str(self.LONG_TEXT_MAX_INTERNAL_REPAIRS))
-        )
-        self.LONG_TEXT_MAX_SECTIONS_PER_REPAIR = int(
-            os.getenv("LONG_TEXT_MAX_SECTIONS_PER_REPAIR", str(self.LONG_TEXT_MAX_SECTIONS_PER_REPAIR))
-        )
-        self.LONG_TEXT_MAX_RANGES_PER_REPAIR = int(
-            os.getenv("LONG_TEXT_MAX_RANGES_PER_REPAIR", str(self.LONG_TEXT_MAX_RANGES_PER_REPAIR))
-        )
-        self.LONG_TEXT_MIN_SECTION_WORDS = int(
-            os.getenv("LONG_TEXT_MIN_SECTION_WORDS", str(self.LONG_TEXT_MIN_SECTION_WORDS))
-        )
-        self.LONG_TEXT_MAX_SECTION_WORD_SHARE = float(
-            os.getenv("LONG_TEXT_MAX_SECTION_WORD_SHARE", str(self.LONG_TEXT_MAX_SECTION_WORD_SHARE))
-        )
-        self.LONG_TEXT_HEALTHY_COVERAGE_MIN = float(
-            os.getenv("LONG_TEXT_HEALTHY_COVERAGE_MIN", str(self.LONG_TEXT_HEALTHY_COVERAGE_MIN))
-        )
-        self.LONG_TEXT_PLAN_SUM_TOLERANCE_PERCENT = int(
-            os.getenv("LONG_TEXT_PLAN_SUM_TOLERANCE_PERCENT", str(self.LONG_TEXT_PLAN_SUM_TOLERANCE_PERCENT))
-        )
-        self.LONG_TEXT_MAX_ROLLING_ANCHORS = int(
-            os.getenv("LONG_TEXT_MAX_ROLLING_ANCHORS", str(self.LONG_TEXT_MAX_ROLLING_ANCHORS))
-        )
-        self.LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS = int(
-            os.getenv("LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS", str(self.LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS))
-        )
+        self.LONG_TEXT_AUTO_MIN_WORDS = self._parse_env_int("LONG_TEXT_AUTO_MIN_WORDS", os.getenv("LONG_TEXT_AUTO_MIN_WORDS"), self.LONG_TEXT_AUTO_MIN_WORDS)
+        self.LONG_TEXT_HARD_CAP_WORDS = self._parse_env_int("LONG_TEXT_HARD_CAP_WORDS", os.getenv("LONG_TEXT_HARD_CAP_WORDS"), self.LONG_TEXT_HARD_CAP_WORDS)
+        self.LONG_TEXT_TARGET_BAND_PERCENT = self._parse_env_int("LONG_TEXT_TARGET_BAND_PERCENT", os.getenv("LONG_TEXT_TARGET_BAND_PERCENT"), self.LONG_TEXT_TARGET_BAND_PERCENT)
+        self.LONG_TEXT_EMERGENCY_BAND_PERCENT = self._parse_env_int("LONG_TEXT_EMERGENCY_BAND_PERCENT", os.getenv("LONG_TEXT_EMERGENCY_BAND_PERCENT"), self.LONG_TEXT_EMERGENCY_BAND_PERCENT)
+        self.LONG_TEXT_MAX_OUTER_ITERATIONS = self._parse_env_int("LONG_TEXT_MAX_OUTER_ITERATIONS", os.getenv("LONG_TEXT_MAX_OUTER_ITERATIONS"), self.LONG_TEXT_MAX_OUTER_ITERATIONS)
+        self.LONG_TEXT_MAX_INTERNAL_REPAIRS = self._parse_env_int("LONG_TEXT_MAX_INTERNAL_REPAIRS", os.getenv("LONG_TEXT_MAX_INTERNAL_REPAIRS"), self.LONG_TEXT_MAX_INTERNAL_REPAIRS)
+        self.LONG_TEXT_MAX_SECTIONS_PER_REPAIR = self._parse_env_int("LONG_TEXT_MAX_SECTIONS_PER_REPAIR", os.getenv("LONG_TEXT_MAX_SECTIONS_PER_REPAIR"), self.LONG_TEXT_MAX_SECTIONS_PER_REPAIR)
+        self.LONG_TEXT_MAX_RANGES_PER_REPAIR = self._parse_env_int("LONG_TEXT_MAX_RANGES_PER_REPAIR", os.getenv("LONG_TEXT_MAX_RANGES_PER_REPAIR"), self.LONG_TEXT_MAX_RANGES_PER_REPAIR)
+        self.LONG_TEXT_MIN_SECTION_WORDS = self._parse_env_int("LONG_TEXT_MIN_SECTION_WORDS", os.getenv("LONG_TEXT_MIN_SECTION_WORDS"), self.LONG_TEXT_MIN_SECTION_WORDS)
+        self.LONG_TEXT_MAX_SECTION_WORD_SHARE = self._parse_env_float("LONG_TEXT_MAX_SECTION_WORD_SHARE", os.getenv("LONG_TEXT_MAX_SECTION_WORD_SHARE"), self.LONG_TEXT_MAX_SECTION_WORD_SHARE)
+        self.LONG_TEXT_HEALTHY_COVERAGE_MIN = self._parse_env_float("LONG_TEXT_HEALTHY_COVERAGE_MIN", os.getenv("LONG_TEXT_HEALTHY_COVERAGE_MIN"), self.LONG_TEXT_HEALTHY_COVERAGE_MIN)
+        self.LONG_TEXT_PLAN_SUM_TOLERANCE_PERCENT = self._parse_env_int("LONG_TEXT_PLAN_SUM_TOLERANCE_PERCENT", os.getenv("LONG_TEXT_PLAN_SUM_TOLERANCE_PERCENT"), self.LONG_TEXT_PLAN_SUM_TOLERANCE_PERCENT)
+        self.LONG_TEXT_MAX_ROLLING_ANCHORS = self._parse_env_int("LONG_TEXT_MAX_ROLLING_ANCHORS", os.getenv("LONG_TEXT_MAX_ROLLING_ANCHORS"), self.LONG_TEXT_MAX_ROLLING_ANCHORS)
+        self.LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS = self._parse_env_int("LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS", os.getenv("LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS"), self.LONG_TEXT_MAX_ROLLING_ANCHOR_WORDS)
         self.LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS = int(
             resolve_env_timeout(
                 "LONG_TEXT_SOURCE_BRIEF_TIMEOUT_SECONDS",
@@ -1438,15 +1929,9 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "LONG_TEXT_SECTION_DRAFT_START_PROFILE",
             self.LONG_TEXT_SECTION_DRAFT_START_PROFILE,
         )
-        self.LONG_TEXT_MAX_SECTIONS = int(
-            os.getenv("LONG_TEXT_MAX_SECTIONS", str(self.LONG_TEXT_MAX_SECTIONS))
-        )
-        self.LONG_TEXT_MAX_GENERATOR_CALLS_TOTAL = int(
-            os.getenv("LONG_TEXT_MAX_GENERATOR_CALLS_TOTAL", str(self.LONG_TEXT_MAX_GENERATOR_CALLS_TOTAL))
-        )
-        self.LONG_TEXT_MAX_SEMANTIC_EVAL_CALLS = int(
-            os.getenv("LONG_TEXT_MAX_SEMANTIC_EVAL_CALLS", str(self.LONG_TEXT_MAX_SEMANTIC_EVAL_CALLS))
-        )
+        self.LONG_TEXT_MAX_SECTIONS = self._parse_env_int("LONG_TEXT_MAX_SECTIONS", os.getenv("LONG_TEXT_MAX_SECTIONS"), self.LONG_TEXT_MAX_SECTIONS)
+        self.LONG_TEXT_MAX_GENERATOR_CALLS_TOTAL = self._parse_env_int("LONG_TEXT_MAX_GENERATOR_CALLS_TOTAL", os.getenv("LONG_TEXT_MAX_GENERATOR_CALLS_TOTAL"), self.LONG_TEXT_MAX_GENERATOR_CALLS_TOTAL)
+        self.LONG_TEXT_MAX_SEMANTIC_EVAL_CALLS = self._parse_env_int("LONG_TEXT_MAX_SEMANTIC_EVAL_CALLS", os.getenv("LONG_TEXT_MAX_SEMANTIC_EVAL_CALLS"), self.LONG_TEXT_MAX_SEMANTIC_EVAL_CALLS)
         self.LONG_TEXT_MAX_TOTAL_WALL_CLOCK_SECONDS = int(
             resolve_env_timeout(
                 "LONG_TEXT_MAX_TOTAL_WALL_CLOCK_SECONDS",
@@ -1455,26 +1940,18 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                 fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
             )
         )
-        self.LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION = int(
-            os.getenv("LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION", str(self.LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION))
+        self.LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION = self._parse_env_int("LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION", os.getenv("LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION"), self.LONG_TEXT_MAX_TOOL_ROUNDS_PER_SECTION)
+        self.LONG_TEXT_MAX_PLAN_INVALIDATIONS = self._parse_env_int("LONG_TEXT_MAX_PLAN_INVALIDATIONS", os.getenv("LONG_TEXT_MAX_PLAN_INVALIDATIONS"), self.LONG_TEXT_MAX_PLAN_INVALIDATIONS)
+        self.LONG_TEXT_MAX_CONSECUTIVE_POST_REPAIR_ASSEMBLY_FAILURES = self._parse_env_int(
+            "LONG_TEXT_MAX_CONSECUTIVE_POST_REPAIR_ASSEMBLY_FAILURES",
+            os.getenv("LONG_TEXT_MAX_CONSECUTIVE_POST_REPAIR_ASSEMBLY_FAILURES"),
+            self.LONG_TEXT_MAX_CONSECUTIVE_POST_REPAIR_ASSEMBLY_FAILURES,
         )
-        self.LONG_TEXT_MAX_PLAN_INVALIDATIONS = int(
-            os.getenv("LONG_TEXT_MAX_PLAN_INVALIDATIONS", str(self.LONG_TEXT_MAX_PLAN_INVALIDATIONS))
-        )
-        self.LONG_TEXT_MAX_CONSECUTIVE_POST_REPAIR_ASSEMBLY_FAILURES = int(
-            os.getenv(
-                "LONG_TEXT_MAX_CONSECUTIVE_POST_REPAIR_ASSEMBLY_FAILURES",
-                str(self.LONG_TEXT_MAX_CONSECUTIVE_POST_REPAIR_ASSEMBLY_FAILURES),
-            )
-        )
-        self.LONG_TEXT_MAX_NO_VIABLE_CANDIDATES = int(
-            os.getenv("LONG_TEXT_MAX_NO_VIABLE_CANDIDATES", str(self.LONG_TEXT_MAX_NO_VIABLE_CANDIDATES))
-        )
-        self.LONG_TEXT_SECTION_DIAGNOSTIC_CONCURRENCY = int(
-            os.getenv(
-                "LONG_TEXT_SECTION_DIAGNOSTIC_CONCURRENCY",
-                str(self.LONG_TEXT_SECTION_DIAGNOSTIC_CONCURRENCY),
-            )
+        self.LONG_TEXT_MAX_NO_VIABLE_CANDIDATES = self._parse_env_int("LONG_TEXT_MAX_NO_VIABLE_CANDIDATES", os.getenv("LONG_TEXT_MAX_NO_VIABLE_CANDIDATES"), self.LONG_TEXT_MAX_NO_VIABLE_CANDIDATES)
+        self.LONG_TEXT_SECTION_DIAGNOSTIC_CONCURRENCY = self._parse_env_int(
+            "LONG_TEXT_SECTION_DIAGNOSTIC_CONCURRENCY",
+            os.getenv("LONG_TEXT_SECTION_DIAGNOSTIC_CONCURRENCY"),
+            self.LONG_TEXT_SECTION_DIAGNOSTIC_CONCURRENCY,
         )
 
         self._validate_long_text_configuration()
@@ -1625,12 +2102,16 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                 continue
             self.GEMINI_MODELS[model_name] = model_data.get("model_id", model_name)
 
-    def get_model_info(self, model_name: str) -> Dict[str, Any]:
+    def get_model_info(
+        self, model_name: str, *, require_api_key: bool = True,
+    ) -> Dict[str, Any]:
         """
         Get comprehensive model information including provider, model ID, and token limits.
 
         - No silent fallbacks.
-        - Raises RuntimeError if the model is unknown or the provider key is missing.
+        - Raises RuntimeError if the model is unknown.
+        - Raises RuntimeError if the provider key is missing unless a provider-free
+          catalog inspection explicitly sets ``require_api_key=False``.
         """
         resolved = resolve_model_catalog_entry(model_name, self.model_specs)
         if not resolved["matched"]:
@@ -1677,7 +2158,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             api_key = "ollama"
         elif provider == "fake" or resolved["is_test_model"]:
             api_key = "fake"
-        if not api_key and provider not in ("ollama", "fake"):
+        if require_api_key and not api_key and provider not in ("ollama", "fake"):
             msg = (
                 f"[CONFIG ERROR] Missing API key for provider '{provider_name}' "
                 f"while resolving model '{resolved['model_name']}'. Set '{env_hint}' in your environment."
@@ -1689,9 +2170,13 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "provider": provider_name,
             "model_id": resolved["model_id"],
             "api_key": api_key,
-            "input_tokens": model_data.get("input_tokens", 100000),
-            "output_tokens": model_data.get("output_tokens", 8192),
-            "context_window": model_data.get("context_window", 100000),
+            # Input and output capacity are fail-closed: no invented default
+            # window. Missing values stay absent (None) so admission and the
+            # token resolvers treat them as unknown and apply their explicit
+            # fallbacks (DEFAULT_OUTPUT_TOKEN_FALLBACK) marked as such.
+            "input_tokens": model_data.get("input_tokens"),
+            "output_tokens": model_data.get("output_tokens"),
+            "context_window": model_data.get("context_window"),
             "name": model_data.get("name", resolved["model_key"]),
             "description": model_data.get("description", ""),
             "capabilities": model_data.get("capabilities", []),
@@ -1704,6 +2189,371 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "thinking_budget": model_data.get("thinking_budget", {}),
             "pricing": model_data.get("pricing", {})
         }
+
+    def get_model_token_limits(self, model_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Resolve the semantic token-limit view for one model, with provenance.
+
+        Precedence: curated overlay > numeric per-model ``token_limits`` object
+        > provider-reported/local numeric legacy fields > active direct-provider
+        family floor > inferred legacy fields > output-only metadata / no
+        capacity. Aliases resolve through
+        ``resolve_model_catalog_entry``. Family floors are inferred conservative
+        ceilings, never exact claims, and are considered only for a matched,
+        enabled direct-provider catalog entry.
+
+        This accessor is consumed only by ``context_budget.resolve_token_limits``.
+        """
+
+        resolved = resolve_model_catalog_entry(model_name, self.model_specs)
+        provider = str(resolved.get("provider") or "")
+        model_data = resolved.get("model_data") or {}
+        sync_meta = model_data.get("sync_metadata", {}) or {}
+        suspect = bool(sync_meta.get("context_suspect"))
+
+        curated = self.MODEL_TOKEN_LIMITS or {}
+        candidate_keys = [
+            str(model_name or "").strip(),
+            resolved.get("model_name"),
+            resolved.get("model_key"),
+            resolved.get("catalog_model_id"),
+            resolved.get("model_id"),
+            resolved.get("base_model"),
+        ]
+        seen: set = set()
+        for key in candidate_keys:
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            entry = curated.get(key)
+            if isinstance(entry, dict):
+                return {
+                    "model": resolved.get("model_id") or key,
+                    # Curated-only models are absent from the catalog, so the
+                    # catalog lookup yields no provider. Fall back to the
+                    # optional curated "provider" so counting can pick the
+                    # right method (e.g. openai embeddings -> tiktoken).
+                    "provider": provider or str(entry.get("provider") or ""),
+                    "max_input_tokens": entry.get("max_input_tokens"),
+                    "max_output_tokens": entry.get("max_output_tokens"),
+                    "max_total_context_tokens": entry.get("max_total_context_tokens"),
+                    "output_accounting": entry.get("output_accounting") or "unknown",
+                    "reasoning_accounting": entry.get("reasoning_accounting") or "unknown",
+                    "provenance": entry.get("provenance") or "manual_curated",
+                    "verified_at": entry.get("verified_at"),
+                    "source": entry.get("source"),
+                    "suspect": suspect,
+                }
+
+        if not resolved.get("matched"):
+            return None
+
+        token_limits = model_data.get("token_limits")
+        token_limit_output: Optional[int] = None
+        if isinstance(token_limits, dict) and token_limits:
+            token_limit_input = self._parse_positive_int_config_value(
+                token_limits.get("max_input_tokens")
+            )
+            token_limit_output = self._parse_positive_int_config_value(
+                token_limits.get("max_output_tokens")
+            )
+            token_limit_total = self._parse_positive_int_config_value(
+                token_limits.get("max_total_context_tokens")
+            )
+            provenance = (
+                token_limits.get("provenance")
+                or sync_meta.get("token_limits_provenance")
+                or "inferred"
+            )
+            if token_limit_input is not None or token_limit_total is not None:
+                return {
+                    "model": resolved.get("model_id") or model_name,
+                    "provider": provider,
+                    "max_input_tokens": token_limit_input,
+                    "max_output_tokens": token_limit_output,
+                    "max_total_context_tokens": token_limit_total,
+                    "output_accounting": token_limits.get("output_accounting") or "unknown",
+                    "reasoning_accounting": token_limits.get("reasoning_accounting") or "unknown",
+                    "provenance": provenance,
+                    "verified_at": token_limits.get("verified_at") or model_data.get("verified_at"),
+                    "source": token_limits.get("source") or model_data.get("source"),
+                    "suspect": suspect,
+                }
+
+        input_tokens = self._parse_positive_int_config_value(model_data.get("input_tokens"))
+        output_tokens = self._parse_positive_int_config_value(model_data.get("output_tokens"))
+        context_window = self._parse_positive_int_config_value(model_data.get("context_window"))
+        legacy_provenance = sync_meta.get("token_limits_provenance") or "inferred"
+        family_floor = _match_model_family_floor(
+            self.MODEL_FAMILY_FLOORS or {},
+            resolved,
+        )
+
+        # Exact provider metadata (including Gemini inputTokenLimit /
+        # outputTokenLimit cached by model sync) and explicit local runtime
+        # configuration outrank the family policy. Generic inferred/template
+        # catalog numbers do not: the versioned, expiring family rule exists to
+        # replace precisely those ad-hoc assumptions for recognised families.
+        legacy_numeric_is_stronger = legacy_provenance in {
+            "local_config",
+            "manual_curated",
+            "provider_api",
+        }
+        if (
+            input_tokens is not None or context_window is not None
+        ) and legacy_numeric_is_stronger:
+            return {
+                "model": resolved.get("model_id") or model_name,
+                "provider": provider,
+                "max_input_tokens": input_tokens,
+                "max_output_tokens": token_limit_output or output_tokens,
+                "max_total_context_tokens": context_window,
+                # Legacy flat fields do not declare accounting semantics.
+                "output_accounting": "unknown",
+                "reasoning_accounting": "unknown",
+                "provenance": legacy_provenance,
+                "verified_at": model_data.get("verified_at"),
+                "source": model_data.get("source"),
+                "suspect": suspect,
+            }
+
+        if family_floor is not None:
+            # A documented lower bound is intentionally used as a conservative
+            # admission ceiling. Requests above it are not proven impossible;
+            # they require fresher exact/provider metadata instead of being
+            # admitted on an optimistic family assumption.
+            return {
+                "model": resolved.get("model_id") or model_name,
+                "provider": provider,
+                "max_input_tokens": self._parse_positive_int_config_value(
+                    family_floor.get("min_input_tokens")
+                ),
+                "max_output_tokens": token_limit_output or output_tokens,
+                "max_total_context_tokens": self._parse_positive_int_config_value(
+                    family_floor.get("min_total_context_tokens")
+                ),
+                "output_accounting": family_floor.get("output_accounting") or "unknown",
+                "reasoning_accounting": family_floor.get("reasoning_accounting") or "unknown",
+                "provenance": "family_floor",
+                "verified_at": family_floor.get("verified_at"),
+                "expires_at": family_floor.get("expires_at"),
+                "source": family_floor.get("source"),
+                "family_rule_id": family_floor.get("rule_id"),
+                "suspect": suspect,
+            }
+
+        if input_tokens is not None or context_window is not None:
+            return {
+                "model": resolved.get("model_id") or model_name,
+                "provider": provider,
+                "max_input_tokens": input_tokens,
+                "max_output_tokens": token_limit_output or output_tokens,
+                "max_total_context_tokens": context_window,
+                # Legacy flat fields do not declare accounting semantics.
+                "output_accounting": "unknown",
+                "reasoning_accounting": "unknown",
+                "provenance": legacy_provenance,
+                "verified_at": model_data.get("verified_at"),
+                "source": model_data.get("source"),
+                "suspect": suspect,
+            }
+
+        if token_limit_output is not None and isinstance(token_limits, dict):
+            return {
+                "model": resolved.get("model_id") or model_name,
+                "provider": provider,
+                "max_input_tokens": None,
+                "max_output_tokens": token_limit_output,
+                "max_total_context_tokens": None,
+                "output_accounting": token_limits.get("output_accounting") or "unknown",
+                "reasoning_accounting": token_limits.get("reasoning_accounting") or "unknown",
+                "provenance": (
+                    token_limits.get("provenance")
+                    or sync_meta.get("token_limits_provenance")
+                    or "inferred"
+                ),
+                "verified_at": token_limits.get("verified_at") or model_data.get("verified_at"),
+                "source": token_limits.get("source") or model_data.get("source"),
+                "suspect": suspect,
+            }
+        if output_tokens is not None:
+            return {
+                "model": resolved.get("model_id") or model_name,
+                "provider": provider,
+                "max_input_tokens": None,
+                "max_output_tokens": output_tokens,
+                "max_total_context_tokens": None,
+                "output_accounting": "unknown",
+                "reasoning_accounting": "unknown",
+                "provenance": sync_meta.get("token_limits_provenance") or "inferred",
+                "verified_at": model_data.get("verified_at"),
+                "source": model_data.get("source"),
+                "suspect": suspect,
+            }
+        return None
+
+    def _validate_model_token_limits(self) -> None:
+        """
+        Validate curated token-limit invariants at load time.
+
+        Fail-closed on non-positive values; WARN (not fail) on comparable
+        output>total / input>total and on curated entries that reference an
+        unknown catalog model.
+        """
+
+        curated = self.MODEL_TOKEN_LIMITS or {}
+        unknown_models: List[str] = []
+        for key, entry in curated.items():
+            if not isinstance(entry, dict):
+                continue
+
+            for field_name in (
+                "max_input_tokens",
+                "max_output_tokens",
+                "max_total_context_tokens",
+            ):
+                value = entry.get(field_name)
+                if value is None:
+                    continue
+                if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                    msg = (
+                        f"[CONFIG ERROR] Curated model-limits entry '{key}' has a "
+                        f"non-positive {field_name}: {value!r}."
+                    )
+                    print(msg, file=sys.stderr, flush=True)
+                    raise RuntimeError(msg)
+
+            max_input = entry.get("max_input_tokens")
+            max_output = entry.get("max_output_tokens")
+            max_total = entry.get("max_total_context_tokens")
+            output_accounting = entry.get("output_accounting") or "unknown"
+            if (
+                isinstance(max_output, int)
+                and isinstance(max_total, int)
+                and output_accounting == "within_total"
+                and max_output > max_total
+            ):
+                logger.warning(
+                    "Curated model-limits entry '%s' has max_output_tokens (%s) > "
+                    "max_total_context_tokens (%s) with within_total accounting.",
+                    key,
+                    max_output,
+                    max_total,
+                )
+            if isinstance(max_input, int) and isinstance(max_total, int) and max_input > max_total:
+                logger.warning(
+                    "Curated model-limits entry '%s' has max_input_tokens (%s) > "
+                    "max_total_context_tokens (%s).",
+                    key,
+                    max_input,
+                    max_total,
+                )
+
+            resolved = resolve_model_catalog_entry(key, self.model_specs)
+            if not resolved.get("matched"):
+                unknown_models.append(key)
+
+        if unknown_models:
+            logger.warning(
+                "Curated model-limits reference models absent from the catalog: %s",
+                ", ".join(sorted(unknown_models)),
+            )
+
+    def _validate_model_family_floors(self) -> None:
+        """Fail fast on malformed or unsafe family-floor policy entries."""
+
+        rules = self.MODEL_FAMILY_FLOORS or {}
+        allowed_output_accounting = {"within_total", "separate", "unknown"}
+        allowed_reasoning_accounting = {"within_output", "separate", "unknown"}
+
+        for rule_id, rule in rules.items():
+            if not isinstance(rule, dict):
+                raise RuntimeError(
+                    f"[CONFIG ERROR] Model-family floor '{rule_id}' must be an object."
+                )
+            if rule.get("provenance") != "family_floor":
+                raise RuntimeError(
+                    f"[CONFIG ERROR] Model-family floor '{rule_id}' must declare "
+                    "provenance='family_floor'."
+                )
+            provider = str(rule.get("provider") or "").strip().lower()
+            if not provider:
+                raise RuntimeError(
+                    f"[CONFIG ERROR] Model-family floor '{rule_id}' has no provider."
+                )
+
+            prefixes = rule.get("model_prefixes")
+            if not isinstance(prefixes, list) or not prefixes or not all(
+                isinstance(prefix, str) and prefix.strip() for prefix in prefixes
+            ):
+                raise RuntimeError(
+                    f"[CONFIG ERROR] Model-family floor '{rule_id}' needs a non-empty "
+                    "model_prefixes string list."
+                )
+
+            for list_field in ("required_capabilities", "excluded_model_markers"):
+                values = rule.get(list_field, [])
+                if not isinstance(values, list) or not all(
+                    isinstance(value, str) and value.strip() for value in values
+                ):
+                    raise RuntimeError(
+                        f"[CONFIG ERROR] Model-family floor '{rule_id}' has invalid "
+                        f"{list_field}; expected a string list."
+                    )
+
+            minimums = []
+            for field_name in ("min_input_tokens", "min_total_context_tokens"):
+                value = rule.get(field_name)
+                if value is None:
+                    continue
+                if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                    raise RuntimeError(
+                        f"[CONFIG ERROR] Model-family floor '{rule_id}' has invalid "
+                        f"{field_name}: {value!r}."
+                    )
+                minimums.append(value)
+            if not minimums:
+                raise RuntimeError(
+                    f"[CONFIG ERROR] Model-family floor '{rule_id}' must define "
+                    "min_input_tokens or min_total_context_tokens."
+                )
+
+            output_accounting = rule.get("output_accounting")
+            if output_accounting not in allowed_output_accounting:
+                raise RuntimeError(
+                    f"[CONFIG ERROR] Model-family floor '{rule_id}' has invalid "
+                    f"output_accounting: {output_accounting!r}."
+                )
+            reasoning_accounting = rule.get("reasoning_accounting")
+            if reasoning_accounting not in allowed_reasoning_accounting:
+                raise RuntimeError(
+                    f"[CONFIG ERROR] Model-family floor '{rule_id}' has invalid "
+                    f"reasoning_accounting: {reasoning_accounting!r}."
+                )
+
+            try:
+                verified_at = date.fromisoformat(str(rule.get("verified_at")))
+                expires_at = date.fromisoformat(str(rule.get("expires_at")))
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"[CONFIG ERROR] Model-family floor '{rule_id}' requires ISO "
+                    "verified_at and expires_at dates."
+                ) from exc
+            if expires_at <= verified_at:
+                raise RuntimeError(
+                    f"[CONFIG ERROR] Model-family floor '{rule_id}' must expire after "
+                    "its verification date."
+                )
+            if expires_at < date.today():
+                logger.warning(
+                    "Model-family floor '%s' expired on %s and will be ignored.",
+                    rule_id,
+                    expires_at.isoformat(),
+                )
+            if not str(rule.get("source") or "").strip():
+                raise RuntimeError(
+                    f"[CONFIG ERROR] Model-family floor '{rule_id}' has no source."
+                )
 
     def model_supports(self, model_name: str, capability: str) -> bool:
         """Return whether a model has a fine-grained provider capability."""
@@ -2007,7 +2857,10 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
 
         resolved = resolve_model_catalog_entry(model_name, self.model_specs)
         model_data = resolved.get("model_data") or {}
-        max_output_tokens = self._parse_positive_int_config_value(model_data.get("output_tokens")) or 8192
+        max_output_tokens = (
+            self._parse_positive_int_config_value(model_data.get("output_tokens"))
+            or DEFAULT_OUTPUT_TOKEN_FALLBACK
+        )
         safety_margin = self.model_specs.get("token_validation", {}).get("safety_margin", 0.95)
         try:
             safe_limit = int(max_output_tokens * float(safety_margin))
@@ -2185,6 +3038,50 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             return None
         return safe_output_tokens
 
+    def resolve_bounded_output_truncation_retry(
+        self,
+        model_name: str,
+        current_max_tokens: Optional[int],
+        *,
+        requested_max_tokens: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return one bounded, model-safe output-token retry plan.
+
+        A deterministic output truncation may justify one larger call, but jumping
+        directly from a small caller contract to the complete model output ceiling
+        is needlessly expensive. Grow by at most two times (and by at least 1024
+        tokens for very small requests), then cap that growth at the trusted
+        model-safe ceiling resolved by ``resolve_output_truncation_retry_max_tokens``.
+        """
+
+        current_tokens = self._parse_positive_int_config_value(current_max_tokens)
+        safe_retry_tokens = self.resolve_output_truncation_retry_max_tokens(
+            model_name,
+            current_tokens,
+        )
+        if current_tokens is None or safe_retry_tokens is None:
+            return None
+
+        bounded_tokens = min(
+            safe_retry_tokens,
+            max(current_tokens * 2, current_tokens + 1024),
+        )
+        if bounded_tokens <= current_tokens:
+            return None
+
+        requested_tokens = (
+            self._parse_positive_int_config_value(requested_max_tokens)
+            or current_tokens
+        )
+        return {
+            "requested_max_tokens": requested_tokens,
+            "effective_max_tokens": current_tokens,
+            "retry_max_tokens": bounded_tokens,
+            "model_safe_max_tokens": safe_retry_tokens,
+            "retry_ordinal": 1,
+            "growth_policy": "double_or_plus_1024_capped_to_model_safe_limit",
+        }
+
     def resolve_qa_max_tokens(
         self,
         model_name: str,
@@ -2206,9 +3103,14 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         model_name: str,
         current_max_tokens: Optional[int],
     ) -> Optional[int]:
-        """Return a larger safe QA token budget for a single truncation retry."""
+        """Return one bounded, model-safe QA budget for a truncation retry."""
 
-        return self.resolve_output_truncation_retry_max_tokens(model_name, current_max_tokens)
+        plan = self.resolve_bounded_output_truncation_retry(
+            model_name,
+            current_max_tokens,
+            requested_max_tokens=current_max_tokens,
+        )
+        return int(plan["retry_max_tokens"]) if isinstance(plan, dict) else None
 
     def validate_api_keys(self) -> Dict[str, bool]:
         """Validate that required API keys are present (no fallbacks)."""
@@ -2228,7 +3130,9 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         max_tokens: Optional[int],
         reasoning_effort: Optional[str] = None,
         thinking_budget_tokens: Optional[int] = None,
-        max_tokens_percentage: Optional[float] = None
+        max_tokens_percentage: Optional[float] = None,
+        *,
+        require_api_key: bool = True,
     ) -> Dict[str, Any]:
         """
         Intelligent validation and adjustment of token limits for a specific model.
@@ -2240,6 +3144,8 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             reasoning_effort: Reasoning effort level for supported models
             thinking_budget_tokens: Budget tokens for thinking/reasoning
             max_tokens_percentage: Use X% of model's maximum available tokens (1-100)
+            require_api_key: Require provider credentials while resolving the
+                model. Stateless catalog-only preflight sets this to ``False``.
         """
         if self._parse_positive_int_config_value(max_tokens) is None:
             token_resolution = self.resolve_output_max_tokens(
@@ -2250,15 +3156,25 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             )
             max_tokens = token_resolution.get("max_tokens") or DEFAULT_OUTPUT_TOKEN_FALLBACK
 
-        model_info = self.get_model_info(model_name)
-        max_output_tokens = model_info.get("output_tokens", 8192)
+        model_info = self.get_model_info(
+            model_name, require_api_key=require_api_key,
+        )
+        max_output_tokens = model_info.get("output_tokens")
         provider = model_info.get("provider", "unknown")
         capabilities = {
             cap.lower() for cap in (model_info.get("capabilities", []) or []) if isinstance(cap, str)
         }
         # Apply safety margin (uses spec value if present, otherwise a conservative default)
         safety_margin = self.model_specs.get("token_validation", {}).get("safety_margin", 0.95)
-        safe_max_tokens = int(max_output_tokens * safety_margin)
+        if max_output_tokens is None:
+            # Output capacity is unknown (fail-closed catalog): enforce the
+            # explicit global fallback as the cap instead of an invented model
+            # limit. The returned model_limit stays None so callers see the
+            # capacity as unknown, not as the fallback value.
+            effective_output_limit = DEFAULT_OUTPUT_TOKEN_FALLBACK
+        else:
+            effective_output_limit = max_output_tokens
+        safe_max_tokens = int(effective_output_limit * safety_margin)
 
         # Calculate tokens based on percentage if specified
         percentage_used = False
@@ -2703,8 +3619,11 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         if adjusted_budget > max_tokens_limit:
             adjusted_budget = max_tokens_limit
 
-        # Get model output limits
-        model_output_limit = model_info.get("output_tokens", 8192)
+        # Get model output limits (unknown capacity uses the explicit global
+        # fallback as the cap, never an invented per-model limit)
+        model_output_limit = model_info.get("output_tokens")
+        if model_output_limit is None:
+            model_output_limit = DEFAULT_OUTPUT_TOKEN_FALLBACK
         safety_margin = self.model_specs.get("token_validation", {}).get("safety_margin", 0.9)
         safe_max_limit = int(model_output_limit * safety_margin)
 

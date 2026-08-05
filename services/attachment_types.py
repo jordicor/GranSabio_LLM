@@ -39,12 +39,12 @@ class AttachmentRecord(BaseModel):
     declared_mime: Optional[str] = Field(default=None, description="Original MIME type claimed by client")
     detected_mime: Optional[str] = Field(default=None, description="MIME type detected via content inspection")
     sha256: str = Field(..., description="SHA-256 checksum of the stored file")
-    metadata_signature: str = Field(..., description="Integrity signature for persisted metadata")
+    metadata_signature: str = Field(..., exclude=True, description="Integrity signature for persisted metadata")
     original_url: Optional[str] = Field(default=None, description="Original source URL when origin is 'url'")
     created_at: str = Field(..., description="UTC timestamp when the file was persisted")
     hash_prefix1: str = Field(..., min_length=3, max_length=3, description="First prefix derived from user hash")
     hash_prefix2: str = Field(..., min_length=4, max_length=4, description="Second prefix derived from user hash")
-    user_hash: str = Field(..., min_length=40, max_length=40, description="Full SHA1 hash for the user")
+    user_hash: str = Field(..., min_length=40, max_length=40, exclude=True, description="Full SHA1 hash for the user")
     storage_path: str = Field(..., description="Logical relative path to the stored attachment")
     metadata_path: str = Field(..., description="Logical relative path to the metadata record")
 
@@ -89,6 +89,7 @@ class CleanupReport:
     attachments_scanned: int = 0
     attachments_removed: int = 0
     retention_expired: int = 0
+    tmp_files_removed: int = 0
     issues: List[str] = field(default_factory=list)
     actions: List[CleanupAction] = field(default_factory=list)
 
@@ -98,6 +99,7 @@ class CleanupReport:
             "attachments_scanned": self.attachments_scanned,
             "attachments_removed": self.attachments_removed,
             "retention_expired": self.retention_expired,
+            "tmp_files_removed": self.tmp_files_removed,
             "issues": list(self.issues),
             "actions": [action.__dict__ for action in self.actions],
         }

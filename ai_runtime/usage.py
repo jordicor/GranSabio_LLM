@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 TOKEN_LIMIT_REASONS_BY_PROVIDER = {
     "openai": {"length", "max_output_tokens", "max_completion_tokens"},
@@ -262,6 +265,29 @@ def build_finish_metadata(
     return metadata
 
 
+def _coerce_int(value: Any) -> Optional[int]:
+    """Coerce a provider token count to ``int`` without ever raising.
+
+    Providers occasionally report token fields as numeric strings
+    (``"12.5"``) or unexpected structures; usage telemetry must never
+    break an otherwise successful generation, so malformed values
+    degrade to ``None`` with a warning instead of propagating
+    ``ValueError``/``TypeError`` (CFG-02).
+    """
+
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            return int(float(value.strip()))
+        if isinstance(value, (int, float)):
+            return int(value)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    logger.warning("normalize_usage: dropping malformed token count %r", value)
+    return None
+
+
 def normalize_usage(usage_obj: Any) -> Optional[dict[str, Any]]:
     """Extract token metrics from provider-specific usage objects."""
 
@@ -306,10 +332,10 @@ def normalize_usage(usage_obj: Any) -> Optional[dict[str, Any]]:
             pass
 
     normalized: dict[str, Any] = {
-        "input_tokens": int(input_tokens or 0),
-        "output_tokens": int(output_tokens or 0),
-        "total_tokens": int(total_tokens) if total_tokens is not None else None,
-        "reasoning_tokens": int(reasoning_tokens) if reasoning_tokens is not None else None,
+        "input_tokens": _coerce_int(input_tokens) or 0,
+        "output_tokens": _coerce_int(output_tokens) or 0,
+        "total_tokens": _coerce_int(total_tokens),
+        "reasoning_tokens": _coerce_int(reasoning_tokens),
     }
     finish_reason_text = stringify_finish_reason(finish_reason)
     if finish_reason_text is not None:

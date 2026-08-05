@@ -947,13 +947,10 @@ class TestAsyncAttachments:
         mock_response = AsyncMock()
         mock_response.status = 200
         mock_response.json = AsyncMock(return_value={"upload_id": "att-123"})
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=None)
 
-        # Create a proper async context manager (session.post returns cm directly, not coroutine)
-        mock_cm = MagicMock()
-        mock_cm.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_cm.__aexit__ = AsyncMock(return_value=None)
-
-        client._session.post = MagicMock(return_value=mock_cm)
+        client._session.request = AsyncMock(return_value=mock_response)
 
         result = await client.upload_attachment(
             username="test-user",
@@ -971,13 +968,10 @@ class TestAsyncAttachments:
         mock_response = AsyncMock()
         mock_response.status = 400
         mock_response.text = AsyncMock(return_value="Invalid file")
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=None)
 
-        # Create a proper async context manager
-        mock_cm = MagicMock()
-        mock_cm.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_cm.__aexit__ = AsyncMock(return_value=None)
-
-        client._session.post = MagicMock(return_value=mock_cm)
+        client._session.request = AsyncMock(return_value=mock_response)
 
         with pytest.raises(GranSabioClientError):
             await client.upload_attachment("user", b"content", "file.txt")
@@ -993,18 +987,16 @@ class TestAsyncAttachments:
             side_effect=aiohttp.ClientPayloadError("truncated response body")
         )
         mock_response.text = AsyncMock(return_value="")
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=None)
 
-        mock_cm = MagicMock()
-        mock_cm.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_cm.__aexit__ = AsyncMock(return_value=None)
-
-        client._session.post = MagicMock(return_value=mock_cm)
+        client._session.request = AsyncMock(return_value=mock_response)
 
         with pytest.raises(GranSabioClientError) as exc:
             await client.upload_attachment("user", b"content", "file.txt")
 
         assert "Failed to read JSON response from /attachments" in str(exc.value)
-        assert client._session.post.call_count == 1
+        assert client._session.request.call_count == 1
 
     @pytest.mark.asyncio
     async def test_upload_attachment_base64_success_body_read_failure_raises_client_error(self, client):

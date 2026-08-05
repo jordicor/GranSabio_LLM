@@ -5,6 +5,87 @@ from typing import Any, Dict, List, Union
 from pydantic import Field, create_model
 from pydantic.fields import FieldInfo
 
+# Complexity ceilings for user-supplied JSON Schemas (audit PER-01). A schema
+# breaching any of them is rejected before any conversion work starts: deep
+# nesting leads to RecursionError in the provider-specific normalizers, and
+# nested combinators multiply the number of Pydantic models/unions built.
+JSON_SCHEMA_MAX_DEPTH = 25
+JSON_SCHEMA_MAX_NODES = 1000
+JSON_SCHEMA_MAX_COMBINATIONS = 10_000
+
+
+def validate_json_schema_complexity(
+    schema: Any,
+    *,
+    max_depth: int = JSON_SCHEMA_MAX_DEPTH,
+    max_nodes: int = JSON_SCHEMA_MAX_NODES,
+    max_combinations: int = JSON_SCHEMA_MAX_COMBINATIONS,
+) -> None:
+    """
+    Reject a JSON Schema whose processing cost would be unbounded (audit PER-01).
+
+    Iterative pre-pass (no recursion, so it cannot itself overflow the stack)
+    over the raw schema structure measuring three metrics:
+
+    - maximum nesting depth, counting every dict/list descent from the root;
+    - total number of schema nodes (dicts) visited;
+    - accumulated combinatorial product: the variant counts of ``oneOf``,
+      ``anyOf`` and list-valued ``type`` multiply as the traversal descends,
+      mirroring the multiplicative cost of building union types from them.
+
+    Non-dict input is a no-op (a JSON Schema boolean or scalar carries no
+    traversal cost). Shared/repeated substructures are counted once per visit,
+    which keeps the estimate conservative.
+
+    Args:
+        schema: Raw JSON Schema structure (usually a dict).
+        max_depth: Maximum allowed nesting depth from the root.
+        max_nodes: Maximum allowed number of visited schema nodes.
+        max_combinations: Maximum allowed accumulated combinatorial product.
+
+    Raises:
+        ValueError: when any ceiling is exceeded. Callers must surface this as
+            a request validation error (HTTP 400/422), never as a 500.
+    """
+
+    if not isinstance(schema, dict):
+        return
+
+    nodes = 0
+    stack: List[Any] = [(schema, 1, 1)]
+    while stack:
+        node, depth, combinations = stack.pop()
+        if depth > max_depth:
+            raise ValueError(
+                f"JSON Schema nesting depth exceeds the limit of {max_depth} levels"
+            )
+        if isinstance(node, dict):
+            nodes += 1
+            if nodes > max_nodes:
+                raise ValueError(
+                    f"JSON Schema exceeds the limit of {max_nodes} schema nodes"
+                )
+            node_combinations = combinations
+            for combinator in ("oneOf", "anyOf"):
+                options = node.get(combinator)
+                if isinstance(options, list) and options:
+                    node_combinations *= len(options)
+            json_type = node.get("type")
+            if isinstance(json_type, list) and json_type:
+                node_combinations *= len(json_type)
+            if node_combinations > max_combinations:
+                raise ValueError(
+                    f"JSON Schema combinatorial complexity exceeds the limit of "
+                    f"{max_combinations} (nested oneOf/anyOf/type unions)"
+                )
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    stack.append((value, depth + 1, node_combinations))
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    stack.append((item, depth + 1, combinations))
+
 
 def json_schema_to_pydantic(
     json_schema: Dict[str, Any],
@@ -17,6 +98,8 @@ def json_schema_to_pydantic(
     Handles nested objects/arrays, enums, simple combinators, and preserves defaults/descriptions
     so Anthropic receives a fully typed schema instead of generic `list`/`dict`.
     """
+    validate_json_schema_complexity(json_schema)
+
     model_cache: Dict[int, Any] = {}
     name_counters: Dict[str, int] = {}
 

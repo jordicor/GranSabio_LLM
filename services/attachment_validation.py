@@ -8,6 +8,7 @@ import re
 import unicodedata
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse, urlunparse
 
 from fastapi import UploadFile
 
@@ -71,12 +72,21 @@ def attachment_kind(*, final_mime: str, stored_filename: str) -> str:
 def validate_declared_size(*, actual: int, declared: Optional[int], settings: Any) -> None:
     if declared is None:
         return
+    if declared == 0 and actual == 0:
+        return
     if declared <= 0:
         raise AttachmentValidationError("Declared size must be a positive integer")
     if actual > declared * settings.max_compression_ratio:
         raise AttachmentValidationError("Attachment size exceeds allowed compression ratio")
     if actual != declared:
         raise AttachmentValidationError("Attachment size mismatches declared Content-Length")
+
+
+def redact_url(url: str) -> str:
+    """Return the URL without query string or fragment (credentials-safe)."""
+
+    parsed = urlparse(url or "")
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
 
 
 def detect_mime(
@@ -162,7 +172,11 @@ def sanitize_filename(filename: str) -> str:
         candidate = "attachment"
     if candidate.lower() == "metadata.json":
         candidate = f"attachment_{candidate}"
-    return candidate[:120]
+    if len(candidate) > 120:
+        suffix = Path(candidate).suffix
+        keep = 120 - len(suffix)
+        candidate = f"{candidate[:keep]}{suffix}" if keep > 0 else candidate[:120]
+    return candidate
 
 
 def validate_extension(extension: str, *, settings: Any) -> None:

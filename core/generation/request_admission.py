@@ -2,17 +2,41 @@
 
 from __future__ import annotations
 
+import logging
 import math
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
-from config import DEFAULT_OUTPUT_TOKEN_FALLBACK
+import context_budget
+from config import DEFAULT_OUTPUT_TOKEN_FALLBACK, config
+from context_budget import (
+    AUTO_QA_PLANNER_SKELETON as _AUTO_QA_SKELETON,
+)
+from context_budget import (
+    PREFLIGHT_VALIDATOR_SKELETON as _PREFLIGHT_SKELETON,
+)
+from context_budget import (
+    AdmissionDecision,
+    PayloadComponent,
+    RenderedCallBudget,
+)
 from model_capability_registry import (
     model_supports_long_text_section_tool_loop,
     resolve_model_capability_context,
 )
-from models import ContentRequest, PreflightIssue
+from models import (
+    ContentRequest,
+    PreflightIssue,
+    PreflightResult,
+    is_json_output_requested,
+)
+
+logger = logging.getLogger(__name__)
+
+_PREFLIGHT_DEFAULT_MAX_TOKENS = 800
+_AUTO_QA_DEFAULT_MAX_TOKENS = 6000
 
 MIN_ITERATION_TIMEOUT_SECONDS = 900
 QA_LAYER_PADDING_SECONDS = 120
@@ -319,3 +343,607 @@ def resolve_long_text_mode(
     )
 
     return resolved, advisories
+
+
+# ---------------------------------------------------------------------------
+# Barrier 1: early technical context admission (spec §5, D13)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ReceptorSpec:
+    """One predictable-call receptor evaluated by barrier 1."""
+
+    call_id: str
+    label: str
+    model: str
+    mandatory: bool
+    budget: RenderedCallBudget
+    worst_case_budget: Optional[RenderedCallBudget] = None
+
+
+@dataclass
+class TechnicalAdmissionResult:
+    """Outcome of the early technical context admission (barrier 1)."""
+
+    rejected: bool = False
+    preflight_result: Optional[PreflightResult] = None
+    advisories: List[PreflightIssue] = field(default_factory=list)
+    diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def _provider_for_model(model_name: str) -> str:
+    try:
+        info = config.get_model_info(model_name)
+        if isinstance(info, dict):
+            return str(info.get("provider") or "")
+    except Exception:
+        return ""
+    return ""
+
+
+def _generator_public_label(
+    request: ContentRequest, request_fields_set: set, alias_registry: Any
+) -> str:
+    if "generator_model" in request_fields_set:
+        return str(request.generator_model)
+    if alias_registry is not None:
+        alias = alias_registry.alias_for_slot("generator:0")
+        if alias:
+            return alias
+    return "Generator"
+
+
+def _preflight_public_label(alias_registry: Any) -> str:
+    if alias_registry is not None:
+        alias = alias_registry.alias_for_slot("preflight:0")
+        if alias:
+            return alias
+    return "PreflightValidator"
+
+
+def _qa_public_label(index: int, model_name: str, client_named: bool, alias_registry: Any) -> str:
+    if client_named:
+        return model_name
+    if alias_registry is not None:
+        return alias_registry.qa_alias(index)
+    return f"Evaluator {index + 1}"
+
+
+def _estimated_generated_tokens(request: ContentRequest) -> int:
+    """Worst-case generated-content token estimate from the word target."""
+
+    words = getattr(request, "max_words", None) or getattr(request, "min_words", None)
+    if not words:
+        return 0
+    return int(math.ceil(int(words) * ESTIMATED_TOKENS_PER_WORD))
+
+
+def _qa_model_reserve(model_entry: Any) -> tuple[str, int, int]:
+    """Return (model_name, reserved_output_tokens, thinking_budget_tokens)."""
+
+    if isinstance(model_entry, str):
+        model_name = model_entry
+        thinking = 0
+        requested_max: Optional[int] = None
+    else:
+        model_name = str(getattr(model_entry, "model", model_entry))
+        thinking = int(getattr(model_entry, "thinking_budget_tokens", None) or 0)
+        requested_max = getattr(model_entry, "max_tokens", None)
+    reserved = config.resolve_qa_max_tokens(model_name, requested_max) or 0
+    return model_name, int(reserved), thinking
+
+
+def _build_receptors(
+    request: ContentRequest,
+    *,
+    request_fields_set: set,
+    preflight_model: Optional[str],
+    preflight_will_run: bool,
+    preflight_max_tokens: int,
+    auto_qa_requested: bool,
+    auto_qa_model: Optional[str],
+    auto_qa_max_tokens: int,
+    qa_mandatory: bool,
+    preflight_image_info: Optional[Dict[str, Any]],
+    alias_registry: Any,
+) -> List[_ReceptorSpec]:
+    """Build the guaranteed lower-bound receptors for all predictable calls."""
+
+    source_text = str(getattr(request, "source_text", "") or "")
+    prompt = str(getattr(request, "prompt", "") or "")
+    image_tokens = int((preflight_image_info or {}).get("total_estimated_tokens", 0) or 0)
+    json_hint = "json" if is_json_output_requested(request) else "prose"
+
+    def _image_component() -> Optional[PayloadComponent]:
+        if image_tokens <= 0:
+            return None
+        return PayloadComponent(
+            name="input_images", chars=0, tokens_estimate=image_tokens, kind="image"
+        )
+
+    receptors: List[_ReceptorSpec] = []
+
+    # --- Generator (generation.main / long_text section-draft) ---
+    # Deliberate exclusion: resolved attachment / context-document text is NOT
+    # added to the generator receptor here. Barrier 1 only measures the
+    # guaranteed lower bound, and the exact tokenization of arbitrary attachment
+    # content is unknown at this stage; blocking on a byte-based estimate could
+    # false-reject a request that actually fits. The provider-frontier guard
+    # (barrier 3) enforces the real rendered payload at dispatch. A conservative
+    # worst-case advisory for that excluded context is emitted in
+    # run_technical_context_admission (never a rejection).
+    gen_model = str(request.generator_model)
+    gen_provider = _provider_for_model(gen_model)
+    gen_components = [
+        context_budget.make_payload_component(
+            "generator_system_prompt",
+            config.GENERATOR_SYSTEM_PROMPT_RAW,
+            "system",
+            gen_provider,
+            gen_model,
+        ),
+        context_budget.make_payload_component(
+            "prompt", prompt, "message", gen_provider, gen_model, json_hint
+        ),
+    ]
+    if source_text:
+        gen_components.append(
+            context_budget.make_payload_component(
+                "source_text", source_text, "message", gen_provider, gen_model, json_hint
+            )
+        )
+    image_component = _image_component()
+    if image_component is not None:
+        gen_components.append(image_component)
+    receptors.append(
+        _ReceptorSpec(
+            call_id="generation.main",
+            label=_generator_public_label(request, request_fields_set, alias_registry),
+            model=gen_model,
+            mandatory=True,
+            budget=RenderedCallBudget(
+                provider=gen_provider,
+                model=gen_model,
+                call_id="generation.main",
+                components=gen_components,
+                reserved_output_tokens=int(getattr(request, "max_tokens", 0) or 0),
+                thinking_budget_tokens=int(getattr(request, "thinking_budget_tokens", None) or 0),
+                content_type_hint=json_hint,
+            ),
+        )
+    )
+
+    # --- Preflight validator (only when the LLM preflight will actually run) ---
+    if preflight_will_run and preflight_model:
+        pf_provider = _provider_for_model(preflight_model)
+        pf_components = [
+            context_budget.make_payload_component(
+                "preflight_system_prompt",
+                config.PREFLIGHT_SYSTEM_PROMPT,
+                "system",
+                pf_provider,
+                preflight_model,
+            ),
+            context_budget.make_payload_component(
+                "prompt", prompt, "message", pf_provider, preflight_model
+            ),
+            context_budget.make_payload_component(
+                "payload_skeleton", _PREFLIGHT_SKELETON, "message", pf_provider, preflight_model
+            ),
+        ]
+        if source_text:
+            pf_components.append(
+                context_budget.make_payload_component(
+                    "source_text", source_text, "message", pf_provider, preflight_model
+                )
+            )
+        receptors.append(
+            _ReceptorSpec(
+                call_id="preflight.validate",
+                label=_preflight_public_label(alias_registry),
+                model=preflight_model,
+                mandatory=True,
+                budget=RenderedCallBudget(
+                    provider=pf_provider,
+                    model=preflight_model,
+                    call_id="preflight.validate",
+                    components=pf_components,
+                    reserved_output_tokens=int(preflight_max_tokens),
+                    content_type_hint="prose",
+                ),
+            )
+        )
+
+    # --- Auto-QA planner (only when Auto-QA is requested) ---
+    if auto_qa_requested and auto_qa_model:
+        aq_provider = _provider_for_model(auto_qa_model)
+        aq_source = source_text[:30000] if source_text else ""
+        aq_components = [
+            context_budget.make_payload_component(
+                "prompt", prompt, "message", aq_provider, auto_qa_model
+            ),
+            context_budget.make_payload_component(
+                "payload_skeleton", _AUTO_QA_SKELETON, "message", aq_provider, auto_qa_model
+            ),
+        ]
+        if aq_source:
+            aq_components.append(
+                context_budget.make_payload_component(
+                    "source_text", aq_source, "message", aq_provider, auto_qa_model
+                )
+            )
+        receptors.append(
+            _ReceptorSpec(
+                call_id="auto_qa.plan",
+                label="AutoQAPlanner",
+                model=auto_qa_model,
+                mandatory=True,
+                budget=RenderedCallBudget(
+                    provider=aq_provider,
+                    model=auto_qa_model,
+                    call_id="auto_qa.plan",
+                    components=aq_components,
+                    reserved_output_tokens=int(auto_qa_max_tokens),
+                    content_type_hint="prose",
+                ),
+            )
+        )
+
+    # --- QA evaluators (strict_all) — guaranteed parts only + worst-case advisory ---
+    qa_models = list(getattr(request, "qa_models", None) or [])
+    if qa_mandatory and qa_models:
+        client_named = "qa_models" in request_fields_set
+        est_gen_tokens = _estimated_generated_tokens(request)
+        for index, model_entry in enumerate(qa_models):
+            model_name, reserved, thinking = _qa_model_reserve(model_entry)
+            provider = _provider_for_model(model_name)
+            guaranteed = [
+                context_budget.make_payload_component(
+                    "qa_system_prompt",
+                    config.QA_SYSTEM_PROMPT_RAW,
+                    "system",
+                    provider,
+                    model_name,
+                ),
+                context_budget.make_payload_component(
+                    "prompt", prompt, "message", provider, model_name
+                ),
+            ]
+            if source_text:
+                guaranteed.append(
+                    context_budget.make_payload_component(
+                        "source_text", source_text, "message", provider, model_name
+                    )
+                )
+            worst_case_budget: Optional[RenderedCallBudget] = None
+            if est_gen_tokens > 0:
+                worst_case_components = list(guaranteed) + [
+                    PayloadComponent(
+                        name="generated_content_worst_case",
+                        chars=0,
+                        tokens_estimate=est_gen_tokens,
+                        kind="message",
+                    )
+                ]
+                worst_case_budget = RenderedCallBudget(
+                    provider=provider,
+                    model=model_name,
+                    call_id="qa.evaluate_layer",
+                    components=worst_case_components,
+                    reserved_output_tokens=reserved,
+                    thinking_budget_tokens=thinking,
+                    content_type_hint="prose",
+                )
+            receptors.append(
+                _ReceptorSpec(
+                    call_id="qa.evaluate_layer",
+                    label=_qa_public_label(index, model_name, client_named, alias_registry),
+                    model=model_name,
+                    mandatory=True,
+                    budget=RenderedCallBudget(
+                        provider=provider,
+                        model=model_name,
+                        call_id="qa.evaluate_layer",
+                        components=guaranteed,
+                        reserved_output_tokens=reserved,
+                        thinking_budget_tokens=thinking,
+                        content_type_hint="prose",
+                    ),
+                    worst_case_budget=worst_case_budget,
+                )
+            )
+
+    return receptors
+
+
+def _utilization_pct(report: Any) -> Any:
+    if report.utilization is None:
+        return "unknown"
+    return round(report.utilization * 100, 1)
+
+
+async def run_technical_context_admission(
+    request: ContentRequest,
+    *,
+    request_fields_set: set,
+    preflight_model: Optional[str],
+    preflight_will_run: bool,
+    auto_qa_requested: bool,
+    auto_qa_model: Optional[str],
+    qa_mandatory: bool,
+    preflight_image_info: Optional[Dict[str, Any]] = None,
+    alias_registry: Any = None,
+    native_counter: Any = None,
+    preflight_max_tokens: int = _PREFLIGHT_DEFAULT_MAX_TOKENS,
+    auto_qa_max_tokens: int = _AUTO_QA_DEFAULT_MAX_TOKENS,
+    context_documents_total_bytes: int = 0,
+) -> TechnicalAdmissionResult:
+    """Early, pre-session, pre-LLM technical context admission (barrier 1).
+
+    Builds one guaranteed lower-bound ``RenderedCallBudget`` per predictable
+    call and classifies each mandatory receptor. In ``enforce`` mode a
+    GUARANTEED overflow on a mandatory receptor, or an unverified capacity whose
+    guaranteed input plus reserved generation is above
+    ``CONTEXT_UNKNOWN_REJECT_TOKENS``, rejects the
+    request through the preflight surface WITHOUT any LLM call and before a
+    session is created. An unverified capacity below that threshold is admitted
+    (silently under ``CONTEXT_UNKNOWN_PASS_TOKENS``, with a warning advisory
+    above it). Worst-case-only concerns become advisories. In ``observe`` mode
+    nothing is rejected — only advisories and logs.
+    """
+
+    receptors = _build_receptors(
+        request,
+        request_fields_set=request_fields_set,
+        preflight_model=preflight_model,
+        preflight_will_run=preflight_will_run,
+        preflight_max_tokens=preflight_max_tokens,
+        auto_qa_requested=auto_qa_requested,
+        auto_qa_model=auto_qa_model,
+        auto_qa_max_tokens=auto_qa_max_tokens,
+        qa_mandatory=qa_mandatory,
+        preflight_image_info=preflight_image_info,
+        alias_registry=alias_registry,
+    )
+
+    mode = context_budget.resolve_admission_mode()
+    advisories: List[PreflightIssue] = []
+    diagnostics: List[Dict[str, Any]] = []
+    rejections: List[tuple[str, Any]] = []
+
+    for spec in receptors:
+        report = await context_budget.evaluate_call_admission(
+            spec.budget, native_counter=native_counter
+        )
+        diagnostics.append(
+            {
+                "call_id": spec.call_id,
+                "model": spec.model,
+                "label": spec.label,
+                "mandatory": spec.mandatory,
+                "decision": report.decision.value,
+                "required_tokens": report.serialized_input_tokens,
+                "required_context_footprint_tokens": (
+                    report.required_context_footprint_tokens
+                ),
+                "reserved_generation_tokens": report.reserved_generation_tokens,
+                "available_tokens": report.safe_input_limit,
+                "utilization": report.utilization,
+                "count_method": report.count_method.value,
+                "confidence": report.limits.confidence.value,
+            }
+        )
+        logger.info(
+            "Context admission plan: call=%s model=%s decision=%s required=%s "
+            "available=%s confidence=%s",
+            spec.call_id,
+            spec.model,
+            report.decision.value,
+            report.serialized_input_tokens,
+            report.safe_input_limit,
+            report.limits.confidence.value,
+        )
+
+        if report.decision is AdmissionDecision.CAPACITY_UNKNOWN_TOLERATED:
+            # Unverified capacity below the reject threshold: admitted with a
+            # warning, never a rejection, in both modes. Falls through so the
+            # worst-case checks below still run for this receptor.
+            advisories.append(
+                build_advisory(
+                    code="context_admission_capacity_unknown_tolerated",
+                    message=(
+                        f"{spec.label}: this model's context capacity is not verified, so "
+                        f"the fit could not be confirmed; the guaranteed context footprint "
+                        f"(~{report.required_context_footprint_tokens} tokens: input plus "
+                        "reserved generation) stays below the size that "
+                        "requires a verified window, so the request proceeds with this warning."
+                    ),
+                )
+            )
+        elif report.decision in (AdmissionDecision.OVERFLOW, AdmissionDecision.CAPACITY_UNKNOWN):
+            if spec.mandatory and mode == "enforce":
+                rejections.append((spec.label, report))
+            else:
+                is_unknown = report.decision is AdmissionDecision.CAPACITY_UNKNOWN
+                advisories.append(
+                    build_advisory(
+                        code=(
+                            "context_admission_capacity_unknown"
+                            if is_unknown
+                            else "context_admission_overflow"
+                        ),
+                        message=(
+                            f"{spec.label}: this model's context capacity is not verified and "
+                            f"the guaranteed context footprint (~"
+                            f"{report.required_context_footprint_tokens} tokens: input plus "
+                            "reserved generation) is "
+                            "above the size that can be admitted without a verified window, so "
+                            "the fit could not be confirmed (observe mode)."
+                            if is_unknown
+                            else (
+                                f"{spec.label}: the guaranteed input (~"
+                                f"{report.serialized_input_tokens} tokens) exceeds the safe "
+                                f"limit (~{report.safe_input_limit} tokens) (observe mode)."
+                            )
+                        ),
+                    )
+                )
+            continue
+
+        if report.decision is AdmissionDecision.NEAR_LIMIT:
+            advisories.append(
+                build_advisory(
+                    code="context_admission_near_limit",
+                    message=(
+                        f"{spec.label}: guaranteed input is near the context limit "
+                        f"(~{report.serialized_input_tokens} of ~{report.safe_input_limit} "
+                        f"safe tokens, {_utilization_pct(report)}% utilization)."
+                    ),
+                )
+            )
+
+        # Attachment worst-case (advisory only): barrier 1 deliberately excludes
+        # resolved attachment / context-document text from the generator receptor
+        # (see _build_receptors). If the guaranteed generator input plus a
+        # conservative token estimate of that excluded context would exceed the
+        # safe limit, surface a worst-case warning so the caller can abort a
+        # doomed generation consciously. Never blocks — the frontier guard
+        # (barrier 3) enforces the real payload at dispatch (mirror rule label).
+        if (
+            spec.call_id == "generation.main"
+            and context_documents_total_bytes > 0
+            and report.safe_input_limit is not None
+        ):
+            attachment_tokens = context_budget.estimate_tokens_from_size(
+                context_documents_total_bytes
+            )
+            worst_case_total = report.serialized_input_tokens + attachment_tokens
+            if worst_case_total > report.safe_input_limit:
+                advisories.append(
+                    build_advisory(
+                        code="context_admission_attachments_worst_case",
+                        message=(
+                            f"{spec.label}: the guaranteed generator input fits, but adding "
+                            f"the resolved attachment/context documents (~{attachment_tokens} "
+                            f"estimated tokens) would raise the worst-case input to "
+                            f"~{worst_case_total} tokens, exceeding the safe limit "
+                            f"(~{report.safe_input_limit} tokens). This is not enforced here; "
+                            "the provider-frontier guard checks the real payload at dispatch."
+                        ),
+                    )
+                )
+
+        # Worst-case (advisory only): the guaranteed lower bound fits, but a
+        # worst-case payload (e.g. the generated content QA will receive) could
+        # overflow. Never blocks — surfaced as a warning.
+        if spec.worst_case_budget is not None:
+            wc_report = await context_budget.evaluate_call_admission(
+                spec.worst_case_budget, native_counter=native_counter
+            )
+            if wc_report.decision is AdmissionDecision.OVERFLOW:
+                advisories.append(
+                    build_advisory(
+                        code="context_admission_worst_case",
+                        message=(
+                            f"{spec.label}: the guaranteed input fits, but the worst-case "
+                            f"payload (~{wc_report.serialized_input_tokens} tokens including "
+                            "the largest expected generated content) may exceed the safe "
+                            f"limit (~{wc_report.safe_input_limit} tokens)."
+                        ),
+                    )
+                )
+            elif wc_report.decision is AdmissionDecision.CAPACITY_UNKNOWN:
+                # The guaranteed input was admitted despite unverified capacity,
+                # but the worst-case payload is large enough that an unknown
+                # window becomes a real overflow risk. Advisory only.
+                advisories.append(
+                    build_advisory(
+                        code="context_admission_worst_case_capacity_unknown",
+                        message=(
+                            f"{spec.label}: the guaranteed input is admitted, but this model's "
+                            "context capacity is not verified and the worst-case payload (~"
+                            f"{wc_report.required_context_footprint_tokens} tokens including "
+                            "input, reserved generation, and the largest expected generated "
+                            "content) is above the size that can be admitted "
+                            "without a verified window."
+                        ),
+                    )
+                )
+
+    if not rejections:
+        return TechnicalAdmissionResult(
+            rejected=False, advisories=advisories, diagnostics=diagnostics
+        )
+
+    issues: List[PreflightIssue] = []
+    capacity_unknown_count = 0
+    for label, report in rejections:
+        if report.decision is AdmissionDecision.CAPACITY_UNKNOWN:
+            capacity_unknown_count += 1
+            issues.append(
+                PreflightIssue(
+                    code="context_admission_capacity_unknown",
+                    severity="critical",
+                    message=(
+                        f"{label}: this model's context capacity is not verified and the "
+                        f"required context footprint (~"
+                        f"{report.required_context_footprint_tokens} tokens: input plus "
+                        "reserved generation) is above "
+                        "the size that can be admitted without a verified window, so the "
+                        "request cannot be confirmed to fit."
+                    ),
+                    blockers=True,
+                )
+            )
+        else:
+            issues.append(
+                PreflightIssue(
+                    code="context_admission_overflow",
+                    severity="critical",
+                    message=(
+                        f"{label}: the required input (~{report.serialized_input_tokens} tokens) "
+                        f"exceeds the safe context limit (~{report.safe_input_limit} tokens, "
+                        f"{_utilization_pct(report)}% utilization)."
+                    ),
+                    blockers=True,
+                )
+            )
+
+    overflow_count = len(rejections) - capacity_unknown_count
+    feedback_parts: List[str] = []
+    if overflow_count:
+        feedback_parts.append(
+            "The request is too large for one or more required models and cannot be "
+            "processed. Reduce the source text or prompt size, split the request into "
+            "smaller parts, or choose a model with a larger context window."
+        )
+    if capacity_unknown_count:
+        feedback_parts.append(
+            "One or more required models have no verified context capacity, and this "
+            "request is large enough that admitting it could overflow their real "
+            "window. Add those models to model_limits.curated.json, reduce the request "
+            "size, or set CONTEXT_ADMISSION_MODE=observe to bypass the check."
+        )
+
+    preflight_result = PreflightResult(
+        decision="reject",
+        user_feedback=" ".join(feedback_parts),
+        summary=f"Context admission rejected {len(rejections)} required receptor(s).",
+        issues=issues,
+    )
+    causes: List[str] = []
+    if overflow_count:
+        causes.append(f"{overflow_count} receptor(s) over budget")
+    if capacity_unknown_count:
+        causes.append(f"{capacity_unknown_count} receptor(s) with unverified capacity")
+    logger.warning(
+        "Barrier 1 rejected generation before session creation: %s.",
+        ", ".join(causes),
+    )
+    return TechnicalAdmissionResult(
+        rejected=True,
+        preflight_result=preflight_result,
+        advisories=advisories,
+        diagnostics=diagnostics,
+    )

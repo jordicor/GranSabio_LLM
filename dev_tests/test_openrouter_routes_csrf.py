@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import sys
 from unittest.mock import AsyncMock, MagicMock
+
+# The venv's libmagic native DLL crashes on import in this Windows environment
+# (pre-existing); attachment_manager treats python-magic as optional. Stub it
+# before importing core.* (same pattern as dev_tests/test_audit_genproc.py).
+sys.modules.setdefault("magic", MagicMock())
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,6 +20,15 @@ from core.app_state import app
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _allow_testserver_admin_host(monkeypatch):
+    # API-05: admin mutations now validate the Host header against a hostname
+    # allowlist (loopback by default). These tests exercise the same-origin
+    # logic, so the TestClient hostname is explicitly allowlisted the same way
+    # a real deployment would via ADMIN_ALLOWED_HOSTNAMES.
+    monkeypatch.setenv("ADMIN_ALLOWED_HOSTNAMES", "testserver")
 
 
 @pytest.fixture
@@ -78,7 +93,12 @@ def test_admin_openrouter_sync_blocks_cross_origin(client, mock_model_sync_servi
     )
 
     assert response.status_code == 403
-    assert response.json()["detail"] == "Admin mutation rejected: cross-origin request"
+    # Either the global cross-site guard middleware (FE-01) or the route-level
+    # same-origin check rejects the request; both enforce the same contract.
+    assert response.json()["detail"] in (
+        "Forbidden: origin mismatch",
+        "Admin mutation rejected: cross-origin request",
+    )
     mock_model_sync_service.sync_provider.assert_not_called()
 
 

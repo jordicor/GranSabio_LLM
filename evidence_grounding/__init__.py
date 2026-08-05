@@ -32,6 +32,7 @@ from .budget_scorer import (
     calculate_budget_metrics,
     extract_yes_probability,
     kl_bernoulli,
+    normalize_yes_no_unsure,
     score_claims,
 )
 from .claim_extractor import ClaimExtractor, extract_claims
@@ -70,6 +71,7 @@ __all__ = [
     "kl_bernoulli",
     "calculate_budget_metrics",
     "extract_yes_probability",
+    "normalize_yes_no_unsure",
     "build_entailment_prompt",
     "ENTAILMENT_SYSTEM_PROMPT",
     # Phase 5: Grounding Engine

@@ -6,10 +6,12 @@ import asyncio
 import copy
 import time
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 IdempotencyState = Literal["pending", "completed", "error"]
 ClaimAction = Literal["execute", "wait", "replay"]
+
+IDEMPOTENCY_WAIT_TIMEOUT_SECONDS = 300
 
 
 class IdempotencyConflictError(Exception):
@@ -18,6 +20,10 @@ class IdempotencyConflictError(Exception):
 
 class IdempotencyCapacityError(Exception):
     """Raised when all bounded registry slots contain active requests."""
+
+
+class IdempotencyWaitTimeoutError(Exception):
+    """Raised when the owner of a claimed key does not finish admission in time."""
 
 
 @dataclass
@@ -47,9 +53,16 @@ class GenerationIdempotencyClaim:
 class GenerationIdempotencyRegistry:
     """Process-local, bounded registry for generation admission idempotency."""
 
-    def __init__(self, *, ttl_seconds: int, max_entries: int) -> None:
+    def __init__(
+        self,
+        *,
+        ttl_seconds: int,
+        max_entries: int,
+        wait_timeout_seconds: float = IDEMPOTENCY_WAIT_TIMEOUT_SECONDS,
+    ) -> None:
         self._ttl_seconds = max(300, int(ttl_seconds))
         self._max_entries = max(100, int(max_entries))
+        self._wait_timeout_seconds = max(1.0, float(wait_timeout_seconds))
         self._entries: dict[str, GenerationIdempotencyEntry] = {}
         self._lock = asyncio.Lock()
 
@@ -116,9 +129,23 @@ class GenerationIdempotencyRegistry:
             self._entries.pop(entry.request_id, None)
             entry.event.set()
 
-    async def wait(self, entry: GenerationIdempotencyEntry) -> None:
-        """Wait until the owner stores a result or aborts its claim."""
-        await entry.event.wait()
+    async def wait(
+        self,
+        entry: GenerationIdempotencyEntry,
+        timeout: Optional[float] = None,
+    ) -> None:
+        """Wait until the owner stores a result or aborts its claim.
+
+        The wait is bounded (audit API-06): when the owner neither completes
+        nor aborts within the timeout, IdempotencyWaitTimeoutError is raised
+        so the caller can ask the client to retry later instead of holding the
+        connection open indefinitely.
+        """
+        effective_timeout = self._wait_timeout_seconds if timeout is None else timeout
+        try:
+            await asyncio.wait_for(entry.event.wait(), timeout=effective_timeout)
+        except asyncio.TimeoutError as exc:
+            raise IdempotencyWaitTimeoutError(entry.request_id) from exc
 
     async def lookup(self, request_id: str) -> dict[str, Any]:
         """Return a public reconciliation snapshot without request payload data."""

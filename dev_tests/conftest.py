@@ -11,6 +11,7 @@ import pytest
 # do not let their historical ``test_*.py`` names pull them into the automated
 # pytest suite.
 collect_ignore = [
+    "manual",
     "test_providers_quick.py",
     "test_vision_basic.py",
     "test_vision_multiimage.py",
@@ -20,6 +21,24 @@ collect_ignore = [
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+@pytest.fixture(autouse=True)
+def _context_admission_observe_default(monkeypatch):
+    """Default the test suite to CONTEXT_ADMISSION_MODE=observe.
+
+    Production defaults to ``enforce`` (fail-closed on any uncurated model), but
+    the vast majority of tests exercise fake/uncurated models that would resolve
+    to ``capacity_unknown`` and be rejected. Observe mode keeps the universal
+    admission guard fully wired (it still computes reports and logs) without
+    fail-closing on those models, reproducing the pre-guard behavior. Tests that
+    need enforce semantics (e.g. ``test_context_admission_frontiers.py``) set the
+    mode explicitly via their own ``monkeypatch.setenv`` after this fixture runs,
+    and ``test_context_budget.py`` passes ``mode=`` directly, bypassing the env.
+    """
+
+    monkeypatch.setenv("CONTEXT_ADMISSION_MODE", "observe")
+    yield
 
 
 # ============================================================================

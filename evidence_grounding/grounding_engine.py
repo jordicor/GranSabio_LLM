@@ -20,6 +20,8 @@ import logging
 import time
 from typing import Any, Callable, Dict, Optional
 
+from ai_service import is_content_filter_stop
+from context_budget import ContextAdmissionError
 from evidence_grounding.budget_scorer import BudgetScorer
 from evidence_grounding.claim_extractor import ClaimExtractor
 from evidence_grounding.evidence_matcher import (
@@ -126,7 +128,21 @@ class GroundingEngine:
             EvidenceGroundingResult with all metrics and pass/fail status
         """
         start_time = time.time()
-        tokens_used = 0  # Track across all API calls
+        tokens_used = 0  # Accumulated across all API calls via usage payloads
+
+        def _tracking_usage_callback(payload: Dict[str, Any]) -> None:
+            """Accumulate reported tokens and forward the payload downstream."""
+            nonlocal tokens_used
+            total = payload.get("total_tokens")
+            if not isinstance(total, (int, float)):
+                total = (payload.get("input_tokens") or 0) + (payload.get("output_tokens") or 0)
+            tokens_used += max(0, int(total))
+            if usage_callback is not None:
+                usage_callback(payload)
+
+        # Providers only report usage when a callback is present, so the
+        # tracker is always passed down even without an external callback.
+        tracked_usage_callback = _tracking_usage_callback
 
         extraction_route = resolve_call("evidence.extract_claims", request=original_request)
         classification_route = resolve_call("evidence.classify_spans", request=original_request)
@@ -161,18 +177,26 @@ class GroundingEngine:
                 filter_trivial=grounding_config.filter_trivial,
                 min_importance=grounding_config.min_claim_importance,
                 extra_verbose=extra_verbose,
-                usage_callback=usage_callback,
+                usage_callback=tracked_usage_callback,
                 cancellation_token=cancellation_token,
             )
         except asyncio.CancelledError:
             raise
+        except ContextAdmissionError:
+            # A context overflow must fail the grounding check visibly, never
+            # become a conservative pass that masks unverified content.
+            raise
         except Exception as e:
+            if is_content_filter_stop(e):
+                raise
             logger.error(f"[GROUNDING] Claim extraction failed: {e}")
-            # Return conservative result on extraction failure
+            # Degrade per on_flag policy: never mask the error as a real pass.
             return self._create_error_result(
                 model=extraction_model,
                 error_message=f"Claim extraction failed: {e}",
                 elapsed_ms=(time.time() - start_time) * 1000,
+                on_flag=grounding_config.on_flag,
+                tokens_used=tokens_used,
             )
 
         total_extracted = len(claims)
@@ -224,17 +248,25 @@ class GroundingEngine:
             spans = await self.evidence_matcher.classify_spans(
                 model=classification_model,
                 request=original_request,
-                usage_callback=usage_callback,
+                usage_callback=tracked_usage_callback,
                 cancellation_token=cancellation_token,
             )
         except asyncio.CancelledError:
             raise
+        except ContextAdmissionError:
+            # A context overflow must fail the grounding check visibly, never
+            # become a conservative pass that masks unverified content.
+            raise
         except Exception as e:
+            if is_content_filter_stop(e):
+                raise
             logger.error(f"[GROUNDING] Span classification failed: {e}")
             return self._create_error_result(
                 model=classification_model,
                 error_message=f"Span classification failed: {e}",
                 elapsed_ms=(time.time() - start_time) * 1000,
+                on_flag=grounding_config.on_flag,
+                tokens_used=tokens_used,
             )
         matched_claims = match_claims_to_spans(filtered_claims, spans)
 
@@ -259,17 +291,25 @@ class GroundingEngine:
                 config_obj=grounding_config,
                 request=original_request,
                 extra_verbose=extra_verbose,
-                usage_callback=usage_callback,
+                usage_callback=tracked_usage_callback,
                 cancellation_token=cancellation_token,
             )
         except asyncio.CancelledError:
             raise
+        except ContextAdmissionError:
+            # A context overflow must fail the grounding check visibly, never
+            # become a conservative pass that masks unverified content.
+            raise
         except Exception as e:
+            if is_content_filter_stop(e):
+                raise
             logger.error(f"[GROUNDING] Budget scoring failed: {e}")
             return self._create_error_result(
                 model=scoring_model,
                 error_message=f"Budget scoring failed: {e}",
                 elapsed_ms=(time.time() - start_time) * 1000,
+                on_flag=grounding_config.on_flag,
+                tokens_used=tokens_used,
             )
 
         # ===== STEP 4: Aggregate results =====
@@ -322,12 +362,54 @@ class GroundingEngine:
         model: str,
         error_message: str,
         elapsed_ms: float,
+        on_flag: str = "warn",
+        tokens_used: int = 0,
     ) -> EvidenceGroundingResult:
-        """Create a conservative result when an error occurs.
+        """Create the result for a verification that could not run.
 
-        Conservative = passed=True to avoid blocking on errors.
-        The error is logged but doesn't fail the generation.
+        The degradation policy follows ``on_flag``:
+        - ``deal_breaker``/``regenerate``: the error counts as a verification
+          failure (``passed=False`` with the configured action), so unverified
+          content is blocked or regenerated instead of silently passing.
+        - ``warn``: keeps the historical conservative pass so an infrastructure
+          error never blocks a generation the user only wanted to be warned
+          about; the error is logged and ``claims_verified=0`` distinguishes
+          it from a real verification.
+
+        Either way the result is marked ``degraded=True`` with the original
+        error in ``verification_error`` so the QA pipeline can surface the
+        failure instead of confusing it with a real pass.
+
+        Args:
+            model: Model that was in use when the error happened
+            error_message: Human-readable error description
+            elapsed_ms: Elapsed verification time in milliseconds
+            on_flag: Configured action policy from EvidenceGroundingConfig
+            tokens_used: Tokens consumed before the error
+
+        Returns:
+            EvidenceGroundingResult following the policy above
         """
+        if on_flag in ("deal_breaker", "regenerate"):
+            logger.warning(
+                f"[GROUNDING] Verification error treated as '{on_flag}' failure: {error_message}"
+            )
+            return EvidenceGroundingResult(
+                enabled=True,
+                model_used=model,
+                total_claims_extracted=0,
+                claims_after_filter=0,
+                claims_verified=0,
+                claims=[],
+                flagged_claims=0,
+                max_budget_gap=0.0,
+                passed=False,
+                triggered_action=on_flag,
+                degraded=True,
+                verification_error=error_message,
+                verification_time_ms=elapsed_ms,
+                tokens_used=tokens_used,
+            )
         logger.warning(f"[GROUNDING] Returning conservative pass due to error: {error_message}")
         return EvidenceGroundingResult(
             enabled=True,
@@ -338,10 +420,12 @@ class GroundingEngine:
             claims=[],
             flagged_claims=0,
             max_budget_gap=0.0,
-            passed=True,  # Conservative: don't fail on errors
+            passed=True,  # Conservative: warn mode never blocks on errors
             triggered_action=None,
+            degraded=True,
+            verification_error=error_message,
             verification_time_ms=elapsed_ms,
-            tokens_used=0,
+            tokens_used=tokens_used,
         )
 
     async def _safe_callback(

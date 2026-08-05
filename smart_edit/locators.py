@@ -487,40 +487,55 @@ def _find_phrase_in_text(
         use_normalized_fallback: Whether to try normalized matching if exact fails
 
     Returns:
-        List of start positions where phrase was found
+        List of start positions where phrase was found (indices into `text`)
     """
-    search_text = text if case_sensitive else text.lower()
-    search_phrase = phrase if case_sensitive else phrase.lower()
-
-    # Try exact match first
-    positions: List[int] = []
-    start = 0
-    while True:
-        pos = search_text.find(search_phrase, start)
-        if pos == -1:
-            break
-        positions.append(pos)
-        start = pos + 1
+    if case_sensitive:
+        positions = _find_literal_positions(text, phrase)
+    else:
+        # Case-insensitive matching must run on the original text: searching
+        # on text.lower() shifts offsets whenever a character expands on
+        # lowering (e.g. 'İ' -> 'i' + combining dot) (AUX-15).
+        # re.IGNORECASE matches 1:1 on the original indices.
+        positions = [
+            match.start()
+            for match in re.finditer(re.escape(phrase), text, re.IGNORECASE)
+        ]
 
     if positions:
         return positions
 
-    # Try with normalized matching as fallback
+    # Try with normalized matching as fallback. normalize_for_matching() only
+    # performs 1:1 character replacements, so positions remain valid for text.
     if use_normalized_fallback:
-        norm_text = normalize_for_matching(search_text)
-        norm_phrase = normalize_for_matching(search_phrase)
+        norm_text = normalize_for_matching(text)
+        norm_phrase = normalize_for_matching(phrase)
 
-        start = 0
-        while True:
-            pos = norm_text.find(norm_phrase, start)
-            if pos == -1:
-                break
-            positions.append(pos)
-            start = pos + 1
+        if case_sensitive:
+            positions = _find_literal_positions(norm_text, norm_phrase)
+        else:
+            positions = [
+                match.start()
+                for match in re.finditer(
+                    re.escape(norm_phrase), norm_text, re.IGNORECASE
+                )
+            ]
 
         if positions:
             logger.debug(f"Found phrase via normalized matching: '{phrase[:30]}...'")
 
+    return positions
+
+
+def _find_literal_positions(text: str, phrase: str) -> List[int]:
+    """Return all start offsets of `phrase` in `text` (plain str.find scan)."""
+    positions: List[int] = []
+    start = 0
+    while True:
+        pos = text.find(phrase, start)
+        if pos == -1:
+            break
+        positions.append(pos)
+        start = pos + 1
     return positions
 
 
@@ -597,12 +612,16 @@ def locate_by_markers(
         logger.debug(f"Start marker not found: '{start_phrase[:50]}...'")
         return None
 
-    # Warn if not unique (but continue with first occurrence)
+    # A non-unique start marker makes the location ambiguous. Fail instead of
+    # guessing the first occurrence: uniqueness is the invariant that justifies
+    # phrase mode, and the pipeline already handles a failed location by
+    # discarding the edit (AUX-05).
     if len(start_positions) > 1:
         logger.warning(
             f"Start marker '{start_phrase[:30]}...' is not unique "
-            f"(found {len(start_positions)} times), using first occurrence"
+            f"(found {len(start_positions)} times), refusing to locate"
         )
+        return None
 
     start_pos = start_positions[0]
 

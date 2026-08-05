@@ -12,12 +12,22 @@ This module contains data models, enums, and prompt templates.
 The actual Arbiter class implementation will be added in Phase 2.
 """
 
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
+from ai_service import AIService, is_content_filter_stop
+from content_events import (
+    ContentEvent,
+    ContentEventSink,
+    ContentEventTemplate,
+    ContentPhase,
+    ContentStatus,
+    ContentSubphase,
+)
 from model_aliasing import PromptPart
 from model_capability_registry import resolve_model_capability_context
 from request_timeouts import resolve_request_timeout
@@ -228,9 +238,16 @@ class LayerEditHistory:
         lines.append("[/PREVIOUS_EDITS_IN_LAYER]")
 
         result = "\n".join(lines)
-        if len(result) > max_chars and max_rounds > 1:
-            # Truncate older rounds if too long
-            return self.format_for_prompt(max_rounds - 1, max_chars)
+        if len(result) > max_chars:
+            if max_rounds > 1:
+                # Truncate older rounds if too long
+                return self.format_for_prompt(max_rounds - 1, max_chars)
+            # Base case: even a single round exceeds the budget, so
+            # hard-truncate the text instead of returning it whole (ORQ-07).
+            truncated_marker = "\n... [truncated]"
+            if max_chars > len(truncated_marker):
+                return result[: max_chars - len(truncated_marker)] + truncated_marker
+            return result[:max_chars]
 
         return result
 
@@ -313,6 +330,45 @@ class ArbiterContext:
     # it per-arbitration without mutating Arbiter state.
     arbiter_tools_mode: str = "auto"
     original_request: Optional[Any] = None
+
+
+# Layer name carried by every Arbiter content event, so a subscriber can tell
+# arbitration chunks apart from the QA layers that produced the edits.
+_ARBITER_STREAM_LAYER = "arbitration"
+
+
+def _arbiter_content_filter_terminal_event(
+    template: ContentEventTemplate,
+    exc: Exception,
+) -> ContentEvent:
+    """Build the terminal ``filtered`` verdict of an arbitration attempt.
+
+    The chunks already streamed went out labelled ``draft``; this event says
+    that attempt is dead and why, so a consumer is not left following a draft
+    that never resolves. It carries no content - the draft is never resent - and
+    the terminal stop keeps propagating untouched.
+    """
+    finish_reason = str(getattr(exc, "finish_reason", None) or "").strip()
+    reason = "Provider content policy stopped the arbitration."
+    if finish_reason:
+        reason = (
+            "Provider content policy stopped the arbitration "
+            f"(finish_reason={finish_reason})."
+        )
+    return ContentEvent(
+        phase=template.phase,
+        model=template.model,
+        layer=template.layer,
+        attempt=template.attempt,
+        content_status=ContentStatus.FILTERED,
+        reason=reason,
+        data={
+            "error_code": "content_filter",
+            "finish_reason": getattr(exc, "finish_reason", None),
+            "finish_reason_category": "content_filter",
+            "retryable": False,
+        },
+    )
 
 
 # =============================================================================
@@ -533,7 +589,7 @@ class Arbiter:
         self,
         ai_service: Any,
         model: Optional[str] = None,
-        stream_callback: Optional[callable] = None,
+        stream_callback: Optional[ContentEventSink] = None,
         debug_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
     ):
@@ -543,8 +599,12 @@ class Arbiter:
         Args:
             ai_service: AI service instance for making API calls
             model: Model to use for conflict resolution (default from config)
-            stream_callback: Optional callback for streaming AI responses.
-                             Signature: async def callback(chunk: str, model: str, operation: str)
+            stream_callback: Optional content-event sink invoked once per
+                provider chunk AS IT ARRIVES (C5). Every emission is a labelled
+                draft (``content_status="draft"``) carrying its model, the
+                ``arbitration`` layer and the provider-reported ``is_thinking``
+                flag. Verdict validation is unchanged: the arbitration payload
+                is still parsed and schema-checked before it governs anything.
             debug_event_callback: Optional pre-bound callback that persists arbitration
                 events to the debugger DB. Signature: async def cb(event_type, payload).
                 The caller is responsible for binding session_id at construction time.
@@ -557,6 +617,11 @@ class Arbiter:
         self.stream_callback = stream_callback
         self._debug_event_callback = debug_event_callback
         self._tool_event_callback = tool_event_callback
+        # One Arbiter serves every resolution of a QA run, so the attempt id of
+        # the labelled drafts is counted here: without it two consecutive
+        # arbitrations would publish under the same key and a consumer could
+        # concatenate the drafts of the second onto the first (C0.2).
+        self._stream_attempt = 0
         self._logger = __import__('logging').getLogger(__name__)
 
     @staticmethod
@@ -592,6 +657,99 @@ class Arbiter:
         if resolved_max_tokens is None:
             resolved_max_tokens = config.ARBITER_MAX_TOKENS
         return int(resolved_max_tokens), resolution
+
+    @staticmethod
+    def _resolve_escalation_model(context: ArbiterContext) -> Optional[str]:
+        """Resolve the conditional escalation model through canonical routing."""
+
+        original_request = getattr(context, "original_request", None)
+        if original_request is not None:
+            try:
+                from llm_routing import resolve_call
+
+                routed_model = resolve_call(
+                    "gransabio.escalation",
+                    request=original_request,
+                ).model
+                if routed_model:
+                    return str(routed_model)
+            except Exception:
+                # Direct/unit callers may provide a lightweight request that has
+                # not gone through route attachment. Preserve their explicit
+                # compatibility value instead of inventing another model.
+                pass
+        return context.gran_sabio_model
+
+    def _resolve_arbiter_call_id(
+        self,
+        context: ArbiterContext,
+        distribution: EditDistribution,
+        selected_model: str,
+    ) -> str:
+        """Return the exact canonical call represented by this arbitration."""
+
+        if distribution in {
+            EditDistribution.MINORITY,
+            EditDistribution.CONFLICT,
+            EditDistribution.TIE,
+        }:
+            escalation_model = self._resolve_escalation_model(context)
+            if escalation_model and selected_model == escalation_model:
+                return "gransabio.escalation"
+        return "arbiter.resolve"
+
+    def _resolve_runtime_parameters(
+        self,
+        context: ArbiterContext,
+        selected_model: str,
+        *,
+        call_id: str,
+    ) -> Tuple[int, Dict[str, Any], float, Optional[str], Optional[int]]:
+        """Resolve the parameters the selected Arbiter call will actually use."""
+
+        from config import config
+        from llm_routing import LLMRoutingError, resolve_call, resolve_temperature
+
+        try:
+            route = resolve_call(
+                call_id,
+                request=getattr(context, "original_request", None),
+            )
+        except LLMRoutingError:
+            if call_id != "gransabio.escalation":
+                raise
+            route = resolve_call(
+                "gransabio.review",
+                request=getattr(context, "original_request", None),
+            )
+        if call_id == "arbiter.resolve":
+            max_tokens, budget_resolution = self._resolve_output_max_tokens(
+                context,
+                selected_model,
+            )
+        else:
+            budget_resolution = config.resolve_output_max_tokens(
+                selected_model,
+                routed_max_tokens=(route.params or {}).get("max_tokens"),
+                configured_default=getattr(config, "ARBITER_MAX_TOKENS", None),
+                call_id=call_id,
+            )
+            resolved_max_tokens = (
+                budget_resolution.get("max_tokens")
+                if isinstance(budget_resolution, dict)
+                else None
+            )
+            if resolved_max_tokens is None:
+                resolved_max_tokens = config.ARBITER_MAX_TOKENS
+            max_tokens = int(resolved_max_tokens)
+        params = route.params or {}
+        return (
+            max_tokens,
+            budget_resolution,
+            resolve_temperature(route, default=config.ARBITER_TEMPERATURE),
+            params.get("reasoning_effort"),
+            params.get("thinking_budget_tokens"),
+        )
 
     async def _emit_debug_event(self, event_type: str, payload: Dict[str, Any]) -> None:
         """Persist an arbiter event to the debugger DB if a callback is bound."""
@@ -1209,8 +1367,9 @@ class Arbiter:
         if not history_str:
             history_str = "No previous edits in this layer."
 
-        # Use full content excerpt; context budget is enforced by the tool loop
-        # (estimate_prompt_overflow + TOOL_LOOP_MAX_PROMPT_CHARS), fail-fast if overflow.
+        # Use full content excerpt; context budget is enforced by the tool loop's
+        # universal admission guard (context_budget) with a TOOL_LOOP_MAX_PROMPT_CHARS
+        # paranoid fallback, fail-fast if overflow.
         content_excerpt = context.content_excerpt or context.current_content
 
         # Format distribution info
@@ -1279,7 +1438,8 @@ class Arbiter:
         context: ArbiterContext,
         conflicts: List[ConflictInfo],
         distribution: EditDistribution,
-        selected_model: str
+        selected_model: str,
+        call_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Call AI to analyze and decide on proposed edits.
@@ -1330,6 +1490,11 @@ class Arbiter:
         tool_loop_enabled = self._should_use_arbiter_tools(
             context.arbiter_tools_mode, selected_model
         )
+        effective_call_id = call_id or self._resolve_arbiter_call_id(
+            context,
+            distribution,
+            selected_model,
+        )
 
         try:
             if tool_loop_enabled:
@@ -1338,6 +1503,7 @@ class Arbiter:
                     prompt=prompt,
                     selected_model=selected_model,
                     prompt_safety_parts=prompt_safety_parts,
+                    call_id=effective_call_id,
                 )
             else:
                 parsed = await self._resolve_single_shot(
@@ -1345,6 +1511,7 @@ class Arbiter:
                     prompt=prompt,
                     selected_model=selected_model,
                     prompt_safety_parts=prompt_safety_parts,
+                    call_id=effective_call_id,
                 )
 
             await self._emit_debug_event(
@@ -1362,6 +1529,23 @@ class Arbiter:
             return parsed
 
         except Exception as e:
+            if is_content_filter_stop(e):
+                self._logger.warning(
+                    "Arbiter AI call stopped by provider content policy for %s",
+                    selected_model,
+                )
+                await self._emit_debug_event(
+                    "arbiter_ai_error",
+                    {
+                        "model": selected_model,
+                        "layer_name": context.layer_name,
+                        "error_code": "content_filter",
+                        "finish_reason": e.finish_reason,
+                        "finish_reason_category": "content_filter",
+                        "retryable": False,
+                    },
+                )
+                raise
             self._logger.error(f"Arbiter AI call failed: {e}")
             await self._emit_debug_event(
                 "arbiter_ai_error",
@@ -1381,6 +1565,7 @@ class Arbiter:
         prompt: str,
         selected_model: str,
         prompt_safety_parts: Optional[List[Any]],
+        call_id: str = "arbiter.resolve",
     ) -> Dict[str, Any]:
         """Dispatch the Arbiter call through ``call_ai_with_validation_tools``.
 
@@ -1420,12 +1605,23 @@ class Arbiter:
 
         max_rounds = getattr(config, "ARBITER_MAX_TOOL_ROUNDS", 2)
         arbiter_timeout = self._resolve_request_timeout(context)
-        max_tokens, _budget_resolution = self._resolve_output_max_tokens(
+        arbiter_deadline = time.monotonic() + float(arbiter_timeout)
+        (
+            max_tokens,
+            _budget_resolution,
+            temperature,
+            reasoning_effort,
+            thinking_budget_tokens,
+        ) = self._resolve_runtime_parameters(
             context,
             selected_model,
+            call_id=call_id,
         )
-
-        async def _call_with_budget(token_budget: int):
+        async def _call_with_budget(
+            token_budget: int,
+            *,
+            timeout_seconds: float,
+        ):
             return await self.ai_service.call_ai_with_validation_tools(
                 prompt=prompt,
                 model=selected_model,
@@ -1439,30 +1635,46 @@ class Arbiter:
                 max_tool_rounds=max_rounds,
                 initial_measurement_text=context.current_content,
                 tool_event_callback=self._tool_event_callback,
-                temperature=config.ARBITER_TEMPERATURE,
+                temperature=temperature,
                 max_tokens=token_budget,
                 system_prompt=ARBITER_SYSTEM_PROMPT,
+                reasoning_effort=reasoning_effort,
+                thinking_budget_tokens=thinking_budget_tokens,
                 model_alias_registry=context.model_alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
-                request_timeout=arbiter_timeout,
+                request_timeout=timeout_seconds,
                 cancellation_token=context.cancellation_token,
             )
 
-        _, envelope = await _call_with_budget(max_tokens)
+        _, envelope = await _call_with_budget(
+            max_tokens,
+            timeout_seconds=arbiter_timeout,
+        )
 
         if envelope is not None and getattr(envelope, "output_truncated", False):
-            retry_max_tokens = config.resolve_output_truncation_retry_max_tokens(
+            retry_plan = config.resolve_bounded_output_truncation_retry(
                 selected_model,
                 getattr(envelope, "max_tokens", None) or max_tokens,
+                requested_max_tokens=max_tokens,
             )
-            if retry_max_tokens is not None:
+            if isinstance(retry_plan, dict):
+                retry_max_tokens = int(retry_plan["retry_max_tokens"])
                 self._logger.warning(
                     "Arbiter tool-loop output truncated for %s at max_tokens=%s; retrying with %s",
                     selected_model,
                     getattr(envelope, "max_tokens", None) or max_tokens,
                     retry_max_tokens,
                 )
-                _, envelope = await _call_with_budget(retry_max_tokens)
+                remaining_timeout = arbiter_deadline - time.monotonic()
+                if remaining_timeout <= 0:
+                    raise asyncio.TimeoutError(
+                        "Arbiter tool-loop exceeded its process deadline before "
+                        "the truncation retry"
+                    )
+                _, envelope = await _call_with_budget(
+                    retry_max_tokens,
+                    timeout_seconds=remaining_timeout,
+                )
             if envelope is not None and getattr(envelope, "output_truncated", False):
                 raise JsonContractError(
                     "Arbiter tool-loop output truncated "
@@ -1492,29 +1704,50 @@ class Arbiter:
         prompt: str,
         selected_model: str,
         prompt_safety_parts: Optional[List[Any]],
+        call_id: str = "arbiter.resolve",
     ) -> Dict[str, Any]:
         """Legacy single-shot arbitration path (tools disabled / unsupported).
 
-        Supports streaming when ``stream_callback`` is set. Parses the final
-        JSON via :func:`tool_loop_models.parse_json_with_markdown_fences` so
-        the strip-markdown logic lives in a single utility.
+        Streams live when ``stream_callback`` is set: every provider chunk is
+        published as a labelled draft while the verdict is still being written
+        (C5), so an operator can watch the Arbiter reason and stop a runaway
+        call before paying for the whole output. Parses the final JSON via
+        :func:`tool_loop_models.parse_json_with_markdown_fences` so the
+        strip-markdown logic lives in a single utility; that parse still owns
+        canonicity, and nothing the stream showed can become the verdict.
         """
-        from config import config
-        from tool_loop_models import JsonContractError, parse_json_with_markdown_fences
+        from tool_loop_models import parse_json_with_markdown_fences
 
         arbiter_timeout = self._resolve_request_timeout(context)
-        max_tokens, _budget_resolution = self._resolve_output_max_tokens(
+        (
+            max_tokens,
+            _budget_resolution,
+            temperature,
+            reasoning_effort,
+            thinking_budget_tokens,
+        ) = self._resolve_runtime_parameters(
             context,
             selected_model,
+            call_id=call_id,
         )
         response_content = ""
         if self.stream_callback:
+            streamed_labelled_chunk = False
+            self._stream_attempt += 1
+            chunk_template = ContentEventTemplate(
+                phase=ContentPhase.ARBITER,
+                model=selected_model,
+                layer=_ARBITER_STREAM_LAYER,
+                attempt=self._stream_attempt,
+            )
             async for chunk in self.ai_service.generate_content_stream(
                 prompt=prompt,
                 model=selected_model,
                 system_prompt=ARBITER_SYSTEM_PROMPT,
                 max_tokens=max_tokens,
-                temperature=config.ARBITER_TEMPERATURE,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                thinking_budget_tokens=thinking_budget_tokens,
                 json_output=True,
                 json_schema=ARBITER_RESPONSE_SCHEMA,
                 model_alias_registry=context.model_alias_registry,
@@ -1531,24 +1764,66 @@ class Arbiter:
                     is_thinking = False
                     metadata = {}
 
-                if metadata.get("output_truncated"):
-                    raise JsonContractError(
-                        "Arbiter streaming response was truncated "
-                        f"(finish_reason={metadata.get('finish_reason')} "
-                        f"max_tokens={metadata.get('max_tokens') or max_tokens})."
+                if chunk_text and not is_thinking:
+                    response_content += chunk_text
+                if chunk_text:
+                    # Live labelled emission (C5/C8): the verdict has not been
+                    # validated yet, so this is a draft. Thinking keeps its own
+                    # subphase and comes from the provider adapter - it is
+                    # never inferred from the text.
+                    streamed_labelled_chunk = True
+                    await self.stream_callback(
+                        chunk_template.chunk(
+                            chunk_text,
+                            is_thinking=is_thinking,
+                            subphase=(
+                                ContentSubphase.THINKING
+                                if is_thinking
+                                else ContentSubphase.DRAFT_STREAM
+                            ),
+                        )
                     )
 
-                if chunk_text:
-                    if not is_thinking:
-                        response_content += chunk_text
-                    await self.stream_callback(chunk_text, selected_model, "arbitration")
+                if metadata:
+                    try:
+                        AIService._raise_if_generation_stopped_unusably(
+                            response_content,
+                            metadata,
+                            provider=str(metadata.get("provider") or "unknown"),
+                            model_id=selected_model,
+                            max_tokens=metadata.get("max_tokens") or max_tokens,
+                        )
+                    except Exception as stop:
+                        if is_content_filter_stop(stop) and streamed_labelled_chunk:
+                            try:
+                                await self.stream_callback(
+                                    _arbiter_content_filter_terminal_event(
+                                        chunk_template,
+                                        stop,
+                                    )
+                                )
+                            except Exception:
+                                # The terminal stop below is what the pipeline
+                                # must classify; a failing telemetry sink would
+                                # replace it and lose the content_filter
+                                # category. Log the dropped verdict and keep
+                                # the real failure.
+                                self._logger.warning(
+                                    "Failed to publish the Arbiter content-filter "
+                                    "verdict for model %s",
+                                    selected_model,
+                                    exc_info=True,
+                                )
+                        raise
         else:
             response_content = await self.ai_service.generate_content(
                 prompt=prompt,
                 model=selected_model,
                 system_prompt=ARBITER_SYSTEM_PROMPT,
                 max_tokens=max_tokens,
-                temperature=config.ARBITER_TEMPERATURE,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                thinking_budget_tokens=thinking_budget_tokens,
                 json_output=True,
                 json_schema=ARBITER_RESPONSE_SCHEMA,
                 model_alias_registry=context.model_alias_registry,
@@ -1557,11 +1832,12 @@ class Arbiter:
                 cancellation_token=context.cancellation_token,
             )
 
-        return parse_json_with_markdown_fences(
+        parsed = parse_json_with_markdown_fences(
             response_content,
             schema=ARBITER_RESPONSE_SCHEMA,
             context="Arbiter response",
         )
+        return parsed
 
     def _parse_arbiter_response(
         self,
@@ -1663,14 +1939,15 @@ class Arbiter:
             )
 
         # Map each proposed edit index to the resolved conflict (if any) -------
+        edit_index_by_id = {id(pe): i for i, pe in enumerate(proposed_edits)}
         edit_to_conflict: Dict[int, ConflictInfo] = {}
         for conflict in conflicts:
             for pe in conflict.involved_edits:
-                try:
-                    idx = proposed_edits.index(pe)
+                # Map by identity: structurally equal ProposedEdit instances
+                # must not collapse onto the first matching index (ORQ-08).
+                idx = edit_index_by_id.get(id(pe))
+                if idx is not None:
                     edit_to_conflict[idx] = conflict
-                except ValueError:
-                    pass
 
         decisions: List[ArbiterEditDecision] = []
         for i, pe in enumerate(proposed_edits):
@@ -1704,14 +1981,15 @@ class Arbiter:
         applied — the QA feedback still exists but the batch cannot be
         arbitrated safely.
         """
+        edit_index_by_id = {id(pe): i for i, pe in enumerate(proposed_edits)}
         edit_to_conflict: Dict[int, ConflictInfo] = {}
         for conflict in conflicts:
             for pe in conflict.involved_edits:
-                try:
-                    idx = proposed_edits.index(pe)
+                # Map by identity: structurally equal ProposedEdit instances
+                # must not collapse onto the first matching index (ORQ-08).
+                idx = edit_index_by_id.get(id(pe))
+                if idx is not None:
                     edit_to_conflict[idx] = conflict
-                except ValueError:
-                    pass
 
         return [
             ArbiterEditDecision(
@@ -1815,7 +2093,8 @@ class Arbiter:
 
         # Select model based on distribution
         selected_model, escalated = self._select_model_for_distribution(
-            distribution, context.gran_sabio_model
+            distribution,
+            self._resolve_escalation_model(context),
         )
 
         self._logger.info(
@@ -1825,7 +2104,17 @@ class Arbiter:
 
         # ALWAYS call AI to verify edits (no passthrough, no fallback)
         self._logger.info(f"Verifying {len(proposed_edits)} edit(s) with AI ({selected_model})...")
-        ai_response = await self._resolve_with_ai(context, conflicts, distribution, selected_model)
+        ai_response = await self._resolve_with_ai(
+            context,
+            conflicts,
+            distribution,
+            selected_model,
+            call_id=(
+                "gransabio.escalation"
+                if escalated
+                else "arbiter.resolve"
+            ),
+        )
 
         ai_decisions = ai_response.get("decisions")
         if ai_decisions is None:

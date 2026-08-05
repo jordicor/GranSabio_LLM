@@ -244,6 +244,18 @@
     .health-pill.unavailable { background: var(--bg-secondary); color: var(--text-muted); }
     .health-source { color: var(--text-muted); }
 
+    /* ── Context capacity badges ───────────── */
+    .badge-context-suspect,
+    .badge-context-stale,
+    .badge-context-curated {
+      display: inline-flex; align-items: center; margin-left: 8px;
+      padding: 2px 7px; border-radius: 999px; font-size: .68rem; font-weight: 600;
+      vertical-align: middle;
+    }
+    .badge-context-suspect { background: var(--error-bg); color: var(--error); }
+    .badge-context-stale { background: var(--warning-bg); color: var(--warning); }
+    .badge-context-curated { background: var(--success-bg); color: var(--success); }
+
     /* ── Modal ──────────────────────────────── */
     .modal-overlay {
       position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 1000;
@@ -462,6 +474,7 @@
       providers: {{ supported_providers | tojson }}
     };
   </script>
+  <script src="/static/js/escape_utils.js"></script>
   <script src="/static/js/models_admin.js?v={{ models_admin_asset_version }}"></script>
 </body>
 </html>

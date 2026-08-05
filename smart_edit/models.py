@@ -27,9 +27,66 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from pydantic import AliasChoices, BaseModel, Field
+
+try:  # Python 3.11+
+    from re import _parser as _re_parser
+except ImportError:  # pragma: no cover - Python <= 3.10 fallback
+    import sre_parse as _re_parser
+
+
+def _iter_subpatterns(value: Any) -> Iterable[Any]:
+    """Yield SubPattern objects nested inside a parsed-regex token argument."""
+    if isinstance(value, _re_parser.SubPattern):
+        yield value
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_subpatterns(item)
+
+
+def _has_nested_repeat(tokens: list, inside_repeat: bool) -> bool:
+    """Recursively detect a variable-width quantifier inside another quantifier."""
+    for op, arg in tokens:
+        if op in (_re_parser.MAX_REPEAT, _re_parser.MIN_REPEAT):
+            min_repeat, max_repeat, subpattern = arg
+            variable = (
+                max_repeat == _re_parser.MAXREPEAT or max_repeat != min_repeat
+            )
+            if inside_repeat and variable:
+                return True
+            if _has_nested_repeat(subpattern.data, inside_repeat or variable):
+                return True
+        else:
+            for subpattern in _iter_subpatterns(arg):
+                if _has_nested_repeat(subpattern.data, inside_repeat):
+                    return True
+    return False
+
+
+def regex_has_nested_quantifiers(pattern: str) -> bool:
+    """
+    Detect variable-width quantifiers nested inside another quantifier.
+
+    Patterns like ``(a+)+`` or ``(\\w+\\s?)+$`` cause catastrophic backtracking
+    in the stdlib ``re`` engine and can freeze the whole event loop when they
+    come from user input (ReDoS, AUX-02). Fixed-width inner repeats such as
+    ``(\\d{4})+`` are safe and allowed.
+
+    Args:
+        pattern: Regular expression source to inspect
+
+    Returns:
+        True if the pattern must be rejected, False otherwise (including
+        syntactically invalid patterns, which re.compile() will reject later)
+    """
+    try:
+        parsed = _re_parser.parse(pattern)
+    except Exception:
+        # Not a safety concern: re.compile() raises the syntax error later.
+        return False
+    return _has_nested_repeat(parsed.data, inside_repeat=False)
 
 
 class OperationType(str, Enum):
@@ -148,6 +205,14 @@ class TextTarget:
             if not isinstance(self.value, str) or not self.value:
                 raise ValueError(
                     f"{self.mode.value.upper()} mode requires a non-empty string"
+                )
+            if self.mode == TargetMode.REGEX and regex_has_nested_quantifiers(
+                self.value
+            ):
+                raise ValueError(
+                    "REGEX pattern rejected: quantifiers nested inside another "
+                    "quantifier (e.g. '(a+)+') can cause catastrophic "
+                    "backtracking"
                 )
         elif self.mode == TargetMode.POSITION:
             if not isinstance(self.value, (tuple, list)) or len(self.value) != 2:

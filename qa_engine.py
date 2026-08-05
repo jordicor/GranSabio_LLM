@@ -29,8 +29,10 @@ if TYPE_CHECKING:
     from logging_utils import PhaseLogger
     from models import ImageData
 
-from ai_service import AIRequestError, AIService, get_ai_service
+import context_budget
+from ai_service import AIRequestError, AIService, get_ai_service, is_content_filter_stop
 from config import EDITABLE_CONTENT_TYPES, config
+from context_budget import ContextAdmissionError
 from evidence_grounding import GroundingEngine, get_effective_order
 from gran_sabio import GranSabioInvocationError, GranSabioProcessCancelled
 from model_aliasing import ModelAliasRegistry, get_evaluator_alias
@@ -42,9 +44,12 @@ from qa_result_utils import (
     build_qa_counts,
     is_technical_qa_failure,
     normalize_qa_technical_failure_metadata,
+    resolve_effective_required_valid,
+    resolve_min_valid_quorum_overrides,
     semantic_deal_breakers,
 )
 from qa_scheduler import (
+    QAEvaluationLifecycleEvent,
     QAScheduler,
     QASchedulerPolicy,
     QASchedulerResult,
@@ -68,6 +73,13 @@ class QAModelUnavailableError(RuntimeError):
 
 CancelCallback = Optional[Callable[[], Awaitable[bool]]]
 
+# Single QA stream channel. It carries three payload types, each recognised by
+# its own type by the consumer:
+#   * ``ContentEvent``                - live labelled QA content chunk (C4/C0).
+#   * ``QAEvaluationLifecycleEvent``  - evaluator dispatched / finished (C10).
+#   * ``dict``                        - structured evidence-grounding telemetry.
+QAStreamSink = Callable[[Any], Awaitable[None]]
+
 
 @asynccontextmanager
 async def _noop_async_context():
@@ -85,6 +97,43 @@ def _qa_model_result_key(
     if alias_registry and qa_model_names.count(model_name) > 1:
         return alias_registry.qa_slot_id(index)
     return model_name
+
+
+def qa_evaluation_key(layer_name: str, result_key: str) -> str:
+    """Build the idempotency key of one QA evaluation (layer + evaluator)."""
+
+    return f"{layer_name}::{result_key}"
+
+
+async def _emit_qa_evaluation_lifecycle(
+    stream_callback: Optional[QAStreamSink],
+    *,
+    layer_name: str,
+    model_name: str,
+    evaluation_key: str,
+    dispatched: bool,
+) -> None:
+    """Report a QA dispatch/finish through the QA stream channel.
+
+    The QA progress counter lives in the session, which this engine does not
+    own; the consumer that already receives the QA stream translates these
+    notifications into progress. Reporting is telemetry, never control flow:
+    a broken consumer must not abort an evaluation, so ordinary exceptions
+    are logged and swallowed (cancellation still propagates).
+    """
+    if stream_callback is None:
+        return
+    try:
+        await stream_callback(
+            QAEvaluationLifecycleEvent(
+                layer_name=layer_name,
+                model_name=model_name,
+                evaluation_key=evaluation_key,
+                dispatched=dispatched,
+            )
+        )
+    except Exception:
+        logger.debug("Failed to emit QA evaluation lifecycle event.", exc_info=True)
 
 
 def _attach_evaluator_identity(
@@ -345,7 +394,7 @@ class QAEngine:
         model: Any,  # Can be str or QAModelConfig
         original_request: Optional[Any] = None,
         extra_verbose: bool = False,
-        stream_callback: Optional[callable] = None,
+        stream_callback: Optional[QAStreamSink] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         request_edit_info: bool = True,
         phase_logger: Optional["PhaseLogger"] = None,
@@ -480,7 +529,7 @@ class QAEngine:
         context: str,
         grounding_config: EvidenceGroundingConfig,
         progress_callback: Optional[Callable] = None,
-        stream_callback: Optional[Callable] = None,
+        stream_callback: Optional[QAStreamSink] = None,
         usage_tracker: Optional[UsageTracker] = None,
         extra_verbose: bool = False,
         phase_logger: Optional["PhaseLogger"] = None,
@@ -539,7 +588,25 @@ class QAEngine:
         #   - passed=True -> 10.0
         #   - passed=False with warn -> 5.0 (contributes to average but not deal_breaker)
         #   - passed=False with deal_breaker/regenerate -> 0.0
-        if grounding_result.passed:
+        # A degraded result (verification could not run) is never presented as
+        # a real pass: fail-closed for deal_breaker/regenerate, visible warning
+        # for warn (the grounding engine already applied the on_flag policy to
+        # passed/triggered_action; here we surface it in score and feedback).
+        if grounding_result.degraded:
+            error_detail = grounding_result.verification_error or "unknown verification error"
+            if grounding_result.triggered_action in ("deal_breaker", "regenerate"):
+                score = 0.0
+                feedback = (
+                    f"Evidence grounding FAILED: verification could not run ({error_detail}). "
+                    f"Treated as '{grounding_result.triggered_action}' per on_flag policy."
+                )
+            else:
+                score = 5.0
+                feedback = (
+                    f"Evidence grounding DEGRADED: verification could not run ({error_detail}). "
+                    "Content was not verified; delivered unverified under on_flag='warn'."
+                )
+        elif grounding_result.passed:
             score = 10.0
             feedback = (
                 f"Evidence grounding PASSED. Verified {grounding_result.claims_verified} claims, "
@@ -563,6 +630,15 @@ class QAEngine:
             not grounding_result.passed and
             grounding_result.triggered_action in ("deal_breaker", "regenerate")
         )
+        deal_breaker_reason = None
+        if is_deal_breaker:
+            if grounding_result.degraded:
+                deal_breaker_reason = (
+                    f"Verification could not run: "
+                    f"{grounding_result.verification_error or 'unknown verification error'}"
+                )
+            else:
+                deal_breaker_reason = f"{grounding_result.flagged_claims} claims lack evidence grounding"
 
         qa_evaluation = QAEvaluation(
             model="evidence_grounding_logprobs",
@@ -570,10 +646,7 @@ class QAEngine:
             score=score,
             feedback=feedback,
             deal_breaker=is_deal_breaker,
-            deal_breaker_reason=(
-                f"{grounding_result.flagged_claims} claims lack evidence grounding"
-                if is_deal_breaker else None
-            ),
+            deal_breaker_reason=deal_breaker_reason,
             passes_score=grounding_result.passed,
             metadata={
                 "grounding_result": grounding_result.model_dump(),
@@ -608,14 +681,13 @@ class QAEngine:
         qa_models: List[Any],  # Can be List[str] or List[QAModelConfig]
         progress_callback: Optional[callable] = None,
         original_request: Optional[Any] = None,
-        stream_callback: Optional[callable] = None,
+        stream_callback: Optional[QAStreamSink] = None,
         gran_sabio_engine: Optional[Any] = None,
         session_id: Optional[str] = None,
         cancel_callback: CancelCallback = None,
         usage_tracker: Optional[UsageTracker] = None,
         iteration: Optional[int] = None,
         phase_logger: Optional["PhaseLogger"] = None,
-        gran_sabio_stream_callback: Optional[callable] = None,
         marker_mode: str = "phrase",
         marker_length: Optional[int] = None,
         word_map_formatted: Optional[str] = None,
@@ -682,6 +754,10 @@ class QAEngine:
         results: Dict[str, Dict[str, QAEvaluation]] = {}
         extra_verbose = getattr(original_request, 'extra_verbose', False) if original_request else False
         cancellation_token = getattr(original_request, "_cancellation_token", None) if original_request else None
+        # Use the same valid-quorum the scheduler applied when admitting each
+        # layer, so deal-breaker recomputation never falls back to a stricter
+        # default the layer did not actually run under.
+        effective_required_valid = resolve_effective_required_valid(original_request, len(qa_models))
 
         async def _abort_if_cancelled(message: str) -> None:
             if cancel_callback and await cancel_callback():
@@ -794,7 +870,11 @@ class QAEngine:
             deal_breakers = semantic_deal_breakers(layer_results)
 
             if deal_breakers:
-                consensus_counts = build_qa_counts(layer_results, len(qa_model_names))
+                consensus_counts = build_qa_counts(
+                    layer_results,
+                    len(qa_model_names),
+                    required_valid=effective_required_valid,
+                )
                 total_models = consensus_counts["valid"]
                 deal_breaker_count = len(deal_breakers)
 
@@ -916,7 +996,6 @@ class QAEngine:
                                 content=content,
                                 minority_deal_breakers=minority_data,
                                 original_request=original_request,
-                                stream_callback=gran_sabio_stream_callback,
                                 cancel_callback=cancel_callback
                             )
 
@@ -990,28 +1069,15 @@ class QAEngine:
                                             f"{override['previous_score']} -> {override['effective_score']}"
                                         )
 
-                                # Check if Gran Sabio provided modified content
-                                gs_modified_content = getattr(gs_result, "final_content", None)
-                                gs_modifications_made = getattr(gs_result, "modifications_made", False)
-
-                                if gs_modifications_made and gs_modified_content and gs_modified_content.strip():
-                                    logger.info(
-                                        f"Gran Sabio approved with modifications in {layer.name}. Content will be re-evaluated."
-                                    )
-                                    if progress_callback:
-                                        await progress_callback(f"Gran Sabio approved {layer.name} with modifications. Re-evaluating...")
-
-                                    # Return special result to trigger re-evaluation with modified content
-                                    results[layer.name] = layer_results
-                                    return self._create_gran_sabio_modified_result(
-                                        partial_results=results,
-                                        modified_content=gs_modified_content,
-                                        reason=gs_result.reason,
-                                        score=gs_result.final_score
-                                    )
-                                else:
-                                    if progress_callback:
-                                        await progress_callback(f"Gran Sabio reviewed {layer.name}: False positive. Continuing...")
+                                # NOTE: a Gran Sabio approval may still carry
+                                # `modifications_made`/`final_content`. The old
+                                # "approved with modifications" re-evaluation
+                                # contract was removed (dead, contradictory
+                                # branch): minority adjudication lives in
+                                # generation_processor, so evaluation continues
+                                # with the original content as a false positive.
+                                if progress_callback:
+                                    await progress_callback(f"Gran Sabio reviewed {layer.name}: False positive. Continuing...")
 
                         except GranSabioProcessCancelled:
                             if not escalation_completed:
@@ -1057,13 +1123,12 @@ class QAEngine:
         qa_models: List[Any],
         progress_callback: Optional[callable] = None,
         original_request: Optional[Any] = None,
-        stream_callback: Optional[callable] = None,
+        stream_callback: Optional[QAStreamSink] = None,
         gran_sabio_engine: Optional[Any] = None,
         session_id: Optional[str] = None,
         cancel_callback: CancelCallback = None,
         usage_tracker: Optional[UsageTracker] = None,
         iteration: Optional[int] = None,
-        gran_sabio_stream_callback: Optional[callable] = None,
         marker_mode: str = "phrase",
         marker_length: Optional[int] = None,
         word_map_formatted: Optional[str] = None,
@@ -1112,7 +1177,6 @@ class QAEngine:
             cancel_callback,
             usage_tracker=usage_tracker,
             iteration=iteration,
-            gran_sabio_stream_callback=gran_sabio_stream_callback,
             marker_mode=marker_mode,
             marker_length=marker_length,
             word_map_formatted=word_map_formatted,
@@ -1292,7 +1356,7 @@ Source QA layers:
         strategy: str,
         progress_callback: Optional[callable] = None,
         original_request: Optional[Any] = None,
-        stream_callback: Optional[callable] = None,
+        stream_callback: Optional[QAStreamSink] = None,
         session_id: Optional[str] = None,
         cancel_callback: CancelCallback = None,
         usage_tracker: Optional[UsageTracker] = None,
@@ -1407,7 +1471,18 @@ Source QA layers:
                         return await evaluate_grounding()
                     return await evaluate_layer(payload)
 
-            item_results = await asyncio.gather(*(run_item(item) for item in execution_items))
+            item_tasks = [asyncio.create_task(run_item(item)) for item in execution_items]
+            try:
+                item_results = await asyncio.gather(*item_tasks)
+            except BaseException:
+                # gather does not cancel siblings on a first raise; stop the
+                # remaining layer/grounding tasks so they do not keep burning
+                # paid API calls after the verification has already aborted.
+                for task in item_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*item_tasks, return_exceptions=True)
+                raise
         else:
             item_results = []
             for item_type, payload in execution_items:
@@ -1674,20 +1749,7 @@ Source QA layers:
             request_timeout_retries = getattr(config, "MAX_QA_TIMEOUT_RETRIES", 2)
         timeout_retries = max(0, int(request_timeout_retries or 0))
         provider_failure_retries = max(0, int(getattr(config, "MAX_QA_PROVIDER_RETRIES", 1) or 0))
-        min_valid_models = (
-            getattr(original_request, "min_valid_qa_models", None)
-            if original_request
-            else None
-        )
-        if not isinstance(min_valid_models, int):
-            min_valid_models = None
-        min_valid_ratio = (
-            getattr(original_request, "min_valid_qa_model_ratio", None)
-            if original_request
-            else None
-        )
-        if not isinstance(min_valid_ratio, (int, float)):
-            min_valid_ratio = None
+        min_valid_models, min_valid_ratio = resolve_min_valid_quorum_overrides(original_request)
         execution_mode = getattr(original_request, "qa_execution_mode", "auto") if original_request else "auto"
         if execution_mode not in {"auto", "sequential", "parallel", "progressive_quorum"}:
             execution_mode = "auto"
@@ -1729,7 +1791,7 @@ Source QA layers:
         qa_model_names: List[str],
         progress_callback: Optional[Callable] = None,
         original_request: Optional[Any] = None,
-        stream_callback: Optional[Callable] = None,
+        stream_callback: Optional[QAStreamSink] = None,
         session_id: Optional[str] = None,
         cancel_callback: Optional[Callable[[], Awaitable[bool]]] = None,
         usage_tracker: Optional[UsageTracker] = None,
@@ -2034,7 +2096,22 @@ Source QA layers:
                     metadata=metadata,
                     original_exception=timeout_error,
                 ) from timeout_error
+            except ContextAdmissionError:
+                # A context-admission error (local budget overflow, capacity
+                # unknown, or a provider-reported overflow) is NEVER a quorum-
+                # absorbable technical failure. Re-raise BEFORE the generic
+                # handler so the scheduler aborts the whole layer and cancels
+                # in-flight sibling slots instead of manufacturing a placeholder.
+                raise
             except Exception as exc:
+                if is_content_filter_stop(exc):
+                    logger.warning(
+                        "QA evaluation stopped by provider content policy for %s "
+                        "on layer %s",
+                        slot.model_name,
+                        layer.name,
+                    )
+                    raise
                 logger.error(
                     "Evaluation failed for %s with %s: %s",
                     layer.name,
@@ -2099,6 +2176,49 @@ Source QA layers:
             )
             return evaluation
 
+        # --- Barrier 2: atomic QA fan-out admission (strict_all) ---
+        # Runs BEFORE any evaluator is dispatched. If any receptor cannot be
+        # admitted, this raises FanoutAdmissionError (a ContextAdmissionError)
+        # and ZERO evaluators are queried. In observe mode it only logs.
+        await self._admit_qa_fanout(
+            content=content,
+            layer=layer,
+            slots=slots,
+            original_request=original_request,
+            request_edit_info=request_edit_info,
+            marker_mode=marker_mode,
+            marker_length=marker_length,
+            word_map_formatted=word_map_formatted,
+            draft_map_formatted=draft_map_formatted,
+            input_images=input_images,
+            edit_history=edit_history,
+            model_alias_registry=model_alias_registry,
+        )
+
+        async def on_evaluation_dispatched(
+            slot: QASchedulerSlot,
+            evaluated_layer: str,
+        ) -> None:
+            await _emit_qa_evaluation_lifecycle(
+                stream_callback,
+                layer_name=evaluated_layer,
+                model_name=slot.model_name,
+                evaluation_key=qa_evaluation_key(evaluated_layer, slot.result_key),
+                dispatched=True,
+            )
+
+        async def on_evaluation_finished(
+            slot: QASchedulerSlot,
+            evaluated_layer: str,
+        ) -> None:
+            await _emit_qa_evaluation_lifecycle(
+                stream_callback,
+                layer_name=evaluated_layer,
+                model_name=slot.model_name,
+                evaluation_key=qa_evaluation_key(evaluated_layer, slot.result_key),
+                dispatched=False,
+            )
+
         scheduler = QAScheduler(scheduler_policy)
         try:
             scheduler_result = await scheduler.evaluate_layer(
@@ -2109,6 +2229,8 @@ Source QA layers:
                 ),
                 slots=slots,
                 evaluate_slot=evaluate_slot,
+                on_evaluation_dispatched=on_evaluation_dispatched,
+                on_evaluation_finished=on_evaluation_finished,
             )
             self._record_technical_failures_for_supervisor(
                 session_id=session_id,
@@ -2124,6 +2246,189 @@ Source QA layers:
                     f"QA model {model_name} returned invalid JSON response for layer {layer.name}"
                 ) from unavailable.original_exception
             raise QAModelUnavailableError(str(unavailable)) from unavailable.original_exception
+
+    async def _admit_qa_fanout(
+        self,
+        *,
+        content: str,
+        layer: QALayer,
+        slots: List[QASchedulerSlot],
+        original_request: Optional[Any],
+        request_edit_info: bool,
+        marker_mode: str,
+        marker_length: Optional[int],
+        word_map_formatted: Optional[str],
+        draft_map_formatted: Optional[str],
+        input_images: Optional[List["ImageData"]],
+        edit_history: Optional[str],
+        model_alias_registry: Optional[ModelAliasRegistry],
+    ) -> None:
+        """Atomic strict_all context admission for one QA layer's evaluators.
+
+        Renders the REAL QA payload once (single source via
+        ``render_qa_evaluation_prompt``), builds one ``RenderedCallBudget`` per
+        evaluator (per-model output reserve + thinking + provider + optional
+        vision-image tokens), and runs the strict_all fan-out. In enforce mode a
+        single non-admittable receptor raises ``FanoutAdmissionError`` BEFORE any
+        evaluator is dispatched; in observe mode it only logs and proceeds. A
+        tolerated unverified capacity never breaks the fan-out: it is admitted
+        with a warning in both modes.
+        """
+        if not slots:
+            return
+
+        from models import QAModelConfig
+
+        # Images that a vision-capable evaluator would actually receive.
+        layer_images = (
+            input_images
+            if (input_images and getattr(layer, "include_input_images", False))
+            else None
+        )
+
+        # Render the shared QA text payload once. The image note is included when
+        # the layer carries images (a small, constant overhead); the real
+        # per-image token cost is added per vision-capable evaluator below.
+        rendered = QAEvaluationService.render_qa_evaluation_prompt(
+            content=content,
+            criteria=layer.criteria,
+            layer_name=layer.name,
+            min_score=layer.min_score,
+            deal_breaker_criteria=getattr(layer, "deal_breaker_criteria", None),
+            concise_on_pass=getattr(layer, "concise_on_pass", True),
+            original_request=original_request,
+            request_edit_info=request_edit_info,
+            marker_mode=marker_mode,
+            marker_length=marker_length,
+            word_map_formatted=word_map_formatted,
+            draft_map_formatted=draft_map_formatted,
+            input_images=layer_images,
+            edit_history=edit_history,
+        )
+
+        image_tokens = 0
+        if layer_images:
+            image_tokens = sum(
+                int(getattr(img, "estimated_tokens", 0) or 0) for img in layer_images
+            )
+
+        def _provider_for(model_name: str) -> str:
+            try:
+                info = config.get_model_info(model_name)
+                provider = info.get("provider") if isinstance(info, dict) else None
+                return str(provider) if provider else ""
+            except Exception:
+                return ""
+
+        def _model_supports_vision(model_name: str) -> bool:
+            try:
+                info = config.get_model_info(model_name)
+                caps = info.get("capabilities", []) if isinstance(info, dict) else []
+                return "vision" in [c.lower() for c in caps if isinstance(c, str)]
+            except Exception:
+                return False
+
+        # Mirror rule (D12): a client-named evaluator is labeled with its exact
+        # model identifier; a routing-chosen evaluator gets a positional alias.
+        # The route stashes the authoritative pre-routing flag; tests/direct
+        # callers fall back to the request's own model_fields_set.
+        client_named = getattr(original_request, "_client_named_qa_models", None)
+        if client_named is None:
+            fields = (
+                getattr(original_request, "model_fields_set", None)
+                or getattr(original_request, "__fields_set__", None)
+                or set()
+            )
+            client_named = "qa_models" in fields
+
+        budgets: List[context_budget.RenderedCallBudget] = []
+        labels: List[str] = []
+        for slot in slots:
+            model_name = slot.model_name
+            model_config = (
+                slot.model
+                if isinstance(slot.model, QAModelConfig)
+                else QAModelConfig(model=model_name)
+            )
+            provider = _provider_for(model_name)
+            reserved_output = config.resolve_qa_max_tokens(
+                model_name, model_config.max_tokens
+            ) or 0
+            thinking = int(getattr(model_config, "thinking_budget_tokens", None) or 0)
+
+            components = [
+                context_budget.make_payload_component(
+                    "qa_system_prompt", rendered.system_prompt, "system", provider, model_name
+                ),
+                context_budget.make_payload_component(
+                    "qa_evaluation_prompt",
+                    rendered.evaluation_prompt,
+                    "message",
+                    provider,
+                    model_name,
+                ),
+            ]
+            if image_tokens and _model_supports_vision(model_name):
+                components.append(
+                    context_budget.PayloadComponent(
+                        name="qa_input_images",
+                        chars=0,
+                        tokens_estimate=image_tokens,
+                        kind="image",
+                    )
+                )
+
+            budgets.append(
+                context_budget.RenderedCallBudget(
+                    provider=provider,
+                    model=model_name,
+                    call_id="qa.evaluate_layer",
+                    components=components,
+                    reserved_output_tokens=int(reserved_output),
+                    thinking_budget_tokens=thinking,
+                    content_type_hint="prose",
+                )
+            )
+
+            if client_named:
+                labels.append(model_name)
+            elif model_alias_registry is not None:
+                labels.append(model_alias_registry.qa_alias(slot.index))
+            else:
+                labels.append(f"Evaluator {slot.index + 1}")
+
+        native_counter = getattr(self.ai_service, "_native_token_count", None)
+        reports = await context_budget.evaluate_fanout_admission(
+            budgets,
+            policy="strict_all",
+            native_counter=native_counter,
+            public_labels=labels,
+        )
+
+        # Reached in observe mode for a non-admittable receptor (enforce raises
+        # before returning) and in BOTH modes for a tolerated unverified
+        # capacity, which is admitted with a warning and never raises. Surface
+        # every receptor that did not cleanly fit so the drift is not silent.
+        non_fitting = [
+            (label, report)
+            for label, report in zip(labels, reports)
+            if report.decision
+            in (
+                context_budget.AdmissionDecision.OVERFLOW,
+                context_budget.AdmissionDecision.CAPACITY_UNKNOWN,
+                context_budget.AdmissionDecision.CAPACITY_UNKNOWN_TOLERATED,
+            )
+        ]
+        if non_fitting:
+            logger.warning(
+                "QA fan-out admission: layer %s has %d receptor(s) that did not "
+                "cleanly fit: %s",
+                layer.name,
+                len(non_fitting),
+                ", ".join(
+                    f"{label}={report.decision.value}" for label, report in non_fitting
+                ),
+            )
 
     def _record_technical_failures_for_supervisor(
         self,
@@ -2168,7 +2473,7 @@ Source QA layers:
         qa_model_names: List[str],
         progress_callback: Optional[Callable] = None,
         original_request: Optional[Any] = None,
-        stream_callback: Optional[Callable] = None,
+        stream_callback: Optional[QAStreamSink] = None,
         session_id: Optional[str] = None,
         cancel_callback: Optional[Callable[[], Awaitable[bool]]] = None,
         usage_tracker: Optional[UsageTracker] = None,
@@ -2273,6 +2578,24 @@ Source QA layers:
                     _attach_evaluator_identity(evaluation, model_name, index, model_alias_registry)
                     result_key = _qa_model_result_key(model_name, index, qa_model_names, model_alias_registry)
                     layer_results[result_key] = evaluation
+                    # An algorithmic bypass never reaches the scheduler and
+                    # never streams a chunk, but it IS one of the evaluations
+                    # the configured total counts.
+                    evaluation_key = qa_evaluation_key(layer.name, result_key)
+                    await _emit_qa_evaluation_lifecycle(
+                        stream_callback,
+                        layer_name=layer.name,
+                        model_name=model_name,
+                        evaluation_key=evaluation_key,
+                        dispatched=True,
+                    )
+                    await _emit_qa_evaluation_lifecycle(
+                        stream_callback,
+                        layer_name=layer.name,
+                        model_name=model_name,
+                        evaluation_key=evaluation_key,
+                        dispatched=False,
+                    )
                 logger.info(f"Layer {layer.name} evaluated algorithmically with bypass engine")
 
                 first_evaluation = next(iter(bypass_results.values()))
@@ -2379,51 +2702,6 @@ Source QA layers:
                 }
             ],
             "consensus_info": consensus_info,
-            "layer_statistics": {},
-            "model_statistics": {},
-            "evaluation_metadata": {
-                "start_time": datetime.now().isoformat(),
-                "end_time": datetime.now().isoformat(),
-                "duration_seconds": 0.0,
-                "total_evaluations": total_evals
-            }
-        }
-
-    def _create_gran_sabio_modified_result(
-        self,
-        partial_results: Dict[str, Any],
-        modified_content: str,
-        reason: str,
-        score: float
-    ) -> Dict[str, Any]:
-        """Create result structure when Gran Sabio approved with modifications."""
-
-        all_scores = []
-        total_evals = 0
-
-        for layer_results in partial_results.values():
-            for evaluation in layer_results.values():
-                if hasattr(evaluation, 'score') and evaluation.score is not None:
-                    all_scores.append(evaluation.score)
-                    total_evals += 1
-
-        return {
-            "qa_results": partial_results,
-            "summary": {
-                "average_score": sum(all_scores) / len(all_scores) if all_scores else 0.0,
-                "min_score": min(all_scores) if all_scores else 0.0,
-                "max_score": max(all_scores) if all_scores else 0.0,
-                "total_evaluations": total_evals,
-                "deal_breakers_count": 0,
-                "has_deal_breakers": False,
-                "force_iteration": True,  # Force re-evaluation with new content
-                "stop_reason": "gran_sabio_approved_with_modifications",
-                "gran_sabio_modified": True,
-            },
-            "gran_sabio_modified_content": modified_content,
-            "gran_sabio_modification_reason": reason,
-            "gran_sabio_score": score,
-            "critical_issues": [],
             "layer_statistics": {},
             "model_statistics": {},
             "evaluation_metadata": {

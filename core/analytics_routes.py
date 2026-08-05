@@ -5,6 +5,7 @@ Analytics, documentation, and auxiliary API routes.
 from __future__ import annotations
 
 from datetime import datetime
+from uuid import uuid4
 
 from fastapi import Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -88,11 +89,12 @@ async def get_analytics():
             status_code=200
         )
 
-    except Exception as e:
-        logger.error(f"Failed to get analytics: {e}")
+    except Exception:
+        error_id = uuid4().hex[:8]
+        logger.exception("Failed to get analytics [error_id=%s]", error_id)
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to retrieve analytics: {str(e)}"
+            detail=f"Failed to retrieve analytics (error_id={error_id})"
         )
 
 
@@ -116,11 +118,12 @@ async def get_model_analytics(model_name: str):
 
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Failed to get model analytics: {e}")
+    except Exception:
+        error_id = uuid4().hex[:8]
+        logger.exception("Failed to get model analytics [error_id=%s]", error_id)
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to retrieve model analytics: {str(e)}"
+            detail=f"Failed to retrieve model analytics (error_id={error_id})"
         )
 
 
@@ -154,9 +157,9 @@ async def get_model_info(model_name: str):
     return {
         "provider": resolved["provider"],
         "model_id": resolved["model_id"],
-        "input_tokens": model_data.get("input_tokens", 100000),
+        "input_tokens": model_data.get("input_tokens"),
         "output_tokens": model_data.get("output_tokens", 8192),
-        "context_window": model_data.get("context_window", 100000),
+        "context_window": model_data.get("context_window"),
         "name": model_data.get("name", resolved["model_key"]),
         "description": model_data.get("description", ""),
         "capabilities": model_data.get("capabilities", []),

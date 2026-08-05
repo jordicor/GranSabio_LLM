@@ -28,6 +28,8 @@ ignore = [
 known-first-party = [
     "ai_service",
     "config",
+    "content_events",
+    "content_stream",
     "models",
     "json_utils",
     "model_aliasing",

@@ -278,9 +278,16 @@ class TextAnalyzer:
 
             # Skip if target not found in text
             if target_text and target_text not in original_text:
-                # Try case-insensitive match
-                if target_text.lower() not in original_text.lower():
+                # Fall back to a case-insensitive match and adopt the exact
+                # fragment from the original text, so the generated action
+                # (case_sensitive=True) actually executes (AUX-08). Matching
+                # runs on the original text to keep offsets aligned (AUX-15).
+                case_match = re.search(
+                    re.escape(target_text), original_text, re.IGNORECASE
+                )
+                if case_match is None:
                     continue
+                target_text = case_match.group(0)
 
             action = {
                 "id": f"act-{i+1:03d}",
@@ -329,13 +336,14 @@ class TextAnalyzer:
 
     def analyze_basic(self, text: str, max_issues: int = 10) -> List[Dict[str, Any]]:
         """
-        Basic pattern-based analysis without AI.
+        Basic mechanical analysis without AI (fallback when AI is unavailable).
 
-        Useful as a fallback or for quick pre-analysis.
-        Detects:
-        - Double words (e.g., "very very")
-        - Common redundancies
-        - Missing punctuation patterns
+        Only detects consecutive duplicate words (e.g., "very very"), which is
+        a purely mechanical check (identical adjacent tokens), not semantic
+        interpretation. Per repo policy, regex/keyword lists must not be used
+        for semantic detection of style issues, so the previous "common
+        redundant phrases" patterns were removed (AUX-10): those suggestions
+        belong to the AI analysis path.
 
         Args:
             text: Text to analyze
@@ -346,11 +354,11 @@ class TextAnalyzer:
         """
         actions = []
 
-        # Detect double words
-        double_words = re.findall(r"\b(\w+)\s+\1\b", text, re.IGNORECASE)
-        for word in double_words:
+        # Detect consecutive duplicate words (mechanical: identical tokens)
+        for match in re.finditer(r"\b(\w+)\s+\1\b", text, re.IGNORECASE):
             if len(actions) >= max_issues:
                 break
+            word = match.group(1)
             actions.append({
                 "id": f"act-{len(actions)+1:03d}",
                 "type": "delete",
@@ -365,62 +373,6 @@ class TextAnalyzer:
                 "ai_required": False,
                 "estimated_ms": 10,
             })
-
-        # Detect intensifier duplications
-        intensifiers = re.findall(
-            r"\b(very|really|quite|extremely|absolutely)\s+\1\b",
-            text,
-            re.IGNORECASE
-        )
-        for word in intensifiers:
-            if len(actions) >= max_issues:
-                break
-            # Check not already added
-            if not any(word.lower() in a["target"]["value"].lower() for a in actions):
-                actions.append({
-                    "id": f"act-{len(actions)+1:03d}",
-                    "type": "delete",
-                    "target": {
-                        "mode": "exact",
-                        "value": f"{word} ",
-                        "occurrence": 1,
-                        "case_sensitive": False,
-                    },
-                    "description": f"Remove duplicate intensifier '{word}'",
-                    "category": "redundancy",
-                    "ai_required": False,
-                    "estimated_ms": 10,
-                })
-
-        # Detect common redundant phrases
-        redundant_patterns = [
-            (r"\bin the year (\d{4})\b", r"in \1", "Simplify year reference"),
-            (r"\bat this point in time\b", "now", "Simplify temporal reference"),
-            (r"\bdue to the fact that\b", "because", "Simplify causal phrase"),
-            (r"\bin order to\b", "to", "Simplify infinitive phrase"),
-            (r"\bfor the purpose of\b", "to", "Simplify purpose phrase"),
-        ]
-
-        for pattern, replacement, description in redundant_patterns:
-            if len(actions) >= max_issues:
-                break
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                actions.append({
-                    "id": f"act-{len(actions)+1:03d}",
-                    "type": "replace",
-                    "target": {
-                        "mode": "exact",
-                        "value": match.group(0),
-                        "occurrence": 1,
-                        "case_sensitive": False,
-                    },
-                    "content": re.sub(pattern, replacement, match.group(0), flags=re.IGNORECASE),
-                    "description": description,
-                    "category": "conciseness",
-                    "ai_required": False,
-                    "estimated_ms": 10,
-                })
 
         return actions
 

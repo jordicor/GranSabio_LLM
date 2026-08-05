@@ -11,10 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
-from typing import Any, Dict, List, Literal, Optional
+from collections import deque
+from time import monotonic
+from typing import Any, Deque, Dict, List, Literal, Optional
+from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, model_validator
 
 # Import analysis tools
@@ -37,6 +41,80 @@ MAX_NGRAM_ORDER = 10
 MAX_ANALYSIS_CHARACTER_ORDERS = 2_000_000
 MAX_ANALYSIS_RESULT_ITEMS = 1_000
 MAX_ANALYSIS_WINDOW_SIZE = 50_000
+
+# API-10 hardening: clients cannot force multiprocess execution via the API.
+# The analyzer only switches to multiprocess automatically, and never below
+# this internal token floor (matches the field default).
+MIN_MP_THRESHOLD_TOKENS = 50_000
+
+
+class SlidingWindowRateLimiter:
+    """Naive in-memory sliding window rate limiter keyed by client IP.
+
+    Follows the same pattern as attachments_router.SimpleRateLimiter.
+    """
+
+    def __init__(self, *, limit: int, window_seconds: int) -> None:
+        self.limit = limit
+        self.window_seconds = max(window_seconds, 1)
+        self._events: Dict[str, Deque[float]] = {}
+        self._lock = asyncio.Lock()
+
+    def _purge_expired_locked(self, now: float) -> None:
+        """Discard expired events and empty keys while the lock is held."""
+        cutoff = now - self.window_seconds
+        stale: List[str] = []
+        for key, bucket in self._events.items():
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
+            if not bucket:
+                stale.append(key)
+        for key in stale:
+            del self._events[key]
+
+    async def check(self, key: str) -> None:
+        """Register one hit for key, or raise HTTP 429 when the window is full."""
+        if self.limit <= 0:
+            return
+        now = monotonic()
+        async with self._lock:
+            # Lazy global purge keeps one-off IP keys from accumulating.
+            if len(self._events) > 500:
+                self._purge_expired_locked(now)
+            bucket = self._events.setdefault(key, deque())
+            cutoff = now - self.window_seconds
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
+            if len(bucket) >= self.limit:
+                logger.warning("Repetition analysis rate limit exceeded for IP %s", key)
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Repetition analysis rate limit exceeded",
+                )
+            bucket.append(now)
+
+
+def _env_int(name: str, default: int) -> int:
+    """Parse a positive-int env override, falling back to default when invalid."""
+    raw = os.getenv(name, "")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+_repetition_rate_limiter: Optional[SlidingWindowRateLimiter] = None
+
+
+def get_repetition_rate_limiter() -> SlidingWindowRateLimiter:
+    """Provide the process-wide rate limiter for the repetition endpoint."""
+    global _repetition_rate_limiter
+    if _repetition_rate_limiter is None:
+        _repetition_rate_limiter = SlidingWindowRateLimiter(
+            limit=_env_int("ANALYSIS_REPETITION_RATE_LIMIT_PER_MINUTE", 30),
+            window_seconds=_env_int("ANALYSIS_REPETITION_RATE_LIMIT_WINDOW_SECONDS", 60),
+        )
+    return _repetition_rate_limiter
 
 
 # ============================================================================
@@ -593,11 +671,12 @@ async def analyze_lexical_diversity_endpoint(request: LexicalDiversityRequest) -
             processing_time_ms=processing_time_ms,
         )
 
-    except Exception as e:
-        logger.error(f"Lexical diversity analysis failed: {e}", exc_info=True)
+    except Exception:
+        error_id = uuid4().hex[:8]
+        logger.exception("Lexical diversity analysis failed [error_id=%s]", error_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Analysis failed: {str(e)}"
+            detail=f"Analysis failed (error_id={error_id})"
         )
 
 
@@ -611,7 +690,11 @@ async def analyze_lexical_diversity_endpoint(request: LexicalDiversityRequest) -
         "over-repetition, dense clusters, and phrase positioning anomalies."
     )
 )
-async def analyze_repetition_endpoint(request: RepetitionAnalyzerRequest) -> RepetitionAnalyzerResponse:
+async def analyze_repetition_endpoint(
+    request: RepetitionAnalyzerRequest,
+    http_request: Request,
+    rate_limiter: SlidingWindowRateLimiter = Depends(get_repetition_rate_limiter),
+) -> RepetitionAnalyzerResponse:
     """
     Analyze repetition patterns in input text.
 
@@ -624,6 +707,28 @@ async def analyze_repetition_endpoint(request: RepetitionAnalyzerRequest) -> Rep
     - Positional bias analysis (sentence/paragraph/block starts/ends)
     - Multi-process support for large texts
     """
+    # Lazy import: a top-level "from core.security import ..." would trigger
+    # core/__init__ (which imports app_state -> this module) and deadlock when
+    # analysis_router is imported before the core package.
+    from core.security import get_client_ip
+
+    client_ip = get_client_ip(http_request) or "unknown"
+    await rate_limiter.check(client_ip)
+
+    # API-10: multiprocess cannot be forced via the API; the analyzer keeps
+    # auto-selection and the token threshold cannot be lowered under the floor.
+    algo_mode = "auto" if request.algo_mode == "multiprocess" else request.algo_mode
+    mp_threshold_tokens = max(request.mp_threshold_tokens, MIN_MP_THRESHOLD_TOKENS)
+    if algo_mode != request.algo_mode or mp_threshold_tokens != request.mp_threshold_tokens:
+        logger.info(
+            "Repetition analysis: client multiprocess settings overridden "
+            "(algo_mode=%s -> %s, mp_threshold_tokens=%s -> %s)",
+            request.algo_mode,
+            algo_mode,
+            request.mp_threshold_tokens,
+            mp_threshold_tokens,
+        )
+
     try:
         start_time = time.time()
 
@@ -643,8 +748,8 @@ async def analyze_repetition_endpoint(request: RepetitionAnalyzerRequest) -> Rep
             sentence_mode=request.sentence_mode,
             sentence_multis=request.sentence_multis or "",
             # Algorithm
-            algo_mode=request.algo_mode,
-            mp_threshold_tokens=request.mp_threshold_tokens,
+            algo_mode=algo_mode,
+            mp_threshold_tokens=mp_threshold_tokens,
             workers=request.workers,
             core_policy=request.core_policy,
             # Punctuation
@@ -707,11 +812,12 @@ async def analyze_repetition_endpoint(request: RepetitionAnalyzerRequest) -> Rep
             processing_time_ms=processing_time_ms,
         )
 
-    except Exception as e:
-        logger.error(f"Repetition analysis failed: {e}", exc_info=True)
+    except Exception:
+        error_id = uuid4().hex[:8]
+        logger.exception("Repetition analysis failed [error_id=%s]", error_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Analysis failed: {str(e)}"
+            detail=f"Analysis failed (error_id={error_id})"
         )
 
 

@@ -18,6 +18,8 @@ from model_capability_registry import (
     resolve_model_capability_context,
 )
 from phrase_frequency_config import normalize_phrase_frequency_config
+from request_timeouts import clamp_client_timeout
+from schema_utils import validate_json_schema_complexity
 from smart_edit import TextEditRange
 
 
@@ -57,6 +59,24 @@ VALID_CONTENT_TYPES = frozenset([
     "report",
     "story"
 ])
+
+
+# Free-text and list payload ceilings (audit API-02). Sized so a fully packed
+# request stays well within the ~10-25 MB body budget enforced at the HTTP
+# layer, while covering every legitimate long-form workflow. The prompt
+# ceiling matches MAX_ANALYSIS_TEXT_CHARACTERS in analysis_router.py.
+MAX_PROMPT_CHARS = 250_000
+MAX_SYSTEM_PROMPT_CHARS = 100_000
+MAX_SOURCE_TEXT_CHARS = 1_000_000
+MAX_CUMULATIVE_TEXT_CHARS = 1_000_000
+MAX_CONTEXT_DOCUMENT_REFS = 50
+MAX_IMAGE_REFS = 20
+MAX_QA_LAYERS = 25
+
+# Productive ceiling for user-supplied max_iterations (audit GEN-10). Higher
+# values are accepted for API compatibility but clamped, so session memory
+# retention (full content + QA results per iteration) stays bounded.
+MAX_ITERATIONS_EFFECTIVE_CAP = 25
 
 
 def is_json_output_requested(request: Any) -> bool:
@@ -138,6 +158,12 @@ class QAModelConfig(BaseModel):
         description="Maximum seconds allowed for this QA model evaluation attempt"
     )
 
+    @field_validator("timeout_seconds")
+    @classmethod
+    def validate_timeout_ceiling(cls, v: Optional[float]) -> Optional[float]:
+        """Clamp client-supplied QA timeouts to the central ceiling (audit API-09)."""
+        return clamp_client_timeout(v)
+
     class Config:
         json_schema_extra = {
             "example": {
@@ -182,22 +208,18 @@ class PhraseFrequencyRule(BaseModel):
     severity: Literal["warn", "deal_breaker"] = Field(default="warn", description="Severity when the rule is violated")
     guidance: Optional[str] = Field(default=None, description="Optional guidance for generator iterations")
 
-    @field_validator("max_length")
-    @classmethod
-    def validate_range(cls, v: Optional[int], info):
-        min_length = info.data.get("min_length", 1)
-        if v is not None and v < min_length:
-            raise ValueError("max_length must be greater than or equal to min_length")
-        return v
+    @model_validator(mode="after")
+    def _validate_limits(self):
+        """Enforce a coherent n-gram range and an effective repetition limit.
 
-    @field_validator("max_ratio_tokens")
-    @classmethod
-    def validate_ratio(cls, v: Optional[float], info):
-        # Either max_ratio_tokens or max_repetitions must be provided
-        max_repetitions = info.data.get("max_repetitions")
-        if v is None and max_repetitions is None:
+        Runs on the fully resolved model, so it also applies when the fields
+        fall back to their defaults (audit PER-03).
+        """
+        if self.max_length is not None and self.max_length < self.min_length:
+            raise ValueError("max_length must be greater than or equal to min_length")
+        if self.max_ratio_tokens is None and self.max_repetitions is None:
             raise ValueError("Either max_ratio_tokens or max_repetitions must be specified")
-        return v
+        return self
 
 
 class PhraseFrequencyConfig(BaseModel):
@@ -311,23 +333,23 @@ class PhraseFrequencyConfig(BaseModel):
         if not self.enabled or not self.rules:
             raise ValueError("Cannot build phrase frequency layer without enabled rules")
 
-        description = "Evalúa repeticiones de frases configuradas"
+        description = "Evaluates the configured phrase repetition rules"
         criteria_lines = [
-            "Analiza el texto con tokenizador word_punct, respetando los límites de oración.",
-            "Revisa estas reglas de repetición:",
+            "Analyze the text with a word_punct tokenizer, respecting sentence boundaries.",
+            "Check these repetition rules:",
         ]
 
         deal_breaker_rules: List[str] = []
         for rule in self.rules:
             length_desc = (
-                f"{rule.min_length}-{rule.max_length} palabras"
+                f"{rule.min_length}-{rule.max_length} words"
                 if rule.max_length is not None and rule.max_length != rule.min_length
-                else (f"{rule.min_length} palabras" if rule.max_length == rule.min_length else f"≥{rule.min_length} palabras")
+                else (f"{rule.min_length} words" if rule.max_length == rule.min_length else f"at least {rule.min_length} words")
             )
-            phrase_desc = f"frase exacta '{rule.phrase}'" if rule.phrase else f"frases de {length_desc}"
-            severity_desc = "deal-breaker" if rule.severity == "deal_breaker" else "aviso"
+            phrase_desc = f"exact phrase '{rule.phrase}'" if rule.phrase else f"phrases of {length_desc}"
+            severity_desc = "deal-breaker" if rule.severity == "deal_breaker" else "warning"
             criteria_lines.append(
-                f"- {rule.name}: {phrase_desc}, máximo {rule.max_repetitions} repeticiones ({severity_desc})."
+                f"- {rule.name}: {phrase_desc}, at most {rule.max_repetitions} repetitions ({severity_desc})."
             )
             if rule.severity == "deal_breaker":
                 deal_breaker_rules.append(rule.name)
@@ -335,7 +357,7 @@ class PhraseFrequencyConfig(BaseModel):
         deal_breaker_text = None
         if deal_breaker_rules:
             deal_breaker_text = (
-                "Repetir cualquiera de las reglas marcadas como deal-breaker por encima del límite configurado"
+                "Exceeding the configured limit on any rule marked as deal-breaker"
             )
 
         return QALayer(
@@ -735,6 +757,18 @@ class EvidenceGroundingResult(BaseModel):
         description="Action triggered if failed: 'warn', 'deal_breaker', or 'regenerate'"
     )
 
+    # Degradation (verification could not run)
+    degraded: bool = Field(
+        default=False,
+        description="True when verification could not run (claim extraction, span classification "
+                    "or scoring error); passed/triggered_action then follow the on_flag error "
+                    "policy instead of real verification evidence"
+    )
+    verification_error: Optional[str] = Field(
+        default=None,
+        description="Human-readable description of the error that degraded verification, if any"
+    )
+
     # Diagnostics
     verification_time_ms: float = Field(..., ge=0.0, description="Verification time in milliseconds")
     tokens_used: int = Field(..., ge=0, description="Total tokens consumed for verification")
@@ -782,7 +816,7 @@ class ImageData(BaseModel):
 
 
 class LlmAccentGuard(BaseModel):
-    """Configuration for LLM-accent guard (Cambio 1 v5, §5.1)."""
+    """Configuration for LLM-accent guard."""
     mode: Literal["off", "inline", "post", "inline_post"] = Field(
         default="off",
         description="off = disabled; inline = generator self-audits via tool; post = synthetic QA layer; inline_post = both."
@@ -928,7 +962,7 @@ class ProjectInitRequest(BaseModel):
 
 class ContentRequest(BaseModel):
     """Request model for content generation"""
-    prompt: str = Field(..., min_length=10, description="The content generation prompt")
+    prompt: str = Field(..., min_length=10, max_length=MAX_PROMPT_CHARS, description="The content generation prompt")
     request_name: Optional[str] = Field(
         default=None,
         max_length=128,
@@ -988,12 +1022,14 @@ class ContentRequest(BaseModel):
     # Context attachments configuration
     context_documents: Optional[List[ContextDocumentRef]] = Field(
         default=None,
+        max_length=MAX_CONTEXT_DOCUMENT_REFS,
         description="List of attachments to expose as contextual documents",
     )
 
     # Image inputs for vision-enabled generation
     images: Optional[List[ImageRef]] = Field(
         default=None,
+        max_length=MAX_IMAGE_REFS,
         description="List of image references for vision-enabled models (GPT-4o, Claude, Gemini)"
     )
     image_detail: Optional[str] = Field(
@@ -1015,7 +1051,7 @@ class ContentRequest(BaseModel):
         le=100.0,
         description="Use X% of model's maximum available tokens (1-100). Takes precedence over max_tokens"
     )
-    system_prompt: Optional[str] = Field(default=None, description="Custom system prompt to override default editorial prompt")
+    system_prompt: Optional[str] = Field(default=None, max_length=MAX_SYSTEM_PROMPT_CHARS, description="Custom system prompt to override default editorial prompt")
     min_words: Optional[int] = Field(default=None, gt=0, description="Minimum words for generation")
     max_words: Optional[int] = Field(default=None, gt=0, description="Maximum words for generation (takes precedence over max_tokens)")
     long_text_mode: Literal["auto", "on", "off"] = Field(
@@ -1041,12 +1077,14 @@ class ContentRequest(BaseModel):
     # Source text for QA validation (optional)
     source_text: Optional[str] = Field(
         default=None,
+        max_length=MAX_SOURCE_TEXT_CHARS,
         description="Original source text for QA validation (e.g., interview text for biographical analysis)"
     )
 
     # Cumulative context for repetition analysis (optional)
     cumulative_text: Optional[str] = Field(
         default=None,
+        max_length=MAX_CUMULATIVE_TEXT_CHARS,
         description="Previously generated chapters for cumulative repetition analysis"
     )
     cumulative_word_count: Optional[int] = Field(
@@ -1123,6 +1161,7 @@ class ContentRequest(BaseModel):
     )
     qa_layers: List[QALayer] = Field(
         default=[],
+        max_length=MAX_QA_LAYERS,
         description=(
             "QA evaluation layers. Use empty list [] to bypass semantic QA layers. "
             "The LLM preflight gate still runs for every request."
@@ -1137,7 +1176,7 @@ class ContentRequest(BaseModel):
     min_global_score: float = Field(default=8.0, ge=0.0, le=10.0, description="Minimum global average score")
 
     # Iteration configuration
-    max_iterations: int = Field(default=5, gt=0, le=999, description="Maximum generation iterations")
+    max_iterations: int = Field(default=5, gt=0, le=999, description="Maximum generation iterations. Values above 25 are clamped to the productive ceiling (see MAX_ITERATIONS_EFFECTIVE_CAP)")
     json_retry_without_iteration: bool = Field(
         default=False,
         description="When true, JSON validation errors do not consume iterations (retries are handled separately)"
@@ -1234,15 +1273,15 @@ class ContentRequest(BaseModel):
     gran_sabio_fallback: bool = Field(default=False, description="Allow Gran Sabio to regenerate content when iterations are exhausted")
 
     gran_sabio_call_limit_per_iteration: int = Field(
-        default=-1,
+        default_factory=lambda: config.DEFAULT_GRAN_SABIO_LIMIT_PER_ITERATION,
         ge=-1,
-        description="Max Gran Sabio escalations per iteration. Use -1 for unlimited (testing/debug)."
+        description="Max Gran Sabio escalations per iteration (default from config, 3). Use -1 for unlimited (testing/debug)."
     )
 
     gran_sabio_call_limit_per_session: int = Field(
-        default=-1,
+        default_factory=lambda: config.DEFAULT_GRAN_SABIO_LIMIT_PER_SESSION,
         ge=-1,
-        description="Max Gran Sabio escalations per entire session. Use -1 for unlimited (testing/debug)."
+        description="Max Gran Sabio escalations per entire session (default from config, 15). Use -1 for unlimited (testing/debug)."
     )
 
     # Arbiter configuration (per-layer conflict resolution)
@@ -1276,26 +1315,30 @@ class ContentRequest(BaseModel):
     # LLM-accent guard configuration
     llm_accent_guard: LlmAccentGuard = Field(
         default_factory=LlmAccentGuard,
-        description="LLM-accent guard configuration (Cambio 1 v5, §5)."
+        description="LLM-accent guard configuration."
     )
 
     # Cost tracking configuration
     show_query_costs: int = Field(
-        default=0,
+        default=1,
         ge=0,
         le=2,
         description=(
-            "When >0, include token/cost usage summary in final outputs. "
-            "1=aggregate summary, 2=full detailed breakdown."
+            "Token/cost usage level of the result payload. Default 1 (aggregate "
+            "summary) so any client can account for cost without knowing the "
+            "flag; 2=full detailed breakdown; 0 opts out. Sending this field "
+            "explicitly also embeds the cost block inside the returned content, "
+            "which the default never does."
         ),
     )
     show_query_stats: int = Field(
-        default=0,
+        default=1,
         ge=0,
         le=3,
         description=(
-            "When >0, include prompt-free execution statistics in final outputs. "
-            "1=summary, 2=phase/iteration details, 3=level 2 plus per-call breakdown."
+            "Prompt-free execution statistics level of the result payload. "
+            "Default 1 (summary); 2=phase/iteration details, 3=level 2 plus "
+            "per-call breakdown; 0 opts out."
         ),
     )
 
@@ -1346,6 +1389,22 @@ class ContentRequest(BaseModel):
         raise ValueError(
             f"Invalid content_type '{v}'. Must be one of: {valid_types_list}"
         )
+
+    @field_validator('json_schema')
+    @classmethod
+    def validate_json_schema_complexity_limits(
+        cls, v: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Reject json_schema payloads with unbounded conversion cost (audit PER-01)."""
+        if v is not None:
+            validate_json_schema_complexity(v)
+        return v
+
+    @field_validator('max_iterations')
+    @classmethod
+    def validate_max_iterations_cap(cls, v: int) -> int:
+        """Clamp max_iterations to the productive ceiling (audit GEN-10)."""
+        return min(v, MAX_ITERATIONS_EFFECTIVE_CAP)
 
     @field_validator('gran_sabio_call_limit_per_iteration')
     @classmethod
@@ -1453,7 +1512,7 @@ class ContentRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_llm_accent_guard(self):
-        """Fail-fast validators for LLM-accent guard (Cambio 1 v5, §5.1)."""
+        """Fail-fast validators for LLM-accent guard."""
         guard = self.llm_accent_guard
         if guard.mode in {"inline", "inline_post"} and self.generation_tools_mode == "never":
             raise ValueError(
@@ -1484,7 +1543,7 @@ class ContentRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_evidence_grounding_order(self):
-        """Reserve order range >= 999_000 for built-in synthetic layers (Cambio 1 v5, §5.1)."""
+        """Reserve order range >= 999_000 for built-in synthetic layers."""
         if self.evidence_grounding is not None:
             order = self.evidence_grounding.order
             if order is not None and order >= 999_000:
@@ -1496,7 +1555,7 @@ class ContentRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_qa_layer_reserved_order(self):
-        """User-defined QA layers cannot occupy the reserved synthetic-layer range (Cambio 1 v5, §5.1)."""
+        """User-defined QA layers cannot occupy the reserved synthetic-layer range."""
         for layer in self.qa_layers or []:
             if layer.order >= 999_000:
                 raise ValueError(
@@ -2006,6 +2065,13 @@ DEFAULT_QA_LAYERS = {
 }
 
 
+# Keys that qa_global_config / qa_models_config may set on a QAModelConfig
+# (audit PER-04). Derived from the model fields minus the routing identity.
+_QA_MODEL_CONFIGURABLE_KEYS = frozenset(
+    key for key in QAModelConfig.model_fields if key != "model"
+)
+
+
 def normalize_qa_models_config(
     qa_models: Union[List[str], List[QAModelConfig]],
     qa_global_config: Optional[Dict[str, Any]] = None,
@@ -2013,6 +2079,10 @@ def normalize_qa_models_config(
 ) -> List[QAModelConfig]:
     """
     Normalize different QA configuration formats to a unified list of QAModelConfig
+
+    User-supplied qa_global_config / qa_models_config values are merged and
+    re-validated through QAModelConfig (audit PER-04): invalid values raise
+    pydantic.ValidationError here instead of failing later in the pipeline.
 
     Priority order:
     1. Explicit QAModelConfig in qa_models
@@ -2030,25 +2100,6 @@ def normalize_qa_models_config(
     """
     result = []
 
-    def _apply_config_values(
-        target: QAModelConfig,
-        values: Optional[Dict[str, Any]],
-        *,
-        explicit_fields: set[str],
-        override_explicit: bool = False,
-        overwrite_existing: bool = False,
-    ) -> None:
-        if not values:
-            return
-        for key, value in values.items():
-            if value is None or not hasattr(target, key):
-                continue
-            if key in explicit_fields and not override_explicit:
-                continue
-            current = getattr(target, key)
-            if overwrite_existing or override_explicit or current is None:
-                setattr(target, key, value)
-
     for model in qa_models:
         if isinstance(model, str):
             # Create QAModelConfig from string with defaults
@@ -2060,20 +2111,26 @@ def normalize_qa_models_config(
             explicit_fields = set(getattr(model_config_obj, "model_fields_set", set()) or set())
 
         model_name = model_config_obj.model
-        _apply_config_values(
-            model_config_obj,
-            qa_global_config,
-            explicit_fields=explicit_fields,
-            override_explicit=False,
-            overwrite_existing=False,
-        )
-        _apply_config_values(
-            model_config_obj,
-            qa_models_config.get(model_name) if qa_models_config else None,
-            explicit_fields=explicit_fields,
-            override_explicit=False,
-            overwrite_existing=True,
-        )
+        # Merge over a plain dict and re-validate, so user-supplied values are
+        # checked against QAModelConfig instead of injected raw via setattr
+        # (audit PER-04). Only declared configurable keys are accepted; the
+        # routing identity ("model") can no longer be overridden from config.
+        merged = model_config_obj.model_dump()
+        if qa_global_config:
+            for key, value in qa_global_config.items():
+                if value is None or key not in _QA_MODEL_CONFIGURABLE_KEYS:
+                    continue
+                if key in explicit_fields or merged.get(key) is not None:
+                    continue
+                merged[key] = value
+        if qa_models_config:
+            for key, value in (qa_models_config.get(model_name) or {}).items():
+                if value is None or key not in _QA_MODEL_CONFIGURABLE_KEYS:
+                    continue
+                if key in explicit_fields:
+                    continue
+                merged[key] = value
+        model_config_obj = QAModelConfig.model_validate(merged)
 
         if model_config_obj.max_tokens is None:
             resolved_max_tokens = config.resolve_qa_max_tokens(model_name)

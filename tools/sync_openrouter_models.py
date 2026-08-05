@@ -21,14 +21,15 @@ Options:
 """
 
 import argparse
+import copy
 import os
 import sys
-
-# Add parent directory to path for json_utils import
-sys.path.insert(0, str(Path(__file__).parent.parent))
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
+
+# Add parent directory to path for json_utils import
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import requests
 from dotenv import load_dotenv
@@ -37,9 +38,6 @@ import json_utils as json
 
 # Load environment variables
 load_dotenv()
-
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 # Default providers to sync from OpenRouter
@@ -289,47 +287,63 @@ class OpenRouterSync:
         return specs
 
     def save_specs(self, specs: Dict[str, Any], dry_run: bool = False):
-        """Save updated specs to file"""
+        """Save updated specs to file atomically (temp file + os.replace)."""
         if dry_run:
             self.log("DRY RUN: Would save updated specs to file", force=True)
             return
 
         self.log(f"Saving updated specs to {self.specs_file}")
 
+        temp_file = self.specs_file.with_name(self.specs_file.name + ".tmp")
         try:
-            with open(self.specs_file, "w", encoding="utf-8") as f:
+            # Write to a sibling temp file first so a crash mid-dump cannot
+            # leave the catalog truncated; os.replace is atomic on the same
+            # filesystem.
+            with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(specs, f, indent=2, ensure_ascii=False)
+            os.replace(temp_file, self.specs_file)
 
             self.log("Specs saved successfully", force=True)
 
         except Exception as e:
+            try:
+                temp_file.unlink(missing_ok=True)
+            except OSError:
+                pass
             raise Exception(f"Failed to save specs: {str(e)}")
 
     def validate_update(
         self, old_specs: Dict[str, Any], new_specs: Dict[str, Any]
     ) -> bool:
-        """Validate that update didn't break anything"""
+        """Validate that update didn't break anything.
+
+        Compares old against new with explicit checks (never ``assert``, which
+        disappears under ``python -O``). This only detects corruption when
+        ``new_specs`` was built from a deep copy of ``old_specs``; with a
+        shallow copy both dicts share the nested provider mappings and every
+        comparison below would be trivially true.
+        """
         self.log("Validating update...")
 
-        try:
-            # Check main structure preserved
-            assert "model_specifications" in new_specs
-            assert "aliases" in new_specs
+        # Check main structure preserved
+        for key in ("model_specifications", "aliases"):
+            if key not in new_specs:
+                self.log(f"Validation failed: '{key}' missing from updated specs", force=True)
+                return False
 
-            # Check other providers not affected
-            for provider in old_specs["model_specifications"]:
-                if provider != "openrouter":
-                    assert provider in new_specs["model_specifications"]
-                    assert len(old_specs["model_specifications"][provider]) == len(
-                        new_specs["model_specifications"][provider]
-                    )
+        # Check other providers not affected
+        for provider in old_specs["model_specifications"]:
+            if provider == "openrouter":
+                continue
+            if provider not in new_specs["model_specifications"]:
+                self.log(f"Validation failed: provider '{provider}' was dropped", force=True)
+                return False
+            if old_specs["model_specifications"][provider] != new_specs["model_specifications"][provider]:
+                self.log(f"Validation failed: provider '{provider}' was modified", force=True)
+                return False
 
-            self.log("Validation passed")
-            return True
-
-        except AssertionError as e:
-            self.log(f"Validation failed: {str(e)}", force=True)
-            return False
+        self.log("Validation passed")
+        return True
 
     def sync(
         self, providers: List[str], dry_run: bool = False
@@ -353,8 +367,10 @@ class OpenRouterSync:
             if not dry_run:
                 self.create_backup()
 
-            # Step 5: Update specs
-            new_specs = self.update_specs(old_specs.copy(), filtered_models, dry_run)
+            # Step 5: Update specs (deep copy so validate_update compares the
+            # pristine old catalog against the new one instead of comparing
+            # shared nested dicts against themselves)
+            new_specs = self.update_specs(copy.deepcopy(old_specs), filtered_models, dry_run)
 
             # Step 6: Validate
             if not self.validate_update(old_specs, new_specs):

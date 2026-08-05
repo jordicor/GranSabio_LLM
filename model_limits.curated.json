@@ -1,0 +1,182 @@
+{
+  "version": 1,
+  "models": {
+    "gpt-5.4-mini": {
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "max_total_context_tokens": 400000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "within_output",
+      "source": null,
+      "verified_at": "2026-07-12",
+      "provenance": "manual_curated",
+      "note": "OpenAI no longer publishes an explicit input split; effective input is window minus output. tiktoken must use get_encoding('o200k_base') directly."
+    },
+    "gpt-5-mini": {
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "max_total_context_tokens": 400000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "within_output",
+      "source": "https://platform.openai.com/docs/models/gpt-5-mini",
+      "verified_at": "2026-07-12",
+      "provenance": "manual_curated",
+      "note": "The old 272K input split is unverified on current docs and is intentionally not curated."
+    },
+    "gpt-5-nano": {
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "max_total_context_tokens": 400000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "within_output",
+      "source": null,
+      "verified_at": "2026-07-12",
+      "provenance": "manual_curated"
+    },
+    "gpt-4o-mini": {
+      "max_input_tokens": null,
+      "max_output_tokens": 16384,
+      "max_total_context_tokens": 128000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "within_output",
+      "source": null,
+      "verified_at": "2026-07-12",
+      "provenance": "manual_curated",
+      "note": "Non-reasoning model; reasoning_accounting is inert (no thinking budget)."
+    },
+    "claude-opus-4-8": {
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "max_total_context_tokens": 1000000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "within_output",
+      "source": "https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-8",
+      "verified_at": "2026-07-23",
+      "provenance": "manual_curated",
+      "note": "1M context and 128K output are the documented Claude API defaults. Adaptive thinking remains within max_tokens."
+    },
+    "claude-sonnet-4-6": {
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "max_total_context_tokens": 1000000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "within_output",
+      "source": "https://platform.claude.com/docs/en/build-with-claude/context-windows",
+      "verified_at": "2026-07-12",
+      "provenance": "manual_curated",
+      "note": "1M window is GA default (no beta header, standard pricing; context-1m-2025-08-07 header retired). Thinking budget is a subset of max_tokens."
+    },
+    "claude-haiku-4-5": {
+      "max_input_tokens": null,
+      "max_output_tokens": 64000,
+      "max_total_context_tokens": 200000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "within_output",
+      "source": "https://platform.claude.com/docs/en/build-with-claude/context-windows",
+      "verified_at": "2026-07-12",
+      "provenance": "manual_curated"
+    },
+    "gemini-2.5-flash": {
+      "max_input_tokens": 1048576,
+      "max_output_tokens": 65536,
+      "max_total_context_tokens": null,
+      "output_accounting": "separate",
+      "reasoning_accounting": "within_output",
+      "source": "https://ai.google.dev/gemini-api/docs/tokens",
+      "verified_at": "2026-07-12",
+      "provenance": "manual_curated",
+      "note": "Independent input/output budgets (no subtraction). Deprecated by Google; shutdown 2026-10-16."
+    },
+    "gemini-2.0-flash": {
+      "max_input_tokens": 1048576,
+      "max_output_tokens": 8192,
+      "max_total_context_tokens": null,
+      "output_accounting": "separate",
+      "reasoning_accounting": "within_output",
+      "source": "https://ai.google.dev/gemini-api/docs/tokens",
+      "verified_at": "2026-07-12",
+      "provenance": "manual_curated",
+      "note": "SHUT DOWN 2026-06-01; historical limits retained for reference. Routing default is dead."
+    },
+    "kimi-k2.7-code": {
+      "max_input_tokens": null,
+      "max_output_tokens": null,
+      "max_total_context_tokens": 262144,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "unknown",
+      "source": null,
+      "verified_at": "2026-07-12",
+      "provenance": "manual_curated",
+      "note": "Official: input + max_completion_tokens must fit 262144. Max output cap is unpublished."
+    },
+    "grok-4-fast-non-reasoning": {
+      "max_input_tokens": null,
+      "max_output_tokens": null,
+      "max_total_context_tokens": 1000000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "unknown",
+      "source": null,
+      "verified_at": "2026-07-12",
+      "provenance": "manual_curated",
+      "note": "Retired 2026-05-15; slug silently served by grok-4.3 (1M window). Curated as served (max_total 1000000)."
+    },
+    "grok-4-0709": {
+      "max_input_tokens": null,
+      "max_output_tokens": null,
+      "max_total_context_tokens": 1000000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "unknown",
+      "source": null,
+      "verified_at": "2026-07-12",
+      "provenance": "manual_curated",
+      "note": "Retired 2026-05-15; served by grok-4.3 (1M window). Curated as served (max_total 1000000)."
+    },
+    "MiniMax-M3": {
+      "max_input_tokens": null,
+      "max_output_tokens": 524288,
+      "max_total_context_tokens": 1000000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "unknown",
+      "source": null,
+      "verified_at": "2026-07-12",
+      "provenance": "manual_curated",
+      "note": "max_completion_tokens cap 524288; total window shared."
+    },
+    "text-embedding-3-large": {
+      "max_input_tokens": 8192,
+      "max_output_tokens": null,
+      "max_total_context_tokens": null,
+      "output_accounting": "separate",
+      "reasoning_accounting": "within_output",
+      "provider": "openai",
+      "source": null,
+      "verified_at": "2026-07-12",
+      "provenance": "manual_curated",
+      "note": "Per-request input limit (embeddings model; no output budget). Curated-only; provider resolves tiktoken cl100k counting."
+    },
+    "text-embedding-3-small": {
+      "max_input_tokens": 8192,
+      "max_output_tokens": null,
+      "max_total_context_tokens": null,
+      "output_accounting": "separate",
+      "reasoning_accounting": "within_output",
+      "provider": "openai",
+      "source": null,
+      "verified_at": "2026-07-12",
+      "provenance": "manual_curated",
+      "note": "Per-request input limit (embeddings model; no output budget). Curated-only; provider resolves tiktoken cl100k counting."
+    },
+    "models/text-embedding-004": {
+      "max_input_tokens": 2048,
+      "max_output_tokens": null,
+      "max_total_context_tokens": null,
+      "output_accounting": "separate",
+      "reasoning_accounting": "within_output",
+      "provider": "google",
+      "source": "https://ai.google.dev/gemini-api/docs/tokens",
+      "verified_at": "2026-07-12",
+      "provenance": "manual_curated",
+      "note": "SHUT DOWN 2026-01-14 (embeddings model; no output budget)."
+    }
+  }
+}

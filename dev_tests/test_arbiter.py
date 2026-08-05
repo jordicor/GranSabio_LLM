@@ -59,7 +59,11 @@ class TestArbiterDecisionEnum:
     """Tests for ArbiterDecision enum."""
 
     def test_enum_values_exist(self):
-        """Verify all expected decisions are defined (MERGE removed — §3.4.2)."""
+        """Verify all expected decisions are defined.
+
+        MERGE was removed from the arbiter contract: only APPLY and DISCARD
+        remain.
+        """
         assert ArbiterDecision.APPLY == "apply"
         assert ArbiterDecision.DISCARD == "discard"
         assert len(list(ArbiterDecision)) == 2

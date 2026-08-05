@@ -16,7 +16,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from threading import RLock
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
+from urllib.parse import urljoin, urlsplit
 from xml.etree import ElementTree
 
 import aiohttp
@@ -43,6 +44,11 @@ _BASE_CHECK_INTERVAL_SECONDS = 5 * 60
 _SUSPECTED_CHECK_INTERVAL_SECONDS = 90
 _HTTP_TIMEOUT_SECONDS = 8
 _USER_AGENT = "GranSabioLLM/1.0 provider-health"
+# Hard cap on status-page/feed bodies (1 MiB is far above any real payload) and
+# same-host redirect policy so a compromised status page cannot inflate memory
+# or bounce the probe to an arbitrary host.
+_MAX_RESPONSE_BYTES = 1_048_576
+_MAX_REDIRECTS = 3
 
 _PROVIDER_DISPLAY_NAMES = {
     "openai": "OpenAI",
@@ -517,6 +523,20 @@ async def _fetch_openrouter_status() -> dict[str, Any]:
     return {"indicator": None, "incident": None, "source": OFFICIAL_SOURCE}
 
 
+def _parse_remote_xml(feed: str) -> ElementTree.Element:
+    """Parse a remote XML feed without DTD support (no entity expansion/XXE).
+
+    ``defusedxml`` is not a dependency of this project, so entity handling is
+    removed at the source: any document declaring a DOCTYPE or entities is
+    rejected before expat can expand them. The 1 MiB fetch cap in
+    :func:`_fetch_text` additionally bounds the input size.
+    """
+
+    if "<!doctype" in feed.lower() or "<!entity" in feed.lower():
+        raise ValueError("XML feed must not contain DOCTYPE/ENTITY declarations")
+    return ElementTree.fromstring(feed)
+
+
 async def _fetch_xai_status() -> dict[str, Any]:
     try:
         html = await _fetch_text("https://status.x.ai/")
@@ -532,7 +552,7 @@ async def _fetch_xai_status() -> dict[str, Any]:
             }
     except Exception:
         feed = await _fetch_text("https://status.x.ai/feed.xml")
-        root = ElementTree.fromstring(feed)
+        root = _parse_remote_xml(feed)
         channel = root.find("channel")
         items = channel.findall("item") if channel is not None else []
         if not items:
@@ -547,14 +567,40 @@ async def _fetch_json(url: str) -> Any:
     return json.loads(text)
 
 
+def _validated_redirect_url(current_url: str, location: Optional[str]) -> Optional[str]:
+    """Resolve a redirect target, refusing non-HTTPS or cross-host jumps."""
+
+    if not location:
+        return None
+    target = urljoin(current_url, location)
+    target_parts = urlsplit(target)
+    if target_parts.scheme != "https":
+        return None
+    if target_parts.netloc.lower() != urlsplit(current_url).netloc.lower():
+        return None
+    return target
+
+
 async def _fetch_text(url: str) -> str:
+    """Fetch a status endpoint body with a byte cap and validated redirects."""
+
     timeout = aiohttp.ClientTimeout(total=_HTTP_TIMEOUT_SECONDS)
     headers = {"User-Agent": _USER_AGENT, "Accept": "application/json,text/html,application/rss+xml,*/*"}
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        async with session.get(url) as response:
-            body = await response.text()
-            response.raise_for_status()
-            return body
+        current_url = url
+        for _ in range(_MAX_REDIRECTS + 1):
+            async with session.get(current_url, allow_redirects=False) as response:
+                if response.status in (301, 302, 303, 307, 308):
+                    current_url = _validated_redirect_url(current_url, response.headers.get("Location"))
+                    if current_url is None:
+                        raise ValueError(f"Refused redirect from {response.url}")
+                    continue
+                body = await response.content.read(_MAX_RESPONSE_BYTES + 1)
+                response.raise_for_status()
+                if len(body) > _MAX_RESPONSE_BYTES:
+                    raise ValueError(f"Status response exceeds {_MAX_RESPONSE_BYTES} bytes: {response.url}")
+                return body.decode(response.get_encoding(), errors="replace")
+    raise ValueError(f"Too many redirects fetching {url}")
 
 
 def _official_degraded_message(state: ProviderHealthState) -> str:

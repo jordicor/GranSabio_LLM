@@ -125,15 +125,14 @@ class CancellationRegistry:
         return project
 
     def _cleanup_project_if_unused_locked(self, project_id: Optional[str]) -> None:
-        """Mark completed, non-cancelled project state for bounded retention."""
+        """Mark unused project state (completed or cancelled) for bounded retention."""
         if not project_id:
             return
         project = self._projects.get(project_id)
         if project is None:
             return
         if (
-            project.cancelled
-            or project.hard_stop_in_progress
+            project.hard_stop_in_progress
             or project.hard_stop_ids
             or project.hard_stop_active_count
         ):
@@ -144,7 +143,7 @@ class CancellationRegistry:
             project.idle_since = datetime.utcnow()
 
     async def cleanup_inactive_projects(self) -> int:
-        """Remove completed project state after its bounded idle retention period."""
+        """Remove idle project state after its bounded retention period."""
         async with self._lock:
             for session_id, runtime in list(self._sessions.items()):
                 self._cleanup_expired_tombstone_locked(session_id, runtime)
@@ -160,7 +159,6 @@ class CancellationRegistry:
                 for project_id, project in self._projects.items()
                 if project.idle_since is not None
                 and project.idle_since <= cutoff
-                and not project.cancelled
                 and not project.hard_stop_in_progress
                 and not project.hard_stop_ids
                 and project_id not in active_project_ids
@@ -279,6 +277,15 @@ class CancellationRegistry:
             if runtime is not None and self._cleanup_expired_tombstone_locked(session_id, runtime):
                 runtime = None
             return runtime is not None
+
+    async def has_project_runtime(self, project_id: str) -> bool:
+        """Check for known project runtime state without creating a project entry."""
+        async with self._lock:
+            if project_id in self._projects:
+                return True
+            return any(
+                runtime.project_id == project_id for runtime in self._sessions.values()
+            )
 
     async def get_session_project_identity(self, session_id: str) -> Dict[str, Any]:
         async with self._lock:
@@ -419,6 +426,7 @@ class CancellationRegistry:
                 runtime = self._sessions[session_id]
                 runtime.soft_cancel_requested = True
                 handles.update(runtime.provider_calls)
+            self._cleanup_project_if_unused_locked(project_id)
         provider_calls_closed = await self._cleanup_provider_handles(handles.values())
         return {
             "project_id": project_id,
@@ -535,6 +543,7 @@ class CancellationRegistry:
                     project.hard_stop_active_count = max(0, project.hard_stop_active_count - 1)
                 if project.hard_stop_active_count == 0 and not project.hard_stop_ids:
                     project.hard_stop_in_progress = False
+                    self._cleanup_project_if_unused_locked(project_id)
 
     async def clear_project_cancellation(self, project_id: str) -> Dict[str, Any]:
         async with self._lock:

@@ -3,7 +3,7 @@
 """
 Lexical Diversity Analyzer (module + CLI)
 Version: 0.2.0
-Author: ChatGPT (GPT-5 Pro)
+Author: Gran Sabio LLM Team
 License: MIT
 
 Features
@@ -624,10 +624,23 @@ def analyze_windows(
 
     if cfg.window_mode == "paragraphs":
         para_spans = _split_paragraphs_with_spans(text)
+        # Precompute word-token char spans once, in document order, then assign
+        # tokens to paragraphs with two pointers (both lists are sorted), so the
+        # pass stays O(paragraphs + tokens) instead of re-scanning every token
+        # for every paragraph.
+        word_token_indices: List[int] = [i for i, t in enumerate(tokens_all) if WORD_TOKEN_RE.fullmatch(t)]
+        word_spans: List[Tuple[int, int]] = [spans[i] for i in word_token_indices]
+        cursor = 0
+        n_word_tokens = len(word_token_indices)
         for i, (cs, ce) in enumerate(para_spans):
-            # Collect word tokens whose char span lies inside paragraph
-            idxs = [j for j, t in enumerate(tokens_all) if WORD_TOKEN_RE.fullmatch(t) and spans[j][0] >= cs and spans[j][1] <= ce]
-            window_words = [tokens_all[j] for j in idxs]
+            # Skip word tokens that start before this paragraph; collect those
+            # whose char span lies fully inside it.
+            while cursor < n_word_tokens and word_spans[cursor][0] < cs:
+                cursor += 1
+            end = cursor
+            while end < n_word_tokens and word_spans[end][1] <= ce:
+                end += 1
+            window_words = [tokens_all[word_token_indices[j]] for j in range(cursor, end)]
             m: Dict[str, float] = {}
             if cfg.include_window_metrics:
                 m = _metrics_for_tokens(window_words, cfg)

@@ -18,10 +18,11 @@ import logging
 import random
 import re
 import threading
+import warnings
 from contextlib import asynccontextmanager
 from datetime import datetime
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optional, Set, Tuple, TypeVar
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optional, Sequence, Set, Tuple, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
@@ -40,6 +41,7 @@ except ImportError:
     google_genai = None
 
 # Use optimized JSON (3.6x faster than standard json)
+import context_budget
 import json_utils as json
 from ai_runtime import capabilities as runtime_capabilities
 from ai_runtime import parameters as runtime_parameters
@@ -47,6 +49,8 @@ from ai_runtime import schemas as runtime_schemas
 from ai_runtime import usage as runtime_usage
 from ai_runtime import vision as runtime_vision
 from config import DEFAULT_OUTPUT_TOKEN_FALLBACK, config, get_model_parameter_requirements
+from content_events import ContentStatus
+from context_budget import ContextAdmissionError, ProviderContextOverflow
 from deterministic_validation import DraftValidationResult
 from llm_accent_prompts import (
     build_accent_criteria_block,
@@ -69,7 +73,12 @@ from provider_adapters import (
     get_provider_adapter,
 )
 from provider_capabilities import CapabilitySupport
-from provider_errors import ProviderErrorKind, ProviderFailure, classify_provider_exception
+from provider_errors import (
+    ProviderErrorKind,
+    ProviderFailure,
+    classify_provider_exception,
+    is_context_overflow_exception,
+)
 from provider_health import record_provider_failure, record_provider_success
 from request_timeouts import coerce_timeout_seconds, resolve_config_timeout
 from schema_utils import json_schema_to_pydantic
@@ -96,6 +105,33 @@ _ollama_concurrency_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
     "ollama_concurrency_depth",
     default=0,
 )
+
+# Per-task carrier for the most recent admission report so ``_emit_usage`` can
+# attach context-utilization telemetry to the matching usage event. It is set by
+# ``_admit_budget`` immediately before provider dispatch and CONSUMED (reset to
+# None) by ``_emit_usage`` so a later usage emit without a fresh admission never
+# inherits a stale report. ContextVars are copied per asyncio task, so concurrent
+# calls (e.g. QA fan-out) never cross-contaminate.
+_last_admission_report: contextvars.ContextVar[
+    Optional["context_budget.CallAdmissionReport"]
+] = contextvars.ContextVar("last_admission_report", default=None)
+
+
+def _wrap_preserving_provider_signals(message: str, exc: Exception) -> RuntimeError:
+    """Wrap ``exc`` in a ``RuntimeError`` keeping structured provider signals.
+
+    The cause chain is preserved (``__cause__``) and SDK status/request_id
+    attributes are copied when present, so downstream failure classification
+    still sees the structured signals a bare ``raise Exception(...)`` loses.
+    """
+
+    wrapped = RuntimeError(message)
+    for attr in ("status", "status_code", "request_id"):
+        value = getattr(exc, attr, None)
+        if value is not None:
+            setattr(wrapped, attr, value)
+    wrapped.__cause__ = exc
+    return wrapped
 
 
 def _resolve_ai_process_timeout(
@@ -252,8 +288,57 @@ def _extract_output_token_limit(params: Mapping[str, Any]) -> Optional[int]:
     return None
 
 
+# Tool-loop events that ARE the verdict of an attempt that just died. Every
+# other event a running loop emits is in-flight work of a turn and is labelled
+# ``draft`` (C6): the consumer sees it while it happens and can never mistake
+# it for the accepted candidate, so nothing ever needs retracting.
+_TOOL_LOOP_ATTEMPT_ENDING_EVENTS = frozenset(
+    {
+        "tool_loop_context_overflow",
+        "tool_loop_error",
+        "tool_loop_output_truncated",
+        "tool_loop_provider_terminal",
+        "tool_loop_rejected",
+    }
+)
+
+
+def _tool_loop_event_content_status(
+    event_type: str,
+    payload: Mapping[str, Any],
+) -> str:
+    """Return the content label (C0) that honestly describes a tool-loop event.
+
+    Args:
+        event_type: tool-loop event name.
+        payload: telemetry payload as built by the emitting loop.
+
+    Returns:
+        ``draft`` while the loop is still working, ``filtered`` when the
+        provider stopped the attempt by content policy, ``rejected`` for any
+        other attempt-ending verdict.
+    """
+
+    if event_type not in _TOOL_LOOP_ATTEMPT_ENDING_EVENTS:
+        return ContentStatus.DRAFT
+    stopped_by_policy = (
+        payload.get("error_code") == "content_filter"
+        or payload.get("finish_reason_category") == "content_filter"
+    )
+    return ContentStatus.FILTERED if stopped_by_policy else ContentStatus.REJECTED
+
+
+class StructuredOutputSchemaError(ValueError):
+    """Raised when a requested native structured-output schema is inadmissible.
+
+    ``ValueError`` preserves the historical public API contract. Internal
+    callers must catch this subtype before broad ``ValueError`` fallback logic
+    so deterministic request-schema failures still fail fast.
+    """
+
+
 class AccentGuardError(Exception):
-    """Raised when the LLM-accent guard cannot accept a candidate (Cambio 1 v5, Sec 5.5).
+    """Raised when the LLM-accent guard cannot accept a candidate.
 
     Not a subclass of ValueError so the existing ``except ValueError`` fallback in
     ``core/generation_processor.py`` does NOT swallow accent failures. The ``reason``
@@ -354,6 +439,16 @@ class GenerationStoppedUnexpectedly(RuntimeError):
         self.usage = usage or {}
 
 
+def is_content_filter_stop(exc: BaseException) -> bool:
+    """Return whether a typed unusable finish is exactly a content filter stop."""
+
+    return (
+        isinstance(exc, GenerationStoppedUnexpectedly)
+        and str(exc.finish_reason_category or "").strip().casefold()
+        == "content_filter"
+    )
+
+
 class StreamChunk:
     """
     Wrapper for streaming chunks that distinguishes thinking from content.
@@ -418,110 +513,6 @@ _shared_ai_service: Optional["AIService"] = None
 _ai_service_init_lock = threading.Lock()
 
 
-def _coerce_positive_int(value: Any) -> Optional[int]:
-    try:
-        coerced = int(value)
-    except (TypeError, ValueError):
-        return None
-    if coerced <= 0:
-        return None
-    return coerced
-
-
-def _resolve_model_context_window(model_info: Optional[Dict[str, Any]]) -> Optional[int]:
-    if not model_info:
-        return None
-    return (
-        _coerce_positive_int(model_info.get("input_tokens"))
-        or _coerce_positive_int(model_info.get("context_window"))
-    )
-
-
-def estimate_prompt_context_budget(
-    model_id: str,
-    prompt_chars: int,
-    max_tokens: int,
-    thinking_budget: int = 0,
-    *,
-    model_info: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Return a cheap, structured context-budget estimate for a tool-loop prompt."""
-
-    estimated_input_tokens = int(prompt_chars) // 4
-    max_tokens_int = _coerce_positive_int(max_tokens) or 0
-    thinking_budget_int = _coerce_positive_int(thinking_budget) or 0
-    overhead = 512  # system-prompt fragments + tool definitions safety margin
-
-    context_window = _resolve_model_context_window(model_info)
-    context_window_source = "model_info" if context_window is not None else None
-    resolution_error: Optional[str] = None
-
-    if context_window is None:
-        try:
-            resolved_model_info = config.get_model_info(model_id)
-        except RuntimeError as exc:
-            resolution_error = str(exc)
-        except Exception as exc:
-            resolution_error = type(exc).__name__
-        else:
-            context_window = _resolve_model_context_window(resolved_model_info)
-            if context_window is not None:
-                context_window_source = "config.get_model_info"
-
-    available_input_tokens: Optional[int] = None
-    overflow_reason: Optional[str] = None
-    overflow_kind: Optional[str] = None
-
-    if context_window is not None:
-        available_input_tokens = (
-            context_window - max_tokens_int - thinking_budget_int - overhead
-        )
-        if estimated_input_tokens > available_input_tokens:
-            overflow_reason = "context_too_large"
-            overflow_kind = "model_context_overflow"
-
-    return {
-        "model_id": model_id,
-        "prompt_chars": int(prompt_chars),
-        "estimated_input_tokens": estimated_input_tokens,
-        "context_window": context_window,
-        "context_window_source": context_window_source,
-        "max_tokens": max_tokens_int,
-        "thinking_budget": thinking_budget_int,
-        "overhead_tokens": overhead,
-        "available_input_tokens": available_input_tokens,
-        "overflow_reason": overflow_reason,
-        "context_overflow_kind": overflow_kind,
-        "context_resolution_error": resolution_error,
-    }
-
-
-def estimate_prompt_overflow(
-    model_id: str,
-    prompt_chars: int,
-    max_tokens: int,
-    thinking_budget: int = 0,
-) -> Optional[str]:
-    """Cheap gate for ``context_too_large`` before dispatching a tool loop.
-
-    Returns ``None`` when the prompt likely fits the model's context window
-    (or when the model is unknown and the caller must rely on the paranoid
-    ``TOOL_LOOP_MAX_PROMPT_CHARS`` hard cap instead). Returns the string
-    ``"context_too_large"`` when an overflow is estimated.
-
-    ``model_specs`` is the primary source of truth; a rough ``chars // 4``
-    token estimate feeds the arithmetic. This is deliberately conservative:
-    a false positive is better than a wasted round-trip on a request that
-    the provider would reject anyway.
-    """
-    return estimate_prompt_context_budget(
-        model_id=model_id,
-        prompt_chars=prompt_chars,
-        max_tokens=max_tokens,
-        thinking_budget=thinking_budget,
-    )["overflow_reason"]
-
-
 def get_ai_service() -> "AIService":
     """Return the shared AIService instance, creating it on first use."""
     global _shared_ai_service
@@ -557,6 +548,12 @@ class AIService:
         self.moonshot_client = None
         self.ollama_client = None
         self.fake_client = None
+        # Background tasks that persist context_suspect flags after a provider
+        # context overflow. Referenced so fire-and-forget tasks are not GC'd.
+        self._context_suspect_tasks: Set["asyncio.Task"] = set()
+        # Background fire-and-forget telemetry tasks (e.g. validate_draft
+        # oversize events). Referenced so they are not GC'd mid-flight.
+        self._telemetry_tasks: Set["asyncio.Task"] = set()
         self._ollama_max_concurrent_requests = self._positive_int_config(
             "OLLAMA_MAX_CONCURRENT_REQUESTS",
             1,
@@ -600,6 +597,11 @@ class AIService:
             parts.append(PromptPart(text=system_prompt, source=system_prompt_source, label=f"{boundary}.system_prompt"))
         if prompt_safety_parts is not None:
             parts.extend(prompt_safety_parts)
+            # Always include the main prompt alongside caller-declared parts so
+            # guard coverage does not depend on each caller remembering it. As
+            # in the no-parts path below, the raw prompt is treated as user
+            # supplied to preserve legitimate user mentions of model names.
+            parts.append(PromptPart(text=prompt, source="user_supplied", label=f"{boundary}.prompt"))
         elif not system_prompt:
             # If callers only pass a raw prompt and no source-aware parts, treat
             # the prompt as user supplied to preserve legitimate user mentions.
@@ -678,7 +680,7 @@ class AIService:
                 timeout=float(config.SDK_OPENROUTER_TIMEOUT_SECONDS),
                 max_retries=3,
                 default_headers={
-                    "HTTP-Referer": "https://gransabio-llm.local",
+                    "HTTP-Referer": "https://github.com/jordicor/GranSabio_LLM",
                     "X-Title": "Gran Sabio LLM Engine"
                 },
                 http_client=_openai_async_http_client(),
@@ -815,15 +817,18 @@ class AIService:
     ) -> Optional[Dict[str, Any]]:
         """Return a provider-compatible JSON Schema copy for native JSON output."""
 
-        return runtime_schemas.prepare_structured_output_schema(
-            provider,
-            model_id,
-            json_schema,
-            claude_structured_outputs_supported=AIService._claude_supports_structured_outputs(
-                (model_id or "").lower()
-            ),
-            json_schema_to_pydantic_fn=json_schema_to_pydantic,
-        )
+        try:
+            return runtime_schemas.prepare_structured_output_schema(
+                provider,
+                model_id,
+                json_schema,
+                claude_structured_outputs_supported=AIService._claude_supports_structured_outputs(
+                    (model_id or "").lower()
+                ),
+                json_schema_to_pydantic_fn=json_schema_to_pydantic,
+            )
+        except ValueError as exc:
+            raise StructuredOutputSchemaError(str(exc)) from exc
 
     @staticmethod
     def _apply_gemini_structured_output_schema(
@@ -854,7 +859,10 @@ class AIService:
         Raises:
             ValueError: If the schema contains unsupported features (e.g., additionalProperties: true)
         """
-        runtime_schemas.validate_schema_for_structured_outputs(schema, provider, model_id)
+        try:
+            runtime_schemas.validate_schema_for_structured_outputs(schema, provider, model_id)
+        except ValueError as exc:
+            raise StructuredOutputSchemaError(str(exc)) from exc
 
     # =========================================================================
     # Vision/Image Support Methods
@@ -1030,6 +1038,21 @@ class AIService:
 
     @staticmethod
     def _should_retry_exception(exc: Exception) -> bool:
+        """Legacy substring-based retry heuristic (deprecated).
+
+        Do not call from new code: the single source of truth for
+        retriability is ``provider_errors.classify_provider_exception``
+        (``ProviderFailure.retryable``), which classifies from structured
+        SDK signals instead of message substrings. Kept only for
+        backwards compatibility with existing callers.
+        """
+        warnings.warn(
+            "AIService._should_retry_exception is deprecated; use "
+            "provider_errors.classify_provider_exception "
+            "(ProviderFailure.retryable) for new code.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if isinstance(exc, AIRequestError):
             failure = getattr(exc, "provider_failure", None)
             if failure is not None:
@@ -1112,6 +1135,597 @@ class AIService:
             or failure.provider_error_code is not None
             or failure.provider_error_param is not None
         )
+
+    # ------------------------------------------------------------------
+    # Context admission (universal budget guard at provider frontiers)
+    # ------------------------------------------------------------------
+
+    async def _native_token_count(
+        self, provider: str, model: str, text: str
+    ) -> Optional[int]:
+        """Provider-native token counter used by ``context_budget`` as a tiebreak.
+
+        Anthropic and Gemini expose exact counters; every other provider returns
+        ``None`` (OpenAI is covered by local tiktoken, not a native call).
+        Exceptions are allowed to propagate — ``context_budget`` swallows them
+        and keeps the local conservative estimate.
+        """
+
+        prov = (provider or "").strip().lower()
+        if prov in ("claude", "anthropic") and self.anthropic_client is not None:
+            result = await self.anthropic_client.messages.count_tokens(
+                model=model,
+                messages=[{"role": "user", "content": text}],
+            )
+            return int(result.input_tokens)
+        if prov in ("gemini", "google") and self.google_new_client is not None:
+            result = await self.google_new_client.aio.models.count_tokens(
+                model=model,
+                contents=text,
+            )
+            return int(result.total_tokens)
+        return None
+
+    def _build_chat_call_budget(
+        self,
+        *,
+        provider: str,
+        model_id: str,
+        call_id: str,
+        system_prompt: Optional[str],
+        prompt: Optional[str],
+        reserved_output_tokens: Optional[int],
+        thinking_budget_tokens: Optional[int] = 0,
+        images: Optional[List[Any]] = None,
+        json_schema: Optional[Dict[str, Any]] = None,
+        json_output: bool = False,
+        extra_text_components: Optional[Sequence[Tuple[str, str, str]]] = None,
+        output_fallback_model: Optional[str] = None,
+    ) -> "context_budget.RenderedCallBudget":
+        """Build a ``RenderedCallBudget`` from the logical payload of a chat call.
+
+        Reserved output defaults to ``reserved_output_tokens`` (the adjusted
+        max_tokens at the call site). When it is ``None`` the model's safe output
+        budget is reserved instead, so the context plan always accounts for what
+        the request is allowed to generate.
+        """
+
+        hint = "json" if json_output else "prose"
+        components: List[context_budget.PayloadComponent] = []
+        if system_prompt:
+            components.append(
+                context_budget.make_payload_component(
+                    name="system_prompt",
+                    text=system_prompt,
+                    kind="system",
+                    provider=provider,
+                    model=model_id,
+                    hint=hint,
+                )
+            )
+        if prompt:
+            components.append(
+                context_budget.make_payload_component(
+                    name="prompt",
+                    text=prompt,
+                    kind="message",
+                    provider=provider,
+                    model=model_id,
+                    hint=hint,
+                )
+            )
+        if json_schema:
+            components.append(
+                context_budget.make_payload_component(
+                    name="json_schema",
+                    text=json.dumps(json_schema, ensure_ascii=True, sort_keys=True),
+                    kind="schema",
+                    provider=provider,
+                    model=model_id,
+                    hint="json",
+                )
+            )
+        for name, text, kind in (extra_text_components or ()):
+            if not text:
+                continue
+            components.append(
+                context_budget.make_payload_component(
+                    name=name,
+                    text=text,
+                    kind=kind,
+                    provider=provider,
+                    model=model_id,
+                    hint=hint,
+                )
+            )
+        if images:
+            image_tokens = runtime_vision.estimate_vision_request_tokens(images, provider)
+            if image_tokens > 0:
+                components.append(
+                    context_budget.PayloadComponent(
+                        name="images",
+                        chars=0,
+                        tokens_estimate=int(image_tokens),
+                        kind="image",
+                    )
+                )
+
+        reserved = reserved_output_tokens
+        if reserved is None:
+            reserved = config.resolve_model_safe_output_tokens(
+                output_fallback_model or model_id
+            ) or 0
+        return context_budget.RenderedCallBudget(
+            provider=provider,
+            model=model_id,
+            call_id=call_id,
+            components=components,
+            reserved_output_tokens=int(reserved or 0),
+            thinking_budget_tokens=int(thinking_budget_tokens or 0),
+            content_type_hint=hint,
+        )
+
+    async def _admit_chat_call(
+        self,
+        *,
+        provider: str,
+        model_id: str,
+        call_id: str,
+        system_prompt: Optional[str] = None,
+        prompt: Optional[str] = None,
+        reserved_output_tokens: Optional[int],
+        thinking_budget_tokens: Optional[int] = 0,
+        images: Optional[List[Any]] = None,
+        json_schema: Optional[Dict[str, Any]] = None,
+        json_output: bool = False,
+        extra_text_components: Optional[Sequence[Tuple[str, str, str]]] = None,
+        output_fallback_model: Optional[str] = None,
+    ) -> "context_budget.CallAdmissionReport":
+        """Admit one provider call against the budget service.
+
+        In ``enforce`` mode raises ``ContextBudgetExceeded`` /
+        ``ContextCapacityUnknown`` before dispatch; in ``observe`` mode logs and
+        returns the report. An unverified capacity only raises above the reject
+        threshold: smaller payloads are admitted by the banded policy (with a
+        warning in the tolerated band). Callers place this BEFORE the provider
+        SDK call so a failed admission never reaches the network (§17.1
+        invariant).
+        """
+
+        budget = self._build_chat_call_budget(
+            provider=provider,
+            model_id=model_id,
+            call_id=call_id,
+            system_prompt=system_prompt,
+            prompt=prompt,
+            reserved_output_tokens=reserved_output_tokens,
+            thinking_budget_tokens=thinking_budget_tokens,
+            images=images,
+            json_schema=json_schema,
+            json_output=json_output,
+            extra_text_components=extra_text_components,
+            output_fallback_model=output_fallback_model,
+        )
+        report = await self._admit_budget(budget)
+        # Carry the admitted report to the matching usage emit (telemetry only).
+        # Scoped to chat-family calls (generate/stream/logprobs/health) which
+        # report via ``_emit_usage``; embeddings admit separately and never emit
+        # here, so their reports must not linger on the context var.
+        _last_admission_report.set(report)
+        return report
+
+    async def _admit_budget(
+        self, budget: "context_budget.RenderedCallBudget"
+    ) -> "context_budget.CallAdmissionReport":
+        """Run ``admit_call`` and make CAPACITY_UNKNOWN enforce errors actionable."""
+
+        try:
+            report = await context_budget.admit_call(
+                budget, native_counter=self._native_token_count
+            )
+        except context_budget.ContextCapacityUnknown as exc:
+            raise context_budget.ContextCapacityUnknown(
+                self._capacity_unknown_message(budget.model, exc.report),
+                report=exc.report,
+                call_id=budget.call_id,
+                public_label=budget.call_id,
+            ) from exc
+        return report
+
+    @staticmethod
+    def _capacity_unknown_message(
+        model_id: str, report: Optional["context_budget.CallAdmissionReport"]
+    ) -> str:
+        """Return an actionable CAPACITY_UNKNOWN message (no prompt content)."""
+
+        provenance = report.limits.provenance if report is not None else "unknown"
+        required = report.serialized_input_tokens if report is not None else "unknown"
+        return (
+            f"Context admission cannot proceed for model '{model_id}': capacity "
+            f"metadata is missing or inferred (provenance={provenance}) and the "
+            f"required input ({required} tokens) is above the size that can be "
+            f"admitted without a verified window. Add a verified entry to "
+            f"model_limits.curated.json, reduce the request size, or set "
+            f"CONTEXT_ADMISSION_MODE=observe to bypass fail-closed admission."
+        )
+
+    async def _admit_embedding_batch(
+        self, texts: Sequence[str], *, provider: str, model: str, call_id: str
+    ) -> None:
+        """Admit each embedding input against the model's per-input budget.
+
+        Embeddings reserve no output tokens. On OVERFLOW in enforce mode this
+        raises ``ContextBudgetExceeded``; callers MUST let it propagate rather
+        than return empty vectors (the empty-vector fallback is reserved for
+        provider failures, never for admission verdicts).
+        """
+
+        await context_budget.admit_embedding_texts(
+            texts,
+            provider=provider,
+            model=model,
+            call_id=call_id,
+            admit=self._admit_budget,
+        )
+
+    @staticmethod
+    def _collect_tool_loop_payload_text(payload: Any) -> str:
+        """Collect strings from a provider payload, excluding binary image data.
+
+        Tool arguments and tool responses are part of the context window even
+        when they do not live in a message's ``content`` field. Images are
+        deliberately skipped here because their fixed token estimate is added
+        separately by the revalidation budget.
+        """
+
+        collected: List[str] = []
+        image_fields = {"image_url", "inline_data", "file_data"}
+
+        def _visit(value: Any, *, field: Optional[str] = None) -> None:
+            if field in image_fields:
+                return
+            if isinstance(value, str):
+                collected.append(value)
+                return
+            if isinstance(value, Mapping):
+                for key, nested in value.items():
+                    _visit(nested, field=str(key))
+                return
+            if isinstance(value, (list, tuple)):
+                for nested in value:
+                    _visit(nested)
+                return
+            model_dump = getattr(value, "model_dump", None)
+            if callable(model_dump):
+                try:
+                    _visit(model_dump(exclude_none=True))
+                except TypeError:
+                    _visit(model_dump())
+                return
+            if isinstance(value, SimpleNamespace):
+                _visit(vars(value))
+
+        _visit(payload)
+        return "\n".join(collected)
+
+    @staticmethod
+    def _collect_tool_loop_message_text(messages: Sequence[Any]) -> str:
+        """Collect the full textual OpenAI/Claude tool-loop payload."""
+
+        return AIService._collect_tool_loop_payload_text(messages)
+
+    @staticmethod
+    def _collect_tool_loop_contents_text(contents: Sequence[Any]) -> str:
+        """Collect the full textual Gemini tool-loop payload."""
+
+        return AIService._collect_tool_loop_payload_text(contents)
+
+    async def _revalidate_tool_loop_context(
+        self,
+        *,
+        provider: str,
+        model_id: str,
+        accumulated_text: str,
+        reserved_output_tokens: Optional[int],
+        thinking_budget_tokens: Optional[int],
+        content_type_hint: str,
+        turn: int,
+        already_warned: bool,
+        tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        extra_texts: Optional[Sequence[Tuple[str, str, str]]] = None,
+        image_tokens: int = 0,
+    ) -> bool:
+        """Re-check accumulated tool-loop size before a subsequent turn's SDK call.
+
+        In ``enforce`` mode an OVERFLOW or reject-band ``capacity_unknown``
+        raises ``ToolLoopContextOverflow`` (which the entry catch converts into
+        a ``context_too_large`` skip envelope). In ``observe`` mode those
+        decisions log once and proceed. The paranoid character cap for an
+        unverified window always blocks, matching the entry guard. Returns the
+        (possibly updated) ``already_warned`` flag.
+
+        ``extra_texts`` carries payload slices that live OUTSIDE the accumulated
+        messages/contents but still consume the receptor window: the system
+        prompt for the Claude/Gemini loops (their system lives in a separate SDK
+        parameter, not in the messages) and the serialized tool definitions sent
+        every turn. Each tuple is ``(name, text, kind)``.
+
+        ``image_tokens`` carries the fixed token estimate for the images
+        riding inside the transcript (they persist across turns): the
+        entry guard counts them on turn 1, so every mid-loop
+        revalidation must count them too (AIS-08).
+        """
+
+        components = [
+            context_budget.make_payload_component(
+                name="tool_loop_accumulated",
+                text=accumulated_text or "",
+                kind="message",
+                provider=provider,
+                model=model_id,
+                hint=content_type_hint,
+            )
+        ]
+        for name, text, kind in (extra_texts or ()):
+            if not text:
+                continue
+            component_hint = "json" if kind in ("tool_defs", "schema") else content_type_hint
+            components.append(
+                context_budget.make_payload_component(
+                    name=name,
+                    text=text,
+                    kind=kind,
+                    provider=provider,
+                    model=model_id,
+                    hint=component_hint,
+                )
+            )
+        if image_tokens > 0:
+            components.append(
+                context_budget.PayloadComponent(
+                    name="images",
+                    chars=0,
+                    tokens_estimate=int(image_tokens),
+                    kind="image",
+                )
+            )
+        budget = context_budget.RenderedCallBudget(
+            provider=provider,
+            model=model_id,
+            call_id="tool_loop.revalidation",
+            components=components,
+            reserved_output_tokens=int(reserved_output_tokens or 0),
+            thinking_budget_tokens=int(thinking_budget_tokens or 0),
+            content_type_hint=content_type_hint,
+        )
+        report = await context_budget.evaluate_call_admission(
+            budget, native_counter=self._native_token_count
+        )
+        decision = report.decision
+        mode = context_budget.resolve_admission_mode()
+        accumulated_chars = len(accumulated_text or "") + sum(
+            len(text) for _name, text, _kind in (extra_texts or ()) if text
+        )
+        raw_hard_cap = getattr(config, "TOOL_LOOP_MAX_PROMPT_CHARS", 200000)
+        try:
+            hard_cap = (
+                int(raw_hard_cap)
+                if isinstance(raw_hard_cap, (int, str))
+                and not isinstance(raw_hard_cap, bool)
+                else 200000
+            )
+        except (TypeError, ValueError):
+            hard_cap = 200000
+        hard_cap_exceeded = bool(
+            getattr(report, "capacity_unverified", False)
+            and accumulated_chars > hard_cap
+        )
+
+        if (
+            decision is context_budget.AdmissionDecision.CAPACITY_UNKNOWN_TOLERATED
+            and not already_warned
+        ):
+            logger.warning(
+                "Tool-loop accumulated context admitted with unverified capacity "
+                "at turn %d: required=%s; proceeding with warning.",
+                turn,
+                report.required_context_footprint_tokens,
+            )
+            already_warned = True
+
+        must_stop = decision in (
+            context_budget.AdmissionDecision.OVERFLOW,
+            context_budget.AdmissionDecision.CAPACITY_UNKNOWN,
+        ) or hard_cap_exceeded
+        if not must_stop:
+            return already_warned
+
+        if mode == "observe" and not hard_cap_exceeded:
+            if not already_warned:
+                logger.warning(
+                    "Tool-loop context admission warning (observe) at turn %d: "
+                    "decision=%s required=%s available=%s; proceeding without blocking.",
+                    turn,
+                    decision.value,
+                    report.required_context_footprint_tokens,
+                    report.safe_input_limit,
+                )
+            return True
+
+        if hard_cap_exceeded:
+            failure_message = (
+                "Accumulated tool-loop payload exceeds the hard cap for an "
+                f"unverified context window ({accumulated_chars} > {hard_cap} chars)."
+            )
+        elif decision is context_budget.AdmissionDecision.CAPACITY_UNKNOWN:
+            failure_message = (
+                "Accumulated tool-loop payload is above the reject threshold and "
+                "the model context capacity is not verified."
+            )
+        else:
+            failure_message = (
+                "Accumulated tool-loop input exceeds the safe context budget "
+                f"({report.serialized_input_tokens} > {report.safe_input_limit} tokens)."
+            )
+
+        await self._emit_tool_event_safe(
+            tool_event_callback,
+            "tool_loop_context_overflow",
+            {
+                "turn": turn,
+                "phase": "revalidation",
+                "decision": decision.value,
+                "accumulated_chars_estimate": accumulated_chars,
+                "required_tokens": report.required_context_footprint_tokens,
+                "available_tokens": report.safe_input_limit,
+                "hard_cap_chars": hard_cap if hard_cap_exceeded else None,
+            },
+        )
+        raise ToolLoopContextOverflow(
+            turn,
+            accumulated_chars,
+            RuntimeError(failure_message),
+            # Local budget math, NOT a provider signal: do not mark the catalog
+            # entry context-suspect (that is reserved for provider drift, D14).
+            provider_reported=False,
+        )
+
+    def _serialize_tool_loop_tool_defs(
+        self,
+        provider_key: str,
+        *,
+        enable_validate_draft: bool,
+        accent_active: bool,
+    ) -> str:
+        """Serialize the validate_draft/audit_accent tool schemas that are sent.
+
+        The tool definitions consume receptor-window tokens on every tool-enabled
+        turn but are NOT part of the accumulated message/content text, so context
+        admission would under-count without them. Serialized ONCE per loop (and
+        reused for the entry budget) — never per turn. Returns an empty string
+        when no tools are attached.
+        """
+
+        schemas: List[Any] = []
+        if provider_key in ("openai", "openrouter", "xai"):
+            if enable_validate_draft:
+                schemas.append(self._build_openai_validation_tool_schema())
+            if accent_active:
+                schemas.append(self._build_openai_audit_accent_tool_schema())
+        elif provider_key == "claude":
+            if enable_validate_draft:
+                schemas.append(self._build_claude_validation_tool_schema())
+            if accent_active:
+                schemas.append(self._build_claude_audit_accent_tool_schema())
+        elif provider_key == "gemini":
+            # Gemini sends FunctionDeclaration objects wrapping these JSON
+            # parameter schemas; serialize the equivalent dict for measurement.
+            if enable_validate_draft:
+                schemas.append(
+                    {
+                        "name": "validate_draft",
+                        "parameters": self._build_validation_tool_parameters_schema(),
+                    }
+                )
+            if accent_active:
+                schemas.append(
+                    {
+                        "name": "audit_accent",
+                        "parameters": self._build_audit_accent_tool_parameters_schema(),
+                    }
+                )
+        if not schemas:
+            return ""
+        # ``default=str`` keeps this measurement helper non-fatal: the tool
+        # schemas are always plain JSON dicts in production, so it never fires,
+        # but it prevents an accounting step from ever crashing generation.
+        return json.dumps(schemas, ensure_ascii=True, sort_keys=True, default=str)
+
+    def _handle_provider_context_overflow(
+        self, provider: str, model_id: str, failure: ProviderFailure
+    ) -> None:
+        """Log and schedule catalog suspect-marking after a provider overflow."""
+
+        logger.warning(
+            "Provider %s reported a context overflow for model '%s' despite the "
+            "local admission guard (status=%s code=%s): %s; marking catalog entry "
+            "context-suspect.",
+            provider,
+            model_id,
+            failure.status_code,
+            failure.provider_error_code,
+            failure.message,
+        )
+        self._schedule_context_suspect_marking(model_id)
+
+    def _schedule_context_suspect_marking(self, model_id: str) -> None:
+        """Fire-and-forget persistence of ``context_suspect`` for a model entry."""
+
+        async def _runner() -> None:
+            try:
+                from services import model_sync
+
+                await asyncio.to_thread(model_sync.mark_model_context_suspect, model_id)
+            except Exception:
+                logger.warning(
+                    "Failed to persist context_suspect for model '%s'",
+                    model_id,
+                    exc_info=True,
+                )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug(
+                "No running event loop; skipping context_suspect scheduling for '%s'",
+                model_id,
+            )
+            return
+        task = loop.create_task(_runner())
+        self._context_suspect_tasks.add(task)
+        task.add_done_callback(self._context_suspect_tasks.discard)
+
+    @staticmethod
+    def _with_openrouter_compression_disabled(
+        extra_body: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Return ``extra_body`` with the OpenRouter context-compression plugin off.
+
+        Provider context compression is an implicit context transformation the
+        admission policy forbids (D15); disable it explicitly on every OpenRouter
+        payload while preserving any existing ``extra_body`` keys.
+        """
+
+        merged: Dict[str, Any] = dict(extra_body or {})
+        plugins = [
+            plugin
+            for plugin in (merged.get("plugins") or [])
+            if not (isinstance(plugin, dict) and plugin.get("id") == "context-compression")
+        ]
+        plugins.append({"id": "context-compression", "enabled": False})
+        merged["plugins"] = plugins
+        return merged
+
+    @staticmethod
+    def _tool_loop_overflow_details(
+        report: "context_budget.CallAdmissionReport",
+        kind: str,
+        prompt_chars: int,
+    ) -> Dict[str, Any]:
+        """Build a content-free tool-loop overflow detail dict for the envelope."""
+
+        return {
+            "context_overflow_kind": kind,
+            "decision": report.decision.value,
+            "prompt_chars": int(prompt_chars),
+            "required_tokens": report.serialized_input_tokens,
+            "available_tokens": report.safe_input_limit,
+            "hard_input_limit": report.hard_input_limit,
+            "utilization": report.utilization,
+            "count_method": report.count_method.value,
+            "confidence": report.limits.confidence.value,
+            "reserved_generation_tokens": report.reserved_generation_tokens,
+        }
 
     @staticmethod
     async def _record_provider_health_success(provider: str, model_id: str, operation: str) -> None:
@@ -1217,14 +1831,53 @@ class AIService:
         action: str,
         attempted_feature: Optional[str] = None,
         cancellation_token: Optional["CancellationToken"] = None,
+        request_timeout: Optional[float] = None,
     ) -> T:
         max_attempts = self._max_retry_attempts()
         last_exception: Optional[Exception] = None
+        process_timeout = coerce_timeout_seconds(request_timeout)
+        process_deadline = (
+            asyncio.get_running_loop().time() + process_timeout
+            if process_timeout is not None
+            else None
+        )
+
+        class _OperationRaisedTimeout(Exception):
+            """Distinguish an adapter timeout from this method's outer deadline."""
+
+            def __init__(self, original: asyncio.TimeoutError) -> None:
+                super().__init__(str(original))
+                self.original = original
+
+        async def run_operation() -> T:
+            try:
+                return await operation()
+            except asyncio.TimeoutError as exc:
+                raise _OperationRaisedTimeout(exc) from exc
 
         for attempt in range(1, max_attempts + 1):
+            process_deadline_expired = False
             try:
                 await self._raise_if_cancelled(cancellation_token)
-                result = await operation()
+                if process_deadline is not None:
+                    remaining_timeout = process_deadline - asyncio.get_running_loop().time()
+                    if remaining_timeout <= 0:
+                        process_deadline_expired = True
+                        raise asyncio.TimeoutError(
+                            f"{action} exceeded its {process_timeout}s process deadline"
+                        )
+                    try:
+                        result = await asyncio.wait_for(
+                            run_operation(),
+                            timeout=remaining_timeout,
+                        )
+                    except _OperationRaisedTimeout as exc:
+                        raise exc.original
+                    except asyncio.TimeoutError:
+                        process_deadline_expired = True
+                        raise
+                else:
+                    result = await operation()
                 await self._record_provider_health_success(provider, model_id, action)
                 return result
             except asyncio.CancelledError:
@@ -1234,8 +1887,13 @@ class AIService:
                 raise
             except AccentGuardError:
                 raise
+            except StructuredOutputSchemaError:
+                raise
             except ToolLoopContextOverflow:
                 # Authoritative provider signal — do not retry, surface to caller.
+                raise
+            except ContextAdmissionError:
+                # Local admission guard verdict — non-retryable, never wrapped.
                 raise
             except ToolLoopOutputTruncated:
                 # Deterministic provider stop at output limit; retrying the
@@ -1259,7 +1917,29 @@ class AIService:
                     attempted_feature=attempted_feature,
                 )
                 await self._record_provider_health_failure(failure)
-                should_retry = attempt < max_attempts and failure.retryable
+                if failure.kind is ProviderErrorKind.CONTEXT_OVERFLOW:
+                    # Provider reported a context overflow despite the local guard:
+                    # non-retryable, typed, and the catalog entry is flagged suspect.
+                    self._handle_provider_context_overflow(provider, model_id, failure)
+                    raise ProviderContextOverflow(
+                        f"Provider reported a context-window overflow during '{action}'.",
+                        call_id=action,
+                        public_label=action,
+                    ) from exc
+                delay_seconds = self._calculate_retry_delay(attempt)
+                deadline_allows_retry = (
+                    not process_deadline_expired
+                    and (
+                        process_deadline is None
+                        or process_deadline - asyncio.get_running_loop().time()
+                        > delay_seconds + 0.001
+                    )
+                )
+                should_retry = (
+                    attempt < max_attempts
+                    and failure.retryable
+                    and deadline_allows_retry
+                )
 
                 if not should_retry:
                     if not self._should_wrap_provider_failure(failure):
@@ -1273,7 +1953,6 @@ class AIService:
                         provider_failure=failure,
                     ) from exc
 
-                delay_seconds = self._calculate_retry_delay(attempt)
                 request_id = failure.request_id or self._extract_request_id(exc)
                 suffix = f" (request_id={request_id})" if request_id else ""
                 logger.warning(
@@ -1321,12 +2000,17 @@ class AIService:
         action: str,
         attempted_feature: Optional[str] = None,
         cancellation_token: Optional["CancellationToken"] = None,
+        request_timeout: Optional[float] = None,
     ) -> T:
         """Run one provider attempt and normalize transient provider failures."""
 
         try:
             await self._raise_if_cancelled(cancellation_token)
-            result = await operation()
+            process_timeout = coerce_timeout_seconds(request_timeout)
+            if process_timeout is not None:
+                result = await asyncio.wait_for(operation(), timeout=process_timeout)
+            else:
+                result = await operation()
             await self._record_provider_health_success(provider, model_id, action)
             return result
         except asyncio.CancelledError:
@@ -1336,7 +2020,12 @@ class AIService:
             raise
         except AccentGuardError:
             raise
+        except StructuredOutputSchemaError:
+            raise
         except ToolLoopContextOverflow:
+            raise
+        except ContextAdmissionError:
+            # Local admission guard verdict — non-retryable, never wrapped.
             raise
         except ToolLoopOutputTruncated:
             raise
@@ -1357,6 +2046,15 @@ class AIService:
                 attempted_feature=attempted_feature,
             )
             await self._record_provider_health_failure(failure)
+            if failure.kind is ProviderErrorKind.CONTEXT_OVERFLOW:
+                # Provider reported a context overflow despite the local guard:
+                # non-retryable, typed, and the catalog entry is flagged suspect.
+                self._handle_provider_context_overflow(provider, model_id, failure)
+                raise ProviderContextOverflow(
+                    f"Provider reported a context-window overflow during '{action}'.",
+                    call_id=action,
+                    public_label=action,
+                ) from exc
             if not failure.retryable:
                 if not self._should_wrap_provider_failure(failure):
                     raise
@@ -1408,6 +2106,45 @@ class AIService:
             fallback_finish_reason=fallback_finish_reason,
         )
 
+    def _chat_completion_content_and_usage(
+        self,
+        response: Any,
+        *,
+        provider: str,
+        model_id: str,
+        max_tokens: Optional[int],
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Normalize a chat-completions response into (content, usage metadata).
+
+        ``message.content`` may be ``None`` (refusals, unexpected tool calls,
+        filters that still report finish ``stop``); normalize it to ``""`` so
+        the ``-> str`` contract holds. When there is no content and the finish
+        metadata does not explain it, fail fast instead of propagating an
+        empty generation; an unusable/truncated finish is left for the
+        generation finish guard to classify.
+        """
+
+        content = response.choices[0].message.content or ""
+        usage_with_finish = self._usage_with_finish_metadata(
+            getattr(response, "usage", None),
+            response,
+            provider=provider,
+            max_tokens=max_tokens,
+        )
+        if not content.strip() and not usage_with_finish.get("finish_unusable"):
+            raise GenerationStoppedUnexpectedly(
+                f"{provider} model '{model_id}' returned no content and the "
+                "response carries no unusable finish reason; it should not be "
+                "treated as a completed generation.",
+                provider=provider,
+                model_id=model_id,
+                finish_reason=usage_with_finish.get("finish_reason"),
+                finish_reason_category=usage_with_finish.get("finish_reason_category"),
+                partial_content="",
+                usage=dict(usage_with_finish),
+            )
+        return content, usage_with_finish
+
     @staticmethod
     def _resolve_effective_output_max_tokens(
         model: str,
@@ -1458,6 +2195,16 @@ class AIService:
         if extra:
             payload.update(extra)
 
+        # Attach context-admission telemetry from the report the matching
+        # ``_admit_chat_call`` stored just before dispatch, then consume it so a
+        # later usage emit without a fresh admission never inherits it.
+        admission_report = _last_admission_report.get()
+        if admission_report is not None:
+            _last_admission_report.set(None)
+            payload["context_utilization"] = admission_report.utilization
+            payload["context_admission_decision"] = admission_report.decision.value
+            payload["context_count_method"] = admission_report.count_method.value
+
         try:
             usage_callback(payload)
         except Exception:
@@ -1484,6 +2231,10 @@ class AIService:
         finish_reason_text = _stringify_finish_reason(finish_reason)
         finish_reason_category = usage_meta.get("finish_reason_category")
         partial_content = content or ""
+        content_filter_stop = (
+            str(finish_reason_category or "").strip().casefold()
+            == "content_filter"
+        )
         unknown_empty_finish = (
             bool(finish_reason_text)
             and finish_reason_category == "unknown"
@@ -1500,6 +2251,7 @@ class AIService:
             not usage_meta.get("output_truncated")
             and not usage_meta.get("finish_unusable")
             and not unknown_empty_finish
+            and not content_filter_stop
         ):
             return
 
@@ -1524,6 +2276,7 @@ class AIService:
         suffix = f" ({', '.join(details)})"
 
         if not usage_meta.get("output_truncated"):
+            public_partial_content = "" if content_filter_stop else partial_content
             raise GenerationStoppedUnexpectedly(
                 "Provider stopped generation with an unusable finish reason"
                 f"{suffix}. The response should not be treated as complete.",
@@ -1535,7 +2288,7 @@ class AIService:
                     if finish_reason_category is not None
                     else None
                 ),
-                partial_content=partial_content,
+                partial_content=public_partial_content,
                 usage=dict(usage_meta),
             )
 
@@ -1843,6 +2596,21 @@ class AIService:
         system_prompt = system_prompt + language_instruction + date_instruction
 
         async def _single_attempt() -> str:
+            # Universal context guard BEFORE provider dispatch — every retry
+            # revalidates the logical payload against the receptor's budget.
+            await self._admit_chat_call(
+                provider=provider,
+                model_id=model_id,
+                call_id="ai_service.generate_content",
+                system_prompt=system_prompt,
+                prompt=prompt,
+                reserved_output_tokens=adjusted_max_tokens,
+                thinking_budget_tokens=thinking_budget_tokens,
+                images=images,
+                json_schema=effective_json_schema,
+                json_output=json_output,
+            )
+
             # Log vision request if images provided
             if images:
                 self._log_vision_request(images, provider, model_id)
@@ -2174,6 +2942,7 @@ class AIService:
                     action="generation",
                     attempted_feature=attempted_feature,
                     cancellation_token=cancellation_token,
+                    request_timeout=request_timeout,
                 )
                 self._raise_if_generation_stopped_unusably(
                     generated_content,
@@ -2358,7 +3127,7 @@ class AIService:
 
     @staticmethod
     def _build_audit_accent_tool_parameters_schema() -> Dict[str, Any]:
-        """Shared JSON schema for the inline ``audit_accent`` tool (Cambio 1 v5, Sec 5.4)."""
+        """Shared JSON schema for the inline ``audit_accent`` tool."""
         return {
             "type": "object",
             "properties": {
@@ -2540,9 +3309,19 @@ class AIService:
         return snapshot
 
     @staticmethod
-    def _get_tool_loop_call_budget(max_rounds: int) -> int:
-        """Return the internal maximum number of tool calls allowed for a generation tool loop."""
-        return max(4, max_rounds * 2)
+    def _get_tool_loop_call_budget(
+        max_rounds: int, max_tool_calls: Optional[int] = None
+    ) -> int:
+        """Return the internal maximum number of tool calls allowed for a generation tool loop.
+
+        The default derives from the round budget (``max(4, max_rounds * 2)``);
+        ``max_tool_calls`` (the public ``call_ai_with_validation_tools`` cap)
+        only clamps it downward, never raises it.
+        """
+        budget = max(4, max_rounds * 2)
+        if max_tool_calls is not None:
+            budget = min(int(max_tool_calls), budget)
+        return budget
 
     @staticmethod
     def _build_tool_loop_force_finalize_message(
@@ -2599,24 +3378,35 @@ class AIService:
         if draft is not None and len(draft) > max_length:
             if tool_event_callback is not None:
                 # Best-effort telemetry — we schedule the emission but do not
-                # block the exception path on the coroutine awaiting success.
+                # block the exception path on it. The task stays referenced
+                # until completion (set + discard) so it cannot be GC'd
+                # mid-flight, and ``_emit_tool_event_safe`` swallows callback
+                # errors so none surface as "never retrieved" (AIS-13).
                 try:
-                    awaitable = tool_event_callback(
-                        "validate_draft_oversize",
-                        {
-                            "received_chars": len(draft),
-                            "limit": max_length,
-                            "turn": turn,
-                            "stage": stage,
-                        },
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is not None:
+                    task = loop.create_task(
+                        self._emit_tool_event_safe(
+                            tool_event_callback,
+                            "validate_draft_oversize",
+                            {
+                                "received_chars": len(draft),
+                                "limit": max_length,
+                                "turn": turn,
+                                "stage": stage,
+                            },
+                        )
                     )
-                    if asyncio.iscoroutine(awaitable):
-                        asyncio.ensure_future(awaitable)
-                except Exception:
-                    logger.warning(
-                        "tool_event_callback failed to emit validate_draft_oversize",
-                        exc_info=True,
-                    )
+                    # Tests often build AIService via __new__ (bypassing
+                    # __init__), so tolerate a missing set instead of
+                    # raising AttributeError here.
+                    telemetry_tasks = getattr(self, "_telemetry_tasks", None)
+                    if telemetry_tasks is None:
+                        telemetry_tasks = self._telemetry_tasks = set()
+                    telemetry_tasks.add(task)
+                    task.add_done_callback(telemetry_tasks.discard)
             raise ValidationToolInputTooLarge(
                 actual_length=len(draft),
                 max_length=max_length,
@@ -2696,6 +3486,9 @@ class AIService:
             turn=turn,
             accumulated_chars_estimate=accumulated_chars_estimate,
             provider_error=exc,
+            # Provider SDK reported the overflow despite the local guard passing:
+            # catalog drift -> the entry catch marks the model context-suspect (D14).
+            provider_reported=True,
         ) from exc
 
     @staticmethod
@@ -2705,48 +3498,11 @@ class AIService:
     ) -> bool:
         """Return ``True`` when ``exc`` is a provider-reported context-window overflow.
 
-        Covers:
-        - OpenAI / OpenAI-compatible: ``openai.BadRequestError`` with
-          ``error.code == "context_length_exceeded"`` or message substring match.
-        - Anthropic / Claude: ``anthropic.BadRequestError`` whose message mentions
-          ``too long`` / ``context`` / ``max_tokens``.
-        - Gemini (new + legacy): ``google.api_core.exceptions.InvalidArgument``
-          (or equivalent) whose message mentions ``context``.
+        Single source of truth lives in ``provider_errors.is_context_overflow_exception``
+        (shared with the retry-path classifier); this thin wrapper keeps the
+        mid-loop translator anchored to the same marker set — no duplicated lists.
         """
-        message = str(exc or "").lower()
-
-        if provider_key in {"openai", "openrouter", "xai", "minimax", "moonshot"}:
-            if isinstance(exc, openai.BadRequestError):
-                code = getattr(exc, "code", None)
-                if code == "context_length_exceeded":
-                    return True
-                body = getattr(exc, "body", None) or {}
-                if isinstance(body, dict):
-                    err = body.get("error") or {}
-                    if isinstance(err, dict) and err.get("code") == "context_length_exceeded":
-                        return True
-                if "context_length_exceeded" in message or "maximum context length" in message:
-                    return True
-
-        if provider_key == "claude":
-            if isinstance(exc, anthropic.BadRequestError):
-                if "too long" in message or "context" in message or "max_tokens" in message:
-                    return True
-
-        if provider_key == "gemini":
-            # Lazy import — google.api_core is a transitive dep of both SDKs but
-            # may be absent in test environments that stub Gemini clients.
-            try:
-                from google.api_core import exceptions as google_exceptions  # type: ignore
-                if isinstance(exc, google_exceptions.InvalidArgument) and "context" in message:
-                    return True
-            except ImportError:
-                pass
-            # Fallback: some SDK paths raise plain ``ValueError`` with a context message.
-            if "context" in message and ("window" in message or "length" in message or "token" in message):
-                if exc.__class__.__name__ in {"InvalidArgument", "FailedPrecondition"}:
-                    return True
-        return False
+        return is_context_overflow_exception(exc, provider=provider_key)
 
     @staticmethod
     def _provider_error_text(exc: BaseException) -> str:
@@ -3106,7 +3862,19 @@ class AIService:
             ) from exc
         except AccentGuardError:
             raise
+        except ContextAdmissionError:
+            # A context-admission verdict (local budget or provider-reported) is
+            # never a fail-open technical accent failure. It must propagate
+            # untouched so the caller surfaces it fatally instead of wrapping it
+            # into an AccentGuardError that the fail-open path would swallow.
+            raise
         except Exception as exc:
+            # A provider content-policy stop is terminal for the whole
+            # generation.  Keeping the typed exception intact prevents
+            # fail-open accent callers from accepting a candidate merely
+            # because the auxiliary judge was filtered.
+            if is_content_filter_stop(exc):
+                raise
             message_text = str(exc).lower()
             # This handler only emits infrastructure reasons (error/timeout/parse_failure);
             # "rejected" is produced exclusively by Path C/D/E sync audits in the tool loops.
@@ -3310,11 +4078,16 @@ class AIService:
             if "tools" in create_params and supports_parallel_tool_calls:
                 create_params["parallel_tool_calls"] = False
 
-        if provider_key == "openrouter" and any(
-            key in create_params
-            for key in ("response_format", "tools", "tool_choice", "parallel_tool_calls")
-        ):
-            create_params["extra_body"] = {"provider": {"require_parameters": True}}
+        if provider_key == "openrouter":
+            if any(
+                key in create_params
+                for key in ("response_format", "tools", "tool_choice", "parallel_tool_calls")
+            ):
+                create_params["extra_body"] = {"provider": {"require_parameters": True}}
+            # Disable provider context compression on every OpenRouter tool turn (D15).
+            create_params["extra_body"] = self._with_openrouter_compression_disabled(
+                create_params.get("extra_body")
+            )
 
         return create_params
 
@@ -3442,6 +4215,8 @@ class AIService:
         parts = getattr(content_obj, "parts", None) or []
         text_parts = []
         for part in parts:
+            if bool(getattr(part, "thought", False)):
+                continue
             text = getattr(part, "text", None)
             if text:
                 text_parts.append(text)
@@ -3585,6 +4360,9 @@ class AIService:
             "model": model_id,
             "input": input_items,
             "max_output_tokens": max_tokens,
+            # Disable provider input truncation explicitly (D15): the admission
+            # policy forbids silent context transformations.
+            "truncation": "disabled",
         }
         if instructions:
             create_params["instructions"] = instructions
@@ -4540,6 +5318,7 @@ class AIService:
         accent_audit_timeout: Optional[float] = None,
         *,
         stop_on_approval: bool = True,
+        max_tool_calls: Optional[int] = None,
         output_contract: OutputContract = OutputContract.FREE_TEXT,
         payload_scope: PayloadScope = PayloadScope.GENERATOR,
         loop_scope: LoopScope = LoopScope.GENERATOR,
@@ -4614,12 +5393,12 @@ class AIService:
         if images:
             image_parts = self._build_openai_image_content(images, use_responses_api=False)
             image_parts.append({"type": "text", "text": prompt})
-            messages: List[Dict[str, Any]] = [
+            initial_messages: List[Dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": image_parts},
             ]
         else:
-            messages = [
+            initial_messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ]
@@ -4632,14 +5411,38 @@ class AIService:
         if usage_extra:
             extra_payload.update(usage_extra)
 
+        # Serialize tool definitions once per loop for per-round revalidation.
+        # The system prompt already lives inside ``messages`` for the
+        # OpenAI-compatible loop, so only the tool defs are added out-of-band.
+        _tool_defs_serialized = self._serialize_tool_loop_tool_defs(
+            provider_key,
+            enable_validate_draft=enable_validate_draft,
+            accent_active=accent_context is not None,
+        )
+        revalidation_extra_texts: List[Tuple[str, str, str]] = (
+            [("tool_definitions", _tool_defs_serialized, "tool_defs")]
+            if _tool_defs_serialized
+            else []
+        )
+        # Images ride inside ``messages`` for the whole loop; count their
+        # estimated tokens as a fixed component of every revalidation.
+        revalidation_image_tokens = (
+            runtime_vision.estimate_vision_request_tokens(images, provider_key)
+            if images
+            else 0
+        )
+
         async def _single_attempt() -> Tuple[str, Dict[str, Any]]:
+            # Every retry attempt must start from the pristine transcript:
+            # turn handling appends assistant/tool/user messages to this list.
+            messages: List[Dict[str, Any]] = copy.deepcopy(initial_messages)
             trace: List[Dict[str, Any]] = []
             latest_validated_text = ""
             latest_feedback = ""
             latest_invalid_draft = ""
             latest_audit_result: Optional[Dict[str, Any]] = None
             total_tool_calls = 0
-            tool_call_budget = self._get_tool_loop_call_budget(max_rounds)
+            tool_call_budget = self._get_tool_loop_call_budget(max_rounds, max_tool_calls)
             budget_warning_emitted = False
 
             audit_accent_approved_hashes: Set[str] = set()
@@ -4776,6 +5579,21 @@ class AIService:
                             json_output=json_output,
                         ),
                     }
+                )
+                # The forced-final turn is still an SDK dispatch: revalidate the
+                # accumulated context (system already in messages) before sending.
+                await self._revalidate_tool_loop_context(
+                    provider=provider_key,
+                    model_id=model_id,
+                    accumulated_text=self._collect_tool_loop_message_text(forced_messages),
+                    reserved_output_tokens=max_tokens,
+                    thinking_budget_tokens=0,
+                    content_type_hint=("json" if json_output else "prose"),
+                    turn=turn,
+                    already_warned=False,
+                    tool_event_callback=tool_event_callback,
+                    extra_texts=revalidation_extra_texts,
+                    image_tokens=revalidation_image_tokens,
                 )
                 if use_responses_api:
                     create_params = self._build_openai_responses_tool_params(
@@ -4924,6 +5742,7 @@ class AIService:
                 envelope.update(_build_accent_envelope())
                 return candidate, envelope
 
+            ctx_overflow_warned = False
             for turn in range(1, max_rounds + 1):
                 active_tools = _build_active_tool_schemas()
                 await self._emit_tool_event_safe(
@@ -4940,6 +5759,22 @@ class AIService:
                         "loop_scope": loop_scope.value,
                     },
                 )
+                if turn > 1:
+                    # Revalidate the accumulated context before each subsequent
+                    # turn's SDK call (first turn is covered by the entry guard).
+                    ctx_overflow_warned = await self._revalidate_tool_loop_context(
+                        provider=provider_key,
+                        model_id=model_id,
+                        accumulated_text=self._collect_tool_loop_message_text(messages),
+                        reserved_output_tokens=max_tokens,
+                        thinking_budget_tokens=0,
+                        content_type_hint=("json" if json_output else "prose"),
+                        turn=turn,
+                        already_warned=ctx_overflow_warned,
+                        tool_event_callback=tool_event_callback,
+                        extra_texts=revalidation_extra_texts,
+                        image_tokens=revalidation_image_tokens,
+                    )
                 if use_responses_api:
                     create_params = self._build_openai_responses_tool_params(
                         model_id=model_id,
@@ -5498,6 +6333,7 @@ class AIService:
                     action="tool_loop_generation",
                     attempted_feature=attempted_feature,
                     cancellation_token=cancellation_token,
+                    request_timeout=request_timeout,
                 )
             return await self._execute_without_retries(
                 _single_attempt,
@@ -5506,6 +6342,7 @@ class AIService:
                 action="tool_loop_generation",
                 attempted_feature=attempted_feature,
                 cancellation_token=cancellation_token,
+                request_timeout=request_timeout,
             )
 
     async def _stream_claude_tool_turn(
@@ -5684,6 +6521,11 @@ class AIService:
                         if thinking_delta:
                             acc["type"] = "thinking"
                             acc["thinking"] = str(acc.get("thinking", "")) + thinking_delta
+                            # The provider exposes the reasoning text, so it
+                            # travels labelled instead of being reduced to a
+                            # character count (C6/C8): seeing a model reason
+                            # before it writes is the earliest chance to stop
+                            # a run that is going nowhere.
                             await self._emit_tool_event_safe(
                                 tool_event_callback,
                                 "thinking_delta",
@@ -5693,6 +6535,8 @@ class AIService:
                                     "turn": turn,
                                     "loop_scope": loop_scope.value,
                                     "api_surface": "messages",
+                                    "content": thinking_delta,
+                                    "is_thinking": True,
                                     "content_chars": len(thinking_delta),
                                 },
                             )
@@ -5951,6 +6795,7 @@ class AIService:
         *,
         reasoning_effort: Optional[str] = None,
         stop_on_approval: bool = True,
+        max_tool_calls: Optional[int] = None,
         output_contract: OutputContract = OutputContract.FREE_TEXT,
         payload_scope: PayloadScope = PayloadScope.GENERATOR,
         loop_scope: LoopScope = LoopScope.GENERATOR,
@@ -5984,7 +6829,7 @@ class AIService:
                 return content_parts
             return text_content
 
-        messages: List[Dict[str, Any]] = [{"role": "user", "content": _build_user_content(prompt)}]
+        initial_messages: List[Dict[str, Any]] = [{"role": "user", "content": _build_user_content(prompt)}]
         request_kwargs: Dict[str, Any] = {}
         if request_timeout and request_timeout > 0:
             request_kwargs["timeout"] = request_timeout
@@ -6044,14 +6889,40 @@ class AIService:
                 use_beta_structured_outputs=use_beta_structured_outputs,
             )
 
+        # The Claude system prompt lives in the separate ``system`` SDK param
+        # (not in ``messages``); include it plus the once-serialized tool defs
+        # so per-round revalidation counts the full receptor payload.
+        _tool_defs_serialized = self._serialize_tool_loop_tool_defs(
+            provider_key,
+            enable_validate_draft=enable_validate_draft,
+            accent_active=accent_context is not None,
+        )
+        revalidation_extra_texts: List[Tuple[str, str, str]] = []
+        if system_prompt:
+            revalidation_extra_texts.append(("system_prompt", system_prompt, "system"))
+        if _tool_defs_serialized:
+            revalidation_extra_texts.append(
+                ("tool_definitions", _tool_defs_serialized, "tool_defs")
+            )
+        # Images ride inside ``messages`` for the whole loop; count their
+        # estimated tokens as a fixed component of every revalidation.
+        revalidation_image_tokens = (
+            runtime_vision.estimate_vision_request_tokens(images, provider_key)
+            if images
+            else 0
+        )
+
         async def _single_attempt() -> Tuple[str, Dict[str, Any]]:
+            # Every retry attempt must start from the pristine transcript:
+            # turn handling appends assistant/tool/user messages to this list.
+            messages: List[Dict[str, Any]] = copy.deepcopy(initial_messages)
             trace: List[Dict[str, Any]] = []
             latest_validated_text = ""
             latest_feedback = ""
             latest_invalid_draft = ""
             latest_audit_result: Optional[Dict[str, Any]] = None
             total_tool_calls = 0
-            tool_call_budget = self._get_tool_loop_call_budget(max_rounds)
+            tool_call_budget = self._get_tool_loop_call_budget(max_rounds, max_tool_calls)
             budget_warning_emitted = False
 
             audit_accent_approved_hashes: Set[str] = set()
@@ -6184,6 +7055,22 @@ class AIService:
                         ),
                     }
                 )
+                # The forced-final turn is still an SDK dispatch: revalidate the
+                # accumulated context (system lives in the separate ``system``
+                # param, carried via extra_texts) before sending.
+                await self._revalidate_tool_loop_context(
+                    provider=provider_key,
+                    model_id=model_id,
+                    accumulated_text=self._collect_tool_loop_message_text(forced_messages),
+                    reserved_output_tokens=max_tokens,
+                    thinking_budget_tokens=thinking_budget_tokens,
+                    content_type_hint=("json" if json_output else "prose"),
+                    turn=turn,
+                    already_warned=False,
+                    tool_event_callback=tool_event_callback,
+                    extra_texts=revalidation_extra_texts,
+                    image_tokens=revalidation_image_tokens,
+                )
                 try:
                     response = await _create_response(forced_messages, tools_enabled=False, turn=turn)
                 except Exception as provider_exc:
@@ -6263,8 +7150,25 @@ class AIService:
                 envelope.update(_build_accent_envelope())
                 return candidate, envelope
 
+            ctx_overflow_warned = False
             for turn in range(1, max_rounds + 1):
                 active_tools = _build_active_tool_schemas()
+                if turn > 1:
+                    # Revalidate the accumulated context before each subsequent
+                    # turn's SDK call (first turn is covered by the entry guard).
+                    ctx_overflow_warned = await self._revalidate_tool_loop_context(
+                        provider=provider_key,
+                        model_id=model_id,
+                        accumulated_text=self._collect_tool_loop_message_text(messages),
+                        reserved_output_tokens=max_tokens,
+                        thinking_budget_tokens=thinking_budget_tokens,
+                        content_type_hint=("json" if json_output else "prose"),
+                        turn=turn,
+                        already_warned=ctx_overflow_warned,
+                        tool_event_callback=tool_event_callback,
+                        extra_texts=revalidation_extra_texts,
+                        image_tokens=revalidation_image_tokens,
+                    )
                 try:
                     response = await _create_response(
                         messages,
@@ -6731,6 +7635,7 @@ class AIService:
                     action="tool_loop_generation",
                     attempted_feature=attempted_feature,
                     cancellation_token=cancellation_token,
+                    request_timeout=request_timeout,
                 )
             return await self._execute_without_retries(
                 _single_attempt,
@@ -6739,6 +7644,7 @@ class AIService:
                 action="tool_loop_generation",
                 attempted_feature=attempted_feature,
                 cancellation_token=cancellation_token,
+                request_timeout=request_timeout,
             )
 
     async def _run_gemini_new_sdk_validation_tool_loop(
@@ -6764,6 +7670,7 @@ class AIService:
         accent_audit_timeout: Optional[float] = None,
         *,
         stop_on_approval: bool = True,
+        max_tool_calls: Optional[int] = None,
         output_contract: OutputContract = OutputContract.FREE_TEXT,
         payload_scope: PayloadScope = PayloadScope.GENERATOR,
         loop_scope: LoopScope = LoopScope.GENERATOR,
@@ -6799,7 +7706,7 @@ class AIService:
         if images:
             initial_parts.extend(self._build_gemini_image_parts(images))
         initial_parts.append({"text": prompt})
-        contents: List[Any] = [{"role": "user", "parts": initial_parts}]
+        initial_contents: List[Any] = [{"role": "user", "parts": initial_parts}]
 
         thinking_config_kwargs = self._build_gemini_thinking_config_kwargs(
             model_id,
@@ -6869,14 +7776,40 @@ class AIService:
         if usage_extra:
             extra_payload.update(usage_extra)
 
+        # The Gemini system instruction lives in ``config.system_instruction``
+        # (not in ``contents``); include it plus the once-serialized tool defs so
+        # per-round revalidation counts the full receptor payload.
+        _tool_defs_serialized = self._serialize_tool_loop_tool_defs(
+            "gemini",
+            enable_validate_draft=enable_validate_draft,
+            accent_active=accent_context is not None,
+        )
+        revalidation_extra_texts: List[Tuple[str, str, str]] = []
+        if effective_system:
+            revalidation_extra_texts.append(("system_instruction", effective_system, "system"))
+        if _tool_defs_serialized:
+            revalidation_extra_texts.append(
+                ("tool_definitions", _tool_defs_serialized, "tool_defs")
+            )
+        # Images ride inside ``contents`` for the whole loop; count their
+        # estimated tokens as a fixed component of every revalidation.
+        revalidation_image_tokens = (
+            runtime_vision.estimate_vision_request_tokens(images, "gemini")
+            if images
+            else 0
+        )
+
         async def _single_attempt() -> Tuple[str, Dict[str, Any]]:
+            # Every retry attempt must start from the pristine transcript:
+            # turn handling appends content entries to this list.
+            contents: List[Any] = copy.deepcopy(initial_contents)
             trace: List[Dict[str, Any]] = []
             latest_validated_text = ""
             latest_feedback = ""
             latest_invalid_draft = ""
             latest_audit_result: Optional[Dict[str, Any]] = None
             total_tool_calls = 0
-            tool_call_budget = self._get_tool_loop_call_budget(max_rounds)
+            tool_call_budget = self._get_tool_loop_call_budget(max_rounds, max_tool_calls)
             budget_warning_emitted = False
 
             audit_accent_approved_hashes: Set[str] = set()
@@ -7008,6 +7941,22 @@ class AIService:
                         ],
                     )
                 )
+                # The forced-final turn is still an SDK dispatch: revalidate the
+                # accumulated context (system instruction carried via extra_texts)
+                # before sending.
+                await self._revalidate_tool_loop_context(
+                    provider="gemini",
+                    model_id=model_id,
+                    accumulated_text=self._collect_tool_loop_contents_text(forced_contents),
+                    reserved_output_tokens=max_tokens,
+                    thinking_budget_tokens=thinking_budget_tokens,
+                    content_type_hint=("json" if json_output else "prose"),
+                    turn=turn,
+                    already_warned=False,
+                    tool_event_callback=tool_event_callback,
+                    extra_texts=revalidation_extra_texts,
+                    image_tokens=revalidation_image_tokens,
+                )
                 try:
                     response = await _generate_with_timeout(
                         model=model_id,
@@ -7091,9 +8040,27 @@ class AIService:
                 envelope.update(_build_accent_envelope())
                 return candidate, envelope
 
+            ctx_overflow_warned = False
             for turn in range(1, max_rounds + 1):
                 if extra_verbose:
                     logger.info("[EXTRA_VERBOSE] gemini tool-loop turn %d", turn)
+
+                if turn > 1:
+                    # Revalidate the accumulated context before each subsequent
+                    # turn's SDK call (first turn is covered by the entry guard).
+                    ctx_overflow_warned = await self._revalidate_tool_loop_context(
+                        provider="gemini",
+                        model_id=model_id,
+                        accumulated_text=self._collect_tool_loop_contents_text(contents),
+                        reserved_output_tokens=max_tokens,
+                        thinking_budget_tokens=thinking_budget_tokens,
+                        content_type_hint=("json" if json_output else "prose"),
+                        turn=turn,
+                        already_warned=ctx_overflow_warned,
+                        tool_event_callback=tool_event_callback,
+                        extra_texts=revalidation_extra_texts,
+                        image_tokens=revalidation_image_tokens,
+                    )
 
                 include_audit_accent = (
                     accent_context is not None
@@ -7559,6 +8526,7 @@ class AIService:
                     action="tool_loop_generation",
                     attempted_feature=attempted_feature,
                     cancellation_token=cancellation_token,
+                    request_timeout=request_timeout,
                 )
             return await self._execute_without_retries(
                 _single_attempt,
@@ -7567,6 +8535,7 @@ class AIService:
                 action="tool_loop_generation",
                 attempted_feature=attempted_feature,
                 cancellation_token=cancellation_token,
+                request_timeout=request_timeout,
             )
 
     async def call_ai_with_validation_tools(
@@ -7629,6 +8598,8 @@ class AIService:
           (``envelope.tools_skipped_reason="no_tool_support"``).
         - Fail-fast ``context_too_large`` detection before dispatch
           (``envelope.tools_skipped_reason="context_too_large"``).
+        - Honor ``max_tool_calls`` as a downward-only clamp over the
+          derived per-loop tool-call budget (``max(4, max_tool_rounds * 2)``).
 
         Returns ``(content, envelope)`` where ``content`` is the final string
         emitted by the provider. For ``OutputContract.JSON_STRUCTURED``,
@@ -7637,6 +8608,40 @@ class AIService:
         wrappers around a JSON object/array; the first valid payload is
         extracted and normalized, but no payload is attached to the envelope.
         """
+
+        # Live labelled tool-loop telemetry (C6). Every event the loop produces
+        # reaches the consumer as it happens — assistant and thinking deltas,
+        # tool-call start/delta/ready/result/error, turn boundaries, budget
+        # state — stamped with the ``content_status`` that says what it is. The
+        # turns of a loop that has not returned yet are drafts; the events that
+        # already are the verdict of a dead attempt carry their terminal label.
+        # Nothing is buffered and nothing is discarded: a consumer that saw a
+        # draft labelled as a draft has nothing to retract when the envelope is
+        # rejected later, and an owner watching a run can stop a model that
+        # went off the rails before paying for the rest of its output.
+        public_tool_event_callback = tool_event_callback
+
+        async def _labelled_tool_event(
+            event_type: str,
+            payload: Dict[str, Any],
+        ) -> None:
+            """Forward one tool-loop event live, labelled with its status."""
+            labelled = dict(payload)
+            labelled.setdefault(
+                "content_status",
+                _tool_loop_event_content_status(event_type, payload),
+            )
+            await self._emit_tool_event_safe(
+                public_tool_event_callback,
+                event_type,
+                labelled,
+            )
+
+        tool_event_callback = (
+            _labelled_tool_event
+            if public_tool_event_callback is not None
+            else None
+        )
 
         await self._raise_if_cancelled(cancellation_token)
         max_tokens, _token_budget_resolution = self._resolve_effective_output_max_tokens(
@@ -7825,44 +8830,100 @@ class AIService:
             }
 
         # ----- Context-budget fail-fast (§3.2.5) -----------------------------
+        # The universal budget service replaces the legacy char/4 estimator. The
+        # tool-loop entry keeps BLOCKING semantics for known overflows in BOTH
+        # admission modes (this protection predates observe mode). An unverified
+        # capacity blocks only in enforce mode and only above the reject
+        # threshold (below it the banded policy admits, with a warning in the
+        # tolerated band); observe mode falls back to the paranoid
+        # TOOL_LOOP_MAX_PROMPT_CHARS hard cap.
         prompt_chars = len(effective_system_prompt or "") + len(prompt or "")
-        context_budget = estimate_prompt_context_budget(
-            model_id=model_id,
-            prompt_chars=prompt_chars,
-            max_tokens=adjusted_max_tokens,
-            thinking_budget=adjusted_thinking_budget or 0,
-            model_info=model_info,
+        entry_tool_defs = self._serialize_tool_loop_tool_defs(
+            provider_key,
+            enable_validate_draft=enable_validate_draft,
+            accent_active=accent_inline_active,
         )
-        overflow_reason = context_budget["overflow_reason"]
-        hard_cap = getattr(config, "TOOL_LOOP_MAX_PROMPT_CHARS", 200000)
-        if (
-            overflow_reason is None
-            and context_budget.get("context_window") is None
-            and prompt_chars > hard_cap
-        ):
+        entry_extra_components = (
+            [("tool_definitions", entry_tool_defs, "tool_defs")] if entry_tool_defs else None
+        )
+        entry_budget = self._build_chat_call_budget(
+            provider=provider,
+            model_id=model_id,
+            call_id="ai_service.call_ai_with_validation_tools",
+            system_prompt=effective_system_prompt,
+            prompt=prompt,
+            reserved_output_tokens=adjusted_max_tokens,
+            thinking_budget_tokens=adjusted_thinking_budget or 0,
+            images=images,
+            json_schema=json_schema_arg,
+            json_output=json_output_flag,
+            extra_text_components=entry_extra_components,
+        )
+        entry_report = await context_budget.evaluate_call_admission(
+            entry_budget, native_counter=self._native_token_count
+        )
+        overflow_reason: Optional[str] = None
+        overflow_kind: Optional[str] = None
+        overflow_details: Optional[Dict[str, Any]] = None
+        if entry_report.decision is context_budget.AdmissionDecision.OVERFLOW:
             overflow_reason = "context_too_large"
-            context_budget["overflow_reason"] = overflow_reason
-            context_budget["context_overflow_kind"] = "unknown_model_hard_cap_overflow"
-            context_budget["hard_cap_chars"] = int(hard_cap)
+            overflow_kind = "model_context_overflow"
+            overflow_details = self._tool_loop_overflow_details(
+                entry_report, overflow_kind, prompt_chars
+            )
+        elif entry_report.capacity_unverified:
+            blocking = (
+                entry_report.decision is context_budget.AdmissionDecision.CAPACITY_UNKNOWN
+                and context_budget.resolve_admission_mode() != "observe"
+            )
+            if blocking:
+                overflow_reason = "context_too_large"
+                overflow_kind = "capacity_unknown"
+                overflow_details = self._tool_loop_overflow_details(
+                    entry_report, overflow_kind, prompt_chars
+                )
+            else:
+                # The window is unknown but the call is admitted anyway (pass or
+                # tolerated band, or observe mode): the paranoid char hard cap is
+                # the only protection left.
+                hard_cap = getattr(config, "TOOL_LOOP_MAX_PROMPT_CHARS", 200000)
+                if prompt_chars > hard_cap:
+                    overflow_reason = "context_too_large"
+                    overflow_kind = "unknown_model_hard_cap_overflow"
+                    overflow_details = self._tool_loop_overflow_details(
+                        entry_report, overflow_kind, prompt_chars
+                    )
+                    overflow_details["hard_cap_chars"] = int(hard_cap)
+                elif (
+                    entry_report.decision
+                    is context_budget.AdmissionDecision.CAPACITY_UNKNOWN_TOLERATED
+                ):
+                    # Admitted, but the risk is never silent.
+                    logger.warning(
+                        "Tool-loop entry admitted with unverified context capacity "
+                        "for %s: prompt_chars=%s required_tokens=%s confidence=%s",
+                        model,
+                        prompt_chars,
+                        entry_report.serialized_input_tokens,
+                        entry_report.limits.confidence.value,
+                    )
+                # else: admitted under the hard cap -> proceed.
         if overflow_reason == "context_too_large":
             logger.warning(
                 "Tool-loop prompt overflow for %s: kind=%s prompt_chars=%s "
-                "estimated_input_tokens=%s context_window=%s max_tokens=%s "
-                "thinking_budget=%s available_input_tokens=%s hard_cap_chars=%s",
+                "required_tokens=%s available_tokens=%s count_method=%s confidence=%s",
                 model,
-                context_budget.get("context_overflow_kind"),
-                context_budget.get("prompt_chars"),
-                context_budget.get("estimated_input_tokens"),
-                context_budget.get("context_window"),
-                context_budget.get("max_tokens"),
-                context_budget.get("thinking_budget"),
-                context_budget.get("available_input_tokens"),
-                context_budget.get("hard_cap_chars"),
+                overflow_kind,
+                prompt_chars,
+                entry_report.serialized_input_tokens,
+                entry_report.safe_input_limit,
+                entry_report.count_method.value,
+                entry_report.limits.confidence.value,
             )
             await self._emit_tool_event_safe(
                 tool_event_callback,
                 "tool_loop_context_overflow",
-                context_budget,
+                overflow_details,
             )
             envelope = ToolLoopEnvelope(
                 loop_scope=loop_scope,
@@ -7871,8 +8932,8 @@ class AIService:
                 accepted=False,
                 accepted_via="tools_skipped",
                 context_size_estimate=prompt_chars,
-                context_overflow_kind=context_budget.get("context_overflow_kind"),
-                context_overflow_details=context_budget,
+                context_overflow_kind=overflow_kind,
+                context_overflow_details=overflow_details,
             )
             return "", envelope
 
@@ -7946,6 +9007,7 @@ class AIService:
 
         loop_common_kwargs: Dict[str, Any] = {
             "stop_on_approval": stop_on_approval,
+            "max_tool_calls": max_tool_calls,
             "output_contract": output_contract,
             "payload_scope": payload_scope,
             "loop_scope": loop_scope,
@@ -8056,14 +9118,28 @@ class AIService:
                 )
                 return "", envelope
         except ToolLoopContextOverflow as overflow_exc:
-            # Provider reported context-window overflow mid-loop — fail-fast
-            # with a typed envelope. No recovery, no truncation.
+            # Context-window overflow mid-loop — fail-fast with a typed envelope.
+            # No recovery, no truncation. This covers BOTH a provider SDK signal
+            # (catalog drift) and a locally-raised revalidation verdict (our own
+            # budget math). Only the provider signal marks the catalog suspect.
             logger.warning(
-                "Tool-loop context overflow for %s at turn %d (accumulated_chars~%d): %s",
+                "Tool-loop context overflow for %s at turn %d (accumulated_chars~%d, "
+                "provider_reported=%s): %s",
                 model,
                 overflow_exc.turn,
                 overflow_exc.accumulated_chars_estimate,
+                getattr(overflow_exc, "provider_reported", False),
                 overflow_exc.provider_error,
+            )
+            provider_reported = bool(getattr(overflow_exc, "provider_reported", False))
+            if provider_reported:
+                # Provider overflowed despite the local guard passing (D14).
+                self._schedule_context_suspect_marking(model_id)
+            # Stamp the overflow nature so callers that convert this skip into a
+            # typed ContextBudgetExceeded (Gran Sabio, Long Text) can set
+            # local_or_provider correctly: provider-reported mid-loop vs local.
+            mid_loop_kind = (
+                "provider_context_overflow" if provider_reported else "local_revalidation_overflow"
             )
             envelope = ToolLoopEnvelope(
                 loop_scope=loop_scope,
@@ -8072,6 +9148,13 @@ class AIService:
                 accepted=False,
                 accepted_via="tools_skipped",
                 context_size_estimate=overflow_exc.accumulated_chars_estimate,
+                context_overflow_kind=mid_loop_kind,
+                context_overflow_details={
+                    "context_overflow_kind": mid_loop_kind,
+                    "turn": overflow_exc.turn,
+                    "accumulated_chars_estimate": overflow_exc.accumulated_chars_estimate,
+                    "provider_reported": provider_reported,
+                },
             )
             return "", envelope
         except ToolLoopOutputTruncated as trunc_exc:
@@ -8124,6 +9207,30 @@ class AIService:
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            if is_content_filter_stop(e):
+                logger.warning(
+                    "Tool-loop generation stopped by provider content policy "
+                    "for %s via %s",
+                    model,
+                    provider_key,
+                )
+                await self._emit_tool_event_safe(
+                    tool_event_callback,
+                    "tool_loop_error",
+                    {
+                        "model": model,
+                        "provider": provider_key,
+                        "model_id": model_id,
+                        "loop_scope": loop_scope.value,
+                        "exception_class": type(e).__name__,
+                        "error_code": "content_filter",
+                        "finish_reason": e.finish_reason,
+                        "finish_reason_category": "content_filter",
+                        "retryable": False,
+                        "partial_content_chars": e.partial_content_chars,
+                    },
+                )
+                raise
             if cancellation_token and await cancellation_token.any_cancelled():
                 raise asyncio.CancelledError() from e
             provider_failure = (
@@ -8177,18 +9284,6 @@ class AIService:
                 },
             )
             raise
-
-        if phase_logger:
-            phase_logger.log_response(
-                model=model_id,
-                response=content,
-                metadata={
-                    "provider": provider,
-                    "tool_loop": True,
-                    "accepted": metadata.get("accepted"),
-                    "turns": metadata.get("turns"),
-                },
-            )
 
         # ----- Build the typed envelope from the loop metadata --------------
         trace_entries: List[ToolLoopTraceEntry] = []
@@ -8358,9 +9453,56 @@ class AIService:
             **legacy_extras,
         )
 
-        if tool_event_callback is not None:
+        if envelope.accepted:
+            if phase_logger:
+                phase_logger.log_response(
+                    model=model_id,
+                    response=content,
+                    metadata={
+                        "provider": provider,
+                        "tool_loop": True,
+                        "accepted": envelope.accepted_via,
+                        "turns": envelope.turns,
+                    },
+                )
+        else:
+            # A rejected attempt is logged and announced, never silenced (C6).
+            # Every ``tools_skipped`` path returns before this point, so an
+            # unaccepted envelope here means the loop really ran and produced
+            # output the contract refused. The drafts already travelled
+            # labelled as drafts; this is the verdict that tells consumers the
+            # attempt they were watching died, and the response log is the
+            # verbatim record of what it produced.
+            if phase_logger:
+                phase_logger.log_response(
+                    model=model_id,
+                    response=content,
+                    metadata={
+                        "provider": provider,
+                        "tool_loop": True,
+                        "accepted": False,
+                        "accepted_via": envelope.accepted_via or None,
+                        "turns": envelope.turns,
+                    },
+                )
+            await _labelled_tool_event(
+                "tool_loop_rejected",
+                {
+                    "provider": provider,
+                    "model": model,
+                    "model_id": model_id,
+                    "loop_scope": envelope.loop_scope.value,
+                    "turns": envelope.turns,
+                    "accepted_via": envelope.accepted_via or None,
+                    "output_schema_valid": envelope.output_schema_valid,
+                    "output_contract": output_contract.value,
+                    "content_chars": len(content or ""),
+                },
+            )
+
+        if public_tool_event_callback is not None:
             try:
-                awaitable = tool_event_callback(
+                awaitable = public_tool_event_callback(
                     "tool_loop_complete",
                     {
                         "total_turns": envelope.turns,
@@ -8443,7 +9585,10 @@ class AIService:
                 "model": model_id,
                 "input": input_content,
                 "instructions": effective_system_prompt,
-                "max_output_tokens": max_tokens
+                "max_output_tokens": max_tokens,
+                # Disable provider input truncation explicitly (D15): the
+                # admission policy forbids silent context transformations.
+                "truncation": "disabled",
             }
             if reasoning_effort:
                 create_params["reasoning"] = {"effort": reasoning_effort}
@@ -8517,12 +9662,15 @@ class AIService:
             else:
                 input_content = effective_prompt  # Plain string for text-only
 
-            # GPT-5 Pro usa Responses API igual que o3-pro
+            # GPT-5 Pro uses the Responses API, same as o3-pro
             create_params = {
                 "model": model_id,
                 "input": input_content,
                 "instructions": effective_system_prompt,
-                "max_output_tokens": max_tokens
+                "max_output_tokens": max_tokens,
+                # Disable provider input truncation explicitly (D15): the
+                # admission policy forbids silent context transformations.
+                "truncation": "disabled",
             }
 
             # GPT-5 Pro defaults to high reasoning effort
@@ -8585,7 +9733,7 @@ class AIService:
                 max_tokens=max_tokens,
             )
 
-        # --- GPT-5 por Chat Completions ---
+        # --- GPT-5 via Chat Completions ---
         elif "gpt-5" in model_id.lower():
             create_params = _build_openai_params(model_id, messages, temperature, max_tokens, reasoning_effort)
 
@@ -8619,20 +9767,22 @@ class AIService:
                     model_id=model_id,
                 )
             except Exception as e:
-                error_msg = f"GPT-5 model '{model_id}' failed: {str(e)}"
-                logger.error(error_msg)
-                raise Exception(error_msg) from e
+                logger.error(f"GPT-5 model '{model_id}' failed: {str(e)}")
+                # Wrap in RuntimeError (never a bare generic Exception) while
+                # preserving the cause chain and structured provider signals
+                # (status, request_id) for failure classification (AIS-12).
+                raise _wrap_preserving_provider_signals(
+                    f"GPT-5 model '{model_id}' failed: {str(e)}", e
+                )
 
-            content = response.choices[0].message.content or ""
-            if not content.strip():
-                error_msg = f"GPT-5 model '{model_id}' returned empty content. This may indicate the model requires different API endpoint (e.g., gpt-5-pro requires Responses API) or other configuration issues."
-                logger.error(error_msg)
-                raise Exception(error_msg)
-
-            return content, self._usage_with_finish_metadata(
-                getattr(response, "usage", None),
+            # Use the shared adapter so an empty response explained by a
+            # provider finish reason (notably ``content_filter``) reaches the
+            # typed finish guard instead of being replaced by a generic
+            # RuntimeError inside the retry loop.
+            return self._chat_completion_content_and_usage(
                 response,
                 provider="openai",
+                model_id=model_id,
                 max_tokens=max_tokens,
             )
 
@@ -8667,10 +9817,10 @@ class AIService:
                 provider_key="openai",
                 model_id=model_id,
             )
-            return response.choices[0].message.content, self._usage_with_finish_metadata(
-                getattr(response, "usage", None),
+            return self._chat_completion_content_and_usage(
                 response,
                 provider="openai",
+                model_id=model_id,
                 max_tokens=max_tokens,
             )
 
@@ -8790,6 +9940,20 @@ class AIService:
             raise ValueError(
                 f"No logprobs runtime adapter is available for provider {provider!r}."
             )
+
+        # Universal context guard BEFORE the logprobs probe dispatch.
+        await self._admit_chat_call(
+            provider=provider,
+            model_id=model_id,
+            call_id="ai_service.generate_with_logprobs",
+            system_prompt=system_prompt,
+            prompt=prompt,
+            reserved_output_tokens=max_tokens,
+        )
+        # This path reports usage through the manual callback below, never
+        # through ``_emit_usage`` — consume the admission report immediately
+        # so it cannot leak into a later usage emit on this task (AIS-09).
+        _last_admission_report.set(None)
 
         try:
             async with self._provider_call_scope(
@@ -9204,6 +10368,11 @@ class AIService:
         max_attempts = self._max_retry_attempts()
         last_exception: Optional[Exception] = None
         attempt = 1
+        stream_deadline = (
+            asyncio.get_running_loop().time() + float(request_timeout)
+            if request_timeout and request_timeout > 0
+            else None
+        )
 
         async def _stream_cancel_requested() -> bool:
             if cancellation_token and await cancellation_token.any_cancelled():
@@ -9217,6 +10386,49 @@ class AIService:
                 return
 
             chunks_emitted = 0
+            # Universal context guard BEFORE provider dispatch — revalidated per
+            # retry attempt. Placed outside the retry ``try`` so an admission
+            # verdict is never reclassified as a provider failure.
+            await self._admit_chat_call(
+                provider=provider,
+                model_id=model_id,
+                call_id="ai_service.generate_content_stream",
+                system_prompt=system_prompt,
+                prompt=prompt,
+                reserved_output_tokens=adjusted_max_tokens,
+                thinking_budget_tokens=thinking_budget_tokens,
+                images=images,
+                json_schema=effective_json_schema,
+                json_output=json_output,
+            )
+            remaining_stream_timeout = (
+                stream_deadline - asyncio.get_running_loop().time()
+                if stream_deadline is not None
+                else None
+            )
+            if remaining_stream_timeout is not None and remaining_stream_timeout <= 0:
+                deadline_error = asyncio.TimeoutError(
+                    f"streaming exceeded its {request_timeout}s process deadline"
+                )
+                failure = self._classify_provider_failure(
+                    deadline_error,
+                    provider=provider,
+                    model_id=model_id,
+                    action="streaming",
+                    attempted_feature=attempted_feature,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                )
+                await self._record_provider_health_failure(failure)
+                raise AIRequestError(
+                    provider,
+                    model_id,
+                    attempt,
+                    max_attempts,
+                    deadline_error,
+                    provider_failure=failure,
+                ) from deadline_error
+            attempt_timeout_scope = None
             try:
                 async with self._provider_call_scope(
                     cancellation_token,
@@ -9226,8 +10438,9 @@ class AIService:
                 ):
                     if await _stream_cancel_requested():
                         return
-                    if request_timeout and request_timeout > 0:
-                        async with asyncio.timeout(float(request_timeout)):
+                    if remaining_stream_timeout is not None:
+                        attempt_timeout_scope = asyncio.timeout(remaining_stream_timeout)
+                        async with attempt_timeout_scope:
                             async for chunk in _dispatch_stream():
                                 chunks_emitted += 1
                                 if await _stream_cancel_requested():
@@ -9246,6 +10459,11 @@ class AIService:
             except AIRequestError as exc:
                 await self._record_provider_health_failure(getattr(exc, "provider_failure", None))
                 raise
+            except StructuredOutputSchemaError:
+                raise
+            except ContextAdmissionError:
+                # Local admission guard verdict — non-retryable, never wrapped.
+                raise
             except Exception as exc:
                 if cancellation_token and await cancellation_token.any_cancelled():
                     raise asyncio.CancelledError() from exc
@@ -9260,10 +10478,33 @@ class AIService:
                     max_attempts=max_attempts,
                 )
                 await self._record_provider_health_failure(failure)
+                if failure.kind is ProviderErrorKind.CONTEXT_OVERFLOW:
+                    # Provider reported a context overflow despite the local
+                    # guard: non-retryable, typed, catalog entry flagged suspect.
+                    self._handle_provider_context_overflow(provider, model_id, failure)
+                    raise ProviderContextOverflow(
+                        "Provider reported a context-window overflow during 'streaming'.",
+                        call_id="streaming",
+                        public_label="streaming",
+                    ) from exc
+                delay_seconds = self._calculate_retry_delay(attempt)
+                attempt_deadline_expired = (
+                    attempt_timeout_scope is not None
+                    and attempt_timeout_scope.expired()
+                )
+                deadline_allows_retry = (
+                    not attempt_deadline_expired
+                    and (
+                        stream_deadline is None
+                        or stream_deadline - asyncio.get_running_loop().time()
+                        > delay_seconds + 0.001
+                    )
+                )
                 should_retry = (
                     attempt < max_attempts
                     and chunks_emitted == 0
                     and failure.retryable
+                    and deadline_allows_retry
                 )
 
                 if not should_retry:
@@ -9276,7 +10517,6 @@ class AIService:
                         provider_failure=failure,
                     ) from exc
 
-                delay_seconds = self._calculate_retry_delay(attempt)
                 request_id = failure.request_id or self._extract_request_id(exc)
                 suffix = f" (request_id={request_id})" if request_id else ""
                 logger.warning(
@@ -9572,38 +10812,44 @@ class AIService:
             else:
                 response = await gemini_call
 
-            # Extract text from response
-            if hasattr(response, 'text') and response.text:
-                return response.text, self._usage_with_finish_metadata(
-                    getattr(response, 'usage_metadata', None),
-                    response,
-                    provider="gemini",
-                    max_tokens=max_tokens,
-                )
-            elif hasattr(response, 'candidates') and response.candidates:
-                candidate = response.candidates[0]
-                if hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts'):
-                    text_parts = []
-                    for part in candidate.content.parts:
-                        if hasattr(part, 'text') and part.text:
-                            text_parts.append(part.text)
-                    if text_parts:
-                        return "".join(text_parts), self._usage_with_finish_metadata(
-                            getattr(response, 'usage_metadata', None),
-                            response,
-                            provider="gemini",
-                            max_tokens=max_tokens,
-                            fallback_finish_reason=getattr(candidate, "finish_reason", None),
-                        )
+            content = self._extract_text_from_gemini_response(response)
+            usage_with_finish = self._usage_with_finish_metadata(
+                getattr(response, 'usage_metadata', None),
+                response,
+                provider="gemini",
+                max_tokens=max_tokens,
+            )
+            if content:
+                return content, usage_with_finish
 
-            return (
-                "Unable to generate content. The response may have been blocked by safety filters.",
-                self._usage_with_finish_metadata(
-                    getattr(response, 'usage_metadata', None),
-                    response,
-                    provider="gemini",
-                    max_tokens=max_tokens,
-                ),
+            # No text was extracted. Never return a canned error sentence as
+            # content: with a classifiable finish reason (e.g. SAFETY) return
+            # empty content and let the generation finish guard classify it;
+            # without one, fail fast like the OpenAI streaming path does.
+            if usage_with_finish.get("finish_reason"):
+                if not usage_with_finish.get("finish_unusable"):
+                    raise GenerationStoppedUnexpectedly(
+                        "Gemini returned no text despite a normal finish reason; "
+                        "the response should not be treated as complete.",
+                        provider="gemini",
+                        model_id=model_id,
+                        finish_reason=usage_with_finish.get("finish_reason"),
+                        finish_reason_category=usage_with_finish.get(
+                            "finish_reason_category"
+                        ),
+                        partial_content="",
+                        usage=dict(usage_with_finish),
+                    )
+                return "", usage_with_finish
+            raise GenerationStoppedUnexpectedly(
+                "Gemini returned no text and no finish reason; the response may "
+                "have been blocked before generation started.",
+                provider="gemini",
+                model_id=model_id,
+                finish_reason=None,
+                finish_reason_category="missing",
+                partial_content="",
+                usage=usage_with_finish,
             )
 
         except Exception as e:
@@ -9660,8 +10906,11 @@ class AIService:
         """Return True for Claude Messages models that reject sampling params."""
         normalized = (model_id or "").strip().lower().replace(".", "-")
         restricted_markers = (
+            "claude-fable-5",
+            "claude-mythos",
             "claude-opus-4-7",
             "claude-opus-4-8",
+            "claude-sonnet-5",
         )
         return any(marker in normalized for marker in restricted_markers)
 
@@ -9682,10 +10931,12 @@ class AIService:
             return
         params["temperature"] = temperature
 
-    @staticmethod
-    def _supports_claude_thinking(model_id: str) -> bool:
+    @classmethod
+    def _supports_claude_thinking(cls, model_id: str) -> bool:
         """Return True if the Claude variant supports thinking mode."""
         model_lower = (model_id or "").lower()
+        if cls._claude_uses_adaptive_thinking_only(model_id):
+            return True
         thinking_markers = (
             "claude-3.7",
             "claude-3-7",
@@ -9709,11 +10960,15 @@ class AIService:
             return False
         normalized = (model_id or "").strip().lower().split(":", 1)[0].replace(".", "-")
         no_temperature_prefixes = (
+            "anthropic/claude-fable-5",
+            "anthropic/claude-mythos",
             "anthropic/claude-opus-4-7",
             "anthropic/claude-opus-4-8",
+            "anthropic/claude-sonnet-5",
         )
         no_temperature_models = (
             "anthropic/claude-sonnet-4-6",
+            "~anthropic/claude-fable-latest",
             "~anthropic/claude-opus-latest",
             "~anthropic/claude-sonnet-latest",
         )
@@ -9811,13 +11066,15 @@ class AIService:
 
         budget = int(thinking_budget_tokens)
         # Ensure minimum budget for thinking mode (1024 tokens minimum)
-        budget = max(budget, 1024)
+        min_budget = 1024
+        budget = max(budget, min_budget)
 
         details = self._get_thinking_budget_details(model_id)
         if details:
             min_tokens = details.get("min_tokens")
             max_tokens = details.get("max_tokens")
             if isinstance(min_tokens, int):
+                min_budget = max(min_budget, min_tokens)
                 budget = max(budget, min_tokens)
             if isinstance(max_tokens, int):
                 budget = min(budget, max_tokens)
@@ -9825,6 +11082,18 @@ class AIService:
         # Ensure thinking budget doesn't exceed max_tokens
         if "max_tokens" in params:
             budget = min(budget, params["max_tokens"] - 100)  # Leave some room for response
+
+        if budget < min_budget:
+            # The response cap leaves no room for the provider minimum
+            # budget: Anthropic would reject the request deterministically.
+            # Disable thinking for this call instead of sending a payload
+            # guaranteed to fail on every retry.
+            logger.info(
+                f"{log_context}Disabling thinking for model {model_id}: "
+                f"max_tokens={params.get('max_tokens')} leaves no room for the "
+                f"minimum thinking budget ({min_budget})"
+            )
+            return
 
         params["thinking"] = {
             "type": "enabled",
@@ -9970,10 +11239,10 @@ class AIService:
             model_id=model_id,
         )
 
-        return response.choices[0].message.content, self._usage_with_finish_metadata(
-            getattr(response, "usage", None),
+        return self._chat_completion_content_and_usage(
             response,
             provider="xai",
+            model_id=model_id,
             max_tokens=max_tokens,
         )
 
@@ -10045,15 +11314,19 @@ class AIService:
                 request_kwargs["extra_body"] = {"provider": {"require_parameters": True}}
                 logger.info(f"Using OpenRouter JSON mode (flexible) for {model_id}")
 
+        # Disable provider context compression on every OpenRouter payload (D15).
+        request_kwargs["extra_body"] = self._with_openrouter_compression_disabled(
+            request_kwargs.get("extra_body")
+        )
         response = await self.openrouter_client.chat.completions.create(
             **request_params,
             **request_kwargs,
         )
 
-        return response.choices[0].message.content, self._usage_with_finish_metadata(
-            getattr(response, "usage", None),
+        return self._chat_completion_content_and_usage(
             response,
             provider="openrouter",
+            model_id=model_id,
             max_tokens=max_tokens,
         )
 
@@ -10136,10 +11409,10 @@ class AIService:
             **request_kwargs,
         )
 
-        return response.choices[0].message.content, self._usage_with_finish_metadata(
-            getattr(response, "usage", None),
+        return self._chat_completion_content_and_usage(
             response,
             provider=provider_key,
+            model_id=model_id,
             max_tokens=max_tokens,
         )
 
@@ -10210,6 +11483,13 @@ class AIService:
         try:
             if self.openai_client:
                 route = resolve_call("health.openai")
+                await self._admit_chat_call(
+                    provider="openai",
+                    model_id=route.model,
+                    call_id="health.openai",
+                    prompt="Hello",
+                    reserved_output_tokens=route.params.get("max_tokens", 5),
+                )
                 await self.openai_client.chat.completions.create(
                     model=route.model,
                     messages=[{"role": "user", "content": "Hello"}],
@@ -10218,6 +11498,13 @@ class AIService:
                 health_status["openai"] = True
             else:
                 health_status["openai"] = False
+        except ContextAdmissionError:
+            logger.warning(
+                "health probe blocked by context admission (capacity metadata "
+                "missing), not a provider outage: %s",
+                route.model,
+            )
+            health_status["openai"] = False
         except Exception as e:
             logger.error(f"OpenAI health check failed: {str(e)}")
             health_status["openai"] = False
@@ -10226,6 +11513,13 @@ class AIService:
         try:
             if self.anthropic_client:
                 route = resolve_call("health.claude")
+                await self._admit_chat_call(
+                    provider="claude",
+                    model_id=route.model,
+                    call_id="health.claude",
+                    prompt="Hello",
+                    reserved_output_tokens=route.params.get("max_tokens", 5),
+                )
                 await self.anthropic_client.messages.create(
                     model=route.model,
                     max_tokens=route.params.get("max_tokens", 5),
@@ -10234,6 +11528,13 @@ class AIService:
                 health_status["claude"] = True
             else:
                 health_status["claude"] = False
+        except ContextAdmissionError:
+            logger.warning(
+                "health probe blocked by context admission (capacity metadata "
+                "missing), not a provider outage: %s",
+                route.model,
+            )
+            health_status["claude"] = False
         except Exception as e:
             logger.error(f"Claude health check failed: {str(e)}")
             health_status["claude"] = False
@@ -10242,6 +11543,13 @@ class AIService:
         try:
             if self.google_new_client:
                 route = resolve_call("health.gemini")
+                await self._admit_chat_call(
+                    provider="gemini",
+                    model_id=route.model,
+                    call_id="health.gemini",
+                    prompt="Hello",
+                    reserved_output_tokens=route.params.get("max_tokens", 5),
+                )
                 await self.google_new_client.aio.models.generate_content(
                     model=route.model,
                     contents="Hello",
@@ -10249,6 +11557,13 @@ class AIService:
                 health_status["gemini"] = True
             else:
                 health_status["gemini"] = False
+        except ContextAdmissionError:
+            logger.warning(
+                "health probe blocked by context admission (capacity metadata "
+                "missing), not a provider outage: %s",
+                route.model,
+            )
+            health_status["gemini"] = False
         except Exception as e:
             logger.error(f"Gemini health check failed: {str(e)}")
             health_status["gemini"] = False
@@ -10257,6 +11572,13 @@ class AIService:
         try:
             if self.xai_client:
                 route = resolve_call("health.xai")
+                await self._admit_chat_call(
+                    provider="xai",
+                    model_id=route.model,
+                    call_id="health.xai",
+                    prompt="Hello",
+                    reserved_output_tokens=route.params.get("max_tokens", 5),
+                )
                 await self.xai_client.chat.completions.create(
                     model=route.model,
                     messages=[{"role": "user", "content": "Hello"}],
@@ -10265,6 +11587,13 @@ class AIService:
                 health_status["xai"] = True
             else:
                 health_status["xai"] = False
+        except ContextAdmissionError:
+            logger.warning(
+                "health probe blocked by context admission (capacity metadata "
+                "missing), not a provider outage: %s",
+                route.model,
+            )
+            health_status["xai"] = False
         except Exception as e:
             logger.error(f"xAI health check failed: {str(e)}")
             health_status["xai"] = False
@@ -10273,6 +11602,13 @@ class AIService:
         try:
             if self.minimax_client:
                 route = resolve_call("health.minimax")
+                await self._admit_chat_call(
+                    provider="minimax",
+                    model_id=route.model,
+                    call_id="health.minimax",
+                    prompt="Hello",
+                    reserved_output_tokens=route.params.get("max_tokens", 5),
+                )
                 await self.minimax_client.chat.completions.create(
                     model=route.model,
                     messages=[{"role": "user", "content": "Hello"}],
@@ -10281,6 +11617,13 @@ class AIService:
                 health_status["minimax"] = True
             else:
                 health_status["minimax"] = False
+        except ContextAdmissionError:
+            logger.warning(
+                "health probe blocked by context admission (capacity metadata "
+                "missing), not a provider outage: %s",
+                route.model,
+            )
+            health_status["minimax"] = False
         except Exception as e:
             logger.error(f"MiniMax health check failed: {str(e)}")
             health_status["minimax"] = False
@@ -10293,6 +11636,13 @@ class AIService:
                     "moonshot",
                     route.model,
                 )
+                await self._admit_chat_call(
+                    provider="moonshot",
+                    model_id=route.model,
+                    call_id="health.moonshot",
+                    prompt="Hello",
+                    reserved_output_tokens=route.params.get("max_tokens", 5),
+                )
                 await self.moonshot_client.chat.completions.create(
                     model=route.model,
                     messages=[{"role": "user", "content": "Hello"}],
@@ -10301,10 +11651,21 @@ class AIService:
                 health_status["moonshot"] = True
             else:
                 health_status["moonshot"] = False
+        except ContextAdmissionError:
+            logger.warning(
+                "health probe blocked by context admission (capacity metadata "
+                "missing), not a provider outage: %s",
+                route.model,
+            )
+            health_status["moonshot"] = False
         except Exception as e:
             logger.error(f"Moonshot health check failed: {str(e)}")
             health_status["moonshot"] = False
 
+        # Probes admit via ``_admit_chat_call`` but never emit usage through
+        # ``_emit_usage``; clear the carrier so the next generation on this
+        # task cannot inherit a stale probe admission report (AIS-09).
+        _last_admission_report.set(None)
         return health_status
 
     async def _stream_openai(
@@ -10328,7 +11689,7 @@ class AIService:
     ):
         """Stream OpenAI content generation with optional JSON Schema and vision support"""
         if not self.openai_client:
-            self._initialize_clients()
+            raise ValueError("OpenAI client not initialized")
 
         extra_payload = usage_extra or {}
 
@@ -10480,8 +11841,31 @@ class AIService:
                     )
                 except Exception as stream_error:
                     logger.error(f"GPT-5 streaming failed to initialize: {str(stream_error)}")
-                    logger.error(f"GPT-5 parameters that failed: {create_params}")
-                    raise Exception(f"GPT-5 streaming initialization failed: {str(stream_error)}")
+                    # Never log full payloads at ERROR: messages may contain
+                    # user text, attachments or PII. Log metadata only; the
+                    # full payload stays behind the opt-in extra_verbose channel.
+                    failed_messages = create_params.get("messages") or []
+                    failed_message_chars = sum(
+                        len(msg.get("content") or "")
+                        for msg in failed_messages
+                        if isinstance(msg, dict) and isinstance(msg.get("content"), str)
+                    )
+                    logger.error(
+                        f"GPT-5 failed parameters summary: model={create_params.get('model')}, "
+                        f"max_completion_tokens={create_params.get('max_completion_tokens')}, "
+                        f"messages={len(failed_messages)} (text_chars={failed_message_chars}), "
+                        f"json_mode={'response_format' in create_params}, "
+                        f"reasoning_effort={create_params.get('reasoning_effort')}"
+                    )
+                    if extra_verbose:
+                        logger.info(f"[EXTRA_VERBOSE] GPT-5 parameters that failed: {create_params}")
+                    # Wrap in RuntimeError (never a bare generic Exception)
+                    # while preserving the cause chain and structured provider
+                    # signals for failure classification (AIS-12).
+                    raise _wrap_preserving_provider_signals(
+                        f"GPT-5 streaming initialization failed: {str(stream_error)}",
+                        stream_error,
+                    )
             else:
                 # Standard GPT models
                 if extra_verbose:
@@ -10541,16 +11925,6 @@ class AIService:
                 if hasattr(chunk, "usage") and chunk.usage:
                     usage_obj = chunk.usage
 
-            # CRITICAL: Validate that we received content
-            if chunk_count == 0 or not total_content.strip():
-                error_msg = f"Streaming completed but no content received from {model_id} (chunks: {chunk_count}, content length: {len(total_content)})"
-                logger.error(error_msg)
-                logger.error(f"This might indicate a model configuration issue or API problem")
-                raise Exception(error_msg)
-
-            if extra_verbose:
-                logger.info(f"[EXTRA_VERBOSE] Streaming completed for {model_id} - received {chunk_count} chunks, {len(total_content)} characters")
-
             if hasattr(stream, "response"):
                 usage_obj = getattr(stream.response, "usage", usage_obj)
             elif hasattr(stream, "usage") and stream.usage:
@@ -10563,6 +11937,23 @@ class AIService:
                 max_tokens=max_tokens,
                 fallback_finish_reason=finish_reason,
             )
+            # Finish metadata is authoritative for an otherwise-empty stream.
+            # A classified unusable finish bypasses the generic zero-output
+            # error and reaches downstream consumers as terminal metadata.
+            # Unexplained empty output keeps the historical retry path.
+            if (
+                (chunk_count == 0 or not total_content.strip())
+                and not usage_with_finish.get("finish_unusable")
+            ):
+                error_msg = (
+                    "Streaming completed but no content received from "
+                    f"{model_id} (chunks: {chunk_count}, "
+                    f"content length: {len(total_content)})"
+                )
+                logger.error(error_msg)
+                logger.error("This might indicate a model configuration issue or API problem")
+                raise RuntimeError(error_msg)
+
             self._emit_usage(
                 usage_callback,
                 resolved_model_id or model_id,
@@ -10579,6 +11970,15 @@ class AIService:
                     max_tokens=max_tokens,
                 ),
             )
+
+            if extra_verbose:
+                logger.info(
+                    "[EXTRA_VERBOSE] Streaming completed for %s - received "
+                    "%d chunks, %d characters",
+                    model_id,
+                    chunk_count,
+                    len(total_content),
+                )
 
         except Exception as e:
             logger.error(f"OpenAI streaming error: {e}")
@@ -10606,7 +12006,7 @@ class AIService:
     ):
         """Stream Claude content generation with optional Structured Outputs and vision support"""
         if not self.anthropic_client:
-            self._initialize_clients()
+            raise ValueError("Claude client not initialized")
 
         extra_payload = usage_extra or {}
 
@@ -10915,25 +12315,18 @@ class AIService:
 
             try:
                 async for chunk in stream_response:
-                    # Extract text from streaming chunks
-                    if hasattr(chunk, 'text') and chunk.text:
+                    candidates = getattr(chunk, "candidates", None) or []
+                    if candidates:
+                        candidate_finish = getattr(
+                            candidates[0], "finish_reason", None
+                        )
+                        if candidate_finish is not None:
+                            finish_reason = candidate_finish
+
+                    chunk_text = self._extract_text_from_gemini_response(chunk)
+                    if chunk_text:
                         yielded_chunks = True
-                        yield chunk.text
-                    elif hasattr(chunk, 'candidates') and chunk.candidates:
-                        candidate = chunk.candidates[0]
-                        if getattr(candidate, "finish_reason", None) is not None:
-                            finish_reason = getattr(candidate, "finish_reason", None)
-                        if hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts'):
-                            try:
-                                for part in candidate.content.parts:
-                                    if hasattr(part, 'text') and part.text:
-                                        yielded_chunks = True
-                                        yield part.text
-                            except TypeError as type_err:
-                                fallback_needed = not yielded_chunks
-                                fallback_reason = type_err
-                                logger.error(f"New Gemini SDK streaming error while iterating parts: {type_err}")
-                                break
+                        yield chunk_text
 
                     if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
                         usage_metadata = chunk.usage_metadata
@@ -10973,8 +12366,10 @@ class AIService:
                         request_timeout=request_timeout,
                         json_output=json_output,
                         json_schema=json_schema,
+                        images=images,
                     )
                     if fallback_text:
+                        yielded_chunks = True
                         yield fallback_text
                     usage_metadata = fallback_usage
                     if isinstance(fallback_usage, dict):
@@ -10998,6 +12393,19 @@ class AIService:
                 usage_with_finish,
                 extra_payload,
             )
+            if not yielded_chunks:
+                raise GenerationStoppedUnexpectedly(
+                    "Gemini streaming returned no text; the response should not "
+                    "be treated as a completed generation.",
+                    provider=provider,
+                    model_id=model_id,
+                    finish_reason=usage_with_finish.get("finish_reason"),
+                    finish_reason_category=usage_with_finish.get(
+                        "finish_reason_category"
+                    ),
+                    partial_content="",
+                    usage=dict(usage_with_finish),
+                )
             yield StreamChunk(
                 "",
                 is_thinking=False,
@@ -11042,7 +12450,7 @@ class AIService:
             images: Optional list of ImageData objects for vision-enabled requests
         """
         if not self.xai_client:
-            self._initialize_clients()
+            raise ValueError("xAI client not initialized")
 
         extra_payload = usage_extra or {}
 
@@ -11171,7 +12579,7 @@ class AIService:
     ):
         """Stream OpenRouter content generation with optional JSON Schema and vision support"""
         if not self.openrouter_client:
-            self._initialize_clients()
+            raise ValueError("OpenRouter client not initialized")
 
         extra_payload = usage_extra or {}
 
@@ -11232,6 +12640,10 @@ class AIService:
                     request_kwargs["extra_body"] = {"provider": {"require_parameters": True}}
                     logger.info(f"Using OpenRouter JSON mode (streaming, flexible) for {model_id}")
 
+            # Disable provider context compression on every OpenRouter payload (D15).
+            request_kwargs["extra_body"] = self._with_openrouter_compression_disabled(
+                request_kwargs.get("extra_body")
+            )
             stream = await self.openrouter_client.chat.completions.create(
                 **create_params,
                 **request_kwargs,
@@ -11302,9 +12714,6 @@ class AIService:
     ):
         """Stream content through an OpenAI-compatible Chat Completions provider."""
 
-        if not client:
-            self._initialize_clients()
-            client = getattr(self, f"{provider_key}_client", None)
         if not client:
             raise ValueError(f"{display_name} client not initialized")
 
@@ -11558,10 +12967,10 @@ class AIService:
                 **request_kwargs,
             )
 
-        return response.choices[0].message.content, self._usage_with_finish_metadata(
-            getattr(response, "usage", None),
+        return self._chat_completion_content_and_usage(
             response,
             provider="ollama",
+            model_id=model_id,
             max_tokens=max_tokens,
         )
 
@@ -11593,7 +13002,7 @@ class AIService:
             usage_extra: Extra usage tracking data
         """
         if not self.ollama_client:
-            self._initialize_clients()
+            raise ValueError("Ollama client not initialized. Set OLLAMA_HOST in your environment.")
 
         extra_payload = usage_extra or {}
 
@@ -11875,6 +13284,12 @@ class AIService:
         if not model:
             model = resolve_call("embedding.openai").model
 
+        # Context guard BEFORE dispatch. An admission verdict is fatal (must never
+        # be swallowed into empty vectors); it is raised before the SDK call.
+        await self._admit_embedding_batch(
+            texts, provider="openai", model=model, call_id="embedding.openai"
+        )
+
         try:
             response = await self.openai_client.embeddings.create(
                 model=model,
@@ -11885,23 +13300,53 @@ class AIService:
 
         except Exception as e:
             logger.error(f"OpenAI embedding error: {e}")
+            last_error: Exception = e
             try:
                 fallback_model = resolve_call("embedding.openai_fallback").model
                 if fallback_model and fallback_model != model:
+                    # Re-admit against the fallback model before retrying.
+                    await self._admit_embedding_batch(
+                        texts,
+                        provider="openai",
+                        model=fallback_model,
+                        call_id="embedding.openai_fallback",
+                    )
                     response = await self.openai_client.embeddings.create(
                         model=fallback_model,
                         input=texts
                     )
                     return [item.embedding for item in response.data]
+            except ContextAdmissionError:
+                # A fallback-model admission verdict is fatal — never empty vectors.
+                raise
             except Exception as e2:
                 logger.error(f"OpenAI embedding fallback failed: {e2}")
+                last_error = e2
 
+            # Degraded batch: keep the documented empty-vector fallback,
+            # but count it in provider health so an embeddings outage is
+            # visible instead of silently decaying every similarity score
+            # to 0.0 (AIS-07).
+            await self._record_provider_health_failure(
+                classify_provider_exception(
+                    last_error,
+                    provider="openai",
+                    model_id=model,
+                    operation="embeddings",
+                )
+            )
             return [[] for _ in texts]
 
     async def _get_google_embeddings(self, texts: List[str], model: str = None) -> List[List[float]]:
         """Get embeddings using Google/Gemini API"""
         if not model:
             model = resolve_call("embedding.google").model
+
+        # Context guard BEFORE dispatch. An admission verdict is fatal (must never
+        # be swallowed into empty vectors); it is raised before the SDK call.
+        await self._admit_embedding_batch(
+            texts, provider="google", model=model, call_id="embedding.google"
+        )
 
         try:
             from google.genai import types
@@ -11922,6 +13367,16 @@ class AIService:
 
         except Exception as e:
             logger.error(f"Google embedding error: {e}")
+            # Degraded batch: keep the documented empty-vector fallback,
+            # but count it in provider health (AIS-07).
+            await self._record_provider_health_failure(
+                classify_provider_exception(
+                    e,
+                    provider="google",
+                    model_id=model,
+                    operation="embeddings",
+                )
+            )
             return [[] for _ in texts]
 
     async def calculate_similarity(self, text1: str, text2: str, model: str = None) -> float:

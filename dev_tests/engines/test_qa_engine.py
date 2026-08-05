@@ -17,7 +17,6 @@ Functions tested:
 - QAEngine.evaluate_all_layers(): Non-progress evaluation
 - QAEngine.evaluate_all_layers_with_progress(): Progress-tracked evaluation
 - QAEngine._create_iteration_stop_result(): Iteration stop result
-- QAEngine._create_gran_sabio_modified_result(): Modified content result
 - QAEngine._calculate_summary(): Summary statistics
 - QAEngine._identify_critical_issues(): Issue identification
 - QAEngine.validate_layers(): Layer validation
@@ -1050,56 +1049,6 @@ class TestCreateIterationStopResult:
         assert result["summary"]["total_evaluations"] == 1
 
 
-class TestCreateGranSabioModifiedResult:
-    """Tests for _create_gran_sabio_modified_result()."""
-
-    def test_creates_result_with_modified_content(self, qa_engine):
-        """
-        Given: Partial results and modified content
-        When: _create_gran_sabio_modified_result() is called
-        Then: Includes modified content and metadata
-        """
-        partial_results = {
-            "Layer1": {
-                "gpt-4o": QAEvaluation(
-                    model="gpt-4o", layer="Layer1", score=7.0,
-                    feedback="OK", deal_breaker=False, passes_score=True
-                )
-            }
-        }
-
-        result = qa_engine._create_gran_sabio_modified_result(
-            partial_results=partial_results,
-            modified_content="Modified test content",
-            reason="Fixed factual error",
-            score=8.5
-        )
-
-        assert result["gran_sabio_modified_content"] == "Modified test content"
-        assert result["gran_sabio_modification_reason"] == "Fixed factual error"
-        assert result["gran_sabio_score"] == 8.5
-        assert result["summary"]["gran_sabio_modified"] is True
-        assert result["summary"]["force_iteration"] is True
-
-    def test_sets_no_deal_breakers(self, qa_engine):
-        """
-        Given: Gran Sabio approved with modifications
-        When: _create_gran_sabio_modified_result() is called
-        Then: Sets has_deal_breakers=False
-        """
-        partial_results = {}
-
-        result = qa_engine._create_gran_sabio_modified_result(
-            partial_results=partial_results,
-            modified_content="Fixed content",
-            reason="Corrected",
-            score=9.0
-        )
-
-        assert result["summary"]["has_deal_breakers"] is False
-        assert result["summary"]["deal_breakers_count"] == 0
-
-
 # ============================================================================
 # Test: Evaluate All Layers with Progress
 # ============================================================================
@@ -1503,7 +1452,7 @@ class TestGranSabioEscalation:
         """
         Given: Gran Sabio approves with modifications (minority 1/3 deal-breaker)
         When: evaluate_all_layers_with_progress() is called
-        Then: Returns result with modified content
+        Then: Modified content is discarded; evaluation continues as false positive
         """
         # Only first model returns deal-breaker (1/3 = minority)
         call_count = [0]
@@ -1545,8 +1494,12 @@ class TestGranSabioEscalation:
                     gran_sabio_engine=gran_sabio
                 )
 
-        assert results.get("gran_sabio_modified_content") == "Corrected content here"
-        assert results.get("summary", {}).get("gran_sabio_modified") is True
+        # The "approved with modifications" branch was removed (QA-04): the
+        # modified content must not surface in the result and the evaluation
+        # continues with the original content as a Gran Sabio false positive.
+        assert results.get("gran_sabio_modified_content") is None
+        assert results.get("summary", {}).get("gran_sabio_modified") is not True
+        assert "Test Quality" in results
         gran_sabio.review_minority_deal_breakers.assert_called_once()
 
     @pytest.mark.asyncio

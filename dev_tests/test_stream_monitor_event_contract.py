@@ -57,6 +57,11 @@ def test_frontend_structured_events_and_terminal_statuses_are_known():
         "validate_draft_oversize",
         "tool_loop_error",
         "tool_loop_complete",
+        # Verdicts of a dead attempt (C3/C5-bis/C6): the monitor must render
+        # them instead of logging "Unknown event type".
+        "iteration_rejected",
+        "tool_loop_rejected",
+        "review_attempt_rejected",
     ):
         assert event_type in source
 
@@ -98,6 +103,49 @@ def test_frontend_structured_events_and_terminal_statuses_are_known():
     assert "if (!line)" in source
     assert "appendContent('status'" not in source
     assert "Event: ${eventType} (phase:" not in source
+
+
+def test_frontend_knows_the_rejection_events_of_the_content_contract():
+    """The three verdict events must be inside KNOWN_STRUCTURED_EVENTS itself."""
+    source = STREAM_MONITOR_JS.read_text(encoding="utf-8")
+    known_events = source.split("const KNOWN_STRUCTURED_EVENTS = new Set([", 1)[1]
+    known_events = known_events.split("]);", 1)[0]
+
+    for event_type in ("iteration_rejected", "tool_loop_rejected", "review_attempt_rejected"):
+        assert f"'{event_type}'" in known_events
+
+    # They render as an explicit rejection line, not as "Unknown event type".
+    assert "eventType === 'iteration_rejected'" in source
+    assert "eventType === 'tool_loop_rejected' || eventType === 'review_attempt_rejected'" in source
+
+
+def test_frontend_replaces_the_draft_on_a_labelled_commit():
+    """C0.7: accepted/rejected/filtered chunks are snapshots, never deltas."""
+    source = STREAM_MONITOR_JS.read_text(encoding="utf-8")
+    template = STREAM_MONITOR_TEMPLATE.read_text(encoding="utf-8")
+
+    assert "function isSnapshotChunk(data)" in source
+    assert "const isSnapshot = isSnapshotChunk(data);" in source
+    assert "iterData.content[phase] = banner + content;" in source
+    assert "indexQAContent(iterData, data, banner + content, { replace: isSnapshot });" in source
+    assert "function replacePanelContent(" in source
+
+    # The operator can tell a draft from a commit: labelled banner + styling.
+    for status in ("draft", "accepted", "rejected", "filtered"):
+        assert f"{status}: '{status.upper()}'," in source
+    assert ".monitor-line-accepted" in template
+    assert ".monitor-line-rejected" in template
+    assert ".monitor-token-draft" in template
+
+
+def test_generation_ui_keeps_full_visibility_and_replaces_on_commit():
+    """app.js is the owner's live view: full visibility, honest labels."""
+    source = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+
+    assert "visibility=canonical" not in source
+    assert "new EventSource(`/stream/project/${this.currentSession}`)" in source
+    assert "append: contentStatus === 'draft'" in source
+    assert "contentStatus: contentStatus," in source
 
 
 def test_project_phase_events_can_mark_thinking_chunks():
@@ -268,6 +316,97 @@ async def test_monitor_active_counts_gran_sabio_review(monkeypatch):
     project = next(p for p in payload["projects"] if p["project_id"] == "project-monitor-gran-sabio")
     assert project["status"] == "running"
     assert project["active_sessions"] == 2
+
+
+@pytest.mark.asyncio
+async def test_monitor_active_lists_sessions_with_phase_per_project(monkeypatch):
+    """C11: the phase of each session is visible without opening a stream."""
+    from core import app_state
+    from core.monitor_routes import list_active_connections
+
+    original_sessions = dict(app_state.active_sessions)
+    original_lock = app_state.active_sessions_lock
+    monkeypatch.setattr(app_state, "active_sessions_lock", None)
+    app_state.active_sessions.clear()
+    app_state.active_sessions["session-phase-a"] = {
+        "project_id": "project-phases",
+        "request_name": "Chapter 1",
+        "status": GenerationStatus.GENERATING,
+        "current_phase": "generating",
+        "current_iteration": 2,
+        "max_iterations": 5,
+        "created_at": datetime.utcnow(),
+    }
+    app_state.active_sessions["session-phase-b"] = {
+        "project_id": "project-phases",
+        "request_name": "Chapter 2",
+        "status": GenerationStatus.QA_EVALUATION,
+        "current_phase": "qa_evaluation",
+        "current_iteration": 1,
+        "max_iterations": 5,
+        "created_at": datetime.utcnow(),
+    }
+
+    try:
+        payload = await list_active_connections()
+    finally:
+        app_state.active_sessions.clear()
+        app_state.active_sessions.update(original_sessions)
+        monkeypatch.setattr(app_state, "active_sessions_lock", original_lock)
+
+    project = next(p for p in payload["projects"] if p["project_id"] == "project-phases")
+    assert project["session_count"] == 2
+    assert project["sessions"] == [
+        {
+            "session_id": "session-phase-a",
+            "request_name": "Chapter 1",
+            "status": "generating",
+            "phase": "generating",
+            "current_iteration": 2,
+            "max_iterations": 5,
+        },
+        {
+            "session_id": "session-phase-b",
+            "request_name": "Chapter 2",
+            "status": "qa_evaluation",
+            "phase": "qa_evaluation",
+            "current_iteration": 1,
+            "max_iterations": 5,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_monitor_active_bounds_the_session_list_with_limit(monkeypatch):
+    """The session list uses the endpoint's own limit so payloads stay bounded."""
+    from core import app_state
+    from core.monitor_routes import list_active_connections
+
+    original_sessions = dict(app_state.active_sessions)
+    original_lock = app_state.active_sessions_lock
+    monkeypatch.setattr(app_state, "active_sessions_lock", None)
+    app_state.active_sessions.clear()
+    for index in range(5):
+        app_state.active_sessions[f"session-bounded-{index}"] = {
+            "project_id": "project-bounded",
+            "request_name": f"Request {index}",
+            "status": GenerationStatus.GENERATING,
+            "current_phase": "generating",
+            "created_at": datetime.utcnow(),
+        }
+
+    try:
+        payload = await list_active_connections(limit=2)
+    finally:
+        app_state.active_sessions.clear()
+        app_state.active_sessions.update(original_sessions)
+        monkeypatch.setattr(app_state, "active_sessions_lock", original_lock)
+
+    project = next(p for p in payload["projects"] if p["project_id"] == "project-bounded")
+    assert project["session_count"] == 5
+    assert len(project["sessions"]) == 2
+    assert project["sessions"][0]["current_iteration"] == 0
+    assert project["sessions"][0]["max_iterations"] == 0
 
 
 @pytest.mark.asyncio

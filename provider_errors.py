@@ -242,6 +242,81 @@ def _feature_error_matches_attempt(
     return False
 
 
+# Structured provider error codes that unambiguously mark a context-window
+# overflow. Machine-generated API markers, so mechanical matching is allowed.
+_CONTEXT_OVERFLOW_CODE_MARKERS = frozenset(
+    {
+        "context_length_exceeded",
+        "context_window_exceeded",
+    }
+)
+
+
+def _is_context_overflow_signal(
+    *,
+    provider: Optional[str],
+    err_type: Optional[str],
+    err_code: Optional[str],
+    message: Optional[str],
+) -> bool:
+    """Return True when a provider exception reports a context-window overflow.
+
+    Structured fields (OpenAI ``code == "context_length_exceeded"``) win first;
+    otherwise provider-documented, machine-generated message markers are matched
+    (allowed mechanical parsing — never semantic interpretation). Provider
+    gating keeps the phrase set tight per provider so a plain
+    ``invalid_request`` is not misclassified.
+    """
+
+    markers = _normalized_error_markers(err_type, err_code)
+    if markers.intersection(_CONTEXT_OVERFLOW_CODE_MARKERS):
+        return True
+
+    text = (message or "").strip().lower()
+    if not text:
+        return False
+
+    prov = (provider or "").strip().lower()
+
+    if prov in {"openai", "openrouter", "xai", "minimax", "moonshot"}:
+        if "context_length_exceeded" in text or "maximum context length" in text:
+            return True
+    if prov in {"claude", "anthropic"}:
+        # Anthropic returns invalid_request_error "prompt is too long: N tokens > M".
+        if "prompt is too long" in text:
+            return True
+    if prov in {"gemini", "google"}:
+        if "input token count" in text and "exceed" in text:
+            return True
+        if "exceeds the maximum number of tokens" in text:
+            return True
+        if (
+            "context" in text
+            and ("window" in text or "length" in text or "token" in text)
+            and "exceed" in text
+        ):
+            return True
+    return False
+
+
+def is_context_overflow_exception(exc: BaseException, *, provider: str) -> bool:
+    """Return True when ``exc`` is a provider-reported context-window overflow.
+
+    Single source of truth for context-overflow detection, reused by the
+    retry paths (via :func:`classify_provider_exception`) and by the tool-loop
+    mid-loop translator in ``ai_service``.
+    """
+
+    payload = _provider_error_payload(exc)
+    err_type, err_code, _err_param = _extract_error_fields(payload)
+    return _is_context_overflow_signal(
+        provider=provider,
+        err_type=err_type,
+        err_code=err_code,
+        message=str(exc or "").lower(),
+    )
+
+
 def _is_overload_signal(
     *,
     status: Optional[int],
@@ -313,11 +388,6 @@ def classify_provider_exception(
         kind = ProviderErrorKind.CANCELLED
     elif isinstance(exc, asyncio.TimeoutError):
         kind = ProviderErrorKind.TIMEOUT
-    elif isinstance(exc, AttributeError) and status is None and any(
-        marker in message_lower
-        for marker in ("aiohttp", "connector", "client", "http", "socket")
-    ):
-        kind = ProviderErrorKind.TRANSIENT_NETWORK
     elif status is None and "timeout" in message_lower:
         kind = ProviderErrorKind.TIMEOUT
     elif status is None and any(
@@ -341,6 +411,16 @@ def classify_provider_exception(
         )
     ):
         kind = ProviderErrorKind.TRANSIENT_NETWORK
+    elif _is_context_overflow_signal(
+        provider=provider,
+        err_type=err_type,
+        err_code=err_code,
+        message=message_lower,
+    ):
+        # Context-window overflow (structured code or provider-documented marker).
+        # Checked before the generic 400/422 handling so it is not misclassified
+        # as a plain invalid_request. Non-retryable by contract.
+        kind = ProviderErrorKind.CONTEXT_OVERFLOW
     elif status == 400:
         if _feature_error_matches_attempt(
             attempted_feature,

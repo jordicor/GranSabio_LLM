@@ -8,7 +8,12 @@ from typing import Any, Dict, Optional
 
 from model_aliasing import get_evaluator_alias
 from models import QALayer
-from qa_result_utils import build_qa_counts, is_valid_semantic_qa_result
+from qa_result_utils import (
+    build_qa_counts,
+    is_valid_semantic_qa_result,
+    required_valid_qa_models,
+    resolve_effective_required_valid,
+)
 
 from .feedback_formatter import create_user_friendly_reason
 
@@ -41,6 +46,15 @@ def _build_grounding_reason(grounding_result: Dict[str, Any]) -> str:
     if isinstance(max_budget_gap, (int, float)):
         reason += f" (max budget gap: {max_budget_gap:.2f} bits)"
     return reason
+
+
+def _effective_required_valid(request: Any) -> Optional[int]:
+    """Resolve the valid-quorum the scheduler applied for this request, if known."""
+
+    qa_models = getattr(request, "qa_models", None) or []
+    if not qa_models:
+        return None
+    return resolve_effective_required_valid(request, len(qa_models))
 
 
 def _evaluate_layer_based_approval(
@@ -155,7 +169,11 @@ def _evaluate_layer_based_approval(
             evaluated_layers=evaluated_layers,
         )
 
-    majority_deal_breakers = _check_majority_deal_breakers(qa_results, request.qa_models)
+    majority_deal_breakers = _check_majority_deal_breakers(
+        qa_results,
+        request.qa_models,
+        required_valid=_effective_required_valid(request),
+    )
     if majority_deal_breakers["has_majority_deal_breakers"]:
         user_friendly_reason = create_user_friendly_reason(
             qa_summary,
@@ -186,7 +204,11 @@ def _evaluate_layer_based_approval(
         }
 
     # Step 2: Check for 50-50 ties first (exact 50% deal-breakers should escalate to Gran Sabio)
-    tie_deal_breakers = _check_50_50_tie_deal_breakers(qa_results, request.qa_models)
+    tie_deal_breakers = _check_50_50_tie_deal_breakers(
+        qa_results,
+        request.qa_models,
+        required_valid=_effective_required_valid(request),
+    )
     if tie_deal_breakers["has_50_50_ties"]:
         user_friendly_reason = create_user_friendly_reason(
             qa_summary,
@@ -205,7 +227,11 @@ def _evaluate_layer_based_approval(
         }
 
     # Step 3: Check for minority deal-breakers (will escalate to Gran Sabio)
-    minority_deal_breakers = _check_minority_deal_breakers(qa_results, request.qa_models)
+    minority_deal_breakers = _check_minority_deal_breakers(
+        qa_results,
+        request.qa_models,
+        required_valid=_effective_required_valid(request),
+    )
     if minority_deal_breakers["has_minority_deal_breakers"]:
         # Don't reject immediately - let it go to Gran Sabio for review
         user_friendly_reason = create_user_friendly_reason(
@@ -420,14 +446,15 @@ def _evaluate_fast_global_approval(
     }
 
 
-def _check_majority_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
+def _check_majority_deal_breakers(qa_results, qa_models, required_valid: Optional[int] = None) -> Dict[str, Any]:
     """Check for majority deal-breakers across all available QA layer results."""
 
     majority_layers = []
     total_models = len(qa_models) if qa_models else 0
 
     for layer_name, model_results in qa_results.items():
-        counts = build_qa_counts(model_results, total_models or len(model_results))
+        configured_count = total_models or len(model_results)
+        counts = build_qa_counts(model_results, configured_count, required_valid=required_valid)
         valid_total = counts["valid"]
         if valid_total == 0:
             continue
@@ -446,10 +473,14 @@ def _check_majority_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
                 )
 
         deal_breaker_count = len(layer_details)
+        # Fail-closed: a valid semantic deal-breaker found while the layer ran
+        # below the default quorum must block the content, never slip through
+        # to the score-only gates.
+        below_default_quorum = valid_total < required_valid_qa_models(configured_count)
         if (
             valid_total >= counts["required_valid"]
             and deal_breaker_count >= counts["required_majority"]
-        ):
+        ) or (deal_breaker_count > 0 and below_default_quorum):
             majority_layers.append(
                 {
                     "layer": layer_name,
@@ -469,7 +500,7 @@ def _check_majority_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
     }
 
 
-def _check_minority_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
+def _check_minority_deal_breakers(qa_results, qa_models, required_valid: Optional[int] = None) -> Dict[str, Any]:
     """
     Check for minority deal-breakers across all layers.
     """
@@ -479,7 +510,11 @@ def _check_minority_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
     total_models = len(qa_models) if qa_models else 0
 
     for layer_name, model_results in qa_results.items():
-        counts = build_qa_counts(model_results, total_models or len(model_results))
+        counts = build_qa_counts(
+            model_results,
+            total_models or len(model_results),
+            required_valid=required_valid,
+        )
         layer_total = counts["valid"]
         if layer_total == 0:
             continue
@@ -519,7 +554,7 @@ def _check_minority_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
     }
 
 
-def _check_50_50_tie_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
+def _check_50_50_tie_deal_breakers(qa_results, qa_models, required_valid: Optional[int] = None) -> Dict[str, Any]:
     """
     Check for 50-50 tie deal-breakers across all layers that should escalate to Gran Sabio.
     Only applies when there's an even number of models and exactly 50% are deal-breakers.
@@ -532,7 +567,11 @@ def _check_50_50_tie_deal_breakers(qa_results, qa_models) -> Dict[str, Any]:
         deal_breaker_count = 0
         approve_count = 0
         layer_details = []
-        counts = build_qa_counts(model_results, total_models or len(model_results))
+        counts = build_qa_counts(
+            model_results,
+            total_models or len(model_results),
+            required_valid=required_valid,
+        )
         valid_total = counts["valid"]
         if valid_total == 0 or valid_total % 2 != 0:
             continue

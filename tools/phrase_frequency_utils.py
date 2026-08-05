@@ -132,8 +132,15 @@ class PhraseFrequencyRuleSpec:
             # Legacy: use absolute limit
             return self.max_repetitions
         else:
-            # Fallback (should not happen if validation works)
-            return 999
+            # No usable limit configured. Request validation should reject
+            # such rules; if one still reaches this point, fail closed with
+            # the strictest limit so the repetition guard stays effective
+            # instead of silently degrading to an allow-everything threshold.
+            logger.warning(
+                "PhraseFrequencyRuleSpec without max_ratio_tokens/max_repetitions; "
+                "applying fail-closed repetition limit of 1"
+            )
+            return 1
 
 
 @dataclass

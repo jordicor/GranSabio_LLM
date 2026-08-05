@@ -3,20 +3,7 @@
  * Professional content generation interface with real-time progress tracking
  */
 
-/**
- * Escapes HTML special characters to prevent XSS attacks.
- * @param {string} str - The string to escape
- * @returns {string} - The escaped string safe for innerHTML
- */
-function escapeHtml(str) {
-    if (str === null || str === undefined) {
-        return '';
-    }
-    const text = String(str);
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-}
+// escapeHtml / escapeHtmlAttr come from /static/js/escape_utils.js (loaded first by the template).
 
 const SSE_MAX_ERRORS = 2;
 const SSE_FALLBACK_DELAY_MS = 8000;
@@ -254,7 +241,19 @@ class GranSabioInterface {
                     return;
                 }
                 if (typeof update.content === 'string' && (phase === 'generation' || phase === 'consensus')) {
-                    this.updateContentStream(update.content, { append: true });
+                    // Content contract (C0.7): only `draft` chunks are deltas.
+                    // Anything else (accepted commits, a rejected or filtered
+                    // candidate) carries the whole body of the attempt and
+                    // REPLACES the drafts already received.
+                    const contentStatus = typeof update.content_status === 'string' && update.content_status
+                        ? update.content_status
+                        : 'draft';
+                    this.updateContentStream(update.content, {
+                        append: contentStatus === 'draft',
+                        contentStatus: contentStatus,
+                        iteration: update.iteration,
+                        attemptId: update.attempt_id,
+                    });
                 }
                 return;
             }
@@ -398,12 +397,24 @@ class GranSabioInterface {
         }
     }
     
-    updateContentStream(text, { append = false } = {}) {
-        // Content streaming removed - final content shown only after completion
-        // See Live Matrix (/monitor) for real-time streaming
-        if (text) {
-            console.log('[Content Stream]', text.substring(0, 100) + (text.length > 100 ? '...' : ''));
+    updateContentStream(text, { append = false, contentStatus = null, iteration = null, attemptId = null } = {}) {
+        // This screen renders the final result only; the live per-phase panels
+        // are the Live Matrix (/monitor). What arrives here is traced with its
+        // content label so a draft is never read as the accepted text, and
+        // `append` states the delta-vs-snapshot semantics of the emission.
+        if (!text) {
+            return;
         }
+        const label = [
+            contentStatus ? `content_status=${contentStatus}` : null,
+            append ? 'delta' : 'snapshot',
+            iteration !== null && iteration !== undefined ? `iteration=${iteration}` : null,
+            attemptId !== null && attemptId !== undefined ? `attempt=${attemptId}` : null,
+        ].filter(Boolean).join(' ');
+        console.log(
+            `[Content Stream] ${label}`,
+            text.substring(0, 100) + (text.length > 100 ? '...' : '')
+        );
     }
     
     updateQAFeedback(qaFeedback) {
@@ -699,6 +710,8 @@ class GranSabioInterface {
             isDealBreaker: false
         };
 
+        // Static skeleton only: layer data is assigned via DOM properties below,
+        // never interpolated into HTML (attribute/text injection).
         const layerHtml = `
             <div class="qa-layer" id="${layerId}">
                 <div class="qa-layer-header">
@@ -710,30 +723,30 @@ class GranSabioInterface {
                 <div class="form-row">
                     <div class="form-group">
                         <label class="form-label">Layer Name</label>
-                        <input type="text" class="form-input" name="layerName" value="${defaultData.name}" required>
+                        <input type="text" class="form-input" name="layerName" required>
                     </div>
                     <div class="form-group">
                         <label class="form-label">Description</label>
-                        <input type="text" class="form-input" name="layerDescription" value="${defaultData.description}" required>
+                        <input type="text" class="form-input" name="layerDescription" required>
                     </div>
                 </div>
                 <div class="form-group">
                     <label class="form-label">Evaluation Criteria</label>
-                    <textarea class="form-textarea" name="layerCriteria" rows="3" required>${defaultData.criteria}</textarea>
+                    <textarea class="form-textarea" name="layerCriteria" rows="3" required></textarea>
                 </div>
                 <div class="form-row">
                     <div class="form-group">
                         <label class="form-label">Minimum Score</label>
                         <div class="slider-container">
                             <input type="range" class="form-slider" name="layerMinScore" 
-                                   min="1" max="10" step="0.1" value="${defaultData.minScore}"
+                                   min="1" max="10" step="0.1"
                                    oninput="this.nextElementSibling.textContent = this.value">
-                            <span class="slider-value">${defaultData.minScore}</span>
+                            <span class="slider-value"></span>
                         </div>
                     </div>
                     <div class="form-group">
                         <label class="checkbox-label">
-                            <input type="checkbox" name="layerIsMandatory" ${defaultData.isMandatory ? 'checked' : ''}>
+                            <input type="checkbox" name="layerIsMandatory">
                             <span class="checkmark"></span>
                             Mandatory Layer
                         </label>
@@ -742,7 +755,6 @@ class GranSabioInterface {
                 <div class="form-group">
                     <label class="form-label">Deal-Breaker Criteria (Optional)</label>
                     <input type="text" class="form-input" name="layerDealBreakerCriteria" 
-                           value="${defaultData.dealBreakerCriteria || ''}"
                            placeholder="e.g., 'invents facts', 'uses offensive language'">
                     <small class="form-help">Specific facts that would immediately reject content</small>
                 </div>
@@ -750,6 +762,16 @@ class GranSabioInterface {
         `;
 
         qaLayersContainer.insertAdjacentHTML('beforeend', layerHtml);
+
+        const layerEl = document.getElementById(layerId);
+        layerEl.querySelector('[name="layerName"]').value = defaultData.name;
+        layerEl.querySelector('[name="layerDescription"]').value = defaultData.description;
+        layerEl.querySelector('[name="layerCriteria"]').value = defaultData.criteria;
+        const minScoreSlider = layerEl.querySelector('[name="layerMinScore"]');
+        minScoreSlider.value = defaultData.minScore;
+        minScoreSlider.nextElementSibling.textContent = defaultData.minScore;
+        layerEl.querySelector('[name="layerIsMandatory"]').checked = Boolean(defaultData.isMandatory);
+        layerEl.querySelector('[name="layerDealBreakerCriteria"]').value = defaultData.dealBreakerCriteria || '';
     }
 
     removeQALayer(layerId) {
@@ -1047,6 +1069,9 @@ class GranSabioInterface {
 
         let source;
         try {
+            // No `visibility` parameter on purpose: this is the owner's live
+            // view of their own run, so it subscribes with the default `full`
+            // and every emission arrives labelled (C0.6).
             source = new EventSource(`/stream/project/${this.currentSession}`);
         } catch (error) {
             console.error('Failed to create EventSource:', error);

@@ -5,6 +5,7 @@ Unified model admin and provider sync routes for Gran Sabio LLM.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -28,8 +29,34 @@ def _default_port(scheme: str) -> int | None:
     return None
 
 
+# Hostnames allowed to serve admin mutations (API-05). Comparing Origin with
+# the Host header is not enough against DNS rebinding, where an attacker
+# domain resolves to this server and both headers carry the attacker's name.
+# Default: loopback only. Override for LAN/remote deployments with
+# ADMIN_ALLOWED_HOSTNAMES="host1,host2".
+_DEFAULT_ADMIN_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _admin_allowed_hostnames() -> frozenset[str]:
+    """Return the admin hostname allowlist from the environment (or loopback)."""
+    raw = os.getenv("ADMIN_ALLOWED_HOSTNAMES", "")
+    hostnames = {
+        entry.strip().lower().rstrip(".")
+        for entry in raw.split(",")
+        if entry.strip()
+    }
+    return frozenset(hostnames) if hostnames else _DEFAULT_ADMIN_HOSTNAMES
+
+
 def require_admin_same_origin(request: Request) -> None:
     """Reject browser-originated admin mutations from a different origin."""
+    sec_fetch_site = request.headers.get("sec-fetch-site")
+    if sec_fetch_site and sec_fetch_site.strip().lower() == "cross-site":
+        raise HTTPException(
+            status_code=403,
+            detail="Admin mutation rejected: cross-site request",
+        )
+
     origin = request.headers.get("origin")
     referer = request.headers.get("referer")
     source = origin or referer
@@ -45,6 +72,13 @@ def require_admin_same_origin(request: Request) -> None:
         raise HTTPException(
             status_code=403,
             detail="Admin mutation rejected: invalid Origin/Referer",
+        )
+
+    request_hostname = (request_url.hostname or "").lower().rstrip(".")
+    if request_hostname not in _admin_allowed_hostnames():
+        raise HTTPException(
+            status_code=403,
+            detail="Admin mutation rejected: untrusted Host header",
         )
 
     source_port = parsed.port or _default_port(parsed.scheme)

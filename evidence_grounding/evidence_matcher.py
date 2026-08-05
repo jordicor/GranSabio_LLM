@@ -198,7 +198,10 @@ def _chunk_paragraph(
         start_offset: Character offset of paragraph start in original text
 
     Returns:
-        List of (text, start_char, end_char) tuples
+        List of (text, start_char, end_char) tuples. The offsets are
+        approximate: multi-sentence chunks are re-joined with a synthetic
+        single-space separator, so positions may drift from the original
+        context when it used other whitespace between sentences.
     """
     if len(paragraph) <= max_chars:
         return [(paragraph, start_offset, start_offset + len(paragraph))]
@@ -213,9 +216,16 @@ def _chunk_paragraph(
     for sentence in sentences:
         sentence_len = len(sentence)
 
-        # If single sentence exceeds max, we have to include it anyway
-        if sentence_len > max_chars and not current_chunk:
-            # Split long sentence at max_chars boundary
+        # A sentence longer than max_chars is always split, regardless of
+        # the current chunk state: flush any accumulated sentences first,
+        # then cut the long sentence at max_chars boundaries.
+        if sentence_len > max_chars:
+            if current_chunk:
+                chunk_text = ' '.join(current_chunk)
+                chunks.append((chunk_text, chunk_start, chunk_start + len(chunk_text)))
+                chunk_start += len(chunk_text) + 1  # +1 for space/newline
+                current_chunk = []
+                current_len = 0
             while sentence:
                 part = sentence[:max_chars]
                 chunks.append((part, chunk_start, chunk_start + len(part)))
@@ -254,6 +264,11 @@ def spanize_context(
     - Sequential IDs (S0, S1, S2, ...)
     - Respect for paragraph boundaries when possible
     - Classification of each span type
+
+    Note: ``start_char``/``end_char`` on the returned spans are approximate
+    positions (see :func:`_chunk_paragraph`); they are not guaranteed to be
+    exact offsets into the original context and no consumer should rely on
+    them for slicing it.
 
     Args:
         context: The full context/evidence text

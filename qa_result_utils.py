@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import hashlib
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from model_aliasing import get_evaluator_alias
 
@@ -70,6 +70,33 @@ def required_valid_qa_models(
     if ratio is not None:
         return max(1, min(math.ceil(configured_count * float(ratio)), configured_count))
     return math.floor(configured_count / 2) + 1
+
+
+def resolve_min_valid_quorum_overrides(request: Any) -> Tuple[Optional[int], Optional[float]]:
+    """Return the validated ``min_valid_qa_models``/``min_valid_qa_model_ratio`` overrides.
+
+    Mirrors the type checks the QA scheduler policy applies so every quorum
+    consumer resolves the same effective value from the same request knobs.
+    """
+
+    min_valid_models = getattr(request, "min_valid_qa_models", None) if request is not None else None
+    if not isinstance(min_valid_models, int):
+        min_valid_models = None
+    min_valid_ratio = getattr(request, "min_valid_qa_model_ratio", None) if request is not None else None
+    if not isinstance(min_valid_ratio, (int, float)):
+        min_valid_ratio = None
+    return min_valid_models, min_valid_ratio
+
+
+def resolve_effective_required_valid(request: Any, configured_count: int) -> int:
+    """Return the valid-quorum the QA scheduler applies for this request."""
+
+    min_valid_models, min_valid_ratio = resolve_min_valid_quorum_overrides(request)
+    return required_valid_qa_models(
+        configured_count,
+        absolute=min_valid_models,
+        ratio=min_valid_ratio,
+    )
 
 
 def is_technical_qa_failure(evaluation: Any) -> bool:

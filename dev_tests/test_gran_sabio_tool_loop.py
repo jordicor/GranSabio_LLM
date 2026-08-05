@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import deterministic_validation as deterministic_validation_module
+from content_events import ContentStatus
 from gran_sabio import (
     GRAN_SABIO_ESCALATION_SCHEMA,
     GRAN_SABIO_MINORITY_OVERRIDE_SCHEMA,
@@ -419,11 +420,14 @@ class TestRegenerateContentUsesToolLoop:
         assert result.final_content == '{"ok": true}'
         service.call_ai_with_validation_tools.assert_awaited_once()
         service.generate_content_stream.assert_not_called()
-        stream_callback.assert_awaited_once_with(
-            '{"ok": true}',
-            "claude-sonnet-4-20250514",
-            "content_regeneration",
-        )
+        # The tool loop produced the body in one shot: the only emission is the
+        # canonical commit, labelled accepted (C5-bis).
+        stream_callback.assert_awaited_once()
+        commit = stream_callback.await_args.args[0]
+        assert commit.content == '{"ok": true}'
+        assert commit.content_status == ContentStatus.ACCEPTED
+        assert commit.model == "claude-sonnet-4-20250514"
+        assert commit.layer == "content_regeneration"
 
         call_kwargs = service.call_ai_with_validation_tools.call_args.kwargs
         assert call_kwargs["output_contract"] == OutputContract.JSON_LOOSE
@@ -435,7 +439,7 @@ class TestRegenerateContentUsesToolLoop:
         self, request_with_tools, tool_loop_config
     ):
         """When `stream_callback` is provided, regenerate_content keeps the
-        legacy streaming path per §3.4.3 — the tool loop is skipped."""
+        streaming path and the tool loop is skipped."""
 
         service = MagicMock()
         service.call_ai_with_validation_tools = AsyncMock()

@@ -4,6 +4,10 @@ Enhanced Logging System for Gran Sabio LLM Engine
 
 Provides visual, colored, structured logging with phase tracking.
 IMPORTANT: No emojis in console output (Windows encoding issues).
+
+WARNING: extra_verbose mode (log_prompt/log_response) writes full prompts and
+responses in clear text to the logging output. When --file-logging is active,
+that output is also persisted to log files on disk (see file_logger.py).
 """
 
 import logging
