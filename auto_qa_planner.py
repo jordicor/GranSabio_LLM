@@ -15,7 +15,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 import json_utils as json
 from ai_service import is_content_filter_stop
 from config import config
-from llm_routing import resolve_call, resolve_temperature
+from llm_routing import endpoint_id_call_kwargs, resolve_call, resolve_temperature
+from local_execution_policy import LocalExecutionPolicyError
 from model_aliasing import (
     ModelAliasRegistry,
     ModelIdentityLeakError,
@@ -618,6 +619,7 @@ async def run_auto_qa_planning(
     usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     phase_logger: Optional[Any] = None,
     cancellation_token: Optional[Any] = None,
+    local_execution: Optional[Any] = None,
 ) -> AutoQAPlanResult:
     """Call GranSabio as planner and return a validated Auto-QA plan."""
 
@@ -665,12 +667,19 @@ async def run_auto_qa_planning(
             phase_logger=phase_logger,
             model_alias_registry=model_alias_registry,
             prompt_safety_parts=prompt_safety_parts,
+            provider_options=getattr(route, "provider_options", None),
+            **endpoint_id_call_kwargs(getattr(route, "endpoint_id", None)),
             request_timeout=auto_qa_timeout,
             cancellation_token=cancellation_token,
+            local_execution=local_execution,
+            dispatch_call_id="auto_qa.plan",
+            dispatch_route_ordinal=0,
         )
     except AutoQAPlanningError:
         raise
     except asyncio.CancelledError:
+        raise
+    except LocalExecutionPolicyError:
         raise
     except Exception as exc:
         if is_content_filter_stop(exc):

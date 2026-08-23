@@ -657,10 +657,33 @@ class TestRunPreflightValidation:
             assert "grok-4-fast-non-reasoning" in result.user_feedback
 
     @pytest.mark.asyncio
-    async def test_unparseable_response_returns_reject(self, request_with_qa_layers, mock_ai_service):
-        """Given: Unparseable AI response, Then: Rejects fail-closed."""
+    async def test_unparseable_response_is_retried_once(self, request_with_qa_layers, mock_ai_service):
+        """Given: One malformed verdict, Then: Retries once inside preflight."""
         mock_ai_service.generate_content = AsyncMock(
-            return_value="This is not valid JSON at all"
+            side_effect=[
+                "This is not valid JSON at all",
+                '{"decision": "proceed", "summary": "Request validated"}',
+            ]
+        )
+
+        with patch("preflight_validator.config") as mock_config:
+            mock_config.PREFLIGHT_SYSTEM_PROMPT = "You are a validator."
+
+            result = await run_preflight_validation(
+                ai_service=mock_ai_service,
+                request=request_with_qa_layers,
+            )
+
+            assert result.decision == "proceed"
+            assert mock_ai_service.generate_content.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_repeated_unparseable_response_rejects_after_one_retry(
+        self, request_with_qa_layers, mock_ai_service
+    ):
+        """Given: Two malformed verdicts, Then: Rejects without a third attempt."""
+        mock_ai_service.generate_content = AsyncMock(
+            side_effect=["not JSON once", "not JSON twice"]
         )
 
         with patch("preflight_validator.config") as mock_config:
@@ -673,6 +696,7 @@ class TestRunPreflightValidation:
 
             assert result.decision == "reject"
             assert result.issues[0].code == "preflight_invalid_response"
+            assert mock_ai_service.generate_content.await_count == 2
 
     @pytest.mark.asyncio
     async def test_truncated_response_returns_specific_reject_summary(
@@ -695,6 +719,7 @@ class TestRunPreflightValidation:
             assert result.summary == "Preflight response truncated"
             assert result.issues[0].code == "preflight_invalid_response"
             assert "truncated or incomplete JSON" in result.user_feedback
+            assert mock_ai_service.generate_content.await_count == 1
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("raw_output", ['[{}]', '"ok"', '123', 'true'])

@@ -458,6 +458,10 @@ def _preflight_request() -> ContentRequest:
 def _stub_preflight_routing(monkeypatch: pytest.MonkeyPatch) -> None:
     route = SimpleNamespace(
         model="test-preflight-model",
+        provider_options={
+            "max_price": {"prompt": 0, "completion": 0},
+            "allow_fallbacks": False,
+        },
         params={
             "temperature": 0.15,
             "max_tokens": 512,
@@ -508,6 +512,10 @@ async def test_preflight_nonstream_forwards_runtime_reasoning_params(
     assert kwargs["temperature"] == 0.15
     assert kwargs["reasoning_effort"] == "medium"
     assert kwargs["thinking_budget_tokens"] == 3_000
+    assert kwargs["provider_options"] == {
+        "max_price": {"prompt": 0, "completion": 0},
+        "allow_fallbacks": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -623,5 +631,9 @@ async def test_preflight_stream_publishes_each_chunk_as_a_labelled_draft(
     assert _drafted_text(callback) == response
     assert captured["max_tokens"] == 512
     assert captured["temperature"] == 0.15
+    assert captured["provider_options"] == {
+        "max_price": {"prompt": 0, "completion": 0},
+        "allow_fallbacks": False,
+    }
     assert captured["reasoning_effort"] == "medium"
     assert captured["thinking_budget_tokens"] == 3_000

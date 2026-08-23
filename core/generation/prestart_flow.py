@@ -23,9 +23,9 @@ from models import ContentRequest, GenerationInitResponse, GenerationStatus
 
 from ..cancellation import CancellationToken, CancelMode
 
-# The preflight validator runs exactly once per session, so its live field only
-# ever holds one attempt; the id still travels because the per-session endpoint
-# resets its cursor on it.
+# The preflight validator normally runs once and may make one protocol-repair
+# attempt when its model returns malformed JSON. The live field always shows
+# only the current attempt; the project stream retains both drafts.
 _PREFLIGHT_ATTEMPT_ID = 1
 _PREFLIGHT_ATTEMPT_KEY = live_attempt_key("preflight_content")
 
@@ -74,6 +74,7 @@ async def run_prestart_flow(
     preflight_context: list[dict[str, Any]],
     preflight_image_info: Optional[dict[str, Any]],
     model_alias_registry: Any,
+    local_execution: Optional[Any] = None,
     deps: PrestartFlowDeps,
 ) -> PrestartFlowResult:
     """Run pre-background Auto-QA and preflight without owning route imports."""
@@ -108,6 +109,7 @@ async def run_prestart_flow(
             else SessionPhase.PREFLIGHT_VALIDATION
         ),
         "usage_tracker": usage_tracker,
+        "local_execution": local_execution,
         "show_query_stats": getattr(request, "show_query_stats", 0),
     }
     try:
@@ -231,6 +233,7 @@ async def run_prestart_flow(
                         ),
                         phase_logger=preflight_phase_logger,
                         cancellation_token=pre_start_cancellation_token,
+                        local_execution=local_execution,
                     )
             await deps.debug_record_event(
                 session_id,
@@ -295,14 +298,18 @@ async def run_prestart_flow(
     async def preflight_stream_callback(event: ContentEvent) -> None:
         """Publish one live preflight chunk, labelled as the draft it is (C5-ter).
 
-        The validator runs exactly once per session, so the live field carries a
-        single attempt; its id is stamped anyway because the per-session
-        endpoint resets its cursor on that field and must never see it missing.
+        A protocol-repair retry replaces the readable live field instead of
+        appending its valid verdict to the malformed previous attempt. The
+        monotonic attempt id tells per-session consumers to reset their cursor.
         """
         if temp_session.get("hard_cancelled"):
             return
+        attempt_id = event.attempt or _PREFLIGHT_ATTEMPT_ID
+        if temp_session.get(_PREFLIGHT_ATTEMPT_KEY) != attempt_id:
+            temp_session["preflight_content"] = ""
+            temp_session[_PREFLIGHT_ATTEMPT_KEY] = attempt_id
+        event.attempt = attempt_id
         temp_session["preflight_content"] += event.content
-        temp_session[_PREFLIGHT_ATTEMPT_KEY] = _PREFLIGHT_ATTEMPT_ID
         event.session_id = session_id
         event.project_id = project_id
         event.project_epoch = project_epoch
@@ -322,6 +329,7 @@ async def run_prestart_flow(
                     phase_logger=preflight_phase_logger,
                     model_alias_registry=model_alias_registry,
                     cancellation_token=pre_start_cancellation_token,
+                    local_execution=local_execution,
                 )
     except asyncio.CancelledError:
         return PrestartFlowResult(

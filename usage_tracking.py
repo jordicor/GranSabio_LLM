@@ -19,6 +19,15 @@ from config import config
 MILLION = 1_000_000
 
 
+def _normalize_endpoint_id(value: Any) -> Optional[str]:
+    """Keep only a non-blank administrative endpoint identity in telemetry."""
+
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
 @dataclass
 class UsageRecord:
     """Single usage event emitted by an AI provider call."""
@@ -29,6 +38,7 @@ class UsageRecord:
     role: str
     model: str
     provider: str
+    endpoint_id: Optional[str] = None
     iteration: Optional[int] = None
     layer: Optional[str] = None
     operation: Optional[str] = None
@@ -95,6 +105,8 @@ class UsageRecord:
             "output_truncated": self.output_truncated,
             "timestamp": self.timestamp,
         }
+        if self.endpoint_id is not None:
+            payload["endpoint_id"] = self.endpoint_id
         payload.update(self._context_admission_fields())
         return payload
 
@@ -127,6 +139,8 @@ class UsageRecord:
             "started_at": self.started_at,
             "ended_at": self.ended_at,
         }
+        if self.endpoint_id is not None:
+            payload["endpoint_id"] = self.endpoint_id
 
         payload.update(self._context_admission_fields())
 
@@ -259,6 +273,7 @@ class UsageTracker:
                     role=role,
                     model=usage_payload.get("model"),
                     provider=usage_payload.get("provider"),
+                    endpoint_id=usage_payload.get("endpoint_id"),
                     input_tokens=usage_payload.get("input_tokens", 0) or 0,
                     output_tokens=usage_payload.get("output_tokens", 0) or 0,
                     total_tokens=usage_payload.get("total_tokens"),
@@ -320,6 +335,7 @@ class UsageTracker:
         role: str,
         model: Optional[str],
         provider: Optional[str],
+        endpoint_id: Optional[str] = None,
         input_tokens: int,
         output_tokens: int,
         total_tokens: Optional[int] = None,
@@ -347,6 +363,7 @@ class UsageTracker:
 
         model_name = str(model) if model else "unknown"
         provider_name = str(provider) if provider else "unknown"
+        normalized_endpoint_id = _normalize_endpoint_id(endpoint_id)
         cost = cost_override
 
         if cost is None:
@@ -366,6 +383,7 @@ class UsageTracker:
             role=role,
             model=model_name,
             provider=provider_name,
+            endpoint_id=normalized_endpoint_id,
             iteration=iteration,
             layer=layer,
             operation=operation,

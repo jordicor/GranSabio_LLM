@@ -16,7 +16,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
 import json_utils as json
 from config import config
-from llm_routing import default_temperature_for_call, resolve_call
+from llm_routing import (
+    default_temperature_for_call,
+    endpoint_id_call_kwargs,
+    resolve_call,
+)
 
 if TYPE_CHECKING:
     from ai_service import AIService
@@ -111,6 +115,7 @@ class TextAnalyzer:
         categories: Optional[List[str]] = None,
         temperature: Optional[float] = None,
         llm_routing: Optional[Mapping[str, Any]] = None,
+        local_execution: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
         """
         Analyze text and return suggested edit actions.
@@ -143,7 +148,13 @@ class TextAnalyzer:
         )
 
         # Call AI
-        response = await self._call_ai(prompt, model, temperature, llm_routing=llm_routing)
+        response = await self._call_ai(
+            prompt,
+            model,
+            temperature,
+            llm_routing=llm_routing,
+            local_execution=local_execution,
+        )
 
         # Parse response
         issues = self._parse_response(response)
@@ -173,15 +184,24 @@ class TextAnalyzer:
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         llm_routing: Optional[Mapping[str, Any]] = None,
+        local_execution: Optional[Any] = None,
     ) -> str:
         """Make AI service call and return response text."""
         if model and llm_routing is None:
             model_name = model
             route_params: Dict[str, Any] = {}
+            provider_options: Dict[str, Any] = {}
+            endpoint_id: Optional[str] = None
         else:
             route = resolve_call("smart_edit.analyze", routing=llm_routing)
             model_name = model or route.model
             route_params = route.params
+            provider_options = getattr(route, "provider_options", {})
+            endpoint_id = (
+                getattr(route, "endpoint_id", None)
+                if str(model_name or "").strip() == str(route.model or "").strip()
+                else None
+            )
         effective_temperature = route_params.get("temperature")
         if effective_temperature is None:
             effective_temperature = (
@@ -202,6 +222,11 @@ class TextAnalyzer:
             "reasoning_effort": route_params.get("reasoning_effort"),
             "thinking_budget_tokens": route_params.get("thinking_budget_tokens"),
             "json_output": True,
+            "provider_options": provider_options,
+            **endpoint_id_call_kwargs(endpoint_id),
+            "local_execution": local_execution,
+            "dispatch_call_id": "smart_edit.analyze",
+            "dispatch_route_ordinal": 0,
         }
         generate_content = getattr(self.ai_service, "generate_content", None)
         has_real_generate_content = (

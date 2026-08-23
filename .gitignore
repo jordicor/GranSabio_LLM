@@ -101,6 +101,9 @@ request_timeouts.json
 model_limits.curated.local.json
 model_family_floors.local.json
 
+# Machine-specific local inference endpoint inventory
+local_endpoints.local.json
+
 # Backups
 backups/
 *.bak
@@ -123,6 +126,10 @@ dev_tests/gpt52_smartedit_debug.json
 *.db
 *.sqlite
 *.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
 *.db-shm
 *.db-wal
 
@@ -152,3 +159,6 @@ nul
 
 # GitHub sync tool output (plans + summaries, regenerated per sync)
 tools/sync_github/output/
+
+# Runtime attachment blobs (user-uploaded content)
+data/attachment_blobs/

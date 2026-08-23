@@ -124,6 +124,44 @@ def test_callback_records_prompt_free_duration_and_finish_metadata():
     assert call["metadata"] == {"requested_model": "qa-model"}
 
 
+def test_query_stats_records_local_endpoint_identity_from_usage_callback():
+    tracker = UsageTracker(detail_level=3)
+    callback = tracker.create_callback(phase="qa", role="evaluation")
+
+    assert callback is not None
+    callback(
+        {
+            "model": "local-reviewer",
+            "provider": "ollama",
+            "endpoint_id": "  local_reviewer_ollama  ",
+            "input_tokens": 10,
+            "output_tokens": 5,
+        }
+    )
+
+    record = tracker._records[0]  # noqa: SLF001 - verifies callback handoff
+    assert record.endpoint_id == "local_reviewer_ollama"
+    assert record.as_dict()["endpoint_id"] == "local_reviewer_ollama"
+    assert tracker.build_query_stats(3)["calls"][0]["endpoint_id"] == "local_reviewer_ollama"
+
+
+def test_query_stats_omits_endpoint_identity_for_external_usage():
+    tracker = UsageTracker(detail_level=3)
+    tracker.record(
+        phase="generation",
+        role="generator",
+        model="external-generator",
+        provider="openrouter",
+        input_tokens=10,
+        output_tokens=5,
+    )
+
+    record = tracker._records[0]  # noqa: SLF001 - verifies serialized contract
+    assert record.endpoint_id is None
+    assert "endpoint_id" not in record.as_dict()
+    assert "endpoint_id" not in tracker.build_query_stats(3)["calls"][0]
+
+
 def test_query_stats_spans_do_not_pollute_legacy_cost_summary():
     tracker = UsageTracker(detail_level=3)
     _record_sample_calls(tracker)

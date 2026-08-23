@@ -22,6 +22,7 @@ from evidence_grounding.budget_scorer import (
     normalize_yes_no_unsure,
     score_claims,
 )
+from local_execution_policy import LocalExecutionPolicyError
 from models import (
     ClaimBudgetResult,
     EvidenceGroundingConfig,
@@ -578,6 +579,29 @@ class TestBudgetScorer:
                 spans=sample_spans,
                 config_obj=config_obj,
             )
+
+    @pytest.mark.asyncio
+    async def test_score_claim_aborts_when_local_backend_omits_logprobs(
+        self,
+        mock_ai_service,
+        sample_claim,
+        sample_spans,
+    ):
+        """Local-only evidence grounding must not replace missing logprobs with 0.33."""
+        mock_ai_service.generate_with_logprobs.return_value = ("YES", None)
+
+        scorer = BudgetScorer(mock_ai_service)
+
+        with pytest.raises(LocalExecutionPolicyError) as exc_info:
+            await scorer.score_claim(
+                claim=sample_claim,
+                spans=sample_spans,
+                model="local-model",
+                local_execution=MagicMock(),
+            )
+
+        assert exc_info.value.code == "local_logprobs_unavailable"
+        mock_ai_service.generate_with_logprobs.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_score_claims_passes_budget_gap_threshold_from_config(self, mock_ai_service, sample_claim, sample_spans):

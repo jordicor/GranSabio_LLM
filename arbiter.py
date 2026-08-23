@@ -28,6 +28,8 @@ from content_events import (
     ContentStatus,
     ContentSubphase,
 )
+from llm_routing import endpoint_id_call_kwargs
+from local_execution_policy import LocalExecutionPolicyError
 from model_aliasing import PromptPart
 from model_capability_registry import resolve_model_capability_context
 from request_timeouts import resolve_request_timeout
@@ -751,6 +753,40 @@ class Arbiter:
             params.get("thinking_budget_tokens"),
         )
 
+    @staticmethod
+    def _resolve_provider_options(context: ArbiterContext, *, call_id: str) -> Dict[str, Any]:
+        """Resolve validated options without changing the legacy tuple contract."""
+
+        from llm_routing import LLMRoutingError, resolve_call
+
+        try:
+            route = resolve_call(
+                call_id,
+                request=getattr(context, "original_request", None),
+            )
+        except LLMRoutingError:
+            if call_id != "gransabio.escalation":
+                raise
+            route = resolve_call(
+                "gransabio.review",
+                request=getattr(context, "original_request", None),
+            )
+        return dict(route.provider_options)
+
+    @staticmethod
+    def _resolve_endpoint_id(context: ArbiterContext, *, call_id: str) -> Optional[str]:
+        """Resolve the administrative endpoint together with a routed Arbiter call."""
+
+        from llm_routing import LLMRoutingError, resolve_call
+
+        try:
+            route = resolve_call(call_id, request=getattr(context, "original_request", None))
+        except LLMRoutingError:
+            if call_id != "gransabio.escalation":
+                raise
+            route = resolve_call("gransabio.review", request=getattr(context, "original_request", None))
+        return getattr(route, "endpoint_id", None)
+
     async def _emit_debug_event(self, event_type: str, payload: Dict[str, Any]) -> None:
         """Persist an arbiter event to the debugger DB if a callback is bound."""
         if self._debug_event_callback is None:
@@ -1402,9 +1438,8 @@ class Arbiter:
         Returns ``False`` when:
 
         - ``mode == "never"`` (user explicitly disabled).
-        - Provider is outside the supported matrix
-          (``openai``, ``openrouter``, ``xai``, ``claude``, ``gemini``).
-        - Model does not advertise tool-calling support.
+        - The resolved provider/model adapter does not advertise tool-calling
+          support.
 
         Returns ``True`` otherwise. Unknown / unresolvable models fall back
         to ``False`` (fail-closed — no tools if we can't prove support).
@@ -1528,6 +1563,8 @@ class Arbiter:
             )
             return parsed
 
+        except LocalExecutionPolicyError:
+            raise
         except Exception as e:
             if is_content_filter_stop(e):
                 self._logger.warning(
@@ -1617,6 +1654,8 @@ class Arbiter:
             selected_model,
             call_id=call_id,
         )
+        provider_options = self._resolve_provider_options(context, call_id=call_id)
+        endpoint_id = self._resolve_endpoint_id(context, call_id=call_id)
         async def _call_with_budget(
             token_budget: int,
             *,
@@ -1642,8 +1681,13 @@ class Arbiter:
                 thinking_budget_tokens=thinking_budget_tokens,
                 model_alias_registry=context.model_alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                provider_options=provider_options,
+                **endpoint_id_call_kwargs(endpoint_id),
                 request_timeout=timeout_seconds,
                 cancellation_token=context.cancellation_token,
+                local_execution=getattr(context.original_request, "_local_execution", None),
+                dispatch_call_id=call_id,
+                dispatch_route_ordinal=0,
             )
 
         _, envelope = await _call_with_budget(
@@ -1730,6 +1774,8 @@ class Arbiter:
             selected_model,
             call_id=call_id,
         )
+        provider_options = self._resolve_provider_options(context, call_id=call_id)
+        endpoint_id = self._resolve_endpoint_id(context, call_id=call_id)
         response_content = ""
         if self.stream_callback:
             streamed_labelled_chunk = False
@@ -1752,8 +1798,13 @@ class Arbiter:
                 json_schema=ARBITER_RESPONSE_SCHEMA,
                 model_alias_registry=context.model_alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                provider_options=provider_options,
+                **endpoint_id_call_kwargs(endpoint_id),
                 request_timeout=arbiter_timeout,
                 cancellation_token=context.cancellation_token,
+                local_execution=getattr(context.original_request, "_local_execution", None),
+                dispatch_call_id=call_id,
+                dispatch_route_ordinal=0,
             ):
                 if hasattr(chunk, 'text'):
                     chunk_text = chunk.text
@@ -1828,8 +1879,13 @@ class Arbiter:
                 json_schema=ARBITER_RESPONSE_SCHEMA,
                 model_alias_registry=context.model_alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
+                provider_options=provider_options,
+                **endpoint_id_call_kwargs(endpoint_id),
                 request_timeout=arbiter_timeout,
                 cancellation_token=context.cancellation_token,
+                local_execution=getattr(context.original_request, "_local_execution", None),
+                dispatch_call_id=call_id,
+                dispatch_route_ordinal=0,
             )
 
         parsed = parse_json_with_markdown_fences(
@@ -2109,11 +2165,6 @@ class Arbiter:
             conflicts,
             distribution,
             selected_model,
-            call_id=(
-                "gransabio.escalation"
-                if escalated
-                else "arbiter.resolve"
-            ),
         )
 
         ai_decisions = ai_response.get("decisions")

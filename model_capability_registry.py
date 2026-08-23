@@ -13,7 +13,9 @@ from provider_capabilities import (
     capability_state,
 )
 
-TOOL_LOOP_RUNTIME_PROVIDERS = frozenset({"openai", "openrouter", "xai", "claude", "gemini"})
+TOOL_LOOP_RUNTIME_PROVIDERS = frozenset(
+    {"openai", "openrouter", "xai", "claude", "gemini", "ollama", "llamacpp", "openai_compatible"}
+)
 
 
 @dataclass(frozen=True)
@@ -199,6 +201,17 @@ def _docs_rule_state(provider: str, model_id: str, capability: str) -> Capabilit
     provider_key = normalize_provider(provider)
     model_lower = (model_id or "").lower()
 
+    if capability == "responses_api":
+        is_gpt56_sol = (
+            model_lower == "gpt-5.6-sol"
+            or model_lower.startswith("gpt-5.6-sol-")
+        )
+        if provider_key == "openai" and is_gpt56_sol:
+            # GPT-5.6 Sol exposes its reasoning/tool contract through Responses.
+            # Keep this tracked docs rule independent of the discovery catalog,
+            # whose newly discovered entries can initially contain text-only
+            # placeholder capabilities.
+            return capability_state(True, source=CapabilitySource.OFFICIAL_DOCS)
     if capability == "chat_completions_api":
         return capability_state(provider_key != "claude" and provider_key != "gemini", source=CapabilitySource.OFFICIAL_DOCS)
     if capability == "streaming":

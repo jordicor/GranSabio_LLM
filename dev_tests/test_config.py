@@ -30,7 +30,11 @@ def restore_config_module_after_test():
     import config as config_module
 
     original_config = config_module.config
+    original_config_class = type(original_config)
     yield
+    # importlib.reload() rewrites both module bindings. Restore the original
+    # pair so modules that imported either one before the reload stay coherent.
+    config_module.Config = original_config_class
     config_module.config = original_config
     original_config.reload_model_specifications()
 
@@ -914,6 +918,127 @@ class TestGetModelInfo:
                 info = cfg.get_model_info("llama3")
                 assert info["provider"] == "ollama"
                 assert info["api_key"] == "ollama"
+
+    def test_llamacpp_uses_configured_local_dummy_key(self, minimal_model_specs):
+        """A configured llama.cpp catalog entry never requires a cloud credential."""
+        import json_utils as json
+
+        specs = json.loads(json.dumps(minimal_model_specs))
+        specs["model_specifications"]["llamacpp"] = {
+            "server-model-q4": {
+                "model_id": "server-model-q4",
+                "name": "Server Model",
+                "input_tokens": 32768,
+                "output_tokens": 8192,
+                "context_window": 32768,
+                "capabilities": ["text"],
+            }
+        }
+        with patch.dict(
+            os.environ,
+            {"LLAMACPP_API_KEY": "local-safe-key"},
+            clear=False,
+        ):
+            with patch("builtins.open", mock_open(read_data=json.dumps(specs))):
+                from config import Config
+
+                cfg = Config()
+                info = cfg.get_model_info("server-model-q4")
+                assert info["provider"] == "llamacpp"
+                assert info["api_key"] == "local-safe-key"
+
+    def test_llamacpp_sdk_timeout_loads_from_environment(self, minimal_model_specs):
+        """llama.cpp uses the same explicit provider timeout loading as other SDKs."""
+        import json_utils as json
+
+        specs_json = json.dumps(minimal_model_specs)
+        with patch.dict(
+            os.environ,
+            {"SDK_LLAMACPP_TIMEOUT_SECONDS": "321"},
+            clear=False,
+        ):
+            with patch("builtins.open", mock_open(read_data=specs_json)):
+                from config import Config
+
+                cfg = Config()
+
+        assert cfg.SDK_LLAMACPP_TIMEOUT_SECONDS == 321
+
+    def test_provider_qualified_llamacpp_lookup_cannot_select_cloud_collision(self):
+        from config import resolve_model_catalog_entry
+
+        specs = {
+            "model_specifications": {
+                "llamacpp": {"same-id": {"model_id": "same-id"}},
+                "openrouter": {"same-id": {"model_id": "same-id"}},
+            }
+        }
+
+        local = resolve_model_catalog_entry("llamacpp/same-id", specs)
+        ambiguous = resolve_model_catalog_entry("same-id", specs)
+
+        assert local["matched"] is True
+        assert local["catalog_provider"] == "llamacpp"
+        assert ambiguous["matched"] is False
+
+    def test_openrouter_vendor_id_is_not_misread_as_direct_provider_qualifier(self):
+        from config import resolve_model_catalog_entry
+
+        specs = {
+            "model_specifications": {
+                "openai": {"gpt-local": {"model_id": "gpt-local"}},
+                "openrouter": {"openai/gpt-local": {"model_id": "openai/gpt-local"}},
+            }
+        }
+
+        resolved = resolve_model_catalog_entry("openai/gpt-local", specs)
+
+        assert resolved["matched"] is True
+        assert resolved["catalog_provider"] == "openrouter"
+
+    def test_exact_colon_variant_wins_over_base_model_catalog_order(self):
+        from config import resolve_model_catalog_entry
+
+        specs = {
+            "model_specifications": {
+                "openrouter": {
+                    "vendor/model": {
+                        "model_id": "vendor/model",
+                        "pricing": {"input_per_million": 1.0},
+                    },
+                    "vendor/model:free": {
+                        "model_id": "vendor/model:free",
+                        "pricing": {"input_per_million": 0.0},
+                    },
+                }
+            }
+        }
+
+        resolved = resolve_model_catalog_entry("vendor/model:free", specs)
+
+        assert resolved["matched"] is True
+        assert resolved["model_id"] == "vendor/model:free"
+        assert resolved["model_data"]["pricing"]["input_per_million"] == 0.0
+
+    def test_fake_model_suffix_still_falls_back_to_test_model_base(self):
+        from config import resolve_model_catalog_entry
+
+        specs = {
+            "model_specifications": {
+                "fake": {
+                    "Generator-Smart": {
+                        "model_id": "Generator-Smart",
+                        "is_test_model": True,
+                    }
+                }
+            }
+        }
+
+        resolved = resolve_model_catalog_entry("Generator-Smart:scenario-a", specs)
+
+        assert resolved["matched"] is True
+        assert resolved["provider"] == "fake"
+        assert resolved["model_id"] == "Generator-Smart:scenario-a"
 
     def test_returns_capabilities_list(self, minimal_model_specs, mock_env_vars):
         """Given: Model with capabilities, Then: Returns capabilities list"""

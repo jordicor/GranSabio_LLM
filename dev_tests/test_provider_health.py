@@ -14,13 +14,19 @@ def clean_provider_health(monkeypatch):
     provider_health.reset_provider_health_state()
 
 
-def _failure(kind: ProviderErrorKind, *, provider: str = "openai") -> ProviderFailure:
+def _failure(
+    kind: ProviderErrorKind,
+    *,
+    provider: str = "openai",
+    endpoint_id: str | None = None,
+) -> ProviderFailure:
     return ProviderFailure(
         provider=provider,
         model_id="test-model",
         operation="generation",
         kind=kind,
         message="provider failed",
+        endpoint_id=endpoint_id,
         retryable=True,
         status_code=503 if kind == ProviderErrorKind.PROVIDER_DOWN else None,
     )
@@ -124,3 +130,60 @@ async def test_failure_payload_only_includes_health_when_surfaceable() -> None:
     assert payload["provider_status"] == provider_health.PROVIDER_SUSPECTED
     assert payload["provider_health_source"] == provider_health.LOCAL_ERRORS_SOURCE
     assert payload["provider_health"]["surface"] is True
+
+
+@pytest.mark.asyncio
+async def test_local_endpoint_errors_are_isolated_from_other_endpoints_and_global() -> None:
+    for _ in range(3):
+        await provider_health.record_provider_error(
+            "ollama",
+            endpoint_id="spark-a",
+            kind=ProviderErrorKind.PROVIDER_DOWN,
+        )
+
+    spark_a = provider_health.get_provider_health("ollama", endpoint_id="spark-a")
+    spark_b = provider_health.get_provider_health("ollama", endpoint_id="spark-b")
+    global_health = provider_health.get_provider_health("ollama")
+
+    assert spark_a["status"] == provider_health.PROVIDER_SUSPECTED
+    assert spark_a["endpoint_id"] == "spark-a"
+    assert spark_b["status"] == provider_health.PROVIDER_OPERATIONAL
+    assert spark_b["endpoint_id"] == "spark-b"
+    assert global_health["status"] == provider_health.PROVIDER_OPERATIONAL
+    assert global_health["endpoint_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_endpoint_failure_payload_and_success_use_the_same_endpoint_state() -> None:
+    failure = _failure(
+        ProviderErrorKind.PROVIDER_DOWN,
+        provider="ollama",
+        endpoint_id="spark-a",
+    )
+    for _ in range(3):
+        await provider_health.record_provider_failure(failure)
+
+    payload = provider_health.provider_health_for_failure_payload(failure)
+    assert payload["provider_health"]["endpoint_id"] == "spark-a"
+    assert payload["provider_status"] == provider_health.PROVIDER_SUSPECTED
+
+    await provider_health.record_provider_success("ollama", endpoint_id="spark-a")
+    assert provider_health.get_provider_health("ollama", endpoint_id="spark-a")["status"] == (
+        provider_health.PROVIDER_RECOVERING
+    )
+    assert provider_health.get_provider_health("ollama")["status"] == provider_health.PROVIDER_OPERATIONAL
+
+
+@pytest.mark.asyncio
+async def test_all_health_keeps_global_entries_and_enumerates_endpoint_snapshots() -> None:
+    for _ in range(3):
+        await provider_health.record_provider_error(
+            "ollama", endpoint_id="spark-a", kind=ProviderErrorKind.TIMEOUT
+        )
+
+    payload = provider_health.get_all_provider_health()
+
+    assert payload["providers"]["ollama"]["endpoint_id"] is None
+    assert payload["providers"]["ollama"]["status"] == provider_health.PROVIDER_OPERATIONAL
+    assert payload["endpoints"]["ollama"]["spark-a"]["endpoint_id"] == "spark-a"
+    assert payload["endpoints"]["ollama"]["spark-a"]["status"] == provider_health.PROVIDER_SUSPECTED

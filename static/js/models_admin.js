@@ -2,8 +2,8 @@
   /* ═══════════════════════════════════════════════════
    * Constants
    * ═══════════════════════════════════════════════════ */
-  const TABS = ["catalog", "openai", "anthropic", "google", "xai", "openrouter", "minimax", "moonshot", "ollama"];
-  const PROVIDER_TABS = ["openai", "anthropic", "google", "xai", "openrouter", "minimax", "moonshot", "ollama"];
+  const TABS = ["catalog", "openai", "anthropic", "google", "xai", "openrouter", "minimax", "moonshot", "ollama", "llamacpp"];
+  const PROVIDER_TABS = ["openai", "anthropic", "google", "xai", "openrouter", "minimax", "moonshot", "ollama", "llamacpp"];
   const PROVIDER_LABELS = {
     catalog: "Catalog",
     openai: "OpenAI",
@@ -14,10 +14,11 @@
     minimax: "MiniMax",
     moonshot: "Moonshot/Kimi",
     ollama: "Ollama",
+    llamacpp: "llama.cpp",
   };
   const FULL_SYNC_PROVIDERS = new Set(["openrouter", "xai", "ollama"]);
   const REMOVE_MISSING_BY_DEFAULT_PROVIDERS = new Set(["ollama"]);
-  const HEALTH_PROVIDERS = ["openai", "claude", "gemini", "xai", "openrouter", "minimax", "moonshot", "ollama"];
+  const HEALTH_PROVIDERS = ["openai", "claude", "gemini", "xai", "openrouter", "minimax", "moonshot", "ollama", "llamacpp"];
   const HEALTH_PROVIDER_LABELS = {
     openai: "OpenAI",
     claude: "Claude",
@@ -27,6 +28,7 @@
     minimax: "MiniMax",
     moonshot: "Moonshot/Kimi",
     ollama: "Ollama",
+    llamacpp: "llama.cpp",
   };
 
   /* ═══════════════════════════════════════════════════
@@ -571,7 +573,9 @@
         if (metaEl) {
           metaEl.textContent = tab === "ollama"
             ? "Local sync - mirrors models installed in Ollama"
-            : (
+            : tab === "llamacpp"
+              ? "Read-only discovery from the configured llama.cpp server; unavailable discovery never removes catalog entries"
+              : (
               FULL_SYNC_PROVIDERS.has(tab)
                 ? "Full sync - replaces provider section in catalog"
                 : "Discovery sync - adds new models to catalog"

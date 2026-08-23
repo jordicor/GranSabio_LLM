@@ -25,7 +25,9 @@ from evidence_grounding.evidence_matcher import (
     format_spans_for_prompt,
     scrub_spans,
 )
-from llm_routing import resolve_call, resolve_temperature
+from evidence_grounding.route_identity import endpoint_id_for_effective_model
+from llm_routing import endpoint_id_call_kwargs, resolve_call, resolve_temperature
+from local_execution_policy import LocalExecutionPolicyError
 from models import (
     ClaimBudgetResult,
     EvidenceGroundingConfig,
@@ -309,6 +311,9 @@ class BudgetScorer:
         extra_verbose: bool = False,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         cancellation_token: Optional[Any] = None,
+        provider_options: Optional[Dict[str, Any]] = None,
+        endpoint_id: Optional[str] = None,
+        local_execution: Optional[Any] = None,
     ) -> ClaimBudgetResult:
         """Score a single claim for evidence grounding.
 
@@ -346,7 +351,10 @@ class BudgetScorer:
             extra_verbose=extra_verbose,
             usage_callback=usage_callback,
             usage_extra={"subphase": "posterior", "claim_idx": claim.idx},
+            provider_options=provider_options,
+            endpoint_id=endpoint_id,
             cancellation_token=cancellation_token,
+            local_execution=local_execution,
         )
 
         # 3. Scrub cited spans and format for prior
@@ -364,7 +372,10 @@ class BudgetScorer:
             extra_verbose=extra_verbose,
             usage_callback=usage_callback,
             usage_extra={"subphase": "prior", "claim_idx": claim.idx},
+            provider_options=provider_options,
+            endpoint_id=endpoint_id,
             cancellation_token=cancellation_token,
+            local_execution=local_execution,
         )
 
         # 5. Calculate budget metrics
@@ -416,6 +427,7 @@ class BudgetScorer:
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         request: Optional[Any] = None,
         cancellation_token: Optional[Any] = None,
+        local_execution: Optional[Any] = None,
     ) -> List[ClaimBudgetResult]:
         """Score multiple claims for evidence grounding.
 
@@ -464,7 +476,10 @@ class BudgetScorer:
                 temperature=routed_temperature,
                 extra_verbose=extra_verbose,
                 usage_callback=usage_callback,
+                provider_options=getattr(route, "provider_options", {}),
+                endpoint_id=endpoint_id_for_effective_model(route, model),
                 cancellation_token=cancellation_token,
+                local_execution=local_execution,
             )
             results.append(result)
 
@@ -481,6 +496,9 @@ class BudgetScorer:
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
         cancellation_token: Optional[Any] = None,
+        provider_options: Optional[Dict[str, Any]] = None,
+        endpoint_id: Optional[str] = None,
+        local_execution: Optional[Any] = None,
     ) -> float:
         """Get P(YES) for an entailment verification prompt.
 
@@ -512,12 +530,23 @@ class BudgetScorer:
                 "phase": "evidence_grounding",
                 **(usage_extra or {}),
             },
+            provider_options=provider_options,
+            **endpoint_id_call_kwargs(endpoint_id),
             cancellation_token=cancellation_token,
+            local_execution=local_execution,
+            dispatch_call_id="evidence.score_logprobs",
+            dispatch_route_ordinal=0,
         )
 
         if extra_verbose:
             logger.info(f"[BUDGET_SCORER] Response: {response_text}")
             logger.info(f"[BUDGET_SCORER] Logprobs: {logprobs_data}")
+
+        if local_execution is not None and not logprobs_data:
+            raise LocalExecutionPolicyError(
+                "local_logprobs_unavailable",
+                "Evidence grounding requires logprobs from the admitted local backend.",
+            )
 
         # Extract P(YES) from logprobs
         p_yes = extract_yes_probability(logprobs_data)

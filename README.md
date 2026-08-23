@@ -585,7 +585,68 @@ PEPPER=any-random-string-here
 
 > **Note:** You only need keys for the providers you want to use. At minimum, configure one provider.
 
-For local Ollama models, `OLLAMA_MAX_CONCURRENT_REQUESTS` defaults to `1` so local generation and QA model calls are queued instead of hitting the same GPU in parallel. Increase it only if your local hardware can handle concurrent Ollama requests.
+For local Ollama models, `OLLAMA_MAX_CONCURRENT_REQUESTS` defaults to `1` so local generation and QA model calls are queued instead of hitting the same GPU in parallel. Increase it only if your local hardware can handle concurrent Ollama requests. `OLLAMA_ENDPOINT_ALIAS` gives that administrator-configured endpoint a stable audit identity; requests cannot supply or override its URL.
+
+For a separate `llama.cpp` server exposing OpenAI-compatible Chat Completions,
+set `LLAMACPP_BASE_URL` (including `/v1`), optionally set `LLAMACPP_API_KEY`,
+and give it an operator-facing `LLAMACPP_ENDPOINT_ALIAS`. Its queue is isolated
+from Ollama and defaults to one request through `LLAMACPP_MAX_CONCURRENT_REQUESTS`.
+Use `LLAMACPP_MAX_OUTPUT_TOKENS` as the catalog fallback when the server does not
+report its own generation limit.
+The admin model sync performs only read-only discovery (`/health`, `/v1/models`,
+`/props`, `/slots`) and will not remove llama.cpp catalog entries when discovery
+is unavailable. Tool support is capability-driven: a local model may use tools
+only when its catalog entry declares `tool_calling`.
+
+For more than one local API service, set `LOCAL_ENDPOINTS_CONFIG_PATH` to an
+administrative JSON file. It registers API endpoints—not machines or model
+lifecycles—and routes identify a model as `(endpoint_id, model_id)`. URLs remain
+server configuration and cannot be supplied by a request. The default policy is
+`"availability": "loaded"`, so Ollama discovery uses `/api/ps`; use
+`"available"` only when the server's own autoload policy is desired. Start
+from [`local_endpoints.example.json`](local_endpoints.example.json) and keep the
+deployment-specific copy out of version control.
+
+```json
+{
+  "local_endpoints": {
+    "spark_ollama": {
+      "adapter": "ollama",
+      "base_url": "http://spark-a.local:11434",
+      "max_concurrent_requests": 1
+    },
+    "reviewer": {
+      "adapter": "openai_compatible",
+      "base_url": "http://spark-b.local:8000/v1",
+      "api_key_env": "REVIEWER_API_KEY",
+      "availability": "loaded"
+    }
+  }
+}
+```
+
+Supported adapters are `ollama`, `llamacpp`, and `openai_compatible`. A new
+registry is intentionally rejected if it conflicts with non-default legacy
+`OLLAMA_HOST` or `LLAMACPP_BASE_URL` settings; it is never silently merged.
+The JSON accepts only `api_key_env`, never an inline `api_key`.
+
+An endpoint is one API service, not one machine: two services on the same host
+but different ports are two endpoints, while one Ollama endpoint can announce
+many models and the route selects the desired `model` under the same URL. Give
+each route its stable `endpoint_id`, including each QA entry:
+
+```json
+{
+  "calls": {
+    "generation.main": {"model": "writer-model", "endpoint_id": "spark_ollama"},
+    "qa.evaluate_layer": {"models": [{"model": "review-model", "endpoint_id": "reviewer"}]}
+  }
+}
+```
+
+`loaded` is the default availability policy: GranSabio verifies that the model
+is already resident when a backend distinguishes it. It never loads or unloads
+models, schedules GPUs, balances requests, or fails over to another endpoint.
 
 ### 3. Start the Server
 
@@ -651,10 +712,44 @@ configuration or `model_specs.json`.
 }
 ```
 
+### Fail-closed local execution
+
+Set `execution_policy.scope` to `local_only` when every AI dispatch in a
+generation must stay on an administrator-configured Ollama, llama.cpp, or
+OpenAI-compatible local endpoint. GranSabio resolves the routes that request can reach, checks the
+endpoints and advertised models through read-only live discovery, and then
+checks the exact call ID, QA ordinal, provider, endpoint and model again before
+each transport attempt. A local timeout or routing change fails the session; it
+never falls back to a cloud provider.
+
+```json
+{
+  "prompt": "Write a short factual summary from the supplied context.",
+  "execution_policy": {"scope": "local_only"},
+  "feedback_memory_enabled": false,
+  "llm_routing": {
+    "calls": {
+      "generation.main": {"model": "your-local-model"},
+      "generation.direct_stream": {"model": "your-local-model"},
+      "preflight.validate": {"model": "your-local-model"}
+    }
+  },
+  "qa_layers": []
+}
+```
+
+Feedback Memory must currently be disabled because its embeddings backends are
+external. If QA, Auto-QA, GranSabio fallback, Arbiter, Long Text, Evidence
+Grounding, accent audit or JSON output is enabled, configure each reachable
+call in `llm_routing` to a live local model with the required catalogued
+capabilities. Successful and terminal session results expose a
+`local_only_attestation` derived from the session dispatch ledger; `/status`
+also exposes the current attestation while a session is active.
+
 Run the API on `0.0.0.0` for LAN access. Other PCs should call the Gran Sabio
 server; Ollama only needs to be reachable from the machine running the API.
-Keep `llm_accent_guard` off in this preset; that audit path uses a global model
-setting and is rejected for strict offline requests.
+An enabled `llm_accent_guard` is accepted only when its `accent.audit` route is
+also admitted on a capable local model.
 
 ---
 
@@ -737,7 +832,12 @@ Group multiple sessions under a single project ID:
 | `/api/admin/models/catalog/{provider}` | DELETE | Remove one local catalog model |
 | `/api/admin/models/sync-all` | POST | Sync the provider/model selection supplied in the request body |
 
-Provider sync covers OpenAI, Anthropic, Google, xAI, OpenRouter, MiniMax, Moonshot/Kimi, and local Ollama models from `OLLAMA_HOST` via Ollama's native `/api/version` and `/api/tags` endpoints.
+Provider sync covers OpenAI, Anthropic, Google, xAI, OpenRouter, MiniMax,
+Moonshot/Kimi, and the legacy local `OLLAMA_HOST`/`LLAMACPP_BASE_URL` settings.
+For `LOCAL_ENDPOINTS_CONFIG_PATH`, local-only admission uses read-only live
+discovery per registered endpoint: Ollama uses `/api/ps` for `loaded` (or
+`/api/tags` for `available`), while llama.cpp and OpenAI-compatible services use
+their served-model API. Discovery never loads models or mutates the catalog.
 
 ---
 

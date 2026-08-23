@@ -527,6 +527,71 @@ async def test_known_large_context_model_fits_proceeds():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "loop_method", "client_attribute"),
+    [
+        ("claude", "_run_claude_validation_tool_loop", "anthropic_client"),
+        ("gemini", "_run_gemini_new_sdk_validation_tool_loop", "google_new_client"),
+    ],
+)
+async def test_cloud_tool_loops_do_not_receive_local_endpoint_id(
+    provider: str,
+    loop_method: str,
+    client_attribute: str,
+) -> None:
+    """Cloud loops must not receive the local endpoint transport kwarg."""
+
+    service = AIService.__new__(AIService)
+    setattr(service, client_attribute, object())
+    fake_loop = AsyncMock(
+        return_value=(
+            "provider called",
+            {"mode": f"{provider}_tool_loop", "turns": 1, "accepted": "assistant_final", "trace": []},
+        )
+    )
+
+    with patch.object(AIService, "_normalize_tool_loop_provider", return_value=provider), \
+         patch.object(AIService, "_supports_generation_validation_tool_loop", return_value=True), \
+         patch.object(AIService, "_apply_temperature_policies", return_value=(0.7, None, False)), \
+         patch.object(AIService, "_should_inject_json_prompt", return_value=False), \
+         patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
+         patch.object(AIService, loop_method, new=fake_loop), \
+         patch.object(
+             context_budget,
+             "resolve_token_limits",
+             return_value=_verified_limits(
+                 max_input=1_048_576,
+                 output_accounting="separate",
+                 provider=provider,
+                 model=f"{provider}-model",
+             ),
+         ), \
+         patch("ai_service.config") as mock_config:
+        mock_config.validate_token_limits.return_value = {
+            "adjusted_tokens": 1024,
+            "adjusted_reasoning_effort": None,
+            "adjusted_thinking_budget_tokens": None,
+            "model_info": {"provider": provider, "model_id": f"{provider}-model"},
+            "reasoning_timeout_seconds": None,
+        }
+        mock_config.GENERATOR_SYSTEM_PROMPT = "system"
+        mock_config.GENERATOR_SYSTEM_PROMPT_RAW = "raw system"
+        mock_config.TOOL_LOOP_MAX_PROMPT_CHARS = 200_000
+        mock_config.REQUEST_TIMEOUT = 30
+        mock_config.AI_ACCENT_AUDIT_TIMEOUT_SECONDS = 30
+
+        content, _envelope = await service.call_ai_with_validation_tools(
+            prompt="cloud request",
+            model=f"{provider}-model",
+            validation_callback=lambda _: _approved_result(),
+            endpoint_id="ollama_b",
+        )
+
+    assert content == "provider called"
+    assert "endpoint_id" not in fake_loop.await_args.kwargs
+
+
+@pytest.mark.asyncio
 async def test_known_model_context_overflow_rejects_with_model_details():
     """A known model that truly exceeds its resolved window fails fast in both modes."""
     service = AIService.__new__(AIService)

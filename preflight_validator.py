@@ -27,7 +27,13 @@ from content_events import (
     ContentPhase,
     ContentSubphase,
 )
-from llm_routing import LLMRoutingError, resolve_call, resolve_temperature
+from llm_routing import (
+    LLMRoutingError,
+    endpoint_id_call_kwargs,
+    resolve_call,
+    resolve_temperature,
+)
+from local_execution_policy import LocalExecutionPolicyError
 from model_aliasing import ModelAliasRegistry, PromptPart
 from models import ContentRequest, PreflightIssue, PreflightResult, WordCountAnalysis
 from request_timeouts import resolve_request_timeout
@@ -540,6 +546,8 @@ def _parse_validator_response_with_diagnostics(
 
     try:
         from tools.ai_json_cleanroom import validate_loose_json
+    except LocalExecutionPolicyError:
+        raise
     except Exception as exc:
         diagnostics["cleanroom_unavailable"] = type(exc).__name__
     else:
@@ -682,6 +690,8 @@ async def run_preflight_validation(
     phase_logger: Optional["PhaseLogger"] = None,
     model_alias_registry: Optional[ModelAliasRegistry] = None,
     cancellation_token: Optional[Any] = None,
+    local_execution: Optional[Any] = None,
+    _invalid_response_attempt: int = 1,
 ) -> PreflightResult:
     """Run the preflight validator and return a structured decision.
 
@@ -733,6 +743,7 @@ async def run_preflight_validation(
         preflight_route = resolve_call("preflight.validate", request=request)
         setattr(request, "_preflight_route", preflight_route)
     preflight_params = getattr(preflight_route, "params", {}) or {}
+    preflight_provider_options = getattr(preflight_route, "provider_options", {}) or {}
     preflight_temperature = resolve_temperature(preflight_route)
     preflight_reasoning_effort = preflight_params.get("reasoning_effort")
     preflight_thinking_budget_tokens = preflight_params.get(
@@ -792,6 +803,7 @@ async def run_preflight_validation(
                 metadata={
                     "context_documents": len(context_documents or []),
                     "model": selected_model,
+                    "attempt": _invalid_response_attempt,
                 },
             )
             if usage_tracker and usage_tracker.enabled
@@ -812,7 +824,7 @@ async def run_preflight_validation(
                 phase=ContentPhase.PREFLIGHT,
                 model=selected_model,
                 layer=_PREFLIGHT_STREAM_LAYER,
-                attempt=1,
+                attempt=_invalid_response_attempt,
             )
             async for chunk in ai_service.generate_content_stream(
                 prompt=validator_prompt,
@@ -828,8 +840,15 @@ async def run_preflight_validation(
                 model_alias_registry=model_alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
                 llm_routing=getattr(request, "_llm_routing", None),
+                provider_options=preflight_provider_options,
+                **endpoint_id_call_kwargs(
+                    getattr(preflight_route, "endpoint_id", None)
+                ),
                 request_timeout=preflight_timeout,
                 cancellation_token=cancellation_token,
+                local_execution=local_execution,
+                dispatch_call_id="preflight.validate",
+                dispatch_route_ordinal=0,
             ):
                 # Handle StreamChunk (Claude with thinking) vs plain string
                 if isinstance(chunk, StreamChunk):
@@ -886,11 +905,20 @@ async def run_preflight_validation(
                 model_alias_registry=model_alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
                 llm_routing=getattr(request, "_llm_routing", None),
+                provider_options=preflight_provider_options,
+                **endpoint_id_call_kwargs(
+                    getattr(preflight_route, "endpoint_id", None)
+                ),
                 request_timeout=preflight_timeout,
                 cancellation_token=cancellation_token,
+                local_execution=local_execution,
+                dispatch_call_id="preflight.validate",
+                dispatch_route_ordinal=0,
             )
 
     except asyncio.CancelledError:
+        raise
+    except LocalExecutionPolicyError:
         raise
     except Exception as exc:
         if is_content_filter_stop(exc):
@@ -927,6 +955,30 @@ async def run_preflight_validation(
             parse_diagnostics,
         )
         likely_truncated = bool(parse_diagnostics.get("likely_truncated"))
+        if not likely_truncated and _invalid_response_attempt == 1:
+            # A syntactically broken validator verdict is neither a semantic rejection nor a
+            # generator failure. Retry it once inside this pre-start session, where GranSabio
+            # owns the raw output, usage accounting and attempt telemetry. Retrying unchanged
+            # at the client boundary would create a second /generate project and weaken durable
+            # idempotency. Truncation is excluded because an unchanged output limit makes that
+            # failure deterministic rather than transient.
+            logger.warning(
+                "Retrying preflight validator after an unparseable first response "
+                "(model=%s, next_attempt=2)",
+                selected_model,
+            )
+            return await run_preflight_validation(
+                ai_service,
+                request,
+                context_documents=context_documents,
+                image_info=image_info,
+                stream_callback=stream_callback,
+                usage_tracker=usage_tracker,
+                phase_logger=phase_logger,
+                model_alias_registry=model_alias_registry,
+                cancellation_token=cancellation_token,
+                _invalid_response_attempt=2,
+            )
         invalid_message = (
             f"Preflight validation failed because model '{selected_model}' returned "
             "truncated or incomplete JSON."

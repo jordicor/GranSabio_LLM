@@ -989,8 +989,6 @@ def analyze_text(text: str, cfg: AnalysisConfig) -> Dict[str, Any]:
 
     # Sentences for counting (respect_sentences) and for positional analysis (always)
     segments = build_sentence_segments(tokens, cfg)
-    sentence_map = token_to_sentence_index_map(segments, total_tokens) if cfg.respect_sentences else [0] * total_tokens
-    total_sentences = len(segments)
     # For positional metrics we want sentence boundaries even if respect_sentences=False
     pos_tc = parse_sentence_terminators(cfg.sentence_terminators, mode=cfg.sentence_mode, multis_spec=cfg.sentence_multis)
     pos_sentence_segments = compute_sentence_segments(tokens, pos_tc)

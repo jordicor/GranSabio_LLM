@@ -60,6 +60,10 @@ def mock_config_with_keys():
     mock_cfg.MINIMAX_API_KEY = "minimax-test-key"
     mock_cfg.MOONSHOT_API_KEY = "moonshot-test-key"
     mock_cfg.OLLAMA_HOST = None  # Disabled by default
+    mock_cfg.LLAMACPP_BASE_URL = None
+    mock_cfg.LLAMACPP_API_KEY = "llama.cpp"
+    mock_cfg.LLAMACPP_ENDPOINT_ALIAS = "llamacpp"
+    mock_cfg.LLAMACPP_MAX_CONCURRENT_REQUESTS = 1
     mock_cfg.FAKE_AI_HOST = None
     mock_cfg.SDK_OPENAI_TIMEOUT_SECONDS = 12000
     mock_cfg.SDK_OPENAI_SYNC_TIMEOUT_SECONDS = 12000
@@ -69,6 +73,7 @@ def mock_config_with_keys():
     mock_cfg.SDK_MINIMAX_TIMEOUT_SECONDS = 12000
     mock_cfg.SDK_MOONSHOT_TIMEOUT_SECONDS = 12000
     mock_cfg.SDK_OLLAMA_TIMEOUT_SECONDS = 12000
+    mock_cfg.SDK_LLAMACPP_TIMEOUT_SECONDS = 12000
     mock_cfg.SDK_FAKE_TIMEOUT_SECONDS = 12000
     return mock_cfg
 
@@ -85,6 +90,11 @@ def mock_config_no_keys():
     mock_cfg.MINIMAX_API_KEY = None
     mock_cfg.MOONSHOT_API_KEY = None
     mock_cfg.OLLAMA_HOST = None
+    mock_cfg.LLAMACPP_BASE_URL = None
+    mock_cfg.LLAMACPP_API_KEY = "llama.cpp"
+    mock_cfg.LLAMACPP_ENDPOINT_ALIAS = "llamacpp"
+    mock_cfg.LLAMACPP_MAX_CONCURRENT_REQUESTS = 1
+    mock_cfg.SDK_LLAMACPP_TIMEOUT_SECONDS = 12000
     mock_cfg.FAKE_AI_HOST = None
     return mock_cfg
 
@@ -741,6 +751,96 @@ class TestOllamaClientInit:
         await asyncio.gather(*(run_call() for _ in range(3)))
 
         assert max_active > 1
+
+
+class TestLlamaCppClientInit:
+    """Tests for the separately queued llama.cpp OpenAI-compatible client."""
+
+    def test_llamacpp_client_uses_configured_v1_base_url(self, mock_all_api_clients, reset_singleton):
+        mock_cfg = MagicMock()
+        mock_cfg.OPENAI_API_KEY = None
+        mock_cfg.ANTHROPIC_API_KEY = None
+        mock_cfg.GOOGLE_API_KEY = None
+        mock_cfg.XAI_API_KEY = None
+        mock_cfg.OPENROUTER_API_KEY = None
+        mock_cfg.MINIMAX_API_KEY = None
+        mock_cfg.MOONSHOT_API_KEY = None
+        mock_cfg.OLLAMA_HOST = None
+        mock_cfg.FAKE_AI_HOST = None
+        mock_cfg.LLAMACPP_BASE_URL = "192.0.2.10:11435/v1"
+        mock_cfg.LLAMACPP_API_KEY = "local-safe-key"
+        mock_cfg.LLAMACPP_ENDPOINT_ALIAS = "llamacpp-test"
+        mock_cfg.LLAMACPP_MAX_CONCURRENT_REQUESTS = 1
+        mock_cfg.SDK_LLAMACPP_TIMEOUT_SECONDS = 12000
+
+        with patch("ai_service.config", mock_cfg):
+            from ai_service import AIService
+
+            service = AIService()
+
+        assert service.llamacpp_client is not None
+        calls = mock_all_api_clients["openai"].AsyncOpenAI.call_args_list
+        llamacpp_call = next(
+            (call for call in calls if "192.0.2.10:11435" in str(call[1].get("base_url", ""))),
+            None,
+        )
+        assert llamacpp_call is not None
+        assert llamacpp_call[1]["base_url"] == "http://192.0.2.10:11435/v1"
+        assert llamacpp_call[1]["api_key"] == "local-safe-key"
+
+    @pytest.mark.asyncio
+    async def test_llamacpp_generation_wrapper_serializes_calls(self):
+        from ai_service import AIService
+
+        service = AIService.__new__(AIService)
+        service.llamacpp_client = object()
+        service._llamacpp_request_semaphore = asyncio.Semaphore(1)
+        active = 0
+        maximum = 0
+
+        async def fake_generate(**kwargs):
+            nonlocal active, maximum
+            assert kwargs["provider_key"] == "llamacpp"
+            assert kwargs["model_id"] == "server-model-q4"
+            assert kwargs["reasoning_effort"] == "none"
+            active += 1
+            maximum = max(maximum, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return "ok", {}
+
+        service._generate_openai_compatible = fake_generate
+        await asyncio.gather(
+            *(
+                service._generate_llamacpp(
+                    "p", "server-model-q4", 0.2, 64, "s", reasoning_effort="none"
+                )
+                for _ in range(3)
+            )
+        )
+        assert maximum == 1
+
+    @pytest.mark.asyncio
+    async def test_llamacpp_stream_wrapper_preserves_upstream_model_id(self):
+        from ai_service import AIService
+
+        service = AIService.__new__(AIService)
+        service.llamacpp_client = object()
+        service._llamacpp_request_semaphore = asyncio.Semaphore(1)
+
+        async def fake_stream(**kwargs):
+            assert kwargs["provider_key"] == "llamacpp"
+            assert kwargs["model_id"] == "server-model-q4"
+            assert kwargs["reasoning_effort"] == "none"
+            yield "ok"
+
+        service._stream_openai_compatible = fake_stream
+        chunks = []
+        async for chunk in service._stream_llamacpp(
+            "p", "server-model-q4", 0.2, 64, "s", reasoning_effort="none"
+        ):
+            chunks.append(chunk)
+        assert chunks == ["ok"]
 
 
 # ============================================================================

@@ -101,7 +101,28 @@ def resolve_model_catalog_entry(model_name: str, model_specs: Optional[Dict[str,
     aliases = model_specs.get("aliases", {}) or {}
     specifications = model_specs.get("model_specifications", {}) or {}
 
-    lookup_name = _strip_model_prefix(raw_model_name)
+    qualified_provider: Optional[str] = None
+    lookup_name = raw_model_name
+    prefix, separator, qualified_model_name = raw_model_name.partition("::")
+    if separator and prefix in specifications:
+        # A known provider prefix is an identity boundary, not display syntax.
+        # In particular, ``llamacpp::foo`` must never fall through to a cloud
+        # provider that happens to expose a model called ``foo``.
+        qualified_provider = prefix
+        lookup_name = qualified_model_name
+    else:
+        legacy_prefix, legacy_separator, legacy_model_name = raw_model_name.partition("/")
+        if legacy_separator and legacy_prefix in {"llamacpp", "ollama"}:
+            # Local endpoint prefixes are unambiguous and retained for the
+            # existing OpenAI-compatible local adapter syntax. Cloud vendor
+            # IDs such as ``openai/gpt-*`` are never interpreted as direct
+            # provider qualifiers; use ``provider::model`` when needed.
+            qualified_provider = legacy_prefix
+            lookup_name = legacy_model_name
+        elif not legacy_separator:
+            lookup_name = _strip_model_prefix(raw_model_name)
+        else:
+            lookup_name = raw_model_name
     base_model, suffix = _split_model_suffix(lookup_name)
 
     candidates: List[str] = []
@@ -116,20 +137,31 @@ def resolve_model_catalog_entry(model_name: str, model_specs: Optional[Dict[str,
     matched_model_key: Optional[str] = None
     matched_model_data: Optional[Dict[str, Any]] = None
 
-    for provider, models in specifications.items():
-        if not isinstance(models, dict):
-            continue
-        for model_key, model_data in models.items():
-            if not isinstance(model_data, dict):
+    provider_catalogs = (
+        [(qualified_provider, specifications.get(qualified_provider, {}))]
+        if qualified_provider is not None
+        else specifications.items()
+    )
+    provider_catalogs = list(provider_catalogs)
+    for candidate in candidates:
+        candidate_matches: List[Tuple[str, str, Dict[str, Any]]] = []
+        for provider, models in provider_catalogs:
+            if not isinstance(models, dict):
                 continue
-            catalog_model_id = str(model_data.get("model_id", model_key) or model_key)
-            if any(candidate == model_key or candidate == catalog_model_id for candidate in candidates):
-                matched_provider = provider
-                matched_model_key = model_key
-                matched_model_data = model_data
-                break
-        if matched_model_data is not None:
+            for model_key, model_data in models.items():
+                if not isinstance(model_data, dict):
+                    continue
+                catalog_model_id = str(model_data.get("model_id", model_key) or model_key)
+                if candidate == model_key or candidate == catalog_model_id:
+                    candidate_matches.append((str(provider), model_key, model_data))
+
+        if not candidate_matches:
+            continue
+        if qualified_provider is None and len({match[0] for match in candidate_matches}) > 1:
+            # An exact unqualified collision cannot safely select a provider.
             break
+        matched_provider, matched_model_key, matched_model_data = candidate_matches[0]
+        break
 
     if matched_model_data is None:
         return {
@@ -655,10 +687,40 @@ class Config(BaseModel):
     MINIMAX_API_KEY: str = Field(default="", description="MiniMax API key")
     MOONSHOT_API_KEY: str = Field(default="", description="Moonshot AI / Kimi API key")
     OLLAMA_HOST: str = Field(default="http://localhost:11434", description="Ollama server URL for local models")
+    OLLAMA_ENDPOINT_ALIAS: str = Field(
+        default="ollama",
+        description="Operator-facing alias for the configured Ollama endpoint",
+    )
     OLLAMA_MAX_CONCURRENT_REQUESTS: int = Field(
         default=1,
         ge=1,
         description="Maximum concurrent requests sent to local Ollama models",
+    )
+    LOCAL_ENDPOINTS_CONFIG_PATH: str = Field(
+        default="",
+        description="Administrative JSON file registering local inference API endpoints",
+    )
+    LLAMACPP_BASE_URL: str = Field(
+        default="",
+        description="OpenAI-compatible llama.cpp server URL (for example http://host:11435/v1)",
+    )
+    LLAMACPP_API_KEY: str = Field(
+        default="llama.cpp",
+        description="Optional llama.cpp API key; the safe local default is a dummy value",
+    )
+    LLAMACPP_ENDPOINT_ALIAS: str = Field(
+        default="llamacpp",
+        description="Operator-facing alias for the configured llama.cpp endpoint",
+    )
+    LLAMACPP_MAX_CONCURRENT_REQUESTS: int = Field(
+        default=1,
+        ge=1,
+        description="Maximum concurrent requests sent to the configured llama.cpp endpoint",
+    )
+    LLAMACPP_MAX_OUTPUT_TOKENS: int = Field(
+        default=4096,
+        gt=0,
+        description="Conservative explicit output cap for llama.cpp discovery entries",
     )
     FAKE_AI_HOST: str = Field(default="", description="Fake AI server URL for testing (e.g., http://localhost:8989)")
     PEPPER: str = Field(default="", description="Pepper used for stable user hashing")
@@ -1102,6 +1164,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
     SDK_MINIMAX_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="MiniMax SDK process timeout")
     SDK_MOONSHOT_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="Moonshot SDK process timeout")
     SDK_OLLAMA_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="Ollama SDK process timeout")
+    SDK_LLAMACPP_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="llama.cpp SDK process timeout")
     SDK_FAKE_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="Fake AI SDK process timeout")
 
     # Session management
@@ -1363,12 +1426,39 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             or os.getenv("KIMI_OPEN_PLATFORM_API_KEY", "")
         )
         self.OLLAMA_HOST = os.getenv("OLLAMA_HOST", self.OLLAMA_HOST)
+        self.LOCAL_ENDPOINTS_CONFIG_PATH = os.getenv(
+            "LOCAL_ENDPOINTS_CONFIG_PATH", self.LOCAL_ENDPOINTS_CONFIG_PATH
+        )
+        self.OLLAMA_ENDPOINT_ALIAS = os.getenv(
+            "OLLAMA_ENDPOINT_ALIAS", self.OLLAMA_ENDPOINT_ALIAS
+        )
         ollama_concurrency_override = os.getenv("OLLAMA_MAX_CONCURRENT_REQUESTS")
         if ollama_concurrency_override:
             try:
                 parsed = int(ollama_concurrency_override)
                 if parsed > 0:
                     self.OLLAMA_MAX_CONCURRENT_REQUESTS = parsed
+            except ValueError:
+                pass
+        self.LLAMACPP_BASE_URL = os.getenv("LLAMACPP_BASE_URL", self.LLAMACPP_BASE_URL)
+        self.LLAMACPP_API_KEY = os.getenv("LLAMACPP_API_KEY", self.LLAMACPP_API_KEY)
+        self.LLAMACPP_ENDPOINT_ALIAS = os.getenv(
+            "LLAMACPP_ENDPOINT_ALIAS", self.LLAMACPP_ENDPOINT_ALIAS
+        )
+        llamacpp_concurrency_override = os.getenv("LLAMACPP_MAX_CONCURRENT_REQUESTS")
+        if llamacpp_concurrency_override:
+            try:
+                parsed = int(llamacpp_concurrency_override)
+                if parsed > 0:
+                    self.LLAMACPP_MAX_CONCURRENT_REQUESTS = parsed
+            except ValueError:
+                pass
+        llamacpp_output_override = os.getenv("LLAMACPP_MAX_OUTPUT_TOKENS")
+        if llamacpp_output_override:
+            try:
+                parsed = int(llamacpp_output_override)
+                if parsed > 0:
+                    self.LLAMACPP_MAX_OUTPUT_TOKENS = parsed
             except ValueError:
                 pass
         self.FAKE_AI_HOST = os.getenv("FAKE_AI_HOST", self.FAKE_AI_HOST)
@@ -1808,6 +1898,14 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                 fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
             )
         )
+        self.SDK_LLAMACPP_TIMEOUT_SECONDS = int(
+            resolve_env_timeout(
+                "SDK_LLAMACPP_TIMEOUT_SECONDS",
+                self.REQUEST_TIMEOUTS,
+                ("sdk_model_timeouts", "llamacpp_seconds"),
+                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+            )
+        )
         self.SDK_FAKE_TIMEOUT_SECONDS = int(
             resolve_env_timeout(
                 "SDK_FAKE_TIMEOUT_SECONDS",
@@ -2156,9 +2254,15 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             env_hint = "MOONSHOT_API_KEY"
         elif provider == "ollama":
             api_key = "ollama"
+        elif provider == "llamacpp":
+            api_key = self.LLAMACPP_API_KEY or "llama.cpp"
+        elif provider == "openai_compatible":
+            # Credentials for registered local OpenAI-compatible services live
+            # in that endpoint's api_key_env, never in OPENAI_API_KEY.
+            api_key = "local-endpoint"
         elif provider == "fake" or resolved["is_test_model"]:
             api_key = "fake"
-        if require_api_key and not api_key and provider not in ("ollama", "fake"):
+        if require_api_key and not api_key and provider not in ("ollama", "openai_compatible", "fake"):
             msg = (
                 f"[CONFIG ERROR] Missing API key for provider '{provider_name}' "
                 f"while resolving model '{resolved['model_name']}'. Set '{env_hint}' in your environment."

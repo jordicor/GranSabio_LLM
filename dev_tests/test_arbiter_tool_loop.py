@@ -126,7 +126,7 @@ class TestShouldUseArbiterTools:
         with patch("config.config", fake_config):
             assert Arbiter._should_use_arbiter_tools("auto", "gpt-5-pro") is True
 
-    def test_unsupported_provider_returns_false(self):
+    def test_local_provider_with_tool_support_returns_true(self):
         fake_config = MagicMock()
         fake_config.model_specs = {
             "model_specifications": {
@@ -139,7 +139,7 @@ class TestShouldUseArbiterTools:
             }
         }
         with patch("config.config", fake_config):
-            assert Arbiter._should_use_arbiter_tools("auto", "llama3.1") is False
+            assert Arbiter._should_use_arbiter_tools("auto", "llama3.1") is True
 
     def test_supported_openai_model_returns_true(self):
         fake_config = MagicMock()

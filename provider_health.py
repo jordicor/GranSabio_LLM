@@ -36,7 +36,15 @@ LOCAL_ERRORS_SOURCE = "local_errors"
 LOCAL_SUCCESSES_SOURCE = "local_successes"
 
 REMOTE_STATUS_PROVIDERS = ("openai", "claude", "gemini", "openrouter", "xai")
-DEFAULT_PROVIDERS = (*REMOTE_STATUS_PROVIDERS, "minimax", "moonshot", "ollama", "fake")
+DEFAULT_PROVIDERS = (
+    *REMOTE_STATUS_PROVIDERS,
+    "minimax",
+    "moonshot",
+    "ollama",
+    "llamacpp",
+    "openai_compatible",
+    "fake",
+)
 
 _EVENT_TTL_SECONDS = 15 * 60
 _MAX_EVENTS_PER_PROVIDER = 300
@@ -59,6 +67,7 @@ _PROVIDER_DISPLAY_NAMES = {
     "minimax": "MiniMax",
     "moonshot": "Moonshot/Kimi",
     "ollama": "Ollama",
+    "llamacpp": "llama.cpp",
     "fake": "Fake AI",
 }
 
@@ -83,11 +92,13 @@ class ProviderHealthEvent:
     status_code: int | None = None
     model: str | None = None
     operation: str | None = None
+    endpoint_id: str | None = None
 
 
 @dataclass
 class ProviderHealthState:
     provider: str
+    endpoint_id: str | None = None
     status: str = PROVIDER_OPERATIONAL
     source: str = LOCAL_SOURCE
     message: str = ""
@@ -101,7 +112,7 @@ class ProviderHealthState:
 
 
 _state_lock = RLock()
-_states: dict[str, ProviderHealthState] = {}
+_states: dict[tuple[str, str | None], ProviderHealthState] = {}
 _check_tasks: dict[str, asyncio.Task] = {}
 
 
@@ -127,10 +138,22 @@ def normalize_provider_key(value: str | None) -> str:
         "xai": "xai",
         "grok": "xai",
         "ollama": "ollama",
+        "llama.cpp": "llamacpp",
+        "llamacpp": "llamacpp",
+        "openai_compatible": "openai_compatible",
         "fake": "fake",
         "fake_ai": "fake",
     }
     return aliases.get(provider, provider)
+
+
+def _normalize_endpoint_id(value: str | None) -> str | None:
+    """Return an optional endpoint identity suitable for a health-state key."""
+
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def provider_display_name(provider: str | None) -> str:
@@ -147,6 +170,7 @@ def should_surface_provider_health(health: dict[str, Any] | None) -> bool:
 async def record_provider_success(
     provider: str | None,
     *,
+    endpoint_id: str | None = None,
     model: str | None = None,
     operation: str | None = None,
 ) -> dict[str, Any]:
@@ -155,13 +179,16 @@ async def record_provider_success(
     provider_key = normalize_provider_key(provider)
     if not provider_key:
         return {}
+    normalized_endpoint_id = _normalize_endpoint_id(endpoint_id)
     snapshot = _record_event(
         provider_key,
+        normalized_endpoint_id,
         ProviderHealthEvent(
             timestamp=time.time(),
             kind="success",
             model=model,
             operation=operation,
+            endpoint_id=normalized_endpoint_id,
         ),
     )
     return snapshot
@@ -172,6 +199,7 @@ async def record_provider_failure(failure: ProviderFailure) -> dict[str, Any]:
 
     return await record_provider_error(
         failure.provider,
+        endpoint_id=failure.endpoint_id,
         kind=failure.kind,
         status_code=failure.status_code,
         model=failure.model_id,
@@ -183,6 +211,7 @@ async def record_provider_error(
     provider: str | None,
     *,
     kind: ProviderErrorKind | str,
+    endpoint_id: str | None = None,
     status_code: int | None = None,
     model: str | None = None,
     operation: str | None = None,
@@ -192,6 +221,7 @@ async def record_provider_error(
     provider_key = normalize_provider_key(provider)
     if not provider_key:
         return {}
+    normalized_endpoint_id = _normalize_endpoint_id(endpoint_id)
     try:
         error_kind = kind if isinstance(kind, ProviderErrorKind) else ProviderErrorKind(str(kind))
     except ValueError:
@@ -199,6 +229,7 @@ async def record_provider_error(
     suspicious = error_kind in _SUSPICIOUS_KINDS
     snapshot = _record_event(
         provider_key,
+        normalized_endpoint_id,
         ProviderHealthEvent(
             timestamp=time.time(),
             kind="error",
@@ -208,40 +239,64 @@ async def record_provider_error(
             status_code=status_code,
             model=model,
             operation=operation,
+            endpoint_id=normalized_endpoint_id,
         ),
     )
-    maybe_schedule_provider_check(provider_key, force=should_surface_provider_health(snapshot))
+    if normalized_endpoint_id is None:
+        maybe_schedule_provider_check(provider_key, force=should_surface_provider_health(snapshot))
     return snapshot
 
 
-def get_provider_health(provider: str | None) -> dict[str, Any]:
+def get_provider_health(
+    provider: str | None,
+    *,
+    endpoint_id: str | None = None,
+) -> dict[str, Any]:
     provider_key = normalize_provider_key(provider)
     if not provider_key:
         return {}
+    normalized_endpoint_id = _normalize_endpoint_id(endpoint_id)
     now = time.time()
     with _state_lock:
-        state = _get_state_locked(provider_key)
+        state = _get_state_locked(provider_key, normalized_endpoint_id)
         _prune_events_locked(state, now)
         _recalculate_status_locked(state, now)
         snapshot = _public_snapshot_locked(state)
-    maybe_schedule_provider_check(provider_key)
+    if normalized_endpoint_id is None:
+        maybe_schedule_provider_check(provider_key)
     return snapshot
 
 
 def get_all_provider_health(providers: Iterable[str] | None = None) -> dict[str, Any]:
     provider_keys = [normalize_provider_key(provider) for provider in (providers or DEFAULT_PROVIDERS)]
-    provider_keys = [provider for provider in provider_keys if provider]
+    with _state_lock:
+        provider_keys.extend(provider for provider, _endpoint_id in _states)
+    provider_keys = list(dict.fromkeys(provider for provider in provider_keys if provider))
     snapshots = {provider: get_provider_health(provider) for provider in provider_keys}
-    overall_status = _overall_status(snapshots.values())
+    endpoint_snapshots: dict[str, dict[str, dict[str, Any]]] = {}
+    with _state_lock:
+        endpoint_keys = sorted(
+            (provider, endpoint_id)
+            for provider, endpoint_id in _states
+            if provider in provider_keys and endpoint_id is not None
+        )
+    for provider, endpoint_id in endpoint_keys:
+        endpoint_snapshots.setdefault(provider, {})[endpoint_id] = get_provider_health(
+            provider, endpoint_id=endpoint_id
+        )
+    overall_status = _overall_status(
+        [*snapshots.values(), *(snapshot for values in endpoint_snapshots.values() for snapshot in values.values())]
+    )
     return {
         "status": overall_status,
         "providers": snapshots,
+        "endpoints": endpoint_snapshots,
         "generated_at": time.time(),
     }
 
 
 def provider_health_for_failure_payload(failure: ProviderFailure) -> dict[str, Any]:
-    health = get_provider_health(failure.provider)
+    health = get_provider_health(failure.provider, endpoint_id=failure.endpoint_id)
     if not should_surface_provider_health(health):
         return {}
     return {
@@ -295,9 +350,13 @@ def reset_provider_health_state() -> None:
         _check_tasks.clear()
 
 
-def _record_event(provider: str, event: ProviderHealthEvent) -> dict[str, Any]:
+def _record_event(
+    provider: str,
+    endpoint_id: str | None,
+    event: ProviderHealthEvent,
+) -> dict[str, Any]:
     with _state_lock:
-        state = _get_state_locked(provider)
+        state = _get_state_locked(provider, endpoint_id)
         state.last_activity_at = event.timestamp
         state.events.append(event)
         _prune_events_locked(state, event.timestamp)
@@ -305,11 +364,12 @@ def _record_event(provider: str, event: ProviderHealthEvent) -> dict[str, Any]:
         return _public_snapshot_locked(state)
 
 
-def _get_state_locked(provider: str) -> ProviderHealthState:
-    state = _states.get(provider)
+def _get_state_locked(provider: str, endpoint_id: str | None = None) -> ProviderHealthState:
+    state_key = (provider, endpoint_id)
+    state = _states.get(state_key)
     if state is None:
-        state = ProviderHealthState(provider=provider)
-        _states[provider] = state
+        state = ProviderHealthState(provider=provider, endpoint_id=endpoint_id)
+        _states[state_key] = state
     return state
 
 
@@ -631,6 +691,7 @@ def _public_snapshot_locked(state: ProviderHealthState) -> dict[str, Any]:
     suspicious = [event for event in recent if event.kind == "error" and event.suspicious]
     return {
         "provider": state.provider,
+        "endpoint_id": state.endpoint_id,
         "provider_name": provider_display_name(state.provider),
         "status": state.status,
         "source": state.source,

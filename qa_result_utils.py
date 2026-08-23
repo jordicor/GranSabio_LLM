@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import math
 import hashlib
+import math
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from model_aliasing import get_evaluator_alias
@@ -340,6 +340,30 @@ def semantic_deal_breakers(layer_results: Dict[str, Any]) -> List[Any]:
         if is_valid_semantic_qa_result(evaluation)
         and bool(getattr(evaluation, "deal_breaker", False))
     ]
+
+
+def is_resolved_gran_sabio_false_positive(evaluation: Any) -> bool:
+    """Return whether Gran Sabio conclusively cleared this evaluation.
+
+    The metadata marker alone is not enough: requiring the normalized pass
+    fields keeps malformed or partially persisted evaluations fail-closed.
+    """
+
+    if isinstance(evaluation, Mapping):
+        metadata = evaluation.get("metadata")
+        deal_breaker = evaluation.get("deal_breaker")
+        passes_score = evaluation.get("passes_score")
+    else:
+        metadata = getattr(evaluation, "metadata", None)
+        deal_breaker = getattr(evaluation, "deal_breaker", None)
+        passes_score = getattr(evaluation, "passes_score", None)
+
+    return (
+        isinstance(metadata, Mapping)
+        and metadata.get("gran_sabio_override") == "false_positive"
+        and deal_breaker is False
+        and passes_score is True
+    )
 
 
 def apply_gran_sabio_false_positive_override(

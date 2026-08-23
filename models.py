@@ -129,6 +129,11 @@ class QALayer(BaseModel):
 class QAModelConfig(BaseModel):
     """Configuration for a specific QA evaluation model"""
     model: str = Field(..., description="Model identifier (e.g., 'gpt-5-mini', 'claude-opus-4')")
+    endpoint_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description="Administrator-configured inference endpoint identity for this evaluator.",
+    )
     max_tokens: Optional[int] = Field(
         default=None,
         gt=0,
@@ -157,6 +162,26 @@ class QAModelConfig(BaseModel):
         gt=0,
         description="Maximum seconds allowed for this QA model evaluation attempt"
     )
+    provider_options: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Per-evaluator provider routing options. Routing supplies this for "
+            "OpenRouter evaluators so duplicate model slots retain their own "
+            "provider policy."
+        ),
+    )
+
+    @field_validator("endpoint_id")
+    @classmethod
+    def validate_endpoint_id(cls, value: Optional[str]) -> Optional[str]:
+        """Reject blank endpoint identifiers before they reach routing."""
+
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("endpoint_id must be a non-empty string")
+        return normalized
 
     @field_validator("timeout_seconds")
     @classmethod
@@ -960,6 +985,18 @@ class ProjectInitRequest(BaseModel):
         return normalized
 
 
+class ExecutionPolicy(BaseModel):
+    """Execution boundary requested for one generation."""
+
+    scope: Literal["default", "local_only"] = Field(
+        default="default",
+        description=(
+            "Execution policy scope. local_only admits and dispatches only "
+            "administrator-configured local endpoints."
+        ),
+    )
+
+
 class ContentRequest(BaseModel):
     """Request model for content generation"""
     prompt: str = Field(..., min_length=10, max_length=MAX_PROMPT_CHARS, description="The content generation prompt")
@@ -1004,7 +1041,31 @@ class ContentRequest(BaseModel):
     llm_routing: Optional[Dict[str, Any]] = Field(
         default=None,
         validation_alias=AliasChoices("llm_routing", "llmRouting"),
-        description="Optional request-scoped model routing overlay keyed by exact LLM call id.",
+        description=(
+            "Optional request-scoped model routing overlay keyed by exact LLM call id. "
+            "A route may include endpoint_id to select one administrator-configured local inference API. "
+            "OpenRouter routes may include provider_options with allow_fallbacks, "
+            "require_parameters, and max_price.prompt/completion."
+        ),
+    )
+    execution_policy: ExecutionPolicy = Field(
+        default_factory=ExecutionPolicy,
+        validation_alias=AliasChoices("execution_policy", "executionPolicy"),
+        description="Optional execution boundary for this generation request.",
+    )
+    feedback_memory_enabled: bool = Field(
+        default=True,
+        description=(
+            "Enable request-scoped Feedback Memory. Disable for isolated canary "
+            "runs that must not read, synthesize, or write cross-session feedback."
+        ),
+    )
+    strict_single_generation_attempt: bool = Field(
+        default=False,
+        description=(
+            "Disable output-growth and transient retries, and set the OpenRouter "
+            "SDK retry budget to zero for the primary generation path."
+        ),
     )
     timeout_seconds: Optional[float] = Field(
         default=None,
@@ -1573,8 +1634,8 @@ class ContentRequest(BaseModel):
                 "json_output": False,
                 "llm_routing": {
                     "calls": {
-                        "generation.main": {"model": "your-generator-model"},
-                        "qa.evaluate_layer": {"models": ["your-qa-model"]},
+                        "generation.main": {"model": "your-generator-model", "endpoint_id": "local-writer"},
+                        "qa.evaluate_layer": {"models": [{"model": "your-qa-model", "endpoint_id": "local-qa"}]},
                         "gransabio.review": {"model": "your-gransabio-model"},
                         "arbiter.resolve": {"model": "your-arbiter-model"}
                     }
@@ -1933,6 +1994,13 @@ class GenerationInitResponse(BaseModel):
     auto_qa_feedback: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Feedback returned when Auto-QA rejects before generation starts.",
+    )
+    local_only_attestation: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Local-only dispatch attestation, including pre-start terminal "
+            "rejections that do not retain a final session."
+        ),
     )
 
 

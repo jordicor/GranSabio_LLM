@@ -15,7 +15,13 @@ import pytest
 
 import json_utils as json
 import services.model_sync as model_sync
-from services.model_sync import ModelSyncError, ModelSyncService, _normalize_ollama_host, _remote_json_headers
+from services.model_sync import (
+    ModelSyncError,
+    ModelSyncService,
+    _normalize_ollama_host,
+    _normalize_openai_compatible_base_url,
+    _remote_json_headers,
+)
 
 
 class _FakeResponse:
@@ -42,6 +48,7 @@ class _FakeOllamaSession:
         self.version_status = version_status
         self.tags_payload = tags_payload if tags_payload is not None else {"models": []}
         self.urls = []
+        self.request_kwargs = []
 
     async def __aenter__(self):
         return self
@@ -51,6 +58,7 @@ class _FakeOllamaSession:
 
     def get(self, url, **kwargs):
         self.urls.append(url)
+        self.request_kwargs.append(kwargs)
         if url.endswith("/api/version"):
             return _FakeResponse(
                 status=self.version_status,
@@ -60,6 +68,52 @@ class _FakeOllamaSession:
         if url.endswith("/api/tags"):
             return _FakeResponse(payload=self.tags_payload)
         raise AssertionError(f"Unexpected URL: {url}")
+
+
+class _FakeLlamaCppSession:
+    def __init__(
+        self,
+        *,
+        statuses=None,
+        required_authorization=None,
+        props_payload=None,
+        slots_payload=None,
+    ):
+        self.statuses = statuses or {}
+        self.required_authorization = required_authorization
+        self.props_payload = props_payload if props_payload is not None else {"n_ctx": 32768}
+        self.slots_payload = slots_payload if slots_payload is not None else [{"id": 0, "is_processing": False}]
+        self.urls = []
+        self.headers = []
+        self.request_kwargs = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def get(self, url, **kwargs):
+        self.urls.append(url)
+        self.request_kwargs.append(kwargs)
+        headers = kwargs.get("headers", {})
+        self.headers.append(headers)
+        status = self.statuses.get(url, 200)
+        if (
+            self.required_authorization is not None
+            and headers.get("Authorization") != self.required_authorization
+        ):
+            status = 401
+        payloads = {
+            "/health": {"status": "ok"},
+            "/v1/models": {"data": [{"id": "server-model-q4"}]},
+            "/props": self.props_payload,
+            "/slots": self.slots_payload,
+        }
+        suffix = next((key for key in payloads if url.endswith(key)), None)
+        if suffix is None:
+            raise AssertionError(f"Unexpected URL: {url}")
+        return _FakeResponse(status=status, payload=payloads[suffix], text="unavailable")
 
 
 class _FakeSingleGetSession:
@@ -297,6 +351,11 @@ def test_normalize_ollama_host_rewrites_unspecified_bind_address():
     assert _normalize_ollama_host("http://192.168.1.50:11434") == "http://192.168.1.50:11434"
 
 
+def test_normalize_openai_compatible_base_url_adds_v1_and_rewrites_bind_address():
+    assert _normalize_openai_compatible_base_url("192.168.1.50:11435") == "http://192.168.1.50:11435/v1"
+    assert _normalize_openai_compatible_base_url("0.0.0.0:11435/v1") == "http://127.0.0.1:11435/v1"
+
+
 @pytest.mark.asyncio
 async def test_fetch_minimax_remote_models_as_discovery_entries(service, monkeypatch):
     fake_session = _FakeSingleGetSession(
@@ -438,6 +497,7 @@ async def test_fetch_ollama_remote_models_from_local_tags(service, monkeypatch):
         "http://localhost:11434/api/version",
         "http://localhost:11434/api/tags",
     ]
+    assert all(kwargs["allow_redirects"] is False for kwargs in fake_session.request_kwargs)
     assert result["provider"] == "ollama"
     assert result["sync_mode"] == "full"
     assert result["stats"]["new"] == 1
@@ -454,13 +514,147 @@ async def test_fetch_ollama_remote_models_from_local_tags(service, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_fetch_ollama_remote_requires_reachable_server(service, monkeypatch):
-    fake_session = _FakeOllamaSession(version_status=503)
+    fake_session = _FakeOllamaSession(version_status=302)
     monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
 
     with pytest.raises(ModelSyncError, match="Ollama API health check failed"):
         await service.fetch_remote_models("ollama")
 
     assert fake_session.urls == ["http://localhost:11434/api/version"]
+    assert fake_session.request_kwargs[0]["allow_redirects"] is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_llamacpp_discovers_effective_context_without_generation(service, monkeypatch):
+    service.config.LLAMACPP_BASE_URL = "http://192.0.2.10:11435/v1"
+    service.config.LLAMACPP_ENDPOINT_ALIAS = "llamacpp-test"
+    fake_session = _FakeLlamaCppSession()
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+
+    result = await service.fetch_remote_models("llamacpp")
+
+    assert fake_session.urls == [
+        "http://192.0.2.10:11435/health",
+        "http://192.0.2.10:11435/v1/models",
+        "http://192.0.2.10:11435/props",
+        "http://192.0.2.10:11435/slots",
+    ]
+    assert all(kwargs["allow_redirects"] is False for kwargs in fake_session.request_kwargs)
+    model = result["models"][0]
+    assert model["model_id"] == "server-model-q4"
+    assert model["context_window"] == 32768
+    assert model["capabilities"] == ["text"]
+    assert model["pricing"] == {"input_per_million": 0.0, "output_per_million": 0.0}
+    assert model["sync_metadata"]["endpoint_alias"] == "llamacpp-test"
+
+
+@pytest.mark.asyncio
+async def test_fetch_llamacpp_advertises_reasoning_only_when_server_reports_support(
+    service, monkeypatch
+):
+    service.config.LLAMACPP_BASE_URL = "http://192.0.2.10:11435/v1"
+    fake_session = _FakeLlamaCppSession(
+        props_payload={
+            "n_ctx": 32768,
+            "chat_template_caps": {"supports_reasoning_effort": True},
+        }
+    )
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+
+    result = await service.fetch_remote_models("llamacpp")
+
+    model = result["models"][0]
+    assert model["capabilities"] == ["text", "reasoning"]
+    assert model["supported_parameters"] == ["reasoning_effort"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_llamacpp_sends_configured_authorization_to_protected_server(
+    service, monkeypatch
+):
+    service.config.LLAMACPP_BASE_URL = "http://192.0.2.10:11435/v1"
+    service.config.LLAMACPP_API_KEY = "server-protected-key"
+    fake_session = _FakeLlamaCppSession(
+        required_authorization="Bearer server-protected-key"
+    )
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+
+    result = await service.fetch_remote_models("llamacpp")
+
+    assert result["models"][0]["model_id"] == "server-model-q4"
+    assert fake_session.headers
+    assert all(
+        headers.get("Authorization") == "Bearer server-protected-key"
+        for headers in fake_session.headers
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_llamacpp_uses_smallest_positive_slot_context_limit(service, monkeypatch):
+    service.config.LLAMACPP_BASE_URL = "http://192.0.2.10:11435/v1"
+    service.config.LLAMACPP_MAX_OUTPUT_TOKENS = 4096
+    fake_session = _FakeLlamaCppSession(
+        props_payload={"n_ctx": 32768, "default_generation_settings": {"n_predict": 1024}},
+        slots_payload=[
+            {"id": 0, "n_ctx": 24576},
+            {"id": 1, "context": 16384},
+            {"id": 2, "n_ctx": 0},
+        ],
+    )
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+
+    result = await service.fetch_remote_models("llamacpp")
+
+    model = result["models"][0]
+    assert model["context_window"] == 16384
+    assert model["input_tokens"] == 16384
+    assert model["output_tokens"] == 1024
+    assert model["sync_metadata"]["effective_context_window"] == 16384
+    assert model["sync_metadata"]["slot_context_limits"] == [24576, 16384]
+
+
+@pytest.mark.asyncio
+async def test_fetch_llamacpp_never_serializes_raw_slot_prompt_or_state(service, monkeypatch):
+    service.config.LLAMACPP_BASE_URL = "http://192.0.2.10:11435/v1"
+    fake_session = _FakeLlamaCppSession(
+        slots_payload=[
+            {
+                "id": 0,
+                "n_ctx": 16384,
+                "is_processing": True,
+                "prompt": "SENSITIVE-SLOT-PROMPT",
+                "cache_state": {"private": "do-not-persist"},
+            }
+        ]
+    )
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+
+    result = await service.fetch_remote_models("llamacpp")
+
+    model = result["models"][0]
+    assert model["sync_metadata"]["busy_slot_count"] == 1
+    assert model["raw"]["slot_summary"] == {
+        "slot_count": 1,
+        "context_limits": [16384],
+        "busy_slot_count": 1,
+    }
+    assert "SENSITIVE-SLOT-PROMPT" not in json.dumps(model)
+
+
+@pytest.mark.asyncio
+async def test_fetch_llamacpp_failure_never_mutates_catalog(service, monkeypatch):
+    service.config.LLAMACPP_BASE_URL = "http://192.0.2.10:11435/v1"
+    before = service.specs_path.read_text(encoding="utf-8")
+    fake_session = _FakeLlamaCppSession(
+        statuses={"http://192.0.2.10:11435/health": 302}
+    )
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+
+    with pytest.raises(ModelSyncError, match="llama.cpp discovery failed"):
+        await service.fetch_remote_models("llamacpp")
+
+    assert service.specs_path.read_text(encoding="utf-8") == before
+    assert fake_session.request_kwargs[0]["allow_redirects"] is False
 
 
 def test_provider_spec_preserves_remote_text_only_capabilities_for_non_reasoning_xai(service):

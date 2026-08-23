@@ -1322,6 +1322,23 @@ def test_provider_and_context_error_results_keep_their_sanitized_payloads():
     assert result["error_type"] == "provider_error"
 
 
+def test_public_provider_failure_payload_includes_local_endpoint_identity():
+    from provider_errors import ProviderErrorKind, ProviderFailure
+
+    payload = generation_processor_module._provider_failure_public_payload(
+        ProviderFailure(
+            provider="ollama",
+            endpoint_id="spark-a",
+            model_id="writer",
+            operation="generation",
+            kind=ProviderErrorKind.TIMEOUT,
+            message="timeout",
+        )
+    )
+
+    assert payload["endpoint_id"] == "spark-a"
+
+
 # ---------------------------------------------------------------------------
 # C2.4: a truncated candidate is never canonical
 # ---------------------------------------------------------------------------

@@ -49,7 +49,8 @@ from gran_sabio import GranSabioProcessCancelled
 from gran_sabio_supervisor import GranSabioSupervisor
 from json_field_utils import prepare_content_for_qa, reconstruct_json, try_extract_json_from_content
 from llm_accent_prompts import ACCENT_SYSTEM_PROMPT_SNIPPET
-from llm_routing import resolve_call, resolve_temperature
+from llm_routing import endpoint_id_call_kwargs, resolve_call, resolve_temperature
+from local_execution_policy import LocalExecutionPolicyError
 from logging_utils import Phase, create_phase_logger
 from long_text.controller import (
     LongTextDeadlineExceeded,
@@ -241,6 +242,7 @@ def _provider_failure_public_payload(failure: ProviderFailure) -> Dict[str, Any]
         "type": "provider_error",
         "kind": failure.kind.value,
         "provider": failure.provider,
+        "endpoint_id": failure.endpoint_id,
         "model": failure.model_id,
         "operation": failure.operation,
         "message": _provider_failure_public_message(failure),
@@ -398,6 +400,28 @@ def _build_generation_error_result(
             "error_type": "context_admission",
             "error_code": exc.error_code,
             "context_admission": context_public,
+            "evidence_grounding": None,
+            "generated_at": datetime.now().isoformat(),
+        }
+        _attach_json_guard_metadata(session, final_result, request)
+        return final_result
+
+    if isinstance(exc, LocalExecutionPolicyError):
+        policy_public = exc.to_payload()
+        error_msg = policy_public["detail"]
+        session["local_execution_policy"] = policy_public
+        session["error_type"] = "local_execution_policy"
+        session["error_code"] = exc.code
+        final_result = {
+            "content": _get_error_result_content(session, default=""),
+            "final_iteration": session.get("current_iteration", 0),
+            "final_score": 0.0,
+            "approved": False,
+            "status": GenerationStatus.FAILED.value,
+            "failure_reason": error_msg,
+            "error_type": "local_execution_policy",
+            "error_code": exc.code,
+            "local_execution_policy": policy_public,
             "evidence_grounding": None,
             "generated_at": datetime.now().isoformat(),
         }
@@ -1220,6 +1244,15 @@ def _attach_usage_metadata(session: Dict[str, Any], final_result: Dict[str, Any]
     the returned content stays opt-in, because that mutates canonical content:
     it only happens when the request set the field explicitly.
     """
+    local_execution = session.get("local_execution")
+    if local_execution is not None:
+        from local_execution_policy import build_local_execution_attestation
+
+        final_result["local_only_attestation"] = build_local_execution_attestation(
+            local_execution.manifest,
+            local_execution.ledger,
+        ).to_payload()
+
     tracker: Optional[UsageTracker] = session.get("usage_tracker")
     level = getattr(request, "show_query_costs", 0)
     stats_level = getattr(request, "show_query_stats", 0)
@@ -2346,6 +2379,27 @@ def _build_compact_iteration_memory_prompt(iterations: List[Dict[str, Any]], lim
     return "\n".join(lines)
 
 
+def _feedback_memory_text(
+    consensus_result: Any,
+    qa_results: Dict[str, Dict[str, Any]],
+) -> str:
+    """Return prompt-safe QA feedback for the cross-iteration memory system.
+
+    Consensus feedback is authoritative when present.  If it is unavailable, reuse the shared
+    fallback projection instead of reading raw evaluator feedback directly; that projection keeps
+    genuine findings while excluding deal-breakers Gran Sabio conclusively resolved as false
+    positives.
+    """
+
+    actionable_feedback = _extract_consensus_field(
+        consensus_result,
+        "actionable_feedback",
+    ) or []
+    if actionable_feedback:
+        return "\n".join(str(item) for item in actionable_feedback)
+    return "\n".join(_fallback_actionable_feedback(qa_results or {}))
+
+
 def _record_accent_fail_open(session: Dict[str, Any], *, path: str, reason: str) -> None:
     """Increment session-level accent fail-open telemetry accumulators (§5.12)."""
     session.setdefault("accent_fail_open_count", 0)
@@ -2829,6 +2883,8 @@ async def _generate_full_content(
         effective_max_tokens: Any,
         finish_metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[int]:
+        if getattr(request, "strict_single_generation_attempt", False):
+            return None
         adjustment = getattr(
             request,
             "_external_generation_min_tokens_adjustment",
@@ -2875,12 +2931,15 @@ async def _generate_full_content(
             )
         await add_verbose_log(
             session_id,
-            "[Tokens] Output was truncated; retrying once with "
-            f"max_tokens={telemetry['retry_max_tokens']} "
-            f"(effective={telemetry['effective_max_tokens']}, "
-            f"requested={telemetry['requested_max_tokens']}).",
+            "[Tokens] Output was truncated at effective "
+            f"max_tokens={telemetry['effective_max_tokens']} "
+            f"(caller requested {telemetry['requested_max_tokens']}); "
+            f"retrying once with max_tokens={telemetry['retry_max_tokens']}.",
         )
         return int(telemetry["retry_max_tokens"])
+
+    generation_route = resolve_call("generation.main", request=request)
+    generation_provider_options = generation_route.provider_options
 
     if _should_use_generation_tools(request):
         generation_tool_deadline = time.monotonic() + float(generation_timeout)
@@ -2924,7 +2983,6 @@ async def _generate_full_content(
         accent_guard_for_call = request.llm_accent_guard if accent_mode != "off" else None
         enable_validate_draft = has_active_generation_validators(request)
         generation_tool_event_callback = _make_generation_tool_event_callback(session_id, session)
-
         async def _call_generation_tool_loop(
             token_budget: int,
             *,
@@ -2963,8 +3021,18 @@ async def _generate_full_content(
                 prompt_safety_parts=prompt_safety_parts,
                 tool_event_callback=generation_tool_event_callback,
                 llm_routing=getattr(request, "_llm_routing", None),
+                provider_options=generation_provider_options,
+                **endpoint_id_call_kwargs(
+                    getattr(generation_route, "endpoint_id", None)
+                ),
+                strict_single_generation_attempt=getattr(
+                    request, "strict_single_generation_attempt", False
+                ),
                 request_timeout=timeout_seconds,
                 cancellation_token=cancellation_token,
+                local_execution=session.get("local_execution"),
+                dispatch_call_id="generation.main",
+                dispatch_route_ordinal=0,
             )
 
         try:
@@ -3213,7 +3281,11 @@ async def _generate_full_content(
     # Transient provider retries and the one output-truncation retry have
     # independent budgets. The extra provider slot is usable only after a
     # model-safe truncation plan has been scheduled.
-    max_stream_attempts = config.MAX_RETRIES if config.RETRY_STREAMING_AFTER_PARTIAL else 1
+    max_stream_attempts = (
+        1
+        if getattr(request, "strict_single_generation_attempt", False)
+        else (config.MAX_RETRIES if config.RETRY_STREAMING_AFTER_PARTIAL else 1)
+    )
     max_provider_attempts = max_stream_attempts + 1
     transient_failures = 0
     truncation_retry_used = False
@@ -3296,9 +3368,19 @@ async def _generate_full_content(
                 model_alias_registry=getattr(request, "_model_alias_registry", None),
                 prompt_safety_parts=prompt_safety_parts,
                 llm_routing=getattr(request, "_llm_routing", None),
+                provider_options=generation_provider_options,
+                **endpoint_id_call_kwargs(
+                    getattr(generation_route, "endpoint_id", None)
+                ),
+                strict_single_generation_attempt=getattr(
+                    request, "strict_single_generation_attempt", False
+                ),
                 request_timeout=remaining_stream_timeout,
                 cancellation_token=cancellation_token,
                 cancel_callback=_generation_cancelled,
+                local_execution=session.get("local_execution"),
+                dispatch_call_id="generation.main",
+                dispatch_route_ordinal=0,
             )
             attempt_timeout_scope = asyncio.timeout(remaining_stream_timeout)
             async for chunk in _iterate_stream_with_deadline(
@@ -4714,6 +4796,8 @@ async def _process_single_layer_with_edits(
                 raise
             except ContextAdmissionError:
                 raise
+            except LocalExecutionPolicyError:
+                raise
             except Exception as e:
                 if _is_content_filter_stop(e):
                     raise
@@ -5430,7 +5514,11 @@ def _clone_request_for_final_verification(request: ContentRequest) -> ContentReq
     cloned_request._generation_mode = "final_verification"
     cloned_request._smart_edit_metadata = None
     cloned_request._resolved_long_text_mode = getattr(request, "_resolved_long_text_mode", None)
-    for runtime_attr in ("_model_alias_registry", "_cancellation_token"):
+    for runtime_attr in (
+        "_model_alias_registry",
+        "_cancellation_token",
+        "_local_execution",
+    ):
         if hasattr(request, runtime_attr):
             setattr(cloned_request, runtime_attr, getattr(request, runtime_attr, None))
     return cloned_request
@@ -5663,6 +5751,8 @@ async def _adjudicate_final_verification_deal_breakers(
             )
             raise
         except ContextAdmissionError:
+            raise
+        except LocalExecutionPolicyError:
             raise
         except Exception as exc:
             if _is_content_filter_stop(exc):
@@ -6104,6 +6194,7 @@ async def _generate_smart_edits(
         edit_route = resolve_call("generation.smart_edit", request=request)
         edit_model = edit_route.model
         edit_temperature = resolve_temperature(edit_route)
+        edit_provider_options = getattr(edit_route, "provider_options", {})
 
         # Sort edits by position (reverse order: back to front) to avoid index invalidation
         sorted_paragraphs = []
@@ -6273,6 +6364,13 @@ async def _generate_smart_edits(
                     preserve_length=True,
                     usage_callback=usage_callback,
                     cancellation_token=cancellation_token,
+                    provider_options=edit_provider_options,
+                    **endpoint_id_call_kwargs(
+                        getattr(edit_route, "endpoint_id", None)
+                    ),
+                    local_execution=session.get("local_execution"),
+                    dispatch_call_id="generation.smart_edit",
+                    dispatch_route_ordinal=0,
                 )
 
             if result.success:
@@ -6422,6 +6520,8 @@ async def _generate_smart_edits(
         # Context overflow is fatal — it must propagate to the context_admission
         # surface, never be swallowed here (as SmartEditError-driven regeneration
         # or the generic-exception "use original content" path below).
+        raise
+    except LocalExecutionPolicyError:
         raise
     except SmartEditError as e:
         # Fail-fast: propagate SmartEditError to trigger fallback to regeneration
@@ -6584,6 +6684,7 @@ async def process_content_generation(
         registry=cancellation_registry,
     )
     request._cancellation_token = cancellation_token
+    request._local_execution = session.get("local_execution")
     usage_tracker: Optional[UsageTracker] = session.get("usage_tracker")
     model_alias_registry = getattr(request, "_model_alias_registry", None) or session.get("model_alias_registry")
     if model_alias_registry is None:
@@ -6604,52 +6705,61 @@ async def process_content_generation(
     )
     session["phase_logger"] = phase_logger
 
-    # Initialize feedback memory for this session
-    feedback_manager = get_feedback_manager()
+    # Isolated canaries must not observe or influence cross-session feedback.
+    # Keep the historical default enabled, but do not even instantiate the
+    # manager when this request has explicitly opted out.
+    feedback_manager = None
+    session["feedback_manager"] = None
+    session["initial_rules"] = []
+    if request.feedback_memory_enabled:
+        feedback_manager = get_feedback_manager()
 
-    async def _finalize_feedback_init_failure(exc: Exception) -> None:
-        try:
-            await _record_terminal_generation_failure(
-                session_id=session_id,
-                session=session,
-                request=request,
-                exc=exc,
-            )
-        finally:
+        async def _finalize_feedback_init_failure(exc: Exception) -> None:
             try:
-                await feedback_manager.complete_session(
-                    session_id,
-                    success=False,
+                await _record_terminal_generation_failure(
+                    session_id=session_id,
+                    session=session,
+                    request=request,
+                    exc=exc,
                 )
-            except Exception as cleanup_error:
-                logger.warning(
-                    "Failed to complete feedback memory session: %s",
-                    cleanup_error,
-                )
-            await cancellation_registry.unregister_session(session_id)
-            reset_console_context(console_context_tokens)
+            finally:
+                try:
+                    await feedback_manager.complete_session(
+                        session_id,
+                        success=False,
+                    )
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "Failed to complete feedback memory session: %s",
+                        cleanup_error,
+                    )
+                await cancellation_registry.unregister_session(session_id)
+                reset_console_context(console_context_tokens)
 
-    try:
-        initial_feedback_info = await feedback_manager.initialize_session(
-            session_id,
-            request,
-            cancellation_token=cancellation_token,
-        )
-        session["feedback_manager"] = feedback_manager
-        session["initial_rules"] = initial_feedback_info.get("initial_rules", [])
-        logger.info(f"Feedback memory initialized for session {session_id} with {len(initial_feedback_info.get('initial_rules', []))} initial rules")
-    except ContextAdmissionError as exc:
-        # A context overflow in feedback-memory init must surface (plan 12.1),
-        # never silently disable feedback memory as if it were a benign failure.
-        await _finalize_feedback_init_failure(exc)
-        return
-    except Exception as exc:
-        if _is_content_filter_stop(exc):
+        try:
+            initial_feedback_info = await feedback_manager.initialize_session(
+                session_id,
+                request,
+                cancellation_token=cancellation_token,
+                local_execution=session.get("local_execution"),
+            )
+            session["feedback_manager"] = feedback_manager
+            session["initial_rules"] = initial_feedback_info.get("initial_rules", [])
+            logger.info(
+                "Feedback memory initialized for session %s with %s initial rules",
+                session_id,
+                len(initial_feedback_info.get("initial_rules", [])),
+            )
+        except ContextAdmissionError as exc:
+            # A context overflow in feedback-memory init must surface (plan 12.1),
+            # never silently disable feedback memory as if it were a benign failure.
             await _finalize_feedback_init_failure(exc)
             return
-        logger.warning(f"Failed to initialize feedback memory for session {session_id}: {exc}")
-        session["feedback_manager"] = None
-        session["initial_rules"] = []
+        except Exception as exc:
+            if _is_content_filter_stop(exc):
+                await _finalize_feedback_init_failure(exc)
+                return
+            logger.warning("Failed to initialize feedback memory for session %s: %s", session_id, exc)
 
     # Handle max_tokens_percentage if specified
     if request.max_tokens_percentage is not None:
@@ -7438,9 +7548,18 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                                         PromptPart(word_instructions, "system_generated", "json_retry.word_instructions")
                                     ] if word_instructions else None,
                                     llm_routing=getattr(request, "_llm_routing", None),
+                                    provider_options=getattr(
+                                        json_retry_route, "provider_options", {}
+                                    ),
+                                    **endpoint_id_call_kwargs(
+                                        getattr(json_retry_route, "endpoint_id", None)
+                                    ),
                                     request_timeout=remaining_json_retry_timeout,
                                     cancellation_token=cancellation_token,
                                     cancel_callback=cancellation_requested,
+                                    local_execution=session.get("local_execution"),
+                                    dispatch_call_id="generation.json_retry",
+                                    dispatch_route_ordinal=0,
                                 )
                                 timeout_scope = asyncio.timeout(
                                     remaining_json_retry_timeout
@@ -8363,6 +8482,34 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                 phase_logger._exit_phase(Phase.QA)
                 return
 
+            except LocalExecutionPolicyError as local_error:
+                final_result = _build_generation_error_result(
+                    session,
+                    request,
+                    local_error,
+                )
+                final_result.setdefault("qa_summary", {})
+                error_msg = str(final_result.get("failure_reason") or local_error)
+                await add_verbose_log(
+                    session_id,
+                    f"Local execution policy rejected during QA: {error_msg}",
+                )
+                _store_final_result(
+                    session,
+                    final_result,
+                    session_id,
+                    final_status=GenerationStatus.FAILED.value,
+                )
+                session["error"] = error_msg
+                update_session_status(session, session_id, GenerationStatus.FAILED)
+                await _debug_update_status(
+                    session_id,
+                    status=GenerationStatus.FAILED.value,
+                    final_payload=final_result,
+                )
+                phase_logger._exit_phase(Phase.QA)
+                return
+
             except Exception as e:
                 if _is_content_filter_stop(e):
                     raise
@@ -8616,18 +8763,10 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
             # Update feedback memory if available
             if session.get("feedback_manager") and consensus_result:
                 try:
-                    # Extract feedback text from consensus result
-                    feedback_text = ""
-                    if hasattr(consensus_result, 'actionable_feedback') and consensus_result.actionable_feedback:
-                        feedback_text = "\n".join(consensus_result.actionable_feedback)
-                    elif qa_results:
-                        # Build feedback from QA results
-                        feedback_parts = []
-                        for layer_name, model_results in qa_results.items():
-                            for model_name, evaluation in model_results.items():
-                                if hasattr(evaluation, 'feedback') and evaluation.feedback:
-                                    feedback_parts.append(f"{layer_name} ({model_name}): {evaluation.feedback}")
-                        feedback_text = "\n".join(feedback_parts)
+                    feedback_text = _feedback_memory_text(
+                        consensus_result,
+                        qa_results,
+                    )
 
                     if feedback_text:
                         # Add feedback to memory system and get updated prompt
@@ -8636,8 +8775,10 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                             feedback_text=feedback_text,
                             content_snapshot=content[:500],  # First 500 chars as snapshot
                             iteration_num=iteration,
+                            request=request,
                             model_alias_registry=getattr(request, "_model_alias_registry", None),
                             cancellation_token=cancellation_token,
+                            local_execution=session.get("local_execution"),
                         )
                         session["feedback_prompt"] = feedback_prompt
                         await add_verbose_log(session_id, "📝 Feedback memory updated with iteration results")
@@ -9465,6 +9606,9 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                             # structured context_admission error, instead of being
                             # swallowed into fallback_notes and continuing to
                             # standard Gran Sabio review.
+                            raise
+
+                        except LocalExecutionPolicyError:
                             raise
 
                         except Exception as e:

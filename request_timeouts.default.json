@@ -28,6 +28,7 @@
     "minimax_seconds": 12000,
     "moonshot_seconds": 12000,
     "ollama_seconds": 12000,
+    "llamacpp_seconds": 12000,
     "fake_seconds": 12000
   },
   "per_call_timeout_propagation": {

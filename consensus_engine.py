@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 from ai_service import AIService, get_ai_service
 from model_aliasing import ModelAliasRegistry, get_evaluator_alias
 from models import ConsensusResult, QAEvaluation, QALayer
+from qa_result_utils import is_resolved_gran_sabio_false_positive
 
 if TYPE_CHECKING:
     from logging_utils import PhaseLogger
@@ -225,10 +226,22 @@ class ConsensusEngine:
                     fallback=alias_registry.alias_for_identity(model_name, fallback="Evaluator") if alias_registry else "Evaluator",
                 )
                 score = self._safe_get_evaluation_attr(evaluation, "score", 0.0)
-                feedback_text = (self._safe_get_evaluation_attr(evaluation, "feedback", "") or "").strip()
+                raw_feedback_text = (
+                    self._safe_get_evaluation_attr(evaluation, "feedback", "") or ""
+                ).strip()
                 deal_breaker = bool(self._safe_get_evaluation_attr(evaluation, "deal_breaker", False))
-                deal_breaker_reason = (self._safe_get_evaluation_attr(evaluation, "deal_breaker_reason", "") or
-                                       self._safe_get_evaluation_attr(evaluation, "reason", "") or "").strip()
+                legacy_reason = (
+                    self._safe_get_evaluation_attr(evaluation, "reason", "") or ""
+                ).strip()
+                deal_breaker_reason = ""
+                if deal_breaker:
+                    deal_breaker_reason = (
+                        self._safe_get_evaluation_attr(evaluation, "deal_breaker_reason", "")
+                        or legacy_reason
+                    ).strip()
+
+                resolved_false_positive = is_resolved_gran_sabio_false_positive(evaluation)
+                feedback_text = "" if resolved_false_positive else raw_feedback_text
 
                 model_entry = {
                     "model": model_name,
@@ -238,13 +251,24 @@ class ConsensusEngine:
                     "feedback": feedback_text
                 }
 
-                if deal_breaker_reason:
+                if resolved_false_positive:
+                    # Raw evaluator feedback remains in qa_results for audit. The
+                    # prompt-facing consensus projection must not turn an
+                    # adjudicated false positive back into revision guidance.
+                    model_entry["resolution"] = "gran_sabio_false_positive"
+                    model_entry["actionable"] = False
+
+                if deal_breaker and deal_breaker_reason:
                     model_entry["deal_breaker_reason"] = deal_breaker_reason
                     layer_entry["deal_breakers"].append(f"{evaluator_name}: {deal_breaker_reason}")
 
                 layer_entry["model_feedback"].append(model_entry)
 
-                actionable_text = deal_breaker_reason or feedback_text
+                actionable_text = ""
+                if not resolved_false_positive:
+                    actionable_text = (
+                        deal_breaker_reason if deal_breaker else (feedback_text or legacy_reason)
+                    )
                 if actionable_text:
                     formatted = f"{layer_name} ({evaluator_name}): {actionable_text}"
                     if formatted not in seen_actionable:

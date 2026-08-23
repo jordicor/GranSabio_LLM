@@ -31,7 +31,7 @@ from auto_qa_planner import (
     run_auto_qa_planning,
 )
 from config import config
-from content_events import ContentStatus
+from content_events import ContentEvent, ContentStatus
 from core import app_state
 from core.generation.prestart_flow import PrestartFlowDeps, run_prestart_flow
 from models import ContentRequest, GenerationStatus
@@ -511,6 +511,75 @@ class _UsageTracker:
 
     def create_callback(self, **_kwargs: object) -> None:
         return None
+
+
+@pytest.mark.asyncio
+async def test_preflight_retry_replaces_live_snapshot_and_keeps_attempt_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live preflight view contains only attempt 2 after protocol repair."""
+    published: list[ContentEvent] = []
+
+    async def _capture(event: ContentEvent) -> None:
+        published.append(event)
+
+    async def _preflight(*_args, **kwargs):
+        callback = kwargs["stream_callback"]
+        await callback(ContentEvent(phase="preflight", content="malformed", attempt=1))
+        await callback(ContentEvent(phase="preflight", content="valid", attempt=2))
+        return SimpleNamespace(decision="proceed")
+
+    monkeypatch.setattr(prestart_flow, "publish_content_event", _capture)
+    monkeypatch.setattr(prestart_flow, "flush_content_events", AsyncMock())
+    registry = SimpleNamespace(
+        register_session=AsyncMock(),
+        register_current_task=AsyncMock(),
+        is_cancelled=AsyncMock(return_value=False),
+        is_soft_cancelled=AsyncMock(return_value=False),
+    )
+    deps = PrestartFlowDeps(
+        ai_service=SimpleNamespace(),
+        cancellation_registry=registry,
+        register_session=AsyncMock(),
+        mutate_session=AsyncMock(),
+        pop_session=AsyncMock(),
+        is_terminal_session=Mock(return_value=False),
+        apply_session_cancelled_state=Mock(),
+        publish_project_session_end=AsyncMock(),
+        debug_record_event=AsyncMock(),
+        create_phase_logger=Mock(return_value=_PhaseLogger()),
+        run_auto_qa_planning=AsyncMock(),
+        run_preflight_validation=_preflight,
+        apply_auto_qa_plan=Mock(),
+        validate_auto_qa_effective_contract=Mock(),
+    )
+    request = SimpleNamespace(
+        max_iterations=1,
+        verbose=False,
+        extra_verbose=False,
+        request_name="preflight retry labels",
+        show_query_stats=0,
+    )
+
+    result = await run_prestart_flow(
+        request=request,
+        session_id="session-preflight-retry",
+        project_id="project-preflight-retry",
+        project_epoch=3,
+        auto_qa_requested=False,
+        request_fields_set=set(),
+        usage_tracker=_UsageTracker(),
+        preflight_context=[],
+        preflight_image_info=None,
+        model_alias_registry=MagicMock(),
+        deps=deps,
+    )
+
+    assert result.response is None
+    assert result.temp_session["preflight_content"] == "valid"
+    assert result.temp_session[prestart_flow._PREFLIGHT_ATTEMPT_KEY] == 2
+    assert [event.attempt for event in published] == [1, 2]
+    assert [event.content for event in published] == ["malformed", "valid"]
 
 
 @pytest.mark.asyncio

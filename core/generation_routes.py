@@ -21,6 +21,7 @@ from auto_qa_planner import (
     run_auto_qa_planning,
     validate_auto_qa_effective_contract,
 )
+from config import EDITABLE_CONTENT_TYPES
 from deal_breaker_tracker import get_tracker
 from llm_routing import (
     LLMRouteResolution,
@@ -28,6 +29,15 @@ from llm_routing import (
     attach_request_llm_routing,
     resolve_call,
     resolve_call_models,
+)
+from local_execution_policy import (
+    LOCAL_ONLY_SCOPE,
+    LocalExecutionPolicyError,
+    LocalExecutionRuntime,
+    LocalRouteRequirement,
+    admit_local_only,
+    build_local_execution_attestation,
+    resolve_local_route_requirement,
 )
 from logging_utils import create_phase_logger
 from model_aliasing import ModelAliasRegistry
@@ -230,11 +240,15 @@ def _apply_resolution_params(
 def _qa_model_config_from_route(entry: Dict[str, Any]) -> QAModelConfig:
     params = dict(entry.get("params", {}) or {})
     payload: Dict[str, Any] = {"model": entry["model"]}
+    if "endpoint_id" in entry:
+        payload["endpoint_id"] = entry["endpoint_id"]
     for key in ("max_tokens", "reasoning_effort", "thinking_budget_tokens", "temperature"):
         if key in entry:
             payload[key] = entry[key]
         elif key in params:
             payload[key] = params[key]
+    if "provider_options" in entry:
+        payload["provider_options"] = dict(entry["provider_options"] or {})
     return QAModelConfig(**payload)
 
 
@@ -273,6 +287,112 @@ def _apply_request_model_routing(request: ContentRequest, request_fields_set: se
     request._preflight_route = preflight_route
     request._preflight_model = preflight_route.model
     request._long_text_controller_eval_model = resolve_call("long_text.semantic_eval", request=request).model
+
+
+def _local_only_requested(request: ContentRequest) -> bool:
+    """Return whether this request asks for the fail-closed local boundary."""
+
+    return getattr(getattr(request, "execution_policy", None), "scope", "default") == LOCAL_ONLY_SCOPE
+
+
+def _local_policy_http_error(exc: LocalExecutionPolicyError) -> HTTPException:
+    """Translate stable policy errors without exposing transport internals."""
+
+    unavailable_codes = {
+        "local_endpoint_unavailable",
+        "local_model_not_announced",
+        "local_discovery_invalid",
+    }
+    return HTTPException(
+        status_code=503 if exc.code in unavailable_codes else 400,
+        detail=exc.to_payload(),
+    )
+
+
+def _build_local_route_requirements(
+    request: ContentRequest,
+    *,
+    auto_qa_requested: bool,
+    preflight_will_run: bool,
+    qa_required: bool,
+    gran_sabio_needed: bool,
+    json_output_requested: bool,
+    long_text_enabled: bool,
+    long_text_tools_supported: bool,
+) -> tuple[LocalRouteRequirement, ...]:
+    """Resolve the concrete LLM routes this accepted request can reach."""
+
+    call_ids: list[str] = ["generation.direct_stream"]
+    if long_text_enabled:
+        call_ids.extend(("long_text.section_draft", "long_text.semantic_eval"))
+        if request.generation_tools_mode == "auto" and long_text_tools_supported:
+            call_ids.append("long_text.section_tools")
+    else:
+        call_ids.append("generation.main")
+
+    if json_output_requested:
+        call_ids.append("generation.json_retry")
+    if auto_qa_requested:
+        call_ids.append("auto_qa.plan")
+    if preflight_will_run:
+        call_ids.append("preflight.validate")
+
+    smart_edit_mode = getattr(request, "smart_editing_mode", "auto")
+    smart_edit_reachable = not long_text_enabled and (
+        smart_edit_mode == "always"
+        or (
+            smart_edit_mode == "auto"
+            and getattr(request, "content_type", None) in EDITABLE_CONTENT_TYPES
+        )
+    )
+    if qa_required:
+        call_ids.append("qa.evaluate_layer")
+        if smart_edit_reachable:
+            call_ids.append("generation.smart_edit")
+
+    if gran_sabio_needed:
+        call_ids.append("gransabio.review")
+    if qa_required:
+        if gran_sabio_needed:
+            call_ids.append("gransabio.escalation")
+        if smart_edit_reachable:
+            call_ids.append("arbiter.resolve")
+    if getattr(request, "gran_sabio_fallback", False):
+        call_ids.append("gransabio.regenerate")
+
+    grounding = getattr(request, "evidence_grounding", None)
+    if grounding and grounding.enabled:
+        call_ids.extend(
+            (
+                "evidence.extract_claims",
+                "evidence.classify_spans",
+                "evidence.score_logprobs",
+            )
+        )
+
+    accent_guard = getattr(request, "llm_accent_guard", None)
+    if accent_guard and accent_guard.mode != "off":
+        call_ids.append("accent.audit")
+
+    requirements: list[LocalRouteRequirement] = []
+    seen: set[str] = set()
+    for call_id in call_ids:
+        if call_id in seen:
+            continue
+        seen.add(call_id)
+        if call_id == "qa.evaluate_layer":
+            qa_resolution = resolve_call_models(call_id, request=request)
+            requirements.extend(
+                resolve_local_route_requirement(
+                    call_id,
+                    request=request,
+                    route_ordinal=route_ordinal,
+                )
+                for route_ordinal in range(len(qa_resolution.models))
+            )
+            continue
+        requirements.append(resolve_local_route_requirement(call_id, request=request))
+    return tuple(requirements)
 
 
 def _supports_long_text_generation_tools(model_name: str) -> bool:
@@ -610,6 +730,13 @@ async def _generate_content_once(request: ContentRequest):
         _apply_request_model_routing(request, request_fields_set)
     except LLMRoutingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if _local_only_requested(request) and request.feedback_memory_enabled:
+        error = LocalExecutionPolicyError(
+            "local_feedback_memory_unsupported",
+            "feedback_memory_enabled must be false for local_only requests because Track A has no local embeddings backend.",
+        )
+        raise _local_policy_http_error(error) from error
 
     resolved_long_text_mode, long_text_advisories = _resolve_long_text_mode(request, request_fields_set)
     long_text_advisories.extend(_routing_warnings_as_advisories(request))
@@ -1019,7 +1146,11 @@ async def _generate_content_once(request: ContentRequest):
         qa_mandatory=qa_required,
         preflight_image_info=preflight_image_info,
         alias_registry=model_alias_registry,
-        native_counter=getattr(ai_service, "_native_token_count", None),
+        native_counter=(
+            None
+            if _local_only_requested(request)
+            else getattr(ai_service, "_native_token_count", None)
+        ),
         preflight_max_tokens=preflight_admission_max_tokens,
         auto_qa_max_tokens=auto_qa_admission_max_tokens,
         context_documents_total_bytes=sum(
@@ -1051,6 +1182,27 @@ async def _generate_content_once(request: ContentRequest):
             advisories=long_text_advisories or None,
         )
 
+    local_execution: Optional[LocalExecutionRuntime] = None
+    if _local_only_requested(request):
+        try:
+            route_requirements = _build_local_route_requirements(
+                request,
+                auto_qa_requested=auto_qa_requested,
+                preflight_will_run=preflight_will_run,
+                qa_required=qa_required,
+                gran_sabio_needed=gran_sabio_needed,
+                json_output_requested=json_output_requested,
+                long_text_enabled=long_text_enabled,
+                long_text_tools_supported=long_text_tools_supported,
+            )
+            manifest = await admit_local_only(route_requirements, config_obj=config)
+            local_execution = LocalExecutionRuntime.create(
+                session_id=session_id,
+                manifest=manifest,
+            )
+        except LocalExecutionPolicyError as exc:
+            raise _local_policy_http_error(exc) from exc
+
     if not _generation_admission_gate.try_acquire():
         logger.warning(
             "Rejecting /generate admission: active generation sessions at configured capacity (%s)",
@@ -1081,6 +1233,7 @@ async def _generate_content_once(request: ContentRequest):
             preflight_context=preflight_context,
             preflight_image_info=preflight_image_info,
             model_alias_registry=model_alias_registry,
+            local_execution=local_execution,
             deps=PrestartFlowDeps(
                 ai_service=ai_service,
                 cancellation_registry=cancellation_registry,
@@ -1099,6 +1252,13 @@ async def _generate_content_once(request: ContentRequest):
             ),
         )
         if prestart_result.response is not None:
+            if local_execution is not None:
+                prestart_result.response.local_only_attestation = (
+                    build_local_execution_attestation(
+                        local_execution.manifest,
+                        local_execution.ledger,
+                    ).to_payload()
+                )
             return prestart_result.response
 
         temp_session = prestart_result.temp_session
@@ -1139,6 +1299,7 @@ async def _generate_content_once(request: ContentRequest):
             long_text_enabled=long_text_enabled,
             long_text_advisories=long_text_advisories,
             auto_qa_plan_payload=auto_qa_plan_payload,
+            local_execution=local_execution,
             deps=SessionBootstrapDeps(
                 cancellation_registry=cancellation_registry,
                 register_session=register_session,
@@ -1151,6 +1312,14 @@ async def _generate_content_once(request: ContentRequest):
                 background_task_hook=_on_background_task_started,
             ),
         )
+    except LocalExecutionPolicyError as exc:
+        await _abort_admission_session(
+            session_id,
+            exc,
+            project_id=project_id,
+            request_name=getattr(request, "request_name", None),
+        )
+        raise _local_policy_http_error(exc) from exc
     except HTTPException:
         raise
     except BaseException as exc:
@@ -1320,6 +1489,18 @@ def _verbose_log_window(
     }
 
 
+def _local_only_attestation_payload(session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Build the current audit view for a local-only session, if applicable."""
+
+    runtime = session.get("local_execution")
+    if not isinstance(runtime, LocalExecutionRuntime):
+        return None
+    return build_local_execution_attestation(
+        runtime.manifest,
+        runtime.ledger,
+    ).to_payload()
+
+
 @app.get("/status/{session_id}")
 async def get_status(
     session_id: str,
@@ -1394,6 +1575,11 @@ async def get_status(
         "context_admission": (
             (session.get("final_result") or {}).get("context_admission")
             or session.get("context_admission")
+        ),
+        **(
+            {"local_only_attestation": _local_only_attestation_payload(session)}
+            if session.get("local_execution") is not None
+            else {}
         ),
         "failure_reason": _client_safe_failure_reason(
             session,

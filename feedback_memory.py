@@ -31,7 +31,7 @@ from ai_service import get_ai_service, is_content_filter_stop
 from config import config as app_config
 from context_budget import ContextAdmissionError, admit_embedding_texts
 from core.cancellation import ProviderCallHandle
-from llm_routing import resolve_call, resolve_temperature
+from llm_routing import endpoint_id_call_kwargs, resolve_call, resolve_temperature
 from model_aliasing import ModelAliasRegistry, PromptPart
 from model_capability_registry import resolve_model_capability_context
 
@@ -54,6 +54,18 @@ class FeedbackEmbeddingSupportError(RuntimeError):
     """Raised when 'feedback.embed' routing cannot be served by this deployment."""
 
 
+def _reject_local_execution(local_execution: Optional[Any]) -> None:
+    """Fail closed: Feedback Memory currently has only external embeddings."""
+
+    if local_execution is not None:
+        from local_execution_policy import LocalExecutionPolicyError
+
+        raise LocalExecutionPolicyError(
+            "local_feedback_memory_unsupported",
+            "Feedback Memory is not available under local_only because embeddings are external.",
+        )
+
+
 def _embedding_support_error(embedding_model: Optional[str], provider: str) -> FeedbackEmbeddingSupportError:
     """Build the explicit unsupported-embedding-route error (audit ORQ-01)."""
     return FeedbackEmbeddingSupportError(
@@ -72,6 +84,17 @@ def _cross_session_learning_enabled() -> bool:
     """
     raw = os.getenv("FEEDBACK_CROSS_SESSION_ENABLED", "true").strip().lower()
     return raw not in {"0", "false", "no", "off"}
+
+
+def _endpoint_id_for_effective_route_model(route: Any, model_name: Optional[str]) -> Optional[str]:
+    """Keep a route endpoint only when its resolved model is dispatched unchanged."""
+
+    routed_model = str(getattr(route, "model", "") or "").strip()
+    effective_model = str(model_name or "").strip()
+    if routed_model != effective_model:
+        return None
+    endpoint_id = str(getattr(route, "endpoint_id", "") or "").strip()
+    return endpoint_id or None
 
 
 # ---------- Configuration ----------
@@ -550,8 +573,11 @@ class FeedbackProcessor:
         feedback_text: str,
         model_alias_registry: Optional[ModelAliasRegistry] = None,
         cancellation_token: Optional[Any] = None,
+        request: Optional[Any] = None,
+        local_execution: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Extract structured analysis from feedback text using AI"""
+        _reject_local_execution(local_execution)
 
         prompt = f"""Analyze this QA consensus feedback and extract structured information.
 
@@ -579,8 +605,9 @@ Provide a JSON response with:
         Return ONLY valid JSON, no additional text."""
 
         try:
-            route = resolve_call("feedback.analyze")
+            route = resolve_call("feedback.analyze", request=request)
             model_name = self.config.analysis_model or route.model
+            endpoint_id = _endpoint_id_for_effective_route_model(route, model_name)
             feedback_max_tokens = app_config.resolve_output_max_tokens(
                 model_name,
                 routed_max_tokens=route.params.get("max_tokens"),
@@ -595,8 +622,13 @@ Provide a JSON response with:
                 thinking_budget_tokens=route.params.get("thinking_budget_tokens"),
                 json_output=True,
                 model_alias_registry=model_alias_registry,
-                llm_routing=None,
+                llm_routing=getattr(request, "_llm_routing", None),
+                provider_options=getattr(route, "provider_options", {}),
                 cancellation_token=cancellation_token,
+                local_execution=local_execution,
+                dispatch_call_id="feedback.analyze",
+                dispatch_route_ordinal=0,
+                **endpoint_id_call_kwargs(endpoint_id),
                 prompt_safety_parts=[
                     PromptPart(
                         text=feedback_text,
@@ -650,7 +682,7 @@ Provide a JSON response with:
             'one_liner': sentences[0] if sentences else "Feedback provided"
         }
 
-    def _resolve_embedding_route(self) -> Tuple[Optional[str], str]:
+    def _resolve_embedding_route(self, request: Optional[Any] = None) -> Tuple[Optional[str], str]:
         """Resolve the 'feedback.embed' route to (model, provider).
 
         The provider comes from the model catalog via
@@ -659,7 +691,7 @@ Provide a JSON response with:
         applies to embedding models absent from the catalog. The endpoint is
         never hardcoded to OpenAI (audit ORQ-01).
         """
-        route = resolve_call("feedback.embed")
+        route = resolve_call("feedback.embed", request=request)
         embedding_model = self.config.embedding_model or route.model
         specs = getattr(app_config, "model_specs", {}) or {}
         context = resolve_model_capability_context(embedding_model or "", specs)
@@ -670,7 +702,7 @@ Provide a JSON response with:
                 provider = "gemini" if model_lower.startswith("models/") else "openai"
         return embedding_model, provider
 
-    def validate_embedding_support(self) -> None:
+    def validate_embedding_support(self, request: Optional[Any] = None) -> None:
         """Fail fast when 'feedback.embed' cannot be served by this deployment.
 
         Called once per session initialization so a misconfigured embedding
@@ -678,7 +710,7 @@ Provide a JSON response with:
         explicitly instead of degrading call by call into empty vectors
         (audit ORQ-01).
         """
-        embedding_model, provider = self._resolve_embedding_route()
+        embedding_model, provider = self._resolve_embedding_route(request=request)
         if provider not in _EMBEDDING_HTTP_PROVIDERS:
             raise _embedding_support_error(embedding_model, provider)
         credential_attr = "OPENAI_API_KEY" if provider == "openai" else "GOOGLE_API_KEY"
@@ -708,8 +740,11 @@ Provide a JSON response with:
         self,
         texts: List[str],
         cancellation_token: Optional[Any] = None,
+        request: Optional[Any] = None,
+        local_execution: Optional[Any] = None,
     ) -> List[List[float]]:
         """Get embeddings for text list"""
+        _reject_local_execution(local_execution)
         current_task = asyncio.current_task()
 
         async def close_provider_task() -> None:
@@ -717,7 +752,7 @@ Provide a JSON response with:
                 return
             current_task.cancel()
 
-        embedding_model, provider = self._resolve_embedding_route()
+        embedding_model, provider = self._resolve_embedding_route(request=request)
         if provider not in _EMBEDDING_HTTP_PROVIDERS:
             # Defensive: validate_embedding_support() normally fails fast at
             # session initialization; never degrade silently here either.
@@ -789,8 +824,11 @@ Provide a JSON response with:
         self,
         categories: List[Dict],
         cancellation_token: Optional[Any] = None,
+        request: Optional[Any] = None,
+        local_execution: Optional[Any] = None,
     ) -> List[str]:
         """Synthesize normative rules from repeated patterns"""
+        _reject_local_execution(local_execution)
 
         if not categories:
             return []
@@ -815,8 +853,9 @@ Each rule should be imperative and actionable (e.g., "ALWAYS include publication
         Return ONLY valid JSON."""
 
         try:
-            route = resolve_call("feedback.synthesize_rules")
+            route = resolve_call("feedback.synthesize_rules", request=request)
             model_name = self.config.analysis_model or route.model
+            endpoint_id = _endpoint_id_for_effective_route_model(route, model_name)
             feedback_max_tokens = app_config.resolve_output_max_tokens(
                 model_name,
                 routed_max_tokens=route.params.get("max_tokens"),
@@ -830,8 +869,10 @@ Each rule should be imperative and actionable (e.g., "ALWAYS include publication
                 reasoning_effort=route.params.get("reasoning_effort"),
                 thinking_budget_tokens=route.params.get("thinking_budget_tokens"),
                 json_output=True,
-                llm_routing=None,
+                llm_routing=getattr(request, "_llm_routing", None),
+                provider_options=getattr(route, "provider_options", {}),
                 cancellation_token=cancellation_token,
+                **endpoint_id_call_kwargs(endpoint_id),
             )
 
             if isinstance(response, str):
@@ -899,8 +940,10 @@ class FeedbackMemoryManager:
         session_id: str,
         request: Any,
         cancellation_token: Optional[Any] = None,
+        local_execution: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Initialize feedback memory for a new session"""
+        _reject_local_execution(local_execution)
 
         # Ensure initialized
         await self.initialize()
@@ -912,7 +955,7 @@ class FeedbackMemoryManager:
 
         # Fail fast on an unservable embedding route instead of degrading
         # call by call into empty vectors later (audit ORQ-01).
-        self.processor.validate_embedding_support()
+        self.processor.validate_embedding_support(request=request)
 
         request_hash = self._hash_request(request)
         # ContentRequest exposes ``username`` (models.py), not ``user_id``;
@@ -940,7 +983,9 @@ class FeedbackMemoryManager:
             if common_patterns:
                 initial_rules = await self.processor.synthesize_normative_rules(
                     common_patterns,
+                    request=request,
                     cancellation_token=cancellation_token,
+                    local_execution=local_execution,
                 )
 
         # Initialize cache entry
@@ -998,14 +1043,18 @@ class FeedbackMemoryManager:
         iteration_num: int,
         model_alias_registry: Optional[ModelAliasRegistry] = None,
         cancellation_token: Optional[Any] = None,
+        request: Optional[Any] = None,
+        local_execution: Optional[Any] = None,
     ) -> str:
         """Process and store feedback for an iteration"""
 
         # Extract structured analysis from feedback
         analysis = await self.processor.extract_feedback_analysis(
             feedback_text,
+            request=request,
             model_alias_registry=model_alias_registry,
             cancellation_token=cancellation_token,
+            local_execution=local_execution,
         )
 
         summaries = analysis['tiered_summaries']
@@ -1024,7 +1073,9 @@ class FeedbackMemoryManager:
                 session_id,
                 issues,
                 iteration_num,
+                request=request,
                 cancellation_token=cancellation_token,
+                local_execution=local_execution,
             )
 
         # Update cache
@@ -1033,7 +1084,11 @@ class FeedbackMemoryManager:
             self.memory_cache[session_id]['iteration_count'] = iteration_num + 1
 
         # Build and return the iteration prompt
-        return await self.build_iteration_prompt(session_id, cancellation_token=cancellation_token)
+        return await self.build_iteration_prompt(
+            session_id,
+            request=request,
+            cancellation_token=cancellation_token,
+        )
 
     async def _process_issues(
         self,
@@ -1041,6 +1096,8 @@ class FeedbackMemoryManager:
         issues: List[Dict],
         iteration_num: int,
         cancellation_token: Optional[Any] = None,
+        request: Optional[Any] = None,
+        local_execution: Optional[Any] = None,
     ):
         """Process issues, detect similarities, and update categories"""
 
@@ -1051,7 +1108,9 @@ class FeedbackMemoryManager:
         ]
         embeddings = await self.processor.get_embeddings(
             issue_texts,
+            request=request,
             cancellation_token=cancellation_token,
+            local_execution=local_execution,
         )
 
         # Get existing categories for similarity comparison
@@ -1103,6 +1162,7 @@ class FeedbackMemoryManager:
         self,
         session_id: str,
         cancellation_token: Optional[Any] = None,
+        request: Optional[Any] = None,
     ) -> str:
         """Build the iteration feedback prompt with temporal decay"""
 
@@ -1122,6 +1182,7 @@ class FeedbackMemoryManager:
         if categories:
             rules = await self.processor.synthesize_normative_rules(
                 categories,
+                request=request,
                 cancellation_token=cancellation_token,
             )
             await self.db.save_normative_rules(

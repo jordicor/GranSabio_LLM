@@ -38,7 +38,8 @@ from content_events import (
 )
 from context_budget import ContextBudgetExceeded
 from deterministic_validation import DraftValidationResult, validate_generation_candidate
-from llm_routing import default_temperature_for_call
+from llm_routing import default_temperature_for_call, endpoint_id_call_kwargs
+from local_execution_policy import LocalExecutionPolicyError
 from model_aliasing import ModelAliasRegistry, PromptPart
 from model_capability_registry import resolve_model_capability_context
 from models import QAEvaluation, is_json_output_requested
@@ -482,6 +483,10 @@ IMPORTANT:
         project_id: Optional[str] = None,
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
         request_timeout: Optional[float] = None,
+        provider_options: Optional[Dict[str, Any]] = None,
+        endpoint_id: Optional[str] = None,
+        local_execution: Optional[Any] = None,
+        dispatch_route_ordinal: int = 0,
     ) -> QAEvaluation:
         """
         Evaluate content quality using specified AI model
@@ -563,6 +568,10 @@ IMPORTANT:
             if temperature is not None
             else default_temperature_for_call("qa.evaluate_layer")
         )
+        # The scheduler owns routing identity. Keep the option object attached
+        # to its exact QAModelConfig slot instead of re-matching by model name:
+        # duplicate model entries can intentionally carry distinct policies.
+        qa_provider_options = dict(provider_options or {})
 
         # Log full prompt if extra_verbose is enabled
         if phase_logger:
@@ -626,8 +635,13 @@ IMPORTANT:
                             label="qa.edit_history",
                         )
                     ] if edit_history else None,
+                    provider_options=qa_provider_options,
+                    **endpoint_id_call_kwargs(endpoint_id),
                     request_timeout=request_timeout,
                     cancellation_token=cancellation_token,
+                    local_execution=local_execution,
+                    dispatch_call_id="qa.evaluate_layer",
+                    dispatch_route_ordinal=dispatch_route_ordinal,
                 ):
                     # Handle StreamChunk (Claude with thinking) vs plain string
                     if isinstance(chunk, StreamChunk):
@@ -730,8 +744,13 @@ IMPORTANT:
                         label="qa.edit_history",
                     )
                 ] if edit_history else None,
+                provider_options=qa_provider_options,
+                **endpoint_id_call_kwargs(endpoint_id),
                 request_timeout=request_timeout,
                 cancellation_token=cancellation_token,
+                local_execution=local_execution,
+                dispatch_call_id="qa.evaluate_layer",
+                dispatch_route_ordinal=dispatch_route_ordinal,
             )
 
         # --- Tool-loop activation (§3.4.1, Fase 2) ---
@@ -847,8 +866,13 @@ IMPORTANT:
                             label="qa.edit_history",
                         )
                     ] if edit_history else None,
+                    provider_options=qa_provider_options,
+                    **endpoint_id_call_kwargs(endpoint_id),
                     request_timeout=timeout_seconds,
                     cancellation_token=cancellation_token,
+                    local_execution=local_execution,
+                    dispatch_call_id="qa.evaluate_layer",
+                    dispatch_route_ordinal=dispatch_route_ordinal,
                 )
 
             loop_content, envelope = await _call_tool_loop(
@@ -956,6 +980,8 @@ IMPORTANT:
         try:
             try:
                 response = await response_generator(qa_response_schema)
+            except LocalExecutionPolicyError:
+                raise
             except Exception as exc:
                 if (
                     not streamed_response_started
@@ -1030,6 +1056,8 @@ IMPORTANT:
         except AIRequestError:
             raise
         except QAResponseParseError:
+            raise
+        except LocalExecutionPolicyError:
             raise
         except Exception as e:
             if is_content_filter_stop(e):

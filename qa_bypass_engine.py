@@ -267,7 +267,6 @@ class QABypassEngine:
         target_min = compliance_result['target_min']
         target_max = compliance_result['target_max']
         score = compliance_result['score']  # Gradual score from 0 to 10
-        severity = compliance_result['severity']
 
         # Determine deal_breaker status:
         # A score of 0 means the content is outside the absolute range.

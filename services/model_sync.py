@@ -13,12 +13,16 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 
 import context_budget
 import json_utils as json
+from local_endpoint_registry import (
+    LocalInferenceEndpoint,
+    endpoint_url,
+    normalize_endpoint_base_url,
+)
 
 logger = logging.getLogger(__name__)
 from ai_runtime.parameters import (
@@ -45,9 +49,10 @@ SUPPORTED_SYNC_PROVIDERS = (
     "minimax",
     "moonshot",
     "ollama",
+    "llamacpp",
 )
 FULL_SYNC_PROVIDERS = {"openrouter", "xai", "ollama"}
-DISCOVERY_SYNC_PROVIDERS = {"openai", "anthropic", "google", "minimax", "moonshot"}
+DISCOVERY_SYNC_PROVIDERS = {"openai", "anthropic", "google", "minimax", "moonshot", "llamacpp"}
 OPENAI_MODEL_LIST_URL = "https://api.openai.com/v1/models"
 ANTHROPIC_MODEL_LIST_URL = "https://api.anthropic.com/v1/models"
 XAI_LANGUAGE_MODELS_URL = "https://api.x.ai/v1/language-models"
@@ -58,6 +63,7 @@ MOONSHOT_MODELS_URL = "https://api.moonshot.ai/v1/models"
 OLLAMA_MODEL_LIST_SOURCE = "local/ollama"
 OLLAMA_DEFAULT_CONTEXT_WINDOW = 32768
 OLLAMA_DEFAULT_OUTPUT_TOKENS = 8192
+LLAMACPP_MODEL_LIST_SOURCE = "local/llama.cpp"
 ANTHROPIC_API_VERSION = "2023-06-01"
 REMOTE_JSON_HEADERS = {
     "Accept": "application/json",
@@ -186,21 +192,7 @@ def _normalize_model_hint(provider: str, model_id: str) -> str:
 
 
 def _normalize_ollama_host(host: Any) -> str:
-    normalized = str(host or "").strip().rstrip("/")
-    if not normalized:
-        return ""
-    if not normalized.startswith(("http://", "https://")):
-        normalized = f"http://{normalized}"
-    for suffix in ("/v1", "/api"):
-        if normalized.endswith(suffix):
-            normalized = normalized[: -len(suffix)].rstrip("/")
-    parsed = urlsplit(normalized)
-    if parsed.hostname in {"0.0.0.0", "::"}:
-        replacement_host = "127.0.0.1" if parsed.hostname == "0.0.0.0" else "[::1]"
-        if parsed.port:
-            replacement_host = f"{replacement_host}:{parsed.port}"
-        normalized = urlunsplit((parsed.scheme, replacement_host, parsed.path, parsed.query, parsed.fragment))
-    return normalized
+    return normalize_endpoint_base_url("ollama", host) if str(host or "").strip() else ""
 
 
 def _ollama_api_url(host: Any, endpoint: str) -> str:
@@ -208,6 +200,27 @@ def _ollama_api_url(host: Any, endpoint: str) -> str:
     if not base_url:
         return ""
     return f"{base_url}/api/{endpoint.strip('/')}"
+
+
+def _normalize_openai_compatible_base_url(host: Any) -> str:
+    """Normalize an OpenAI-compatible server URL to its ``/v1`` base path."""
+
+    return normalize_endpoint_base_url("openai_compatible", host) if str(host or "").strip() else ""
+
+
+def _llamacpp_urls(base_url: Any) -> dict[str, str]:
+    """Build llama.cpp's read-only discovery URLs from an OpenAI-compatible base."""
+
+    api_base = _normalize_openai_compatible_base_url(base_url)
+    if not api_base:
+        return {}
+    server_base = api_base[:-3] if api_base.endswith("/v1") else api_base
+    return {
+        "health": f"{server_base}/health",
+        "models": f"{api_base}/models",
+        "props": f"{server_base}/props",
+        "slots": f"{server_base}/slots",
+    }
 
 
 def _ollama_description(model_id: str, details: dict[str, Any]) -> str:
@@ -416,6 +429,7 @@ class ModelSyncService:
             "minimax": self._fetch_minimax_remote,
             "moonshot": self._fetch_moonshot_remote,
             "ollama": self._fetch_ollama_remote,
+            "llamacpp": self._fetch_llamacpp_remote,
         }
         remote_models = await fetchers[provider]()
         merged = self._merge_remote_with_local(provider, remote_models)
@@ -429,6 +443,132 @@ class ModelSyncService:
                 "fetched_at": _utc_now_iso(),
             },
         }
+
+    async def discover_local_endpoint(
+        self, endpoint: LocalInferenceEndpoint
+    ) -> list[dict[str, Any]]:
+        """Read the models served by one registered endpoint without catalog sync.
+
+        This is intentionally separate from ``fetch_remote_models``: admission
+        must never rewrite ``model_specs.json`` merely to verify a live route.
+        Every returned model carries the endpoint identity that announced it.
+        """
+
+        headers = _remote_json_headers(endpoint.authorization_header())
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession() as session:
+            if endpoint.adapter == "ollama":
+                return await self._discover_ollama_endpoint(session, endpoint, headers, timeout)
+            if endpoint.adapter == "llamacpp":
+                return await self._discover_llamacpp_endpoint(session, endpoint, headers, timeout)
+            if endpoint.adapter == "openai_compatible":
+                return await self._discover_openai_compatible_endpoint(
+                    session, endpoint, headers, timeout
+                )
+        raise ModelSyncError(f"Unsupported local endpoint adapter '{endpoint.adapter}'.")
+
+    @staticmethod
+    async def _endpoint_json(
+        session: aiohttp.ClientSession,
+        url: str,
+        headers: dict[str, str],
+        timeout: aiohttp.ClientTimeout,
+        endpoint: LocalInferenceEndpoint,
+    ) -> Any:
+        try:
+            async with session.get(
+                url,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=False,
+            ) as response:
+                if response.status != 200:
+                    raise ModelSyncError(
+                        f"Endpoint '{endpoint.endpoint_id}' discovery failed at {url}: {await response.text()}"
+                    )
+                return await response.json()
+        except ModelSyncError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+            raise ModelSyncError(
+                f"Endpoint '{endpoint.endpoint_id}' is not reachable at {url}: {exc}"
+            ) from exc
+
+    async def _discover_ollama_endpoint(
+        self,
+        session: aiohttp.ClientSession,
+        endpoint: LocalInferenceEndpoint,
+        headers: dict[str, str],
+        timeout: aiohttp.ClientTimeout,
+    ) -> list[dict[str, Any]]:
+        await self._endpoint_json(session, endpoint_url(endpoint, "api/version"), headers, timeout, endpoint)
+        collection = "ps" if endpoint.availability == "loaded" else "tags"
+        payload = await self._endpoint_json(
+            session, endpoint_url(endpoint, f"api/{collection}"), headers, timeout, endpoint
+        )
+        models = payload.get("models", []) if isinstance(payload, dict) else []
+        if not isinstance(models, list):
+            raise ModelSyncError(
+                f"Endpoint '{endpoint.endpoint_id}' returned an invalid Ollama /api/{collection} payload."
+            )
+        return self._endpoint_model_records(endpoint, models)
+
+    async def _discover_openai_compatible_endpoint(
+        self,
+        session: aiohttp.ClientSession,
+        endpoint: LocalInferenceEndpoint,
+        headers: dict[str, str],
+        timeout: aiohttp.ClientTimeout,
+    ) -> list[dict[str, Any]]:
+        payload = await self._endpoint_json(
+            session, endpoint_url(endpoint, "models"), headers, timeout, endpoint
+        )
+        models = payload.get("data", []) if isinstance(payload, dict) else []
+        if not isinstance(models, list):
+            raise ModelSyncError(f"Endpoint '{endpoint.endpoint_id}' returned an invalid /v1/models payload.")
+        return self._endpoint_model_records(endpoint, models)
+
+    async def _discover_llamacpp_endpoint(
+        self,
+        session: aiohttp.ClientSession,
+        endpoint: LocalInferenceEndpoint,
+        headers: dict[str, str],
+        timeout: aiohttp.ClientTimeout,
+    ) -> list[dict[str, Any]]:
+        server_base = endpoint.base_url[:-3] if endpoint.base_url.endswith("/v1") else endpoint.base_url
+        await self._endpoint_json(session, f"{server_base}/health", headers, timeout, endpoint)
+        return await self._discover_openai_compatible_endpoint(session, endpoint, headers, timeout)
+
+    @staticmethod
+    def _endpoint_model_records(
+        endpoint: LocalInferenceEndpoint, models: list[Any]
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            model_id = str(model.get("id") or model.get("model") or model.get("name") or "").strip()
+            if not model_id:
+                continue
+            state = str(model.get("state") or model.get("status") or "").strip().lower()
+            # llama.cpp's multimodel router reports state when it knows it. A
+            # classic one-model server commonly has no state field; its model
+            # list itself is the proof that the model is served.
+            if endpoint.availability == "loaded" and state and state not in {"loaded", "ready", "running"}:
+                continue
+            records.append(
+                {
+                    "endpoint_id": endpoint.endpoint_id,
+                    "adapter": endpoint.adapter,
+                    "provider": endpoint.adapter,
+                    "model_id": model_id,
+                    "id": model_id,
+                    "availability": endpoint.availability,
+                    "state": state or "served",
+                }
+            )
+        records.sort(key=lambda item: item["model_id"])
+        return records
 
     async def _fetch_openrouter_remote(self) -> list[dict[str, Any]]:
         if not self.config.OPENROUTER_API_KEY:
@@ -619,7 +759,12 @@ class ModelSyncService:
         timeout = aiohttp.ClientTimeout(total=8)
         async with aiohttp.ClientSession() as session:
             try:
-                async with session.get(version_url, headers=headers, timeout=timeout) as response:
+                async with session.get(
+                    version_url,
+                    headers=headers,
+                    timeout=timeout,
+                    allow_redirects=False,
+                ) as response:
                     if response.status != 200:
                         raise ModelSyncError(
                             f"Ollama API health check failed at {version_url}: {await response.text()}"
@@ -631,7 +776,12 @@ class ModelSyncService:
                 raise ModelSyncError(f"Ollama API is not reachable at {version_url}: {exc}") from exc
 
             try:
-                async with session.get(tags_url, headers=headers, timeout=timeout) as response:
+                async with session.get(
+                    tags_url,
+                    headers=headers,
+                    timeout=timeout,
+                    allow_redirects=False,
+                ) as response:
                     if response.status != 200:
                         raise ModelSyncError(f"Ollama API error at {tags_url}: {await response.text()}")
                     payload = await response.json()
@@ -708,6 +858,161 @@ class ModelSyncService:
                         "size": model.get("size"),
                         "details": details,
                         "ollama_version": version_payload.get("version") if isinstance(version_payload, dict) else None,
+                    },
+                }
+            )
+
+        remote_models.sort(key=lambda item: item["name"].lower())
+        return remote_models
+
+    async def _fetch_llamacpp_remote(self) -> list[dict[str, Any]]:
+        """Discover models from one configured llama.cpp server without generation."""
+
+        urls = _llamacpp_urls(getattr(self.config, "LLAMACPP_BASE_URL", ""))
+        if not urls:
+            raise ModelSyncError("LLAMACPP_BASE_URL is not configured.")
+
+        endpoint_alias = str(
+            getattr(self.config, "LLAMACPP_ENDPOINT_ALIAS", "llamacpp") or "llamacpp"
+        ).strip()
+        if not endpoint_alias:
+            endpoint_alias = "llamacpp"
+
+        api_key = getattr(self.config, "LLAMACPP_API_KEY", "")
+        headers = _remote_json_headers(
+            {"Authorization": f"Bearer {api_key}"} if api_key else None
+        )
+        timeout = aiohttp.ClientTimeout(total=8)
+        payloads: dict[str, Any] = {}
+        async with aiohttp.ClientSession() as session:
+            for name, url in urls.items():
+                try:
+                    async with session.get(
+                        url,
+                        headers=headers,
+                        timeout=timeout,
+                        allow_redirects=False,
+                    ) as response:
+                        if response.status != 200:
+                            raise ModelSyncError(
+                                f"llama.cpp discovery failed at {url}: {await response.text()}"
+                            )
+                        payloads[name] = await response.json()
+                except ModelSyncError:
+                    raise
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+                    raise ModelSyncError(
+                        f"llama.cpp endpoint is not reachable at {url}: {exc}"
+                    ) from exc
+
+        props = payloads.get("props") if isinstance(payloads.get("props"), dict) else {}
+        runtime_context = _safe_int(props.get("n_ctx"))
+        if runtime_context <= 0:
+            default_settings = props.get("default_generation_settings")
+            if isinstance(default_settings, dict):
+                runtime_context = _safe_int(default_settings.get("n_ctx"))
+        if runtime_context <= 0:
+            raise ModelSyncError("llama.cpp /props did not provide a positive effective n_ctx.")
+
+        default_settings = props.get("default_generation_settings")
+        runtime_n_predict = _safe_int(
+            default_settings.get("n_predict") if isinstance(default_settings, dict) else None
+        )
+
+        models_payload = payloads.get("models") if isinstance(payloads.get("models"), dict) else {}
+        models_data = models_payload.get("data", []) if isinstance(models_payload, dict) else []
+        if not isinstance(models_data, list):
+            raise ModelSyncError("llama.cpp /v1/models returned an invalid data payload.")
+
+        slots_payload = payloads.get("slots")
+        slot_count = len(slots_payload) if isinstance(slots_payload, list) else None
+        slot_context_limits: list[int] = []
+        busy_slot_count = 0
+        if isinstance(slots_payload, list):
+            for slot in slots_payload:
+                if not isinstance(slot, dict):
+                    continue
+                if slot.get("is_processing") is True:
+                    busy_slot_count += 1
+                # llama.cpp exposes these exact context keys per slot across
+                # supported server response shapes. A loaded slot can have a
+                # smaller usable context than /props, so discovery must publish
+                # the conservative shared ceiling rather than over-admit calls.
+                for key in ("n_ctx", "context"):
+                    slot_context = _safe_int(slot.get(key))
+                    if slot_context > 0:
+                        slot_context_limits.append(slot_context)
+
+        if slot_context_limits:
+            runtime_context = min(runtime_context, min(slot_context_limits))
+        chat_template_caps = props.get("chat_template_caps")
+        supports_reasoning_effort = (
+            isinstance(chat_template_caps, dict)
+            and chat_template_caps.get("supports_reasoning_effort") is True
+        )
+        capabilities = ["text"]
+        supported_parameters: list[str] = []
+        if supports_reasoning_effort:
+            capabilities.append("reasoning")
+            supported_parameters.append("reasoning_effort")
+        current_specs = self._get_provider_specs(self.load_specs(), "llamacpp")
+        remote_models: list[dict[str, Any]] = []
+        for model in models_data:
+            if not isinstance(model, dict):
+                continue
+            model_id = str(model.get("id") or "").strip()
+            if not model_id:
+                continue
+            local_template = self._find_best_local_template("llamacpp", model_id, current_specs)
+            configured_output_cap = _safe_int(
+                getattr(self.config, "LLAMACPP_MAX_OUTPUT_TOKENS", 4096), 4096
+            )
+            if configured_output_cap <= 0:
+                configured_output_cap = 4096
+            output_tokens = min(configured_output_cap, runtime_context)
+            if runtime_n_predict > 0:
+                output_tokens = min(output_tokens, runtime_n_predict)
+            remote_models.append(
+                {
+                    "key": model_id,
+                    "id": model_id,
+                    "model_id": model_id,
+                    "name": str(local_template.get("name") or model_id),
+                    "description": str(
+                        local_template.get("description")
+                        or f"{model_id} served locally through llama.cpp."
+                    ),
+                    "provider": "llamacpp",
+                    "vendor": "llama.cpp",
+                    "context_window": runtime_context,
+                    "input_tokens": runtime_context,
+                    "output_tokens": output_tokens,
+                    "token_limits_provenance": TOKEN_PROVENANCE_LOCAL_CONFIG,
+                    "pricing": {"input_per_million": 0.0, "output_per_million": 0.0},
+                    "capabilities": capabilities,
+                    "supported_parameters": supported_parameters,
+                    "supported": True,
+                    "needs_review": False,
+                    "sync_mode": "discovery-assisted",
+                    "source": LLAMACPP_MODEL_LIST_SOURCE,
+                    "remote_created_at": None,
+                    "local_only": False,
+                    "sync_metadata": {
+                        "endpoint_alias": endpoint_alias,
+                        "effective_context_window": runtime_context,
+                        "slot_count": slot_count,
+                        "slot_context_limits": slot_context_limits,
+                        "busy_slot_count": busy_slot_count,
+                        "health_checked": True,
+                    },
+                    "raw": {
+                        "server_props": props,
+                        "slot_summary": {
+                            "slot_count": slot_count,
+                            "context_limits": slot_context_limits,
+                            "busy_slot_count": busy_slot_count,
+                        },
+                        "model": model,
                     },
                 }
             )
@@ -1118,8 +1423,8 @@ class ModelSyncService:
         local_spec: dict[str, Any] | None,
     ) -> str:
         if local_spec is None:
-            return "review" if provider in DISCOVERY_SYNC_PROVIDERS else "new"
-        if provider in DISCOVERY_SYNC_PROVIDERS:
+            return "review" if provider in DISCOVERY_SYNC_PROVIDERS and provider != "llamacpp" else "new"
+        if provider in DISCOVERY_SYNC_PROVIDERS and provider != "llamacpp":
             sync_meta = local_spec.get("sync_metadata", {}) or {}
             return "review" if sync_meta.get("needs_review") else "enabled"
 
@@ -1416,6 +1721,21 @@ class ModelSyncService:
                 ),
             }
         )
+        remote_sync_metadata = model.get("sync_metadata")
+        if isinstance(remote_sync_metadata, dict):
+            sync_meta.update(
+                {
+                    key: value
+                    for key, value in remote_sync_metadata.items()
+                    if key
+                    in {
+                        "endpoint_alias",
+                        "effective_context_window",
+                        "slot_count",
+                        "health_checked",
+                    }
+                }
+            )
 
         new_spec = dict(current_spec)
         # Preserve a curated per-model token_limits sub-object across syncs.

@@ -11,6 +11,7 @@ This module tests:
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any, Dict
 from unittest.mock import AsyncMock, Mock, patch
@@ -116,6 +117,12 @@ class _FakeOpenAICompatibleStream:
             raise StopAsyncIteration
 
 
+@asynccontextmanager
+async def _unrestricted_model_call_slot(*_args, **_kwargs):
+    """Avoid catalog-backed concurrency setup in request-payload unit tests."""
+    yield
+
+
 def _claude_message_delta(stop_reason: str):
     return SimpleNamespace(
         type="message_delta",
@@ -200,6 +207,7 @@ class TestMiniMaxOpenAICompatibleRuntime:
         assert content == "hello"
         request_kwargs = ai_service_instance.minimax_client.chat.completions.create.await_args.kwargs
         assert request_kwargs["extra_body"] == {"reasoning_split": True}
+        assert "reasoning_effort" not in request_kwargs
 
     @pytest.mark.asyncio
     async def test_stream_minimax_requests_reasoning_split(self, ai_service_instance):
@@ -244,6 +252,133 @@ class TestMiniMaxOpenAICompatibleRuntime:
         assert chunks[0] == "hello"
         request_kwargs = ai_service_instance.minimax_client.chat.completions.create.await_args.kwargs
         assert request_kwargs["extra_body"] == {"reasoning_split": True}
+        assert "reasoning_effort" not in request_kwargs
+
+
+class TestLocalOpenAICompatibleReasoningEffort:
+    """Local providers forward explicit reasoning mode only on their own paths."""
+
+    @pytest.mark.asyncio
+    async def test_generate_llamacpp_forwards_reasoning_effort(self, ai_service_instance):
+        ai_service_instance.llamacpp_client = Mock()
+        ai_service_instance.llamacpp_client.chat = Mock()
+        ai_service_instance.llamacpp_client.chat.completions = Mock()
+        ai_service_instance.llamacpp_client.chat.completions.create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="hello"), finish_reason="stop")],
+                usage=None,
+            )
+        )
+
+        content, _usage = await ai_service_instance._generate_llamacpp(
+            prompt="Reply with exactly: hello",
+            model_id="server-model-q4",
+            temperature=0.2,
+            max_tokens=128,
+            system_prompt="Reply minimally.",
+            reasoning_effort="none",
+        )
+
+        assert content == "hello"
+        request_kwargs = ai_service_instance.llamacpp_client.chat.completions.create.await_args.kwargs
+        assert request_kwargs["reasoning_effort"] == "none"
+
+    @pytest.mark.asyncio
+    async def test_stream_llamacpp_forwards_reasoning_effort(self, ai_service_instance):
+        ai_service_instance.llamacpp_client = Mock()
+        ai_service_instance.llamacpp_client.chat = Mock()
+        ai_service_instance.llamacpp_client.chat.completions = Mock()
+        ai_service_instance.llamacpp_client.chat.completions.create = AsyncMock(
+            return_value=_FakeOpenAICompatibleStream(
+                [
+                    SimpleNamespace(
+                        choices=[SimpleNamespace(delta=SimpleNamespace(content="hello"), finish_reason=None)],
+                        usage=None,
+                    ),
+                    SimpleNamespace(
+                        choices=[SimpleNamespace(delta=SimpleNamespace(content=None), finish_reason="stop")],
+                        usage=None,
+                    ),
+                ]
+            )
+        )
+
+        chunks = []
+        async for chunk in ai_service_instance._stream_llamacpp(
+            prompt="Reply with exactly: hello",
+            model_id="server-model-q4",
+            temperature=0.2,
+            max_tokens=128,
+            system_prompt="Reply minimally.",
+            reasoning_effort="none",
+        ):
+            chunks.append(chunk)
+
+        assert chunks[0] == "hello"
+        request_kwargs = ai_service_instance.llamacpp_client.chat.completions.create.await_args.kwargs
+        assert request_kwargs["reasoning_effort"] == "none"
+
+    @pytest.mark.asyncio
+    async def test_generate_ollama_forwards_reasoning_effort(self, ai_service_instance):
+        ai_service_instance.ollama_client = Mock()
+        ai_service_instance.ollama_client.chat = Mock()
+        ai_service_instance.ollama_client.chat.completions = Mock()
+        ai_service_instance.ollama_client.chat.completions.create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="hello"), finish_reason="stop")],
+                usage=None,
+            )
+        )
+        ai_service_instance.model_call_concurrency_slot = _unrestricted_model_call_slot
+
+        content, _usage = await ai_service_instance._generate_ollama(
+            prompt="Reply with exactly: hello",
+            model_id="qwen3.8:latest",
+            temperature=0.2,
+            max_tokens=128,
+            system_prompt="Reply minimally.",
+            reasoning_effort="none",
+        )
+
+        assert content == "hello"
+        request_kwargs = ai_service_instance.ollama_client.chat.completions.create.await_args.kwargs
+        assert request_kwargs["reasoning_effort"] == "none"
+
+    @pytest.mark.asyncio
+    async def test_stream_ollama_forwards_reasoning_effort(self, ai_service_instance):
+        ai_service_instance.ollama_client = Mock()
+        ai_service_instance.ollama_client.chat = Mock()
+        ai_service_instance.ollama_client.chat.completions = Mock()
+        ai_service_instance.ollama_client.chat.completions.create = AsyncMock(
+            return_value=_FakeOpenAICompatibleStream(
+                [
+                    SimpleNamespace(
+                        choices=[SimpleNamespace(delta=SimpleNamespace(content="hello"), finish_reason=None)],
+                        usage=None,
+                    ),
+                    SimpleNamespace(
+                        choices=[SimpleNamespace(delta=SimpleNamespace(content=None), finish_reason="stop")],
+                        usage=None,
+                    ),
+                ]
+            )
+        )
+        ai_service_instance.model_call_concurrency_slot = _unrestricted_model_call_slot
+
+        chunks = []
+        async for chunk in ai_service_instance._stream_ollama(
+            prompt="Reply with exactly: hello",
+            model_id="qwen3.8:latest",
+            temperature=0.2,
+            max_tokens=128,
+            system_prompt="Reply minimally.",
+            reasoning_effort="none",
+        ):
+            chunks.append(chunk)
+
+        assert chunks[0] == "hello"
+        request_kwargs = ai_service_instance.ollama_client.chat.completions.create.await_args.kwargs
+        assert request_kwargs["reasoning_effort"] == "none"
 
 
 # ============================================================================
@@ -1618,7 +1753,83 @@ class TestReasoningEffortProviderRetry:
         assert create.await_args_list[1].kwargs["reasoning"]["effort"] == "xhigh"
 
     @pytest.mark.asyncio
-    async def test_chat_completion_retry_removes_effort_when_supported_values_absent(self, ai_service_instance):
+    async def test_responses_retry_fails_closed_instead_of_xhigh_to_none(
+        self,
+        ai_service_instance,
+    ):
+        create = AsyncMock(
+            side_effect=Exception(
+                "Unsupported reasoning.effort 'xhigh'. Supported values are: 'none'."
+            )
+        )
+        ai_service_instance.openai_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create)
+        )
+
+        with pytest.raises(Exception, match="Supported values are: 'none'"):
+            await ai_service_instance._call_responses_create_with_reasoning_retry(
+                {
+                    "model": "gpt-5.6-sol",
+                    "input": "hi",
+                    "reasoning": {"effort": "xhigh"},
+                },
+                model_id="gpt-5.6-sol",
+            )
+
+        assert create.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_retry_fails_closed_for_nonzero_effort_without_supported_values(
+        self,
+        ai_service_instance,
+    ):
+        create = AsyncMock(
+            side_effect=Exception("reasoning_effort is not supported by this model")
+        )
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+        with pytest.raises(Exception, match="reasoning_effort is not supported"):
+            await ai_service_instance._call_chat_completions_create_with_reasoning_retry(
+                client,
+                {
+                    "model": "legacy",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "reasoning_effort": "low",
+                },
+                provider_key="openai",
+                model_id="legacy",
+            )
+
+        assert create.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_retry_fails_closed_instead_of_xhigh_to_none(
+        self,
+        ai_service_instance,
+    ):
+        create = AsyncMock(
+            side_effect=Exception(
+                "Unsupported value: 'xhigh'. Supported values are: 'none'."
+            )
+        )
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+        with pytest.raises(Exception, match="Supported values are: 'none'"):
+            await ai_service_instance._call_chat_completions_create_with_reasoning_retry(
+                client,
+                {
+                    "model": "gpt-5.6-sol",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "reasoning_effort": "xhigh",
+                },
+                provider_key="openai",
+                model_id="gpt-5.6-sol",
+            )
+
+        assert create.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_retry_can_remove_explicit_none(self, ai_service_instance):
         response = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
             usage=None,
@@ -1636,7 +1847,7 @@ class TestReasoningEffortProviderRetry:
             {
                 "model": "legacy",
                 "messages": [{"role": "user", "content": "hi"}],
-                "reasoning_effort": "low",
+                "reasoning_effort": "none",
             },
             provider_key="openai",
             model_id="legacy",
@@ -1939,6 +2150,21 @@ class TestClaudeStructuredOutputsParams:
                         response=SimpleNamespace(
                             status="completed",
                             usage=SimpleNamespace(total_tokens=9),
+                            output=[
+                                {
+                                    "type": "reasoning",
+                                    "id": "rs_1",
+                                    "summary": [],
+                                    "encrypted_content": "opaque-reasoning-state",
+                                },
+                                {
+                                    "type": "function_call",
+                                    "id": "fc_1",
+                                    "call_id": "call_1",
+                                    "name": "validate_draft",
+                                    "arguments": '{"text":"hello world"}',
+                                },
+                            ],
                         ),
                     )
 
@@ -1969,6 +2195,10 @@ class TestClaudeStructuredOutputsParams:
         assert message.tool_calls[0].call_id == "call_1"
         assert message.tool_calls[0].function.name == "validate_draft"
         assert message.tool_calls[0].function.arguments == '{"text":"hello world"}'
+        assert [item["type"] for item in message.responses_output_items] == [
+            "reasoning",
+            "function_call",
+        ]
         assert usage.total_tokens == 9
         assert finish_reason == "completed"
         assert any(event_type == "tool_call_delta" for event_type, _ in events)
@@ -2010,7 +2240,10 @@ class TestClaudeStructuredOutputsParams:
         async def on_event(event_type, payload):
             events.append((event_type, payload))
 
-        with pytest.raises(RuntimeError, match="without response.completed"):
+        with pytest.raises(
+            GenerationStoppedUnexpectedly,
+            match="without response.completed",
+        ) as exc_info:
             await ai_service_instance._stream_openai_responses_tool_turn(
                 {"model": "gpt-5-pro", "input": []},
                 {},
@@ -2021,8 +2254,298 @@ class TestClaudeStructuredOutputsParams:
                 cancellation_token=None,
             )
 
-        assert any(event_type == "tool_loop_provider_terminal" for event_type, _ in events)
+        assert exc_info.value.finish_reason == "missing_terminal_event"
+        assert exc_info.value.finish_reason_category == "missing"
+        terminal_payload = next(
+            payload
+            for event_type, payload in events
+            if event_type == "tool_loop_provider_terminal"
+        )
+        assert terminal_payload["status"] == "missing_terminal_event"
+        assert terminal_payload["last_event_type"] == "response.function_call_arguments.delta"
+        assert terminal_payload["event_count"] == 2
         assert not any(event_type == "tool_call_ready" for event_type, _ in events)
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_tool_turn_error_event_is_typed_and_never_retried(
+        self,
+        ai_service_instance,
+    ):
+        """A Responses SSE ``error`` preserves its cause and cannot replay the POST."""
+
+        class FakeResponsesStream:
+            def __aiter__(self):
+                async def iterator():
+                    yield SimpleNamespace(
+                        type="response.created",
+                        response=SimpleNamespace(
+                            id="resp_error_1",
+                            status="in_progress",
+                            usage=None,
+                            output=[],
+                        ),
+                    )
+                    yield SimpleNamespace(
+                        type="error",
+                        code="server_error",
+                        message="Upstream generation failed",
+                        param="reasoning.effort",
+                    )
+
+                return iterator()
+
+        create = AsyncMock(return_value=FakeResponsesStream())
+        retrieve = AsyncMock(
+            side_effect=AssertionError("an explicit error event must not be retrieved")
+        )
+        ai_service_instance.openai_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create, retrieve=retrieve)
+        )
+        events = []
+
+        async def on_event(event_type, payload):
+            events.append((event_type, payload))
+
+        async def operation():
+            return await ai_service_instance._stream_openai_responses_tool_turn(
+                {"model": "gpt-5.6-sol", "input": []},
+                {},
+                model_id="gpt-5.6-sol",
+                turn=1,
+                loop_scope=LoopScope.GENERATOR,
+                tool_event_callback=on_event,
+                cancellation_token=None,
+            )
+
+        with patch.object(ai_service_instance, "_max_retry_attempts", return_value=3):
+            with pytest.raises(GenerationStoppedUnexpectedly) as exc_info:
+                await ai_service_instance._execute_with_retries(
+                    operation,
+                    provider="openai",
+                    model_id="gpt-5.6-sol",
+                    action="tool_loop_generation",
+                )
+
+        assert create.await_count == 1
+        retrieve.assert_not_awaited()
+        assert exc_info.value.finish_reason == "server_error"
+        assert exc_info.value.finish_reason_category == "error"
+        assert "code=server_error" in str(exc_info.value)
+        assert "param=reasoning.effort" in str(exc_info.value)
+        assert "last_event_type=error" in str(exc_info.value)
+        assert "event_count=2" in str(exc_info.value)
+        terminal_payload = next(
+            payload
+            for event_type, payload in events
+            if event_type == "tool_loop_provider_terminal"
+        )
+        assert terminal_payload["error_code"] == "server_error"
+        assert terminal_payload["message"] == "Upstream generation failed"
+        assert terminal_payload["param"] == "reasoning.effort"
+        assert terminal_payload["last_event_type"] == "error"
+        assert terminal_payload["event_count"] == 2
+        assert not any(event_type == "tool_call_ready" for event_type, _ in events)
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_tool_turn_retrieves_same_response_after_clean_eof(
+        self,
+        ai_service_instance,
+    ):
+        """A missing terminal event may reconcile once by id, never with another create."""
+
+        class FakeResponsesStream:
+            def __aiter__(self):
+                async def iterator():
+                    yield SimpleNamespace(
+                        type="response.created",
+                        response=SimpleNamespace(
+                            id="resp_recover_1",
+                            status="in_progress",
+                            usage=None,
+                            output=[],
+                        ),
+                    )
+
+                return iterator()
+
+        recovered_response = SimpleNamespace(
+            id="resp_recover_1",
+            status="completed",
+            usage=SimpleNamespace(total_tokens=17),
+            output=[
+                SimpleNamespace(
+                    type="reasoning",
+                    id="rs_recover_1",
+                    summary=[],
+                    encrypted_content="opaque-recovered-reasoning",
+                ),
+                SimpleNamespace(
+                    type="function_call",
+                    id="fc_recover_1",
+                    call_id="call_recover_1",
+                    name="validate_draft",
+                    arguments='{"text":"recovered draft"}',
+                ),
+            ],
+        )
+        create = AsyncMock(return_value=FakeResponsesStream())
+        retrieve = AsyncMock(return_value=recovered_response)
+        ai_service_instance.openai_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create, retrieve=retrieve)
+        )
+        events = []
+
+        async def on_event(event_type, payload):
+            events.append((event_type, payload))
+
+        message, usage, finish_reason = (
+            await ai_service_instance._stream_openai_responses_tool_turn(
+                {"model": "gpt-5.6-sol", "input": []},
+                {"timeout": 321},
+                model_id="gpt-5.6-sol",
+                turn=1,
+                loop_scope=LoopScope.GENERATOR,
+                tool_event_callback=on_event,
+                cancellation_token=None,
+            )
+        )
+
+        assert create.await_count == 1
+        retrieve.assert_awaited_once_with(
+            "resp_recover_1",
+            stream=False,
+            timeout=321,
+        )
+        assert finish_reason == "completed"
+        assert usage.total_tokens == 17
+        assert len(message.tool_calls) == 1
+        assert message.tool_calls[0].call_id == "call_recover_1"
+        assert message.tool_calls[0].function.arguments == '{"text":"recovered draft"}'
+        assert [item["type"] for item in message.responses_output_items] == [
+            "reasoning",
+            "function_call",
+        ]
+        assert any(
+            event_type == "tool_loop_stream_reconciled"
+            for event_type, _ in events
+        )
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_tool_turn_retrieved_nonterminal_state_fails_closed(
+        self,
+        ai_service_instance,
+    ):
+        """Reconciliation never polls an in-progress response or executes partial output."""
+
+        class FakeResponsesStream:
+            def __aiter__(self):
+                async def iterator():
+                    yield SimpleNamespace(
+                        type="response.created",
+                        response=SimpleNamespace(
+                            id="resp_busy_1",
+                            status="in_progress",
+                            usage=None,
+                            output=[],
+                        ),
+                    )
+
+                return iterator()
+
+        create = AsyncMock(return_value=FakeResponsesStream())
+        retrieve = AsyncMock(
+            return_value=SimpleNamespace(
+                id="resp_busy_1",
+                status="in_progress",
+                usage=None,
+                output=[],
+                error=None,
+                incomplete_details=None,
+            )
+        )
+        ai_service_instance.openai_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create, retrieve=retrieve)
+        )
+        events = []
+
+        async def on_event(event_type, payload):
+            events.append((event_type, payload))
+
+        with pytest.raises(GenerationStoppedUnexpectedly) as exc_info:
+            await ai_service_instance._stream_openai_responses_tool_turn(
+                {"model": "gpt-5.6-sol", "input": []},
+                {},
+                model_id="gpt-5.6-sol",
+                turn=1,
+                loop_scope=LoopScope.GENERATOR,
+                tool_event_callback=on_event,
+                cancellation_token=None,
+            )
+
+        assert create.await_count == 1
+        assert retrieve.await_count == 1
+        assert exc_info.value.finish_reason == "in_progress"
+        assert exc_info.value.finish_reason_category == "retrieved_in_progress"
+        assert not any(event_type == "tool_call_ready" for event_type, _ in events)
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_tool_turn_retrieve_error_fails_closed_without_create_retry(
+        self,
+        ai_service_instance,
+    ):
+        """A failed one-shot GET remains typed and cannot replay paid generation."""
+
+        class FakeResponsesStream:
+            def __aiter__(self):
+                async def iterator():
+                    yield SimpleNamespace(
+                        type="response.created",
+                        response=SimpleNamespace(
+                            id="resp_lost_1",
+                            status="in_progress",
+                            usage=None,
+                            output=[],
+                        ),
+                    )
+
+                return iterator()
+
+        create = AsyncMock(return_value=FakeResponsesStream())
+        retrieve = AsyncMock(side_effect=RuntimeError("not found"))
+        ai_service_instance.openai_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create, retrieve=retrieve)
+        )
+
+        async def operation():
+            return await ai_service_instance._stream_openai_responses_tool_turn(
+                {"model": "gpt-5.6-sol", "input": []},
+                {},
+                model_id="gpt-5.6-sol",
+                turn=1,
+                loop_scope=LoopScope.GENERATOR,
+                tool_event_callback=None,
+                cancellation_token=None,
+            )
+
+        with patch.object(ai_service_instance, "_max_retry_attempts", return_value=3):
+            with pytest.raises(GenerationStoppedUnexpectedly) as exc_info:
+                await ai_service_instance._execute_with_retries(
+                    operation,
+                    provider="openai",
+                    model_id="gpt-5.6-sol",
+                    action="tool_loop_generation",
+                )
+
+        assert create.await_count == 1
+        assert retrieve.await_count == 1
+        assert exc_info.value.finish_reason == "retrieve_failed"
+        assert exc_info.value.finish_reason_category == "retrieve_failed"
+        assert "RuntimeError: not found" in str(exc_info.value)
+        assert "response_id=resp_lost_1" in str(exc_info.value)
+        assert "last_event_type=response.created" in str(exc_info.value)
+        assert "event_count=1" in str(exc_info.value)
+        assert exc_info.value.usage["last_event_type"] == "response.created"
+        assert exc_info.value.usage["stream_event_count"] == 1
 
     @pytest.mark.asyncio
     async def test_openai_responses_tool_turn_nonstream_accumulates_function_call(self, ai_service_instance):
@@ -2032,6 +2555,12 @@ class TestClaudeStructuredOutputsParams:
             status="completed",
             usage=SimpleNamespace(total_tokens=11),
             output=[
+                SimpleNamespace(
+                    type="reasoning",
+                    id="rs_1",
+                    summary=[],
+                    encrypted_content="opaque-reasoning-state",
+                ),
                 SimpleNamespace(
                     type="function_call",
                     id="fc_1",
@@ -2067,6 +2596,11 @@ class TestClaudeStructuredOutputsParams:
         assert message.tool_calls[0].call_id == "call_1"
         assert message.tool_calls[0].function.name == "validate_draft"
         assert message.tool_calls[0].function.arguments == '{"text":"hello world"}'
+        assert [item["type"] for item in message.responses_output_items] == [
+            "reasoning",
+            "function_call",
+        ]
+        assert message.responses_output_items[0]["encrypted_content"] == "opaque-reasoning-state"
         assert usage.total_tokens == 11
         assert finish_reason == "completed"
         assert any(event_type == "tool_call_ready" for event_type, _ in events)
@@ -2215,6 +2749,349 @@ class TestClaudeStructuredOutputsParams:
         assert metadata["accepted"] == "validated_tool_argument"
         assert create.await_args.kwargs.get("stream") is None
         assert create.await_count == 1
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "gpt-5.6-sol",
+            "GPT-5.6-SOL",
+            "gpt-5.6-sol-2026-08-01",
+        ],
+    )
+    def test_gpt56_sol_tool_streaming_is_quarantined(self, model_id):
+        assert AIService._openai_responses_tool_streaming_supported(model_id) is False
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "gpt-5.6-solar",
+            "gpt-5.6-solar-2026-08-01",
+            "gpt-5.5",
+            "gpt-4.1",
+        ],
+    )
+    def test_gpt56_sol_tool_streaming_quarantine_does_not_drift(self, model_id):
+        assert AIService._openai_responses_tool_streaming_supported(model_id) is True
+
+    @pytest.mark.asyncio
+    async def test_gpt56_sol_tool_loop_uses_one_nonstream_responses_create(
+        self,
+        ai_service_instance,
+    ):
+        """Sol keeps Responses/xhigh/tools while bypassing only the SSE transport."""
+
+        response = SimpleNamespace(
+            id="resp_sol_nonstream_1",
+            status="completed",
+            usage=SimpleNamespace(total_tokens=11),
+            output=[
+                SimpleNamespace(
+                    type="function_call",
+                    id="fc_sol_1",
+                    call_id="call_sol_1",
+                    name="validate_draft",
+                    arguments='{"text":"validated draft"}',
+                )
+            ],
+        )
+        create = AsyncMock(return_value=response)
+        ai_service_instance.openai_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create)
+        )
+
+        content, metadata = (
+            await ai_service_instance._run_openai_compatible_validation_tool_loop(
+                provider="openai",
+                model_id="gpt-5.6-sol",
+                prompt="Write.",
+                validation_callback=lambda candidate: _result_for_target(
+                    candidate,
+                    "validated draft",
+                ),
+                temperature=0.7,
+                max_tokens=128,
+                system_prompt="system",
+                request_timeout=None,
+                reasoning_effort="xhigh",
+                json_output=False,
+                json_schema=None,
+                usage_callback=None,
+                usage_extra=None,
+                images=None,
+                max_rounds=1,
+                retries_enabled=False,
+            )
+        )
+
+        create_kwargs = create.await_args.kwargs
+        assert content == "validated draft"
+        assert metadata["accepted"] == "validated_tool_argument"
+        assert create.await_count == 1
+        assert create_kwargs.get("stream") is None
+        assert create_kwargs["reasoning"] == {"effort": "xhigh"}
+        assert create_kwargs["tools"][0]["name"] == "validate_draft"
+        assert create_kwargs["parallel_tool_calls"] is False
+
+    @pytest.mark.asyncio
+    async def test_gpt56_sol_nonstream_refusal_fails_closed_without_loop_replay(
+        self,
+        ai_service_instance,
+    ):
+        """A completed refusal is policy output, never an empty multi-POST candidate."""
+
+        refusal = "I cannot assist with this sensitive request."
+        response = SimpleNamespace(
+            id="resp_refusal_nonstream_1",
+            status="completed",
+            usage=SimpleNamespace(total_tokens=7),
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    id="msg_refusal_1",
+                    role="assistant",
+                    status="completed",
+                    content=[
+                        SimpleNamespace(type="refusal", refusal=refusal)
+                    ],
+                )
+            ],
+        )
+        create = AsyncMock(return_value=response)
+        ai_service_instance.openai_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create)
+        )
+        events = []
+
+        async def on_event(event_type, payload):
+            events.append((event_type, payload))
+
+        with pytest.raises(GenerationStoppedUnexpectedly) as exc_info:
+            await ai_service_instance._run_openai_compatible_validation_tool_loop(
+                provider="openai",
+                model_id="gpt-5.6-sol",
+                prompt="Write.",
+                validation_callback=lambda candidate: _result_for_target(
+                    candidate,
+                    "never accepted",
+                ),
+                temperature=0.7,
+                max_tokens=128,
+                system_prompt="system",
+                request_timeout=None,
+                reasoning_effort="xhigh",
+                json_output=False,
+                json_schema=None,
+                usage_callback=None,
+                usage_extra=None,
+                images=None,
+                max_rounds=3,
+                retries_enabled=True,
+                tool_event_callback=on_event,
+            )
+
+        assert create.await_count == 1
+        assert create.await_args.kwargs.get("stream") is None
+        assert exc_info.value.finish_reason == "refusal"
+        assert exc_info.value.finish_reason_category == "content_filter"
+        assert exc_info.value.partial_content == ""
+        assert exc_info.value.usage["refusal_chars"] == len(refusal)
+        assert refusal in str(exc_info.value)
+        assert not any(event_type == "tool_call_ready" for event_type, _ in events)
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_stream_refusal_fails_closed_without_retry(
+        self,
+        ai_service_instance,
+    ):
+        """Refusal SSE events preserve policy cause and cannot replay the POST."""
+
+        refusal = "I cannot comply with that request."
+
+        class FakeResponsesStream:
+            def __aiter__(self):
+                async def iterator():
+                    yield SimpleNamespace(
+                        type="response.created",
+                        response=SimpleNamespace(
+                            id="resp_refusal_stream_1",
+                            status="in_progress",
+                            usage=None,
+                            output=[],
+                        ),
+                    )
+                    yield SimpleNamespace(
+                        type="response.refusal.delta",
+                        delta="I cannot comply ",
+                    )
+                    yield SimpleNamespace(
+                        type="response.refusal.done",
+                        refusal=refusal,
+                    )
+                    yield SimpleNamespace(
+                        type="response.completed",
+                        response=SimpleNamespace(
+                            id="resp_refusal_stream_1",
+                            status="completed",
+                            usage=SimpleNamespace(total_tokens=9),
+                            output=[
+                                SimpleNamespace(
+                                    type="message",
+                                    id="msg_refusal_stream_1",
+                                    role="assistant",
+                                    status="completed",
+                                    content=[
+                                        SimpleNamespace(
+                                            type="refusal",
+                                            refusal=refusal,
+                                        )
+                                    ],
+                                )
+                            ],
+                        ),
+                    )
+
+                return iterator()
+
+        create = AsyncMock(return_value=FakeResponsesStream())
+        ai_service_instance.openai_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create)
+        )
+        events = []
+
+        async def on_event(event_type, payload):
+            events.append((event_type, payload))
+
+        async def operation():
+            return await ai_service_instance._stream_openai_responses_tool_turn(
+                {"model": "gpt-5.5", "input": []},
+                {},
+                model_id="gpt-5.5",
+                turn=1,
+                loop_scope=LoopScope.GENERATOR,
+                tool_event_callback=on_event,
+                cancellation_token=None,
+            )
+
+        with patch.object(ai_service_instance, "_max_retry_attempts", return_value=3):
+            with pytest.raises(GenerationStoppedUnexpectedly) as exc_info:
+                await ai_service_instance._execute_with_retries(
+                    operation,
+                    provider="openai",
+                    model_id="gpt-5.5",
+                    action="tool_loop_generation",
+                )
+
+        assert create.await_count == 1
+        assert create.await_args.kwargs["stream"] is True
+        assert exc_info.value.finish_reason == "refusal"
+        assert exc_info.value.finish_reason_category == "content_filter"
+        assert exc_info.value.partial_content == ""
+        assert exc_info.value.usage["refusal_chars"] == len(refusal)
+        assert refusal in str(exc_info.value)
+        assert not any(event_type == "tool_call_ready" for event_type, _ in events)
+
+    @pytest.mark.asyncio
+    async def test_gpt56_sol_tool_loop_routes_xhigh_through_responses(self, ai_service_instance):
+        """Sol keeps xhigh and reasoning items across Responses tool turns."""
+
+        first_call = SimpleNamespace(
+            id="fc_1",
+            call_id="call_1",
+            response_item_id="fc_1",
+            type="function",
+            function=SimpleNamespace(
+                name="validate_draft",
+                arguments='{"text":"needs revision"}',
+            ),
+        )
+        second_call = SimpleNamespace(
+            id="fc_2",
+            call_id="call_2",
+            response_item_id="fc_2",
+            type="function",
+            function=SimpleNamespace(
+                name="validate_draft",
+                arguments='{"text":"validated draft"}',
+            ),
+        )
+        reasoning_item = {
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [],
+            "encrypted_content": "opaque-reasoning-state",
+        }
+        first_function_item = {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "validate_draft",
+            "arguments": '{"text":"needs revision"}',
+        }
+        responses_turn = AsyncMock(
+            side_effect=[
+                (
+                    SimpleNamespace(
+                        content="",
+                        tool_calls=[first_call],
+                        responses_output_items=[reasoning_item, first_function_item],
+                    ),
+                    SimpleNamespace(total_tokens=11),
+                    "completed",
+                ),
+                (
+                    SimpleNamespace(content="", tool_calls=[second_call]),
+                    SimpleNamespace(total_tokens=13),
+                    "completed",
+                ),
+            ]
+        )
+        chat_create = AsyncMock(side_effect=AssertionError("Chat Completions must not run"))
+        ai_service_instance.openai_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=chat_create)),
+            responses=SimpleNamespace(create=AsyncMock()),
+        )
+
+        with patch.object(
+            ai_service_instance,
+            "_run_openai_responses_tool_turn",
+            new=responses_turn,
+        ):
+            content, metadata = await ai_service_instance._run_openai_compatible_validation_tool_loop(
+                provider="openai",
+                model_id="gpt-5.6-sol",
+                prompt="Write.",
+                validation_callback=lambda candidate: _result_for_target(
+                    candidate,
+                    "validated draft",
+                ),
+                temperature=0.7,
+                max_tokens=128,
+                system_prompt="system",
+                request_timeout=None,
+                reasoning_effort="xhigh",
+                json_output=False,
+                json_schema=None,
+                usage_callback=None,
+                usage_extra=None,
+                images=None,
+                max_rounds=2,
+                retries_enabled=False,
+            )
+
+        first_params = responses_turn.await_args_list[0].args[0]
+        second_params = responses_turn.await_args_list[1].args[0]
+        assert content == "validated draft"
+        assert metadata["accepted"] == "validated_tool_argument"
+        assert first_params["reasoning"] == {"effort": "xhigh"}
+        assert second_params["reasoning"] == {"effort": "xhigh"}
+        assert "reasoning_effort" not in first_params
+        assert first_params["tools"][0]["name"] == "validate_draft"
+        assert second_params["input"][1] == reasoning_item
+        assert second_params["input"][2] == first_function_item
+        assert second_params["input"][3]["type"] == "function_call_output"
+        assert second_params["input"][3]["call_id"] == "call_1"
+        assert responses_turn.await_count == 2
+        chat_create.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_openai_chat_tool_turn_missing_terminal_raises_before_tool_ready(self, ai_service_instance):
@@ -2430,6 +3307,21 @@ class TestClaudeStructuredOutputsParams:
                             },
                         }
                     ],
+                    "responses_output_items": [
+                        {
+                            "type": "reasoning",
+                            "id": "rs_1",
+                            "summary": [],
+                            "encrypted_content": "opaque-reasoning-state",
+                        },
+                        {
+                            "type": "function_call",
+                            "id": "fc_1",
+                            "call_id": "call_1",
+                            "name": "validate_draft",
+                            "arguments": '{"text":"Write"}',
+                        },
+                    ],
                 },
                 {"role": "tool", "tool_call_id": "call_1", "content": '{"approved":true}'},
             ],
@@ -2443,10 +3335,12 @@ class TestClaudeStructuredOutputsParams:
 
         assert params["instructions"] == "System"
         assert params["input"][0] == {"role": "user", "content": "Write"}
-        assert params["input"][1]["type"] == "function_call"
-        assert params["input"][1]["call_id"] == "call_1"
-        assert params["input"][2]["type"] == "function_call_output"
+        assert params["input"][1]["type"] == "reasoning"
+        assert params["input"][1]["encrypted_content"] == "opaque-reasoning-state"
+        assert params["input"][2]["type"] == "function_call"
         assert params["input"][2]["call_id"] == "call_1"
+        assert params["input"][3]["type"] == "function_call_output"
+        assert params["input"][3]["call_id"] == "call_1"
         assert params["tools"][0]["name"] == "validate_draft"
         assert params["tool_choice"] == "auto"
 
@@ -2545,6 +3439,41 @@ class TestClaudeStructuredOutputsParams:
                 }
             }
             assert "json_schema" not in params["text"]["format"]
+
+    @pytest.mark.asyncio
+    async def test_stream_openai_sol_delegates_to_responses_with_xhigh(self, ai_service_instance):
+        """A standard Sol stream request cannot fall back to Chat Completions."""
+
+        chat_create = AsyncMock(side_effect=AssertionError("Chat Completions must not run"))
+        ai_service_instance.openai_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=chat_create)),
+            responses=SimpleNamespace(create=AsyncMock()),
+        )
+        generate_responses = AsyncMock(
+            return_value=(
+                "final from responses",
+                {"finish_reason": "completed", "input_tokens": 10, "output_tokens": 4},
+            )
+        )
+
+        with patch.object(ai_service_instance, "_generate_openai", new=generate_responses):
+            chunks = [
+                chunk
+                async for chunk in ai_service_instance._stream_openai(
+                    prompt="Write.",
+                    model_id="gpt-5.6-sol",
+                    temperature=0.7,
+                    max_tokens=128,
+                    system_prompt="system",
+                    extra_verbose=False,
+                    reasoning_effort="xhigh",
+                )
+            ]
+
+        assert chunks[0] == "final from responses"
+        assert generate_responses.await_args.args[1] == "gpt-5.6-sol"
+        assert generate_responses.await_args.args[5] == "xhigh"
+        chat_create.assert_not_awaited()
 
 
 class TestInjectClaudeThinkingParams:
@@ -2935,6 +3864,30 @@ class TestExecuteWithRetries:
 
         assert result == "success"
         record_success.assert_awaited_once_with("openai", model="gpt-4o", operation="test")
+
+    @pytest.mark.asyncio
+    async def test_records_endpoint_health_on_success(self, ai_service_instance, mock_config):
+        mock_config.MAX_RETRIES = 3
+
+        async def successful_operation():
+            return "success"
+
+        with patch("ai_service.record_provider_success", new_callable=AsyncMock) as record_success:
+            result = await ai_service_instance._execute_with_retries(
+                successful_operation,
+                provider="ollama",
+                model_id="writer-local",
+                action="test",
+                endpoint_id="ollama_b",
+            )
+
+        assert result == "success"
+        record_success.assert_awaited_once_with(
+            "ollama",
+            model="writer-local",
+            operation="test",
+            endpoint_id="ollama_b",
+        )
 
     @pytest.mark.asyncio
     async def test_records_provider_health_on_wrapped_failure(self, ai_service_instance):

@@ -20,6 +20,7 @@ import re
 import threading
 import warnings
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optional, Sequence, Set, Tuple, TypeVar
@@ -30,6 +31,7 @@ import httpx
 
 if TYPE_CHECKING:
     from core.cancellation import CancellationToken
+    from local_execution_policy import LocalExecutionRuntime
     from logging_utils import PhaseLogger
     from models import ImageData, LlmAccentGuard
 import anthropic
@@ -48,7 +50,16 @@ from ai_runtime import parameters as runtime_parameters
 from ai_runtime import schemas as runtime_schemas
 from ai_runtime import usage as runtime_usage
 from ai_runtime import vision as runtime_vision
-from config import DEFAULT_OUTPUT_TOKEN_FALLBACK, config, get_model_parameter_requirements
+from ai_runtime.openrouter_provider_options import (
+    OpenRouterProviderOptionsError,
+    validate_openrouter_provider_options,
+)
+from config import (
+    DEFAULT_OUTPUT_TOKEN_FALLBACK,
+    config,
+    get_model_parameter_requirements,
+    resolve_model_catalog_entry,
+)
 from content_events import ContentStatus
 from context_budget import ContextAdmissionError, ProviderContextOverflow
 from deterministic_validation import DraftValidationResult
@@ -57,6 +68,12 @@ from llm_accent_prompts import (
     build_inline_accent_prompt,
 )
 from llm_routing import resolve_call, resolve_temperature
+from local_endpoint_registry import (
+    LocalEndpointConfigurationError,
+    LocalInferenceEndpoint,
+    build_local_endpoint_registry,
+)
+from local_execution_policy import LocalExecutionPolicyError
 from model_aliasing import PromptPart, PromptSource, assert_prompt_is_model_blind
 from model_capability_registry import (
     model_supports as registry_model_supports,
@@ -186,6 +203,15 @@ def _openai_async_http_client() -> httpx.AsyncClient:
     return openai.DefaultAsyncHttpxClient(limits=_sdk_http_limits())
 
 
+def _local_openai_async_http_client() -> httpx.AsyncClient:
+    """Build a local OpenAI-compatible client that never follows redirects."""
+
+    return openai.DefaultAsyncHttpxClient(
+        limits=_sdk_http_limits(),
+        follow_redirects=False,
+    )
+
+
 def _openai_sync_http_client() -> httpx.Client:
     """Build an OpenAI-compatible sync HTTP client with shared pool settings."""
 
@@ -240,8 +266,8 @@ def _is_unusable_openai_stream_finish(reason: Any) -> bool:
     return runtime_usage.is_unusable_openai_stream_finish(reason)
 
 
-def _normalize_ollama_openai_base_url(host: Any) -> str:
-    """Return the OpenAI-compatible Ollama base URL used by this client."""
+def _normalize_openai_compatible_base_url(host: Any) -> str:
+    """Return an OpenAI-compatible ``/v1`` base URL for a local server."""
 
     base_url = str(host or "").strip().rstrip("/")
     if not base_url:
@@ -257,6 +283,12 @@ def _normalize_ollama_openai_base_url(host: Any) -> str:
     if not base_url.endswith("/v1"):
         base_url = f"{base_url}/v1"
     return base_url
+
+
+def _normalize_ollama_openai_base_url(host: Any) -> str:
+    """Backward-compatible Ollama-specific name for the shared normalizer."""
+
+    return _normalize_openai_compatible_base_url(host)
 
 
 def _build_finish_metadata(
@@ -416,7 +448,7 @@ class GenerationOutputTruncated(RuntimeError):
 
 
 class GenerationStoppedUnexpectedly(RuntimeError):
-    """Raised when a provider finishes a non-streaming generation unusably."""
+    """Raised when a provider finishes a generation unusably."""
 
     def __init__(
         self,
@@ -547,6 +579,11 @@ class AIService:
         self.minimax_client = None
         self.moonshot_client = None
         self.ollama_client = None
+        self.llamacpp_client = None
+        self.local_endpoint_registry = None
+        self._local_endpoint_clients: Dict[str, Any] = {}
+        self._local_endpoint_semaphores: Dict[str, asyncio.Semaphore] = {}
+        self._local_endpoints: Dict[str, LocalInferenceEndpoint] = {}
         self.fake_client = None
         # Background tasks that persist context_suspect flags after a provider
         # context overflow. Referenced so fire-and-forget tasks are not GC'd.
@@ -561,6 +598,13 @@ class AIService:
         self._ollama_request_semaphore = asyncio.Semaphore(
             self._ollama_max_concurrent_requests
         )
+        self._llamacpp_max_concurrent_requests = self._positive_int_config(
+            "LLAMACPP_MAX_CONCURRENT_REQUESTS",
+            1,
+        )
+        self._llamacpp_request_semaphore = asyncio.Semaphore(
+            self._llamacpp_max_concurrent_requests
+        )
 
         # Configure optimized HTTP connector for better performance
         self.http_connector = aiohttp.TCPConnector(
@@ -573,6 +617,288 @@ class AIService:
         )
 
         self._initialize_clients()
+
+    @staticmethod
+    def _authorize_local_execution(
+        local_execution: Optional["LocalExecutionRuntime"],
+        *,
+        dispatch_call_id: Optional[str],
+        dispatch_route_ordinal: int,
+        provider: str,
+        model_id: str,
+        endpoint_id: Optional[str] = None,
+    ) -> Optional[Any]:
+        """Authorize one concrete transport dispatch for a local-only session."""
+
+        if local_execution is None:
+            return None
+        if not dispatch_call_id:
+            local_execution.record_blocked(
+                call_id="",
+                route_ordinal=dispatch_route_ordinal,
+                provider=provider,
+                model_id=model_id,
+                reason="local_dispatch_call_id_missing",
+            )
+            raise LocalExecutionPolicyError(
+                "local_dispatch_call_id_missing",
+                "A local-only provider dispatch requires its registered call id.",
+            )
+        route = local_execution.authorize(
+            dispatch_call_id,
+            dispatch_route_ordinal,
+            provider,
+            model_id,
+            endpoint_id=endpoint_id,
+        )
+        if endpoint_id is not None and route.endpoint_id != endpoint_id:
+            raise LocalExecutionPolicyError(
+                "local_dispatch_endpoint_not_authorized",
+                "Dispatch endpoint does not match its admitted local route.",
+            )
+        return route
+
+    @staticmethod
+    def _local_endpoint_hint_for_selection(
+        local_execution: Optional["LocalExecutionRuntime"],
+        *,
+        dispatch_call_id: Optional[str],
+        dispatch_route_ordinal: int,
+        provider: str,
+        model_id: str,
+        endpoint_id: Optional[str],
+    ) -> Optional[str]:
+        """Read the admitted endpoint needed to select a client without ledgering a dispatch.
+
+        Tool loops must select their endpoint before they can issue a request, but
+        the ledger represents actual SDK dispatches rather than client lookup.
+        The real authorization remains immediately adjacent to every SDK call.
+        """
+
+        if local_execution is None or not dispatch_call_id:
+            return endpoint_id
+        try:
+            return local_execution.manifest.route_for(
+                dispatch_call_id,
+                dispatch_route_ordinal,
+            ).endpoint_id
+        except LocalExecutionPolicyError as exc:
+            # No SDK request will follow, but preserve the failed-dispatch
+            # evidence that the normal authorization path would have recorded.
+            local_execution.record_blocked(
+                call_id=dispatch_call_id,
+                route_ordinal=dispatch_route_ordinal,
+                provider=provider,
+                model_id=model_id,
+                reason=exc.code,
+            )
+            raise
+
+    @staticmethod
+    def _normalize_local_endpoint_adapter(value: Any) -> str:
+        """Return one supported local endpoint adapter name, if present."""
+
+        adapter = str(value or "").strip().lower()
+        return "llamacpp" if adapter == "llama.cpp" else adapter
+
+    @staticmethod
+    def _model_name_is_provider_qualified(model: str) -> bool:
+        """Return whether a model name already declares its catalog namespace."""
+
+        value = str(model or "").strip()
+        return "::" in value or value.startswith(
+            ("ollama/", "llamacpp/", "openai_compatible/")
+        )
+
+    @staticmethod
+    def _catalog_identifier_for_endpoint_adapter(model: str, adapter: str) -> str:
+        """Scope an unqualified local model to the endpoint adapter catalog."""
+
+        model_name = str(model or "").strip()
+        if AIService._model_name_is_provider_qualified(model_name):
+            return model_name
+
+        candidates = {
+            "ollama": (f"ollama::{model_name}",),
+            "llamacpp": (f"llamacpp::{model_name}",),
+            # Keep the intentionally explicit llama.cpp compatibility fallback
+            # for generic OpenAI-compatible endpoints. It is never a global
+            # lookup, so another adapter cannot win a colliding raw ID.
+            "openai_compatible": (
+                f"openai_compatible::{model_name}",
+                f"llamacpp::{model_name}",
+            ),
+        }.get(adapter, (model_name,))
+        if len(candidates) == 1:
+            return candidates[0]
+
+        specs = getattr(config, "model_specs", None)
+        if not isinstance(specs, Mapping):
+            return candidates[0]
+        for candidate in candidates:
+            try:
+                if resolve_model_catalog_entry(candidate, specs).get("matched"):
+                    return candidate
+            except Exception:
+                continue
+        return candidates[0]
+
+    def _registered_local_endpoint(
+        self, endpoint_id: Optional[str]
+    ) -> Optional[LocalInferenceEndpoint]:
+        """Return administrative endpoint metadata without inferring a fallback."""
+
+        normalized_id = str(endpoint_id or "").strip()
+        if not normalized_id:
+            return None
+        endpoint = getattr(self, "_local_endpoints", {}).get(normalized_id)
+        if endpoint is not None:
+            return endpoint
+        registry = getattr(self, "local_endpoint_registry", None)
+        if registry is None:
+            return None
+        try:
+            return registry.get(normalized_id)
+        except LocalEndpointConfigurationError:
+            return None
+
+    def _resolve_endpoint_scoped_catalog_model(
+        self,
+        model: str,
+        *,
+        endpoint_id: Optional[str],
+        local_execution: Optional["LocalExecutionRuntime"],
+        dispatch_call_id: Optional[str],
+        dispatch_route_ordinal: int,
+    ) -> tuple[str, Optional[str], Optional[LocalInferenceEndpoint]]:
+        """Resolve catalog identity from the exact local endpoint when available.
+
+        Catalog identity is separate from the model ID sent to the API. The
+        former may need an adapter qualifier to avoid a global collision, while
+        ``config.validate_token_limits`` returns the latter for dispatch.
+        """
+
+        effective_endpoint_id = str(endpoint_id or "").strip() or None
+        adapter = ""
+        if local_execution is not None and dispatch_call_id:
+            effective_endpoint_id = self._local_endpoint_hint_for_selection(
+                local_execution,
+                dispatch_call_id=dispatch_call_id,
+                dispatch_route_ordinal=dispatch_route_ordinal,
+                provider="",
+                model_id=str(model),
+                endpoint_id=effective_endpoint_id,
+            )
+            route = local_execution.manifest.route_for(
+                dispatch_call_id,
+                dispatch_route_ordinal,
+            )
+            adapter = self._normalize_local_endpoint_adapter(route.adapter or route.provider)
+
+        endpoint = self._registered_local_endpoint(effective_endpoint_id)
+        if endpoint is not None:
+            adapter = self._normalize_local_endpoint_adapter(endpoint.adapter)
+        if adapter not in {"ollama", "llamacpp", "openai_compatible"}:
+            return str(model), effective_endpoint_id, endpoint
+        return (
+            self._catalog_identifier_for_endpoint_adapter(str(model), adapter),
+            effective_endpoint_id,
+            endpoint,
+        )
+
+    @staticmethod
+    def _endpoint_accepts_local_provider(
+        endpoint: LocalInferenceEndpoint, provider: str
+    ) -> bool:
+        """Return whether the registered endpoint can carry this local provider."""
+
+        normalized_provider = str(provider or "").strip().lower()
+        if normalized_provider == "llama.cpp":
+            normalized_provider = "llamacpp"
+        accepted_adapters = {
+            "ollama": {"ollama"},
+            "llamacpp": {"llamacpp", "openai_compatible"},
+            "openai_compatible": {"openai_compatible"},
+        }.get(normalized_provider, set())
+        return AIService._normalize_local_endpoint_adapter(endpoint.adapter) in accepted_adapters
+
+    @staticmethod
+    def _discovered_endpoint_model_is_available(
+        discovered_model: Mapping[str, Any], availability: str
+    ) -> bool:
+        """Apply the configured loaded/available policy to a discovery record."""
+
+        if str(availability or "loaded").strip().lower() != "loaded":
+            return True
+        state = str(
+            discovered_model.get("state") or discovered_model.get("status") or ""
+        ).strip().lower()
+        return not state or state in {"loaded", "ready", "running", "served"}
+
+    async def _verify_normal_local_endpoint_availability(
+        self,
+        endpoint: Optional[LocalInferenceEndpoint],
+        *,
+        provider: str,
+        model_id: str,
+        local_execution: Optional["LocalExecutionRuntime"],
+    ) -> None:
+        """Verify one explicit normal-scope local route before its first SDK call."""
+
+        if endpoint is None or local_execution is not None:
+            return
+        if not self._endpoint_accepts_local_provider(endpoint, provider):
+            raise LocalExecutionPolicyError(
+                "local_endpoint_adapter_mismatch",
+                f"Endpoint '{endpoint.endpoint_id}' adapter '{endpoint.adapter}' is "
+                f"incompatible with provider '{provider}'.",
+            )
+
+        from services.model_sync import ModelSyncService
+
+        try:
+            discovered_models = await ModelSyncService(
+                config, logger
+            ).discover_local_endpoint(endpoint)
+        except LocalExecutionPolicyError:
+            raise
+        except Exception as exc:
+            raise LocalExecutionPolicyError(
+                "local_endpoint_unavailable",
+                f"Could not discover local endpoint '{endpoint.endpoint_id}': {exc}",
+            ) from exc
+
+        if not isinstance(discovered_models, Sequence) or isinstance(
+            discovered_models, (str, bytes, bytearray)
+        ):
+            raise LocalExecutionPolicyError(
+                "local_discovery_invalid",
+                f"Local discovery for endpoint '{endpoint.endpoint_id}' returned no models list.",
+            )
+        for discovered_model in discovered_models:
+            if not isinstance(discovered_model, Mapping):
+                continue
+            if (
+                str(discovered_model.get("status") or "").strip().lower() == "stale"
+                or discovered_model.get("local_only") is True
+            ):
+                continue
+            announced_ids = {
+                str(discovered_model.get(key) or "").strip()
+                for key in ("model_id", "key", "id")
+            }
+            if (
+                model_id in announced_ids
+                and self._discovered_endpoint_model_is_available(
+                    discovered_model, endpoint.availability
+                )
+            ):
+                return
+        raise LocalExecutionPolicyError(
+            "local_model_not_announced",
+            f"Model '{model_id}' is not announced as {endpoint.availability} by "
+            f"endpoint '{endpoint.endpoint_id}'.",
+        )
 
     def _assert_model_blind_prompt(
         self,
@@ -717,19 +1043,7 @@ class AIService:
         else:
             logger.warning("Moonshot API key not found")
 
-        # Initialize Ollama client (local models, OpenAI-compatible API)
-        if config.OLLAMA_HOST:
-            ollama_base_url = _normalize_ollama_openai_base_url(config.OLLAMA_HOST)
-            self.ollama_client = openai.AsyncOpenAI(
-                api_key="ollama",  # Dummy key, Ollama doesn't require authentication
-                base_url=ollama_base_url,
-                timeout=float(config.SDK_OLLAMA_TIMEOUT_SECONDS),
-                max_retries=2,
-                http_client=_openai_async_http_client(),
-            )
-            logger.info(f"Ollama client initialized at {ollama_base_url}")
-        else:
-            logger.info("Ollama not configured (OLLAMA_HOST not set)")
+        self._initialize_local_endpoint_clients()
 
         # Initialize Fake AI client (for testing with controlled responses)
         if config.FAKE_AI_HOST:
@@ -749,6 +1063,133 @@ class AIService:
         else:
             self.fake_client = None
             logger.debug("Fake AI not configured (FAKE_AI_HOST not set)")
+
+    def _initialize_local_endpoint_clients(self) -> None:
+        """Create one OpenAI-compatible client and queue for every local API endpoint."""
+
+        try:
+            registry = build_local_endpoint_registry(config)
+        except LocalEndpointConfigurationError:
+            logger.exception("Invalid local endpoint configuration")
+            raise
+        self.local_endpoint_registry = registry
+        self._local_endpoints = {endpoint.endpoint_id: endpoint for endpoint in registry}
+        if registry.legacy and not any(
+            endpoint.adapter == "ollama" for endpoint in registry
+        ):
+            logger.info("Ollama not configured")
+        for endpoint in registry:
+            timeout_name = "SDK_OLLAMA_TIMEOUT_SECONDS" if endpoint.adapter == "ollama" else "SDK_LLAMACPP_TIMEOUT_SECONDS"
+            timeout = float(getattr(config, timeout_name, 12000))
+            api_key = "ollama" if endpoint.adapter == "ollama" else "llama.cpp"
+            headers = endpoint.authorization_header()
+            if headers:
+                api_key = headers["Authorization"].removeprefix("Bearer ")
+            client = openai.AsyncOpenAI(
+                api_key=api_key,
+                base_url=_normalize_ollama_openai_base_url(endpoint.base_url)
+                if endpoint.adapter == "ollama"
+                else endpoint.base_url,
+                timeout=timeout,
+                max_retries=0,
+                http_client=_local_openai_async_http_client(),
+            )
+            self._local_endpoint_clients[endpoint.endpoint_id] = client
+            self._local_endpoint_semaphores[endpoint.endpoint_id] = asyncio.Semaphore(
+                endpoint.max_concurrent_requests
+            )
+            logger.info("Local %s client initialized for endpoint %s at %s", endpoint.adapter, endpoint.endpoint_id, endpoint.base_url)
+
+        # Preserve the legacy singleton attributes for existing callers.  A
+        # multi-endpoint registry never uses these aliases for selection.
+        if registry.legacy:
+            for endpoint in registry:
+                client = self._local_endpoint_clients[endpoint.endpoint_id]
+                semaphore = self._local_endpoint_semaphores[endpoint.endpoint_id]
+                if endpoint.adapter == "ollama":
+                    self.ollama_client = client
+                    self._ollama_request_semaphore = semaphore
+                elif endpoint.adapter == "llamacpp":
+                    self.llamacpp_client = client
+                    self._llamacpp_request_semaphore = semaphore
+
+    def _local_endpoint_transport(
+        self, provider: str, endpoint_id: Optional[str]
+    ) -> tuple[Any, asyncio.Semaphore, LocalInferenceEndpoint]:
+        """Return the exact configured local transport; never infer among multiples."""
+
+        if endpoint_id is None:
+            registry = getattr(self, "local_endpoint_registry", None)
+            if registry is not None and not registry.legacy:
+                raise LocalExecutionPolicyError(
+                    "local_endpoint_required",
+                    "A multi-endpoint local dispatch requires endpoint_id.",
+                )
+            if provider == "ollama" and self.ollama_client:
+                endpoint = next((item for item in self._local_endpoints.values() if item.adapter == "ollama"), None)
+                if endpoint:
+                    return self.ollama_client, self._ollama_request_semaphore, endpoint
+            if provider == "llamacpp" and self.llamacpp_client:
+                endpoint = next((item for item in self._local_endpoints.values() if item.adapter == "llamacpp"), None)
+                if endpoint:
+                    return self.llamacpp_client, self._llamacpp_request_semaphore, endpoint
+            raise ValueError(f"No configured local client for provider '{provider}'.")
+        endpoint = self._local_endpoints.get(endpoint_id)
+        if endpoint is None:
+            raise LocalExecutionPolicyError("local_endpoint_unknown", f"Unknown local endpoint '{endpoint_id}'.")
+        compatible_adapters = {
+            "ollama": {"ollama"},
+            "llamacpp": {"llamacpp", "openai_compatible"},
+            "openai_compatible": {"openai_compatible"},
+        }
+        compatible = compatible_adapters.get(provider, set())
+        if endpoint.adapter not in compatible:
+            raise LocalExecutionPolicyError(
+                "local_endpoint_adapter_mismatch",
+                f"Endpoint '{endpoint_id}' adapter '{endpoint.adapter}' is incompatible with provider '{provider}'.",
+            )
+        return (
+            self._local_endpoint_clients[endpoint_id],
+            self._local_endpoint_semaphores[endpoint_id],
+            endpoint,
+        )
+
+    async def _generate_registered_local(
+        self, provider: str, endpoint_id: Optional[str], **kwargs: Any
+    ) -> Tuple[str, Any]:
+        """Dispatch one non-stream local request through its admitted endpoint."""
+
+        # Lightweight test doubles and pre-Track-B embedders sometimes build
+        # AIService with __new__. Keep their established singleton adapters
+        # usable; production instances always have the registry initialized.
+        if not getattr(self, "_local_endpoints", None):
+            if provider == "ollama":
+                return await self._generate_ollama(**kwargs)
+            if provider == "llamacpp":
+                return await self._generate_llamacpp(**kwargs)
+        client, semaphore, endpoint = self._local_endpoint_transport(provider, endpoint_id)
+        async with semaphore:
+            return await self._generate_openai_compatible(
+                provider_key=provider,
+                client=client,
+                display_name=f"{endpoint.adapter} endpoint '{endpoint.endpoint_id}'",
+                **kwargs,
+            )
+
+    async def _stream_registered_local(
+        self, provider: str, endpoint_id: Optional[str], **kwargs: Any
+    ):
+        """Stream through exactly one registered local endpoint and its queue."""
+
+        client, semaphore, endpoint = self._local_endpoint_transport(provider, endpoint_id)
+        async with semaphore:
+            async for chunk in self._stream_openai_compatible(
+                provider_key=provider,
+                client=client,
+                display_name=f"{endpoint.adapter} endpoint '{endpoint.endpoint_id}'",
+                **kwargs,
+            ):
+                yield chunk
 
     @staticmethod
     def _strip_additional_properties(schema: Dict[str, Any]) -> Dict[str, Any]:
@@ -1181,6 +1622,7 @@ class AIService:
         json_output: bool = False,
         extra_text_components: Optional[Sequence[Tuple[str, str, str]]] = None,
         output_fallback_model: Optional[str] = None,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
     ) -> "context_budget.RenderedCallBudget":
         """Build a ``RenderedCallBudget`` from the logical payload of a chat call.
 
@@ -1280,6 +1722,7 @@ class AIService:
         json_output: bool = False,
         extra_text_components: Optional[Sequence[Tuple[str, str, str]]] = None,
         output_fallback_model: Optional[str] = None,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
     ) -> "context_budget.CallAdmissionReport":
         """Admit one provider call against the budget service.
 
@@ -1306,7 +1749,10 @@ class AIService:
             extra_text_components=extra_text_components,
             output_fallback_model=output_fallback_model,
         )
-        report = await self._admit_budget(budget)
+        report = await self._admit_budget(
+            budget,
+            local_execution=local_execution,
+        )
         # Carry the admitted report to the matching usage emit (telemetry only).
         # Scoped to chat-family calls (generate/stream/logprobs/health) which
         # report via ``_emit_usage``; embeddings admit separately and never emit
@@ -1315,13 +1761,19 @@ class AIService:
         return report
 
     async def _admit_budget(
-        self, budget: "context_budget.RenderedCallBudget"
+        self,
+        budget: "context_budget.RenderedCallBudget",
+        *,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
     ) -> "context_budget.CallAdmissionReport":
         """Run ``admit_call`` and make CAPACITY_UNKNOWN enforce errors actionable."""
 
         try:
             report = await context_budget.admit_call(
-                budget, native_counter=self._native_token_count
+                budget,
+                native_counter=(
+                    None if local_execution is not None else self._native_token_count
+                ),
             )
         except context_budget.ContextCapacityUnknown as exc:
             raise context_budget.ContextCapacityUnknown(
@@ -1434,6 +1886,7 @@ class AIService:
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
         extra_texts: Optional[Sequence[Tuple[str, str, str]]] = None,
         image_tokens: int = 0,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
     ) -> bool:
         """Re-check accumulated tool-loop size before a subsequent turn's SDK call.
 
@@ -1499,7 +1952,10 @@ class AIService:
             content_type_hint=content_type_hint,
         )
         report = await context_budget.evaluate_call_admission(
-            budget, native_counter=self._native_token_count
+            budget,
+            native_counter=(
+                None if local_execution is not None else self._native_token_count
+            ),
         )
         decision = report.decision
         mode = context_budget.resolve_admission_mode()
@@ -1707,6 +2163,48 @@ class AIService:
         return merged
 
     @staticmethod
+    def _with_openrouter_provider_options(
+        extra_body: Optional[Dict[str, Any]],
+        provider_options: Optional[Mapping[str, Any]],
+        *,
+        require_parameters: bool = False,
+    ) -> Dict[str, Any]:
+        """Merge validated route options with mandatory OpenRouter safeguards.
+
+        Structured output and tool calls require parameter support regardless of
+        a route's preference.  The result remains an OpenAI-SDK ``extra_body``
+        payload and is subsequently passed through the compression guard.
+        """
+
+        try:
+            route_options = validate_openrouter_provider_options(provider_options)
+        except OpenRouterProviderOptionsError as exc:
+            raise ValueError(f"Invalid OpenRouter provider options: {exc}") from exc
+
+        merged: Dict[str, Any] = dict(extra_body or {})
+        existing_provider = merged.get("provider") or {}
+        if not isinstance(existing_provider, Mapping):
+            raise ValueError("OpenRouter extra_body.provider must be an object.")
+        try:
+            provider_payload = validate_openrouter_provider_options(existing_provider)
+        except OpenRouterProviderOptionsError as exc:
+            raise ValueError(f"Invalid OpenRouter provider options: {exc}") from exc
+        provider_payload.update(route_options)
+        if require_parameters:
+            provider_payload["require_parameters"] = True
+        if provider_payload:
+            merged["provider"] = provider_payload
+        return merged
+
+    def _openrouter_client_for_attempt(self, strict_single_generation_attempt: bool) -> Any:
+        """Return a request-scoped OpenRouter client with no SDK retries when strict."""
+        if not self.openrouter_client:
+            raise ValueError("OpenRouter client not initialized")
+        if strict_single_generation_attempt:
+            return self.openrouter_client.with_options(max_retries=0)
+        return self.openrouter_client
+
+    @staticmethod
     def _tool_loop_overflow_details(
         report: "context_budget.CallAdmissionReport",
         kind: str,
@@ -1728,9 +2226,17 @@ class AIService:
         }
 
     @staticmethod
-    async def _record_provider_health_success(provider: str, model_id: str, operation: str) -> None:
+    async def _record_provider_health_success(
+        provider: str, model_id: str, operation: str, endpoint_id: Optional[str] = None
+    ) -> None:
         try:
-            await record_provider_success(provider, model=model_id, operation=operation)
+            success_kwargs: Dict[str, Any] = {
+                "model": model_id,
+                "operation": operation,
+            }
+            if endpoint_id is not None:
+                success_kwargs["endpoint_id"] = endpoint_id
+            await record_provider_success(provider, **success_kwargs)
         except Exception:
             logger.exception("Provider health success recording failed for %s/%s", provider, model_id)
 
@@ -1742,6 +2248,29 @@ class AIService:
             await record_provider_failure(failure)
         except Exception:
             logger.exception("Provider health failure recording failed for %s/%s", failure.provider, failure.model_id)
+
+    @staticmethod
+    def _failure_with_endpoint(
+        failure: ProviderFailure | None, endpoint_id: Optional[str]
+    ) -> ProviderFailure | None:
+        if failure is None or not endpoint_id or failure.endpoint_id == endpoint_id:
+            return failure
+        return replace(failure, endpoint_id=endpoint_id)
+
+    @staticmethod
+    def _effective_health_endpoint_id(
+        endpoint_id: Optional[str],
+        local_execution: Optional["LocalExecutionRuntime"],
+        dispatch_call_id: Optional[str],
+        dispatch_route_ordinal: int,
+    ) -> Optional[str]:
+        if endpoint_id:
+            return endpoint_id
+        if local_execution is not None and dispatch_call_id:
+            return local_execution.manifest.route_for(
+                dispatch_call_id, dispatch_route_ordinal
+            ).endpoint_id
+        return None
 
     @staticmethod
     def _attempted_output_feature(
@@ -1832,8 +2361,10 @@ class AIService:
         attempted_feature: Optional[str] = None,
         cancellation_token: Optional["CancellationToken"] = None,
         request_timeout: Optional[float] = None,
+        strict_single_generation_attempt: bool = False,
+        endpoint_id: Optional[str] = None,
     ) -> T:
-        max_attempts = self._max_retry_attempts()
+        max_attempts = 1 if strict_single_generation_attempt else self._max_retry_attempts()
         last_exception: Optional[Exception] = None
         process_timeout = coerce_timeout_seconds(request_timeout)
         process_deadline = (
@@ -1878,12 +2409,14 @@ class AIService:
                         raise
                 else:
                     result = await operation()
-                await self._record_provider_health_success(provider, model_id, action)
+                await self._record_provider_health_success(provider, model_id, action, endpoint_id)
                 return result
             except asyncio.CancelledError:
                 raise
             except AIRequestError as exc:
-                await self._record_provider_health_failure(getattr(exc, "provider_failure", None))
+                failure = self._failure_with_endpoint(getattr(exc, "provider_failure", None), endpoint_id)
+                exc.provider_failure = failure
+                await self._record_provider_health_failure(failure)
                 raise
             except AccentGuardError:
                 raise
@@ -1894,6 +2427,9 @@ class AIService:
                 raise
             except ContextAdmissionError:
                 # Local admission guard verdict — non-retryable, never wrapped.
+                raise
+            except LocalExecutionPolicyError:
+                # Transport authorization is terminal and must never retry or wrap.
                 raise
             except ToolLoopOutputTruncated:
                 # Deterministic provider stop at output limit; retrying the
@@ -1916,6 +2452,7 @@ class AIService:
                     max_attempts=max_attempts,
                     attempted_feature=attempted_feature,
                 )
+                failure = self._failure_with_endpoint(failure, endpoint_id)
                 await self._record_provider_health_failure(failure)
                 if failure.kind is ProviderErrorKind.CONTEXT_OVERFLOW:
                     # Provider reported a context overflow despite the local guard:
@@ -1981,6 +2518,7 @@ class AIService:
             max_attempts=max_attempts,
             attempted_feature=attempted_feature,
         )
+        failure = self._failure_with_endpoint(failure, endpoint_id)
         await self._record_provider_health_failure(failure)
         raise AIRequestError(
             provider,
@@ -2001,6 +2539,7 @@ class AIService:
         attempted_feature: Optional[str] = None,
         cancellation_token: Optional["CancellationToken"] = None,
         request_timeout: Optional[float] = None,
+        endpoint_id: Optional[str] = None,
     ) -> T:
         """Run one provider attempt and normalize transient provider failures."""
 
@@ -2011,12 +2550,14 @@ class AIService:
                 result = await asyncio.wait_for(operation(), timeout=process_timeout)
             else:
                 result = await operation()
-            await self._record_provider_health_success(provider, model_id, action)
+            await self._record_provider_health_success(provider, model_id, action, endpoint_id)
             return result
         except asyncio.CancelledError:
             raise
         except AIRequestError as exc:
-            await self._record_provider_health_failure(getattr(exc, "provider_failure", None))
+            failure = self._failure_with_endpoint(getattr(exc, "provider_failure", None), endpoint_id)
+            exc.provider_failure = failure
+            await self._record_provider_health_failure(failure)
             raise
         except AccentGuardError:
             raise
@@ -2026,6 +2567,9 @@ class AIService:
             raise
         except ContextAdmissionError:
             # Local admission guard verdict — non-retryable, never wrapped.
+            raise
+        except LocalExecutionPolicyError:
+            # Transport authorization is terminal and must never retry or wrap.
             raise
         except ToolLoopOutputTruncated:
             raise
@@ -2045,6 +2589,7 @@ class AIService:
                 max_attempts=1,
                 attempted_feature=attempted_feature,
             )
+            failure = self._failure_with_endpoint(failure, endpoint_id)
             await self._record_provider_health_failure(failure)
             if failure.kind is ProviderErrorKind.CONTEXT_OVERFLOW:
                 # Provider reported a context overflow despite the local guard:
@@ -2404,6 +2949,12 @@ class AIService:
         llm_routing: Optional[Mapping[str, Any]] = None,
         request_timeout: Optional[float] = None,
         cancellation_token: Optional["CancellationToken"] = None,
+        provider_options: Optional[Mapping[str, Any]] = None,
+        strict_single_generation_attempt: bool = False,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
+        dispatch_call_id: Optional[str] = None,
+        dispatch_route_ordinal: int = 0,
+        endpoint_id: Optional[str] = None,
     ) -> str:
         """
         Generate content using specified AI model
@@ -2423,15 +2974,24 @@ class AIService:
         Returns:
             Generated content as string
         """
+        catalog_model, _effective_endpoint_id, local_endpoint = (
+            self._resolve_endpoint_scoped_catalog_model(
+                model,
+                endpoint_id=endpoint_id,
+                local_execution=local_execution,
+                dispatch_call_id=dispatch_call_id,
+                dispatch_route_ordinal=dispatch_route_ordinal,
+            )
+        )
         max_tokens, _token_budget_resolution = self._resolve_effective_output_max_tokens(
-            model,
+            catalog_model,
             max_tokens,
             call_id="ai_service.generate_content",
         )
 
         # Intelligent validation and adjustment of all token parameters
         token_validation = config.validate_token_limits(
-            model, max_tokens, reasoning_effort, thinking_budget_tokens
+            catalog_model, max_tokens, reasoning_effort, thinking_budget_tokens
         )
         adjusted_max_tokens = token_validation["adjusted_tokens"]
         adjusted_reasoning_effort = token_validation["adjusted_reasoning_effort"]
@@ -2481,6 +3041,15 @@ class AIService:
         model_info = token_validation["model_info"]
         provider = model_info["provider"]
         model_id = model_info["model_id"]
+        await self._verify_normal_local_endpoint_availability(
+            local_endpoint,
+            provider=provider,
+            model_id=model_id,
+            local_execution=local_execution,
+        )
+        self._assert_images_supported(model_info, model_id, images)
+        if provider_options and provider != "openrouter":
+            raise ValueError("provider_options are supported only for OpenRouter models.")
         extra_payload = {"requested_model": model}
         if usage_extra:
             extra_payload.update(usage_extra)
@@ -2596,6 +3165,19 @@ class AIService:
         system_prompt = system_prompt + language_instruction + date_instruction
 
         async def _single_attempt() -> str:
+            authorized_route = self._authorize_local_execution(
+                local_execution,
+                dispatch_call_id=dispatch_call_id,
+                dispatch_route_ordinal=dispatch_route_ordinal,
+                provider=provider,
+                model_id=model_id,
+                endpoint_id=endpoint_id,
+            )
+            effective_endpoint_id = (
+                authorized_route.endpoint_id if authorized_route is not None else endpoint_id
+            )
+            if effective_endpoint_id:
+                extra_payload["endpoint_id"] = effective_endpoint_id
             # Universal context guard BEFORE provider dispatch — every retry
             # revalidates the logical payload against the receptor's budget.
             await self._admit_chat_call(
@@ -2609,6 +3191,7 @@ class AIService:
                 images=images,
                 json_schema=effective_json_schema,
                 json_output=json_output,
+                local_execution=local_execution,
             )
 
             # Log vision request if images provided
@@ -2770,6 +3353,8 @@ class AIService:
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     images=images,
+                    provider_options=provider_options,
+                    strict_single_generation_attempt=strict_single_generation_attempt,
                 )
 
                 # Log full response if extra_verbose is enabled
@@ -2859,16 +3444,54 @@ class AIService:
 
                 _emit_generation_usage(usage_meta)
                 return content
-            elif provider == "ollama":
-                content, usage_meta = await self._generate_ollama(
-                    prompt,
-                    model_id,
-                    temperature,
-                    adjusted_max_tokens,
-                    system_prompt or "",
+            elif provider == "llamacpp":
+                content, usage_meta = await self._generate_registered_local(
+                    provider,
+                    effective_endpoint_id,
+                    prompt=prompt,
+                    model_id=model_id,
+                    temperature=temperature,
+                    max_tokens=adjusted_max_tokens,
+                    system_prompt=system_prompt or "",
                     request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
+                    reasoning_effort=reasoning_effort,
+                )
+
+                if phase_logger:
+                    phase_logger.log_response(
+                        model=model_id,
+                        response=content,
+                        metadata={
+                            "input_tokens": usage_meta.get("input_tokens"),
+                            "output_tokens": usage_meta.get("output_tokens"),
+                            "provider": provider,
+                        },
+                    )
+                elif extra_verbose:
+                    separator = "=" * 80
+                    logger.info(f"\n{separator}")
+                    logger.info(f"[EXTRA_VERBOSE] AI GENERATION RESPONSE from {model_id}")
+                    logger.info(f"{separator}")
+                    logger.info(content)
+                    logger.info(f"{separator}\n")
+
+                _emit_generation_usage(usage_meta)
+                return content
+            elif provider in {"ollama", "openai_compatible"}:
+                content, usage_meta = await self._generate_registered_local(
+                    provider,
+                    effective_endpoint_id,
+                    prompt=prompt,
+                    model_id=model_id,
+                    temperature=temperature,
+                    max_tokens=adjusted_max_tokens,
+                    system_prompt=system_prompt or "",
+                    request_timeout=request_timeout,
+                    json_output=json_output,
+                    json_schema=effective_json_schema,
+                    reasoning_effort=reasoning_effort,
                 )
 
                 # Log full response if extra_verbose is enabled
@@ -2943,6 +3566,10 @@ class AIService:
                     attempted_feature=attempted_feature,
                     cancellation_token=cancellation_token,
                     request_timeout=request_timeout,
+                    strict_single_generation_attempt=strict_single_generation_attempt,
+                    endpoint_id=self._effective_health_endpoint_id(
+                        endpoint_id, local_execution, dispatch_call_id, dispatch_route_ordinal
+                    ),
                 )
                 self._raise_if_generation_stopped_unusably(
                     generated_content,
@@ -2988,6 +3615,23 @@ class AIService:
         except Exception as e:
             logger.error(f"Content generation failed for {model}: {str(e)}")
             raise
+
+    @staticmethod
+    def _assert_images_supported(
+        model_info: Mapping[str, Any],
+        model_id: str,
+        images: Optional[List["ImageData"]],
+    ) -> None:
+        """Reject image input before dispatch when the resolved model is text-only."""
+        if not images:
+            return
+        capabilities = model_info.get("capabilities") or []
+        if "vision" not in {
+            str(capability).lower() for capability in capabilities if isinstance(capability, str)
+        }:
+            raise ValueError(
+                f"Model {model_id} does not support vision input; remove images or choose a vision model."
+            )
 
     @staticmethod
     def _normalize_tool_loop_provider(provider: str) -> str:
@@ -3654,6 +4298,14 @@ class AIService:
 
         adjusted_effort = self._coerce_retry_reasoning_effort(current_effort, supported_levels)
         if adjusted_effort and adjusted_effort != current_effort:
+            current_level = config.normalize_reasoning_effort_label(current_effort)
+            adjusted_level = config.normalize_reasoning_effort_label(adjusted_effort)
+            if (current_level == "none") != (adjusted_level == "none"):
+                # ``none`` is a qualitative boundary, not merely an adjacent
+                # compatibility label. Crossing it would silently discard an
+                # explicit reasoning policy (or unexpectedly enable reasoning),
+                # so preserve the provider rejection and fail closed instead.
+                return None
             if surface == "chat_completions":
                 retry_params["reasoning_effort"] = adjusted_effort
             elif surface == "responses":
@@ -3661,6 +4313,12 @@ class AIService:
             else:
                 retry_params.setdefault("output_config", {})["effort"] = adjusted_effort
             return retry_params, f"{parameter_path}: {current_effort} -> {adjusted_effort}"
+
+        if config.normalize_reasoning_effort_label(current_effort) != "none":
+            # Removing a non-zero effort is equivalent to an unbounded quality
+            # downgrade. A caller that requested reasoning must see the original
+            # capability error rather than receive a lower-policy completion.
+            return None
 
         if surface == "chat_completions":
             retry_params.pop("reasoning_effort", None)
@@ -3777,6 +4435,9 @@ class AIService:
         on_error: Literal["fail_closed", "fail_open"],
         llm_routing: Optional[Mapping[str, Any]] = None,
         cancellation_token: Optional["CancellationToken"] = None,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
+        dispatch_call_id: Optional[str] = None,
+        dispatch_route_ordinal: int = 0,
     ) -> Dict[str, Any]:
         """Call the configured accent-judge model and return a normalized audit payload (Sec 5.4).
 
@@ -3846,7 +4507,12 @@ class AIService:
                 system_prompt=system_prompt,
                 json_output=True,
                 json_schema=accent_schema if use_structured else None,
+                provider_options=getattr(audit_route, "provider_options", None),
                 cancellation_token=cancellation_token,
+                local_execution=local_execution,
+                dispatch_call_id=dispatch_call_id or "accent.audit",
+                dispatch_route_ordinal=dispatch_route_ordinal,
+                endpoint_id=getattr(audit_route, "endpoint_id", None),
             )
 
         try:
@@ -3861,6 +4527,10 @@ class AIService:
                 details={"elapsed_seconds": float(timeout_seconds)},
             ) from exc
         except AccentGuardError:
+            raise
+        except LocalExecutionPolicyError:
+            # The local-only transport verdict is terminal, including for the
+            # auxiliary accent route; never turn it into a fail-open audit error.
             raise
         except ContextAdmissionError:
             # A context-admission verdict (local budget or provider-reported) is
@@ -3975,18 +4645,29 @@ class AIService:
         )
         return True
 
-    def _get_openai_compatible_tool_client(self, provider: str):
+    def _get_openai_compatible_tool_client(
+        self,
+        provider: str,
+        *,
+        strict_single_generation_attempt: bool = False,
+        endpoint_id: Optional[str] = None,
+    ):
         """Return the OpenAI-compatible client for the requested provider."""
         provider_key = self._normalize_tool_loop_provider(provider)
         if provider_key == "openai":
             client = self.openai_client
             label = "OpenAI"
         elif provider_key == "openrouter":
-            client = self.openrouter_client
+            client = self._openrouter_client_for_attempt(
+                strict_single_generation_attempt
+            )
             label = "OpenRouter"
         elif provider_key == "xai":
             client = self.xai_client
             label = "xAI"
+        elif provider_key in {"ollama", "llamacpp", "openai_compatible"}:
+            client, _semaphore, endpoint = self._local_endpoint_transport(provider_key, endpoint_id)
+            label = f"local endpoint '{endpoint.endpoint_id}'"
         else:
             raise ValueError(f"Provider {provider} is not OpenAI-compatible for tool-loop generation.")
 
@@ -4006,6 +4687,7 @@ class AIService:
         json_schema: Optional[Dict[str, Any]],
         tools_enabled: bool,
         tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        provider_options: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build chat completion params for providers with OpenAI-style tool calling.
 
@@ -4079,11 +4761,14 @@ class AIService:
                 create_params["parallel_tool_calls"] = False
 
         if provider_key == "openrouter":
-            if any(
-                key in create_params
-                for key in ("response_format", "tools", "tool_choice", "parallel_tool_calls")
-            ):
-                create_params["extra_body"] = {"provider": {"require_parameters": True}}
+            create_params["extra_body"] = self._with_openrouter_provider_options(
+                create_params.get("extra_body"),
+                provider_options,
+                require_parameters=any(
+                    key in create_params
+                    for key in ("response_format", "tools", "tool_choice", "parallel_tool_calls")
+                ),
+            )
             # Disable provider context compression on every OpenRouter tool turn (D15).
             create_params["extra_body"] = self._with_openrouter_compression_disabled(
                 create_params.get("extra_body")
@@ -4303,6 +4988,14 @@ class AIService:
                 )
                 continue
 
+            if role == "assistant" and message.get("responses_output_items"):
+                # GPT-5.6 defaults to persisted reasoning across turns. When
+                # history is managed manually, every prior Responses output
+                # item (including opaque/encrypted reasoning) must be replayed
+                # alongside the function output.
+                input_items.extend(copy.deepcopy(message["responses_output_items"]))
+                continue
+
             if role == "assistant" and message.get("tool_calls"):
                 assistant_text = content_value if isinstance(content_value, str) else ""
                 if assistant_text:
@@ -4397,10 +5090,18 @@ class AIService:
 
     @staticmethod
     def _openai_responses_tool_streaming_supported(model_id: str) -> bool:
-        """Return False for Responses models known to reject streaming."""
+        """Return False for Responses tool-loop transports quarantined from SSE."""
 
         model_lower = (model_id or "").lower()
-        return "o3-pro" not in model_lower and "gpt-5-pro" not in model_lower
+        is_gpt56_sol = (
+            model_lower == "gpt-5.6-sol"
+            or model_lower.startswith("gpt-5.6-sol-")
+        )
+        return (
+            not is_gpt56_sol
+            and "o3-pro" not in model_lower
+            and "gpt-5-pro" not in model_lower
+        )
 
     @staticmethod
     def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
@@ -4421,6 +5122,39 @@ class AIService:
             return list(data.get("output") or [])
         return []
 
+    @staticmethod
+    def _serialize_openai_responses_replay_item(item: Any) -> Optional[Dict[str, Any]]:
+        """Serialize one Responses output item for exact stateless replay."""
+
+        if isinstance(item, dict):
+            return copy.deepcopy(item)
+        model_dump = getattr(item, "model_dump", None)
+        if callable(model_dump):
+            try:
+                serialized = model_dump(exclude_none=True)
+            except TypeError:
+                serialized = model_dump()
+            if isinstance(serialized, dict):
+                return serialized
+        if isinstance(item, SimpleNamespace):
+            return {
+                key: copy.deepcopy(value)
+                for key, value in vars(item).items()
+                if value is not None
+            }
+        return None
+
+    @classmethod
+    def _openai_responses_replay_items(cls, response: Any) -> List[Dict[str, Any]]:
+        """Return every provider output item in an SDK-input-compatible shape."""
+
+        replay_items: List[Dict[str, Any]] = []
+        for item in cls._openai_responses_output_items(response):
+            serialized = cls._serialize_openai_responses_replay_item(item)
+            if serialized:
+                replay_items.append(serialized)
+        return replay_items
+
     @classmethod
     def _extract_openai_responses_text(cls, response: Any) -> str:
         output_text = cls._obj_get(response, "output_text", None)
@@ -4436,6 +5170,22 @@ class AIService:
                 if text_value:
                     pieces.append(str(text_value))
         return "".join(pieces)
+
+    @classmethod
+    def _extract_openai_responses_refusal(cls, response: Any) -> str:
+        """Return refusal text without treating it as assistant candidate text."""
+
+        pieces: List[str] = []
+        for item in cls._openai_responses_output_items(response):
+            if cls._obj_get(item, "type") != "message":
+                continue
+            for part in cls._obj_get(item, "content", []) or []:
+                if cls._obj_get(part, "type") != "refusal":
+                    continue
+                refusal_value = cls._obj_get(part, "refusal", None)
+                if refusal_value:
+                    pieces.append(str(refusal_value))
+        return "\n".join(pieces)
 
     @classmethod
     def _extract_openai_responses_function_calls(cls, response: Any) -> List[Any]:
@@ -4457,6 +5207,22 @@ class AIService:
                 )
             )
         return tool_calls
+
+    @classmethod
+    def _openai_responses_error_fields(
+        cls,
+        error_obj: Any,
+    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """Return stable ``code``, ``message`` and ``param`` values from an error."""
+
+        if error_obj is None:
+            return None, None, None
+        code = _stringify_finish_reason(cls._obj_get(error_obj, "code", None))
+        message_value = cls._obj_get(error_obj, "message", None)
+        param_value = cls._obj_get(error_obj, "param", None)
+        message = str(message_value)[:500] if message_value else None
+        param = str(param_value)[:200] if param_value else None
+        return code, message, param
 
     @staticmethod
     def _openai_tool_response_id(call: Any) -> str:
@@ -4904,6 +5670,50 @@ class AIService:
                 f"(status={finish_reason}, detail={detail or 'n/a'})"
             )
 
+        refusal_text = self._extract_openai_responses_refusal(response).strip()
+        if refusal_text:
+            response_id = self._obj_get(response, "id", None)
+            refusal_preview = _truncate_to_bytes(refusal_text, 500)
+            normalized_usage = self._normalize_usage(usage_meta) or {}
+            normalized_usage.update(
+                {
+                    "provider_stop_reason": "refusal",
+                    "finish_reason_category": "content_filter",
+                    "response_id": str(response_id) if response_id else None,
+                    "refusal_chars": len(refusal_text),
+                }
+            )
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_loop_provider_terminal",
+                {
+                    "provider": "openai",
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "responses",
+                    "streaming": False,
+                    "status": "refusal",
+                    "error_code": "content_filter",
+                    "finish_reason": "refusal",
+                    "finish_reason_category": "content_filter",
+                    "response_id": str(response_id) if response_id else None,
+                    "refusal_chars": len(refusal_text),
+                    "detail": refusal_preview,
+                },
+            )
+            raise GenerationStoppedUnexpectedly(
+                "OpenAI Responses returned a refusal instead of a usable "
+                f"tool-loop turn (response_id={response_id or 'n/a'}, "
+                f"refusal={refusal_preview!r})",
+                provider="openai",
+                model_id=model_id,
+                finish_reason="refusal",
+                finish_reason_category="content_filter",
+                partial_content="",
+                usage=normalized_usage,
+            )
+
         assistant_text = self._extract_openai_responses_text(response)
         tool_calls = self._extract_openai_responses_function_calls(response)
 
@@ -4955,7 +5765,11 @@ class AIService:
         )
 
         return (
-            SimpleNamespace(content=assistant_text, tool_calls=tool_calls),
+            SimpleNamespace(
+                content=assistant_text,
+                tool_calls=tool_calls,
+                responses_output_items=self._openai_responses_replay_items(response),
+            ),
             usage_meta,
             finish_reason,
         )
@@ -5003,20 +5817,86 @@ class AIService:
         terminal_error_status: Optional[str] = None
         terminal_error_detail: Optional[str] = None
         terminal_error_reason: Optional[str] = None
+        terminal_error_code: Optional[str] = None
+        terminal_error_param: Optional[str] = None
         response_completed = False
+        stream_response_id: Optional[str] = None
+        stream_event_count = 0
+        last_event_type: Optional[str] = None
+        refusal_parts: List[str] = []
+        terminal_refusal_text = ""
+        terminal_replay_items: List[Dict[str, Any]] = []
+        replay_items_by_index: Dict[int, Dict[str, Any]] = {}
 
         async for event in stream:
             await self._raise_if_cancelled(cancellation_token)
             event_type = getattr(event, "type", "")
+            stream_event_count += 1
+            last_event_type = str(event_type or "unknown")
 
             response_obj = getattr(event, "response", None)
             if response_obj is not None:
+                response_id_value = self._obj_get(response_obj, "id", None)
+                if response_id_value:
+                    stream_response_id = str(response_id_value)
                 usage_value = getattr(response_obj, "usage", None)
                 if usage_value is not None:
                     usage_meta = usage_value
                 status_value = getattr(response_obj, "status", None)
                 if status_value:
                     finish_reason = _stringify_finish_reason(status_value)
+                response_replay_items = self._openai_responses_replay_items(response_obj)
+                if response_replay_items:
+                    terminal_replay_items = response_replay_items
+                response_refusal = self._extract_openai_responses_refusal(
+                    response_obj
+                )
+                if response_refusal:
+                    terminal_refusal_text = response_refusal
+
+            if event_type in {"error", "response.error"}:
+                # The OpenAI SDK models an SSE-level provider failure as
+                # ``ResponseErrorEvent(type="error")``. It has no ``response``
+                # object, so ignoring it makes the stream look like a clean EOF
+                # without ``response.completed`` and destroys the real cause.
+                terminal_error_status = "error"
+                (
+                    terminal_error_code,
+                    terminal_error_detail,
+                    terminal_error_param,
+                ) = self._openai_responses_error_fields(event)
+                terminal_error_reason = terminal_error_code or "error"
+                await self._emit_tool_event_safe(
+                    tool_event_callback,
+                    "tool_loop_provider_terminal",
+                    {
+                        "provider": "openai",
+                        "model": model_id,
+                        "turn": turn,
+                        "loop_scope": loop_scope.value,
+                        "api_surface": "responses",
+                        "status": "error",
+                        "error_code": terminal_error_code,
+                        "message": terminal_error_detail,
+                        "param": terminal_error_param,
+                        "response_id": stream_response_id,
+                        "last_event_type": last_event_type,
+                        "event_count": stream_event_count,
+                    },
+                )
+                continue
+
+            if event_type == "response.refusal.delta":
+                refusal_delta = str(getattr(event, "delta", "") or "")
+                if refusal_delta:
+                    refusal_parts.append(refusal_delta)
+                continue
+
+            if event_type == "response.refusal.done":
+                refusal_done = str(getattr(event, "refusal", "") or "")
+                if refusal_done:
+                    terminal_refusal_text = refusal_done
+                continue
 
             if event_type == "response.output_text.delta":
                 text_delta = str(getattr(event, "delta", "") or "")
@@ -5045,8 +5925,13 @@ class AIService:
             if event_type == "response.output_item.added":
                 item = getattr(event, "item", None)
                 item_type = getattr(item, "type", None)
+                output_index = int(
+                    getattr(event, "output_index", len(replay_items_by_index)) or 0
+                )
+                serialized_item = self._serialize_openai_responses_replay_item(item)
+                if serialized_item:
+                    replay_items_by_index[output_index] = serialized_item
                 if item_type == "function_call":
-                    output_index = int(getattr(event, "output_index", len(tool_accumulators)) or 0)
                     tool_accumulators[output_index] = {
                         "id": str(getattr(item, "id", "") or ""),
                         "call_id": str(getattr(item, "call_id", "") or ""),
@@ -5120,8 +6005,13 @@ class AIService:
             if event_type == "response.output_item.done":
                 item = getattr(event, "item", None)
                 item_type = getattr(item, "type", None)
+                output_index = int(
+                    getattr(event, "output_index", len(replay_items_by_index)) or 0
+                )
+                serialized_item = self._serialize_openai_responses_replay_item(item)
+                if serialized_item:
+                    replay_items_by_index[output_index] = serialized_item
                 if item_type == "function_call":
-                    output_index = int(getattr(event, "output_index", len(tool_accumulators)) or 0)
                     acc = tool_accumulators.setdefault(
                         output_index,
                         {
@@ -5151,6 +6041,12 @@ class AIService:
                     terminal_error_status = finish_reason
                     error_obj = getattr(event, "error", None)
                     response_error = getattr(response_obj, "error", None) if response_obj is not None else None
+                    structured_error = error_obj or response_error
+                    (
+                        terminal_error_code,
+                        structured_error_message,
+                        terminal_error_param,
+                    ) = self._openai_responses_error_fields(structured_error)
                     incomplete_details = (
                         getattr(response_obj, "incomplete_details", None)
                         if response_obj is not None
@@ -5161,7 +6057,11 @@ class AIService:
                         if reason_value is None and isinstance(incomplete_details, dict):
                             reason_value = incomplete_details.get("reason")
                         terminal_error_reason = _stringify_finish_reason(reason_value)
-                    terminal_error_detail = str(error_obj or response_error or incomplete_details or "")[:500]
+                    terminal_error_reason = terminal_error_reason or terminal_error_code
+                    terminal_error_detail = (
+                        structured_error_message
+                        or str(structured_error or incomplete_details or "")[:500]
+                    )
                     await self._emit_tool_event_safe(
                         tool_event_callback,
                         "tool_loop_provider_terminal",
@@ -5173,8 +6073,269 @@ class AIService:
                             "api_surface": "responses",
                             "status": finish_reason,
                             "detail": terminal_error_detail,
+                            "error_code": terminal_error_code,
+                            "param": terminal_error_param,
+                            "response_id": stream_response_id,
+                            "last_event_type": last_event_type,
+                            "event_count": stream_event_count,
                         },
                     )
+
+        refusal_text = (terminal_refusal_text or "".join(refusal_parts)).strip()
+        if terminal_error_status is None and refusal_text:
+            refusal_preview = _truncate_to_bytes(refusal_text, 500)
+            normalized_usage = self._normalize_usage(usage_meta) or {}
+            normalized_usage.update(
+                {
+                    "provider_stop_reason": "refusal",
+                    "finish_reason_category": "content_filter",
+                    "response_id": stream_response_id,
+                    "last_event_type": last_event_type,
+                    "stream_event_count": stream_event_count,
+                    "refusal_chars": len(refusal_text),
+                }
+            )
+            await self._emit_tool_event_safe(
+                tool_event_callback,
+                "tool_loop_provider_terminal",
+                {
+                    "provider": "openai",
+                    "model": model_id,
+                    "turn": turn,
+                    "loop_scope": loop_scope.value,
+                    "api_surface": "responses",
+                    "streaming": True,
+                    "status": "refusal",
+                    "error_code": "content_filter",
+                    "finish_reason": "refusal",
+                    "finish_reason_category": "content_filter",
+                    "response_id": stream_response_id,
+                    "last_event_type": last_event_type,
+                    "event_count": stream_event_count,
+                    "refusal_chars": len(refusal_text),
+                    "detail": refusal_preview,
+                },
+            )
+            raise GenerationStoppedUnexpectedly(
+                "OpenAI Responses stream returned a refusal instead of a "
+                f"usable tool-loop turn (response_id={stream_response_id or 'n/a'}, "
+                f"last_event_type={last_event_type or 'n/a'}, "
+                f"event_count={stream_event_count}, refusal={refusal_preview!r})",
+                provider="openai",
+                model_id=model_id,
+                finish_reason="refusal",
+                finish_reason_category="content_filter",
+                partial_content="",
+                usage=normalized_usage,
+            )
+
+        if terminal_error_status is None and not response_completed and stream_response_id:
+            # A clean SSE EOF can happen after the provider accepted and stored
+            # the Response but before the terminal event reached this process.
+            # Reconcile that SAME response exactly once by id. This is a GET,
+            # never a second generation POST, and deliberately does not poll.
+            await self._raise_if_cancelled(cancellation_token)
+            responses_resource = getattr(self.openai_client, "responses", None)
+            retrieve_response = getattr(responses_resource, "retrieve", None)
+            if callable(retrieve_response):
+                retrieve_kwargs: Dict[str, Any] = {"stream": False}
+                if request_kwargs.get("timeout") is not None:
+                    retrieve_kwargs["timeout"] = request_kwargs["timeout"]
+                try:
+                    recovered_response = await retrieve_response(
+                        stream_response_id,
+                        **retrieve_kwargs,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as retrieve_exc:
+                    terminal_error_status = "retrieve_failed"
+                    terminal_error_reason = "retrieve_failed"
+                    terminal_error_detail = (
+                        f"{type(retrieve_exc).__name__}: {retrieve_exc}"
+                    )[:500]
+                    await self._emit_tool_event_safe(
+                        tool_event_callback,
+                        "tool_loop_provider_terminal",
+                        {
+                            "provider": "openai",
+                            "model": model_id,
+                            "turn": turn,
+                            "loop_scope": loop_scope.value,
+                            "api_surface": "responses",
+                            "status": "missing_terminal_retrieve_failed",
+                            "detail": terminal_error_detail,
+                            "response_id": stream_response_id,
+                            "last_event_type": last_event_type,
+                            "event_count": stream_event_count,
+                        },
+                    )
+                else:
+                    recovered_status = _stringify_finish_reason(
+                        self._obj_get(recovered_response, "status", None)
+                    ) or "unknown"
+                    recovered_response_id = self._obj_get(
+                        recovered_response,
+                        "id",
+                        None,
+                    )
+                    if recovered_response_id:
+                        stream_response_id = str(recovered_response_id)
+                    recovered_usage = self._obj_get(recovered_response, "usage", None)
+                    if recovered_usage is not None:
+                        usage_meta = recovered_usage
+
+                    if recovered_status == "completed":
+                        response_completed = True
+                        finish_reason = "completed"
+                        terminal_replay_items = self._openai_responses_replay_items(
+                            recovered_response
+                        )
+                        terminal_refusal_text = (
+                            self._extract_openai_responses_refusal(
+                                recovered_response
+                            )
+                        )
+                        if terminal_refusal_text:
+                            terminal_error_status = "refusal"
+                            terminal_error_reason = "refusal"
+                            terminal_error_code = "content_filter"
+                            terminal_error_detail = _truncate_to_bytes(
+                                terminal_refusal_text,
+                                500,
+                            )
+                        recovered_text = self._extract_openai_responses_text(
+                            recovered_response
+                        )
+                        assistant_parts = [recovered_text] if recovered_text else []
+                        tool_accumulators.clear()
+                        for recovered_index, call in enumerate(
+                            self._extract_openai_responses_function_calls(
+                                recovered_response
+                            )
+                        ):
+                            tool_accumulators[recovered_index] = {
+                                "id": str(getattr(call, "id", "") or ""),
+                                "call_id": str(
+                                    getattr(call, "call_id", "") or ""
+                                ),
+                                "type": "function",
+                                "function": {
+                                    "name": str(
+                                        getattr(call.function, "name", "") or ""
+                                    ),
+                                    "arguments": str(
+                                        getattr(call.function, "arguments", "") or ""
+                                    ),
+                                },
+                            }
+                        await self._emit_tool_event_safe(
+                            tool_event_callback,
+                            (
+                                "tool_loop_provider_terminal"
+                                if terminal_refusal_text
+                                else "tool_loop_stream_reconciled"
+                            ),
+                            {
+                                "provider": "openai",
+                                "model": model_id,
+                                "turn": turn,
+                                "loop_scope": loop_scope.value,
+                                "api_surface": "responses",
+                                "status": (
+                                    "refusal"
+                                    if terminal_refusal_text
+                                    else "completed"
+                                ),
+                                "error_code": (
+                                    "content_filter"
+                                    if terminal_refusal_text
+                                    else None
+                                ),
+                                "finish_reason_category": (
+                                    "content_filter"
+                                    if terminal_refusal_text
+                                    else None
+                                ),
+                                "response_id": stream_response_id,
+                                "last_event_type": last_event_type,
+                                "event_count": stream_event_count,
+                                "assistant_text_chars": len(recovered_text),
+                                "tool_calls": len(tool_accumulators),
+                                "detail": terminal_error_detail,
+                            },
+                        )
+                    else:
+                        terminal_error_status = f"retrieved_{recovered_status}"
+                        recovered_error = self._obj_get(
+                            recovered_response,
+                            "error",
+                            None,
+                        )
+                        (
+                            terminal_error_code,
+                            recovered_error_message,
+                            terminal_error_param,
+                        ) = self._openai_responses_error_fields(recovered_error)
+                        incomplete_details = self._obj_get(
+                            recovered_response,
+                            "incomplete_details",
+                            None,
+                        )
+                        incomplete_reason = self._obj_get(
+                            incomplete_details,
+                            "reason",
+                            None,
+                        )
+                        terminal_error_reason = (
+                            _stringify_finish_reason(incomplete_reason)
+                            or terminal_error_code
+                            or recovered_status
+                        )
+                        terminal_error_detail = (
+                            recovered_error_message
+                            or str(recovered_error or incomplete_details or "")[:500]
+                        )
+                        await self._emit_tool_event_safe(
+                            tool_event_callback,
+                            "tool_loop_provider_terminal",
+                            {
+                                "provider": "openai",
+                                "model": model_id,
+                                "turn": turn,
+                                "loop_scope": loop_scope.value,
+                                "api_surface": "responses",
+                                "status": terminal_error_status,
+                                "detail": terminal_error_detail,
+                                "error_code": terminal_error_code,
+                                "param": terminal_error_param,
+                                "response_id": stream_response_id,
+                                "last_event_type": last_event_type,
+                                "event_count": stream_event_count,
+                            },
+                        )
+            else:
+                terminal_error_status = "retrieve_unavailable"
+                terminal_error_reason = "retrieve_unavailable"
+                terminal_error_detail = (
+                    "OpenAI client has no responses.retrieve surface"
+                )
+                await self._emit_tool_event_safe(
+                    tool_event_callback,
+                    "tool_loop_provider_terminal",
+                    {
+                        "provider": "openai",
+                        "model": model_id,
+                        "turn": turn,
+                        "loop_scope": loop_scope.value,
+                        "api_surface": "responses",
+                        "status": "missing_terminal_retrieve_unavailable",
+                        "detail": terminal_error_detail,
+                        "response_id": stream_response_id,
+                        "last_event_type": last_event_type,
+                        "event_count": stream_event_count,
+                    },
+                )
 
         if terminal_error_status is not None:
             stop_reason = terminal_error_reason or terminal_error_status
@@ -5194,9 +6355,49 @@ class AIService:
                     partial_content_chars=sum(len(part) for part in assistant_parts),
                     partial_tool_calls=len(tool_accumulators),
                 )
-            raise RuntimeError(
+            error_parts = [f"status={terminal_error_status}"]
+            if terminal_error_code:
+                error_parts.append(f"code={terminal_error_code}")
+            if terminal_error_param:
+                error_parts.append(f"param={terminal_error_param}")
+            if stream_response_id:
+                error_parts.append(f"response_id={stream_response_id}")
+            error_parts.append(f"last_event_type={last_event_type or 'n/a'}")
+            error_parts.append(f"event_count={stream_event_count}")
+            error_parts.append(f"detail={terminal_error_detail or 'n/a'}")
+            partial_content = "".join(assistant_parts)
+            normalized_usage = self._normalize_usage(usage_meta) or {}
+            normalized_usage.update(
+                {
+                    "provider_stop_reason": stop_reason,
+                    "response_id": stream_response_id,
+                    "last_event_type": last_event_type,
+                    "stream_event_count": stream_event_count,
+                }
+            )
+            if terminal_error_status == "refusal":
+                normalized_usage.update(
+                    {
+                        "finish_reason_category": "content_filter",
+                        "refusal_chars": len(terminal_refusal_text),
+                    }
+                )
+                partial_content = ""
+            finish_category = (
+                "content_filter"
+                if str(terminal_error_code or "").strip().casefold()
+                == "content_filter"
+                else terminal_error_status
+            )
+            raise GenerationStoppedUnexpectedly(
                 "OpenAI Responses stream ended before a usable turn completed "
-                f"(status={terminal_error_status}, detail={terminal_error_detail or 'n/a'})"
+                f"({', '.join(error_parts)})",
+                provider="openai",
+                model_id=model_id,
+                finish_reason=stop_reason,
+                finish_reason_category=finish_category,
+                partial_content=partial_content,
+                usage=normalized_usage,
             )
 
         if not response_completed:
@@ -5210,9 +6411,37 @@ class AIService:
                     "loop_scope": loop_scope.value,
                     "api_surface": "responses",
                     "status": "missing_terminal_event",
+                    "response_id": stream_response_id,
+                    "last_event_type": last_event_type,
+                    "event_count": stream_event_count,
+                    "partial_content_chars": sum(
+                        len(part) for part in assistant_parts
+                    ),
+                    "partial_tool_calls": len(tool_accumulators),
                 },
             )
-            raise RuntimeError("OpenAI Responses stream ended without response.completed")
+            partial_content = "".join(assistant_parts)
+            normalized_usage = self._normalize_usage(usage_meta) or {}
+            normalized_usage.update(
+                {
+                    "provider_stop_reason": "missing_terminal_event",
+                    "response_id": stream_response_id,
+                    "last_event_type": last_event_type,
+                    "stream_event_count": stream_event_count,
+                }
+            )
+            raise GenerationStoppedUnexpectedly(
+                "OpenAI Responses stream ended without response.completed "
+                f"(response_id={stream_response_id or 'n/a'}, "
+                f"last_event_type={last_event_type or 'n/a'}, "
+                f"event_count={stream_event_count})",
+                provider="openai",
+                model_id=model_id,
+                finish_reason="missing_terminal_event",
+                finish_reason_category="missing",
+                partial_content=partial_content,
+                usage=normalized_usage,
+            )
 
         if _is_unusable_openai_stream_finish(finish_reason):
             await self._emit_tool_event_safe(
@@ -5227,8 +6456,28 @@ class AIService:
                     "status": finish_reason,
                 },
             )
-            raise RuntimeError(
-                f"OpenAI Responses stream ended with unusable finish_reason={finish_reason}"
+            partial_content = "".join(assistant_parts)
+            normalized_usage = self._normalize_usage(usage_meta) or {}
+            normalized_usage.update(
+                {
+                    "provider_stop_reason": finish_reason,
+                    "response_id": stream_response_id,
+                    "last_event_type": last_event_type,
+                    "stream_event_count": stream_event_count,
+                }
+            )
+            raise GenerationStoppedUnexpectedly(
+                "OpenAI Responses stream ended with unusable "
+                f"finish_reason={finish_reason} "
+                f"(response_id={stream_response_id or 'n/a'}, "
+                f"last_event_type={last_event_type or 'n/a'}, "
+                f"event_count={stream_event_count})",
+                provider="openai",
+                model_id=model_id,
+                finish_reason=finish_reason,
+                finish_reason_category="unusable",
+                partial_content=partial_content,
+                usage=normalized_usage,
             )
 
         tool_calls = []
@@ -5260,6 +6509,24 @@ class AIService:
                 },
             )
 
+        if not terminal_replay_items:
+            # Streaming test doubles and older SDK event shapes may omit the
+            # full terminal response. Preserve any completed reasoning/message
+            # items and mechanically finalize function calls from the deltas.
+            for output_index, acc in tool_accumulators.items():
+                function_data = acc.get("function") or {}
+                replay_items_by_index[output_index] = {
+                    "type": "function_call",
+                    "id": acc.get("id") or acc.get("call_id") or "",
+                    "call_id": acc.get("call_id") or acc.get("id") or "",
+                    "name": function_data.get("name") or "",
+                    "arguments": function_data.get("arguments") or "",
+                }
+            terminal_replay_items = [
+                replay_items_by_index[index]
+                for index in sorted(replay_items_by_index)
+            ]
+
         assistant_text = "".join(assistant_parts)
         if assistant_text:
             await self._emit_tool_event_safe(
@@ -5290,7 +6557,11 @@ class AIService:
         )
 
         return (
-            SimpleNamespace(content=assistant_text, tool_calls=tool_calls),
+            SimpleNamespace(
+                content=assistant_text,
+                tool_calls=tool_calls,
+                responses_output_items=terminal_replay_items,
+            ),
             usage_meta,
             finish_reason,
         )
@@ -5329,7 +6600,13 @@ class AIService:
         retries_enabled: bool = True,
         attempted_feature: Optional[str] = None,
         llm_routing: Optional[Mapping[str, Any]] = None,
+        provider_options: Optional[Mapping[str, Any]] = None,
+        strict_single_generation_attempt: bool = False,
         cancellation_token: Optional["CancellationToken"] = None,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
+        dispatch_call_id: Optional[str] = None,
+        dispatch_route_ordinal: int = 0,
+        endpoint_id: Optional[str] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on OpenAI-style chat APIs.
 
@@ -5356,8 +6633,44 @@ class AIService:
                 "OpenAI-compatible tool loop invoked with neither validate_draft nor accent_context."
             )
 
-        client = self._get_openai_compatible_tool_client(provider)
         provider_key = self._normalize_tool_loop_provider(provider)
+        transport_endpoint_id = self._local_endpoint_hint_for_selection(
+            local_execution,
+            dispatch_call_id=dispatch_call_id,
+            dispatch_route_ordinal=dispatch_route_ordinal,
+            provider=provider_key,
+            model_id=model_id,
+            endpoint_id=endpoint_id,
+        )
+        client = self._get_openai_compatible_tool_client(
+            provider,
+            strict_single_generation_attempt=strict_single_generation_attempt,
+            endpoint_id=transport_endpoint_id,
+        )
+        local_tool_semaphore = None
+        if provider_key in {"ollama", "llamacpp", "openai_compatible"}:
+            _client, local_tool_semaphore, _endpoint = self._local_endpoint_transport(
+                provider_key, transport_endpoint_id
+            )
+
+        async def _stream_tool_turn(*args: Any, **kwargs: Any) -> Tuple[Any, Any, Optional[str]]:
+            if local_tool_semaphore is None:
+                _authorize_tool_turn()
+                return await self._stream_openai_compatible_tool_turn(*args, **kwargs)
+            async with local_tool_semaphore:
+                _authorize_tool_turn()
+                return await self._stream_openai_compatible_tool_turn(*args, **kwargs)
+
+        def _authorize_tool_turn() -> None:
+            self._authorize_local_execution(
+                local_execution,
+                dispatch_call_id=dispatch_call_id,
+                dispatch_route_ordinal=dispatch_route_ordinal,
+                provider=provider_key,
+                model_id=model_id,
+                endpoint_id=endpoint_id,
+            )
+
         mode_name = f"{provider_key}_tool_loop"
         use_responses_api = provider_key == "openai" and self._is_openai_responses_api_model(model_id)
         use_openrouter_chat_streaming = (
@@ -5386,7 +6699,7 @@ class AIService:
             and self._openai_responses_tool_streaming_supported(model_id)
         )
         use_chat_streaming = (
-            provider_key in {"openai", "xai"}
+            provider_key in {"openai", "xai", "ollama", "llamacpp", "openai_compatible"}
             or use_openrouter_chat_streaming
         ) and not use_responses_api
 
@@ -5532,6 +6845,7 @@ class AIService:
                         max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                         on_error=audit_on_error,
                         llm_routing=llm_routing,
+                        local_execution=local_execution,
                     )
                 except AccentGuardError as acc_exc:
                     if audit_on_error == "fail_open":
@@ -5594,6 +6908,7 @@ class AIService:
                     tool_event_callback=tool_event_callback,
                     extra_texts=revalidation_extra_texts,
                     image_tokens=revalidation_image_tokens,
+                    local_execution=local_execution,
                 )
                 if use_responses_api:
                     create_params = self._build_openai_responses_tool_params(
@@ -5616,9 +6931,11 @@ class AIService:
                         json_output=json_output,
                         json_schema=json_schema,
                         tools_enabled=False,
+                        provider_options=provider_options,
                     )
                 try:
                     if use_responses_api and use_responses_streaming:
+                        _authorize_tool_turn()
                         message, usage_meta, _finish_reason = await self._stream_openai_responses_tool_turn(
                             create_params,
                             request_kwargs,
@@ -5629,6 +6946,7 @@ class AIService:
                             cancellation_token=cancellation_token,
                         )
                     elif use_responses_api:
+                        _authorize_tool_turn()
                         message, usage_meta, _finish_reason = await self._run_openai_responses_tool_turn(
                             create_params,
                             request_kwargs,
@@ -5639,7 +6957,7 @@ class AIService:
                             cancellation_token=cancellation_token,
                         )
                     elif use_chat_streaming:
-                        message, usage_meta, _finish_reason = await self._stream_openai_compatible_tool_turn(
+                        message, usage_meta, _finish_reason = await _stream_tool_turn(
                             client,
                             create_params,
                             request_kwargs,
@@ -5651,6 +6969,7 @@ class AIService:
                             cancellation_token=cancellation_token,
                         )
                     else:
+                        _authorize_tool_turn()
                         response = await self._call_chat_completions_create_with_reasoning_retry(
                             client,
                             create_params,
@@ -5774,6 +7093,7 @@ class AIService:
                         tool_event_callback=tool_event_callback,
                         extra_texts=revalidation_extra_texts,
                         image_tokens=revalidation_image_tokens,
+                        local_execution=local_execution,
                     )
                 if use_responses_api:
                     create_params = self._build_openai_responses_tool_params(
@@ -5798,6 +7118,7 @@ class AIService:
                         json_schema=json_schema,
                         tools_enabled=bool(active_tools),
                         tool_schemas=active_tools if active_tools else None,
+                        provider_options=provider_options,
                     )
                 if extra_verbose:
                     logger.info(
@@ -5809,6 +7130,7 @@ class AIService:
 
                 try:
                     if use_responses_api and use_responses_streaming:
+                        _authorize_tool_turn()
                         message, usage_meta, _finish_reason = await self._stream_openai_responses_tool_turn(
                             create_params,
                             request_kwargs,
@@ -5819,6 +7141,7 @@ class AIService:
                             cancellation_token=cancellation_token,
                         )
                     elif use_responses_api:
+                        _authorize_tool_turn()
                         message, usage_meta, _finish_reason = await self._run_openai_responses_tool_turn(
                             create_params,
                             request_kwargs,
@@ -5829,7 +7152,7 @@ class AIService:
                             cancellation_token=cancellation_token,
                         )
                     elif use_chat_streaming:
-                        message, usage_meta, _finish_reason = await self._stream_openai_compatible_tool_turn(
+                        message, usage_meta, _finish_reason = await _stream_tool_turn(
                             client,
                             create_params,
                             request_kwargs,
@@ -5841,6 +7164,7 @@ class AIService:
                             cancellation_token=cancellation_token,
                         )
                     else:
+                        _authorize_tool_turn()
                         response = await self._call_chat_completions_create_with_reasoning_retry(
                             client,
                             create_params,
@@ -5957,19 +7281,28 @@ class AIService:
                             return forced_result
                         raise ValueError("Tool loop exhausted without producing a validated draft")
 
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": assistant_text,
-                            "tool_calls": [
-                                self._serialize_openai_tool_call_for_messages(
-                                    call,
-                                    responses_api=use_responses_api,
-                                )
-                                for call in tool_calls
-                            ],
-                        }
-                    )
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": assistant_text,
+                        "tool_calls": [
+                            self._serialize_openai_tool_call_for_messages(
+                                call,
+                                responses_api=use_responses_api,
+                            )
+                            for call in tool_calls
+                        ],
+                    }
+                    if use_responses_api:
+                        response_output_items = getattr(
+                            message,
+                            "responses_output_items",
+                            None,
+                        )
+                        if response_output_items:
+                            assistant_message["responses_output_items"] = copy.deepcopy(
+                                response_output_items
+                            )
+                    messages.append(assistant_message)
 
                     candidate_validated_draft: Optional[str] = None
                     turn_accent_rejected_text: Optional[str] = None
@@ -5993,6 +7326,7 @@ class AIService:
                                     max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                                     on_error=audit_on_error,
                                     llm_routing=llm_routing,
+                                    local_execution=local_execution,
                                 )
                             except AccentGuardError as acc_exc:
                                 if audit_on_error == "fail_closed":
@@ -6325,7 +7659,7 @@ class AIService:
             model_id=model_id,
             operation="tool_loop_generation",
         ):
-            if retries_enabled:
+            if retries_enabled and not strict_single_generation_attempt:
                 return await self._execute_with_retries(
                     _single_attempt,
                     provider=provider_key,
@@ -6334,6 +7668,7 @@ class AIService:
                     attempted_feature=attempted_feature,
                     cancellation_token=cancellation_token,
                     request_timeout=request_timeout,
+                    endpoint_id=transport_endpoint_id,
                 )
             return await self._execute_without_retries(
                 _single_attempt,
@@ -6343,6 +7678,7 @@ class AIService:
                 attempted_feature=attempted_feature,
                 cancellation_token=cancellation_token,
                 request_timeout=request_timeout,
+                endpoint_id=transport_endpoint_id,
             )
 
     async def _stream_claude_tool_turn(
@@ -6807,6 +8143,9 @@ class AIService:
         attempted_feature: Optional[str] = None,
         llm_routing: Optional[Mapping[str, Any]] = None,
         cancellation_token: Optional["CancellationToken"] = None,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
+        dispatch_call_id: Optional[str] = None,
+        dispatch_route_ordinal: int = 0,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on Claude messages API."""
         if not (enable_validate_draft or accent_context is not None):
@@ -6844,6 +8183,13 @@ class AIService:
             tool_schemas: Optional[List[Dict[str, Any]]] = None,
             turn: int = 0,
         ):
+            self._authorize_local_execution(
+                local_execution,
+                dispatch_call_id=dispatch_call_id,
+                dispatch_route_ordinal=dispatch_route_ordinal,
+                provider=provider_key,
+                model_id=model_id,
+            )
             create_params = {
                 "model": model_id,
                 "max_tokens": max_tokens,
@@ -7007,6 +8353,7 @@ class AIService:
                         max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                         on_error=audit_on_error,
                         llm_routing=llm_routing,
+                        local_execution=local_execution,
                     )
                 except AccentGuardError as acc_exc:
                     if audit_on_error == "fail_open":
@@ -7070,6 +8417,7 @@ class AIService:
                     tool_event_callback=tool_event_callback,
                     extra_texts=revalidation_extra_texts,
                     image_tokens=revalidation_image_tokens,
+                    local_execution=local_execution,
                 )
                 try:
                     response = await _create_response(forced_messages, tools_enabled=False, turn=turn)
@@ -7168,6 +8516,7 @@ class AIService:
                         tool_event_callback=tool_event_callback,
                         extra_texts=revalidation_extra_texts,
                         image_tokens=revalidation_image_tokens,
+                        local_execution=local_execution,
                     )
                 try:
                     response = await _create_response(
@@ -7293,6 +8642,7 @@ class AIService:
                                     max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                                     on_error=audit_on_error,
                                     llm_routing=llm_routing,
+                                    local_execution=local_execution,
                                 )
                             except AccentGuardError as acc_exc:
                                 if audit_on_error == "fail_closed":
@@ -7682,6 +9032,9 @@ class AIService:
         attempted_feature: Optional[str] = None,
         llm_routing: Optional[Mapping[str, Any]] = None,
         cancellation_token: Optional["CancellationToken"] = None,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
+        dispatch_call_id: Optional[str] = None,
+        dispatch_route_ordinal: int = 0,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on the new Gemini SDK."""
         if not (enable_validate_draft or accent_context is not None):
@@ -7694,6 +9047,13 @@ class AIService:
         from google.genai import types
 
         async def _generate_with_timeout(**kwargs: Any) -> Any:
+            self._authorize_local_execution(
+                local_execution,
+                dispatch_call_id=dispatch_call_id,
+                dispatch_route_ordinal=dispatch_route_ordinal,
+                provider="gemini",
+                model_id=model_id,
+            )
             call = self.google_new_client.aio.models.generate_content(**kwargs)
             if request_timeout and request_timeout > 0:
                 return await asyncio.wait_for(call, timeout=float(request_timeout))
@@ -7889,6 +9249,7 @@ class AIService:
                         max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                         on_error=audit_on_error,
                         llm_routing=llm_routing,
+                        local_execution=local_execution,
                     )
                 except AccentGuardError as acc_exc:
                     if audit_on_error == "fail_open":
@@ -7956,6 +9317,7 @@ class AIService:
                     tool_event_callback=tool_event_callback,
                     extra_texts=revalidation_extra_texts,
                     image_tokens=revalidation_image_tokens,
+                    local_execution=local_execution,
                 )
                 try:
                     response = await _generate_with_timeout(
@@ -8060,6 +9422,7 @@ class AIService:
                         tool_event_callback=tool_event_callback,
                         extra_texts=revalidation_extra_texts,
                         image_tokens=revalidation_image_tokens,
+                        local_execution=local_execution,
                     )
 
                 include_audit_accent = (
@@ -8185,6 +9548,7 @@ class AIService:
                                     max_tokens=int(config.AI_ACCENT_AUDIT_MAX_TOKENS),
                                     on_error=audit_on_error,
                                     llm_routing=llm_routing,
+                                    local_execution=local_execution,
                                 )
                             except AccentGuardError as acc_exc:
                                 if audit_on_error == "fail_closed":
@@ -8581,8 +9945,14 @@ class AIService:
         min_global_score: Optional[float] = None,
         system_prompt_source: "PromptSource" = "system_generated",
         llm_routing: Optional[Mapping[str, Any]] = None,
+        provider_options: Optional[Mapping[str, Any]] = None,
+        strict_single_generation_attempt: bool = False,
         request_timeout: Optional[float] = None,
         cancellation_token: Optional["CancellationToken"] = None,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
+        dispatch_call_id: Optional[str] = None,
+        dispatch_route_ordinal: int = 0,
+        endpoint_id: Optional[str] = None,
     ) -> Tuple[str, ToolLoopEnvelope]:
         """Reusable entry point for the shared ``validate_draft`` tool loop.
 
@@ -8644,8 +10014,17 @@ class AIService:
         )
 
         await self._raise_if_cancelled(cancellation_token)
+        catalog_model, _effective_endpoint_id, local_endpoint = (
+            self._resolve_endpoint_scoped_catalog_model(
+                model,
+                endpoint_id=endpoint_id,
+                local_execution=local_execution,
+                dispatch_call_id=dispatch_call_id,
+                dispatch_route_ordinal=dispatch_route_ordinal,
+            )
+        )
         max_tokens, _token_budget_resolution = self._resolve_effective_output_max_tokens(
-            model,
+            catalog_model,
             max_tokens,
             call_id="ai_service.call_ai_with_validation_tools",
         )
@@ -8699,7 +10078,7 @@ class AIService:
             )
 
         token_validation = config.validate_token_limits(
-            model, max_tokens, reasoning_effort, thinking_budget_tokens
+            catalog_model, max_tokens, reasoning_effort, thinking_budget_tokens
         )
         adjusted_max_tokens = token_validation["adjusted_tokens"]
         adjusted_reasoning_effort = token_validation["adjusted_reasoning_effort"]
@@ -8709,6 +10088,8 @@ class AIService:
         model_id = model_info["model_id"]
 
         provider_key = self._normalize_tool_loop_provider(provider)
+        if provider_options and provider_key != "openrouter":
+            raise ValueError("provider_options are supported only for OpenRouter models.")
 
         # ----- Centralized provider fallback protection (§3.7) ---------------
         # raising — the caller can then route to a single-shot path.
@@ -8727,6 +10108,13 @@ class AIService:
                 accepted_via="tools_skipped",
             )
             return "", envelope
+
+        await self._verify_normal_local_endpoint_availability(
+            local_endpoint,
+            provider=provider,
+            model_id=model_id,
+            local_execution=local_execution,
+        )
 
         recommended_timeout = token_validation.get("reasoning_timeout_seconds")
         if recommended_timeout and recommended_timeout > 0:
@@ -8860,7 +10248,10 @@ class AIService:
             extra_text_components=entry_extra_components,
         )
         entry_report = await context_budget.evaluate_call_admission(
-            entry_budget, native_counter=self._native_token_count
+            entry_budget,
+            native_counter=(
+                None if local_execution is not None else self._native_token_count
+            ),
         )
         overflow_reason: Optional[str] = None
         overflow_kind: Optional[str] = None
@@ -9019,10 +10410,18 @@ class AIService:
             "attempted_feature": output_plan.attempted_feature or "tools",
             "llm_routing": llm_routing,
             "cancellation_token": cancellation_token,
+            "local_execution": local_execution,
+            "dispatch_call_id": dispatch_call_id,
+            "dispatch_route_ordinal": dispatch_route_ordinal,
         }
+        local_transport_kwargs = (
+            {"endpoint_id": endpoint_id}
+            if provider_key in {"ollama", "llamacpp", "openai_compatible"}
+            else {}
+        )
 
         try:
-            if provider_key in {"openai", "openrouter", "xai"}:
+            if provider_key in {"openai", "openrouter", "xai", "ollama", "llamacpp", "openai_compatible"}:
                 content, metadata = await self._run_openai_compatible_validation_tool_loop(
                     provider=provider_key,
                     model_id=model_id,
@@ -9043,7 +10442,10 @@ class AIService:
                     accent_context=accent_context,
                     enable_validate_draft=enable_validate_draft,
                     accent_audit_timeout=resolved_accent_audit_timeout,
+                    provider_options=provider_options,
+                    strict_single_generation_attempt=strict_single_generation_attempt,
                     **loop_common_kwargs,
+                    **local_transport_kwargs,
                 )
             elif provider_key == "claude":
                 content, metadata = await self._run_claude_validation_tool_loop(
@@ -9837,6 +11239,11 @@ class AIService:
         model_alias_registry: Optional[Any] = None,
         prompt_safety_parts: Optional[List[Any]] = None,
         cancellation_token: Optional["CancellationToken"] = None,
+        provider_options: Optional[Mapping[str, Any]] = None,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
+        dispatch_call_id: Optional[str] = None,
+        dispatch_route_ordinal: int = 0,
+        endpoint_id: Optional[str] = None,
     ) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
         """
         Generate content and return logprobs for the response tokens.
@@ -9867,12 +11274,23 @@ class AIService:
             Exception: If API call fails
         """
         # Validate model supports logprobs
-        model_info = config.get_model_info(model)
+        catalog_model, _effective_endpoint_id, local_endpoint = (
+            self._resolve_endpoint_scoped_catalog_model(
+                model,
+                endpoint_id=endpoint_id,
+                local_execution=local_execution,
+                dispatch_call_id=dispatch_call_id,
+                dispatch_route_ordinal=dispatch_route_ordinal,
+            )
+        )
+        model_info = config.get_model_info(catalog_model)
         if not model_info:
             raise ValueError(f"Unknown model: {model}")
 
         provider = model_info.get("provider", "")
         model_id = model_info.get("model_id", model)
+        if provider_options and provider != "openrouter":
+            raise ValueError("provider_options are supported only for OpenRouter models.")
 
         from model_capability_registry import model_supports
 
@@ -9888,6 +11306,13 @@ class AIService:
                 f"Model {model} (provider: {provider}) does not have verified "
                 "logprobs support."
             )
+
+        await self._verify_normal_local_endpoint_availability(
+            local_endpoint,
+            provider=provider,
+            model_id=model_id,
+            local_execution=local_execution,
+        )
 
         # Clamp top_logprobs to API limits
         # OpenAI: 1-20, xAI: 1-8
@@ -9917,10 +11342,29 @@ class AIService:
             "logprobs": True,
             "top_logprobs": top_logprobs,
         }
+        if provider == "openrouter":
+            create_params["extra_body"] = self._with_openrouter_provider_options(
+                None,
+                provider_options,
+            )
 
         logger.debug(
             f"Generating with logprobs: model={model_id}, provider={provider}, "
             f"top_logprobs={top_logprobs}, max_tokens={max_tokens}"
+        )
+
+        # Authorize before selecting a local client. In local_only the
+        # manifest, not caller input, owns endpoint identity.
+        authorized_route = self._authorize_local_execution(
+            local_execution,
+            dispatch_call_id=dispatch_call_id,
+            dispatch_route_ordinal=dispatch_route_ordinal,
+            provider=provider,
+            model_id=model_id,
+            endpoint_id=endpoint_id,
+        )
+        effective_endpoint_id = (
+            authorized_route.endpoint_id if authorized_route is not None else endpoint_id
         )
 
         # Select appropriate client based on provider
@@ -9936,6 +11380,10 @@ class AIService:
             client = self.openrouter_client
         elif provider == "openai":
             client = self.openai_client
+        elif provider in {"ollama", "llamacpp", "openai_compatible"}:
+            client, local_semaphore, _endpoint = self._local_endpoint_transport(
+                provider, effective_endpoint_id
+            )
         else:
             raise ValueError(
                 f"No logprobs runtime adapter is available for provider {provider!r}."
@@ -9949,6 +11397,7 @@ class AIService:
             system_prompt=system_prompt,
             prompt=prompt,
             reserved_output_tokens=max_tokens,
+            local_execution=local_execution,
         )
         # This path reports usage through the manual callback below, never
         # through ``_emit_usage`` — consume the admission report immediately
@@ -9963,15 +11412,40 @@ class AIService:
                 operation="generate_with_logprobs",
             ):
                 await self._raise_if_cancelled(cancellation_token)
-                response = await client.chat.completions.create(**create_params)
+                if provider in {"ollama", "llamacpp", "openai_compatible"}:
+                    async with local_semaphore:
+                        response = await client.chat.completions.create(**create_params)
+                else:
+                    response = await client.chat.completions.create(**create_params)
                 await self._raise_if_cancelled(cancellation_token)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             if cancellation_token and await cancellation_token.any_cancelled():
                 raise asyncio.CancelledError() from e
+            failure = self._classify_provider_failure(
+                e,
+                provider=provider,
+                model_id=model_id,
+                action="generate_with_logprobs",
+                attempt=1,
+                max_attempts=1,
+            )
+            failure = self._failure_with_endpoint(failure, effective_endpoint_id)
+            await self._record_provider_health_failure(failure)
             logger.error(f"Logprobs API call failed for {model_id} ({provider}): {e}")
-            raise
+            raise AIRequestError(
+                provider,
+                model_id,
+                1,
+                1,
+                e,
+                provider_failure=failure,
+            ) from e
+
+        await self._record_provider_health_success(
+            provider, model_id, "generate_with_logprobs", effective_endpoint_id
+        )
 
         # Extract content
         content = response.choices[0].message.content or ""
@@ -10005,6 +11479,8 @@ class AIService:
             }
             if usage_extra:
                 usage_info.update(usage_extra)
+            if effective_endpoint_id:
+                usage_info["endpoint_id"] = effective_endpoint_id
             try:
                 usage_callback(usage_info)
             except Exception as cb_error:
@@ -10036,6 +11512,12 @@ class AIService:
         llm_routing: Optional[Mapping[str, Any]] = None,
         request_timeout: Optional[float] = None,
         cancellation_token: Optional["CancellationToken"] = None,
+        provider_options: Optional[Mapping[str, Any]] = None,
+        strict_single_generation_attempt: bool = False,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
+        dispatch_call_id: Optional[str] = None,
+        dispatch_route_ordinal: int = 0,
+        endpoint_id: Optional[str] = None,
     ):
         """
         Generate content with streaming support
@@ -10055,15 +11537,24 @@ class AIService:
         Yields:
             Generated content chunks as they are produced
         """
+        catalog_model, _effective_endpoint_id, local_endpoint = (
+            self._resolve_endpoint_scoped_catalog_model(
+                model,
+                endpoint_id=endpoint_id,
+                local_execution=local_execution,
+                dispatch_call_id=dispatch_call_id,
+                dispatch_route_ordinal=dispatch_route_ordinal,
+            )
+        )
         max_tokens, _token_budget_resolution = self._resolve_effective_output_max_tokens(
-            model,
+            catalog_model,
             max_tokens,
             call_id="ai_service.generate_content_stream",
         )
 
         # Intelligent validation and adjustment of all token parameters
         token_validation = config.validate_token_limits(
-            model, max_tokens, reasoning_effort, thinking_budget_tokens
+            catalog_model, max_tokens, reasoning_effort, thinking_budget_tokens
         )
         adjusted_max_tokens = token_validation["adjusted_tokens"]
         adjusted_reasoning_effort = token_validation["adjusted_reasoning_effort"]
@@ -10113,6 +11604,15 @@ class AIService:
         model_info = token_validation["model_info"]
         provider = model_info["provider"]
         model_id = model_info["model_id"]
+        await self._verify_normal_local_endpoint_availability(
+            local_endpoint,
+            provider=provider,
+            model_id=model_id,
+            local_execution=local_execution,
+        )
+        self._assert_images_supported(model_info, model_id, images)
+        if provider_options and provider != "openrouter":
+            raise ValueError("provider_options are supported only for OpenRouter models.")
         extra_payload = {"requested_model": model}
         if usage_extra:
             extra_payload.update(usage_extra)
@@ -10210,7 +11710,24 @@ class AIService:
         date_instruction = f"\n\nCurrent date: {current_date}"
         system_prompt = system_prompt + language_instruction + date_instruction
 
+        stream_health_endpoint_id = self._effective_health_endpoint_id(
+            endpoint_id, local_execution, dispatch_call_id, dispatch_route_ordinal
+        )
+
         async def _dispatch_stream():
+            authorized_route = self._authorize_local_execution(
+                local_execution,
+                dispatch_call_id=dispatch_call_id,
+                dispatch_route_ordinal=dispatch_route_ordinal,
+                provider=provider,
+                model_id=model_id,
+                endpoint_id=endpoint_id,
+            )
+            effective_endpoint_id = (
+                authorized_route.endpoint_id if authorized_route is not None else endpoint_id
+            )
+            if effective_endpoint_id:
+                extra_payload["endpoint_id"] = effective_endpoint_id
             # Log vision request if images provided
             if images:
                 self._log_vision_request(images, provider, model_id)
@@ -10302,6 +11819,8 @@ class AIService:
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                     images=images,
+                    provider_options=provider_options,
+                    strict_single_generation_attempt=strict_single_generation_attempt,
                 ):
                     yield chunk
             elif provider == "minimax":
@@ -10334,16 +11853,53 @@ class AIService:
                     images=images,
                 ):
                     yield chunk
-            elif provider == "ollama":
-                async for chunk in self._stream_ollama(
-                    prompt,
-                    model_id,
-                    temperature,
-                    adjusted_max_tokens,
-                    system_prompt,
+            elif provider == "llamacpp":
+                async for chunk in self._stream_registered_local(
+                    provider,
+                    effective_endpoint_id,
+                    prompt=prompt,
+                    model_id=model_id,
+                    temperature=temperature,
+                    max_tokens=adjusted_max_tokens,
+                    system_prompt=system_prompt,
                     request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
+                    reasoning_effort=reasoning_effort,
+                    usage_callback=usage_callback,
+                    usage_extra=extra_payload,
+                ):
+                    yield chunk
+            elif provider == "ollama":
+                async for chunk in self._stream_registered_local(
+                    provider,
+                    effective_endpoint_id,
+                    prompt=prompt,
+                    model_id=model_id,
+                    temperature=temperature,
+                    max_tokens=adjusted_max_tokens,
+                    system_prompt=system_prompt,
+                    request_timeout=request_timeout,
+                    json_output=json_output,
+                    json_schema=effective_json_schema,
+                    reasoning_effort=reasoning_effort,
+                    usage_callback=usage_callback,
+                    usage_extra=extra_payload,
+                ):
+                    yield chunk
+            elif provider == "openai_compatible":
+                async for chunk in self._stream_registered_local(
+                    provider,
+                    effective_endpoint_id,
+                    prompt=prompt,
+                    model_id=model_id,
+                    temperature=temperature,
+                    max_tokens=adjusted_max_tokens,
+                    system_prompt=system_prompt,
+                    request_timeout=request_timeout,
+                    json_output=json_output,
+                    json_schema=effective_json_schema,
+                    reasoning_effort=reasoning_effort,
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                 ):
@@ -10365,7 +11921,7 @@ class AIService:
             else:
                 raise ValueError(f"Unsupported provider: {provider}")
 
-        max_attempts = self._max_retry_attempts()
+        max_attempts = 1 if strict_single_generation_attempt else self._max_retry_attempts()
         last_exception: Optional[Exception] = None
         attempt = 1
         stream_deadline = (
@@ -10400,6 +11956,7 @@ class AIService:
                 images=images,
                 json_schema=effective_json_schema,
                 json_output=json_output,
+                local_execution=local_execution,
             )
             remaining_stream_timeout = (
                 stream_deadline - asyncio.get_running_loop().time()
@@ -10419,6 +11976,7 @@ class AIService:
                     attempt=attempt,
                     max_attempts=max_attempts,
                 )
+                failure = self._failure_with_endpoint(failure, stream_health_endpoint_id)
                 await self._record_provider_health_failure(failure)
                 raise AIRequestError(
                     provider,
@@ -10452,17 +12010,26 @@ class AIService:
                             if await _stream_cancel_requested():
                                 return
                             yield chunk
-                await self._record_provider_health_success(provider, model_id, "streaming")
+                await self._record_provider_health_success(
+                    provider, model_id, "streaming", stream_health_endpoint_id
+                )
                 return
             except asyncio.CancelledError:
                 raise
             except AIRequestError as exc:
-                await self._record_provider_health_failure(getattr(exc, "provider_failure", None))
+                failure = self._failure_with_endpoint(
+                    getattr(exc, "provider_failure", None), stream_health_endpoint_id
+                )
+                exc.provider_failure = failure
+                await self._record_provider_health_failure(failure)
                 raise
             except StructuredOutputSchemaError:
                 raise
             except ContextAdmissionError:
                 # Local admission guard verdict — non-retryable, never wrapped.
+                raise
+            except LocalExecutionPolicyError:
+                # Transport authorization is terminal and must never retry or wrap.
                 raise
             except Exception as exc:
                 if cancellation_token and await cancellation_token.any_cancelled():
@@ -10477,6 +12044,7 @@ class AIService:
                     attempt=attempt,
                     max_attempts=max_attempts,
                 )
+                failure = self._failure_with_endpoint(failure, stream_health_endpoint_id)
                 await self._record_provider_health_failure(failure)
                 if failure.kind is ProviderErrorKind.CONTEXT_OVERFLOW:
                     # Provider reported a context overflow despite the local
@@ -10545,6 +12113,7 @@ class AIService:
             attempt=max_attempts,
             max_attempts=max_attempts,
         )
+        failure = self._failure_with_endpoint(failure, stream_health_endpoint_id)
         await self._record_provider_health_failure(failure)
         raise AIRequestError(
             provider,
@@ -11257,6 +12826,8 @@ class AIService:
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        provider_options: Optional[Mapping[str, Any]] = None,
+        strict_single_generation_attempt: bool = False,
     ) -> Tuple[str, Any]:
         """Generate content using OpenRouter unified API with optional JSON Schema and vision support"""
         if not self.openrouter_client:
@@ -11314,11 +12885,17 @@ class AIService:
                 request_kwargs["extra_body"] = {"provider": {"require_parameters": True}}
                 logger.info(f"Using OpenRouter JSON mode (flexible) for {model_id}")
 
+        request_kwargs["extra_body"] = self._with_openrouter_provider_options(
+            request_kwargs.get("extra_body"),
+            provider_options,
+            require_parameters=bool(json_output and "response_format" in request_params),
+        )
         # Disable provider context compression on every OpenRouter payload (D15).
         request_kwargs["extra_body"] = self._with_openrouter_compression_disabled(
             request_kwargs.get("extra_body")
         )
-        response = await self.openrouter_client.chat.completions.create(
+        client = self._openrouter_client_for_attempt(strict_single_generation_attempt)
+        response = await client.chat.completions.create(
             **request_params,
             **request_kwargs,
         )
@@ -11345,6 +12922,7 @@ class AIService:
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> Tuple[str, Any]:
         """Generate content through an OpenAI-compatible Chat Completions provider."""
 
@@ -11384,6 +12962,8 @@ class AIService:
         )
         if provider_key == "minimax":
             request_params["extra_body"] = {"reasoning_split": True}
+        elif provider_key == "llamacpp" and reasoning_effort is not None:
+            request_params["reasoning_effort"] = reasoning_effort
 
         request_kwargs: Dict[str, Any] = {}
         if request_timeout and request_timeout > 0:
@@ -11473,6 +13053,36 @@ class AIService:
             json_schema=json_schema,
             images=images,
         )
+
+    async def _generate_llamacpp(
+        self,
+        prompt: str,
+        model_id: str,
+        temperature: float,
+        max_tokens: int,
+        system_prompt: str,
+        request_timeout: Optional[float] = None,
+        json_output: bool = False,
+        json_schema: Optional[Dict[str, Any]] = None,
+        reasoning_effort: Optional[str] = None,
+    ) -> Tuple[str, Any]:
+        """Generate through the configured llama.cpp OpenAI-compatible server."""
+
+        async with self._llamacpp_request_semaphore:
+            return await self._generate_openai_compatible(
+                provider_key="llamacpp",
+                client=self.llamacpp_client,
+                display_name="llama.cpp",
+                prompt=prompt,
+                model_id=model_id,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                system_prompt=system_prompt,
+                request_timeout=request_timeout,
+                json_output=json_output,
+                json_schema=json_schema,
+                reasoning_effort=reasoning_effort,
+            )
 
     async def health_check(self) -> Dict[str, bool]:
         """Check health of all AI service providers"""
@@ -11724,9 +13334,14 @@ class AIService:
             logger.info(f"[EXTRA_VERBOSE] Max tokens: {max_tokens}")
 
         try:
-            # Handle O3-pro models (no streaming support, fallback to regular generation)
-            if "o3-pro" in model_id.lower():
-                logger.info(f"O3-pro doesn't support streaming, using regular generation")
+            # Responses-capability models must not fall through to the legacy
+            # Chat Completions branch. The regular generator already owns the
+            # Responses request shape and preserves the requested effort.
+            if self._is_openai_responses_api_model(model_id) or "o3-pro" in model_id.lower():
+                logger.info(
+                    "Using regular Responses generation for streaming request model %s",
+                    model_id,
+                )
                 content, usage_meta = await self._generate_openai(
                     prompt,
                     model_id,
@@ -12576,6 +14191,8 @@ class AIService:
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        provider_options: Optional[Mapping[str, Any]] = None,
+        strict_single_generation_attempt: bool = False,
     ):
         """Stream OpenRouter content generation with optional JSON Schema and vision support"""
         if not self.openrouter_client:
@@ -12640,11 +14257,17 @@ class AIService:
                     request_kwargs["extra_body"] = {"provider": {"require_parameters": True}}
                     logger.info(f"Using OpenRouter JSON mode (streaming, flexible) for {model_id}")
 
+            request_kwargs["extra_body"] = self._with_openrouter_provider_options(
+                request_kwargs.get("extra_body"),
+                provider_options,
+                require_parameters=bool(json_output and "response_format" in create_params),
+            )
             # Disable provider context compression on every OpenRouter payload (D15).
             request_kwargs["extra_body"] = self._with_openrouter_compression_disabled(
                 request_kwargs.get("extra_body")
             )
-            stream = await self.openrouter_client.chat.completions.create(
+            client = self._openrouter_client_for_attempt(strict_single_generation_attempt)
+            stream = await client.chat.completions.create(
                 **create_params,
                 **request_kwargs,
             )
@@ -12711,6 +14334,7 @@ class AIService:
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        reasoning_effort: Optional[str] = None,
     ):
         """Stream content through an OpenAI-compatible Chat Completions provider."""
 
@@ -12752,6 +14376,8 @@ class AIService:
         )
         if provider_key == "minimax":
             create_params["extra_body"] = {"reasoning_split": True}
+        elif provider_key == "llamacpp" and reasoning_effort is not None:
+            create_params["reasoning_effort"] = reasoning_effort
         request_kwargs: Dict[str, Any] = {}
         if request_timeout and request_timeout > 0:
             request_kwargs["timeout"] = request_timeout
@@ -12892,6 +14518,41 @@ class AIService:
         ):
             yield chunk
 
+    async def _stream_llamacpp(
+        self,
+        prompt: str,
+        model_id: str,
+        temperature: float,
+        max_tokens: int,
+        system_prompt: Optional[str],
+        request_timeout: Optional[float] = None,
+        json_output: bool = False,
+        json_schema: Optional[Dict[str, Any]] = None,
+        reasoning_effort: Optional[str] = None,
+        usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        usage_extra: Optional[Dict[str, Any]] = None,
+    ):
+        """Stream through the configured llama.cpp server with its own queue."""
+
+        async with self._llamacpp_request_semaphore:
+            async for chunk in self._stream_openai_compatible(
+                provider_key="llamacpp",
+                client=self.llamacpp_client,
+                display_name="llama.cpp",
+                prompt=prompt,
+                model_id=model_id,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                system_prompt=system_prompt,
+                request_timeout=request_timeout,
+                json_output=json_output,
+                json_schema=json_schema,
+                reasoning_effort=reasoning_effort,
+                usage_callback=usage_callback,
+                usage_extra=usage_extra,
+            ):
+                yield chunk
+
     async def _generate_ollama(
         self,
         prompt: str,
@@ -12902,6 +14563,7 @@ class AIService:
         request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> Tuple[str, Any]:
         """Generate content using Ollama local models (OpenAI-compatible API)
 
@@ -12941,6 +14603,8 @@ class AIService:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if reasoning_effort is not None:
+            request_params["reasoning_effort"] = reasoning_effort
         request_kwargs: Dict[str, Any] = {}
         if request_timeout and request_timeout > 0:
             request_kwargs["timeout"] = request_timeout
@@ -12984,6 +14648,7 @@ class AIService:
         request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
+        reasoning_effort: Optional[str] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
     ):
@@ -13030,6 +14695,8 @@ class AIService:
                 "max_tokens": max_tokens,
                 "stream": True
             }
+            if reasoning_effort is not None:
+                create_params["reasoning_effort"] = reasoning_effort
             request_kwargs: Dict[str, Any] = {}
             if request_timeout and request_timeout > 0:
                 request_kwargs["timeout"] = request_timeout
@@ -13254,7 +14921,15 @@ class AIService:
             logger.error(f"Fake AI streaming error: {e}")
             raise
 
-    async def get_embeddings(self, texts: List[str], model: str = None) -> List[List[float]]:
+    async def get_embeddings(
+        self,
+        texts: List[str],
+        model: str = None,
+        *,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
+        dispatch_call_id: Optional[str] = None,
+        dispatch_route_ordinal: int = 0,
+    ) -> List[List[float]]:
         """
         Get embeddings for a list of texts
 
@@ -13265,6 +14940,12 @@ class AIService:
         Returns:
             List of embedding vectors
         """
+        if local_execution is not None:
+            raise LocalExecutionPolicyError(
+                "local_embeddings_unsupported",
+                "Embeddings are not available in local_only execution.",
+            )
+
         if not texts:
             return []
 
@@ -13279,8 +14960,21 @@ class AIService:
         logger.warning("No embedding provider available")
         return [[] for _ in texts]  # Return empty embeddings
 
-    async def _get_openai_embeddings(self, texts: List[str], model: str = None) -> List[List[float]]:
+    async def _get_openai_embeddings(
+        self,
+        texts: List[str],
+        model: str = None,
+        *,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
+        dispatch_call_id: Optional[str] = None,
+        dispatch_route_ordinal: int = 0,
+    ) -> List[List[float]]:
         """Get embeddings using OpenAI API"""
+        if local_execution is not None:
+            raise LocalExecutionPolicyError(
+                "local_embeddings_unsupported",
+                "Embeddings are not available in local_only execution.",
+            )
         if not model:
             model = resolve_call("embedding.openai").model
 
@@ -13337,8 +15031,21 @@ class AIService:
             )
             return [[] for _ in texts]
 
-    async def _get_google_embeddings(self, texts: List[str], model: str = None) -> List[List[float]]:
+    async def _get_google_embeddings(
+        self,
+        texts: List[str],
+        model: str = None,
+        *,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
+        dispatch_call_id: Optional[str] = None,
+        dispatch_route_ordinal: int = 0,
+    ) -> List[List[float]]:
         """Get embeddings using Google/Gemini API"""
+        if local_execution is not None:
+            raise LocalExecutionPolicyError(
+                "local_embeddings_unsupported",
+                "Embeddings are not available in local_only execution.",
+            )
         if not model:
             model = resolve_call("embedding.google").model
 
@@ -13379,7 +15086,16 @@ class AIService:
             )
             return [[] for _ in texts]
 
-    async def calculate_similarity(self, text1: str, text2: str, model: str = None) -> float:
+    async def calculate_similarity(
+        self,
+        text1: str,
+        text2: str,
+        model: str = None,
+        *,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
+        dispatch_call_id: Optional[str] = None,
+        dispatch_route_ordinal: int = 0,
+    ) -> float:
         """
         Calculate cosine similarity between two texts using embeddings
 
@@ -13391,7 +15107,13 @@ class AIService:
         Returns:
             Cosine similarity score (0 to 1)
         """
-        embeddings = await self.get_embeddings([text1, text2], model)
+        embeddings = await self.get_embeddings(
+            [text1, text2],
+            model,
+            local_execution=local_execution,
+            dispatch_call_id=dispatch_call_id,
+            dispatch_route_ordinal=dispatch_route_ordinal,
+        )
 
         if len(embeddings) != 2 or not embeddings[0] or not embeddings[1]:
             return 0.0
@@ -13408,7 +15130,16 @@ class AIService:
 
         return dot_product / (norm1 * norm2)
 
-    async def _make_request(self, method: str, url: str, **kwargs) -> Optional[Dict]:
+    async def _make_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
+        dispatch_call_id: Optional[str] = None,
+        dispatch_route_ordinal: int = 0,
+        **kwargs: Any,
+    ) -> Optional[Dict]:
         """
         Make HTTP request to API endpoints (for custom operations)
 
@@ -13420,6 +15151,12 @@ class AIService:
         Returns:
             JSON response or None on error
         """
+        if local_execution is not None:
+            raise LocalExecutionPolicyError(
+                "local_http_request_unsupported",
+                "Direct HTTP requests are not available in local_only execution.",
+            )
+
         try:
             if not hasattr(self, 'http_session'):
                 import aiohttp
@@ -13471,10 +15208,21 @@ class AIService:
             ("MiniMax client", getattr(self, "minimax_client", None)),
             ("Moonshot client", getattr(self, "moonshot_client", None)),
             ("Ollama client", getattr(self, "ollama_client", None)),
+            ("llama.cpp client", getattr(self, "llamacpp_client", None)),
             ("Fake AI client", getattr(self, "fake_client", None)),
         )
+        closed_client_ids: set[int] = set()
         for name, client in provider_clients:
+            if client is not None and id(client) in closed_client_ids:
+                continue
             await _close_resource(name, client)
+            if client is not None:
+                closed_client_ids.add(id(client))
+        for endpoint_id, client in getattr(self, "_local_endpoint_clients", {}).items():
+            if id(client) in closed_client_ids:
+                continue
+            await _close_resource(f"Local endpoint client {endpoint_id}", client)
+            closed_client_ids.add(id(client))
 
         google_client = getattr(self, "google_new_client", None)
         if google_client is not None:

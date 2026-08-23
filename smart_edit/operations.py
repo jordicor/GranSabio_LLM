@@ -20,7 +20,12 @@ from typing import TYPE_CHECKING, Any, Callable, List, Literal, Mapping, Optiona
 
 from config import config
 from context_budget import ContextAdmissionError
-from llm_routing import default_temperature_for_call, resolve_call
+from llm_routing import (
+    default_temperature_for_call,
+    endpoint_id_call_kwargs,
+    resolve_call,
+)
+from local_execution_policy import LocalExecutionPolicyError
 
 from .locators import (
     build_word_map,
@@ -672,6 +677,11 @@ class SmartTextEditor:
         usage_callback: Optional[Callable] = None,
         cancellation_token: Optional[Any] = None,
         llm_routing: Optional[Mapping[str, Any]] = None,
+        provider_options: Optional[Mapping[str, Any]] = None,
+        endpoint_id: Optional[str] = None,
+        local_execution: Optional[Any] = None,
+        dispatch_call_id: str = "smart_edit.apply",
+        dispatch_route_ordinal: int = 0,
     ) -> str:
         """
         Call AI service to generate text.
@@ -696,10 +706,26 @@ class SmartTextEditor:
 
         if model and llm_routing is None:
             route_params: dict[str, Any] = {}
+            resolved_provider_options: dict[str, Any] = {}
+            resolved_endpoint_id: Optional[str] = None
         else:
             route = resolve_call("smart_edit.apply", routing=llm_routing)
             model = model or route.model
             route_params = route.params
+            resolved_provider_options = getattr(route, "provider_options", {})
+            resolved_endpoint_id = (
+                getattr(route, "endpoint_id", None)
+                if str(model or "").strip() == str(route.model or "").strip()
+                else None
+            )
+        effective_provider_options = (
+            dict(provider_options)
+            if provider_options is not None
+            else dict(resolved_provider_options)
+        )
+        effective_endpoint_id = (
+            endpoint_id if endpoint_id is not None else resolved_endpoint_id
+        )
         effective_temperature = route_params.get("temperature")
         if effective_temperature is None:
             effective_temperature = (
@@ -724,6 +750,11 @@ class SmartTextEditor:
             usage_callback=usage_callback,
             cancellation_token=cancellation_token,
             llm_routing=llm_routing,
+            provider_options=effective_provider_options,
+            **endpoint_id_call_kwargs(effective_endpoint_id),
+            local_execution=local_execution,
+            dispatch_call_id=dispatch_call_id,
+            dispatch_route_ordinal=dispatch_route_ordinal,
         )
 
         # generate_content returns the content string directly
@@ -750,6 +781,11 @@ class SmartTextEditor:
         usage_callback: Optional[Callable] = None,
         cancellation_token: Optional[Any] = None,
         llm_routing: Optional[Mapping[str, Any]] = None,
+        provider_options: Optional[Mapping[str, Any]] = None,
+        endpoint_id: Optional[str] = None,
+        local_execution: Optional[Any] = None,
+        dispatch_call_id: str = "smart_edit.apply",
+        dispatch_route_ordinal: int = 0,
     ) -> EditResult:
         """
         Apply an edit to target text using AI with a specific instruction.
@@ -830,6 +866,11 @@ class SmartTextEditor:
                 usage_callback=usage_callback,
                 cancellation_token=cancellation_token,
                 llm_routing=llm_routing,
+                provider_options=provider_options,
+                endpoint_id=endpoint_id,
+                local_execution=local_execution,
+                dispatch_call_id=dispatch_call_id,
+                dispatch_route_ordinal=dispatch_route_ordinal,
             )
 
             # Clean AI response
@@ -865,6 +906,8 @@ class SmartTextEditor:
             # were folded into EditResult(success=False) the caller would raise a
             # generic SmartEditError and silently fall back to the original
             # content, masking the overflow.
+            raise
+        except LocalExecutionPolicyError:
             raise
         except Exception as e:
             # Lazy import avoids ai_service -> models -> smart_edit import cycles.

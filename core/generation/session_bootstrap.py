@@ -42,6 +42,7 @@ def build_session_payload(
     resolved_long_text_mode: dict[str, Any],
     long_text_enabled: bool,
     auto_qa_plan_payload: Optional[dict[str, Any]],
+    local_execution: Any = None,
 ) -> dict[str, Any]:
     """Build the final session payload without side effects."""
 
@@ -101,6 +102,7 @@ def build_session_payload(
         "current_qa_layer": None,
         "qa_evaluations_completed": 0,
         "qa_evaluations_total": 0,
+        "local_execution": local_execution,
         "last_consensus_score": None,
         "approved": False,
         "last_generated_content_length": 0,
@@ -146,6 +148,7 @@ async def finalize_generation_session(
     long_text_enabled: bool,
     long_text_advisories: list[Any],
     auto_qa_plan_payload: Optional[dict[str, Any]],
+    local_execution: Any = None,
     deps: SessionBootstrapDeps,
 ) -> GenerationInitResponse:
     """Register the final session and start background generation."""
@@ -213,6 +216,7 @@ async def finalize_generation_session(
         resolved_long_text_mode=resolved_long_text_mode,
         long_text_enabled=long_text_enabled,
         auto_qa_plan_payload=auto_qa_plan_payload,
+        local_execution=local_execution,
     )
     await deps.register_session(session_id, session_payload)
 

@@ -35,6 +35,8 @@ from config import EDITABLE_CONTENT_TYPES, config
 from context_budget import ContextAdmissionError
 from evidence_grounding import GroundingEngine, get_effective_order
 from gran_sabio import GranSabioInvocationError, GranSabioProcessCancelled
+from llm_routing import endpoint_id_call_kwargs
+from local_execution_policy import LocalExecutionPolicyError
 from model_aliasing import ModelAliasRegistry, get_evaluator_alias
 from models import EvidenceGroundingConfig, EvidenceGroundingResult, QAEvaluation, QALayer
 from qa_bypass_engine import QABypassEngine
@@ -409,6 +411,8 @@ class QAEngine:
         project_id: Optional[str] = None,
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
         request_timeout: Optional[float] = None,
+        local_execution: Optional[Any] = None,
+        dispatch_route_ordinal: int = 0,
     ) -> QAEvaluation:
         """
         Evaluate content using a specific QA layer and AI model
@@ -493,7 +497,15 @@ class QAEngine:
                 project_id=project_id,
                 tool_event_callback=tool_event_callback,
                 request_timeout=request_timeout,
+                provider_options=model_config.provider_options,
+                **endpoint_id_call_kwargs(
+                    getattr(model_config, "endpoint_id", None)
+                ),
+                local_execution=local_execution,
+                dispatch_route_ordinal=dispatch_route_ordinal,
             )
+        except LocalExecutionPolicyError:
+            raise
         except Exception as e:
             logger.error(f"QA evaluation failed for layer {layer.name} with model {model_config.model}: {str(e)}")
             raise
@@ -581,6 +593,7 @@ class QAEngine:
             extra_verbose=extra_verbose,
             original_request=original_request,
             cancellation_token=cancellation_token,
+            local_execution=getattr(original_request, "_local_execution", None),
         )
 
         # Convert to QAEvaluation for consensus integration
@@ -1958,6 +1971,8 @@ Source QA layers:
                             project_id=project_id,
                             tool_event_callback=tool_event_callback,
                             request_timeout=slot.timeout_seconds,
+                            local_execution=getattr(original_request, "_local_execution", None),
+                            dispatch_route_ordinal=slot.index,
                         ),
                         timeout=slot.timeout_seconds,
                     )
@@ -2102,6 +2117,8 @@ Source QA layers:
                 # absorbable technical failure. Re-raise BEFORE the generic
                 # handler so the scheduler aborts the whole layer and cancels
                 # in-flight sibling slots instead of manufacturing a placeholder.
+                raise
+            except LocalExecutionPolicyError:
                 raise
             except Exception as exc:
                 if is_content_filter_stop(exc):
@@ -2397,7 +2414,11 @@ Source QA layers:
             else:
                 labels.append(f"Evaluator {slot.index + 1}")
 
-        native_counter = getattr(self.ai_service, "_native_token_count", None)
+        native_counter = (
+            None
+            if getattr(original_request, "_local_execution", None) is not None
+            else getattr(self.ai_service, "_native_token_count", None)
+        )
         reports = await context_budget.evaluate_fanout_admission(
             budgets,
             policy="strict_all",

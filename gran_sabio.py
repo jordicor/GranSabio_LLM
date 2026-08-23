@@ -13,7 +13,7 @@ import math
 import re
 import time
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 if TYPE_CHECKING:
     from logging_utils import PhaseLogger
@@ -39,7 +39,8 @@ from content_events import (
 from context_budget import ContextAdmissionError, context_budget_error_from_overflow
 from deterministic_validation import DraftValidationResult, validate_generation_candidate
 from json_utils import dumps as json_dumps
-from llm_routing import resolve_call, resolve_temperature
+from llm_routing import endpoint_id_call_kwargs, resolve_call, resolve_temperature
+from local_execution_policy import LocalExecutionPolicyError
 from model_aliasing import PromptPart, get_evaluator_alias
 from model_capability_registry import resolve_model_capability_context
 from models import ContentRequest, GranSabioResult, is_json_output_requested
@@ -604,6 +605,8 @@ def _resolve_output_truncation_retry_plan(
 ) -> Optional[Dict[str, Any]]:
     """Resolve one bounded retry while retaining the caller's original budget."""
 
+    if getattr(request, "strict_single_generation_attempt", False):
+        return None
     adjustment = getattr(
         request,
         "_external_generation_min_tokens_adjustment",
@@ -914,6 +917,16 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 model=model,
                 call_id="gransabio.escalation",
             )
+            escalation_provider_options = getattr(
+                resolve_call("gransabio.escalation", request=original_request),
+                "provider_options",
+                {},
+            )
+            escalation_endpoint_id = getattr(
+                resolve_call("gransabio.escalation", request=original_request),
+                "endpoint_id",
+                None,
+            )
             logger.info(
                 "Gran Sabio using %s with reasoning_effort=%s for minority deal-breaker check",
                 model, reasoning_effort
@@ -969,6 +982,9 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 max_tokens=decision_max_tokens,
                 review_tool_events=review_tool_events,
                 cancellation_token=cancellation_token,
+                provider_options=escalation_provider_options,
+                **endpoint_id_call_kwargs(escalation_endpoint_id),
+                dispatch_call_id="gransabio.escalation",
             )
             await _abort_if_cancelled("minority_review_after_generation")
 
@@ -1058,6 +1074,8 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
         except ContextAdmissionError:
             # Context overflow must surface as a typed context_admission failure,
             # never be masked as a review result that keeps the original content.
+            raise
+        except LocalExecutionPolicyError:
             raise
         except Exception as e:
             if is_content_filter_stop(e):
@@ -1234,6 +1252,16 @@ CRITICAL INSTRUCTIONS:
                 original_request,
                 "gransabio.regenerate",
             )
+            regeneration_provider_options = getattr(
+                resolve_call("gransabio.regenerate", request=original_request),
+                "provider_options",
+                {},
+            )
+            regeneration_endpoint_id = getattr(
+                resolve_call("gransabio.regenerate", request=original_request),
+                "endpoint_id",
+                None,
+            )
             regeneration_max_tokens = self._resolve_gran_sabio_max_tokens(
                 request=original_request,
                 model=model,
@@ -1345,8 +1373,13 @@ CRITICAL INSTRUCTIONS:
                         model_alias_registry=model_alias_registry,
                         prompt_safety_parts=prompt_safety_parts,
                         llm_routing=getattr(original_request, "_llm_routing", None),
+                        provider_options=regeneration_provider_options,
+                        **endpoint_id_call_kwargs(regeneration_endpoint_id),
                         request_timeout=timeout_seconds,
                         cancellation_token=cancellation_token,
+                        local_execution=getattr(original_request, "_local_execution", None),
+                        dispatch_call_id="gransabio.regenerate",
+                        dispatch_route_ordinal=0,
                     )
 
                 try:
@@ -1449,8 +1482,13 @@ CRITICAL INSTRUCTIONS:
                         model_alias_registry=model_alias_registry,
                         prompt_safety_parts=prompt_safety_parts,
                         llm_routing=getattr(original_request, "_llm_routing", None),
+                        provider_options=regeneration_provider_options,
+                        **endpoint_id_call_kwargs(regeneration_endpoint_id),
                         request_timeout=_next_provider_timeout(),
                         cancellation_token=cancellation_token,
+                        local_execution=getattr(original_request, "_local_execution", None),
+                        dispatch_call_id="gransabio.regenerate",
+                        dispatch_route_ordinal=0,
                     )
                     if json_output_effective:
                         generated_content = _normalize_regeneration_json_output(
@@ -1501,8 +1539,13 @@ CRITICAL INSTRUCTIONS:
                             model_alias_registry=model_alias_registry,
                             prompt_safety_parts=prompt_safety_parts,
                             llm_routing=getattr(original_request, "_llm_routing", None),
+                            provider_options=regeneration_provider_options,
+                            **endpoint_id_call_kwargs(regeneration_endpoint_id),
                             request_timeout=_next_provider_timeout(),
                             cancellation_token=cancellation_token,
+                            local_execution=getattr(original_request, "_local_execution", None),
+                            dispatch_call_id="gransabio.regenerate",
+                            dispatch_route_ordinal=0,
                         ):
                             # Handle StreamChunk (Claude with thinking) vs plain string
                             if isinstance(chunk, StreamChunk):
@@ -1650,6 +1693,10 @@ CRITICAL INSTRUCTIONS:
                         # Context overflow is non-retryable and must surface;
                         # never fold it into the streaming-retry ladder.
                         raise
+                    except LocalExecutionPolicyError:
+                        # Manifest admission is non-retryable and must not
+                        # turn into a provider retry or editorial fallback.
+                        raise
                     except (AIRequestError, Exception) as stream_error:
                         transient_failures += 1
                         is_retryable = _is_retryable_streaming_error(stream_error)
@@ -1699,8 +1746,13 @@ CRITICAL INSTRUCTIONS:
                     model_alias_registry=model_alias_registry,
                     prompt_safety_parts=prompt_safety_parts,
                     llm_routing=getattr(original_request, "_llm_routing", None),
+                    provider_options=regeneration_provider_options,
+                    **endpoint_id_call_kwargs(regeneration_endpoint_id),
                     request_timeout=_next_provider_timeout(),
                     cancellation_token=cancellation_token,
+                    local_execution=getattr(original_request, "_local_execution", None),
+                    dispatch_call_id="gransabio.regenerate",
+                    dispatch_route_ordinal=0,
                 )
                 if json_output_effective:
                     generated_content = _normalize_regeneration_json_output(
@@ -1762,6 +1814,8 @@ CRITICAL INSTRUCTIONS:
             # Context overflow must surface as a typed context_admission failure,
             # never be masked as a "regeneration failed" result with recovered
             # fallback content.
+            raise
+        except LocalExecutionPolicyError:
             raise
         except Exception as e:
             if is_content_filter_stop(e):
@@ -1925,6 +1979,19 @@ CRITICAL INSTRUCTIONS:
                 max_tokens=decision_max_tokens,
                 review_tool_events=review_tool_events,
                 cancellation_token=cancellation_token,
+                provider_options=getattr(
+                    resolve_call("gransabio.review", request=original_request),
+                    "provider_options",
+                    {},
+                ),
+                **endpoint_id_call_kwargs(
+                    getattr(
+                        resolve_call("gransabio.review", request=original_request),
+                        "endpoint_id",
+                        None,
+                    )
+                ),
+                dispatch_call_id="gransabio.review",
             )
 
             await _abort_if_cancelled("iterations_review_after_generation")
@@ -2015,6 +2082,8 @@ CRITICAL INSTRUCTIONS:
         except ContextAdmissionError:
             # Context overflow must surface as a typed context_admission failure,
             # never be masked as a review result that keeps the best iteration.
+            raise
+        except LocalExecutionPolicyError:
             raise
         except Exception as e:
             if is_content_filter_stop(e):
@@ -2264,6 +2333,9 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
         max_tokens: int,
         review_tool_events: Optional[_ReviewToolEventStream] = None,
         cancellation_token: Optional[Any] = None,
+        provider_options: Optional[Mapping[str, Any]] = None,
+        endpoint_id: Optional[str] = None,
+        dispatch_call_id: str = "gransabio.review",
     ) -> Tuple[Dict[str, Any], str]:
         """Run a GranSabio JSON_STRUCTURED call with tool-loop or single-shot fallback.
 
@@ -2295,6 +2367,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
             if review_tool_events is not None
             else None
         )
+        review_provider_options = dict(provider_options or {})
 
         tool_loop_enabled = (
             stream_callback is None
@@ -2369,8 +2442,16 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                     model_alias_registry=alias_registry,
                     prompt_safety_parts=prompt_safety_parts,
                     llm_routing=getattr(request, "_llm_routing", None),
+                    provider_options=review_provider_options,
+                    **endpoint_id_call_kwargs(endpoint_id),
+                    strict_single_generation_attempt=getattr(
+                        request, "strict_single_generation_attempt", False
+                    ),
                     request_timeout=timeout_seconds,
                     cancellation_token=cancellation_token,
+                    local_execution=getattr(request, "_local_execution", None),
+                    dispatch_call_id=dispatch_call_id,
+                    dispatch_route_ordinal=0,
                 )
 
             content, envelope = await _call_tool_loop(
@@ -2378,10 +2459,14 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 timeout_seconds=_next_provider_timeout(),
             )
             if envelope is not None and envelope.output_truncated:
-                retry_plan = config.resolve_bounded_output_truncation_retry(
-                    model,
-                    envelope.max_tokens or max_tokens,
-                    requested_max_tokens=max_tokens,
+                retry_plan = (
+                    None
+                    if getattr(request, "strict_single_generation_attempt", False)
+                    else config.resolve_bounded_output_truncation_retry(
+                        model,
+                        envelope.max_tokens or max_tokens,
+                        requested_max_tokens=max_tokens,
+                    )
                 )
                 if isinstance(retry_plan, dict):
                     retry_max_tokens = int(retry_plan["retry_max_tokens"])
@@ -2476,8 +2561,16 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                         model_alias_registry=alias_registry,
                         prompt_safety_parts=prompt_safety_parts,
                         llm_routing=getattr(request, "_llm_routing", None),
+                        provider_options=review_provider_options,
+                        **endpoint_id_call_kwargs(endpoint_id),
+                        strict_single_generation_attempt=getattr(
+                            request, "strict_single_generation_attempt", False
+                        ),
                         request_timeout=_next_provider_timeout(),
                         cancellation_token=cancellation_token,
+                        local_execution=getattr(request, "_local_execution", None),
+                        dispatch_call_id=dispatch_call_id,
+                        dispatch_route_ordinal=0,
                     ):
                         if isinstance(chunk, StreamChunk):
                             chunk_text = chunk.text
@@ -2635,8 +2728,16 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 model_alias_registry=alias_registry,
                 prompt_safety_parts=prompt_safety_parts,
                 llm_routing=getattr(request, "_llm_routing", None),
+                provider_options=review_provider_options,
+                **endpoint_id_call_kwargs(endpoint_id),
+                strict_single_generation_attempt=getattr(
+                    request, "strict_single_generation_attempt", False
+                ),
                 request_timeout=_next_provider_timeout(),
                 cancellation_token=cancellation_token,
+                local_execution=getattr(request, "_local_execution", None),
+                dispatch_call_id=dispatch_call_id,
+                dispatch_route_ordinal=0,
             )
 
         parsed = self._parse_single_shot_json(response_text, response_schema)

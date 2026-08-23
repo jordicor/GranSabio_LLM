@@ -223,6 +223,15 @@ async def test_generate_full_content_raises_on_unusable_stream_finish():
     session = {}
 
     with patch("core.generation_processor._should_use_generation_tools", return_value=False), \
+         patch(
+             "core.generation_processor.resolve_call",
+             return_value=SimpleNamespace(
+                 provider_options={
+                     "max_price": {"prompt": 0, "completion": 0},
+                     "allow_fallbacks": False,
+                 }
+             ),
+         ), \
          patch("core.generation_processor.check_session_cancelled", new=AsyncMock(return_value=False)), \
          patch("core.generation_processor.add_verbose_log", new=AsyncMock()), \
          patch("core.generation_processor._debug_record_event", new=AsyncMock()):
@@ -241,6 +250,10 @@ async def test_generate_full_content_raises_on_unusable_stream_finish():
     assert exc_info.value.finish_reason == "SAFETY"
     assert exc_info.value.finish_reason_category == "content_filter"
     assert session["generation_finish_metadata"]["provider_stop_reason"] == "SAFETY"
+    assert ai_service.generate_content_stream.call_args.kwargs["provider_options"] == {
+        "max_price": {"prompt": 0, "completion": 0},
+        "allow_fallbacks": False,
+    }
 
 
 def test_build_generation_error_result_surfaces_provider_quota():
@@ -449,6 +462,41 @@ async def test_generate_full_content_routes_json_without_schema_as_json_loose():
     assert kwargs["output_contract"] == OutputContract.JSON_LOOSE
     assert kwargs["response_format"] is None
     assert kwargs["json_expectations"] is expectations
+    ai_service.generate_content_stream.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_generate_full_content_forwards_strict_flag_to_primary_tool_loop():
+    request = _tool_request(strict_single_generation_attempt=True)
+    ai_service = SimpleNamespace(
+        call_ai_with_validation_tools=AsyncMock(
+            return_value=("accepted prose", _accepted_envelope())
+        ),
+        generate_content_stream=AsyncMock(),
+    )
+
+    with patch("core.generation_processor._should_use_generation_tools", return_value=True), \
+         patch("core.generation_processor.has_active_generation_validators", return_value=True), \
+         patch("core.generation_processor.add_verbose_log", new=AsyncMock()), \
+         patch("core.generation_processor._debug_record_event", new=AsyncMock()):
+        content = await _generate_full_content(
+            final_prompt="Write accepted prose.",
+            request=request,
+            ai_service=ai_service,
+            usage_tracker=None,
+            session_id="session-strict-tool-loop",
+            session={},
+            iteration=0,
+            json_output_requested=False,
+        )
+
+    assert content == "accepted prose"
+    assert (
+        ai_service.call_ai_with_validation_tools.await_args.kwargs[
+            "strict_single_generation_attempt"
+        ]
+        is True
+    )
     ai_service.generate_content_stream.assert_not_called()
 
 

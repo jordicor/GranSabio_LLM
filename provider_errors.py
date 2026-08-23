@@ -54,6 +54,7 @@ class ProviderFailure(Exception):
     max_attempts: int = 1
     raw_exception_class: Optional[str] = None
     raw_metadata: Mapping[str, Any] = field(default_factory=dict)
+    endpoint_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         Exception.__init__(self, self.message)

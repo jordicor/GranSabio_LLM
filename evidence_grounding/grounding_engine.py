@@ -29,6 +29,7 @@ from evidence_grounding.evidence_matcher import (
     match_claims_to_spans,
 )
 from llm_routing import resolve_call
+from local_execution_policy import LocalExecutionPolicyError
 from models import (
     EvidenceGroundingConfig,
     EvidenceGroundingResult,
@@ -105,6 +106,7 @@ class GroundingEngine:
         extra_verbose: bool = False,
         original_request: Optional[Any] = None,
         cancellation_token: Optional[Any] = None,
+        local_execution: Optional[Any] = None,
     ) -> EvidenceGroundingResult:
         """
         Run complete evidence grounding verification pipeline.
@@ -179,12 +181,15 @@ class GroundingEngine:
                 extra_verbose=extra_verbose,
                 usage_callback=tracked_usage_callback,
                 cancellation_token=cancellation_token,
+                local_execution=local_execution,
             )
         except asyncio.CancelledError:
             raise
         except ContextAdmissionError:
             # A context overflow must fail the grounding check visibly, never
             # become a conservative pass that masks unverified content.
+            raise
+        except LocalExecutionPolicyError:
             raise
         except Exception as e:
             if is_content_filter_stop(e):
@@ -250,12 +255,15 @@ class GroundingEngine:
                 request=original_request,
                 usage_callback=tracked_usage_callback,
                 cancellation_token=cancellation_token,
+                local_execution=local_execution,
             )
         except asyncio.CancelledError:
             raise
         except ContextAdmissionError:
             # A context overflow must fail the grounding check visibly, never
             # become a conservative pass that masks unverified content.
+            raise
+        except LocalExecutionPolicyError:
             raise
         except Exception as e:
             if is_content_filter_stop(e):
@@ -293,12 +301,15 @@ class GroundingEngine:
                 extra_verbose=extra_verbose,
                 usage_callback=tracked_usage_callback,
                 cancellation_token=cancellation_token,
+                local_execution=local_execution,
             )
         except asyncio.CancelledError:
             raise
         except ContextAdmissionError:
             # A context overflow must fail the grounding check visibly, never
             # become a conservative pass that masks unverified content.
+            raise
+        except LocalExecutionPolicyError:
             raise
         except Exception as e:
             if is_content_filter_stop(e):

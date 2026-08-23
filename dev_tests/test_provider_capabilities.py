@@ -184,6 +184,24 @@ def test_model_uses_responses_api_matches_key_model_id_and_overrides():
     assert model_uses_responses_api("openai", "gpt-5-chat", specs) is False
 
 
+def test_gpt56_sol_uses_responses_when_discovery_catalog_is_still_text_only():
+    specs = {
+        "model_specifications": {
+            "openai": {
+                "gpt-5.6-sol": {
+                    "model_id": "gpt-5.6-sol",
+                    "capabilities": ["text"],
+                    "sync_metadata": {"needs_review": True},
+                }
+            }
+        }
+    }
+
+    assert model_uses_responses_api("openai", "gpt-5.6-sol", specs) is True
+    assert model_uses_responses_api("openai", "gpt-5.6-sol-2026-08-01", specs) is True
+    assert model_uses_responses_api("openai", "gpt-5.6-solar", specs) is False
+
+
 def test_resolve_model_capability_context_statuses_without_credentials():
     specs = {
         "model_specifications": {
@@ -221,6 +239,13 @@ def test_generation_validation_tool_loop_runtime_matrix_and_openrouter_tools():
                     "provider_capabilities": {"tool_calling": True},
                 }
             },
+            "ollama": {
+                "local-tools": {
+                    "model_id": "local-tools",
+                    "provider_capabilities": {"tool_calling": True},
+                },
+                "local-no-tools": {"model_id": "local-no-tools"},
+            },
             "openai": {
                 "gpt-tool": {
                     "model_id": "gpt-tool",
@@ -250,6 +275,8 @@ def test_generation_validation_tool_loop_runtime_matrix_and_openrouter_tools():
     assert model_supports_generation_validation_tool_loop("openai", "gpt-no-tool", specs) is False
     assert model_supports_generation_validation_tool_loop("openrouter", "vendor/with-tools", specs) is True
     assert model_supports_generation_validation_tool_loop("openrouter", "vendor/no-tools", specs) is False
+    assert model_supports_generation_validation_tool_loop("ollama", "local-tools", specs) is True
+    assert model_supports_generation_validation_tool_loop("ollama", "local-no-tools", specs) is False
 
 
 def test_inline_and_long_text_wrappers_exclude_openai_responses_api():

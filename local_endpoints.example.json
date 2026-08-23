@@ -1,0 +1,16 @@
+{
+  "local_endpoints": {
+    "spark_ollama": {
+      "adapter": "ollama",
+      "base_url": "http://spark-a.local:11434",
+      "max_concurrent_requests": 1
+    },
+    "spark_reviewer": {
+      "adapter": "openai_compatible",
+      "base_url": "http://spark-a.local:8001/v1",
+      "api_key_env": "SPARK_REVIEWER_API_KEY",
+      "max_concurrent_requests": 1,
+      "availability": "loaded"
+    }
+  }
+}

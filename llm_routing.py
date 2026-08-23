@@ -13,12 +13,34 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import json_utils as json
 from ai_runtime import parameters as runtime_parameters
+from ai_runtime.openrouter_provider_options import (
+    OpenRouterProviderOptionsError,
+    validate_openrouter_provider_options,
+)
+from local_endpoint_registry import (
+    LocalEndpointConfigurationError,
+    build_local_endpoint_registry,
+)
 
 DEFAULT_ROUTING_FILENAME = "llm_routing.default.json"
 
 
 class LLMRoutingError(ValueError):
     """Raised when model routing cannot resolve a valid model for a call."""
+
+
+def endpoint_id_call_kwargs(endpoint_id: Optional[str]) -> Dict[str, str]:
+    """Return an endpoint keyword only when a route explicitly selected one.
+
+    Existing cloud and legacy callers must retain their original call shape.
+    This also lets lightweight route doubles created before endpoint routing omit
+    the new attribute without changing their downstream service interface.
+    """
+
+    if not isinstance(endpoint_id, str):
+        return {}
+    normalized = endpoint_id.strip()
+    return {"endpoint_id": normalized} if normalized else {}
 
 
 @dataclass(frozen=True)
@@ -38,6 +60,7 @@ class LLMRouteResolution:
 
     call_id: str
     model: Optional[str] = None
+    endpoint_id: Optional[str] = None
     models: List[Dict[str, Any]] = field(default_factory=list)
     params: Dict[str, Any] = field(default_factory=dict)
     provider_options: Dict[str, Any] = field(default_factory=dict)
@@ -269,10 +292,16 @@ def _request_fields_set(request: Any) -> set[str]:
     return {str(field) for field in fields or set()}
 
 
-def _model_entry(model: Any, params: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+def _model_entry(
+    model: Any,
+    params: Optional[Mapping[str, Any]] = None,
+    endpoint_id: Optional[str] = None,
+) -> Dict[str, Any]:
     entry: Dict[str, Any] = {"model": str(model)}
     if params:
         entry["params"] = dict(params)
+    if endpoint_id is not None:
+        entry["endpoint_id"] = endpoint_id
     return entry
 
 
@@ -303,7 +332,13 @@ def build_legacy_request_overlay(request: Any, fields_set: Optional[set[str]] = 
                     for key in ("max_tokens", "reasoning_effort", "thinking_budget_tokens", "temperature")
                     if getattr(item, key, None) is not None
                 }
-                entries.append(_model_entry(getattr(item, "model"), params))
+                entries.append(
+                    _model_entry(
+                        getattr(item, "model"),
+                        params,
+                        getattr(item, "endpoint_id", None),
+                    )
+                )
             elif isinstance(item, Mapping) and item.get("model"):
                 entries.append(dict(item))
         calls["qa.evaluate_layer"] = {"models": entries}
@@ -368,13 +403,34 @@ def _call_config(routing: Mapping[str, Any], call_id: str) -> tuple[Dict[str, An
     return merged, source
 
 
-def _normalize_models(value: Any, inherited_params: Mapping[str, Any]) -> List[Dict[str, Any]]:
+def _normalize_endpoint_id(value: Any, *, call_id: str) -> Optional[str]:
+    """Validate an optional administrative endpoint identity."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise LLMRoutingError(
+            f"LLM routing 'endpoint_id' for '{call_id}' must be a non-empty string."
+        )
+    return value.strip()
+
+
+def _normalize_models(
+    value: Any,
+    inherited_params: Mapping[str, Any],
+    *,
+    inherited_endpoint_id: Optional[str],
+    call_id: str,
+) -> List[Dict[str, Any]]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         raise LLMRoutingError("Multi-model routing entries must use a 'models' array.")
     entries: List[Dict[str, Any]] = []
     for item in value:
         if isinstance(item, str):
-            entries.append({"model": item, "params": dict(inherited_params)})
+            entry: Dict[str, Any] = {"model": item, "params": dict(inherited_params)}
+            if inherited_endpoint_id is not None:
+                entry["endpoint_id"] = inherited_endpoint_id
+            entries.append(entry)
             continue
         if not isinstance(item, Mapping) or not item.get("model"):
             raise LLMRoutingError("Each multi-model routing entry must include a model.")
@@ -386,6 +442,14 @@ def _normalize_models(value: Any, inherited_params: Mapping[str, Any]) -> List[D
         params = _deep_merge(dict(inherited_params), item_params)
         entry = dict(item)
         entry["model"] = str(item["model"])
+        endpoint_id = _normalize_endpoint_id(
+            item.get("endpoint_id", inherited_endpoint_id),
+            call_id=call_id,
+        )
+        if endpoint_id is not None:
+            entry["endpoint_id"] = endpoint_id
+        else:
+            entry.pop("endpoint_id", None)
         if params:
             entry["params"] = params
         entries.append(entry)
@@ -412,6 +476,72 @@ def _validate_known_model(model: str, call_id: str, config_obj: Any) -> Dict[str
         raise LLMRoutingError(
             f"LLM routing for '{call_id}' references unknown model '{model}': {exc}"
         ) from exc
+
+
+def _validate_known_model_for_endpoint(
+    model: str,
+    call_id: str,
+    config_obj: Any,
+    endpoint_id: str,
+) -> tuple[str, Dict[str, Any]]:
+    """Resolve an endpoint-scoped catalog identity and its metadata.
+
+    An unqualified model is returned with its adapter namespace so upstream
+    token and capability checks cannot accidentally use a colliding global
+    catalog entry. The transport boundary resolves that catalog identity to
+    its raw model id before sending the API request.
+    """
+
+    try:
+        endpoint = build_local_endpoint_registry(config_obj).get(endpoint_id)
+    except LocalEndpointConfigurationError as exc:
+        raise LLMRoutingError(
+            f"LLM routing for '{call_id}' references unknown local endpoint '{endpoint_id}': {exc}"
+        ) from exc
+
+    value = str(model or "").strip()
+    if "::" in value or value.startswith(("ollama/", "llamacpp/", "openai_compatible/")):
+        return value, _validate_known_model(value, call_id, config_obj)
+
+    provider_hints = {
+        "ollama": ("ollama",),
+        "llamacpp": ("llamacpp",),
+        "openai_compatible": ("openai_compatible", "llamacpp"),
+    }.get(endpoint.adapter, ())
+    if not provider_hints:
+        raise LLMRoutingError(
+            f"LLM routing for '{call_id}' endpoint '{endpoint_id}' has unsupported adapter "
+            f"'{endpoint.adapter}'."
+        )
+
+    last_error: Optional[Exception] = None
+    for provider_hint in provider_hints:
+        catalog_model = f"{provider_hint}::{value}"
+        try:
+            return catalog_model, _validate_known_model(
+                catalog_model,
+                call_id,
+                config_obj,
+            )
+        except Exception as exc:
+            last_error = exc
+    raise LLMRoutingError(
+        f"LLM routing for '{call_id}' references unknown model '{model}' at endpoint "
+        f"'{endpoint_id}': {last_error}"
+    ) from last_error
+
+
+def _validate_known_route_model(
+    model: str,
+    call_id: str,
+    config_obj: Any,
+    endpoint_id: Optional[str],
+) -> tuple[str, Dict[str, Any]]:
+    """Validate route model identity, using endpoint scope when supplied."""
+
+    if endpoint_id is not None:
+        return _validate_known_model_for_endpoint(model, call_id, config_obj, endpoint_id)
+    return model, _validate_known_model(model, call_id, config_obj)
 
 
 def _supports_logprobs(model: str, model_info: Mapping[str, Any]) -> bool:
@@ -464,6 +594,14 @@ def _param_supported(model_info: Mapping[str, Any], param_name: str) -> bool:
             return False
         return True
     if param_name == "reasoning_effort":
+        supported_parameters = model_info.get("supported_parameters")
+        if (
+            provider == "llamacpp"
+            and isinstance(supported_parameters, Sequence)
+            and not isinstance(supported_parameters, (str, bytes, bytearray))
+            and "reasoning_effort" in supported_parameters
+        ):
+            return True
         return "gpt-5" in model_id or model_id.startswith(("o1", "o3", "o4"))
     if param_name == "thinking_budget_tokens":
         return provider in {"claude", "gemini", "google"} or "claude" in model_id or "gemini" in model_id
@@ -499,12 +637,39 @@ def _sanitize_params(
     return clean, warnings
 
 
+def _sanitize_provider_options(
+    *,
+    call_id: str,
+    model_info: Mapping[str, Any],
+    provider_options: Any,
+) -> Dict[str, Any]:
+    """Validate provider options before they become transport configuration."""
+
+    if provider_options is None:
+        return {}
+    if not isinstance(provider_options, Mapping):
+        raise LLMRoutingError(
+            f"LLM routing 'provider_options' for '{call_id}' must be an object."
+        )
+    if _provider_key(model_info) != "openrouter":
+        raise LLMRoutingError(
+            f"LLM routing 'provider_options' for '{call_id}' requires an OpenRouter model."
+        )
+    try:
+        return validate_openrouter_provider_options(provider_options)
+    except OpenRouterProviderOptionsError as exc:
+        raise LLMRoutingError(
+            f"Invalid OpenRouter provider_options for '{call_id}': {exc}"
+        ) from exc
+
+
 def resolve_call(
     call_id: str,
     *,
     request: Any = None,
     routing: Optional[Mapping[str, Any]] = None,
     required_capabilities: Optional[Iterable[str]] = None,
+    validate_model: bool = True,
 ) -> LLMRouteResolution:
     """Resolve a single-model call."""
 
@@ -526,33 +691,52 @@ def resolve_call(
         raise LLMRoutingError("Unable to load runtime config for model validation.") from exc
 
     model_name = str(model)
-    model_info = _validate_known_model(model_name, call_id, config)
+    endpoint_id = _normalize_endpoint_id(cfg.get("endpoint_id"), call_id=call_id)
+    if not validate_model:
+        raw_params = cfg.get("params", {}) or {}
+        if not isinstance(raw_params, Mapping):
+            raise LLMRoutingError(f"LLM routing 'params' for '{call_id}' must be an object.")
+        return LLMRouteResolution(
+            call_id=call_id,
+            model=model_name,
+            endpoint_id=endpoint_id,
+            params=dict(raw_params),
+            source=source,
+        )
+
+    catalog_model, model_info = _validate_known_route_model(
+        model_name,
+        call_id,
+        config,
+        endpoint_id,
+    )
     required = tuple(call_spec.required_capabilities) + tuple(required_capabilities or ())
     explicit_required = tuple(cfg.get("requires") or ())
     required = required + explicit_required
     _validate_required_capabilities(
-        model=model_name,
+        model=catalog_model,
         model_info=model_info,
         call_id=call_id,
         required=required,
     )
     params, warnings = _sanitize_params(
         call_id=call_id,
-        model=model_name,
+        model=catalog_model,
         model_info=model_info,
         params=cfg.get("params", {}) or {},
         policy=active_routing.get("policy", {}) or {},
     )
     if request is not None and warnings:
         getattr(request, "_llm_routing_warnings", []).extend(warnings)
-    provider_options = cfg.get("provider_options", {}) or {}
-    if not isinstance(provider_options, Mapping):
-        raise LLMRoutingError(
-            f"LLM routing 'provider_options' for '{call_id}' must be an object."
-        )
+    provider_options = _sanitize_provider_options(
+        call_id=call_id,
+        model_info=model_info,
+        provider_options=cfg.get("provider_options"),
+    )
     return LLMRouteResolution(
         call_id=call_id,
-        model=model_name,
+        model=catalog_model,
+        endpoint_id=endpoint_id,
         params=params,
         provider_options=dict(provider_options),
         source=source,
@@ -565,6 +749,7 @@ def resolve_call_models(
     *,
     request: Any = None,
     routing: Optional[Mapping[str, Any]] = None,
+    validate_model: bool = True,
 ) -> LLMRouteResolution:
     """Resolve a multi-model call."""
 
@@ -580,9 +765,22 @@ def resolve_call_models(
     if raw_models is None:
         model = cfg.get("model")
         raw_models = [model] if model else []
-    models = _normalize_models(raw_models, inherited_params)
+    inherited_endpoint_id = _normalize_endpoint_id(cfg.get("endpoint_id"), call_id=call_id)
+    models = _normalize_models(
+        raw_models,
+        inherited_params,
+        inherited_endpoint_id=inherited_endpoint_id,
+        call_id=call_id,
+    )
     if not models:
         raise LLMRoutingError(f"No models configured for LLM call '{call_id}'.")
+
+    if not validate_model:
+        return LLMRouteResolution(
+            call_id=call_id,
+            models=models,
+            source=source,
+        )
 
     try:
         from config import config
@@ -593,26 +791,41 @@ def resolve_call_models(
     validated: List[Dict[str, Any]] = []
     for entry in models:
         model_name = str(entry["model"])
-        model_info = _validate_known_model(model_name, call_id, config)
+        catalog_model, model_info = _validate_known_route_model(
+            model_name,
+            call_id,
+            config,
+            _normalize_endpoint_id(entry.get("endpoint_id"), call_id=call_id),
+        )
         required = tuple(call_spec.required_capabilities) + tuple(entry.get("requires") or ())
         _validate_required_capabilities(
-            model=model_name,
+            model=catalog_model,
             model_info=model_info,
             call_id=call_id,
             required=required,
         )
         params, entry_warnings = _sanitize_params(
             call_id=call_id,
-            model=model_name,
+            model=catalog_model,
             model_info=model_info,
             params=entry.get("params", {}) or {},
             policy=active_routing.get("policy", {}) or {},
         )
         clean_entry = dict(entry)
+        clean_entry["model"] = catalog_model
         if params:
             clean_entry["params"] = params
         else:
             clean_entry.pop("params", None)
+        provider_options = _sanitize_provider_options(
+            call_id=call_id,
+            model_info=model_info,
+            provider_options=entry.get("provider_options", cfg.get("provider_options")),
+        )
+        if provider_options:
+            clean_entry["provider_options"] = provider_options
+        else:
+            clean_entry.pop("provider_options", None)
         validated.append(clean_entry)
         warnings.extend(entry_warnings)
 

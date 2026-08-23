@@ -150,6 +150,7 @@ async def get_model_info(model_name: str):
         "minimax": bool(config.MINIMAX_API_KEY),
         "moonshot": bool(config.MOONSHOT_API_KEY),
         "ollama": True,
+        "llamacpp": bool(getattr(config, "LLAMACPP_BASE_URL", "")),
         "fake": True,
     }
     has_api_key = bool(resolved["is_test_model"]) or bool(provider_has_key.get(catalog_provider))

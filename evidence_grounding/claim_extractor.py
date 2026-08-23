@@ -16,7 +16,8 @@ from typing import Any, Callable, Dict, List, Optional
 # Use optimized JSON (3.6x faster than standard json)
 import json_utils as json
 from config import config
-from llm_routing import resolve_call, resolve_temperature
+from evidence_grounding.route_identity import endpoint_id_for_effective_model
+from llm_routing import endpoint_id_call_kwargs, resolve_call, resolve_temperature
 from models import ExtractedClaim
 
 logger = logging.getLogger(__name__)
@@ -314,6 +315,7 @@ class ClaimExtractor:
         extra_verbose: bool = False,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         cancellation_token: Optional[Any] = None,
+        local_execution: Optional[Any] = None,
     ) -> List[ExtractedClaim]:
         """Extract verifiable claims from generated content.
 
@@ -376,7 +378,14 @@ class ClaimExtractor:
                 usage_callback=usage_callback,
                 usage_extra={"phase": "evidence_grounding", "subphase": "claim_extraction"},
                 llm_routing=getattr(request, "_llm_routing", None),
+                provider_options=getattr(route, "provider_options", {}),
+                **endpoint_id_call_kwargs(
+                    endpoint_id_for_effective_model(route, effective_model)
+                ),
                 cancellation_token=cancellation_token,
+                local_execution=local_execution,
+                dispatch_call_id="evidence.extract_claims",
+                dispatch_route_ordinal=0,
             )
         except asyncio.CancelledError:
             raise

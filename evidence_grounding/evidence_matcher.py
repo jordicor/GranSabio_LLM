@@ -17,7 +17,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import json_utils as json
 from config import config
-from llm_routing import resolve_call, resolve_temperature
+from evidence_grounding.route_identity import endpoint_id_for_effective_model
+from llm_routing import endpoint_id_call_kwargs, resolve_call, resolve_temperature
 from models import EvidenceSpan, ExtractedClaim, SpanType
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,7 @@ async def classify_spans_semantically(
     request: Optional[Any] = None,
     usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     cancellation_token: Optional[Any] = None,
+    local_execution: Optional[Any] = None,
 ) -> List[EvidenceSpan]:
     """Classify all non-empty spans with one structured multilingual LLM call."""
     semantic_spans = [span for span in spans if span.span_type != SpanType.EMPTY]
@@ -131,7 +133,14 @@ async def classify_spans_semantically(
                 "subphase": "span_classification",
             },
             llm_routing=getattr(request, "_llm_routing", None),
+            provider_options=getattr(route, "provider_options", {}),
+            **endpoint_id_call_kwargs(
+                endpoint_id_for_effective_model(route, effective_model)
+            ),
             cancellation_token=cancellation_token,
+            local_execution=local_execution,
+            dispatch_call_id="evidence.classify_spans",
+            dispatch_route_ordinal=0,
         )
     except asyncio.CancelledError:
         raise
@@ -584,6 +593,7 @@ class EvidenceMatcher:
         request: Optional[Any] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         cancellation_token: Optional[Any] = None,
+        local_execution: Optional[Any] = None,
     ) -> List[EvidenceSpan]:
         """Semantically classify cached spans and replace the cache."""
         if self.ai_service is None:
@@ -595,6 +605,7 @@ class EvidenceMatcher:
             request=request,
             usage_callback=usage_callback,
             cancellation_token=cancellation_token,
+            local_execution=local_execution,
         )
         return self.spans
 

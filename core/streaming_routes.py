@@ -31,7 +31,7 @@ from content_events import (
     parse_visibility,
 )
 from content_stream import flush_content_events, publish_content_event
-from llm_routing import resolve_call
+from llm_routing import endpoint_id_call_kwargs, resolve_call
 from models import GenerationStatus
 from request_timeouts import (
     get_request_default_timeout,
@@ -124,6 +124,7 @@ def _claim_direct_stream(session: Dict[str, Any]) -> Dict[str, Any]:
         "cancelled": session.get("cancelled", False),
         "hard_cancelled": session.get("hard_cancelled", False),
         "usage_tracker": session.get("usage_tracker"),
+        "local_execution": session.get("local_execution"),
         "direct_stream_count": count + 1,
     }
 
@@ -311,6 +312,8 @@ async def stream_content_direct_v2(session_id: str):
                 thinking_budget_tokens=route_params.get("thinking_budget_tokens", getattr(request_data, 'thinking_budget_tokens', None)),
                 content_type=getattr(request_data, 'content_type', 'biography'),
                 llm_routing=getattr(request_data, "_llm_routing", None),
+                provider_options=getattr(route, "provider_options", {}),
+                **endpoint_id_call_kwargs(getattr(route, "endpoint_id", None)),
                 request_timeout=stream_timeout,
                 usage_callback=usage_tracker.create_callback(
                     phase="direct_stream",
@@ -319,6 +322,9 @@ async def stream_content_direct_v2(session_id: str):
                 ) if usage_tracker else None,
                 cancellation_token=cancellation_token,
                 cancel_callback=direct_stream_cancelled,
+                local_execution=snapshot.get("local_execution"),
+                dispatch_call_id="generation.direct_stream",
+                dispatch_route_ordinal=0,
             ):
                 if await direct_stream_cancelled():
                     raise asyncio.CancelledError()

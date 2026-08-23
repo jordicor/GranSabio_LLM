@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Set
 
 from model_aliasing import get_evaluator_alias
+from qa_result_utils import is_resolved_gran_sabio_false_positive
 
 
 def _safe_get_evaluation_attr(evaluation: Any, attr: str) -> Any:
@@ -45,6 +46,8 @@ def _format_layer_feedback_lines(layer_entries: Any, qa_results: Dict[str, Dict[
             for model_entry in entry.get("model_feedback", []) or []:
                 if not isinstance(model_entry, dict):
                     continue
+                if model_entry.get("resolution") == "gran_sabio_false_positive":
+                    continue
                 model_name = model_entry.get("evaluator") or "Evaluator"
                 text = (model_entry.get("deal_breaker_reason") or model_entry.get("feedback") or "").strip()
                 if text:
@@ -63,6 +66,8 @@ def _format_layer_feedback_lines(layer_entries: Any, qa_results: Dict[str, Dict[
     for layer_name, model_results in qa_results.items():
         fallback_lines.append(f"- {layer_name}")
         for model_name, evaluation in model_results.items():
+            if is_resolved_gran_sabio_false_positive(evaluation):
+                continue
             evaluator_name = get_evaluator_alias(evaluation, fallback=None)
             text = (
                 _safe_get_evaluation_attr(evaluation, "deal_breaker_reason")
@@ -84,6 +89,8 @@ def _fallback_actionable_feedback(qa_results: Dict[str, Dict[str, Any]]) -> List
 
     for layer_name, model_results in qa_results.items():
         for model_name, evaluation in model_results.items():
+            if is_resolved_gran_sabio_false_positive(evaluation):
+                continue
             evaluator_name = get_evaluator_alias(evaluation, fallback=None)
             text = (
                 _safe_get_evaluation_attr(evaluation, "deal_breaker_reason")
