@@ -960,19 +960,43 @@ class TestHistoryInjection:
 class TestArbiterConfig:
     """Tests for Arbiter configuration."""
 
-    def test_arbiter_model_in_defaults(self):
+    SHIPPED_ARBITER_MODEL = "gpt-6-sol"
+
+    @pytest.fixture
+    def shipped_routing(self, monkeypatch):
+        """Resolve against the tracked routing file with a stub model catalog.
+
+        Keeps the local model_specs.json and any LLM_ROUTING_DEFAULT_PATH
+        override out of the shipped-default assertions.
+        """
+        from pathlib import Path
+
+        import config as config_module
+        import llm_routing
+
+        monkeypatch.setenv(
+            "LLM_ROUTING_DEFAULT_PATH",
+            str(Path(llm_routing.__file__).with_name(llm_routing.DEFAULT_ROUTING_FILENAME)),
+        )
+
+        def fake_model_info(_self, model_name, **_kwargs):
+            return {"model_id": model_name, "provider": "openai", "capabilities": ["text"]}
+
+        monkeypatch.setattr(config_module.Config, "get_model_info", fake_model_info)
+
+    def test_arbiter_model_in_defaults(self, shipped_routing):
         """Arbiter model should be in default_models."""
         from config import get_default_models
         defaults = get_default_models()
         assert "arbiter" in defaults
-        assert defaults["arbiter"] == "gpt-5-mini"
+        assert defaults["arbiter"] == self.SHIPPED_ARBITER_MODEL
 
-    def test_arbiter_model_function(self):
+    def test_arbiter_model_function(self, shipped_routing):
         """arbiter.resolve routing should return configured model."""
         from llm_routing import resolve_call
 
         model = resolve_call("arbiter.resolve").model
-        assert model == "gpt-5-mini"
+        assert model == self.SHIPPED_ARBITER_MODEL
 
     def test_arbiter_config_values(self):
         """Arbiter config values should be accessible."""

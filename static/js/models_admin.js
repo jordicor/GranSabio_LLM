@@ -69,27 +69,73 @@
     });
   }
 
+  // Per-million rate keys of a catalog pricing block, in persisted order. The
+  // server writes a key only when the provider lists that rate (an unlisted
+  // rate is an unknown price, never a free one), so the UI carries each key
+  // through unchanged and never fills a missing one in.
+  const PRICING_RATE_KEYS = [
+    "input_per_million",
+    "output_per_million",
+    "cached_input_per_million",
+    "cache_write_per_million",
+  ];
+
+  function finiteNumber(value) {
+    if (value === null || value === undefined || value === "") return undefined;
+    const num = Number(value);
+    return Number.isFinite(num) ? num : undefined;
+  }
+
   function normalizePricing(raw = {}) {
-    const input =
+    const pricing = {};
+    const input = finiteNumber(
       raw.input_per_million ??
-      raw.input ??
-      raw.prompt ??
-      raw.prompt_per_million ??
-      raw.prompt_price ??
-      raw.input_price ??
-      0;
-    const output =
+        raw.input ??
+        raw.prompt ??
+        raw.prompt_per_million ??
+        raw.prompt_price ??
+        raw.input_price
+    );
+    if (input !== undefined) pricing.input_per_million = input;
+    const output = finiteNumber(
       raw.output_per_million ??
-      raw.output ??
-      raw.completion ??
-      raw.completion_per_million ??
-      raw.completion_price ??
-      raw.output_price ??
-      0;
-    return {
-      input_per_million: Number(input) || 0,
-      output_per_million: Number(output) || 0,
-    };
+        raw.output ??
+        raw.completion ??
+        raw.completion_per_million ??
+        raw.completion_price ??
+        raw.output_price
+    );
+    if (output !== undefined) pricing.output_per_million = output;
+    for (const key of ["cached_input_per_million", "cache_write_per_million"]) {
+      const rate = finiteNumber(raw[key]);
+      if (rate !== undefined) pricing[key] = rate;
+    }
+    const longContext = raw.long_context;
+    if (longContext && typeof longContext === "object" && !Array.isArray(longContext)) {
+      const threshold = finiteNumber(longContext.threshold_tokens);
+      if (threshold !== undefined && threshold > 0) {
+        const block = { threshold_tokens: threshold };
+        for (const key of PRICING_RATE_KEYS) {
+          const rate = finiteNumber(longContext[key]);
+          if (rate !== undefined) block[key] = rate;
+        }
+        pricing.long_context = block;
+      }
+    }
+    return pricing;
+  }
+
+  function formatLongContext(block) {
+    if (!block || typeof block !== "object") return "-";
+    const rates = [
+      ["in", block.input_per_million],
+      ["out", block.output_per_million],
+      ["cached", block.cached_input_per_million],
+      ["write", block.cache_write_per_million],
+    ]
+      .filter(([, value]) => value !== undefined)
+      .map(([label, value]) => `${label} ${formatMoney(value)}`);
+    return `>${formatNumber(block.threshold_tokens)} tokens: ${rates.join(" / ") || "-"}`;
   }
 
   function normalizeCapabilities(raw) {
@@ -1168,6 +1214,8 @@
       const pricingFields = [
         { key: "input_per_million", label: "Input $/M" },
         { key: "output_per_million", label: "Output $/M" },
+        { key: "cached_input_per_million", label: "Cached input $/M" },
+        { key: "cache_write_per_million", label: "Cache write $/M" },
       ];
 
       let diffs = "";
@@ -1188,6 +1236,12 @@
         if (oldVal !== newVal) {
           diffs += `<div class="diff-field">${escapeHtml(f.label)}: <span class="diff-old">${formatMoney(oldVal)}</span> -> <span class="diff-new">${formatMoney(newVal)}</span></div>`;
         }
+      }
+
+      const oldLongContext = localModel.pricing?.long_context;
+      const newLongContext = remoteModel.pricing?.long_context;
+      if (JSON.stringify(oldLongContext ?? null) !== JSON.stringify(newLongContext ?? null)) {
+        diffs += `<div class="diff-field">Long context $/M: <span class="diff-old">${escapeHtml(formatLongContext(oldLongContext))}</span> -> <span class="diff-new">${escapeHtml(formatLongContext(newLongContext))}</span></div>`;
       }
 
       for (const f of listFields) {
@@ -1305,6 +1359,9 @@
       if (remote.context_window !== local.context_window) changes.push("context");
       if (remote.pricing?.input_per_million !== local.pricing?.input_per_million) changes.push("input price");
       if (remote.pricing?.output_per_million !== local.pricing?.output_per_million) changes.push("output price");
+      if (remote.pricing?.cached_input_per_million !== local.pricing?.cached_input_per_million) changes.push("cached input price");
+      if (remote.pricing?.cache_write_per_million !== local.pricing?.cache_write_per_million) changes.push("cache write price");
+      if (JSON.stringify(remote.pricing?.long_context ?? null) !== JSON.stringify(local.pricing?.long_context ?? null)) changes.push("long-context price");
       if (remote.output_tokens !== local.output_tokens) changes.push("output tokens");
       if (remote.name !== local.name) changes.push("name");
       if ([...toArray(remote.supported_parameters)].sort().join(",") !== [...toArray(local.supported_parameters)].sort().join(",")) changes.push("supported parameters");

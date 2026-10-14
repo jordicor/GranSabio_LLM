@@ -33,6 +33,8 @@ This folder contains demonstration scripts showcasing the capabilities of Gran S
 
 ---
 
+The twelve executable demos load the repository `.env` explicitly before importing the client. Existing process variables take precedence. The SDK itself never loads environment files. Install the repository demo dependencies (including `python-dotenv`) separately from the minimal SDK.
+
 ## Demo Details
 
 ### 01: Simple Article

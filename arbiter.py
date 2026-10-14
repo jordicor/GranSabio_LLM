@@ -13,7 +13,7 @@ The actual Arbiter class implementation will be added in Phase 2.
 """
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -28,10 +28,12 @@ from content_events import (
     ContentStatus,
     ContentSubphase,
 )
+from context_budget import ContextAdmissionError
 from llm_routing import endpoint_id_call_kwargs
 from local_execution_policy import LocalExecutionPolicyError
 from model_aliasing import PromptPart
 from model_capability_registry import resolve_model_capability_context
+from models import shared_context_call_kwargs
 from request_timeouts import resolve_request_timeout
 
 if TYPE_CHECKING:
@@ -1565,6 +1567,10 @@ class Arbiter:
 
         except LocalExecutionPolicyError:
             raise
+        except ContextAdmissionError:
+            # Admission and budget verdicts are terminal; never wrap them as a
+            # generic arbiter failure.
+            raise
         except Exception as e:
             if is_content_filter_stop(e):
                 self._logger.warning(
@@ -1663,6 +1669,7 @@ class Arbiter:
         ):
             return await self.ai_service.call_ai_with_validation_tools(
                 prompt=prompt,
+                **shared_context_call_kwargs(context.original_request),
                 model=selected_model,
                 validation_callback=_neutral_validation_callback,
                 output_contract=OutputContract.JSON_STRUCTURED,
@@ -1788,6 +1795,7 @@ class Arbiter:
             )
             async for chunk in self.ai_service.generate_content_stream(
                 prompt=prompt,
+                **shared_context_call_kwargs(context.original_request),
                 model=selected_model,
                 system_prompt=ARBITER_SYSTEM_PROMPT,
                 max_tokens=max_tokens,
@@ -1869,6 +1877,7 @@ class Arbiter:
         else:
             response_content = await self.ai_service.generate_content(
                 prompt=prompt,
+                **shared_context_call_kwargs(context.original_request),
                 model=selected_model,
                 system_prompt=ARBITER_SYSTEM_PROMPT,
                 max_tokens=max_tokens,
@@ -2161,7 +2170,9 @@ class Arbiter:
         # ALWAYS call AI to verify edits (no passthrough, no fallback)
         self._logger.info(f"Verifying {len(proposed_edits)} edit(s) with AI ({selected_model})...")
         ai_response = await self._resolve_with_ai(
-            context,
+            # Prompt indices must refer to the same filtered list as the parser.
+            # Keep the caller's context intact for original-order history below.
+            replace(context, proposed_edits=proposed_edits),
             conflicts,
             distribution,
             selected_model,

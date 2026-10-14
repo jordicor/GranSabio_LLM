@@ -12,6 +12,8 @@ Covers the three vectors of the finding:
 No environment variables or network access required.
 """
 
+import pytest
+
 from tools.ai_json_cleanroom import (
     MAX_PATTERN_LENGTH,
     ErrorCode,
@@ -172,6 +174,35 @@ def test_legitimate_schema_still_validates():
 
     assert result.json_valid is True, [e.to_dict() for e in result.errors]
     assert result.data == {"name": "gran_sabio", "age": 3, "tags": ["x"], "status": "active"}
+
+
+@pytest.mark.parametrize("transition_schema,transition,valid", [
+    ({"type": "null"}, None, True),
+    ({"anyOf": [{"type": "string"}, {"type": "null"}]}, None, True),
+    ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "Continue the thread", True),
+    ({"type": "string"}, None, False),
+    ({"anyOf": [{"type": "string"}, {"type": "integer"}]}, None, False),
+    ({"type": "null"}, "null", False),
+])
+def test_nullable_transition_schema_keeps_null_distinct_from_other_types(
+    transition_schema, transition, valid,
+):
+    """A missing transition is JSON null, not a failed union or the string 'null'."""
+    payload = {"incoming_transition": transition, "outgoing_transition": transition}
+    schema = {
+        "type": "object",
+        "required": ["incoming_transition", "outgoing_transition"],
+        "additionalProperties": False,
+        "properties": {key: transition_schema for key in payload},
+    }
+
+    result = validate_ai_json(payload, schema=schema)
+
+    assert result.json_valid is valid, [error.to_dict() for error in result.errors]
+    if valid:
+        assert result.data == payload
+    else:
+        assert _codes(result) & {ErrorCode.TYPE_MISMATCH, ErrorCode.ANY_OF_FAILED}
 
 
 def test_fixed_width_inner_repeat_pattern_allowed():

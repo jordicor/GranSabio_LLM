@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import HTTPException
 
 import context_budget
+import long_text_adapter
 from config import DEFAULT_OUTPUT_TOKEN_FALLBACK, config
 from context_budget import (
     AUTO_QA_PLANNER_SKELETON as _AUTO_QA_SKELETON,
@@ -285,6 +286,17 @@ def resolve_long_text_mode(
             detail="long_text_mode='on' requires min_words, max_words, or both so a target can be derived.",
         )
 
+    if not long_text_adapter.LONG_TEXT_AVAILABLE:
+        reason = long_text_adapter.LONG_TEXT_UNAVAILABLE
+        if requested_mode == "on":
+            raise HTTPException(status_code=400, detail=reason)
+        resolved["activation_reason"] = reason
+        advisories.append(build_advisory(
+            code="long_text_unavailable",
+            message=f"{reason} Continuing with standard generation and the requested word limits.",
+        ))
+        return resolved, advisories
+
     if derived_target_words is not None:
         if derived_target_words < config_obj.LONG_TEXT_AUTO_MIN_WORDS:
             raise HTTPException(
@@ -302,6 +314,12 @@ def resolve_long_text_mode(
                     "multiple runs instead of requesting a larger single document."
                 ),
             )
+
+    if request.shared_context:
+        raise HTTPException(
+            status_code=400,
+            detail="shared_context is not supported with enabled Long Text Mode; set long_text_mode='off'.",
+        )
 
     resolved["enabled"] = True
     resolved["activation_reason"] = (
@@ -654,6 +672,15 @@ def _build_receptors(
                 )
             )
 
+    if request.shared_context:
+        for spec in receptors:
+            component = context_budget.make_payload_component(
+                "shared_context", request.shared_context, "message",
+                spec.budget.provider, spec.model,
+            )
+            spec.budget.components.append(component)
+            if spec.worst_case_budget is not None:
+                spec.worst_case_budget.components.append(component)
     return receptors
 
 

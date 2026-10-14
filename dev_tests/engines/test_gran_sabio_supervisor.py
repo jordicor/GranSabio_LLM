@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from deal_breaker_tracker import DealBreakerTracker
 from gran_sabio_supervisor import GranSabioSupervisor
 from models import ContentRequest, QAEvaluation
@@ -21,6 +24,15 @@ def _deal_breaker(model: str, layer: str = "Accuracy", slot_id: str = "qa:0"):
 
 def _tracker(tmp_path: Path):
     return DealBreakerTracker(persistence_path=str(tmp_path))
+
+
+@pytest.mark.parametrize("activation", ["enabled", "bench_enabled"])
+def test_request_rejects_unsupported_qa_replacement_activation(activation):
+    with pytest.raises(ValidationError, match="supervisor is observation-only"):
+        ContentRequest(
+            prompt="Write a valid article prompt",
+            qa_replacement_policy={activation: True, "replacements": {"qa:0": "model-b"}},
+        )
 
 
 def test_tracker_completes_escalation_for_each_evaluator(tmp_path):
@@ -140,7 +152,10 @@ def test_supervisor_recommends_bench_after_three_false_positives_without_replace
     result = GranSabioSupervisor().review_session(
         session_id="session-1",
         tracker=tracker,
-        request=ContentRequest(prompt="Write a valid article prompt"),
+        request=ContentRequest(
+            prompt="Write a valid article prompt",
+            qa_replacement_policy={"enabled": False, "replacements": {"qa:0": "model-b"}},
+        ),
         session={},
     )
 
@@ -148,6 +163,9 @@ def test_supervisor_recommends_bench_after_three_false_positives_without_replace
     assert result["recommended_action"] == "review_bench_recommendations"
     assert result["bench_recommendations"][0]["replacement"] is None
     assert result["bench_actions"] == []
+    assert {event["event_type"] for event in tracker.get_session_events("session-1")} == {
+        "deal_breaker_raised"
+    }
 
 
 def test_supervisor_tracks_technical_failures_separately(tmp_path):

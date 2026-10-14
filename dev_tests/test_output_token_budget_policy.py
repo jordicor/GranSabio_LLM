@@ -1,5 +1,6 @@
 import ast
 import inspect
+import subprocess
 from pathlib import Path
 
 from ai_service import AIService
@@ -119,18 +120,29 @@ def _parent_functions(tree: ast.AST) -> dict[ast.AST, str]:
     return functions
 
 
+def _repository_python_sources(root: Path) -> list[Path]:
+    """Python files of this repository: tracked plus untracked, never git-ignored.
+
+    Scanning the directory tree would also pick up whatever happens to sit in
+    it, such as agent worktrees under the ignored ``.claude/`` directory.
+    """
+    listing = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "*.py"],
+        check=True,
+        capture_output=True,
+    )
+    paths = [root / name for name in listing.stdout.decode("utf-8").split("\0") if name]
+    # --cached still lists tracked files deleted from the working tree.
+    return [path for path in paths if path.is_file()]
+
+
 def test_no_unapproved_local_max_tokens_numeric_fallbacks():
     root = Path(__file__).resolve().parents[1]
     excluded = {
-        ".git",
-        ".pytest_cache",
-        "__pycache__",
         "dev_tests",
         "docs",
         "demos",
-        "templates",
         "saas",
-        "gransabio_reimagined",
     }
     allowed_get_defaults = {
         ("config.py", "_validate_thinking_budget", 16384),
@@ -139,7 +151,7 @@ def test_no_unapproved_local_max_tokens_numeric_fallbacks():
     }
 
     findings: list[str] = []
-    for path in root.rglob("*.py"):
+    for path in _repository_python_sources(root):
         relative = path.relative_to(root)
         if any(part in excluded for part in relative.parts):
             continue

@@ -4,7 +4,10 @@
     "MCP servers require absolute paths - relative paths will NOT work.",
     "Recommended: Use install_mcp.bat (Windows) or install_mcp.sh (Linux/macOS) instead.",
     "Windows example: C:/Projects/GranSabio_LLM/mcp_server/gransabio_mcp_server.py",
-    "Linux example: /home/user/GranSabio_LLM/mcp_server/gransabio_mcp_server.py"
+    "Linux example: /home/user/GranSabio_LLM/mcp_server/gransabio_mcp_server.py",
+    "Model and effort overrides default to empty; the Gran Sabio API supplies defaults through llm_routing.",
+    "GRANSABIO_ARBITER_MODEL selects Gran Sabio (gran_sabio_model), not the separate layer-edit Arbiter.",
+    "Remove GRANSABIO_ARBITER_REASONING from older configs: it never affected API requests and is now rejected."
   ],
   "mcpServers": {
     "gransabio-llm": {
@@ -14,12 +17,11 @@
       "env": {
         "GRANSABIO_API_URL": "${GRANSABIO_API_URL:-http://localhost:8000}",
         "GRANSABIO_API_KEY": "${GRANSABIO_API_KEY:-}",
-        "GRANSABIO_GENERATOR_MODEL": "${GRANSABIO_GENERATOR_MODEL:-gpt-5.2}",
-        "GRANSABIO_QA_MODELS": "${GRANSABIO_QA_MODELS:-claude-opus-4-6,z-ai/glm-4.7,gemini-3-pro-preview}",
-        "GRANSABIO_ARBITER_MODEL": "${GRANSABIO_ARBITER_MODEL:-claude-opus-4-6}",
-        "GRANSABIO_GENERATOR_REASONING": "${GRANSABIO_GENERATOR_REASONING:-medium}",
-        "GRANSABIO_QA_REASONING": "${GRANSABIO_QA_REASONING:-medium}",
-        "GRANSABIO_ARBITER_REASONING": "${GRANSABIO_ARBITER_REASONING:-high}",
+        "GRANSABIO_GENERATOR_MODEL": "${GRANSABIO_GENERATOR_MODEL:-}",
+        "GRANSABIO_QA_MODELS": "${GRANSABIO_QA_MODELS:-}",
+        "GRANSABIO_ARBITER_MODEL": "${GRANSABIO_ARBITER_MODEL:-}",
+        "GRANSABIO_GENERATOR_REASONING": "${GRANSABIO_GENERATOR_REASONING:-}",
+        "GRANSABIO_QA_REASONING": "${GRANSABIO_QA_REASONING:-}",
         "GRANSABIO_THINKING_BUDGET": "${GRANSABIO_THINKING_BUDGET:-0}"
       },
       "description": "Gran Sabio LLM - Multi-model QA for code analysis and content generation with reasoning support"

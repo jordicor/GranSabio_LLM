@@ -36,6 +36,7 @@ import hashlib
 import logging
 import math
 import os
+import re
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -691,27 +692,24 @@ def _is_openai_provider(provider: str) -> bool:
     return str(provider or "").strip().lower() == "openai"
 
 
-def _is_cjk_codepoint(codepoint: int) -> bool:
-    return (
-        0x4E00 <= codepoint <= 0x9FFF  # CJK Unified Ideographs
-        or 0x3400 <= codepoint <= 0x4DBF  # CJK Ext A
-        or 0x3040 <= codepoint <= 0x30FF  # Hiragana + Katakana
-        or 0xAC00 <= codepoint <= 0xD7AF  # Hangul Syllables
-        or 0x1100 <= codepoint <= 0x11FF  # Hangul Jamo
-        or 0x20000 <= codepoint <= 0x2A6DF  # CJK Ext B
-    )
+_CJK_RE = re.compile(
+    "[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff"
+    "\uac00-\ud7af\u1100-\u11ff\U00020000-\U0002a6df]"
+)
+_CJK_RUN_RE = re.compile(_CJK_RE.pattern + "+")
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
 
 
 def _cjk_fraction(text: str) -> float:
-    total = 0
-    cjk = 0
-    for char in text:
-        if char.isspace():
-            continue
-        total += 1
-        if _is_cjk_codepoint(ord(char)):
-            cjk += 1
-    return (cjk / total) if total else 0.0
+    if text.isascii() or _CJK_RE.search(text) is None:
+        return 0.0
+
+    # Count runs without allocating a match or character list for the full text.
+    cjk = sum(match.end() - match.start() for match in _CJK_RUN_RE.finditer(text))
+    whitespace = sum(
+        match.end() - match.start() for match in _WHITESPACE_RUN_RE.finditer(text)
+    )
+    return cjk / (len(text) - whitespace)
 
 
 def _estimate_ratio(text: str, hint: str) -> float:

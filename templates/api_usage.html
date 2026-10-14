@@ -151,7 +151,12 @@ response = requests.post('https://api.example.com/generate', json={
     "qa_layers": ["accuracy", "readability", "engagement"]
 })
 
-session_id = response.json()['session_id']
+response.raise_for_status()
+initial = response.json()
+session_id = initial.get('session_id')
+if not session_id:
+    feedback = initial.get('auto_qa_feedback') or initial.get('preflight_feedback') or {}
+    raise RuntimeError(f"Generation did not start: {feedback} (status: {initial.get('status')})")
 
 # Step 2: Check status
 status = requests.get(f'https://api.example.com/status/{session_id}')
@@ -282,7 +287,23 @@ content = result.json()['content']</code></pre>
                     <pre><code class="language-json">{
   "session_id": "550e8400-e29b-41d4-a716-446655440000",
   "status": "initialized",
-  "message": "Content generation started successfully"
+  "project_id": "550e8400-e29b-41d4-a716-446655440000"
+}</code></pre>
+                </div>
+                <p>HTTP 200 can also mean generation did not start. Always check <code>session_id</code> before polling or streaming. A <code>preflight_rejected</code> response has no session and carries <code>preflight_feedback.user_feedback</code> and <code>issues</code>. Its <code>decision</code> distinguishes <code>reject</code> from <code>manual_review</code>, which asks for clarification or human review. An <code>auto_qa_rejected</code> response carries <code>auto_qa_feedback.message</code>. Correct the request before submitting it again.</p>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON · Manual review</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "status": "preflight_rejected",
+  "session_id": null,
+  "preflight_feedback": {
+    "decision": "manual_review",
+    "user_feedback": "Please clarify the requirements before generation.",
+    "issues": []
+  }
 }</code></pre>
                 </div>
             </section>
@@ -821,7 +842,12 @@ def generate_biography(subject_name, focus_areas):
         }
     )
 
-    session_id = response.json()['session_id']
+    response.raise_for_status()
+    initial = response.json()
+    session_id = initial.get('session_id')
+    if not session_id:
+        feedback = initial.get('auto_qa_feedback') or initial.get('preflight_feedback') or {}
+        raise RuntimeError(f"Generation did not start: {feedback} (status: {initial.get('status')})")
 
     # Poll for completion
     while True:
@@ -897,7 +923,13 @@ print(biography)</code></pre>
         })
     });
 
-    const { session_id } = await response.json();
+    if (!response.ok) throw new Error(`Generation failed: ${response.status}`);
+    const initial = await response.json();
+    const { session_id } = initial;
+    if (!session_id) {
+        const feedback = initial.auto_qa_feedback || initial.preflight_feedback || {};
+        throw new Error(`Generation did not start: ${feedback.message || feedback.user_feedback || initial.status}`);
+    }
 
     // Stream progress (project_id = session_id when not explicitly provided)
     const eventSource = new EventSource(

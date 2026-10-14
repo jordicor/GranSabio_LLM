@@ -220,6 +220,51 @@ class WordCountEnforcement(BaseModel):
         }
 
 
+class SegmentBudgetsContract(BaseModel):
+    """Self-declared per-segment word budgets contract (segment-budgets/v1).
+
+    Opt-in: when present and enabled, the JSON output must carry a structure
+    object in ``structure_field`` declaring the document word budget and the
+    ordered sections (title, optional subsection_id, parent_subsection_id and
+    per-section word budget). The target text is then validated
+    deterministically against that declaration before acceptance: headings
+    must match the declared titles/levels in order and every segment length
+    (heading included) must fit its budget.
+    """
+
+    enabled: bool = Field(default=True, description="Enable segment budget validation")
+    schema_version: Literal["segment-budgets/v1"] = Field(
+        default="segment-budgets/v1",
+        description="Version of the self-declared structure schema",
+    )
+    structure_field: str = Field(
+        default="composition",
+        min_length=1,
+        description="JSON field that carries the self-declared structure",
+    )
+    base_heading_level: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+        description="Markdown heading level of top-level sections (subsections use base+1)",
+    )
+    severity: Literal["deal_breaker"] = Field(
+        default="deal_breaker",
+        description="Severity when the declared budgets are violated",
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "enabled": True,
+                "schema_version": "segment-budgets/v1",
+                "structure_field": "composition",
+                "base_heading_level": 3,
+                "severity": "deal_breaker"
+            }
+        }
+
+
 class PhraseFrequencyRule(BaseModel):
     """Rule definition for phrase repetition checks."""
 
@@ -714,7 +759,7 @@ class ExtractedClaim(BaseModel):
     """A single verifiable claim extracted from generated content."""
 
     idx: int = Field(..., ge=0, description="Claim index")
-    claim: str = Field(..., max_length=300, description="The claim text")
+    claim: str = Field(..., description="The claim text")
     kind: Literal["factual", "inference", "opinion", "trivial"] = Field(
         ..., description="Classification of the claim type"
     )
@@ -1000,6 +1045,14 @@ class ExecutionPolicy(BaseModel):
 class ContentRequest(BaseModel):
     """Request model for content generation"""
     prompt: str = Field(..., min_length=10, max_length=MAX_PROMPT_CHARS, description="The content generation prompt")
+    shared_context: Optional[str] = Field(
+        default=None,
+        max_length=MAX_SOURCE_TEXT_CHARS,
+        description=(
+            "Optional stable source data shared across tasks. Sent as a separate user message "
+            "before the task prompt, never as system instructions."
+        ),
+    )
     request_name: Optional[str] = Field(
         default=None,
         max_length=128,
@@ -1010,22 +1063,24 @@ class ContentRequest(BaseModel):
         default=False,
         description="When true, enforce JSON validation/payload handling while keeping the declared content_type.",
     )
-    target_field: Optional[Union[str, List[str]]] = Field(
+    target_field: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("target_field", "text_field_path"),
         description=(
-            "Path(s) to primary text field(s) in JSON output using jmespath notation. "
-            "Examples: 'generated_text', 'data.content', ['chapter', 'notes']. "
-            "Smart Edit and algorithmic QA guards operate on these fields automatically."
+            "Path to one primary text field in JSON output using jmespath notation. "
+            "Examples: 'generated_text', 'data.content', 'items[0].text'. "
+            "Lists of paths are rejected. Smart Edit and algorithmic QA guards "
+            "operate on this field automatically."
         )
     )
     target_field_only: bool = Field(
         default=False,
         validation_alias=AliasChoices("target_field_only", "text_field_only"),
         description=(
-            "If true: AI QA receives only extracted text. "
-            "If false: AI QA receives complete JSON. "
-            "Algorithmic QA always uses extracted text when target_field is set."
+            "If true: AI QA and minority adjudication receive only extracted text. "
+            "If false (default): they receive complete JSON with the current field edits. "
+            "Smart Edit locators and algorithmic QA always use extracted text; "
+            "only the selected field can be edited."
         )
     )
     username: Optional[str] = Field(default=None, description="User identifier required when referencing attachments")
@@ -1113,6 +1168,10 @@ class ContentRequest(BaseModel):
         description="Use X% of model's maximum available tokens (1-100). Takes precedence over max_tokens"
     )
     system_prompt: Optional[str] = Field(default=None, max_length=MAX_SYSTEM_PROMPT_CHARS, description="Custom system prompt to override default editorial prompt")
+    include_default_system_context: bool = Field(
+        default=True,
+        description="Append the automatic language instruction and current date to the generation system prompt.",
+    )
     min_words: Optional[int] = Field(default=None, gt=0, description="Minimum words for generation")
     max_words: Optional[int] = Field(default=None, gt=0, description="Maximum words for generation (takes precedence over max_tokens)")
     long_text_mode: Literal["auto", "on", "off"] = Field(
@@ -1215,9 +1274,10 @@ class ContentRequest(BaseModel):
     )
     qa_replacement_policy: Optional[Dict[str, Any]] = Field(
         default=None,
+        deprecated=True,
         description=(
-            "Optional explicit QA replacement/bench policy. Disabled by default; "
-            "replacements require user-provided substitutes."
+            "Legacy disabled QA replacement policy. The supervisor only observes "
+            "and recommends review; enabled or bench_enabled activation is rejected."
         ),
     )
     qa_layers: List[QALayer] = Field(
@@ -1242,13 +1302,6 @@ class ContentRequest(BaseModel):
         default=False,
         description="When true, JSON validation errors do not consume iterations (retries are handled separately)"
     )
-    max_consecutive_smart_edits: int = Field(
-        default_factory=lambda: config.DEFAULT_MAX_CONSECUTIVE_SMART_EDITS,
-        ge=1,
-        le=999,
-        description="Maximum consecutive smart edit passes before forcing full regeneration (configurable via DEFAULT_MAX_CONSECUTIVE_SMART_EDITS in .env)"
-    )
-
     smart_editing_mode: Literal["auto", "always", "never"] = Field(
         default="auto",
         description=(
@@ -1357,6 +1410,12 @@ class ContentRequest(BaseModel):
         description="Word count enforcement configuration"
     )
 
+    # Segment budgets contract (self-declared per-section word budgets in JSON output)
+    segment_budgets: Optional[SegmentBudgetsContract] = Field(
+        default=None,
+        description="Segment budgets contract configuration (segment-budgets/v1)"
+    )
+
     # Phrase frequency QA configuration
     phrase_frequency: Optional[PhraseFrequencyConfig] = Field(
         default=None,
@@ -1425,9 +1484,31 @@ class ContentRequest(BaseModel):
     # These fields are set during processing to provide context to IAs
     _current_iteration: Optional[int] = None
     _total_iterations: Optional[int] = None
-    _generation_mode: Optional[str] = None  # "normal" | "smart_edit"
-    _smart_edit_metadata: Optional[Dict[str, Any]] = None
+    _generation_mode: Optional[str] = None  # "final_verification" for read-only QA
     _resolved_long_text_mode: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_retired_smart_edit_limit(cls, value: Any) -> Any:
+        """Reject the retired outer-loop option without changing other extras."""
+        if isinstance(value, dict) and "max_consecutive_smart_edits" in value:
+            raise ValueError(
+                "max_consecutive_smart_edits was removed because outer-iteration "
+                "Smart Edit is inactive. Omit this parameter."
+            )
+        return value
+
+    @field_validator("qa_replacement_policy")
+    @classmethod
+    def validate_qa_replacement_policy(cls, value: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Reject replacement activation until a QA plan actuator exists."""
+        if value and (value.get("enabled") or value.get("bench_enabled")):
+            raise ValueError(
+                "qa_replacement_policy cannot enable QA replacement or benching: "
+                "the Gran Sabio supervisor is observation-only. "
+                "Omit the policy or keep enabled and bench_enabled false."
+            )
+        return value
 
     @field_validator('max_tokens_percentage')
     @classmethod
@@ -1499,7 +1580,7 @@ class ContentRequest(BaseModel):
 
     @field_validator('target_field')
     @classmethod
-    def validate_target_field_syntax(cls, v: Optional[Union[str, List[str]]]) -> Optional[Union[str, List[str]]]:
+    def validate_target_field_syntax(cls, v: Optional[str]) -> Optional[str]:
         """Validate target_field syntax using json_field_utils validation."""
         if v is not None:
             from json_field_utils import validate_target_field
@@ -1532,6 +1613,17 @@ class ContentRequest(BaseModel):
                 "json_schema requires an effective JSON request. "
                 "Set json_output=True or content_type='json', or omit json_schema."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_segment_budgets_target(self):
+        if self.segment_budgets is not None and self.segment_budgets.enabled:
+            if not is_json_output_requested(self):
+                raise ValueError("segment_budgets requires JSON output")
+            if not isinstance(self.target_field, str):
+                raise ValueError("segment_budgets requires one explicit target_field")
+            if self.target_field == self.segment_budgets.structure_field:
+                raise ValueError("segment_budgets structure_field must differ from target_field")
         return self
 
     @model_validator(mode="after")
@@ -2208,3 +2300,18 @@ def normalize_qa_models_config(
         result.append(model_config_obj)
 
     return result
+
+
+def shared_context_call_kwargs(request: Any) -> Dict[str, str]:
+    """Forward supplied source data without changing calls for legacy requests."""
+    context = getattr(request, "shared_context", None)
+    return {"shared_context": context} if context else {}
+
+
+def request_evidence_context(request: Any) -> str:
+    """Combine source evidence and task for existing single-context consumers."""
+    prompt = getattr(request, "prompt", "") or ""
+    context = getattr(request, "shared_context", None)
+    if not context:
+        return prompt
+    return f"SHARED SOURCE DATA (reference evidence):\n{context}\n\nTASK:\n{prompt}"

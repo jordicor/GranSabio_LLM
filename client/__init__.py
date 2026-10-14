@@ -36,10 +36,15 @@ from typing import Any, Dict, Optional
 class GranSabioClientError(Exception):
     """Exception raised for Gran Sabio client errors."""
 
-    def __init__(self, message: str, status_code: Optional[int] = None, details: Optional[Dict] = None):
+    def __init__(
+        self, message: str, status_code: Optional[int] = None,
+        details: Optional[Dict] = None, *, provider_outcome: Optional[str] = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.details = details or {}
+        # A terminal rejection may include paid preflight or Auto-QA work.
+        self.provider_outcome = provider_outcome
 
 
 class TransientGranSabioError(GranSabioClientError):
@@ -67,6 +72,7 @@ class GranSabioGenerationRejected(GranSabioClientError):
         self.details = details or {}
 
 
+from ._common import admission_rejection_error
 from .async_client import AsyncGranSabioClient
 from .sync_client import GranSabioClient
 
@@ -77,6 +83,7 @@ __all__ = [
     "TransientGranSabioError",
     "GranSabioGenerationCancelled",
     "GranSabioGenerationRejected",
+    "admission_rejection_error",
 ]
 
-__version__ = "1.2.0"
+__version__ = "1.3.1"

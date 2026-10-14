@@ -74,6 +74,10 @@ def parameter_policy(
 
     if is_kimi_fixed_sampling_model(provider_key, model_id):
         policy.update(KIMI_FIXED_SAMPLING_PARAMETER_POLICY)
+    if provider_key == "gemini" and model_id.removeprefix("models/").startswith("gemini-3.8-flash"):
+        # Gemini 3.8 rejects sampling controls; thinking_level controls effort.
+        for name in ("temperature", "top_p", "top_k", "candidate_count"):
+            policy[name] = {"mode": "omit"}
     return policy
 
 

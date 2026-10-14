@@ -27,7 +27,6 @@ Hard rules:
 """
 from __future__ import annotations
 
-import datetime
 import json
 import math
 import os
@@ -36,11 +35,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import context_budget
 import llm_routing
+from ai_service import _with_default_system_context
 from arbiter import ARBITER_SYSTEM_PROMPT, ARBITER_USER_PROMPT_TEMPLATE
 from config import config
 from context_budget import PREFLIGHT_VALIDATOR_SKELETON
 from models import ContentRequest, QAModelConfig, normalize_qa_models_config
 from phrase_frequency_config import is_phrase_frequency_active
+from services.typesafe_client import (
+    TypeSafeConfigurationError,
+    build_system_one_budget,
+    is_typesafe_provider,
+    validate_questions,
+)
 
 SCHEMA_VERSION = "gransabio_context_preflight.v2"
 POLICY_SCHEMA_VERSION = "gransabio_context_budget_policy.v1"
@@ -79,11 +85,6 @@ _QA_FORMAT_SKELETON = (
     "You are a QA evaluator. Score the candidate against the layer criteria "
     "and return a structured verdict with optional edit suggestions."
 ) * 6
-
-_LANGUAGE_INSTRUCTION = (
-    "\n\nIMPORTANT: Always respond in the same language as the user's request, "
-    "regardless of the language used in these instructions."
-)
 
 
 class MalformedRequest(ValueError):
@@ -155,14 +156,16 @@ class OperationalPolicy:
         return policy, raw
 
     def matches_configured(self) -> bool:
+        """Accept a run policy within the service's ceiling and safety margin.
+
+        The configured fraction and floor are defaults, not mandatory values:
+        enforcing equality prevented callers from choosing a smaller operating
+        window, or a fixed window independent of model size.
+        """
         configured = OperationalPolicy.configured()
         return (
-            self.context_fraction == configured.context_fraction
-            and self.minimum_working_context_tokens
-            == configured.minimum_working_context_tokens
-            and self.maximum_working_context_tokens
-            == configured.maximum_working_context_tokens
-            and self.safety_margin_fraction == configured.safety_margin_fraction
+            self.maximum_working_context_tokens <= configured.maximum_working_context_tokens
+            and self.safety_margin_fraction >= configured.safety_margin_fraction
         )
 
     def working_context_tokens(self, context_window_tokens: int) -> int:
@@ -369,6 +372,7 @@ class ParticipantSpec:
     fixed_components: Tuple[Tuple[str, str, str], ...]
     requested_reasoning_effort: Optional[str] = None
     requested_thinking_budget_tokens: Optional[int] = None
+    call_kind: str = "chat"
 
 
 def _effective_reasoning_settings(
@@ -415,7 +419,7 @@ def _build_participant(
     """Return (participant payload, candidate rejection) applying the v2 math."""
 
     capacity = _resolve_capacity(spec.requested_model)
-    if capacity.known:
+    if capacity.known and spec.call_kind != "system_one":
         effective_effort, effective_thinking_budget = _effective_reasoning_settings(spec)
         effective_reasoning_tokens = max(
             spec.reasoning_tokens,
@@ -461,6 +465,7 @@ def _build_participant(
     participant = {
         "participant": spec.participant,
         "participant_kind": spec.participant_kind,
+        "call_kind": spec.call_kind,
         "requested_model": spec.requested_model,
         "model": capacity.effective_model,
         "receives_generated_candidate": spec.receives_generated_candidate,
@@ -845,16 +850,15 @@ def _json_hint(payload: Dict[str, Any]) -> str:
 
 def _generator_system_prompt(payload: Dict[str, Any]) -> str:
     explicit = payload.get("system_prompt")
-    if isinstance(explicit, str) and explicit.strip():
+    if isinstance(explicit, str):
         base = explicit
     elif _json_hint(payload) == "json":
         base = str(config.GENERATOR_SYSTEM_PROMPT_RAW)
     else:
         base = str(config.GENERATOR_SYSTEM_PROMPT)
-    # The engine always appends the language instruction and the current date
-    # (ai_service generate_content); mirror that scaffolding exactly.
-    current_date = datetime.datetime.now().strftime("%Y/%m/%d")
-    return f"{base}{_LANGUAGE_INSTRUCTION}\n\nCurrent date: {current_date}"
+    return _with_default_system_context(
+        base, payload.get("include_default_system_context", True)
+    )
 
 
 def _serialized_request_skeleton(payload: Dict[str, Any]) -> str:
@@ -912,9 +916,65 @@ def _semantic_qa_is_explicit(request: ContentRequest) -> bool:
     return False
 
 
+def _system_one_qa_components(
+    model: str, request: ContentRequest,
+) -> List[Tuple[str, str, str]]:
+    """Size the largest typed QA call, including its full evidence and questions."""
+
+    from qa_evaluation_service import QAEvaluationService
+
+    budgets = []
+    for layer in request.qa_layers:
+        state, questions = QAEvaluationService.build_system_one_qa_payload(
+            content="",
+            criteria=layer.criteria,
+            layer_name=layer.name,
+            min_score=layer.min_score,
+            deal_breaker_criteria=layer.deal_breaker_criteria,
+            original_request=request,
+            edit_history=" " * _ATTEMPT_EXCERPT_ALLOWANCE_CHARS,
+        )
+        budgets.append(build_system_one_budget(state, questions, model))
+    # QA runs each layer separately. Summing them would count the complete source
+    # once per layer and needlessly reject requests that fit every actual call.
+    largest = max(budgets, key=lambda item: sum(c.tokens_estimate for c in item.components))
+    return [(item.name, item.text or "", "json") for item in largest.components]
+
+
 def _build_participant_specs(payload: Dict[str, Any]) -> List[ParticipantSpec]:
     """Enumerate every participant a real /generate with this payload could run."""
 
+    if payload.get("operation") == "system_one":
+        model = _require_str(payload, "model")
+        contract = {
+            "max_output_tokens": 0,
+            "max_reasoning_tokens": 0,
+            "receives_generated_candidate": False,
+        }
+        if payload.get("context_participant_contracts") != {"system_one": contract}:
+            raise MalformedRequest("invalid System One participant contract")
+        if "state" not in payload:
+            raise MalformedRequest("state is required")
+        try:
+            questions = validate_questions(payload.get("questions"))
+            budget = build_system_one_budget(payload["state"], questions, model)
+        except TypeSafeConfigurationError as exc:
+            raise MalformedRequest(str(exc)) from exc
+        return [ParticipantSpec(
+            participant="system_one",
+            participant_kind="system_one",
+            requested_model=model,
+            output_tokens=0,
+            reasoning_tokens=0,
+            receives_generated_candidate=False,
+            generated_input_tokens=0,
+            fixed_components=tuple(
+                (item.name, item.text or "", "json") for item in budget.components
+            ),
+            call_kind="system_one",
+        )]
+    if payload.get("operation") is not None:
+        raise MalformedRequest("unsupported context preflight operation")
     contracts = payload.get("context_participant_contracts")
     if not isinstance(contracts, dict) or not contracts:
         raise MalformedRequest("context_participant_contracts must be a non-empty object")
@@ -1021,19 +1081,28 @@ def _build_participant_specs(payload: Dict[str, Any]) -> List[ParticipantSpec]:
             qa_components.append(("qa_layers", qa_layers_text, "json"))
         if source_text:
             qa_components.append(("source_text", source_text, "prose"))
+        try:
+            qa_info = config.get_model_info(qa["model"], require_api_key=False) or {}
+        except Exception:
+            # Unknown catalog entries retain the ordinary structured capacity rejection.
+            qa_info = {}
+        system_one = is_typesafe_provider(str(qa_info.get("provider") or ""))
+        if system_one:
+            qa_components = _system_one_qa_components(qa["model"], runtime_request)
         qa_receives = bool(qa_contract and qa_contract.receives_generated_candidate)
         specs.append(
             ParticipantSpec(
                 participant=f"qa:{index}",
                 participant_kind="qa_evaluator",
                 requested_model=qa["model"],
-                output_tokens=qa["max_tokens"],
-                reasoning_tokens=int(qa["thinking_budget_tokens"] or 0),
+                output_tokens=0 if system_one else qa["max_tokens"],
+                reasoning_tokens=0 if system_one else int(qa["thinking_budget_tokens"] or 0),
                 receives_generated_candidate=qa_receives,
                 generated_input_tokens=max_tokens if qa_receives else 0,
                 fixed_components=tuple(qa_components),
-                requested_reasoning_effort=qa["reasoning_effort"],
-                requested_thinking_budget_tokens=qa["thinking_budget_tokens"],
+                requested_reasoning_effort=None if system_one else qa["reasoning_effort"],
+                requested_thinking_budget_tokens=None if system_one else qa["thinking_budget_tokens"],
+                call_kind="system_one" if system_one else "chat",
             )
         )
 
@@ -1297,8 +1366,8 @@ def build_context_preflight_response(payload: Dict[str, Any]) -> Dict[str, Any]:
         rejection = {
             "code": CODE_POLICY_MISMATCH,
             "message": (
-                "The requested context_budget_policy does not match this "
-                "engine's configured global operational policy "
+                "The requested context_budget_policy exceeds this engine's "
+                "operating ceiling or reduces its minimum safety margin "
                 f"(configured={OperationalPolicy.configured()!r})."
             ),
         }

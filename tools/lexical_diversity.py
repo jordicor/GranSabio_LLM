@@ -51,8 +51,8 @@ import sys
 # --- Tokenization & normalization (compatible with your analyzer's spirit) ---
 import unicodedata
 from collections import Counter
-from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from dataclasses import asdict, dataclass, field, replace
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import json_utils as json
 from tools.stopwords_utils import (
@@ -522,9 +522,17 @@ def _metrics_for_tokens(tokens: List[str], cfg: LexDivConfig) -> Dict[str, float
 
 # --- Core analysis -----------------------------------------------------------
 
-def analyze_lexical_diversity(text: str, cfg: LexDivConfig) -> Dict[str, Any]:
+def analyze_lexical_diversity(
+    text: str,
+    cfg: LexDivConfig,
+    *,
+    window_decision: Optional[Callable[[int, str], bool]] = None,
+) -> Dict[str, Any]:
     """
     Analyze lexical diversity, optionally computing global top words and window analysis.
+
+    A window decision can use the global token count and diagnosis to enable
+    windows without repeating tokenization or changing the caller's config.
     """
     # Tokenize once for global analysis
     tokens_all, spans = tokenize_with_spans(
@@ -543,6 +551,9 @@ def analyze_lexical_diversity(text: str, cfg: LexDivConfig) -> Dict[str, Any]:
     metrics = _metrics_for_tokens(word_tokens, cfg)
     grades = diagnose(metrics, cfg.thresholds)
     decision = aggregate_decision(grades, require_majority=max(1, int(cfg.require_majority)))
+
+    if window_decision is not None and window_decision(N_words, decision["label"].upper()):
+        cfg = replace(cfg, analyze_windows=True)
 
     # Global top words
     top_words: List[Dict[str, Any]] = []

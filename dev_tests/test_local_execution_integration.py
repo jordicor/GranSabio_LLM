@@ -63,14 +63,22 @@ def test_reachable_routes_are_request_scoped_and_keep_qa_ordinals(monkeypatch) -
     )
 
     route_keys = {(item.call_id, item.route_ordinal) for item in requirements}
-    assert ("qa.evaluate_layer", 0) in route_keys
-    assert ("qa.evaluate_layer", 1) in route_keys
-    assert ("auto_qa.plan", 0) in route_keys
-    assert ("evidence.score_logprobs", 0) in route_keys
-    assert ("accent.audit", 0) in route_keys
-    assert ("generation.smart_edit", 0) in route_keys
-    assert not any(call_id.startswith("feedback.") for call_id, _ in route_keys)
-    assert not any(call_id.startswith("health.") for call_id, _ in route_keys)
+    assert route_keys == {
+        ("generation.main", 0),
+        ("auto_qa.plan", 0),
+        ("preflight.validate", 0),
+        ("qa.evaluate_layer", 0),
+        ("qa.evaluate_layer", 1),
+        ("generation.smart_edit", 0),
+        ("gransabio.review", 0),
+        ("gransabio.escalation", 0),
+        ("arbiter.resolve", 0),
+        ("gransabio.regenerate", 0),
+        ("evidence.extract_claims", 0),
+        ("evidence.classify_spans", 0),
+        ("evidence.score_logprobs", 0),
+        ("accent.audit", 0),
+    }
 
 
 def test_route_requirements_include_only_reachable_smart_edit_and_regeneration(monkeypatch) -> None:

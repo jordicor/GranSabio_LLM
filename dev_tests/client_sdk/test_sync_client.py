@@ -13,6 +13,7 @@ Tests cover:
 - Convenience methods
 """
 
+import json
 import os
 
 # Import after mocking requests
@@ -21,6 +22,7 @@ import time
 from unittest.mock import Mock, patch
 
 import pytest
+from requests import Response
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -47,6 +49,20 @@ def mock_response():
 
 
 @pytest.fixture
+def http_response():
+    """Build complete HTTP bodies with the real requests JSON decoder."""
+    def build(status, body):
+        response = Response()
+        response.status_code = status
+        response.headers["Content-Type"] = "application/json"
+        response.encoding = "utf-8"
+        response._content = body.encode("utf-8")
+        return response
+
+    return build
+
+
+@pytest.fixture
 def client():
     """Create a GranSabioClient with default settings."""
     from client import GranSabioClient
@@ -63,6 +79,15 @@ def client_no_key():
 # ==============================================================================
 # Initialization Tests
 # ==============================================================================
+
+def test_system_one_sends_the_explicit_model(client, mock_requests, mock_response):
+    mock_response.json.return_value = {"model": "jev-1.13.0", "answers": {"flag": {"noul": 0.9}}}
+    mock_requests.request.return_value = mock_response
+    result = client.evaluate_system_one("state", {"flag": {"type": "noul"}}, model="jev-latest")
+    assert result["answers"]["flag"]["noul"] == 0.9
+    assert mock_requests.request.call_args.kwargs["json"]["model"] == "jev-latest"
+    assert mock_requests.request.call_args.args[:2] == ("POST", "http://test-server:8000/systemone")
+
 
 class TestClientInitialization:
     """Tests for GranSabioClient initialization."""
@@ -393,6 +418,9 @@ class TestGenerate:
 
         mock_response.json.return_value = {
             "status": "preflight_rejected",
+            "session_id": None,
+            "project_id": "project-preflight",
+            "request_name": "editorial-sufficiency",
             "preflight_feedback": {
                 "user_feedback": "Contradictory requirements"
             }
@@ -403,6 +431,9 @@ class TestGenerate:
             client.generate(prompt="Test", qa_layers=[])
 
         assert "rejected by preflight" in str(exc.value)
+        assert exc.value.provider_outcome == "rejected"
+        assert exc.value.details["response"] == mock_response.json.return_value
+        assert exc.value.details["preflight_feedback"] == mock_response.json.return_value["preflight_feedback"]
 
     def test_generate_raises_on_auto_qa_rejection(self, client, mock_requests, mock_response):
         """Given: Auto-QA rejects, Then: Raises GranSabioClientError with feedback."""
@@ -410,6 +441,10 @@ class TestGenerate:
 
         mock_response.json.return_value = {
             "status": "auto_qa_rejected",
+            "session_id": None,
+            "project_id": "project-auto-qa",
+            "request_name": "editorial-sufficiency",
+            "preflight_feedback": {"decision": "proceed"},
             "auto_qa_feedback": {
                 "message": "Planner could not build a non-contradictory QA contract"
             },
@@ -420,6 +455,9 @@ class TestGenerate:
             client.generate(prompt="Test", qa_layers=[])
 
         assert "rejected by Auto-QA" in str(exc.value)
+        assert exc.value.provider_outcome == "rejected"
+        assert exc.value.details["response"] == mock_response.json.return_value
+        assert exc.value.details["auto_qa_feedback"] == mock_response.json.return_value["auto_qa_feedback"]
 
     def test_generate_raises_on_missing_session_id(self, client, mock_requests, mock_response):
         """Given: No session_id in response, Then: Raises GranSabioClientError."""
@@ -432,6 +470,7 @@ class TestGenerate:
             client.generate(prompt="Test", qa_layers=[])
 
         assert "No session_id" in str(exc.value)
+        assert exc.value.provider_outcome is None
 
     def test_generate_includes_optional_params(self, client, mock_requests, mock_response):
         """Given: Optional params provided, Then: Included in payload."""
@@ -933,7 +972,7 @@ class TestSyncBodyReadTransient:
         with patch("time.sleep"):
             result = client._call_with_retry(
                 op_name="get_status",
-                session_id="sess-retry",
+                resource_id="sess-retry",
                 func=lambda: client.get_status("sess-retry"),
                 start_time=time.monotonic(),
                 max_wait=60.0,
@@ -941,6 +980,158 @@ class TestSyncBodyReadTransient:
 
         assert result == {"status": "completed"}
         assert client._request.call_count == 2
+
+    @pytest.mark.parametrize("outcome", ["recovered", "exhausted", "deadline"])
+    def test_fetch_result_polling_retries_complete_invalid_json(
+        self, client, mock_requests, http_response, outcome
+    ):
+        """A complete non-JSON 200 stays inside the bounded GET retry operation."""
+        from client import GranSabioClientError, TransientGranSabioError
+        from client._common import POLL_RETRY_BACKOFF_SECONDS
+
+        invalid = http_response(200, "<html>Temporary proxy response</html>")
+        final = {"status": "completed", "content": "Final content"}
+        if outcome == "recovered":
+            mock_requests.request.side_effect = [invalid, http_response(200, json.dumps(final))]
+        else:
+            mock_requests.request.return_value = invalid
+
+        with patch("client.sync_client.time.sleep") as sleep:
+            if outcome == "recovered":
+                assert client._fetch_result_polling("sess-1", timeout_seconds=12000) == final
+                attempts = 2
+            else:
+                timeout = 1 if outcome == "deadline" else 12000
+                message = "Timed out" if outcome == "deadline" else "exhausted retries"
+                with pytest.raises(GranSabioClientError, match=message) as error:
+                    client._fetch_result_polling("sess-1", timeout_seconds=timeout)
+                assert isinstance(error.value.__cause__, TransientGranSabioError)
+                attempts = 1 if outcome == "deadline" else len(POLL_RETRY_BACKOFF_SECONDS) + 1
+            assert sleep.call_count == attempts - 1
+
+        assert [call.args[:2] for call in mock_requests.request.call_args_list] == [
+            ("GET", "http://test-server:8000/result/sess-1")
+        ] * attempts
+
+    @pytest.mark.parametrize("entry", ["wait_for_result", "_fetch_result_polling"])
+    def test_result_polling_handles_http_states_consistently(
+        self, client, mock_requests, http_response, entry
+    ):
+        """202 waits; 425/429/503 back off without interpreting the HTTP body."""
+        final = {"status": "completed", "content": "Final content"}
+        responses = iter([
+            http_response(202, '{"detail": "Generación en marcha"}'),
+            http_response(425, "not JSON"),
+            http_response(429, "<html>Rate limited</html>"),
+            http_response(503, '{"detail": "Busy"}'),
+            http_response(200, json.dumps(final)),
+        ])
+
+        def respond(method, url, **kwargs):
+            assert method == "GET"
+            if url.endswith("/status/sess-1"):
+                return http_response(200, '{"status": "completed"}')
+            assert url.endswith("/result/sess-1")
+            return next(responses)
+
+        mock_requests.request.side_effect = respond
+        with patch("client.sync_client.time.sleep"):
+            if entry == "wait_for_result":
+                result = client.wait_for_result("sess-1", poll_interval=0, max_wait=120)
+            else:
+                result = client._fetch_result_polling("sess-1", poll_interval=0, timeout_seconds=120)
+
+        assert result == final
+        urls = [call.args[1] for call in mock_requests.request.call_args_list]
+        assert urls.count("http://test-server:8000/result/sess-1") == 5
+        assert urls.count("http://test-server:8000/status/sess-1") == (2 if entry == "wait_for_result" else 0)
+
+    @pytest.mark.parametrize("entry", ["wait_for_result", "_fetch_result_polling"])
+    def test_pending_result_respects_wait_deadline(
+        self, client, mock_requests, http_response, entry
+    ):
+        """A terminal status followed by repeated 202 cannot wait indefinitely."""
+        from client import GranSabioClientError
+
+        def respond(method, url, **kwargs):
+            assert method == "GET"
+            if url.endswith("/status/sess-1"):
+                return http_response(200, '{"status": "completed"}')
+            return http_response(202, "")
+
+        mock_requests.request.side_effect = respond
+        with pytest.raises(GranSabioClientError, match="Timed out"):
+            if entry == "wait_for_result":
+                client.wait_for_result("sess-1", poll_interval=1, max_wait=0.05)
+            else:
+                client._fetch_result_polling("sess-1", poll_interval=1, timeout_seconds=0.05)
+
+    def test_fetch_result_polling_preserves_active_window_during_backoff(
+        self, client, mock_requests, http_response, monkeypatch
+    ):
+        """Recent stream activity extends an expired window before a transient GET."""
+        from client._common import ActivityMonitor
+
+        clock = Mock()
+        clock.monotonic.return_value = 0.0
+
+        def advance(seconds):
+            clock.monotonic.return_value += seconds
+
+        clock.sleep.side_effect = advance
+        monkeypatch.setattr("client.sync_client.time", clock)
+        monkeypatch.setattr("client._common.time", clock)
+        monitor = ActivityMonitor(inactivity_window=10)
+        final = {"status": "completed", "content": "Final content"}
+
+        def respond(method, url, **kwargs):
+            if mock_requests.request.call_count == 1:
+                clock.monotonic.return_value = 10.0
+                monitor.mark(iteration=2)
+                return http_response(202, "")
+            if mock_requests.request.call_count == 2:
+                return http_response(503, "")
+            return http_response(200, json.dumps(final))
+
+        mock_requests.request.side_effect = respond
+        result = client._fetch_result_polling(
+            "sess-1", timeout_seconds=10, poll_interval=0, activity_monitor=monitor
+        )
+
+        assert result == final
+        assert mock_requests.request.call_count == 3
+        assert clock.monotonic.return_value == 15.0
+
+    def test_fetch_result_polling_bad_request_fails_immediately(
+        self, client, mock_requests, http_response
+    ):
+        """400 is an HTTP failure even when its detail resembles old pending text."""
+        from client import GranSabioClientError, TransientGranSabioError
+
+        mock_requests.request.return_value = http_response(
+            400, '{"detail": "Generation still in progress"}'
+        )
+        with pytest.raises(GranSabioClientError) as error:
+            client._fetch_result_polling("sess-1", timeout_seconds=1)
+
+        assert error.value.status_code == 400
+        assert not isinstance(error.value, TransientGranSabioError)
+        assert mock_requests.request.call_count == 1
+
+    def test_generate_does_not_retry_complete_invalid_json(
+        self, client, mock_requests, http_response
+    ):
+        """An unreadable creation receipt leaves exactly one POST on the transport."""
+        from client import GranSabioClientError, TransientGranSabioError
+
+        mock_requests.request.return_value = http_response(200, "<html>Receipt unavailable</html>")
+        with pytest.raises(GranSabioClientError, match="may have been accepted") as error:
+            client.generate(prompt="Test", qa_layers=[], wait_for_completion=False)
+
+        assert not isinstance(error.value, TransientGranSabioError)
+        assert [call.args[:2] for call in mock_requests.request.call_args_list] == [
+            ("POST", "http://test-server:8000/generate")
+        ]
 
     def test_fetch_result_polling_non_retryable_status_body_read_fails_fast(self, client):
         """A truncated 500 body must not become a retryable polling failure."""
@@ -991,6 +1182,7 @@ class TestGranSabioClientError:
         assert str(error) == "Test error"
         assert error.status_code is None
         assert error.details == {}
+        assert error.provider_outcome is None
 
     def test_error_with_status_code(self):
         """Given: Status code, Then: Stores status_code."""
@@ -1006,3 +1198,138 @@ class TestGranSabioClientError:
         error = GranSabioClientError("Error", details=details)
 
         assert error.details == details
+
+
+# ==============================================================================
+# Idempotent Submission Tests
+# ==============================================================================
+
+class TestSyncIdempotentSubmission:
+    """Request IDs on POST /generate, replay waits, and reconciliation reads."""
+
+    @staticmethod
+    def _response(status, body, headers=None):
+        response = Response()
+        response.status_code = status
+        response.headers["Content-Type"] = "application/json"
+        response.headers.update(headers or {})
+        response.encoding = "utf-8"
+        response._content = body.encode("utf-8")
+        return response
+
+    def test_request_id_travels_only_on_its_own_post(self, client, mock_requests):
+        from client._common import SAAS_REQUEST_ID_HEADER
+
+        mock_requests.request.return_value = self._response(
+            200, json.dumps({"session_id": "sess-1", "status": "initialized"}),
+        )
+        client.generate(prompt="Test", qa_layers=[], wait_for_completion=False, request_id="axv2:abc")
+        client.generate(prompt="Test", qa_layers=[], wait_for_completion=False)
+
+        first, second = mock_requests.request.call_args_list
+        assert first.kwargs["headers"][SAAS_REQUEST_ID_HEADER] == "axv2:abc"
+        assert first.kwargs["headers"]["Authorization"] == "Bearer test-key"
+        assert SAAS_REQUEST_ID_HEADER not in second.kwargs["headers"]
+        assert SAAS_REQUEST_ID_HEADER not in client._headers()
+        assert "request_id" not in first.kwargs["json"]
+
+    @pytest.mark.parametrize("request_id", ["", "x" * 129, "has space", "slash/no"])
+    def test_invalid_request_id_fails_before_sending(self, client, mock_requests, request_id):
+        with pytest.raises(ValueError, match="request_id"):
+            client.generate(prompt="Test", qa_layers=[], request_id=request_id)
+        assert mock_requests.request.call_count == 0
+
+    def test_pending_replay_maps_to_transient_with_retry_after(self, client, mock_requests):
+        from client import TransientGranSabioError
+
+        mock_requests.request.return_value = self._response(
+            202, json.dumps({"detail": "still in progress", "request_id": "axv2:1"}),
+            headers={"Retry-After": "5"},
+        )
+        with pytest.raises(TransientGranSabioError) as error:
+            client.generate(prompt="Test", qa_layers=[], request_id="axv2:1")
+        assert error.value.status_code == 202
+        assert error.value.details["retry_after_seconds"] == 5.0
+        assert error.value.details["request_id"] == "axv2:1"
+        assert mock_requests.request.call_count == 1
+
+    def test_pending_status_without_request_id_keeps_plain_error(self, client, mock_requests):
+        from client import GranSabioClientError, TransientGranSabioError
+
+        mock_requests.request.return_value = self._response(
+            202, json.dumps({"detail": "still in progress"}), headers={"Retry-After": "5"},
+        )
+        with pytest.raises(GranSabioClientError) as error:
+            client.generate(prompt="Test", qa_layers=[])
+        assert not isinstance(error.value, TransientGranSabioError)
+        assert error.value.status_code == 202
+        assert "request_id" not in error.value.details
+        assert mock_requests.request.call_count == 1
+
+    @pytest.mark.parametrize(("status", "body", "engine"), [
+        (422, json.dumps({"detail": "invalid"}), True),
+        (502, "<html>Bad gateway</html>", False),
+    ])
+    def test_http_errors_report_engine_origin(self, client, mock_requests, status, body, engine):
+        from client import GranSabioClientError, TransientGranSabioError
+
+        mock_requests.request.return_value = self._response(status, body)
+        with pytest.raises(GranSabioClientError) as error:
+            client.generate(prompt="Test", qa_layers=[])
+        assert not isinstance(error.value, TransientGranSabioError)
+        assert error.value.status_code == status
+        assert error.value.details["json_error_detail"] is engine
+        assert "request_id" not in error.value.details
+
+    def test_get_request_status_reads_encoded_snapshot_with_retry(self, client, mock_requests):
+        snapshot = {"found": True, "request_id": "axv2:a", "state": "error", "status": "error",
+                    "session_id": None, "project_id": None, "init_response": None,
+                    "error": {"status_code": 422, "detail": "invalid"}}
+        mock_requests.request.side_effect = [self._response(503, "busy"),
+                                             self._response(200, json.dumps(snapshot))]
+        with patch("client.sync_client.time.sleep") as sleep:
+            assert client.get_request_status("axv2:a") == snapshot
+        assert sleep.call_count == 1
+        assert mock_requests.request.call_args.args[:2] == (
+            "GET", "http://test-server:8000/api/saas/requests/axv2%3Aa",
+        )
+
+    @pytest.mark.parametrize("status", [400, 404])
+    def test_get_request_status_http_errors_fail_without_retry(self, client, mock_requests, status):
+        from client import GranSabioClientError, TransientGranSabioError
+
+        mock_requests.request.return_value = self._response(status, '{"detail": "private"}')
+        with pytest.raises(GranSabioClientError) as error:
+            client.get_request_status("axv2:4")
+        assert not isinstance(error.value, TransientGranSabioError)
+        assert error.value.status_code == status
+        assert mock_requests.request.call_count == 1
+
+    def test_list_sessions_passes_paging_and_returns_body(self, client, mock_requests):
+        body = {"sessions": [], "project_id": None}
+        mock_requests.request.return_value = self._response(200, json.dumps(body))
+        assert client.list_sessions(limit=5) == body
+        call = mock_requests.request.call_args
+        assert call.args[:2] == ("GET", "http://test-server:8000/debugger/sessions")
+        assert call.kwargs["params"] == {"limit": 5, "offset": 0}
+        with pytest.raises(ValueError):
+            client.list_sessions(limit=0)
+
+    @pytest.mark.parametrize("status", [200, 403, 503])
+    def test_session_details_are_an_encoded_read_without_generation(self, client, mock_requests, status):
+        from client import GranSabioClientError, TransientGranSabioError
+
+        payload = {"session_id": "session?one", "request": {"prompt": "Private source"}}
+        mock_requests.request.return_value = self._response(status, json.dumps(payload))
+        if status == 200:
+            assert client.get_session_details("session?one") == payload
+        else:
+            expected = TransientGranSabioError if status == 503 else GranSabioClientError
+            with pytest.raises(expected) as error:
+                client.get_session_details("session?one")
+            assert error.value.status_code == status
+            assert "Private source" not in str(error.value)
+        assert mock_requests.request.call_count == 1
+        assert mock_requests.request.call_args.args[:2] == (
+            "GET", "http://test-server:8000/debugger/sessions/session%3Fone",
+        )

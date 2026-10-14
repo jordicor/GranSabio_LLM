@@ -10,8 +10,6 @@ before the corresponding fix:
 - AUX-08: case-insensitive validated actions must carry the exact fragment
   from the original text so they execute
 - AUX-09: replace(..., count=N) with N>1 must replace N occurrences
-- AUX-10: analyze_basic fallback must stay purely mechanical (no semantic
-  regex/keyword detection)
 - AUX-15: case-insensitive offsets must stay aligned with the original text
   for Unicode characters whose lowercase form expands (e.g. 'İ')
 - AUX-17 (smart_edit items): execute must not leak raw internal errors
@@ -215,40 +213,6 @@ class TestAux09ReplaceCount:
         result = SmartTextEditor().replace("cat cat cat", "cat", "dog")
         assert result.success is True
         assert result.content_after == "dog dog dog"
-
-
-# =============================================================================
-# AUX-10: analyze_basic stays purely mechanical
-# =============================================================================
-
-
-class TestAux10MechanicalFallback:
-    def test_semantic_phrases_no_longer_flagged(self):
-        """Style rewrites ('due to the fact that' -> 'because', etc.) are
-        semantic judgments and must not come from regex/keyword lists."""
-        analyzer = TextAnalyzer.__new__(TextAnalyzer)
-        text = (
-            "She was born in the year 1985. Due to the fact that she worked "
-            "hard, she succeeded in order to thrive."
-        )
-
-        assert analyzer.analyze_basic(text) == []
-
-    def test_consecutive_duplicate_words_still_detected(self):
-        """Identical adjacent tokens are a mechanical check and stay."""
-        analyzer = TextAnalyzer.__new__(TextAnalyzer)
-
-        actions = analyzer.analyze_basic("The weather is very very nice today.")
-
-        assert len(actions) == 1
-        action = actions[0]
-        assert action["type"] == "delete"
-        assert action["category"] == "redundancy"
-        assert action["ai_required"] is False
-        assert action["target"]["value"].lower().startswith("very")
-        # Output contract unchanged
-        for key in ("id", "description", "estimated_ms", "target"):
-            assert key in action
 
 
 # =============================================================================

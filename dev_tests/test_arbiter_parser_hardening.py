@@ -237,6 +237,44 @@ class TestHappyPath:
             arbiter._parse_arbiter_response(ai_response, proposed, [])
 
 
+@pytest.mark.parametrize("stale_index", [0, 1])
+def test_filtered_edits_share_prompt_and_parser_indices(stale_index):
+    """Check request plumbing only; stop before any AI resolution or response."""
+    context = _two_edit_context()
+    original_edits = context.proposed_edits
+    stale_edit = original_edits[stale_index]
+    valid_edit = original_edits[1 - stale_index]
+    stale_edit.edit.exact_fragment = "Removed fragment."
+    valid_edit.edit.exact_fragment = context.current_content
+    arbiter = Arbiter(ai_service=object())
+    captured_contexts = []
+
+    class ResolutionBoundaryReached(Exception):
+        pass
+
+    async def capture_resolution_context(filtered_context, conflicts, distribution, model):
+        captured_contexts.append(filtered_context)
+        prompt = arbiter._build_arbiter_prompt(filtered_context, conflicts, distribution)
+        assert "[0] REPLACE" in prompt
+        assert "[1] REPLACE" not in prompt
+        assert "Removed fragment." not in prompt
+        raise ResolutionBoundaryReached
+
+    arbiter._resolve_with_ai = capture_resolution_context
+    with pytest.raises(ResolutionBoundaryReached):
+        asyncio.run(arbiter.arbitrate(context))
+
+    assert len(captured_contexts) == 1
+    filtered_context = captured_contexts[0]
+    assert filtered_context is not context
+    assert len(filtered_context.proposed_edits) == 1
+    assert filtered_context.proposed_edits[0] is valid_edit
+    assert filtered_context.layer_history is context.layer_history
+    assert context.proposed_edits is original_edits
+    assert context.proposed_edits[stale_index] is stale_edit
+    assert len(context.proposed_edits) == 2
+
+
 # ---------------------------------------------------------------------------
 # arbitrate()-level fail-closed + debug event emission
 # ---------------------------------------------------------------------------

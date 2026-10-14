@@ -142,6 +142,10 @@ def _limits(
 
 
 FAKE_LIMITS = {
+    "jev-latest": _limits(
+        context_window=32_000, max_input=32_000, max_output=256,
+        provider="typesafe", output_accounting="separate",
+    ),
     "gen-model": _limits(),
     "qa-model-a": _limits(),
     "qa-model-b": _limits(context_window=200_000, max_input=200_000, max_output=32_000),
@@ -191,6 +195,57 @@ _REAL_GET_MODEL_TOKEN_LIMITS = type(
 ).get_model_token_limits
 _REAL_VALIDATE_TOKEN_LIMITS = type(context_preflight.config).validate_token_limits
 _REAL_GET_MODEL_INFO = type(context_preflight.config).get_model_info
+
+
+def test_system_one_qa_admits_typed_payload_without_chat_output_reservation():
+    payload = _payload(
+        qa_models=["jev-latest", "qa-model-a"],
+        qa_global_config={"max_tokens": 2048},
+        qa_layers=[{
+            **_qa_layer(),
+            "deal_breaker_criteria": "The candidate contradicts the supplied source.",
+        }],
+        source_text="A complete source retained for the typed factual review.",
+    )
+
+    response = context_preflight.build_context_preflight_response(payload)
+
+    assert response["accepted"] is True
+    _assert_client_contract(response, payload)
+    typed = next(item for item in response["participants"] if item["model"] == "jev-latest")
+    assert typed["call_kind"] == "system_one"
+    assert typed["output_tokens"] == typed["reasoning_tokens"] == 0
+    assert typed["generated_input_tokens"] == payload["max_tokens"]
+    assert typed["max_output_tokens"] == 256
+    specs = context_preflight._build_participant_specs(payload)
+    typed_spec = next(item for item in specs if item.requested_model == "jev-latest")
+    encoded = typed_spec.fixed_components[0][1]
+    state = context_preflight.json.loads(encoded)
+    assert state["state"]["source_text"] == payload["source_text"]
+    assert state["state"]["original_prompt"] == payload["prompt"]
+    assert set(state["questions"]) == {"quality_score", "deal_breaker"}
+    chat = next(item for item in response["participants"] if item["participant"] == "qa:2")
+    assert chat["call_kind"] == "chat"
+    assert chat["output_tokens"] == 2048
+
+
+@pytest.mark.parametrize("oversized", ["source", "question"])
+def test_system_one_qa_rejects_oversized_evidence_or_question(oversized):
+    layer = _qa_layer()
+    source = "Short source."
+    if oversized == "source":
+        source = "Complete evidence must not be truncated. " * 10_000
+    else:
+        layer["criteria"] = "Evaluate every required criterion. " * 10_000
+    response = context_preflight.build_context_preflight_response(_payload(
+        qa_models=["jev-latest"], qa_layers=[layer], source_text=source,
+    ))
+
+    assert response["accepted"] is False
+    assert response["rejection"]["code"] == "prompt_too_large"
+    typed = next(item for item in response["participants"] if item["model"] == "jev-latest")
+    assert typed["evidence_tokens"] < 0
+    assert typed["output_tokens"] == 0
 
 
 @pytest.fixture(autouse=True)
@@ -402,6 +457,10 @@ def _assert_client_contract(response: dict, payload: dict) -> None:
     assert len(qa_participants) == len(qa_entries)
     for entry, item in zip(qa_entries, qa_participants):
         assert item["requested_model"] == entry["model"]
+        if item.get("call_kind") == "system_one":
+            assert item["output_tokens"] == item["reasoning_tokens"] == 0
+            assert item["generated_input_tokens"] >= max_tokens
+            continue
         assert item["output_tokens"] == int(entry["max_tokens"])
         assert item["reasoning_tokens"] >= int(
             entry.get("thinking_budget_tokens") or 0
@@ -1086,11 +1145,51 @@ def test_tiny_window_prompt_too_large():
 
 
 def test_policy_mismatch_rejected():
-    payload = _payload(context_budget_policy=_policy(context_fraction=0.5))
+    ceiling = context_preflight.OperationalPolicy.configured().maximum_working_context_tokens
+    payload = _payload(context_budget_policy=_policy(maximum_working_context_tokens=ceiling + 1))
     response = context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is False
     assert response["rejection"]["code"] == "context_budget_policy_mismatch"
     _assert_client_contract(response, payload)
+
+
+def test_run_ceiling_caps_each_participant_independently_of_model_window():
+    payload = _payload(context_budget_policy=_policy(
+        context_fraction=1, minimum_working_context_tokens=1,
+        maximum_working_context_tokens=32000,
+    ))
+    response = context_preflight.build_context_preflight_response(payload)
+    assert response["accepted"] is True
+    assert all(item["working_context_tokens"] == 32000 for item in response["participants"])
+    _assert_client_contract(response, payload)
+
+
+def test_native_system_one_preflight_counts_typed_payload_and_enforces_run_ceiling():
+    payload = {
+        "operation": "system_one", "model": "jev-latest", "state": "State " * 100,
+        "questions": {"q": {
+            "type": "choice", "instructions": "Select an option.",
+            "criteria": {"a": "Option A", "b": "Option B"},
+        }},
+        "context_budget_policy": _policy(
+            context_fraction=1, minimum_working_context_tokens=1,
+            maximum_working_context_tokens=32000,
+        ),
+        "context_participant_contracts": {"system_one": {
+            "max_output_tokens": 0, "max_reasoning_tokens": 0,
+            "receives_generated_candidate": False,
+        }},
+    }
+    response = context_preflight.build_context_preflight_response(payload)
+    assert response["accepted"] is True
+    participant, = response["participants"]
+    assert participant["call_kind"] == "system_one"
+    assert participant["fixed_input_tokens"] > 0
+    assert participant["output_tokens"] == participant["generated_input_tokens"] == 0
+    payload["context_budget_policy"]["maximum_working_context_tokens"] = 32
+    rejected = context_preflight.build_context_preflight_response(payload)
+    assert rejected["accepted"] is False
+    assert rejected["rejection"]["code"] == "prompt_too_large"
 
 
 def test_auto_qa_rejected_as_non_deterministic():
@@ -1231,3 +1330,23 @@ def test_route_accepts_and_rejects_gracefully():
 
     not_a_dict = client.post("/context/preflight", json=["not", "a", "dict"])
     assert not_a_dict.status_code == 400
+
+
+
+@pytest.mark.parametrize("system_prompt", ["Fixed temporal instructions.", "", "   "])
+@pytest.mark.parametrize("include_context", [True, False])
+def test_context_preflight_preserves_exact_generator_system_prompt(
+    system_prompt: str, include_context: bool
+) -> None:
+    payload = _payload(
+        system_prompt=system_prompt,
+        include_default_system_context=include_context,
+    )
+    specs = context_preflight._build_participant_specs(payload)
+    generator = next(spec for spec in specs if spec.participant == "generator")
+    counted_system = next(value for name, value, _hint in generator.fixed_components if name == "generator_system_prompt")
+    if include_context:
+        assert counted_system.startswith(system_prompt + "\n\nIMPORTANT: Always respond in the same language")
+        assert "\n\nCurrent date:" in counted_system
+    else:
+        assert counted_system == system_prompt

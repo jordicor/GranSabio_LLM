@@ -7,12 +7,18 @@ import inspect
 import logging
 import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Set, Union
 
 logger = logging.getLogger(__name__)
+
+provider_call_context: ContextVar[tuple[str, str] | None] = ContextVar(
+    "provider_call_context", default=None)
+provider_phase_override: ContextVar[str | None] = ContextVar(
+    "provider_phase_override", default=None)
 
 MaybeAsyncCallback = Callable[[], Union[None, Awaitable[None]]]
 

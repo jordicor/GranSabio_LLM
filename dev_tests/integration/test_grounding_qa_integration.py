@@ -14,10 +14,12 @@ Tests verify:
 All tests use mocked AI responses to avoid API calls.
 """
 
+import math
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import json_utils as json
 from evidence_grounding import get_effective_order
 from models import (
     ClaimBudgetResult,
@@ -668,6 +670,125 @@ class TestGroundingExecutionOrder:
 
 class TestComprehensiveEvaluationIntegration:
     """Tests for evaluate_content_comprehensive with evidence grounding."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("on_flag", ["warn", "deal_breaker", "regenerate"])
+    @pytest.mark.parametrize("failure", ["invalid_claim", "missing_logprobs", "missing_prior"])
+    async def test_unverified_provider_response_is_visible_in_qa(
+        self, qa_engine, mock_ai_service, on_flag, failure
+    ):
+        """Real extraction/scoring errors reach QA through the configured policy."""
+        content = "Marie Curie was born in Warsaw in 1867."
+        claim = {
+            "idx": 0,
+            "claim": content,
+            "kind": "factual",
+            "importance": 0.9,
+            "cited_spans": [content],
+            "source_text": content,
+        }
+        claims = [claim]
+        if failure == "invalid_claim":
+            # Even a low-importance trivial item must be validated before filtering.
+            invalid = {**claim, "idx": 1, "kind": "trivial", "importance": 0.1}
+            invalid.pop("claim")
+            claims.append(invalid)
+        mock_ai_service.generate_content.side_effect = [
+            json.dumps({"claims": claims}),
+            json.dumps({"spans": [{"id": "S0", "span_type": "assertion"}]}),
+        ]
+        measured_yes = ("YES", [{"token": "YES", "logprob": math.log(0.95)}])
+        mock_ai_service.generate_with_logprobs.return_value = ("YES", None)
+        if failure == "invalid_claim":
+            mock_ai_service.generate_with_logprobs.side_effect = [
+                measured_yes, ("YES", [{"token": "YES", "logprob": math.log(0.15)}])
+            ]
+        elif failure == "missing_prior":
+            mock_ai_service.generate_with_logprobs.side_effect = [measured_yes, ("UNSURE", None)]
+
+        result = await qa_engine.evaluate_content_comprehensive(
+            content=content,
+            layers=[],
+            qa_models=[],
+            evidence_grounding_config=EvidenceGroundingConfig(
+                enabled=True, model="gpt-4o-mini", on_flag=on_flag
+            ),
+            context_for_grounding=content,
+        )
+
+        grounding = result["evidence_grounding"]
+        assert grounding["degraded"] is True
+        assert grounding["claims_verified"] == 0
+        assert grounding["claims"] == []
+        phase = "Claim extraction" if failure == "invalid_claim" else "Budget scoring"
+        assert phase in grounding["verification_error"]
+        assert grounding["passed"] is (on_flag == "warn")
+        assert grounding["triggered_action"] == (None if on_flag == "warn" else on_flag)
+        evaluation = result["qa_results"]["Evidence Grounding"]["evidence_grounding_logprobs"]
+        assert evaluation.score == (5.0 if on_flag == "warn" else 0.0)
+        assert evaluation.deal_breaker is (on_flag != "warn")
+        if on_flag != "warn":
+            assert result["summary"]["force_iteration"] is True
+        assert mock_ai_service.generate_content.await_count == (
+            1 if failure == "invalid_claim" else 2
+        )
+        assert mock_ai_service.generate_with_logprobs.await_count == {
+            "invalid_claim": 0, "missing_logprobs": 1, "missing_prior": 2
+        }[failure]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("empty", [True, False], ids=["empty", "long_claim"])
+    async def test_valid_extraction_reaches_grounding_result(
+        self, qa_engine, mock_ai_service, empty
+    ):
+        """Empty extraction is valid and a claim over 300 characters is verified."""
+        content = (
+            "The expedition's final survey, conducted with calibrated instruments "
+            "along the complete northern route after the seasonal flooding had "
+            "subsided, recorded an average water depth of twelve metres at the "
+            "designated reference stations, including the remote stations that "
+            "earlier teams had been unable to visit during the original survey."
+        )
+        assert len(content) > 300
+        claims = [] if empty else [{
+            "idx": 0,
+            "claim": content,
+            "kind": "factual",
+            "importance": 0.9,
+            "cited_spans": [content],
+            "source_text": content,
+        }]
+        mock_ai_service.generate_content.side_effect = [
+            json.dumps({"claims": claims}),
+            json.dumps({"spans": [{"id": "S0", "span_type": "assertion"}]}),
+        ]
+        mock_ai_service.generate_with_logprobs.side_effect = [
+            ("YES", [{"token": "YES", "logprob": math.log(0.95)}]),
+            ("UNSURE", [{"top_logprobs": [
+                {"token": "UNSURE", "logprob": math.log(0.8)},
+                {"token": "YES", "logprob": math.log(0.15)},
+            ]}]),
+        ]
+
+        result = await qa_engine.evaluate_content_comprehensive(
+            content=content,
+            layers=[],
+            qa_models=[],
+            evidence_grounding_config=EvidenceGroundingConfig(
+                enabled=True, model="gpt-4o-mini", on_flag="deal_breaker"
+            ),
+            context_for_grounding=content,
+        )
+
+        grounding = result["evidence_grounding"]
+        assert grounding["passed"] is True
+        assert grounding["degraded"] is False
+        assert grounding["verification_error"] is None
+        assert grounding["claims_verified"] == (0 if empty else 1)
+        assert result["qa_results"]["Evidence Grounding"]["evidence_grounding_logprobs"].score == 10.0
+        if not empty:
+            assert grounding["claims"][0]["claim"] == content
+        assert mock_ai_service.generate_with_logprobs.await_count == (0 if empty else 2)
 
     @pytest.mark.asyncio
     async def test_comprehensive_includes_grounding_result(

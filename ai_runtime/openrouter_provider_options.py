@@ -14,7 +14,7 @@ from typing import Any
 _KNOWN_PROVIDER_OPTIONS = frozenset(
     {"allow_fallbacks", "max_price", "require_parameters"}
 )
-_KNOWN_MAX_PRICE_OPTIONS = frozenset({"prompt", "completion"})
+_KNOWN_MAX_PRICE_OPTIONS = frozenset({"prompt", "completion", "request"})
 
 
 class OpenRouterProviderOptionsError(ValueError):
@@ -24,8 +24,8 @@ class OpenRouterProviderOptionsError(ValueError):
 def validate_openrouter_provider_options(value: Any) -> dict[str, Any]:
     """Normalize the supported OpenRouter ``provider`` options.
 
-    ``max_price`` is deliberately constrained to prompt/completion prices,
-    because those are the only billable dimensions this chat-only engine sends.
+    ``max_price`` is constrained to prompt/completion and per-request prices.
+    The dispatch budget pins request pricing to zero for its text-only scope.
     Boolean values must be actual booleans, not integer lookalikes.
     """
 

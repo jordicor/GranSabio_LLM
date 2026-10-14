@@ -1,0 +1,343 @@
+<section id="analysis-lexical-diversity" class="docs-section">
+                <h2 class="docs-subheading">Lexical Diversity Analysis</h2>
+                <div class="endpoint-header">
+                    <span class="http-method post">POST</span>
+                    <span class="endpoint-path">/analysis/lexical-diversity</span>
+                </div>
+
+                <p>Analyze text for vocabulary richness and lexical diversity using multiple statistical metrics including MTLD, HD-D, Yule's K, and Herdan's C. Returns GREEN/AMBER/RED grades based on configurable thresholds.</p>
+
+                <h3 class="docs-minor-heading">Key Features</h3>
+                <ul>
+                    <li><strong>Auto metric selection:</strong> Automatically selects appropriate metrics based on text length</li>
+                    <li><strong>Multiple metrics:</strong> MTLD (bidirectional), HD-D, Yule's K, Herdan's C, Brunet's W, TTR, Distinct-n</li>
+                    <li><strong>Configurable thresholds:</strong> Customize GREEN/AMBER/RED boundaries for each metric</li>
+                    <li><strong>Window analysis:</strong> Detect local repetition zones with sliding windows or paragraph-based analysis</li>
+                    <li><strong>Top words:</strong> Identify most frequent words with optional position tracking</li>
+                </ul>
+
+                <h3 class="docs-minor-heading">Request Parameters</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">text</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Text to analyze (required, min length: 1)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">tokenizer</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Tokenization mode: "word_punct" (default) or "alnum"</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">lowercase</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Convert tokens to lowercase (default: true)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">metrics</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Metrics to compute: "auto", "all", or CSV like "mtld,hdd,yulek" (default: "auto")</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">top_words</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Top K most frequent words (0=disabled, default: 0)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">target_field</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Optional. Specific JSON field to analyze for lexical diversity (e.g., "generated_text", "data.content"). If not specified or JSON parsing fails, analyzes all content. Supports dot notation for nested fields.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">analyze_windows</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Enable window-based analysis (default: false)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">window_mode</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Window mode: "tokens" for sliding windows, "paragraphs" for paragraph-based (default: "tokens")</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">thresholds</div>
+                        <div class="param-type">object</div>
+                        <div class="param-desc">Custom thresholds for grades (mtld_green_min, yulek_green_max, etc.)</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Example Request</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">cURL</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X POST "http://localhost:8000/analysis/lexical-diversity" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Artificial intelligence has revolutionized technology. Machine learning enables systems to learn from data. Deep learning models process information hierarchically.",
+    "metrics": "auto",
+    "top_words": 10,
+    "analyze_windows": false
+  }'</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Success Response (200 OK)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "version": "0.2.0",
+  "meta": {
+    "total_tokens": 45,
+    "tokenizer": "word_punct",
+    "metrics_selected": ["c", "yulek"]
+  },
+  "metrics": {
+    "c": 0.85,
+    "yulek": 95.3
+  },
+  "grades": {
+    "c": "GREEN",
+    "yulek": "GREEN"
+  },
+  "decision": {
+    "label": "GREEN",
+    "reasoning": "Majority of metrics meet GREEN criteria",
+    "votes": {"GREEN": 2, "AMBER": 0, "RED": 0}
+  },
+  "top_words": [
+    {"word": "learning", "count": 2, "freq": 0.044},
+    {"word": "intelligence", "count": 1, "freq": 0.022}
+  ],
+  "processing_time_ms": 1.5
+}</code></pre>
+                </div>
+
+                <div class="docs-info-box">
+                    <p><strong>Automatic metric selection by text length:</strong></p>
+                    <ul>
+                        <li><strong>N &lt; 200 tokens:</strong> Herdan's C, Yule's K (+ optional TTR)</li>
+                        <li><strong>200 ≤ N &lt; 400:</strong> MTLD (bi), Herdan's C, Yule's K</li>
+                        <li><strong>N ≥ 400:</strong> MTLD (bi), HD-D, Yule's K, Herdan's C (+ optional Brunet's W)</li>
+                    </ul>
+                </div>
+
+                <h3 class="docs-minor-heading">JSON Field Targeting</h3>
+                <p>Use the <code>target_field</code> parameter to analyze lexical diversity only in a specific JSON field. This is useful when generating structured JSON output where you want to validate vocabulary richness for specific sections.</p>
+                <ul class="docs-list">
+                    <li><strong>No target_field:</strong> Analyzes all words in the entire content (default behavior)</li>
+                    <li><strong>Simple field:</strong> Use field name like <code>"generated_text"</code> for top-level fields</li>
+                    <li><strong>Nested field:</strong> Use dot notation like <code>"data.content"</code> for nested fields</li>
+                    <li><strong>Fallback:</strong> If the field doesn't exist or JSON parsing fails, automatically falls back to analyzing all content with a warning</li>
+                </ul>
+
+                <h3 class="docs-minor-heading">Example with JSON Field Targeting</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">cURL</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X POST "http://localhost:8000/analysis/lexical-diversity" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "{\"story\": \"AI revolutionized tech. Machine learning enables systems to learn. Deep learning processes data.\", \"metadata\": \"Generated on 2025-01-15\"}",
+    "metrics": "auto",
+    "target_field": "story",
+    "top_words": 10
+  }'</code></pre>
+                </div>
+
+                <div class="alert warning">
+                    <strong>Fallback Behavior:</strong> If <code>target_field</code> is specified but the generated content is not valid JSON or the field doesn't exist, the system will automatically fall back to analyzing all content and log a warning. This ensures lexical diversity analysis always runs even when content structure differs from expectations.
+                </div>
+            </section>
+
+            <!-- Analysis Tools: Repetition Analyzer Section -->
+            <section id="analysis-repetition" class="docs-section">
+                <h2 class="docs-subheading">Repetition Analysis</h2>
+                <div class="endpoint-header">
+                    <span class="http-method post">POST</span>
+                    <span class="endpoint-path">/analysis/repetition</span>
+                </div>
+
+                <p>Analyze exact n-gram repetition patterns in text with clustering, diagnostics, and positional bias detection. Useful for detecting over-repetition, dense clusters, and phrase positioning anomalies.</p>
+
+                <h3 class="docs-minor-heading">Key Features</h3>
+                <ul>
+                    <li><strong>N-gram counting:</strong> Configurable min/max n-gram lengths with minimum count threshold</li>
+                    <li><strong>Distance metrics:</strong> Mean, stdev, quartiles between repetitions</li>
+                    <li><strong>Cluster detection:</strong> Groups repetitions by token gap proximity</li>
+                    <li><strong>Dense windows:</strong> Identifies densest windows of repeated phrases</li>
+                    <li><strong>Diagnostics:</strong> Over-repetition detection with configurable rules</li>
+                    <li><strong>Positional bias:</strong> Detects if phrases cluster at sentence/paragraph/block starts/ends</li>
+                    <li><strong>Multi-process:</strong> Parallel processing for large texts (&gt;50k tokens)</li>
+                </ul>
+
+                <h3 class="docs-minor-heading">Request Parameters</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">text</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Text to analyze (required, min length: 1)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">min_n</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Minimum n-gram length (default: 2)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">max_n</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Maximum n-gram length (default: 5)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">min_count</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Minimum occurrences to report (default: 2)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">diagnostics</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Diagnostics level: "off" (default), "basic", or "full"</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">enable_clusters</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Enable cluster computation (default: false)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">enable_position_metrics</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Enable positional bias analysis (default: false)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">algo_mode</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Algorithm: "auto" (default), "counter", or "multiprocess"</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Example Request (Basic)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">cURL</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X POST "http://localhost:8000/analysis/repetition" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "The quick brown fox jumps over the lazy dog. The dog was lazy. The brown fox was quick.",
+    "min_n": 2,
+    "max_n": 4,
+    "min_count": 2
+  }'</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Example Request (Advanced with Diagnostics)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">cURL</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X POST "http://localhost:8000/analysis/repetition" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Your long text here...",
+    "min_n": 2,
+    "max_n": 6,
+    "diagnostics": "full",
+    "enable_clusters": true,
+    "enable_position_metrics": true,
+    "pos_bias_threshold": 0.60
+  }'</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Success Response (200 OK)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "version": "2.3.2",
+  "meta": {
+    "total_tokens": 52,
+    "total_chars": 245,
+    "algo_used": "counter"
+  },
+  "settings": {
+    "min_n": 2,
+    "max_n": 4,
+    "min_count": 2
+  },
+  "summary": {
+    "top_by_count": {
+      "2": [
+        {"phrase": "the dog", "count": 3, "ratio": 0.058}
+      ],
+      "3": [
+        {"phrase": "the brown fox", "count": 2, "ratio": 0.038}
+      ]
+    }
+  },
+  "diagnostics": {
+    "status": "ok",
+    "has_issues": false,
+    "violations": {}
+  },
+  "processing_time_ms": 2.3
+}</code></pre>
+                </div>
+
+                <div class="docs-info-box">
+                    <p><strong>Algorithm selection:</strong></p>
+                    <ul>
+                        <li><strong>counter:</strong> Single-threaded, memory-efficient (best for &lt;50k tokens)</li>
+                        <li><strong>multiprocess:</strong> Parallel processing (automatically used for &gt;50k tokens)</li>
+                        <li><strong>auto:</strong> Automatically selects based on token count (recommended)</li>
+                    </ul>
+                </div>
+
+                <div class="alert warning">
+                    <strong>Performance tip:</strong> For large texts (&gt;100k tokens), enable multiprocess mode and limit details_top_k to reduce processing time.
+                </div>
+            </section>
+
+            <!-- Analysis Tools: Health Check Section -->
+            <section id="analysis-health" class="docs-section">
+                <h2 class="docs-subheading">Analysis Health Check</h2>
+                <div class="endpoint-header">
+                    <span class="http-method get">GET</span>
+                    <span class="endpoint-path">/analysis/health</span>
+                </div>
+
+                <p>Verify that the analysis endpoints are operational and available.</p>
+
+                <h3 class="docs-minor-heading">Example Request</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">cURL</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl "http://localhost:8000/analysis/health"</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Success Response (200 OK)</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "status": "healthy",
+  "endpoints": [
+    "/analysis/lexical-diversity",
+    "/analysis/repetition"
+  ]
+}</code></pre>
+                </div>
+            </section>
+
+            <!-- Project Grouping Section -->

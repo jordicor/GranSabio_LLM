@@ -23,12 +23,13 @@ Functions tested:
 """
 
 import asyncio
-from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
+import json_utils as json
+from ai_service import AIService
 from config import EDITABLE_CONTENT_TYPES
 from models import QAEvaluation, QALayer, QAModelConfig
 from qa_engine import (
@@ -78,28 +79,6 @@ def qa_engine(mock_ai_service, mock_bypass_engine):
     return engine
 
 
-class _FakeLocalAIService:
-    """Minimal AI service that exposes the local provider concurrency slot."""
-
-    def __init__(self):
-        self._ollama_request_semaphore = asyncio.Semaphore(1)
-        self.active = 0
-        self.max_active = 0
-
-    @asynccontextmanager
-    async def model_call_concurrency_slot(self, provider, model_id, operation):
-        if provider != "ollama":
-            yield None
-            return
-        async with self._ollama_request_semaphore:
-            self.active += 1
-            self.max_active = max(self.max_active, self.active)
-            try:
-                yield None
-            finally:
-                self.active -= 1
-
-
 @pytest.fixture
 def sample_qa_layer():
     """Create a sample QA layer."""
@@ -113,17 +92,96 @@ def sample_qa_layer():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [True, False])
+@pytest.mark.parametrize("streaming", [False, True])
 async def test_ollama_qa_evaluators_wait_for_local_slot_before_timeout(
     monkeypatch,
     mock_bypass_engine,
+    tmp_path,
+    legacy,
+    streaming,
 ):
-    """
-    Given: Multiple QA evaluators use Ollama
-    When: The scheduler launches them in parallel
-    Then: The local provider slot serializes actual evaluator work
-    """
-    fake_ai = _FakeLocalAIService()
-    engine = QAEngine(ai_service=fake_ai, bypass_engine=mock_bypass_engine)
+    """Real local QA finishes while respecting shared or distinct queue limits."""
+    import ai_service as ai_service_module
+
+    cfg = ai_service_module.config
+    for setting in (
+        "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "XAI_API_KEY",
+        "OPENROUTER_API_KEY", "MINIMAX_API_KEY", "MOONSHOT_API_KEY",
+        "PROVIDER_BUDGET_LEDGER_PATH", "LLAMACPP_BASE_URL", "FAKE_AI_HOST",
+    ):
+        monkeypatch.setattr(cfg, setting, "")
+    monkeypatch.setattr(cfg, "OLLAMA_HOST", "http://localhost:11434")
+    monkeypatch.setattr(cfg, "OLLAMA_ENDPOINT_ALIAS", "ollama")
+    monkeypatch.setattr(cfg, "LLAMACPP_ENDPOINT_ALIAS", "llamacpp")
+    monkeypatch.setattr(cfg, "OLLAMA_MAX_CONCURRENT_REQUESTS", 1 if legacy else 3)
+    endpoint_config = tmp_path / "local-endpoints.json"
+    endpoint_config.write_text(json.dumps({"local_endpoints": [{
+        "endpoint_id": "ollama",
+        "adapter": "ollama",
+        "base_url": "http://localhost:11434",
+        "max_concurrent_requests": 1,
+    }]}), encoding="utf-8")
+    monkeypatch.setattr(cfg, "LOCAL_ENDPOINTS_CONFIG_PATH", "" if legacy else str(endpoint_config))
+    monkeypatch.setattr(
+        type(cfg), "get_model_info",
+        lambda self, model, **kwargs: {
+            "provider": "ollama", "model_id": model.split("::")[-1], "capabilities": ["text"],
+            "max_tokens": 4096, "max_input_tokens": 32768,
+        },
+    )
+    monkeypatch.setattr(
+        "services.model_sync.ModelSyncService.discover_local_endpoint",
+        AsyncMock(return_value=[
+            {"model_id": name, "state": "loaded"}
+            for name in ("local-a", "local-b", "local-c")
+        ]),
+    )
+    active = 0
+    max_active = 0
+    response_json = '{"score":8,"feedback":"ok","deal_breaker":false,"issues":[]}'
+
+    class OfflineStream:
+        async def __aiter__(self):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(0.01)
+                yield SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        delta=SimpleNamespace(content=response_json), finish_reason="stop",
+                    )],
+                    usage=SimpleNamespace(prompt_tokens=10, completion_tokens=20, total_tokens=30),
+                )
+            finally:
+                active -= 1
+
+    async def complete(**kwargs):
+        nonlocal active, max_active
+        if kwargs.get("stream"):
+            return OfflineStream()
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(0.01)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(content=response_json), finish_reason="stop",
+                )],
+                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=20, total_tokens=30),
+            )
+        finally:
+            active -= 1
+
+    create = AsyncMock(side_effect=complete)
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)), close=AsyncMock(),
+    )
+    monkeypatch.setattr(ai_service_module.openai, "AsyncOpenAI", lambda **kwargs: client)
+    monkeypatch.setattr(ai_service_module, "_local_openai_async_http_client", lambda: None)
+    service = AIService(require_global_api_key=False)
+    engine = QAEngine(ai_service=service, bypass_engine=mock_bypass_engine)
     layer = QALayer(
         name="Local QA",
         description="Local model concurrency",
@@ -136,40 +194,26 @@ async def test_ollama_qa_evaluators_wait_for_local_slot_before_timeout(
         "qa_engine.calculate_qa_timeout_for_model",
         lambda *args, **kwargs: 1.0,
     )
-    import qa_engine as qa_engine_module
+    models = [QAModelConfig(model=name, endpoint_id="ollama") for name in ("local-a", "local-b", "local-c")]
+    try:
+        result = await asyncio.wait_for(engine._evaluate_ai_layer_with_scheduler(
+            content="content",
+            layer=layer,
+            qa_models=models,
+            qa_model_names=[model.model for model in models],
+            stream_callback=AsyncMock() if streaming else None,
+            original_request=SimpleNamespace(
+                qa_execution_mode="parallel",
+                smart_editing_mode="never",
+                content_type="other",
+                qa_timeout_retries=0,
+            ),
+        ), timeout=2.0)
+    finally:
+        await service.close()
 
-    monkeypatch.setattr(
-        type(qa_engine_module.config),
-        "get_model_info",
-        lambda self, model: {"provider": "ollama"},
-    )
-
-    async def fake_evaluate_content(content, layer, model, original_request, **kwargs):
-        await asyncio.sleep(0.01)
-        return QAEvaluation(
-            model=model,
-            layer=layer.name,
-            score=8.0,
-            feedback="ok",
-            deal_breaker=False,
-            passes_score=True,
-        )
-
-    engine.evaluate_content = fake_evaluate_content
-
-    result = await engine._evaluate_ai_layer_with_scheduler(
-        content="content",
-        layer=layer,
-        qa_models=["local-a", "local-b", "local-c"],
-        qa_model_names=["local-a", "local-b", "local-c"],
-        original_request=SimpleNamespace(
-            qa_execution_mode="parallel",
-            smart_editing_mode="never",
-            content_type="other",
-        ),
-    )
-
-    assert fake_ai.max_active == 1
+    assert max_active == 1
+    assert create.await_count == 3
     assert result.counts["valid"] == 3
 
 

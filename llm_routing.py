@@ -70,7 +70,6 @@ class LLMRouteResolution:
 
 LLM_CALL_REGISTRY: Dict[str, LLMCallSpec] = {
     "generation.main": LLMCallSpec("generation.main", description="Primary content generation"),
-    "generation.direct_stream": LLMCallSpec("generation.direct_stream", description="Direct content streaming"),
     "generation.json_retry": LLMCallSpec("generation.json_retry", description="JSON repair regeneration"),
     "generation.smart_edit": LLMCallSpec("generation.smart_edit", description="Smart-edit generation fallback"),
     "qa.evaluate_layer": LLMCallSpec("qa.evaluate_layer", multi_model=True, description="QA layer evaluation"),
@@ -315,7 +314,6 @@ def build_legacy_request_overlay(request: Any, fields_set: Optional[set[str]] = 
         generator_model = getattr(request, "generator_model", None)
         if generator_model:
             calls["generation.main"] = {"model": str(generator_model)}
-            calls["generation.direct_stream"] = {"model": str(generator_model)}
             calls["generation.json_retry"] = {"model": str(generator_model)}
             calls["long_text.section_draft"] = {"model": str(generator_model)}
             calls["long_text.section_tools"] = {"model": str(generator_model)}
@@ -590,19 +588,31 @@ def _param_supported(model_info: Mapping[str, Any], param_name: str) -> bool:
     if not runtime_parameters.accepts_parameter(provider, model_id, param_name):
         return False
     if param_name == "temperature":
-        if "gpt-5" in model_id or model_id.startswith(("o1", "o3", "o4")):
+        if model_id.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4")):
             return False
         return True
     if param_name == "reasoning_effort":
+        reasoning_config = model_info.get("reasoning_effort")
+        if isinstance(reasoning_config, Mapping) and reasoning_config.get("supported") is False:
+            return False
+        if provider == "openrouter":
+            from model_capability_registry import model_supports
+
+            return model_supports(
+                specs={}, provider=provider, model_id=model_id,
+                capability="reasoning_effort", model_data=model_info,
+            ).supported
+        if isinstance(reasoning_config, Mapping) and "supported" in reasoning_config:
+            return bool(reasoning_config["supported"])
         supported_parameters = model_info.get("supported_parameters")
         if (
-            provider == "llamacpp"
-            and isinstance(supported_parameters, Sequence)
+            isinstance(supported_parameters, Sequence)
             and not isinstance(supported_parameters, (str, bytes, bytearray))
-            and "reasoning_effort" in supported_parameters
+            and supported_parameters
         ):
-            return True
-        return "gpt-5" in model_id or model_id.startswith(("o1", "o3", "o4"))
+            return "reasoning_effort" in supported_parameters
+        # Preserve existing family defaults when discovery has no parameter metadata.
+        return model_id.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4"))
     if param_name == "thinking_budget_tokens":
         return provider in {"claude", "gemini", "google"} or "claude" in model_id or "gemini" in model_id
     return True

@@ -23,6 +23,43 @@ collect_ignore = [
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+@pytest.fixture(scope="session")
+def live_engine_server() -> str:
+    """Base URL of the running engine server for opt-in ``integration`` tests.
+
+    Fails fast, once per session, when nothing healthy answers at ``API_BASE``
+    (default ``http://localhost:8000``).
+    """
+    import httpx
+
+    api_base = os.environ.get("API_BASE", "http://localhost:8000")
+    try:
+        response = httpx.get(f"{api_base}/health", timeout=5)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+    else:
+        return api_base
+    pytest.fail(
+        f"Engine server unreachable at {api_base} ({reason}). "
+        "Start it with `python main.py` or point API_BASE at a running one.",
+        pytrace=False,
+    )
+
+
+@pytest.fixture
+def short_tmp_path(tmp_path_factory):
+    """Per-test temporary directory with a minimal name.
+
+    Content-addressed attachment storage builds deep paths (blob kind, sha256
+    fan-out, 64-hex file names, timestamped quarantine names). Under a deep
+    ``--basetemp``, the default ``tmp_path``, named after the test, pushes them
+    past the 260-character Windows MAX_PATH limit on hosts without long path
+    support.
+    """
+    return tmp_path_factory.mktemp("t")
+
+
 @pytest.fixture(autouse=True)
 def _context_admission_observe_default(monkeypatch):
     """Default the test suite to CONTEXT_ADMISSION_MODE=observe.
@@ -56,6 +93,7 @@ def mock_env_vars():
         "OPENROUTER_API_KEY": "sk-or-test-key-12345",
         "MINIMAX_API_KEY": "minimax-test-key-12345",
         "MOONSHOT_API_KEY": "moonshot-test-key-12345",
+        "TYPESAFE_API_KEY": "test-key",
         "DEFAULT_MIN_GLOBAL_SCORE": "8.0",
         "DEFAULT_MAX_ITERATIONS": "5",
         "APP_HOST": "0.0.0.0",
@@ -70,7 +108,8 @@ def clean_env():
     """Provide clean environment without API keys."""
     keys_to_remove = [
         "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
-        "XAI_API_KEY", "OPENROUTER_API_KEY", "MINIMAX_API_KEY", "MOONSHOT_API_KEY"
+        "XAI_API_KEY", "OPENROUTER_API_KEY", "MINIMAX_API_KEY", "MOONSHOT_API_KEY",
+        "TYPESAFE_API_KEY",
     ]
     with patch.dict(os.environ, {}, clear=False):
         for key in keys_to_remove:

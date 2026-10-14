@@ -987,18 +987,22 @@ def analyze_text(text: str, cfg: AnalysisConfig) -> Dict[str, Any]:
     total_tokens = len(tokens)
     total_chars = len(text)
 
-    # Sentences for counting (respect_sentences) and for positional analysis (always)
+    # Sentence boundaries used by n-gram counting.
     segments = build_sentence_segments(tokens, cfg)
-    # For positional metrics we want sentence boundaries even if respect_sentences=False
-    pos_tc = parse_sentence_terminators(cfg.sentence_terminators, mode=cfg.sentence_mode, multis_spec=cfg.sentence_multis)
-    pos_sentence_segments = compute_sentence_segments(tokens, pos_tc)
-    pos_sentence_map = token_to_segment_index_map(pos_sentence_segments, total_tokens)
+    if cfg.enable_position_metrics:
+        if cfg.respect_sentences:
+            pos_sentence_segments = segments
+        else:
+            # Positional metrics still need boundaries when counting crosses sentences.
+            pos_tc = parse_sentence_terminators(cfg.sentence_terminators, mode=cfg.sentence_mode, multis_spec=cfg.sentence_multis)
+            pos_sentence_segments = compute_sentence_segments(tokens, pos_tc)
+        pos_sentence_map = token_to_segment_index_map(pos_sentence_segments, total_tokens)
 
-    # Paragraphs and Blocks (by blank lines)
-    para_segments_tok = compute_token_segments_from_blanklines(text, token_spans, cfg.paragraph_break_min_blank_lines)
-    block_segments_tok = compute_token_segments_from_blanklines(text, token_spans, cfg.block_break_min_blank_lines)
-    para_map = token_to_segment_index_map(para_segments_tok, total_tokens)
-    block_map = token_to_segment_index_map(block_segments_tok, total_tokens)
+        # Paragraph and block maps are only consumed by positional metrics.
+        para_segments_tok = compute_token_segments_from_blanklines(text, token_spans, cfg.paragraph_break_min_blank_lines)
+        block_segments_tok = compute_token_segments_from_blanklines(text, token_spans, cfg.block_break_min_blank_lines)
+        para_map = token_to_segment_index_map(para_segments_tok, total_tokens)
+        block_map = token_to_segment_index_map(block_segments_tok, total_tokens)
 
     # Algo selection
     algo_mode_norm = (cfg.algo_mode or "auto").lower()

@@ -68,7 +68,6 @@ from .models import (
     ChangeDetail,
     EditBaseModel,
     EditContext,
-    EditDecision,
     # Core operation types
     EditOperation,
     EditResult,
@@ -127,7 +126,6 @@ __all__ = [
     "MarkerConfig",
     "TextEditRange",
     "EditContext",
-    "EditDecision",
     "QAEvaluationWithRanges",
     # Localization utilities
     "find_optimal_phrase_length",

@@ -61,16 +61,16 @@ POLL_INTERVAL = float(os.getenv("GRANSABIO_POLL_INTERVAL", "2.0"))
 GENERATOR_MODEL_OVERRIDE = os.getenv("GRANSABIO_GENERATOR_MODEL")
 _qa_models_env = os.getenv("GRANSABIO_QA_MODELS")
 QA_MODEL_OVERRIDES = [item.strip() for item in _qa_models_env.split(",") if item.strip()] if _qa_models_env else None
-ARBITER_MODEL_OVERRIDE = os.getenv("GRANSABIO_ARBITER_MODEL")
+# Keep the existing environment name; it selects Gran Sabio, not the
+# separate Arbiter that resolves edits within a QA layer.
+GRAN_SABIO_MODEL_OVERRIDE = os.getenv("GRANSABIO_ARBITER_MODEL")
 
 # Optional reasoning overrides.
 GENERATOR_REASONING_OVERRIDE = os.getenv("GRANSABIO_GENERATOR_REASONING")
 QA_REASONING_OVERRIDE = os.getenv("GRANSABIO_QA_REASONING")
-ARBITER_REASONING_OVERRIDE = os.getenv("GRANSABIO_ARBITER_REASONING")
 
-# Thinking budget for Claude models (0 = auto/disabled)
-_thinking_budget_env = os.getenv("GRANSABIO_THINKING_BUDGET", "0")
-THINKING_BUDGET_OVERRIDE = int(_thinking_budget_env) if _thinking_budget_env.isdigit() else 0
+# Thinking budget for compatible models (0 in the environment = API routing)
+THINKING_BUDGET_OVERRIDE = os.getenv("GRANSABIO_THINKING_BUDGET", "0")
 
 
 # =============================================================================
@@ -78,6 +78,7 @@ THINKING_BUDGET_OVERRIDE = int(_thinking_budget_env) if _thinking_budget_env.isd
 # =============================================================================
 
 # Common reasoning parameters schema for tool definitions
+REASONING_EFFORT_VALUES = ["none", "low", "medium", "high", "off", "disabled", "0", "false"]
 REASONING_PARAMS_SCHEMA = {
     "generator_model": {
         "type": "string",
@@ -88,10 +89,14 @@ REASONING_PARAMS_SCHEMA = {
         "items": {"type": "string"},
         "description": "Override QA models list"
     },
+    "gran_sabio_model": {
+        "type": "string",
+        "description": "Optional explicit model for Gran Sabio escalation, not the QA layer-edit Arbiter"
+    },
     "reasoning_effort": {
         "type": "string",
-        "enum": ["none", "low", "medium", "high"],
-        "description": "Reasoning effort for compatible reasoning models. Higher = deeper analysis, slower response."
+        "enum": REASONING_EFFORT_VALUES,
+        "description": "Generator reasoning override. none (aliases: off, disabled, 0, false) omits the MCP override and uses API routing; it does not disable provider reasoning."
     },
     "thinking_budget_tokens": {
         "type": "integer",
@@ -100,8 +105,8 @@ REASONING_PARAMS_SCHEMA = {
     },
     "qa_reasoning_effort": {
         "type": "string",
-        "enum": ["none", "low", "medium", "high"],
-        "description": "Reasoning effort for QA evaluation models"
+        "enum": REASONING_EFFORT_VALUES,
+        "description": "QA reasoning override. none (aliases: off, disabled, 0, false) omits the MCP override and uses API routing; it does not disable provider reasoning."
     }
 }
 
@@ -163,16 +168,43 @@ def _request_timeout_from_payload(payload: Dict[str, Any]) -> float:
     return float(REQUEST_TIMEOUT)
 
 
-def _parse_reasoning_effort(value: Optional[str]) -> Optional[str]:
-    """Normalize reasoning effort value."""
-    if not value:
-        return None
+def _parse_reasoning_effort(value: Any, setting: str = "reasoning_effort") -> Optional[str]:
+    """Normalize a supported override, rejecting invalid explicit values."""
+    if not isinstance(value, str):
+        raise ValueError(f"Invalid {setting}: expected a string from {', '.join(REASONING_EFFORT_VALUES)}")
     normalized = value.lower().strip()
     if normalized in ("none", "off", "disabled", "0", "false"):
         return None
     if normalized in ("low", "medium", "high"):
         return normalized
-    return None
+    raise ValueError(f"Invalid {setting}: expected one of {', '.join(REASONING_EFFORT_VALUES)}")
+
+
+def _parse_thinking_budget(value: Any, *, from_environment: bool = False) -> Optional[int]:
+    """Validate a thinking budget; only the environment accepts zero as unset."""
+    setting = "GRANSABIO_THINKING_BUDGET" if from_environment else "thinking_budget_tokens"
+    error = f"Invalid {setting}: expected an integer >= 1024"
+    if from_environment:
+        error += " or 0 to use API routing"
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(error) from None
+        if value == 0:
+            return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1024:
+        raise ValueError(error)
+    return value
+
+
+def _reject_removed_reasoning_setting() -> None:
+    """Reject the retired environment option without exposing its value."""
+    if "GRANSABIO_ARBITER_REASONING" in os.environ:
+        raise ValueError(
+            "GRANSABIO_ARBITER_REASONING is unsupported and was never forwarded to the API. "
+            "Remove it from the MCP environment; configure Gran Sabio or Arbiter reasoning "
+            "for the intended call in the API llm_routing document."
+        )
 
 
 def _build_generator_config(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -182,23 +214,23 @@ def _build_generator_config(args: Dict[str, Any]) -> Dict[str, Any]:
     if generator_model:
         config["generator_model"] = generator_model
 
-    # Reasoning effort (GPT-5, O1, O3)
-    reasoning = args.get("reasoning_effort")
-    if reasoning:
-        parsed = _parse_reasoning_effort(reasoning)
-        if parsed:
-            config["reasoning_effort"] = parsed
+    # An explicit inheritance value takes precedence over the environment.
+    if "reasoning_effort" in args:
+        reasoning = _parse_reasoning_effort(args["reasoning_effort"])
     elif GENERATOR_REASONING_OVERRIDE:
-        parsed = _parse_reasoning_effort(GENERATOR_REASONING_OVERRIDE)
-        if parsed:
-            config["reasoning_effort"] = parsed
+        reasoning = _parse_reasoning_effort(GENERATOR_REASONING_OVERRIDE, "GRANSABIO_GENERATOR_REASONING")
+    else:
+        reasoning = None
+    if reasoning is not None:
+        config["reasoning_effort"] = reasoning
 
     # Thinking budget (Claude models)
-    thinking_budget = args.get("thinking_budget_tokens")
-    if thinking_budget and isinstance(thinking_budget, int) and thinking_budget >= 1024:
+    if "thinking_budget_tokens" in args:
+        thinking_budget = _parse_thinking_budget(args["thinking_budget_tokens"])
+    else:
+        thinking_budget = _parse_thinking_budget(THINKING_BUDGET_OVERRIDE, from_environment=True)
+    if thinking_budget is not None:
         config["thinking_budget_tokens"] = thinking_budget
-    elif THINKING_BUDGET_OVERRIDE >= 1024:
-        config["thinking_budget_tokens"] = THINKING_BUDGET_OVERRIDE
 
     return config
 
@@ -211,27 +243,24 @@ def _build_qa_config(args: Dict[str, Any]) -> Dict[str, Any]:
         config["qa_models"] = qa_models
 
     # QA reasoning effort - apply globally to all QA models
-    qa_reasoning = args.get("qa_reasoning_effort")
-    if qa_reasoning:
-        parsed = _parse_reasoning_effort(qa_reasoning)
-        if parsed:
-            config["qa_global_config"] = {"reasoning_effort": parsed}
+    if "qa_reasoning_effort" in args:
+        qa_reasoning = _parse_reasoning_effort(args["qa_reasoning_effort"], "qa_reasoning_effort")
     elif QA_REASONING_OVERRIDE:
-        parsed = _parse_reasoning_effort(QA_REASONING_OVERRIDE)
-        if parsed:
-            config["qa_global_config"] = {"reasoning_effort": parsed}
+        qa_reasoning = _parse_reasoning_effort(QA_REASONING_OVERRIDE, "GRANSABIO_QA_REASONING")
+    else:
+        qa_reasoning = None
+    if qa_reasoning is not None:
+        config["qa_global_config"] = {"reasoning_effort": qa_reasoning}
 
     return config
 
 
-def _build_arbiter_config(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Build arbiter (Gran Sabio) configuration."""
-    # Arbiter doesn't support per-call reasoning config in the API yet,
-    # but we prepare the model selection
+def _build_gran_sabio_config(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Build Gran Sabio model selection, preserving the external environment name."""
     config = {"gran_sabio_fallback": True}
-    arbiter_model = args.get("gran_sabio_model") or ARBITER_MODEL_OVERRIDE
-    if arbiter_model:
-        config["gran_sabio_model"] = arbiter_model
+    gran_sabio_model = args.get("gran_sabio_model") or GRAN_SABIO_MODEL_OVERRIDE
+    if gran_sabio_model:
+        config["gran_sabio_model"] = gran_sabio_model
     return config
 
 
@@ -317,21 +346,36 @@ async def _call_gransabio(payload: dict[str, Any]) -> dict[str, Any]:
             raise Exception(_bounded_error_message("Generation failed", response.status_code, response.text))
 
         data = response.json()
+        if not isinstance(data, dict):
+            raise Exception("Invalid initialization response from Gran Sabio API: expected a JSON object")
+        status = data.get("status")
 
         # Check for preflight rejection
-        if data.get("status") == "rejected":
-            feedback = data.get("preflight_feedback", {})
+        if status == "preflight_rejected":
+            feedback = data.get("preflight_feedback") or {}
+            decision = feedback.get("decision")
             return {
                 "success": False,
-                "error": "Preflight validation rejected",
-                "feedback": feedback.get("user_feedback", "Unknown reason"),
+                "status": status,
+                "decision": decision,
+                "error": "Preflight validation requires manual review" if decision == "manual_review" else "Preflight validation rejected",
+                "feedback": feedback.get("user_feedback") or feedback.get("summary") or "Unknown reason",
                 "issues": feedback.get("issues", [])
+            }
+
+        if status == "auto_qa_rejected":
+            feedback = data.get("auto_qa_feedback") or {}
+            return {
+                "success": False,
+                "status": status,
+                "error": "Auto-QA validation rejected",
+                "feedback": feedback.get("message") or "Unknown reason",
+                "auto_qa_feedback": feedback,
             }
 
         session_id = data.get("session_id")
         if not session_id:
-            print(f"No session_id in /generate response: {data}", file=sys.stderr)
-            raise Exception("No session_id in /generate response from Gran Sabio API")
+            raise Exception(f"No session_id in /generate response from Gran Sabio API (status: {status or 'unknown'})")
 
         # Wait for completion
         result = await _wait_for_result(client, session_id, timeout=request_timeout)
@@ -446,10 +490,10 @@ The content goes through:
 1. Generation by a primary AI model (with optional reasoning)
 2. QA evaluation by multiple reviewer models
 3. Iteration if quality thresholds aren't met
-4. Gran Sabio arbitration if there are conflicts
+4. Gran Sabio escalation if there are conflicts
 
 Supports full reasoning configuration for both generator and QA models.
-Returns approved content only when it meets all quality criteria.""",
+Returns approval status and any candidate content supplied by the engine.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -541,6 +585,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Handle tool calls."""
 
     try:
+        _reject_removed_reasoning_setting()
         if name == "gransabio_analyze_code":
             result = await _handle_analyze_code(arguments)
         elif name == "gransabio_review_fix":
@@ -562,7 +607,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         error_result = {
             "error": str(e),
             "tool": name,
-            "hint": "Ensure Gran Sabio LLM is running at " + GRANSABIO_API_URL
+            "hint": "Review the error details. Use gransabio_check_health to verify API connectivity."
         }
         return [TextContent(type="text", text=json.dumps(error_result, indent=2))]
 
@@ -628,7 +673,7 @@ Provide a comprehensive analysis in JSON format with:
     # Build configuration from arguments
     generator_config = _build_generator_config(args)
     qa_config = _build_qa_config(args)
-    arbiter_config = _build_arbiter_config(args)
+    gran_sabio_config = _build_gran_sabio_config(args)
     timeout_config = _build_timeout_config(args)
 
     payload = {
@@ -637,7 +682,7 @@ Provide a comprehensive analysis in JSON format with:
         "json_output": True,
         **generator_config,
         **qa_config,
-        **arbiter_config,
+        **gran_sabio_config,
         **timeout_config,
         "qa_layers": qa_layers,
         "min_global_score": 7.5,
@@ -722,7 +767,7 @@ Analyze and respond in JSON format:
     # Build configuration from arguments
     generator_config = _build_generator_config(args)
     qa_config = _build_qa_config(args)
-    arbiter_config = _build_arbiter_config(args)
+    gran_sabio_config = _build_gran_sabio_config(args)
     timeout_config = _build_timeout_config(args)
 
     payload = {
@@ -731,7 +776,7 @@ Analyze and respond in JSON format:
         "json_output": True,
         **generator_config,
         **qa_config,
-        **arbiter_config,
+        **gran_sabio_config,
         **timeout_config,
         "qa_layers": qa_layers,
         "min_global_score": 7.5,
@@ -793,7 +838,7 @@ async def _handle_generate_with_qa(args: dict[str, Any]) -> dict[str, Any]:
     # Build configuration from arguments
     generator_config = _build_generator_config(args)
     qa_config = _build_qa_config(args)
-    arbiter_config = _build_arbiter_config(args)
+    gran_sabio_config = _build_gran_sabio_config(args)
     timeout_config = _build_timeout_config(args)
 
     payload = {
@@ -801,7 +846,7 @@ async def _handle_generate_with_qa(args: dict[str, Any]) -> dict[str, Any]:
         "content_type": content_type,
         **generator_config,
         **qa_config,
-        **arbiter_config,
+        **gran_sabio_config,
         **timeout_config,
         "qa_layers": qa_layers,
         "min_global_score": min_score,
@@ -885,19 +930,21 @@ async def _handle_list_models(args: dict[str, Any]) -> dict[str, Any]:
 
 def _handle_get_config() -> dict[str, Any]:
     """Return current MCP server configuration."""
+    generator_config = _build_generator_config({})
+    qa_config = _build_qa_config({})
     return {
         "api_url": GRANSABIO_API_URL,
         "models": {
             "generator_override": GENERATOR_MODEL_OVERRIDE,
             "qa_model_overrides": QA_MODEL_OVERRIDES,
-            "arbiter_override": ARBITER_MODEL_OVERRIDE,
+            # Preserve the response key used by existing MCP clients.
+            "arbiter_override": GRAN_SABIO_MODEL_OVERRIDE,
             "default_source": "Gran Sabio API llm_routing"
         },
         "reasoning": {
-            "generator_reasoning": GENERATOR_REASONING_OVERRIDE,
-            "qa_reasoning": QA_REASONING_OVERRIDE,
-            "arbiter_reasoning": ARBITER_REASONING_OVERRIDE,
-            "thinking_budget": THINKING_BUDGET_OVERRIDE if THINKING_BUDGET_OVERRIDE >= 1024 else "API routing"
+            "generator_reasoning": generator_config.get("reasoning_effort"),
+            "qa_reasoning": qa_config.get("qa_global_config", {}).get("reasoning_effort"),
+            "thinking_budget": generator_config.get("thinking_budget_tokens", "API routing")
         },
         "timeouts": {
             "request_timeout": REQUEST_TIMEOUT,
@@ -910,8 +957,10 @@ def _handle_get_config() -> dict[str, Any]:
 # Main Entry Point
 # =============================================================================
 
-async def main():
+async def main() -> None:
     """Run the MCP server."""
+    _reject_removed_reasoning_setting()
+    configuration = _handle_get_config()
     print("Gran Sabio LLM MCP Server", file=sys.stderr)
     print(f"API URL: {GRANSABIO_API_URL}", file=sys.stderr)
     print("", file=sys.stderr)
@@ -921,15 +970,15 @@ async def main():
         print(f"  Generator override: {GENERATOR_MODEL_OVERRIDE}", file=sys.stderr)
     if QA_MODEL_OVERRIDES:
         print(f"  QA overrides: {', '.join(QA_MODEL_OVERRIDES)}", file=sys.stderr)
-    if ARBITER_MODEL_OVERRIDE:
-        print(f"  Arbiter override: {ARBITER_MODEL_OVERRIDE}", file=sys.stderr)
+    if GRAN_SABIO_MODEL_OVERRIDE:
+        print(f"  Gran Sabio override (GRANSABIO_ARBITER_MODEL): {GRAN_SABIO_MODEL_OVERRIDE}", file=sys.stderr)
     print("", file=sys.stderr)
     print("Reasoning overrides:", file=sys.stderr)
-    print(f"  Generator: {GENERATOR_REASONING_OVERRIDE or 'API routing'}", file=sys.stderr)
-    print(f"  QA: {QA_REASONING_OVERRIDE or 'API routing'}", file=sys.stderr)
-    print(f"  Arbiter: {ARBITER_REASONING_OVERRIDE or 'API routing'}", file=sys.stderr)
-    if THINKING_BUDGET_OVERRIDE >= 1024:
-        print(f"  Thinking Budget: {THINKING_BUDGET_OVERRIDE} tokens", file=sys.stderr)
+    print(f"  Generator: {configuration['reasoning']['generator_reasoning'] or 'API routing'}", file=sys.stderr)
+    print(f"  QA: {configuration['reasoning']['qa_reasoning'] or 'API routing'}", file=sys.stderr)
+    thinking_budget = configuration['reasoning']['thinking_budget']
+    if isinstance(thinking_budget, int):
+        print(f"  Thinking Budget: {thinking_budget} tokens", file=sys.stderr)
     print("", file=sys.stderr)
 
     async with stdio_server() as (read_stream, write_stream):

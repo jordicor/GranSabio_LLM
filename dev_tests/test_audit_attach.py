@@ -46,10 +46,16 @@ SimpleRateLimiter = attachments_router.SimpleRateLimiter
 def _settings(tmp_path, **overrides):
     values = {
         "dedupe_db_path": str(tmp_path / "attachments" / "attachments.sqlite3"),
-        "blob_base_path": str(tmp_path / "attachment_blobs"),
+        "blob_base_path": str(tmp_path / "blobs"),
     }
     values.update(overrides)
     return AttachmentSettings(**values)
+
+
+@pytest.fixture
+def tmp_path(short_tmp_path):
+    """Blob storage paths are deep; keep them under MAX_PATH (see conftest)."""
+    return short_tmp_path
 
 
 @pytest.fixture(autouse=True)

@@ -136,14 +136,14 @@ class TestFilterClaims:
         Then: Trivial claims are removed
         """
         claims = [
-            {"idx": 0, "kind": "factual", "importance": 0.8},
-            {"idx": 1, "kind": "trivial", "importance": 0.9},
-            {"idx": 2, "kind": "inference", "importance": 0.7},
+            ExtractedClaim(idx=0, claim="Test claim", kind="factual", importance=0.8),
+            ExtractedClaim(idx=1, claim="Test claim", kind="trivial", importance=0.9),
+            ExtractedClaim(idx=2, claim="Test claim", kind="inference", importance=0.7),
         ]
         result = _filter_claims(claims, filter_trivial=True, min_importance=0.0)
 
         assert len(result) == 2
-        assert all(c["kind"] != "trivial" for c in result)
+        assert all(c.kind != "trivial" for c in result)
 
     def test_keeps_trivial_claims_when_disabled(self):
         """
@@ -152,8 +152,8 @@ class TestFilterClaims:
         Then: Trivial claims are kept
         """
         claims = [
-            {"idx": 0, "kind": "factual", "importance": 0.8},
-            {"idx": 1, "kind": "trivial", "importance": 0.9},
+            ExtractedClaim(idx=0, claim="Test claim", kind="factual", importance=0.8),
+            ExtractedClaim(idx=1, claim="Test claim", kind="trivial", importance=0.9),
         ]
         result = _filter_claims(claims, filter_trivial=False, min_importance=0.0)
 
@@ -166,14 +166,14 @@ class TestFilterClaims:
         Then: Only claims with importance >= 0.6 are kept
         """
         claims = [
-            {"idx": 0, "kind": "factual", "importance": 0.8},
-            {"idx": 1, "kind": "factual", "importance": 0.5},
-            {"idx": 2, "kind": "factual", "importance": 0.3},
+            ExtractedClaim(idx=0, claim="Test claim", kind="factual", importance=0.8),
+            ExtractedClaim(idx=1, claim="Test claim", kind="factual", importance=0.5),
+            ExtractedClaim(idx=2, claim="Test claim", kind="factual", importance=0.3),
         ]
         result = _filter_claims(claims, filter_trivial=False, min_importance=0.6)
 
         assert len(result) == 1
-        assert result[0]["importance"] == 0.8
+        assert result[0].importance == 0.8
 
     def test_combines_both_filters(self):
         """
@@ -182,16 +182,16 @@ class TestFilterClaims:
         Then: Both filters are applied
         """
         claims = [
-            {"idx": 0, "kind": "factual", "importance": 0.8},  # Keep
-            {"idx": 1, "kind": "trivial", "importance": 0.9},  # Filter: trivial
-            {"idx": 2, "kind": "factual", "importance": 0.3},  # Filter: importance
-            {"idx": 3, "kind": "inference", "importance": 0.7},  # Keep
+            ExtractedClaim(idx=0, claim="Test claim", kind="factual", importance=0.8),
+            ExtractedClaim(idx=1, claim="Test claim", kind="trivial", importance=0.9),
+            ExtractedClaim(idx=2, claim="Test claim", kind="factual", importance=0.3),
+            ExtractedClaim(idx=3, claim="Test claim", kind="inference", importance=0.7),
         ]
         result = _filter_claims(claims, filter_trivial=True, min_importance=0.6)
 
         assert len(result) == 2
-        assert result[0]["idx"] == 0
-        assert result[1]["idx"] == 3
+        assert result[0].idx == 0
+        assert result[1].idx == 3
 
     def test_returns_empty_list_when_all_filtered(self):
         """
@@ -200,7 +200,7 @@ class TestFilterClaims:
         Then: Returns empty list
         """
         claims = [
-            {"idx": 0, "kind": "trivial", "importance": 0.1},
+            ExtractedClaim(idx=0, claim="Test claim", kind="trivial", importance=0.1),
         ]
         result = _filter_claims(claims, filter_trivial=True, min_importance=0.5)
         assert result == []
@@ -208,6 +208,18 @@ class TestFilterClaims:
 
 class TestParseClaimsResponse:
     """Tests for _parse_claims_response function."""
+
+    @pytest.fixture
+    def valid_claim(self):
+        """Complete provider response item, including uncited/source text fields."""
+        return {
+            "idx": 0,
+            "claim": "Test claim",
+            "kind": "factual",
+            "importance": 0.7,
+            "cited_spans": [],
+            "source_text": "Test claim",
+        }
 
     def test_parses_valid_response(self):
         """
@@ -235,7 +247,7 @@ class TestParseClaimsResponse:
         assert result[0].kind == "factual"
         assert result[0].importance == 0.9
 
-    def test_applies_filters(self):
+    def test_applies_filters(self, valid_claim):
         """
         Given: Response with claims of varying importance
         When: _parse_claims_response with filters
@@ -243,8 +255,8 @@ class TestParseClaimsResponse:
         """
         response = json.dumps({
             "claims": [
-                {"idx": 0, "claim": "Important", "kind": "factual", "importance": 0.9},
-                {"idx": 1, "claim": "Unimportant", "kind": "factual", "importance": 0.3},
+                {**valid_claim, "idx": 0, "claim": "Important", "importance": 0.9},
+                {**valid_claim, "idx": 1, "claim": "Unimportant", "importance": 0.3},
             ]
         })
         result = _parse_claims_response(response, filter_trivial=True, min_importance=0.6)
@@ -252,22 +264,33 @@ class TestParseClaimsResponse:
         assert len(result) == 1
         assert result[0].claim == "Important"
 
-    def test_handles_missing_optional_fields(self):
-        """
-        Given: Response with minimal claim data
-        When: _parse_claims_response is called
-        Then: Uses defaults for missing optional fields
-        """
-        response = json.dumps({
-            "claims": [
-                {"idx": 0, "claim": "Test claim", "kind": "factual", "importance": 0.7}
-            ]
-        })
-        result = _parse_claims_response(response, filter_trivial=False, min_importance=0.0)
+    @pytest.mark.parametrize(
+        "missing", ["idx", "claim", "kind", "importance", "cited_spans", "source_text"]
+    )
+    def test_requires_all_extraction_fields(self, valid_claim, missing):
+        """Provider fields remain required even when the internal model has defaults."""
+        valid_claim.pop(missing)
+        response = json.dumps({"claims": [valid_claim]})
+        with pytest.raises(ValueError, match="Invalid claim at index 0: missing required"):
+            _parse_claims_response(response, filter_trivial=False, min_importance=0.0)
 
-        assert len(result) == 1
-        assert result[0].cited_spans == []
-        assert result[0].source_text == ""
+    @pytest.mark.parametrize("field,value", [
+        ("idx", True),
+        ("claim", 1),
+        ("claim", " "),
+        ("kind", "unsupported"),
+        ("importance", "0.9"),
+        ("importance", 1.1),
+        ("cited_spans", None),
+        ("cited_spans", [1]),
+        ("source_text", None),
+    ])
+    def test_invalid_item_rejects_entire_response(self, valid_claim, field, value):
+        """A bad item cannot disappear while valid claims are accepted."""
+        invalid_claim = {**valid_claim, "idx": 1, field: value}
+        response = json.dumps({"claims": [valid_claim, invalid_claim]})
+        with pytest.raises(ValueError, match="Invalid claim at index 1"):
+            _parse_claims_response(response, filter_trivial=True, min_importance=0.6)
 
     def test_raises_on_invalid_json(self):
         """
@@ -279,16 +302,22 @@ class TestParseClaimsResponse:
             _parse_claims_response("not valid json", filter_trivial=False, min_importance=0.0)
         assert "Invalid JSON" in str(exc_info.value)
 
-    def test_raises_on_invalid_claims_field(self):
+    @pytest.mark.parametrize("data,error", [
+        ({"claims": "not a list"}, "not a list"),
+        ({}, "missing required 'claims'"),
+        ([], "must be a JSON object"),
+        ({"claims": [None]}, "Invalid claim at index 0"),
+    ])
+    def test_raises_on_invalid_claims_field(self, data, error):
         """
         Given: JSON without valid claims list
         When: _parse_claims_response is called
         Then: Raises ValueError
         """
-        response = json.dumps({"claims": "not a list"})
+        response = json.dumps(data)
         with pytest.raises(ValueError) as exc_info:
             _parse_claims_response(response, filter_trivial=False, min_importance=0.0)
-        assert "not a list" in str(exc_info.value)
+        assert error in str(exc_info.value)
 
 
 class TestClaimExtractor:
@@ -315,7 +344,8 @@ class TestClaimExtractor:
         """
         mock_ai_service.generate_content.return_value = json.dumps({
             "claims": [
-                {"idx": 0, "claim": "Test claim", "kind": "factual", "importance": 0.8}
+                {"idx": 0, "claim": "Test claim", "kind": "factual", "importance": 0.8,
+                 "cited_spans": [], "source_text": "Test claim"}
             ]
         })
 
@@ -420,8 +450,10 @@ class TestClaimExtractor:
         """
         mock_ai_service.generate_content.return_value = json.dumps({
             "claims": [
-                {"idx": 0, "claim": "Important", "kind": "factual", "importance": 0.9},
-                {"idx": 1, "claim": "Trivial", "kind": "trivial", "importance": 0.9},
+                {"idx": 0, "claim": "Important", "kind": "factual", "importance": 0.9,
+                 "cited_spans": [], "source_text": "Important"},
+                {"idx": 1, "claim": "Trivial", "kind": "trivial", "importance": 0.9,
+                 "cited_spans": [], "source_text": "Trivial"},
             ]
         })
 

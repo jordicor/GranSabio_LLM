@@ -1,0 +1,705 @@
+<section id="qa-layers" class="docs-section">
+                <h2 class="docs-subheading">QA Layers Configuration</h2>
+                <p>QA layers define evaluation criteria for content quality. Each layer is evaluated by multiple models to ensure comprehensive assessment.</p>
+
+                <h3 class="docs-minor-heading">QA Layer Structure</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">name</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Name of the QA layer</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name required">description</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">What this layer evaluates</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name required">criteria</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Specific criteria for evaluation</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">min_score</div>
+                        <div class="param-type">float</div>
+                        <div class="param-desc">Minimum score for this layer (default: 7.0)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">is_mandatory</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Whether this layer must pass after max iterations or trigger rejection (default: false)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">deal_breaker_criteria</div>
+                        <div class="param-type">string | null</div>
+                        <div class="param-desc">Specific deal-breaker facts to detect (e.g., "invents facts", "uses offensive language"). <strong>NEW v2.0:</strong> Minority deal-breakers (< 50%) trigger immediate Gran Sabio escalation. If majority (> 50%), forces iteration. If tie (50%), Gran Sabio decides. (default: null)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">concise_on_pass</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">If true, provide concise "Passed" feedback when score >= min_score (saves tokens). If false, always provide detailed feedback. (default: true)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">order</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Evaluation order for this layer (default: 1)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">include_input_images</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">When true and <code>qa_with_vision=true</code> in the request, this layer receives input images for evaluation. Useful for verifying that text descriptions match image content. Requires a vision-capable QA model. (default: false)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name deprecated">is_deal_breaker</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc"><strong>DEPRECATED:</strong> Use deal_breaker_criteria instead (default: false)</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Pre-defined Layer Templates</h3>
+                <div class="template-grid">
+                    <div class="template-card">
+                        <h4>Biography</h4>
+                        <ul>
+                            <li>Factual Accuracy (deal-breaker)</li>
+                            <li>Literary Quality</li>
+                            <li>Structure & Organization</li>
+                            <li>Depth & Coverage</li>
+                        </ul>
+                    </div>
+                    <div class="template-card">
+                        <h4>Script</h4>
+                        <ul>
+                            <li>Dialogue Quality</li>
+                            <li>Format Compliance (deal-breaker)</li>
+                            <li>Story Structure</li>
+                        </ul>
+                    </div>
+                    <div class="template-card">
+                        <h4>Novel</h4>
+                        <ul>
+                            <li>Character Development</li>
+                            <li>Plot Coherence (deal-breaker)</li>
+                            <li>Prose Quality</li>
+                            <li>Engagement</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="alert info">
+                    <strong>Algorithmic Layers:</strong> Word Count Enforcement, Lexical Diversity Guard, and Phrase Frequency Guard are automatically injected when their respective configurations are active. All three layers run through the <em>QA Bypass Engine</em>, avoiding additional QA model calls when obvious violations are detected.
+                </div>
+            </section>
+
+            <section id="qa-scheduler" class="docs-section">
+                <h2 class="docs-subheading">QA Scheduler</h2>
+                <p><code>QAScheduler</code> controls how QA evaluator slots are executed and how many valid semantic results are required before a layer can be trusted.</p>
+
+                <h3 class="docs-minor-heading">Execution Modes</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">auto</div>
+                        <div class="param-type">default</div>
+                        <div class="param-desc">Uses progressive quorum for layers with deal-breaker criteria and bounded parallelism for normal scoring layers.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">progressive_quorum</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Starts with the minimum valid quorum and requests more evaluators only when needed to resolve deal-breaker majority.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">parallel</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Runs configured evaluator slots with bounded concurrency.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">sequential</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Runs evaluator slots one by one in configuration order.</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Technical Failure Policy</h3>
+                <pre><code class="language-json">{
+  "qa_execution_mode": "auto",
+  "on_qa_model_unavailable": "skip_if_quorum",
+  "on_qa_timeout": "retry_then_skip_if_quorum",
+  "qa_timeout_retries": 2,
+  "timeouts": {
+    "qa_model_seconds": 12000,
+    "qa_comprehensive_seconds": 12000
+  },
+  "min_valid_qa_models": null,
+  "min_valid_qa_model_ratio": null
+}</code></pre>
+                <p>Technical failures are not semantic deal-breakers. They are tracked separately by the deal-breaker tracker and Gran Sabio supervisor, and too many failures can make the valid-result quorum impossible.</p>
+                <p>The supervisor observes evaluator reliability and recommends review after repeated confirmed false positives. It does not remove or replace evaluators. The legacy <code>qa_replacement_policy</code> is accepted only while disabled; setting <code>enabled</code> or <code>bench_enabled</code> to an active value produces a validation error. Completed final-verification adjudications contribute to the same observations.</p>
+            </section>
+
+            <section id="final-verification" class="docs-section">
+                <h2 class="docs-subheading">Final Verification</h2>
+                <p>Final verification is an optional read-only QA pass over the final content snapshot after normal QA, smart edits, or Gran Sabio rewrites.</p>
+
+                <pre><code class="language-json">{
+  "qa_final_verification_mode": "after_modifications",
+  "qa_final_verification_strategy": "full_parallel"
+}</code></pre>
+
+                <h3 class="docs-minor-heading">Modes</h3>
+                <ul class="docs-list">
+                    <li><code>disabled</code>: no final pass.</li>
+                    <li><code>after_modifications</code>: run only if the final content differs from the pre-QA snapshot.</li>
+                    <li><code>always</code>: run whenever there is an effective QA contract.</li>
+                </ul>
+
+                <h3 class="docs-minor-heading">Strategies</h3>
+                <ul class="docs-list">
+                    <li><code>full_parallel</code>: re-run effective real QA layers concurrently with bounded layer concurrency.</li>
+                    <li><code>full_sequential</code>: re-run effective real QA layers in order.</li>
+                    <li><code>fast_global</code>: run deterministic/special guards separately and one synthetic global semantic QA layer.</li>
+                </ul>
+
+                <div class="alert info">
+                    <strong>fast_global:</strong> This is a global screening pass. It does not prove each source layer passed independently and fails closed when the synthetic criteria prompt exceeds <code>QA_FAST_GLOBAL_MAX_ESTIMATED_TOKENS</code>.
+                </div>
+            </section>
+
+            <!-- QA Models with Reasoning Section -->
+            <section id="qa-models-reasoning" class="docs-section">
+                <h2 class="docs-subheading">QA Models with Reasoning/Thinking</h2>
+                <p>QA evaluation models can now use advanced reasoning capabilities, just like generator models. This enables more thorough and intelligent content evaluation for complex or high-stakes content.</p>
+
+                <h3 class="docs-minor-heading">Configuration Methods</h3>
+
+                <div class="config-option">
+                    <h4>Option 1: Simple Configuration (Backward Compatible)</h4>
+                    <p>Use model names as strings with configured/model-aware defaults (QA_DEFAULT_MAX_TOKENS or the model's safe output limit, temperature=0.3):</p>
+                    <pre><code class="language-json">{
+  "qa_models": ["gpt-4o-mini", "claude-sonnet-4"]
+}</code></pre>
+                </div>
+
+                <div class="config-option">
+                    <h4>Option 2: Global QA Configuration</h4>
+                    <p>Apply the same configuration to all QA models:</p>
+                    <pre><code class="language-json">{
+  "qa_models": ["gpt-5-mini", "claude-opus-4"],
+  "qa_global_config": {
+    "max_tokens": 10000,
+    "reasoning_effort": "medium",
+    "temperature": 0.2
+  }
+}</code></pre>
+                </div>
+
+                <div class="config-option">
+                    <h4>Option 3: Per-Model Configuration</h4>
+                    <p>Customize each QA model individually:</p>
+                    <pre><code class="language-json">{
+  "qa_models": ["gpt-5-mini", "claude-opus-4", "o3-mini"],
+  "qa_models_config": {
+    "gpt-5-mini": {
+      "reasoning_effort": "high",
+      "max_tokens": 12000,
+      "temperature": 0.25
+    },
+    "claude-opus-4": {
+      "thinking_budget_tokens": 8000,
+      "max_tokens": 15000
+    },
+    "o3-mini": {
+      "reasoning_effort": "medium",
+      "max_tokens": 10000
+    }
+  }
+}</code></pre>
+                </div>
+
+                <div class="config-option">
+                    <h4>Option 4: Advanced Object Configuration</h4>
+                    <p>Use QAModelConfig objects directly:</p>
+                    <pre><code class="language-json">{
+  "qa_models": [
+    {
+      "model": "gpt-5-mini",
+      "reasoning_effort": "high",
+      "max_tokens": 12000,
+      "temperature": 0.2
+    },
+    {
+      "model": "claude-opus-4",
+      "thinking_budget_tokens": 10000,
+      "max_tokens": 15000
+    }
+  ]
+}</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">QA Model Parameters</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">model</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Model identifier (e.g., "gpt-5-mini", "claude-opus-4")</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">max_tokens</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Maximum tokens for QA evaluation (default: 8000)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">reasoning_effort</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">For GPT-5/O1/O3 models: "none", "low", "medium", "high"</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">thinking_budget_tokens</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">For Claude models: Thinking budget (min: 1024)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">temperature</div>
+                        <div class="param-type">float</div>
+                        <div class="param-desc">Temperature for QA evaluation (default: 0.3)</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Configuration Priority</h3>
+                <p>When multiple configuration methods are used, the system applies them in this order:</p>
+                <ol>
+                    <li><strong>QAModelConfig objects</strong> in <code>qa_models</code> (highest priority)</li>
+                    <li><strong>Per-model config</strong> in <code>qa_models_config</code></li>
+                    <li><strong>Global config</strong> in <code>qa_global_config</code></li>
+                    <li><strong>System defaults</strong> (QA_DEFAULT_MAX_TOKENS or the model's safe output limit, temperature=0.3)</li>
+                </ol>
+
+                <h3 class="docs-minor-heading">Use Cases for QA Reasoning</h3>
+                <div class="use-case-grid">
+                    <div class="use-case">
+                        <strong>Complex Content Validation</strong>
+                        <p>Legal, technical, or medical content requiring deep analysis</p>
+                    </div>
+                    <div class="use-case">
+                        <strong>Nuanced Evaluation</strong>
+                        <p>Detecting subtle quality issues that require reasoning</p>
+                    </div>
+                    <div class="use-case">
+                        <strong>High-Stakes Content</strong>
+                        <p>When accuracy and quality are absolutely critical</p>
+                    </div>
+                    <div class="use-case">
+                        <strong>Multi-Criteria Assessment</strong>
+                        <p>Complex evaluation requiring thoughtful analysis</p>
+                    </div>
+                </div>
+
+                <div class="alert success">
+                    <strong>Performance Note:</strong> QA models with reasoning/thinking take longer to evaluate but provide significantly more thorough and intelligent assessment. This is especially valuable for complex content where subtle quality issues must be detected.
+                </div>
+            </section>
+
+            <!-- Smart Editing Section -->
+            <section id="smart-editing" class="docs-section">
+                <h2 class="docs-subheading">Smart Editing Workflow</h2>
+                <p>The Smart Content Editor applies targeted paragraph edits instead of regenerating the entire document when QA detects localized issues. Each QA layer is processed sequentially, with edits applied immediately before moving to the next layer.</p>
+
+                <h3 class="docs-minor-heading">How It Works (Per-Layer Flow)</h3>
+                <ul class="docs-list">
+                    <li>Content is generated once, then each QA layer is processed in order.</li>
+                    <li>For each layer: QA identifies issues, edits are applied, and the layer re-evaluates until it passes or max rounds is reached.</li>
+                    <li>The edited content is passed to the next layer, preserving improvements from previous layers.</li>
+                    <li>After all layers complete, Consensus evaluates the fully polished content.</li>
+                </ul>
+
+                <div class="info-box">
+                    <strong>Per-Layer Benefits:</strong> Markers are recalculated after each edit, ensuring accurate paragraph targeting. Each layer works with content already improved by previous layers.
+                </div>
+
+                <h3 class="docs-minor-heading">Controlling Edit Rounds Per Layer</h3>
+                <p>Use <code>max_edit_rounds_per_layer</code> to cap how many edit rounds run for each QA layer before moving to the next. The default is <code>5</code>.</p>
+
+                <pre><code class="language-json">{
+  "max_edit_rounds_per_layer": 5,
+  "max_iterations": 2,
+  "prompt": "Write a 1200-word profile of Ada Lovelace...",
+  "qa_layers": [
+    {
+      "name": "Factual Accuracy",
+      "criteria": "Verify all dates and facts are correct.",
+      "order": 1
+    },
+    {
+      "name": "Editorial QA",
+      "criteria": "Ensure tone and structure follow brand guidelines.",
+      "order": 2
+    }
+  ]
+}</code></pre>
+
+                <div class="alert warning">
+                    <strong>Best Practice:</strong> Keep <code>max_edit_rounds_per_layer</code> between 3-5. Higher values may increase API calls without significant quality gains. Use <code>max_iterations</code> for full regeneration attempts if Consensus rejects after all layers pass.
+                </div>
+
+                <h3 class="docs-minor-heading">Smart Edit with JSON Output</h3>
+                <p>When generating JSON-wrapped content (e.g., <code>{"generated_text": "...", "metadata": {...}}</code>), Smart Edit needs to work on the text content, not the JSON structure. Two parameters control this behavior:</p>
+
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">target_field</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Path to one primary text field using jmespath notation. Examples: <code>"generated_text"</code>, <code>"data.content"</code>. The alias <code>text_field_path</code> accepts the same single path; lists return HTTP 422.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">target_field_only</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">If <code>true</code>: semantic QA and minority adjudication receive only the extracted field text. If <code>false</code> or omitted: they receive the complete current JSON. The alias <code>text_field_only</code> remains supported.</div>
+                    </div>
+                </div>
+
+                <h4 class="docs-minor-heading">How It Works</h4>
+                <ol class="docs-list">
+                    <li><strong>Extraction:</strong> After generation, text is extracted from the selected JSON field</li>
+                    <li><strong>QA Evaluation:</strong> Each round and final verification respect <code>target_field_only</code>. The complete JSON includes edits already applied to the selected field.</li>
+                    <li><strong>Smart Edit:</strong> Paragraph IDs, phrase markers, word indices and deterministic measurements are built from the extracted text. Edit groups can change only this field; issues elsewhere can affect scores and feedback.</li>
+                    <li><strong>Reconstruction:</strong> Edited text is placed back into the original JSON structure, preserving sibling values. An inline Gran Sabio correction contributes the same selected string field from its JSON response; a missing or non-string field fails QA.</li>
+                </ol>
+
+                <div class="info-box">
+                    <strong>Auto-Detection:</strong> If <code>target_field</code> is not specified, the system automatically detects the largest string field. If multiple fields have similar sizes (within 10%), an error is returned asking you to specify the path explicitly.
+                </div>
+
+                <h4 class="docs-minor-heading">Example: JSON with Explicit Field Path</h4>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "prompt": "Write a biography with metadata",
+  "json_output": true,
+  "target_field": "generated_text",
+  "target_field_only": true,
+  "json_schema": {
+    "type": "object",
+    "properties": {
+      "generated_text": {"type": "string"},
+      "word_count": {"type": "integer"},
+      "sources": {"type": "array", "items": {"type": "string"}}
+    },
+    "required": ["generated_text"]
+  },
+  "qa_layers": [
+    {
+      "name": "Content Quality",
+      "criteria": "Evaluate prose quality and accuracy"
+    }
+  ]
+}</code></pre>
+                </div>
+
+                <h4 class="docs-minor-heading">Example: Chapter with Other JSON Fields</h4>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "prompt": "Write a chapter with author notes",
+  "json_output": true,
+  "target_field": "chapter_content",
+  "text_field_only": false,
+  "qa_layers": [...]
+}</code></pre>
+                    <p class="docs-note">Smart Edit changes <code>chapter_content</code> and preserves <code>author_notes</code> and all other JSON fields. Select one string path; editing multiple fields is not supported.</p>
+                </div>
+
+                <div class="alert info">
+                    <strong>User Always Gets Complete JSON:</strong> Regardless of <code>text_field_only</code> setting, the final result always includes the complete JSON structure with all fields intact. The parameter only controls what QA evaluators see.
+                </div>
+            </section>
+
+            <section id="llm-accent-guard" class="docs-section">
+                <h2 class="docs-subheading">LLM Accent Guard</h2>
+                <p>The LLM accent guard detects formulaic or AI-accented prose with an LLM judge. It does not use keyword lists or language-specific regexes.</p>
+
+                <pre><code class="language-json">{
+  "generation_tools_mode": "auto",
+  "llm_accent_guard": {
+    "mode": "inline_post",
+    "min_score": 8.0
+  }
+}</code></pre>
+
+                <h3 class="docs-minor-heading">Modes</h3>
+                <ul class="docs-list">
+                    <li><code>off</code>: disabled.</li>
+                    <li><code>inline</code>: uses generator tool-loop feedback while drafting.</li>
+                    <li><code>post</code>: audits the completed draft with the <code>accent.audit</code> routing entry.</li>
+                    <li><code>inline_post</code>: combines inline feedback with a final audit.</li>
+                </ul>
+
+                <div class="alert warning">
+                    <strong>Constraints:</strong> Inline modes require <code>generation_tools_mode != "never"</code> and a provider with tool calling. The guard is not supported when <code>long_text_mode</code> is <code>on</code>.
+                </div>
+            </section>
+
+            <!-- Gran Sabio Escalation Section -->
+            <section id="gran-sabio-escalation" class="docs-section">
+                <h2 class="docs-subheading">Gran Sabio Escalation System</h2>
+                <p>The Gran Sabio (Great Sage) is the final arbiter for quality conflicts and deal-breaker resolution. In v2.0 (Option C), minority and tie deal-breakers trigger immediate escalation.</p>
+
+                <div class="alert info">
+                    <strong>New in v2.0:</strong> Immediate escalation for minority/tie deal-breakers with configurable limits to prevent excessive costs.
+                </div>
+
+                <h3 class="docs-minor-heading">When Gran Sabio is Consulted</h3>
+                <div class="info-box">
+                    <ol class="docs-list">
+                        <li><strong>Immediate - 50-50 Tie:</strong> When exactly 50% of QA models flag a deal-breaker and 50% approve</li>
+                        <li><strong>Immediate - Minority Deal-Breaker:</strong> When less than 50% of models flag a deal-breaker (NEW!)</li>
+                        <li><strong>Max Iterations:</strong> When all iterations are exhausted without approval</li>
+                        <li><strong>Fallback Regeneration:</strong> When gran_sabio_fallback is enabled and iterations are exhausted</li>
+                    </ol>
+                </div>
+
+                <h3 class="docs-minor-heading">Escalation Limits</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">gran_sabio_call_limit_per_iteration</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Maximum escalations per iteration (default: 3, use -1 for unlimited)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">gran_sabio_call_limit_per_session</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Maximum escalations per entire session (default: 15, use -1 for unlimited)</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Escalation Flow Example</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">Flow</span>
+                    </div>
+                    <pre><code>Layer 1 "Accuracy": 1/3 models → deal-breaker (minority)
+  ↓
+STOP evaluation immediately
+  ↓
+ESCALATE TO GRAN SABIO (escalation #1/3 this iteration)
+  ↓
+Gran Sabio analyzes and decides:
+  ├─ REAL → Force iteration (don't evaluate remaining layers)
+  └─ FALSE POSITIVE → Invalidate deal-breaker, continue to Layer 2</code></pre>
+                </div>
+
+                <h3 class="docs-minor-heading">Gran Sabio Decisions</h3>
+                <div class="info-box">
+                    <ul>
+                        <li><strong>APPROVED (False Positive):</strong> Deal-breaker is invalidated, QA continues with remaining layers</li>
+                        <li><strong>REJECTED (Real Issue):</strong> Forces iteration immediately, doesn't waste resources on remaining layers</li>
+                        <li><strong>APPROVED with Modifications:</strong> Gran Sabio edits content to fix minor issues</li>
+                    </ul>
+                </div>
+
+                <div class="alert warning">
+                    <strong>Cost Warning:</strong> Gran Sabio uses premium models (default: Claude Opus 4). Use limits to control costs. For testing, use -1 for unlimited escalations.
+                </div>
+
+                <h3 class="docs-minor-heading">Tracking and Analytics</h3>
+                <p>Every Gran Sabio escalation is tracked and recorded:</p>
+                <ul class="docs-list">
+                    <li>Escalation ID, session, iteration, and layer</li>
+                    <li>Which model triggered and why</li>
+                    <li>Gran Sabio's decision (real/false_positive)</li>
+                    <li>Duration and timing</li>
+                    <li>Model reliability statistics calculated automatically</li>
+                </ul>
+
+                <p>Access escalation data via <code>GET /status/{session_id}</code> (includes gran_sabio_escalations field) or <code>GET /analytics</code> for global statistics.</p>
+            </section>
+
+            <!-- Evidence Grounding Section -->
+            <section id="evidence-grounding" class="docs-section">
+                <h2 class="docs-subheading">Evidence Grounding Verification</h2>
+                <p>Evidence Grounding is an optional verification layer that uses logprobs to mathematically detect when AI models claim to use evidence but actually ignore it (procedural hallucination or "confabulation").</p>
+
+                <div class="alert info">
+                    <strong>Strawberry Integration:</strong> This feature is inspired by the <a href="https://github.com/leochlon/pythea" target="_blank">Pythea/Strawberry</a> project (MIT License) and uses information-theoretic methods to measure evidence utilization.
+                </div>
+
+                <h3 class="docs-minor-heading">How It Works</h3>
+                <ol class="docs-list">
+                    <li><strong>Claim Extraction:</strong> Extracts verifiable claims from generated content, filtering trivial statements</li>
+                    <li><strong>Evidence Matching:</strong> Maps each claim to cited evidence spans in the original context</li>
+                    <li><strong>Budget Scoring:</strong> For each claim, measures P(YES | full_context) vs P(YES | context_without_evidence)</li>
+                    <li><strong>Gap Detection:</strong> Flags claims where confidence doesn't drop when evidence is removed</li>
+                </ol>
+
+                <div class="info-box">
+                    <strong>Core Insight:</strong> If a model's confidence in a claim doesn't change when you remove the evidence it supposedly used, the model is likely confabulating.
+                </div>
+
+                <h3 class="docs-minor-heading">Configuration</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">enabled</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Enable evidence grounding verification (default: false)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">model</div>
+                        <div class="param-type">string | null</div>
+                        <div class="param-desc">Model for logprob verification. Must support logprobs (OpenAI models only, not O1/O3). If null, uses server default (gpt-5-nano). Recommended: gpt-4o-mini, gpt-5-nano</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">max_claims</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Maximum claims to extract and verify (default: 15)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">filter_trivial</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Filter non-substantive claims before verification (default: true)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">min_claim_importance</div>
+                        <div class="param-type">float</div>
+                        <div class="param-desc">Minimum importance score (0-1) to keep a claim (default: 0.6)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">target_confidence</div>
+                        <div class="param-type">float</div>
+                        <div class="param-desc">Expected reliability of claims (default: 0.95)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">budget_gap_threshold</div>
+                        <div class="param-type">float</div>
+                        <div class="param-desc">Flag claims with budget gap above this (in bits). Lower = stricter. (default: 0.5)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">on_flag</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Action when threshold exceeded: "warn" (include in results), "deal_breaker" (force iteration), "regenerate" (trigger regeneration). (default: "warn")</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">max_flagged_claims</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Trigger on_flag action when this many claims are flagged (default: 2)</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">order</div>
+                        <div class="param-type">integer | null</div>
+                        <div class="param-desc">Execution order relative to QA layers. If null, auto-calculated: deal_breaker/regenerate = 0 (first), warn = 999 (last)</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Example Configurations</h3>
+
+                <div class="config-option">
+                    <h4>Minimal (Verification Only)</h4>
+                    <pre><code class="language-json">{
+  "evidence_grounding": {
+    "enabled": true
+  }
+}</code></pre>
+                    <p>Uses defaults: warns but doesn't block, runs after semantic QA.</p>
+                </div>
+
+                <div class="config-option">
+                    <h4>Fail-Fast (Critical Content)</h4>
+                    <pre><code class="language-json">{
+  "evidence_grounding": {
+    "enabled": true,
+    "model": "gpt-5-nano",
+    "budget_gap_threshold": 0.3,
+    "on_flag": "deal_breaker",
+    "max_flagged_claims": 1
+  }
+}</code></pre>
+                    <p>Strict verification. Runs first (order=0), fails immediately if any claim lacks grounding.</p>
+                </div>
+
+                <div class="config-option">
+                    <h4>Balanced (General Factual Content)</h4>
+                    <pre><code class="language-json">{
+  "evidence_grounding": {
+    "enabled": true,
+    "budget_gap_threshold": 0.5,
+    "on_flag": "warn",
+    "max_flagged_claims": 3
+  }
+}</code></pre>
+                    <p>Results visible but don't block. Good for biographies, articles.</p>
+                </div>
+
+                <h3 class="docs-minor-heading">Response Structure</h3>
+                <p>When enabled, the response includes an <code>evidence_grounding</code> object:</p>
+                <pre><code class="language-json">{
+  "evidence_grounding": {
+    "enabled": true,
+    "model_used": "gpt-5-nano",
+    "total_claims_extracted": 12,
+    "claims_after_filter": 8,
+    "claims_verified": 8,
+    "flagged_claims": 1,
+    "max_budget_gap": 0.73,
+    "passed": true,
+    "triggered_action": null,
+    "verification_time_ms": 2340.5,
+    "claims": [
+      {
+        "idx": 0,
+        "claim": "Marie Curie was born in Warsaw in 1867",
+        "posterior_yes": 0.94,
+        "prior_yes": 0.12,
+        "required_bits": 2.89,
+        "observed_bits": 3.21,
+        "budget_gap": -0.32,
+        "flagged": false,
+        "confidence_delta": 0.82
+      }
+    ]
+  }
+}</code></pre>
+
+                <h3 class="docs-minor-heading">Interpreting Results</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name">budget_gap &lt; 0</div>
+                        <div class="param-type">Good</div>
+                        <div class="param-desc">More evidence than needed - well grounded</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">budget_gap 0 to 0.5</div>
+                        <div class="param-type">OK</div>
+                        <div class="param-desc">Adequate evidence - acceptable</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">budget_gap 0.5 to 1.0</div>
+                        <div class="param-type">Warning</div>
+                        <div class="param-desc">Marginal evidence - review claim</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">budget_gap &gt; 1.0</div>
+                        <div class="param-type">Flagged</div>
+                        <div class="param-desc">Insufficient evidence - likely confabulation</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">False Positives</h3>
+                <p>Evidence grounding can flag well-grounded claims as confabulated when:</p>
+                <ul class="docs-list">
+                    <li><strong>Prior knowledge:</strong> The model already "knows" the fact from training data</li>
+                    <li><strong>Common knowledge:</strong> Well-known facts appear in both context and training</li>
+                    <li><strong>Threshold too strict:</strong> budget_gap_threshold below 0.3</li>
+                </ul>
+
+                <div class="alert warning">
+                    <strong>Mitigation:</strong> For well-known factual content, use higher thresholds (0.7+) or <code>on_flag: "warn"</code> to avoid blocking good content.
+                </div>
+
+                <h3 class="docs-minor-heading">Cost Estimate</h3>
+                <p>Using GPT-4o-mini for 10 claims: ~$0.003 per request (2-6% overhead on top of standard QA).</p>
+            </section>
+
+            <!-- Word Count Enforcement Section -->

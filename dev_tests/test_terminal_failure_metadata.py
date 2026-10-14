@@ -5,13 +5,15 @@ from datetime import datetime
 
 import pytest
 
-from ai_service import GenerationOutputTruncated
+from ai_service import AIRequestError, GenerationOutputTruncated
 from client import GranSabioClientError, GranSabioGenerationRejected
 from client._common import validate_result
 from core import app_state
 from core.app_state import _store_final_result
-from core.generation_processor import _build_generation_error_result
+from core.generation_processor import _attach_qa_provider_failure, _build_generation_error_result
 from models import ContentRequest, GenerationStatus
+from provider_errors import ProviderErrorKind, ProviderFailure
+from qa_engine import QAModelUnavailableError
 
 
 def _truncated_session() -> dict:
@@ -290,3 +292,75 @@ def test_sdk_failed_error_preserves_structured_terminal_metadata() -> None:
     assert details["error_code"] == "output_token_limit"
     assert details["output_truncated"] is True
     assert details["finish_reason"] == "max_tokens"
+
+
+def test_sdk_failed_error_preserves_terminal_category_and_retryable() -> None:
+    result = {
+        "status": "failed",
+        "failure_reason": "Generation stopped by content filter",
+        "error_type": "generation_error",
+        "error_code": "content_filter",
+        "finish_reason": "SAFETY",
+        "finish_reason_category": "content_filter",
+        "retryable": False,
+        "session_id": "session-filtered",
+    }
+
+    with pytest.raises(GranSabioClientError) as exc_info:
+        validate_result(result)
+
+    details = exc_info.value.details
+    assert details["error_code"] == "content_filter"
+    assert details["finish_reason"] == "SAFETY"
+    assert details["finish_reason_category"] == "content_filter"
+    assert details["retryable"] is False
+
+
+def test_sdk_failed_error_omits_terminal_fields_the_server_did_not_send() -> None:
+    result = {
+        "status": "failed",
+        "failure_reason": "No complete JSON candidate",
+        "error_type": "generation_error",
+        "error_code": "output_token_limit",
+        "output_truncated": True,
+        "finish_reason": "max_tokens",
+        "session_id": "session-truncated",
+    }
+
+    with pytest.raises(GranSabioClientError) as exc_info:
+        validate_result(result)
+
+    details = exc_info.value.details
+    assert "finish_reason_category" not in details
+    assert "retryable" not in details
+
+
+def _qa_unavailable(cause: Exception | None) -> QAModelUnavailableError:
+    try:
+        raise QAModelUnavailableError("QA model claude-sonnet-5 unavailable in layer Accuracy") from cause
+    except QAModelUnavailableError as exc:
+        return exc
+
+
+def test_qa_model_provider_failure_is_carried_into_the_terminal_payload() -> None:
+    failure = ProviderFailure(provider="claude", model_id="claude-sonnet-5", operation="ai_request",
+                              kind=ProviderErrorKind.AUTH_INVALID, message="API key is invalid.", status_code=401)
+    request_error = AIRequestError("claude", "claude-sonnet-5", 1, 1, RuntimeError("401"), provider_failure=failure)
+    session: dict = {}
+    final_result: dict = {"failure_reason": "QA model claude-sonnet-5 unavailable in layer Accuracy"}
+
+    _attach_qa_provider_failure(session, final_result, _qa_unavailable(request_error))
+
+    assert final_result["error_type"] == session["error_type"] == "provider_error"
+    assert final_result["error_code"] == session["error_code"] == "auth_invalid"
+    assert final_result["provider_error"]["kind"] == "auth_invalid"
+    assert final_result["provider_error"]["model"] == "claude-sonnet-5"
+    assert session["provider_error"] is final_result["provider_error"]
+
+
+def test_qa_model_failure_without_provider_metadata_stays_unclassified() -> None:
+    session: dict = {}
+    final_result: dict = {}
+    _attach_qa_provider_failure(session, final_result, _qa_unavailable(ValueError("bad JSON")))
+    _attach_qa_provider_failure(session, final_result, _qa_unavailable(None))
+    assert session == {} and final_result == {}

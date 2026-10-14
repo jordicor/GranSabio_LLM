@@ -22,6 +22,8 @@ from llm_routing import (
     resolve_call,
 )
 
+from .locators import _find_phrase_in_text
+
 if TYPE_CHECKING:
     from ai_service import AIService
 
@@ -68,6 +70,7 @@ RESPOND IN THIS EXACT JSON FORMAT:
 RULES:
 - Only report real issues, not stylistic preferences
 - Copy target text EXACTLY as it appears (including spaces)
+- Each target must appear exactly once in the text; include enough surrounding text to make it unique
 - Maximum {max_issues} issues
 - Prioritize: critical > major > minor
 - For "delete": target is text to remove entirely
@@ -81,6 +84,10 @@ Return valid JSON only, no markdown code blocks.'''
 # =============================================================================
 # TEXT ANALYZER CLASS
 # =============================================================================
+
+
+class TextAnalysisError(ValueError):
+    """The AI response cannot safely supply suggested edit actions."""
 
 
 class TextAnalyzer:
@@ -143,7 +150,7 @@ class TextAnalyzer:
 
         # Build prompt
         prompt = ANALYSIS_PROMPT.format(
-            text=text[:15000],  # Limit text length for token efficiency
+            text=text,
             max_issues=max_issues,
         )
 
@@ -272,22 +279,20 @@ class TextAnalyzer:
 
         try:
             data = json.loads(cleaned)
-            if isinstance(data, dict) and "issues" in data:
-                return data["issues"]
-            elif isinstance(data, list):
-                return data
-            else:
-                return []
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
             # Try to extract JSON from response
             json_match = re.search(r'\{[\s\S]*"issues"[\s\S]*\}', response)
-            if json_match:
-                try:
-                    data = json.loads(json_match.group())
-                    return data.get("issues", [])
-                except json.JSONDecodeError:
-                    pass
-            return []
+            if json_match is None:
+                raise TextAnalysisError("AI analysis did not return valid JSON") from exc
+            try:
+                data = json.loads(json_match.group())
+            except json.JSONDecodeError as extracted_exc:
+                raise TextAnalysisError("AI analysis did not return valid JSON") from extracted_exc
+
+        issues = data.get("issues") if isinstance(data, dict) else data
+        if not isinstance(issues, list) or any(not isinstance(issue, dict) for issue in issues):
+            raise TextAnalysisError("AI analysis must return a list of issues")
+        return issues
 
     def _issues_to_actions(
         self,
@@ -299,20 +304,30 @@ class TextAnalyzer:
 
         for i, issue in enumerate(issues):
             target_text = issue.get("target", "")
-            issue_type = issue.get("type", "").lower()
+            issue_type = issue.get("type", "")
+            if not isinstance(target_text, str) or not target_text:
+                raise TextAnalysisError(f"AI analysis issue {i + 1} has an invalid target")
+            if not isinstance(issue_type, str) or issue_type.lower() not in {
+                "delete", "replace", "format", "rephrase",
+            }:
+                raise TextAnalysisError(f"AI analysis issue {i + 1} has an invalid edit type")
+            issue_type = issue_type.lower()
 
-            # Skip if target not found in text
-            if target_text and target_text not in original_text:
-                # Fall back to a case-insensitive match and adopt the exact
-                # fragment from the original text, so the generated action
-                # (case_sensitive=True) actually executes (AUX-08). Matching
-                # runs on the original text to keep offsets aligned (AUX-15).
-                case_match = re.search(
-                    re.escape(target_text), original_text, re.IGNORECASE
+            positions = _find_phrase_in_text(
+                original_text, target_text, case_sensitive=True, use_normalized_fallback=False
+            )
+            if not positions:
+                # Preserve AUX-08/15: adopt the original casing only when the
+                # case-insensitive match is unique, with original text offsets.
+                positions = _find_phrase_in_text(
+                    original_text, target_text, case_sensitive=False, use_normalized_fallback=False
                 )
-                if case_match is None:
-                    continue
-                target_text = case_match.group(0)
+            if not positions:
+                raise TextAnalysisError(f"AI analysis issue {i + 1} target was not found")
+            if len(positions) != 1:
+                raise TextAnalysisError(f"AI analysis issue {i + 1} target is ambiguous")
+            start = positions[0]
+            target_text = original_text[start:start + len(target_text)]
 
             action = {
                 "id": f"act-{i+1:03d}",
@@ -325,6 +340,7 @@ class TextAnalyzer:
                 },
                 "description": issue.get("description", f"Fix {issue_type} issue"),
                 "category": issue.get("category", "style"),
+                "metadata": {"_require_unique_target": True},
             }
 
             # Set operation-specific fields
@@ -333,13 +349,18 @@ class TextAnalyzer:
                 action["estimated_ms"] = 10
 
             elif issue_type == "replace":
-                action["content"] = issue.get("replacement", "")
+                replacement = issue.get("replacement")
+                if not isinstance(replacement, str):
+                    raise TextAnalysisError(f"AI analysis issue {i + 1} has no replacement text")
+                action["content"] = replacement
                 action["ai_required"] = False
                 action["estimated_ms"] = 10
 
             elif issue_type == "format":
-                format_type = issue.get("format_type", "bold")
-                action["metadata"] = {"format_type": format_type}
+                format_type = issue.get("format_type")
+                if format_type not in ("bold", "italic"):
+                    raise TextAnalysisError(f"AI analysis issue {i + 1} has an invalid format type")
+                action["metadata"]["format_type"] = format_type
                 action["ai_required"] = False
                 action["estimated_ms"] = 10
 
@@ -348,56 +369,7 @@ class TextAnalyzer:
                 action["ai_required"] = True
                 action["estimated_ms"] = 2500
 
-            else:
-                # Unknown type - default to rephrase
-                action["type"] = "rephrase"
-                action["instruction"] = issue.get("description", "Fix this text")
-                action["ai_required"] = True
-                action["estimated_ms"] = 2500
-
             actions.append(action)
-
-        return actions
-
-    def analyze_basic(self, text: str, max_issues: int = 10) -> List[Dict[str, Any]]:
-        """
-        Basic mechanical analysis without AI (fallback when AI is unavailable).
-
-        Only detects consecutive duplicate words (e.g., "very very"), which is
-        a purely mechanical check (identical adjacent tokens), not semantic
-        interpretation. Per repo policy, regex/keyword lists must not be used
-        for semantic detection of style issues, so the previous "common
-        redundant phrases" patterns were removed (AUX-10): those suggestions
-        belong to the AI analysis path.
-
-        Args:
-            text: Text to analyze
-            max_issues: Maximum issues to return
-
-        Returns:
-            List of action dictionaries (same format as analyze())
-        """
-        actions = []
-
-        # Detect consecutive duplicate words (mechanical: identical tokens)
-        for match in re.finditer(r"\b(\w+)\s+\1\b", text, re.IGNORECASE):
-            if len(actions) >= max_issues:
-                break
-            word = match.group(1)
-            actions.append({
-                "id": f"act-{len(actions)+1:03d}",
-                "type": "delete",
-                "target": {
-                    "mode": "exact",
-                    "value": f"{word} ",
-                    "occurrence": 1,
-                    "case_sensitive": False,
-                },
-                "description": f"Remove duplicate word '{word}'",
-                "category": "redundancy",
-                "ai_required": False,
-                "estimated_ms": 10,
-            })
 
         return actions
 

@@ -167,6 +167,19 @@ class GranSabioInterface {
             
             if (response.ok) {
                 const result = await response.json();
+                if (!result?.session_id) {
+                    const feedback = result?.preflight_feedback || {};
+                    const reason = result?.auto_qa_feedback?.message || feedback.user_feedback ||
+                        feedback.summary || (feedback.issues || []).map(issue => issue.message).filter(Boolean).join('; ') ||
+                        `No session was created (status: ${result?.status || 'unknown'})`;
+                    const message = feedback.decision === 'manual_review' ?
+                        'Manual review required' : 'Generation did not start';
+                    this.currentSession = null;
+                    this.setLoadingState(false);
+                    this.showConfigurationScreen();
+                    this.showError(`${message}: ${reason}`);
+                    return;
+                }
                 this.currentSession = result.session_id;
                 
                 // Update session display

@@ -12,6 +12,10 @@ initial response headers and status codes without waiting for content.
 """
 
 import threading
+from unittest.mock import Mock
+
+from core.app_state import active_sessions
+from models import GenerationStatus
 
 # Note: Fixtures inherited from conftest.py:
 # - bypass_ip_filter (autouse)
@@ -69,14 +73,34 @@ class TestContentStreaming:
         response = base_test_client.get("/stream-content/nonexistent-session-123")
         assert response.status_code == 404
 
-    def test_stream_content_direct_unknown_session_returns_404(self, base_test_client):
-        """
-        Given: Unknown session_id
-        When: GET /stream-content-direct/{session_id}
-        Then: Returns 404
-        """
-        response = base_test_client.get("/stream-content-direct/nonexistent-session-123")
-        assert response.status_code == 404
+    def test_retired_direct_generation_points_to_observer_without_dispatch(
+        self, base_test_client, mock_ai_service, monkeypatch
+    ):
+        """The retired route returns 410 and observing saved content starts no model call."""
+        session_id = "stream-retirement-session"
+        monkeypatch.setitem(active_sessions, session_id, {
+            "status": GenerationStatus.COMPLETED,
+            "partial_content": "Saved generation.",
+            "last_generated_content": "Saved generation.",
+        })
+        mock_ai_service.generate_content_stream = Mock(
+            side_effect=AssertionError("Observation must not dispatch a provider")
+        )
+        mock_ai_service.generate_content.side_effect = AssertionError(
+            "Observation must not dispatch a provider"
+        )
+
+        response = base_test_client.get(f"/stream-content-direct/{session_id}")
+        assert response.status_code == 410
+        assert f"GET /stream-content/{session_id}" in response.json()["detail"]
+        assert base_test_client.get("/stream-content-direct/unknown-session").status_code == 410
+
+        observed = base_test_client.get(f"/stream-content/{session_id}")
+        assert observed.status_code == 200
+        assert observed.headers["content-type"].startswith("text/event-stream")
+        assert observed.text == 'data: {"type":"chunk","content":"Saved generation."}\n\n'
+        mock_ai_service.generate_content_stream.assert_not_called()
+        mock_ai_service.generate_content.assert_not_awaited()
 
 
 # ============================================================================
@@ -151,23 +175,6 @@ class TestProjectStreaming:
             params={"phases": "invalid_phase"}
         )
         assert response.status_code == 400
-
-
-# ============================================================================
-# Direct Streaming Tests
-# ============================================================================
-
-class TestDirectStreaming:
-    """Tests for direct content streaming (bypasses QA)."""
-
-    def test_direct_stream_unknown_session_returns_404(self, base_test_client):
-        """
-        Given: Unknown session_id
-        When: GET /stream-content-direct/{session_id}
-        Then: Returns 404
-        """
-        response = base_test_client.get("/stream-content-direct/nonexistent-session")
-        assert response.status_code == 404
 
 
 # ============================================================================

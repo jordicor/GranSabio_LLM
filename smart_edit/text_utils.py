@@ -111,6 +111,7 @@ def clean_edited_text(
 
     # Track previously seen blocks for duplicate detection
     seen_blocks: Dict[int, Set[tuple]] = {w: set() for w in block_window_sizes}
+    descending_windows = sorted(block_window_sizes, reverse=True)
 
     i = 0
     while i < len(sentences):
@@ -123,7 +124,7 @@ def clean_edited_text(
 
         # Check for repeated blocks seen earlier (check larger windows first)
         skipped_block = False
-        for window in sorted(block_window_sizes, reverse=True):
+        for window in descending_windows:
             if i + window <= len(sentences):
                 block = tuple(norm_sentences[i:i + window])
                 if block in seen_blocks[window]:
@@ -141,8 +142,8 @@ def clean_edited_text(
             continue
 
         # Drop near-duplicate fragments contained in prior sentences
-        if any(
-            current_norm in prev and len(current_norm) >= min_fragment_length
+        if len(current_norm) >= min_fragment_length and any(
+            current_norm in prev
             for prev in cleaned_norm
         ):
             i += 1

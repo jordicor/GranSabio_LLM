@@ -220,7 +220,11 @@ def analyze_text_lexical_diversity(
 
     lex_config = settings.build_lexdiv_config()
     text_to_analyze = text  # Content already preprocessed by caller
-    base_result = analyze_lexical_diversity(text_to_analyze, lex_config)
+    base_result = analyze_lexical_diversity(
+        text_to_analyze,
+        lex_config,
+        window_decision=settings.window_policy.should_analyze_windows,
+    )
 
     metrics = base_result.get("metrics", {})
     grades = base_result.get("grades", {})
@@ -232,21 +236,6 @@ def analyze_text_lexical_diversity(
         {k.lower(): v for k, v in grades.items()},
     )
     decision_label = decision_label.upper()
-
-    # Evaluate window analysis if required
-    total_tokens = base_result.get("meta", {}).get("total_word_tokens", 0)
-    if settings.window_policy.should_analyze_windows(total_tokens, decision_label):
-        window_config = settings.build_lexdiv_config()
-        window_config.analyze_windows = True
-        base_result = analyze_lexical_diversity(text_to_analyze, window_config)
-        metrics = base_result.get("metrics", metrics)
-        grades = base_result.get("grades", grades)
-        decision = base_result.get("decision", decision)
-        decision_label = decision.get("label", decision_label).upper()
-        adjusted_grades = settings.decision_policy.apply_metric_overrides(
-            {k.lower(): v for k, v in metrics.items()},
-            {k.lower(): v for k, v in grades.items()},
-        )
 
     final_score = settings.score_policy.score_for_label(decision_label)
     deal_breaker = settings.decision_policy.should_trigger_deal_breaker(

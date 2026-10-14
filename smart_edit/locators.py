@@ -496,9 +496,10 @@ def _find_phrase_in_text(
         # on text.lower() shifts offsets whenever a character expands on
         # lowering (e.g. 'İ' -> 'i' + combining dot) (AUX-15).
         # re.IGNORECASE matches 1:1 on the original indices.
+        # Lookahead retains overlapping matches, like the literal scan.
         positions = [
             match.start()
-            for match in re.finditer(re.escape(phrase), text, re.IGNORECASE)
+            for match in re.finditer(f"(?={re.escape(phrase)})", text, re.IGNORECASE)
         ]
 
     if positions:
@@ -516,7 +517,7 @@ def _find_phrase_in_text(
             positions = [
                 match.start()
                 for match in re.finditer(
-                    re.escape(norm_phrase), norm_text, re.IGNORECASE
+                    f"(?={re.escape(norm_phrase)})", norm_text, re.IGNORECASE
                 )
             ]
 

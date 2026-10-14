@@ -92,6 +92,7 @@ async def test_openai_tool_loop_retry_starts_with_clean_transcript(service):
                 SimpleNamespace(content="", tool_calls=[_openai_tool_call("draft attempt one")]),
                 None,
                 "tool_calls",
+                None,
             )
         if calls["n"] == 2:
             # Transient, retryable provider failure after the loop already
@@ -101,6 +102,7 @@ async def test_openai_tool_loop_retry_starts_with_clean_transcript(service):
             SimpleNamespace(content="", tool_calls=[_openai_tool_call("final draft")]),
             None,
             "tool_calls",
+            None,
         )
 
     service.openai_client = SimpleNamespace()
@@ -205,6 +207,7 @@ def _gemini_function_call_response(draft_text: str) -> SimpleNamespace:
                         SimpleNamespace(
                             text=None,
                             function_call=SimpleNamespace(
+                                id="validation-call-1",
                                 name="validate_draft",
                                 args={"text": draft_text},
                             ),
@@ -219,12 +222,15 @@ def _gemini_function_call_response(draft_text: str) -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
-async def test_gemini_tool_loop_retry_starts_with_clean_transcript(service):
+@pytest.mark.parametrize("model_id", ["gemini-2.5-flash", "gemini-3.8-flash"])
+async def test_gemini_tool_loop_retry_starts_with_clean_transcript(service, model_id):
     """AIS-01 (Gemini loop): a retry must not inherit the failed attempt's contents."""
     captured = []
     calls = {"n": 0}
 
     async def fake_generate_content(**kwargs):
+        expected_temperature = None if model_id == "gemini-3.8-flash" else 0.5
+        assert kwargs["config"].temperature == expected_temperature
         captured.append(copy.deepcopy(kwargs["contents"]))
         calls["n"] += 1
         if calls["n"] == 1:
@@ -238,7 +244,7 @@ async def test_gemini_tool_loop_retry_starts_with_clean_transcript(service):
     )
 
     text, _envelope = await service._run_gemini_new_sdk_validation_tool_loop(
-        "gemini-2.5-flash",
+        model_id,
         "Write the intro",
         _validation_callback_feeding([False, True]),
         0.5,
@@ -259,6 +265,7 @@ async def test_gemini_tool_loop_retry_starts_with_clean_transcript(service):
     assert captured[0] == [{"role": "user", "parts": [{"text": "Write the intro"}]}]
     # The failed first attempt did append model/tool turns before dying...
     assert len(captured[1]) > len(captured[0])
+    assert captured[1][-1].parts[0].function_response.id == "validation-call-1"
     # ...but the second attempt must start from the pristine transcript.
     assert captured[2] == captured[0]
 
@@ -417,8 +424,10 @@ async def test_gemini_stream_fallback_forwards_images(service):
 
 
 @pytest.mark.asyncio
-async def test_gemini_stream_accepts_terminal_parts_none(service):
+@pytest.mark.parametrize("finish_reason", ["STOP", "MAX_TOKENS"])
+async def test_gemini_stream_accepts_terminal_parts_none(service, finish_reason):
     """A metadata-only terminal chunk must not kill a completed stream."""
+    usage_events = []
 
     async def fake_stream(**_kwargs):
         async def chunks():
@@ -439,13 +448,14 @@ async def test_gemini_stream_accepts_terminal_parts_none(service):
                 candidates=[
                     SimpleNamespace(
                         content=SimpleNamespace(parts=None),
-                        finish_reason="STOP",
+                        finish_reason=finish_reason,
                     )
                 ],
                 usage_metadata=SimpleNamespace(
                     prompt_token_count=3,
                     candidates_token_count=2,
-                    total_token_count=5,
+                    thoughts_token_count=5,
+                    total_token_count=10,
                 ),
             )
 
@@ -459,12 +469,19 @@ async def test_gemini_stream_accepts_terminal_parts_none(service):
         chunks = [
             chunk
             async for chunk in service._stream_gemini_new_sdk(
-                "prompt", "gemini-2.5-flash", 0.5, 128, ""
+                "prompt", "gemini-2.5-flash", 0.5, 128, "",
+                usage_callback=usage_events.append,
             )
         ]
 
     assert chunks[0] == "complete answer"
-    assert chunks[-1].metadata["finish_reason"] == "STOP"
+    assert chunks[-1].metadata["finish_reason"] == finish_reason
+    assert len(usage_events) == 1
+    assert usage_events[0]["input_tokens"] == 3
+    assert usage_events[0]["output_tokens"] == 7
+    assert usage_events[0]["reasoning_tokens"] == 5
+    assert usage_events[0]["total_tokens"] == 10
+    assert usage_events[0]["output_truncated"] == (finish_reason == "MAX_TOKENS")
 
 
 @pytest.mark.asyncio

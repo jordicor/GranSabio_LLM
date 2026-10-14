@@ -53,9 +53,11 @@ def minimal_request():
 def stub_model_catalog(monkeypatch):
     import config as config_module
 
-    def fake_model_info(_self, model_name):
+    def fake_model_info(_self, model_name, **_kwargs):
         model_lower = str(model_name).lower()
-        if model_lower.startswith("claude-"):
+        if "jev" in model_lower or model_lower.startswith("typesafe"):
+            provider = "typesafe"
+        elif model_lower.startswith("claude-"):
             provider = "anthropic"
         elif model_lower.startswith("gemini-") or model_lower.startswith("models/"):
             provider = "google"
@@ -66,7 +68,7 @@ def stub_model_catalog(monkeypatch):
         return {
             "model_id": model_name,
             "provider": provider,
-            "capabilities": ["text"],
+            "capabilities": ["text", "system_one"] if provider == "typesafe" else ["text"],
         }
 
     monkeypatch.setattr(config_module.Config, "get_model_info", fake_model_info)
@@ -96,6 +98,9 @@ def request_with_qa_layers():
             ),
         ],
         qa_models=["gpt-4o", "claude-sonnet-4-20250514"],
+        llm_routing={
+            "calls": {"preflight.validate": {"model": "grok-4-fast-non-reasoning"}}
+        },
     )
 
 
@@ -124,6 +129,9 @@ def request_with_word_count():
             ),
         ],
         qa_models=["gpt-4o"],
+        llm_routing={
+            "calls": {"preflight.validate": {"model": "grok-4-fast-non-reasoning"}}
+        },
     )
 
 
@@ -891,6 +899,205 @@ class TestRunPreflightValidation:
 
         assert result.duplicate_word_count_layers_to_remove == []
         assert request_with_word_count.qa_layers[0].is_mandatory is True
+
+    @pytest.mark.asyncio
+    async def test_vision_reject_does_not_call_jev_or_chat(
+        self, request_with_qa_layers, mock_ai_service
+    ):
+        """Images plus a non-vision generator reject before any provider call."""
+        request_with_qa_layers.llm_routing = {
+            "calls": {"preflight.validate": {"model": "jev-latest"}}
+        }
+        mock_ai_service.evaluate_system_one = AsyncMock()
+        result = await run_preflight_validation(
+            ai_service=mock_ai_service,
+            request=request_with_qa_layers,
+            image_info={
+                "count": 1,
+                "filenames": ["photo.png"],
+                "generator_supports_vision": False,
+            },
+        )
+        assert result.decision == "reject"
+        assert result.issues[0].code == "vision_not_supported"
+        mock_ai_service.evaluate_system_one.assert_not_called()
+        mock_ai_service.generate_content.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_jev_proceed_skips_generate_content(
+        self, request_with_qa_layers, mock_ai_service
+    ):
+        from services.typesafe_client import TypeSafeEvaluation
+
+        request_with_qa_layers.llm_routing = {
+            "calls": {"preflight.validate": {"model": "jev-latest"}}
+        }
+        mock_ai_service.evaluate_system_one = AsyncMock(
+            return_value=TypeSafeEvaluation(
+                model="jev-1.13.0",
+                answers={
+                    "decision": {
+                        "type": "choice",
+                        "choice": "proceed",
+                        "probabilities": {"proceed": 1.0, "reject": 0.0},
+                        "confidence": 0.88,
+                    },
+                    "length_layer_Accuracy": {"type": "noul", "noul": 0.05},
+                    "length_layer_Style": {"type": "noul", "noul": 0.08},
+                },
+                usage={"input_tokens": 40, "output_tokens": 0},
+            )
+        )
+        result = await run_preflight_validation(
+            ai_service=mock_ai_service,
+            request=request_with_qa_layers,
+        )
+        assert result.decision == "proceed"
+        assert result.user_feedback == "Request approved"
+        assert result.summary == "OK"
+        assert result.confidence == 0.88
+        mock_ai_service.generate_content.assert_not_awaited()
+        mock_ai_service.evaluate_system_one.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_jev_latest_qualified_name_uses_system_one(
+        self, request_with_qa_layers, mock_ai_service
+    ):
+        from services.typesafe_client import TypeSafeEvaluation
+
+        request_with_qa_layers.llm_routing = {
+            "calls": {"preflight.validate": {"model": "typesafe::jev-latest"}}
+        }
+        mock_ai_service.evaluate_system_one = AsyncMock(
+            return_value=TypeSafeEvaluation(
+                model="jev-1.13.0",
+                answers={
+                    "decision": {
+                        "type": "choice",
+                        "choice": "proceed",
+                        "probabilities": {"proceed": 1.0, "reject": 0.0},
+                        "confidence": 1.0,
+                    },
+                    "length_layer_Accuracy": {"type": "noul", "noul": 0.01},
+                    "length_layer_Style": {"type": "noul", "noul": 0.01},
+                },
+                usage={"input_tokens": 10, "output_tokens": 0},
+            )
+        )
+        result = await run_preflight_validation(
+            ai_service=mock_ai_service,
+            request=request_with_qa_layers,
+        )
+        assert result.decision == "proceed"
+        called_model = mock_ai_service.evaluate_system_one.await_args.args[2]
+        assert called_model == "typesafe::jev-latest"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("choice", [
+        "conflicting_requirements", "qa_incompatible_with_task", "missing_required_basis",
+    ])
+    async def test_jev_rejection_uses_a_fixed_message_without_a_chat_call(
+        self, request_with_qa_layers, mock_ai_service, choice
+    ):
+        from services.typesafe_client import TypeSafeEvaluation
+
+        request_with_qa_layers.llm_routing = {
+            "calls": {"preflight.validate": {"model": "jev-1.13.0"}}
+        }
+        mock_ai_service.evaluate_system_one = AsyncMock(
+            return_value=TypeSafeEvaluation(
+                model="jev-1.13.0",
+                answers={"decision": {"type": "choice", "choice": choice, "confidence": 0.95}},
+                usage={"input_tokens": 40, "output_tokens": 4},
+            )
+        )
+        result = await run_preflight_validation(
+            ai_service=mock_ai_service, request=request_with_qa_layers,
+        )
+        assert result.decision == "reject"
+        assert result.user_feedback
+        assert result.issues[0].code == choice
+        assert result.issues[0].message == result.user_feedback
+        assert result.confidence == 0.95
+        mock_ai_service.evaluate_system_one.assert_awaited_once()
+        questions = mock_ai_service.evaluate_system_one.await_args.args[1]
+        assert set(questions["decision"]["criteria"]) == {
+            "proceed", "conflicting_requirements", "qa_incompatible_with_task", "missing_required_basis",
+        }
+        assert "length_layer_Accuracy" in questions
+        mock_ai_service.generate_content.assert_not_awaited()
+        mock_ai_service.generate_content_stream.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_jev_unknown_category_is_a_technical_failure(
+        self, request_with_qa_layers, mock_ai_service
+    ):
+        from services.typesafe_client import TypeSafeEvaluation
+
+        request_with_qa_layers.llm_routing = {
+            "calls": {"preflight.validate": {"model": "jev-1.13.0"}}
+        }
+        mock_ai_service.evaluate_system_one = AsyncMock(return_value=TypeSafeEvaluation(
+            model="jev-1.13.0", answers={"decision": {"choice": "unknown"}},
+            usage={"input_tokens": 40, "output_tokens": 4},
+        ))
+        result = await run_preflight_validation(
+            ai_service=mock_ai_service, request=request_with_qa_layers,
+        )
+        assert result.decision == "reject"
+        assert result.issues[0].code == "preflight_invalid_decision"
+        mock_ai_service.generate_content.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_jev_error_fails_closed(self, request_with_qa_layers, mock_ai_service):
+        from services.typesafe_client import TypeSafeResponseError
+
+        request_with_qa_layers.llm_routing = {
+            "calls": {"preflight.validate": {"model": "jev-latest"}}
+        }
+        mock_ai_service.evaluate_system_one = AsyncMock(
+            side_effect=TypeSafeResponseError("TypeSafe returned an invalid choice distribution")
+        )
+        result = await run_preflight_validation(
+            ai_service=mock_ai_service,
+            request=request_with_qa_layers,
+        )
+        assert result.decision == "reject"
+        assert result.issues[0].code == "preflight_llm_call_failed"
+        mock_ai_service.generate_content.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_jev_length_nouls_feed_word_count_removals(
+        self, request_with_word_count, mock_ai_service
+    ):
+        from services.typesafe_client import TypeSafeEvaluation
+
+        request_with_word_count.llm_routing = {
+            "calls": {"preflight.validate": {"model": "jev-latest"}}
+        }
+        mock_ai_service.evaluate_system_one = AsyncMock(
+            return_value=TypeSafeEvaluation(
+                model="jev-1.13.0",
+                answers={
+                    "decision": {
+                        "type": "choice",
+                        "choice": "proceed",
+                        "probabilities": {"proceed": 1.0, "reject": 0.0},
+                        "confidence": 0.7,
+                    },
+                    "length_layer_Word Count Check": {"type": "noul", "noul": 0.97},
+                },
+                usage={"input_tokens": 30, "output_tokens": 0},
+            )
+        )
+        result = await run_preflight_validation(
+            ai_service=mock_ai_service,
+            request=request_with_word_count,
+        )
+        assert result.decision == "proceed"
+        assert result.word_count_analysis is not None
+        assert result.word_count_analysis.conflicting_layers == ["Word Count Check"]
+        assert result.duplicate_word_count_layers_to_remove == ["Word Count Check"]
 
 
 # ============================================================================

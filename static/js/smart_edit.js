@@ -245,9 +245,13 @@ async function handleGenerateActions() {
             body: JSON.stringify(payload),
         });
 
-        if (!response.ok) throw new Error('Analysis failed');
-
         const data = await response.json();
+        if (!response.ok) {
+            const detail = data.detail;
+            const message = typeof detail === 'string' ? detail : detail?.message || detail?.error_code;
+            throw new Error(message || 'Analysis failed');
+        }
+
         state.actions = data.actions;
         state.originalText = text;
         state.currentText = text;

@@ -19,10 +19,29 @@ from tools.attachments_cli import _command_delete, _command_list
 def _settings(tmp_path, **overrides):
     values = {
         "dedupe_db_path": str(tmp_path / "attachments" / "attachments.sqlite3"),
-        "blob_base_path": str(tmp_path / "attachment_blobs"),
+        "blob_base_path": str(tmp_path / "blobs"),
     }
     values.update(overrides)
     return AttachmentSettings(**values)
+
+
+@pytest.fixture
+def tmp_path(short_tmp_path):
+    """Blob storage paths are deep; keep them under MAX_PATH (see conftest)."""
+    return short_tmp_path
+
+
+@pytest.fixture(autouse=True)
+def _host_independent_mime_detection(monkeypatch):
+    """Use the built-in MIME heuristic instead of the host's libmagic.
+
+    libmagic versions disagree on JSON: the one bundled with python-magic-bin
+    on Windows reports ``text/plain`` while recent releases report
+    ``application/json``. These tests cover storage and dedupe, not libmagic.
+    """
+    import services.attachment_manager as manager_module
+
+    monkeypatch.setattr(manager_module, "magic", None)
 
 
 @pytest.mark.asyncio

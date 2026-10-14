@@ -6,7 +6,10 @@ OpenAI uses reasoning_effort (string: "low", "medium", "high") instead of
 thinking_budget_tokens (number).
 
 IMPORTANT: These tests make real API calls and incur costs.
-Set SKIP_EXPENSIVE_TESTS=1 to skip these tests.
+They are opt-in (marker ``integration``, deselected by default) and need the
+engine server running at API_BASE (default http://localhost:8000):
+
+    pytest -m integration dev_tests/test_tokens_openai_api.py
 """
 
 import os
@@ -20,8 +23,8 @@ from typing import Any, Dict
 import httpx
 import pytest
 
-# Skip expensive API tests unless explicitly enabled
-SKIP_EXPENSIVE = os.environ.get("SKIP_EXPENSIVE_TESTS", "0") == "1"
+# Opt-in live tests: real provider calls through a running engine server.
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("live_engine_server")]
 
 # API configuration
 API_BASE = os.environ.get("API_BASE", "http://localhost:8000")
@@ -82,7 +85,6 @@ def base_payload():
 class TestOpenAIReasoningEffortViaAPI:
     """Test OpenAI reasoning_effort through the generation API."""
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gpt5_with_reasoning_effort_low(self, base_payload):
         """Test GPT-5 with reasoning_effort=low."""
         payload = {
@@ -107,7 +109,6 @@ class TestOpenAIReasoningEffortViaAPI:
         print(f"\n[OK] GPT-5 with reasoning_effort='low' completed")
         print(f"    Content length: {len(result['content'])} chars")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gpt5_with_reasoning_effort_medium(self, base_payload):
         """Test GPT-5 with reasoning_effort=medium."""
         payload = {
@@ -127,7 +128,6 @@ class TestOpenAIReasoningEffortViaAPI:
 
         print(f"\n[OK] GPT-5 with reasoning_effort='medium' completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gpt5_with_reasoning_effort_high(self, base_payload):
         """Test GPT-5 with reasoning_effort=high."""
         payload = {
@@ -147,7 +147,6 @@ class TestOpenAIReasoningEffortViaAPI:
 
         print(f"\n[OK] GPT-5 with reasoning_effort='high' completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gpt51_with_reasoning_effort(self, base_payload):
         """Test GPT-5.1 with reasoning_effort."""
         payload = {
@@ -167,7 +166,6 @@ class TestOpenAIReasoningEffortViaAPI:
 
         print(f"\n[OK] GPT-5.1 with reasoning_effort='medium' completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gpt52_with_reasoning_effort(self, base_payload):
         """Test GPT-5.2 with reasoning_effort."""
         payload = {
@@ -191,7 +189,6 @@ class TestOpenAIReasoningEffortViaAPI:
 class TestOpenAIThinkingBudgetToReasoningEffort:
     """Test conversion from thinking_budget_tokens to reasoning_effort for OpenAI."""
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gpt5_thinking_budget_converts_to_reasoning_effort_high(self, base_payload):
         """Test that high thinking_budget_tokens converts to reasoning_effort=high."""
         payload = {
@@ -212,7 +209,6 @@ class TestOpenAIThinkingBudgetToReasoningEffort:
 
         print(f"\n[OK] GPT-5 with thinking_budget_tokens=65535 -> reasoning_effort='high'")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gpt5_thinking_budget_converts_to_reasoning_effort_medium(self, base_payload):
         """Test that medium thinking_budget_tokens converts to reasoning_effort=medium."""
         payload = {
@@ -232,7 +228,6 @@ class TestOpenAIThinkingBudgetToReasoningEffort:
 
         print(f"\n[OK] GPT-5 with thinking_budget_tokens=16000 -> reasoning_effort='medium'")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gpt5_thinking_budget_converts_to_reasoning_effort_low(self, base_payload):
         """Test that low thinking_budget_tokens converts to reasoning_effort=low."""
         payload = {
@@ -256,7 +251,6 @@ class TestOpenAIThinkingBudgetToReasoningEffort:
 class TestOpenAIReasoningEffortAliases:
     """Test reasoning_effort aliases for OpenAI."""
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gpt5_with_mid_alias(self, base_payload):
         """Test 'mid' alias converts to 'medium'."""
         payload = {
@@ -276,7 +270,6 @@ class TestOpenAIReasoningEffortAliases:
 
         print(f"\n[OK] GPT-5 with reasoning_effort='mid' (alias) completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gpt5_with_hi_alias(self, base_payload):
         """Test 'hi' alias converts to 'high'."""
         payload = {
@@ -296,7 +289,6 @@ class TestOpenAIReasoningEffortAliases:
 
         print(f"\n[OK] GPT-5 with reasoning_effort='hi' (alias) completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gpt5_with_lo_alias(self, base_payload):
         """Test 'lo' alias converts to 'low'."""
         payload = {
@@ -320,7 +312,6 @@ class TestOpenAIReasoningEffortAliases:
 class TestOpenAINonReasoningModels:
     """Test non-reasoning OpenAI models (GPT-4o) - should not use reasoning_effort."""
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gpt4o_without_reasoning(self, base_payload):
         """Test GPT-4o works without reasoning parameters."""
         payload = {
@@ -340,7 +331,6 @@ class TestOpenAINonReasoningModels:
 
         print(f"\n[OK] GPT-4o without reasoning completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gpt4o_mini_without_reasoning(self, base_payload):
         """Test GPT-4o-mini works without reasoning parameters."""
         payload = {
@@ -359,7 +349,6 @@ class TestOpenAINonReasoningModels:
 
         print(f"\n[OK] GPT-4o-mini without reasoning completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gpt4o_ignores_reasoning_effort(self, base_payload):
         """Test GPT-4o ignores reasoning_effort if passed (not supported)."""
         payload = {
@@ -384,7 +373,6 @@ class TestOpenAINonReasoningModels:
 class TestOpenAIReasoningWithJsonOutput:
     """Test OpenAI reasoning with JSON output."""
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gpt5_reasoning_with_json_output(self, base_payload):
         """Test GPT-5 reasoning + JSON output."""
         payload = {

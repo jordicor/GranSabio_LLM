@@ -19,4 +19,5 @@ from . import (
     interfaces,  # noqa: F401
     openrouter_routes,  # noqa: F401
     streaming_routes,  # noqa: F401
+    systemone_routes,  # noqa: F401
 )

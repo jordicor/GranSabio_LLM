@@ -238,19 +238,17 @@ class SmartTextEditor:
         flags = 0 if target.case_sensitive else re.IGNORECASE
         pattern = re.compile(target.value, flags)
 
-        matches = list(pattern.finditer(content))
-        if not matches:
-            return None
+        for occurrence, match in enumerate(pattern.finditer(content), start=1):
+            if target.occurrence == -1:
+                # Return first match (for -1 = all, caller handles iteration).
+                return (match.start(), match.end())
+            if 0 < target.occurrence <= occurrence:
+                if not isinstance(target.occurrence, int):
+                    # Retain list-index errors for malformed direct Python targets.
+                    match = [match][target.occurrence - occurrence]
+                return (match.start(), match.end())
 
-        if target.occurrence == -1:
-            # Return first match (for -1 = all, caller handles iteration)
-            match = matches[0]
-        elif 0 < target.occurrence <= len(matches):
-            match = matches[target.occurrence - 1]
-        else:
-            return None
-
-        return (match.start(), match.end())
+        return None
 
     def _locate_paragraph(
         self, content: str, index: int
@@ -682,6 +680,8 @@ class SmartTextEditor:
         local_execution: Optional[Any] = None,
         dispatch_call_id: str = "smart_edit.apply",
         dispatch_route_ordinal: int = 0,
+        *,
+        shared_context: Optional[str] = None,
     ) -> str:
         """
         Call AI service to generate text.
@@ -743,6 +743,7 @@ class SmartTextEditor:
         response = await self.ai_service.generate_content(
             model=model,
             prompt=prompt,
+            **({"shared_context": shared_context} if shared_context else {}),
             temperature=effective_temperature,
             max_tokens=effective_max_tokens,
             reasoning_effort=route_params.get("reasoning_effort"),
@@ -786,6 +787,8 @@ class SmartTextEditor:
         local_execution: Optional[Any] = None,
         dispatch_call_id: str = "smart_edit.apply",
         dispatch_route_ordinal: int = 0,
+        *,
+        shared_context: Optional[str] = None,
     ) -> EditResult:
         """
         Apply an edit to target text using AI with a specific instruction.
@@ -799,6 +802,7 @@ class SmartTextEditor:
             target: Text segment to edit (string, position tuple, or TextTarget)
             instruction: Specific instruction for the edit (from QA, user, etc.)
             context: Optional full document context for style preservation
+            shared_context: Complete user source evidence, separate from the truncated style context
             model: Optional explicit model override. Defaults resolve through llm_routing.
             temperature: Generation temperature (default 0.2 for consistency)
             preserve_length: Try to maintain similar length (default True)
@@ -861,6 +865,7 @@ class SmartTextEditor:
             # Call AI
             ai_response = await self._call_ai(
                 prompt=prompt,
+                **({"shared_context": shared_context} if shared_context else {}),
                 model=model,
                 temperature=temperature,
                 usage_callback=usage_callback,

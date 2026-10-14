@@ -92,11 +92,11 @@ def get_final_content(
     is_json_output_requested_fn: Callable[[Any], bool],
     is_gran_sabio: bool = False,
 ) -> Any:
-    """Return parsed JSON content when available, otherwise raw content."""
+    """Return the current JSON candidate, never a previous parsed snapshot."""
 
     if is_json_output_requested_fn(request):
-        parsed_key = "gran_sabio_json_parsed_content" if is_gran_sabio else "json_parsed_content"
-        parsed_content = session.get(parsed_key)
-        if parsed_content is not None:
-            return parsed_content
+        try:
+            return json.loads(raw_content)
+        except (ValueError, TypeError):
+            pass
     return raw_content

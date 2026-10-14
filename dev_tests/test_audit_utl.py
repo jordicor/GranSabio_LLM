@@ -22,6 +22,7 @@ import json as std_json
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -191,6 +192,58 @@ def test_save_specs_writes_content_via_atomic_replace(tmp_path):
 
     assert std_json.loads(sync.specs_file.read_text(encoding="utf-8")) == payload
     assert not (tmp_path / "model_specs.json.tmp").exists()
+
+
+def test_convert_openrouter_model_maps_cache_and_long_context_pricing(tmp_path):
+    """The CLI sync shares the service mapping: cache rates and the long-context
+    override are kept when OpenRouter lists them and never invented otherwise."""
+    sync = _make_sync(tmp_path)
+
+    priced = sync.convert_openrouter_model(
+        {
+            "id": "openai/gpt-6-luna",
+            "name": "GPT-6 Luna",
+            "context_length": 1050000,
+            "top_provider": {"max_completion_tokens": 128000},
+            "pricing": {
+                "prompt": "0.0000001",
+                "completion": "0.0000005",
+                "input_cache_read": "0.00000001",
+                "input_cache_write": "0.000000125",
+                "overrides": [
+                    {
+                        "min_prompt_tokens": 272000,
+                        "prompt": "0.0000002",
+                        "completion": "0.00000075",
+                        "input_cache_read": "0.00000002",
+                        "input_cache_write": "0.00000025",
+                    }
+                ],
+            },
+        }
+    )
+    plain = sync.convert_openrouter_model(
+        {"id": "meta-llama/llama-4-scout", "pricing": {"prompt": "0.00000008", "completion": "0.0000003"}}
+    )
+
+    assert priced["pricing"] == {
+        "input_per_million": 0.1,
+        "output_per_million": 0.5,
+        "cached_input_per_million": 0.01,
+        "cache_write_per_million": 0.125,
+        "long_context": {
+            "threshold_tokens": 272000,
+            "input_per_million": 0.2,
+            "output_per_million": 0.75,
+            "cached_input_per_million": 0.02,
+            "cache_write_per_million": 0.25,
+        },
+    }
+    assert plain["pricing"] == {"input_per_million": 0.08, "output_per_million": 0.3}
+    routed = sync.convert_openrouter_model(
+        {"id": "openrouter/auto", "pricing": {"prompt": "-1", "completion": "-1"}}
+    )
+    assert routed["pricing"] == {}
 
 
 # =============================================================================
@@ -402,11 +455,25 @@ async def test_async_upload_attachment_connection_error_maps_to_transient(async_
 
 
 @pytest.fixture
-def mcp_server_module():
+def mcp_server_module(monkeypatch, request):
     """Import the MCP server module with a stubbed mcp SDK (not installed in the venv)."""
+    for setting in (
+        "GRANSABIO_GENERATOR_MODEL", "GRANSABIO_QA_MODELS", "GRANSABIO_ARBITER_MODEL",
+        "GRANSABIO_GENERATOR_REASONING", "GRANSABIO_QA_REASONING",
+        "GRANSABIO_ARBITER_REASONING", "GRANSABIO_THINKING_BUDGET",
+    ):
+        monkeypatch.delenv(setting, raising=False)
+    for setting, value in getattr(request, "param", {}).items():
+        monkeypatch.setenv(setting, value)
     stubs = {}
     for name in ("mcp", "mcp.server", "mcp.server.stdio", "mcp.types"):
         stubs[name] = MagicMock()
+    # Preserve the decorated handlers so tests can exercise real dispatch.
+    sdk_server = stubs["mcp.server"].Server.return_value
+    sdk_server.list_tools.return_value = lambda handler: handler
+    sdk_server.call_tool.return_value = lambda handler: handler
+    stubs["mcp.types"].TextContent.side_effect = lambda **kwargs: Mock(**kwargs)
+    stubs["mcp.types"].Tool.side_effect = lambda **kwargs: SimpleNamespace(**kwargs)
     with patch.dict(sys.modules, stubs):
         spec = importlib.util.spec_from_file_location(
             "gransabio_mcp_server_under_test",
@@ -446,12 +513,17 @@ async def test_mcp_wait_for_result_bounds_engine_error_body(mcp_server_module):
 
 
 @pytest.mark.asyncio
-async def test_mcp_missing_session_id_does_not_dump_response(mcp_server_module):
+@pytest.mark.parametrize(
+    ("initial", "error_detail"),
+    [({"status": "unexpected", "huge": "payload " * 1000}, "unexpected"), (None, "expected a JSON object")],
+)
+async def test_mcp_missing_session_id_does_not_dump_response(mcp_server_module, capsys, initial, error_detail):
     response = MagicMock()
     response.status_code = 200
-    response.json.return_value = {"huge": "payload " * 1000}
+    response.json.return_value = initial
     client = MagicMock()
     client.post = AsyncMock(return_value=response)
+    client.get = AsyncMock()
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=None)
 
@@ -460,6 +532,236 @@ async def test_mcp_missing_session_id_does_not_dump_response(mcp_server_module):
             await mcp_server_module._call_gransabio({"prompt": "hola"})
 
     assert "huge" not in str(exc.value)
+    assert error_detail in str(exc.value)
+    assert "huge" not in capsys.readouterr().err
+    client.post.assert_awaited_once()
+    client.get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "decision"),
+    [("preflight_rejected", "reject"), ("preflight_rejected", "manual_review"), ("auto_qa_rejected", None)],
+)
+async def test_mcp_consumes_initial_refusal_without_followup(mcp_server_module, status, decision):
+    """Consume the real initialization schema through the active MCP handler."""
+    import httpx
+
+    from models import GenerationInitResponse, PreflightResult
+
+    feedback = PreflightResult(
+        decision=decision or "proceed",
+        user_feedback="Clarify the requirements" if decision else "Preflight passed",
+        issues=[{"code": "clarification", "message": "Requirements need clarification"}] if decision else [],
+    )
+    initial = GenerationInitResponse(
+        status=status,
+        session_id=None,
+        preflight_feedback=feedback,
+        auto_qa_feedback={"message": "No usable QA plan", "code": "invalid_plan"} if not decision else None,
+    ).model_dump(mode="json")
+    requests = []
+
+    def respond(request):
+        requests.append((request.method, request.url.path))
+        assert request.method == "POST" and request.url.path == "/generate"
+        return httpx.Response(200, json=initial)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    with patch.object(mcp_server_module.httpx, "AsyncClient", return_value=client):
+        contents = await mcp_server_module.call_tool("gransabio_generate_with_qa", {"prompt": "Generate a draft"})
+    result = std_json.loads(contents[0].text)
+
+    assert requests == [("POST", "/generate")]
+    assert result["success"] is False
+    assert result["status"] == status
+    assert result.get("decision") == decision
+    assert "hint" not in result
+    if decision:
+        assert result["feedback"] == feedback.user_feedback
+        assert result["issues"] == initial["preflight_feedback"]["issues"]
+        assert ("manual review" in result["error"].lower()) == (decision == "manual_review")
+    else:
+        assert result["feedback"] == "No usable QA plan"
+        assert result["auto_qa_feedback"] == initial["auto_qa_feedback"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mcp_server_module",
+    [{
+        # Resolve the example's documented ${SETTING:-fallback} placeholders
+        # as a client copying it without any overrides would do.
+        setting: (
+            expansion.partition(":-")[2][:-1]
+            if expansion.startswith("${") and expansion.endswith("}") and ":-" in expansion
+            else expansion
+        )
+        for setting, expansion in std_json.loads(
+            (REPO_ROOT / ".mcp.json.example").read_text(encoding="utf-8")
+        )["mcpServers"]["gransabio-llm"]["env"].items()
+    }],
+    indirect=True,
+)
+@pytest.mark.parametrize("status", ["completed", "rejected"])
+async def test_mcp_preserves_final_qa_result(mcp_server_module, status):
+    import httpx
+
+    requests = []
+    payloads = []
+
+    def respond(request):
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/generate":
+            payloads.append(std_json.loads(request.content))
+            return httpx.Response(200, json={"status": "initialized", "session_id": "qa-session"})
+        assert request.method == "GET" and request.url.path == "/result/qa-session"
+        return httpx.Response(200, json={"status": status, "approved": status == "completed", "content": "candidate"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    with patch.object(mcp_server_module.httpx, "AsyncClient", return_value=client):
+        contents = await mcp_server_module.call_tool("gransabio_generate_with_qa", {"prompt": "Generate a draft"})
+    result = std_json.loads(contents[0].text)
+
+    assert requests == [("POST", "/generate"), ("GET", "/result/qa-session")]
+    assert result["status"] == status
+    assert result["success"] is (status == "completed")
+    assert result["content"] == "candidate"
+    assert not {"generator_model", "qa_models", "gran_sabio_model", "reasoning_effort", "qa_global_config", "thinking_budget_tokens"} & payloads[0].keys()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mcp_server_module",
+    [{
+        "GRANSABIO_GENERATOR_MODEL": "env-generator",
+        "GRANSABIO_QA_MODELS": "env-reviewer-a, env-reviewer-b",
+        "GRANSABIO_ARBITER_MODEL": "env-gran-sabio",
+        "GRANSABIO_GENERATOR_REASONING": " LOW ",
+        "GRANSABIO_QA_REASONING": "medium",
+        "GRANSABIO_THINKING_BUDGET": "2048",
+    }],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("gransabio_analyze_code", {"code": "print(1)"}),
+        ("gransabio_review_fix", {"original_code": "before", "proposed_fix": "after", "issue_description": "fix"}),
+        ("gransabio_generate_with_qa", {"prompt": "Generate a draft"}),
+    ],
+)
+@pytest.mark.parametrize("override", ["environment", "call", "inherit"])
+async def test_mcp_overrides_reach_generation_payload(mcp_server_module, tool_name, arguments, override):
+    """Exercise each dispatch branch with the published schema and HTTP boundary."""
+    import httpx
+
+    arguments = dict(arguments)
+    expected = {
+        "generator_model": "env-generator",
+        "qa_models": ["env-reviewer-a", "env-reviewer-b"],
+        "gran_sabio_model": "env-gran-sabio",
+        "reasoning_effort": "low",
+        "qa_global_config": {"reasoning_effort": "medium"},
+        "thinking_budget_tokens": 2048,
+    }
+    if override == "call":
+        arguments.update({
+            "generator_model": "call-generator",
+            "qa_models": ["call-reviewer"],
+            "gran_sabio_model": "call-gran-sabio",
+            "reasoning_effort": "high",
+            "qa_reasoning_effort": "low",
+            "thinking_budget_tokens": 4096,
+        })
+        expected.update({
+            "generator_model": "call-generator",
+            "qa_models": ["call-reviewer"],
+            "gran_sabio_model": "call-gran-sabio",
+            "reasoning_effort": "high",
+            "qa_global_config": {"reasoning_effort": "low"},
+            "thinking_budget_tokens": 4096,
+        })
+    elif override == "inherit":
+        arguments.update({"reasoning_effort": "none", "qa_reasoning_effort": "off"})
+        del expected["reasoning_effort"]
+        del expected["qa_global_config"]
+
+    tool = next(tool for tool in await mcp_server_module.list_tools() if tool.name == tool_name)
+    assert "gran_sabio_model" in tool.inputSchema["properties"]
+    assert set(arguments) <= tool.inputSchema["properties"].keys()
+    for field in ("reasoning_effort", "qa_reasoning_effort"):
+        if field in arguments:
+            assert arguments[field] in tool.inputSchema["properties"][field]["enum"]
+
+    payloads = []
+
+    def respond(request):
+        if request.method == "POST":
+            assert request.url.path == "/generate"
+            payloads.append(std_json.loads(request.content))
+            return httpx.Response(200, json={"status": "initialized", "session_id": "config-session"})
+        assert request.method == "GET" and request.url.path == "/result/config-session"
+        return httpx.Response(200, json={"status": "completed", "approved": True, "content": {"summary": "OK"}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    with patch.object(mcp_server_module.httpx, "AsyncClient", return_value=client):
+        contents = await mcp_server_module.call_tool(tool_name, arguments)
+    result = std_json.loads(contents[0].text)
+
+    assert result["success"] is True
+    assert len(payloads) == 1
+    payload = payloads[0]
+    for field, value in expected.items():
+        assert payload[field] == value
+    assert "arbiter_model" not in payload
+    if override == "inherit":
+        assert "reasoning_effort" not in payload
+        assert "qa_global_config" not in payload
+
+    contents = await mcp_server_module.call_tool("gransabio_get_config", {})
+    configuration = std_json.loads(contents[0].text)
+    assert configuration["models"]["arbiter_override"] == "env-gran-sabio"
+    assert configuration["reasoning"] == {
+        "generator_reasoning": "low", "qa_reasoning": "medium", "thinking_budget": 2048,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mcp_server_module", "arguments", "setting"),
+    [
+        ({"GRANSABIO_ARBITER_REASONING": "sensitive-invalid-value"}, {}, "GRANSABIO_ARBITER_REASONING"),
+        ({"GRANSABIO_GENERATOR_REASONING": "sensitive-invalid-value"}, {}, "GRANSABIO_GENERATOR_REASONING"),
+        ({"GRANSABIO_QA_REASONING": "sensitive-invalid-value"}, {}, "GRANSABIO_QA_REASONING"),
+        ({"GRANSABIO_THINKING_BUDGET": "sensitive-invalid-value"}, {}, "GRANSABIO_THINKING_BUDGET"),
+        ({"GRANSABIO_THINKING_BUDGET": "512"}, {}, "GRANSABIO_THINKING_BUDGET"),
+        ({}, {"reasoning_effort": "sensitive-invalid-value"}, "reasoning_effort"),
+        ({}, {"qa_reasoning_effort": ""}, "qa_reasoning_effort"),
+        ({}, {"reasoning_effort": True}, "reasoning_effort"),
+        ({}, {"thinking_budget_tokens": 512}, "thinking_budget_tokens"),
+        ({}, {"thinking_budget_tokens": True}, "thinking_budget_tokens"),
+    ],
+    indirect=["mcp_server_module"],
+)
+async def test_mcp_invalid_overrides_fail_before_generation(mcp_server_module, arguments, setting):
+    with patch.object(mcp_server_module.httpx, "AsyncClient") as client_factory:
+        contents = await mcp_server_module.call_tool("gransabio_generate_with_qa", {"prompt": "Generate a draft", **arguments})
+    result = std_json.loads(contents[0].text)
+
+    assert setting in result["error"]
+    assert "sensitive-invalid-value" not in result["error"]
+    assert result["tool"] == "gransabio_generate_with_qa"
+    assert "success" not in result
+    client_factory.assert_not_called()
+
+    if setting.startswith("GRANSABIO_"):
+        with patch.object(mcp_server_module, "stdio_server") as start_stdio:
+            with pytest.raises(ValueError, match=setting):
+                await mcp_server_module.main()
+        start_stdio.assert_not_called()
+    if setting == "GRANSABIO_ARBITER_REASONING":
+        assert "Remove it from the MCP environment" in result["error"]
 
 
 # =============================================================================

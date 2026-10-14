@@ -98,8 +98,6 @@ def test_final_verification_request_clone_forces_read_only_qa():
     alias_registry = object()
     request._current_iteration = 3
     request._total_iterations = 5
-    request._generation_mode = "smart_edit"
-    request._smart_edit_metadata = {"runtime_task": object()}
     request._resolved_long_text_mode = {"enabled": True, "mode": "chaptered"}
     request._model_alias_registry = alias_registry
 
@@ -113,7 +111,6 @@ def test_final_verification_request_clone_forces_read_only_qa():
     assert cloned._current_iteration == 3
     assert cloned._total_iterations == 5
     assert cloned._generation_mode == "final_verification"
-    assert cloned._smart_edit_metadata is None
     assert cloned._resolved_long_text_mode == {"enabled": True, "mode": "chaptered"}
     assert cloned._model_alias_registry is alias_registry
 
@@ -123,7 +120,6 @@ async def test_final_verification_request_clone_keeps_runtime_task_without_deepc
     request = ContentRequest(prompt="Write a test article about QA final verification.")
     runtime_task = asyncio.create_task(asyncio.sleep(0))
     request._cancellation_token = runtime_task
-    request._smart_edit_metadata = {"runtime_task": runtime_task}
 
     try:
         cloned = _clone_request_for_final_verification(request)
@@ -132,4 +128,3 @@ async def test_final_verification_request_clone_keeps_runtime_task_without_deepc
 
     assert cloned._cancellation_token is runtime_task
     assert cloned.smart_editing_mode == "never"
-    assert cloned._smart_edit_metadata is None

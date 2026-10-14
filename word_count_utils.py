@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 # Reserved order for the synthetic accent-guard layer.
 LAYER_ORDER_LLM_ACCENT_GUARD = 999_999
+_WORD_RE = re.compile(r"\w+")
 
 
 def word_count_config_to_dict(config: Any) -> Optional[Dict[str, Any]]:
@@ -123,13 +124,10 @@ def count_words(text: str) -> int:
     Returns:
         Number of words
     """
-    if not text or not text.strip():
+    if not text:
         return 0
 
-    # Remove extra whitespace and split by whitespace
-    # This handles multiple spaces, tabs, newlines, etc.
-    words = re.findall(r'\b\w+\b', text.strip())
-    return len(words)
+    return len(_WORD_RE.findall(text))
 
 
 def validate_word_count_config(config: Any) -> Tuple[bool, str]:

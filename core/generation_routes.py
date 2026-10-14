@@ -295,18 +295,41 @@ def _local_only_requested(request: ContentRequest) -> bool:
     return getattr(getattr(request, "execution_policy", None), "scope", "default") == LOCAL_ONLY_SCOPE
 
 
-def _local_policy_http_error(exc: LocalExecutionPolicyError) -> HTTPException:
-    """Translate stable policy errors without exposing transport internals."""
+class TransientAdmissionRefusal(HTTPException):
+    """An admission refusal that reflects current capacity, not the payload.
 
-    unavailable_codes = {
+    No generation has been admitted when it is raised: a pre-start temp
+    session, if prestart registered one, is discarded (never recorded as a
+    failure). An idempotent submission therefore must not store it: the same
+    request ID may be re-sent once capacity returns and is still admitted at
+    most once. Payload-determined errors (400/409/422, preflight and Auto-QA
+    rejections) stay plain ``HTTPException`` and are replayed for the key's
+    lifetime.
+    """
+
+
+def _local_policy_http_error(exc: LocalExecutionPolicyError) -> HTTPException:
+    """Translate stable policy errors without exposing transport internals.
+
+    Codes describing the local runtime's current state are transient admission
+    refusals (HTTP 503): the identical payload is admissible once the endpoint
+    answers and serves the routed model. Every other code describes the request
+    or its configuration and stays a deterministic HTTP 400.
+    """
+
+    transient_codes = {
+        # Discovery got no answer from the endpoint (down, restarting, unreachable).
         "local_endpoint_unavailable",
+        # The endpoint answered but does not serve the routed model right now
+        # (not loaded yet, swapped out); loading it needs no change to the request.
         "local_model_not_announced",
+        # The endpoint answered discovery without a usable model list: a server
+        # mid-restart or misbehaving, which is not a property of the payload.
         "local_discovery_invalid",
     }
-    return HTTPException(
-        status_code=503 if exc.code in unavailable_codes else 400,
-        detail=exc.to_payload(),
-    )
+    if exc.code in transient_codes:
+        return TransientAdmissionRefusal(status_code=503, detail=exc.to_payload())
+    return HTTPException(status_code=400, detail=exc.to_payload())
 
 
 def _build_local_route_requirements(
@@ -322,7 +345,7 @@ def _build_local_route_requirements(
 ) -> tuple[LocalRouteRequirement, ...]:
     """Resolve the concrete LLM routes this accepted request can reach."""
 
-    call_ids: list[str] = ["generation.direct_stream"]
+    call_ids: list[str] = []
     if long_text_enabled:
         call_ids.extend(("long_text.section_draft", "long_text.semantic_eval"))
         if request.generation_tools_mode == "auto" and long_text_tools_supported:
@@ -703,6 +726,32 @@ async def _abort_admission_session(
     await cancellation_registry.unregister_session(session_id)
 
 
+async def _discard_admission_session(
+    session_id: str,
+    *,
+    project_id: Optional[str],
+    request_name: Optional[str],
+    project_epoch: Optional[int],
+) -> None:
+    """Drop the pre-start temp session after a transient admission refusal.
+
+    The local runtime, not the request, refused the admission, so the session
+    is discarded the way a preflight or Auto-QA rejection discards it: the
+    project streams learn it ended, it leaves the session store, and its
+    cancellation entry goes with it. Nothing was admitted, so no failure is
+    recorded and no traceback is logged.
+    """
+    await publish_project_session_end(
+        project_id,
+        session_id,
+        "admission_refused",
+        request_name=request_name,
+        project_epoch=project_epoch,
+    )
+    await pop_session(session_id)
+    await cancellation_registry.unregister_session(session_id)
+
+
 async def _generate_content_once(request: ContentRequest):
     """
     Generate content using the Gran Sabio LLM Engine
@@ -731,7 +780,11 @@ async def _generate_content_once(request: ContentRequest):
     except LLMRoutingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if _local_only_requested(request) and request.feedback_memory_enabled:
+    if (
+        _local_only_requested(request)
+        and config.FEEDBACK_MEMORY.enabled
+        and request.feedback_memory_enabled
+    ):
         error = LocalExecutionPolicyError(
             "local_feedback_memory_unsupported",
             "feedback_memory_enabled must be false for local_only requests because Track A has no local embeddings backend.",
@@ -1208,7 +1261,7 @@ async def _generate_content_once(request: ContentRequest):
             "Rejecting /generate admission: active generation sessions at configured capacity (%s)",
             getattr(config, "MAX_ACTIVE_SESSIONS", 100),
         )
-        raise HTTPException(
+        raise TransientAdmissionRefusal(
             status_code=503,
             detail="Generation capacity reached: too many active sessions. Retry later.",
             headers={"Retry-After": "5"},
@@ -1313,13 +1366,25 @@ async def _generate_content_once(request: ContentRequest):
             ),
         )
     except LocalExecutionPolicyError as exc:
-        await _abort_admission_session(
-            session_id,
-            exc,
-            project_id=project_id,
-            request_name=getattr(request, "request_name", None),
-        )
-        raise _local_policy_http_error(exc) from exc
+        # A normal-scope route to an explicit local endpoint is verified at its
+        # first SDK call, which preflight and Auto-QA reach after prestart
+        # registered the temp session.
+        http_error = _local_policy_http_error(exc)
+        if isinstance(http_error, TransientAdmissionRefusal):
+            await _discard_admission_session(
+                session_id,
+                project_id=project_id,
+                request_name=getattr(request, "request_name", None),
+                project_epoch=project_epoch,
+            )
+        else:
+            await _abort_admission_session(
+                session_id,
+                exc,
+                project_id=project_id,
+                request_name=getattr(request, "request_name", None),
+            )
+        raise http_error from exc
     except HTTPException:
         raise
     except BaseException as exc:
@@ -1349,6 +1414,8 @@ def _normalize_saas_request_id(value: object) -> str | None:
 
 def _generation_request_fingerprint(request: ContentRequest) -> str:
     payload = request.model_dump(mode="json")
+    if request.shared_context is None:
+        payload.pop("shared_context", None)  # Preserve legacy request identities.
     serialized = json.dumps(payload, sort_keys=True)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
@@ -1391,7 +1458,9 @@ async def generate_content(
                 detail="SaaS request ID was already used with a different generation payload",
             ) from exc
         except IdempotencyCapacityError as exc:
-            raise HTTPException(
+            # Raised before any claim exists, so nothing is stored under the
+            # key: the same submission is safe to re-send once entries expire.
+            raise TransientAdmissionRefusal(
                 status_code=503,
                 detail="Generation idempotency registry is temporarily full",
             ) from exc
@@ -1418,6 +1487,12 @@ async def generate_content(
         try:
             response = await _generate_content_once(request)
             validated_response = GenerationInitResponse.model_validate(response)
+        except TransientAdmissionRefusal:
+            # Nothing was admitted: release the key so the same submission can
+            # be re-sent once capacity returns, instead of replaying the refusal
+            # for the key's lifetime. Duplicate waiters wake and re-claim.
+            await generation_idempotency_registry.abort(claim.entry)
+            raise
         except HTTPException as exc:
             await generation_idempotency_registry.fail(
                 claim.entry,
@@ -1558,6 +1633,14 @@ async def get_status(
         "finish_reason": (
             (session.get("final_result") or {}).get("finish_reason")
             or session.get("finish_reason")
+        ),
+        "native_finish_reason": (
+            (session.get("final_result") or {}).get("native_finish_reason")
+            or session.get("native_finish_reason")
+        ),
+        "prompt_block_reason": (
+            (session.get("final_result") or {}).get("prompt_block_reason")
+            or session.get("prompt_block_reason")
         ),
         "finish_reason_category": (
             (session.get("final_result") or {}).get("finish_reason_category")

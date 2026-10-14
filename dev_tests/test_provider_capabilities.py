@@ -202,6 +202,16 @@ def test_gpt56_sol_uses_responses_when_discovery_catalog_is_still_text_only():
     assert model_uses_responses_api("openai", "gpt-5.6-solar", specs) is False
 
 
+def test_gpt6_default_models_use_responses_tools_and_structured_output():
+    """Provider discovery alone must not route reasoning models to chat."""
+    for model_id in ("gpt-6-luna", "gpt-6-sol"):
+        for capability in ("responses_api", "json_schema", "tool_calling"):
+            assert model_supports(
+                specs={}, provider="openai", model_id=model_id,
+                capability=capability, model_data={"capabilities": ["text"]},
+            ).support == CapabilitySupport.SUPPORTED
+
+
 def test_resolve_model_capability_context_statuses_without_credentials():
     specs = {
         "model_specifications": {
@@ -354,6 +364,38 @@ def test_429_plain_rate_limit_remains_retryable():
 
     assert failure.kind == ProviderErrorKind.RATE_LIMITED
     assert failure.retryable is True
+
+
+def test_openrouter_gemini_prohibited_content_403_is_content_policy():
+    class GeminiContentPolicyError(Exception):
+        status_code = 403
+        body = {"error": {"code": 403, "type": 403}}
+
+    failure = classify_provider_exception(
+        GeminiContentPolicyError("Gemini blocked the request: PROHIBITED_CONTENT"),
+        provider="openrouter",
+        model_id="google/gemini-2.5-pro",
+        operation="tool_loop_generation",
+    )
+
+    assert failure.kind == ProviderErrorKind.CONTENT_POLICY
+    assert failure.retryable is False
+
+
+def test_generic_403_remains_permission_denied():
+    class ProviderForbiddenError(Exception):
+        status_code = 403
+        body = {"error": {"code": 403, "type": 403}}
+
+    failure = classify_provider_exception(
+        ProviderForbiddenError("Forbidden"),
+        provider="openrouter",
+        model_id="google/gemini-2.5-pro",
+        operation="tool_loop_generation",
+    )
+
+    assert failure.kind == ProviderErrorKind.PERMISSION_DENIED
+    assert failure.retryable is False
 
 
 def test_gemini_503_unavailable_is_provider_down_not_overloaded():

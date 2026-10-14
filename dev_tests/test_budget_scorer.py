@@ -226,17 +226,21 @@ class TestExtractYesProbability:
             }
         ]
         result = extract_yes_probability(logprobs_content)
-        # Should return the lowest logprob as upper bound
-        assert result < 0.10  # Less than the smallest in top-k
+        assert result == pytest.approx(0.05)
 
-    def test_empty_logprobs_returns_default(self):
-        """
-        Given: Empty or None logprobs
-        When: extract_yes_probability is called
-        Then: Returns default uncertain value
-        """
-        assert extract_yes_probability(None) == 0.33
-        assert extract_yes_probability([]) == 0.33
+    @pytest.mark.parametrize("logprobs_content", [
+        None,
+        [],
+        [{}],
+        [{"token": "NO", "logprob": math.log(0.9)}],
+        [{"token": "YES", "logprob": None}],
+        [{"top_logprobs": [{"token": "NO"}]}],
+        [{"top_logprobs": [{"token": "YES", "logprob": float("nan")}]}],
+    ])
+    def test_unavailable_logprobs_raise_instead_of_returning_default(self, logprobs_content):
+        """Absent or invalid measurements cannot produce a probability or top-k bound."""
+        with pytest.raises(ValueError, match="logprobs"):
+            extract_yes_probability(logprobs_content, default_uncertain=0.9)
 
     def test_no_top_logprobs_uses_token_logprob(self):
         """

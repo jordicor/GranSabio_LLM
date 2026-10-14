@@ -5,7 +5,10 @@ Tests that thinking_budget and reasoning_effort are correctly
 handled when making actual requests to Gemini models through the API.
 
 IMPORTANT: These tests make real API calls and incur costs.
-Set SKIP_EXPENSIVE_TESTS=1 to skip these tests.
+They are opt-in (marker ``integration``, deselected by default) and need the
+engine server running at API_BASE (default http://localhost:8000):
+
+    pytest -m integration dev_tests/test_tokens_gemini_api.py
 """
 
 import os
@@ -19,8 +22,8 @@ from typing import Any, Dict
 import httpx
 import pytest
 
-# Skip expensive API tests unless explicitly enabled
-SKIP_EXPENSIVE = os.environ.get("SKIP_EXPENSIVE_TESTS", "0") == "1"
+# Opt-in live tests: real provider calls through a running engine server.
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("live_engine_server")]
 
 # API configuration
 API_BASE = os.environ.get("API_BASE", "http://localhost:8000")
@@ -81,7 +84,6 @@ def base_payload():
 class TestGeminiThinkingBudgetViaAPI:
     """Test Gemini thinking budget through the generation API."""
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gemini_flash_with_default_thinking(self, base_payload):
         """Test Gemini Flash with default thinking (auto-applied: 4000 tokens)."""
         payload = {
@@ -106,7 +108,6 @@ class TestGeminiThinkingBudgetViaAPI:
         print(f"\n[OK] Gemini Flash with default thinking (4000) completed")
         print(f"    Content length: {len(result['content'])} chars")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gemini_flash_with_explicit_thinking_budget(self, base_payload):
         """Test Gemini Flash with explicit thinking_budget_tokens."""
         payload = {
@@ -126,7 +127,6 @@ class TestGeminiThinkingBudgetViaAPI:
 
         print(f"\n[OK] Gemini Flash with thinking_budget_tokens=8000 completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gemini_flash_lite_with_thinking_disabled(self, base_payload):
         """Test Gemini Flash Lite with default (thinking disabled: 0 tokens)."""
         payload = {
@@ -147,7 +147,6 @@ class TestGeminiThinkingBudgetViaAPI:
 
         print(f"\n[OK] Gemini Flash Lite with thinking disabled (default=0) completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gemini_flash_lite_with_thinking_enabled(self, base_payload):
         """Test Gemini Flash Lite with explicit thinking budget (override default 0)."""
         payload = {
@@ -167,7 +166,6 @@ class TestGeminiThinkingBudgetViaAPI:
 
         print(f"\n[OK] Gemini Flash Lite with thinking_budget_tokens=2000 completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gemini_3_flash_with_reasoning_effort_low(self, base_payload):
         """Test Gemini 3 Flash with reasoning_effort=low."""
         payload = {
@@ -187,7 +185,6 @@ class TestGeminiThinkingBudgetViaAPI:
 
         print(f"\n[OK] Gemini 3 Flash with reasoning_effort='low' completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gemini_3_flash_with_reasoning_effort_medium(self, base_payload):
         """Test Gemini 3 Flash with reasoning_effort=medium."""
         payload = {
@@ -207,7 +204,6 @@ class TestGeminiThinkingBudgetViaAPI:
 
         print(f"\n[OK] Gemini 3 Flash with reasoning_effort='medium' completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gemini_3_flash_with_reasoning_effort_high(self, base_payload):
         """Test Gemini 3 Flash with reasoning_effort=high."""
         payload = {
@@ -231,7 +227,6 @@ class TestGeminiThinkingBudgetViaAPI:
 class TestGeminiThinkingBudgetConversion:
     """Test reasoning_effort to thinking_budget conversion for Gemini."""
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gemini_flash_reasoning_effort_converts_to_tokens(self, base_payload):
         """Test that reasoning_effort is converted to thinking_budget_tokens for Gemini."""
         # Test low = 25% of max (65536 * 0.25 = 16384)
@@ -252,7 +247,6 @@ class TestGeminiThinkingBudgetConversion:
 
         print(f"\n[OK] Gemini Flash with reasoning_effort='low' -> 16384 tokens completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gemini_3_pro_with_high_thinking(self, base_payload):
         """Test Gemini 3 Pro with max thinking budget."""
         payload = {
@@ -276,7 +270,6 @@ class TestGeminiThinkingBudgetConversion:
 class TestGeminiThinkingWithJsonOutput:
     """Test Gemini thinking with JSON output mode."""
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gemini_flash_thinking_with_json_output(self, base_payload):
         """Test Gemini Flash with thinking + JSON output."""
         payload = {
@@ -318,7 +311,6 @@ class TestGeminiThinkingWithJsonOutput:
         except:
             print(f"\n[WARN] Could not parse JSON, but request completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gemini_3_flash_thinking_with_json_schema(self, base_payload):
         """Test Gemini 3 Flash with thinking + JSON schema."""
         payload = {
@@ -352,7 +344,6 @@ class TestGeminiThinkingWithJsonOutput:
 class TestGeminiThinkingValidation:
     """Test thinking budget validation for Gemini."""
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gemini_thinking_budget_capped(self, base_payload):
         """Test that excessive thinking budget is capped."""
         payload = {
@@ -373,7 +364,6 @@ class TestGeminiThinkingValidation:
 
         print(f"\n[OK] Gemini with excessive thinking budget was capped and completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_gemini_thinking_budget_raised_to_minimum(self, base_payload):
         """Test that sub-minimum thinking budget is raised."""
         payload = {

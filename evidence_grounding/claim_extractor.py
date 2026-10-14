@@ -201,14 +201,14 @@ def _extract_json_from_response(response: str) -> Dict[str, Any]:
 
 
 def _filter_claims(
-    claims: List[Dict[str, Any]],
+    claims: List[ExtractedClaim],
     filter_trivial: bool,
     min_importance: float
-) -> List[Dict[str, Any]]:
+) -> List[ExtractedClaim]:
     """Filter claims based on triviality and importance threshold.
 
     Args:
-        claims: List of raw claim dictionaries
+        claims: List of validated claims
         filter_trivial: Whether to exclude trivial claims
         min_importance: Minimum importance score to keep
 
@@ -218,12 +218,11 @@ def _filter_claims(
     filtered = []
     for claim in claims:
         # Filter trivial claims if requested
-        if filter_trivial and claim.get("kind") == "trivial":
+        if filter_trivial and claim.kind == "trivial":
             continue
 
         # Filter by importance threshold
-        importance = claim.get("importance", 0.0)
-        if importance < min_importance:
+        if claim.importance < min_importance:
             continue
 
         filtered.append(claim)
@@ -255,32 +254,33 @@ def _parse_claims_response(
         logger.error(f"Failed to parse claim extraction response: {e}")
         raise ValueError(f"Invalid JSON response from claim extraction: {e}")
 
-    raw_claims = data.get("claims", [])
+    if not isinstance(data, dict):
+        raise ValueError("Claim extraction response must be a JSON object")
+    if "claims" not in data:
+        raise ValueError("Claim extraction response is missing required 'claims' field")
+    raw_claims = data["claims"]
     if not isinstance(raw_claims, list):
         raise ValueError("Response 'claims' field is not a list")
 
-    # Filter claims
-    filtered_claims = _filter_claims(raw_claims, filter_trivial, min_importance)
-
-    # Convert to ExtractedClaim objects
-    result = []
-    for i, claim_data in enumerate(filtered_claims):
+    # Validate the entire extraction before filtering. Defaults for internally
+    # constructed claims do not make required provider response fields optional.
+    required_fields = CLAIM_EXTRACTION_SCHEMA["properties"]["claims"]["items"]["required"]
+    claims = []
+    for i, claim_data in enumerate(raw_claims):
+        if not isinstance(claim_data, dict):
+            raise ValueError(f"Invalid claim at index {i}: expected a JSON object")
+        missing_fields = [field for field in required_fields if field not in claim_data]
+        if missing_fields:
+            raise ValueError(f"Invalid claim at index {i}: missing required fields {missing_fields}")
         try:
-            # Ensure required fields with defaults
-            claim = ExtractedClaim(
-                idx=claim_data.get("idx", i),
-                claim=claim_data.get("claim", ""),
-                kind=claim_data.get("kind", "factual"),
-                importance=float(claim_data.get("importance", 0.5)),
-                cited_spans=claim_data.get("cited_spans") or [],
-                source_text=claim_data.get("source_text") or ""
-            )
-            result.append(claim)
-        except Exception as e:
-            logger.warning(f"Failed to parse claim at index {i}: {e}")
-            continue
+            claim = ExtractedClaim.model_validate(claim_data, strict=True)
+        except ValueError as e:
+            raise ValueError(f"Invalid claim at index {i}: {e}") from e
+        if not claim.claim.strip():
+            raise ValueError(f"Invalid claim at index {i}: claim text cannot be empty")
+        claims.append(claim)
 
-    return result
+    return _filter_claims(claims, filter_trivial, min_importance)
 
 
 class ClaimExtractor:

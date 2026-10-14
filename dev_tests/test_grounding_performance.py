@@ -4,8 +4,11 @@ Performance Benchmarks for Evidence Grounding Pipeline.
 Phase 7 of Strawberry Integration: Performance benchmarks that measure
 timing and throughput of the evidence grounding pipeline.
 
-IMPORTANT: These tests make real API calls and incur costs.
-- Set SKIP_EXPENSIVE_TESTS=1 to skip these tests
+IMPORTANT: The benchmarks that call the provider make real API calls and incur
+costs. They are opt-in (marker ``integration``, deselected by default):
+
+    pytest -m integration dev_tests/test_grounding_performance.py
+
 - Requires OPENAI_API_KEY to be configured
 
 Benchmarks cover:
@@ -26,10 +29,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 import pytest
-
-# Check if we should skip expensive tests
-SKIP_EXPENSIVE = os.environ.get("SKIP_EXPENSIVE_TESTS", "0") == "1"
-SKIP_REASON = "Skipping expensive performance tests (set SKIP_EXPENSIVE_TESTS=0 to run)"
 
 # Test model for logprobs (must support logprobs - NOT reasoning models)
 # Note: gpt-5-nano does NOT support logprobs (403 error)
@@ -272,7 +271,7 @@ def create_base_config():
 # Component Benchmarks
 # =============================================================================
 
-@pytest.mark.skipif(SKIP_EXPENSIVE, reason=SKIP_REASON)
+@pytest.mark.integration
 class TestClaimExtractionPerformance:
     """Benchmarks for claim extraction phase."""
 
@@ -370,7 +369,7 @@ class TestClaimExtractionPerformance:
         assert duration_ms < 60000, "Should complete within 60s"
 
 
-@pytest.mark.skipif(SKIP_EXPENSIVE, reason=SKIP_REASON)
+@pytest.mark.integration
 class TestBudgetScoringPerformance:
     """Benchmarks for budget scoring phase (logprobs verification)."""
 
@@ -483,7 +482,7 @@ class TestBudgetScoringPerformance:
 # Full Pipeline Benchmarks
 # =============================================================================
 
-@pytest.mark.skipif(SKIP_EXPENSIVE, reason=SKIP_REASON)
+@pytest.mark.integration
 class TestFullPipelinePerformance:
     """Benchmarks for the complete grounding pipeline."""
 
@@ -603,7 +602,7 @@ class TestFullPipelinePerformance:
 # Scaling Benchmarks
 # =============================================================================
 
-@pytest.mark.skipif(SKIP_EXPENSIVE, reason=SKIP_REASON)
+@pytest.mark.integration
 class TestMaxClaimsScaling:
     """Test how performance scales with max_claims parameter."""
 

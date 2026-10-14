@@ -21,7 +21,6 @@
   },
   "sdk_model_timeouts": {
     "openai_seconds": 12000,
-    "openai_sync_seconds": 12000,
     "anthropic_seconds": 12000,
     "xai_seconds": 12000,
     "openrouter_seconds": 12000,

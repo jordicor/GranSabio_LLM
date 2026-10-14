@@ -316,6 +316,73 @@ async def test_monitor_active_counts_gran_sabio_review(monkeypatch):
     project = next(p for p in payload["projects"] if p["project_id"] == "project-monitor-gran-sabio")
     assert project["status"] == "running"
     assert project["active_sessions"] == 2
+    assert payload["standalone_sessions"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_status", "phase", "project_status"),
+    [
+        (GenerationStatus.COMPLETED, "gran_sabio_review", "completed"),
+        (GenerationStatus.REJECTED, "inline_deal_breaker_review", "rejected"),
+        (GenerationStatus.FAILED, "gran_sabio_regeneration", "failed"),
+        (GenerationStatus.CANCELLED, "gran_sabio_review", "cancelled"),
+        ("error", "gran_sabio_regeneration", "failed"),
+    ],
+)
+async def test_terminal_session_phase_cannot_keep_project_running(
+    monkeypatch, terminal_status, phase, project_status
+):
+    """A normal terminal transition can retain its last Gran Sabio phase."""
+    from core import app_state
+    from core.monitor_routes import list_active_connections
+
+    project_id = "project-terminal-gran-sabio"
+    session_id = "session-terminal-gran-sabio"
+    session = {
+        "project_id": project_id,
+        "status": GenerationStatus.GRAN_SABIO_REVIEW,
+        "current_phase": phase,
+        "created_at": datetime.utcnow(),
+        "request": None,
+    }
+    monkeypatch.setattr(app_state, "active_sessions", {session_id: session})
+    monkeypatch.setattr(app_state, "active_sessions_lock", None)
+    # Publishing is unrelated to classification; keep the actual transition.
+    monkeypatch.setattr(app_state, "queue_project_status_event", lambda *args: None)
+    monkeypatch.setattr(app_state, "queue_debug_session_transition", lambda *args, **kwargs: None)
+    app_state.update_session_status(session, session_id, terminal_status)
+
+    snapshot = await app_state.get_project_status(project_id)
+    terminal = await list_active_connections(status="terminal")
+    running = await list_active_connections()
+
+    assert snapshot["status"] == project_status
+    assert snapshot["summary"]["active_sessions"] == 0
+    assert snapshot["sessions"][0]["phase"] == phase
+    assert snapshot["sessions"][0]["gran_sabio"]["active"] is False
+    assert terminal["projects"][0]["status"] == project_status
+    assert terminal["projects"][0]["active_sessions"] == 0
+    assert running["projects"] == []
+
+    # An older active sibling still makes a mixed project running.
+    app_state.active_sessions["session-active-sibling"] = {
+        "project_id": project_id,
+        "status": "waiting",
+        "current_phase": "gran_sabio_regeneration",
+        "created_at": datetime(2020, 1, 1),
+        "request": None,
+    }
+    snapshot = await app_state.get_project_status(project_id)
+    running = await list_active_connections()
+    terminal = await list_active_connections(status="terminal")
+
+    assert snapshot["status"] == "running"
+    assert snapshot["summary"]["active_sessions"] == 1
+    assert snapshot["sessions"][0]["gran_sabio"]["active"] is False
+    assert snapshot["sessions"][1]["gran_sabio"]["active"] is True
+    assert running["projects"][0]["active_sessions"] == 1
+    assert terminal["projects"] == []
 
 
 @pytest.mark.asyncio

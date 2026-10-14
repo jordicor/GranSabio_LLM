@@ -43,7 +43,7 @@ from llm_routing import endpoint_id_call_kwargs, resolve_call, resolve_temperatu
 from local_execution_policy import LocalExecutionPolicyError
 from model_aliasing import PromptPart, get_evaluator_alias
 from model_capability_registry import resolve_model_capability_context
-from models import ContentRequest, GranSabioResult, is_json_output_requested
+from models import ContentRequest, GranSabioResult, is_json_output_requested, shared_context_call_kwargs
 from request_timeouts import resolve_request_timeout
 from tool_loop_models import (
     JsonContractError,
@@ -1351,6 +1351,7 @@ CRITICAL INSTRUCTIONS:
                 ):
                     return await self.ai_service.call_ai_with_validation_tools(
                         prompt=generation_prompt,
+                        **shared_context_call_kwargs(original_request),
                         model=model,
                         validation_callback=_validate_regeneration_draft,
                         stop_on_approval=True,
@@ -1469,6 +1470,7 @@ CRITICAL INSTRUCTIONS:
                     await _abort_if_cancelled("regeneration_before_single_shot_fallback")
                     generated_content = await self.ai_service.generate_content(
                         prompt=generation_prompt,
+                        **shared_context_call_kwargs(original_request),
                         model=model,
                         temperature=temperature,
                         max_tokens=regeneration_max_tokens,
@@ -1526,6 +1528,7 @@ CRITICAL INSTRUCTIONS:
                     try:
                         async for chunk in self.ai_service.generate_content_stream(
                             prompt=generation_prompt,
+                            **shared_context_call_kwargs(original_request),
                             model=model,
                             temperature=temperature,
                             max_tokens=regeneration_max_tokens,
@@ -1733,6 +1736,7 @@ CRITICAL INSTRUCTIONS:
                 await _abort_if_cancelled("regeneration_before_generation")
                 generated_content = await self.ai_service.generate_content(
                     prompt=generation_prompt,
+                    **shared_context_call_kwargs(original_request),
                     model=model,
                     temperature=temperature,
                     max_tokens=regeneration_max_tokens,
@@ -2417,6 +2421,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
             ):
                 return await self.ai_service.call_ai_with_validation_tools(
                     prompt=prompt,
+                    **shared_context_call_kwargs(request),
                     model=model,
                     validation_callback=_measurement_validator,
                     stop_on_approval=False,
@@ -2547,6 +2552,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 try:
                     async for chunk in self.ai_service.generate_content_stream(
                         prompt=prompt,
+                        **shared_context_call_kwargs(request),
                         model=model,
                         temperature=temperature,
                         max_tokens=stream_max_tokens,
@@ -2715,6 +2721,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
             await _abort(f"{abort_stage}_before_single_shot")
             response_text = await self.ai_service.generate_content(
                 prompt=prompt,
+                **shared_context_call_kwargs(request),
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,

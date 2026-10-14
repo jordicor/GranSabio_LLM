@@ -14,7 +14,10 @@ Total: 40 tests
 """
 
 import uuid
+from copy import deepcopy
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
@@ -336,6 +339,76 @@ class TestModelsEndpoint:
         assert data["model_id"] == "no-key-test-model"
         assert data["has_api_key"] is False
         assert "api_key" not in data
+
+    def test_models_slash_ids_preserve_lookup_and_static_qa_priority(self, client, monkeypatch):
+        """Namespaced IDs work verbatim/encoded; QA retains its static route."""
+        from config import config
+
+        specs = deepcopy(config.model_specs)
+        known = {
+            "openrouter": "openai/catalog-test-model",
+            "ollama": "namespace/catalog-test-model:latest",
+        }
+        for provider, model_id in known.items():
+            specs["model_specifications"].setdefault(provider, {})[model_id] = {
+                "model_id": model_id,
+                "name": model_id,
+                "capabilities": ["text"],
+            }
+        specs["model_specifications"]["ollama"].update({
+            "namespace/disabled-test-model:latest": {"enabled": False},
+            "qa/available": {"model_id": "qa/available", "name": "Route collision"},
+        })
+        monkeypatch.setattr(config, "model_specs", specs)
+
+        for provider, model_id in known.items():
+            for path_id in (model_id, quote(model_id, safe="")):
+                response = client.get(f"/models/{path_id}")
+                assert response.status_code == 200
+                assert response.json()["model_id"] == model_id
+                assert response.json()["provider"] == provider
+
+        for model_id in ("namespace/nonexistent-model-xyz", "namespace/disabled-test-model:latest"):
+            response = client.get(f"/models/{model_id}")
+            assert response.status_code == 404
+            assert response.json()["detail"] == f"Model not found: {model_id}"
+
+        response = client.get("/models/qa/available")
+        assert response.status_code == 200
+        qa_keys = {item["key"] for item in response.json()["qa_models"]}
+        assert set(known.values()) <= qa_keys
+        assert "namespace/disabled-test-model:latest" not in qa_keys
+
+    def test_analytics_slash_id_returns_stats_with_json_timestamps(self, client, tmp_path, monkeypatch):
+        """The HTTP route preserves the tracker key and serializes real stats."""
+        import core.analytics_routes as analytics_routes
+        from deal_breaker_tracker import DealBreakerTracker
+        from models import ModelReliabilityStats
+
+        model_id = "openai/catalog-test-model"
+        tracker = DealBreakerTracker(persistence_path=str(tmp_path / "tracking"))
+        tracker.model_stats[model_id] = ModelReliabilityStats(
+            model_name=model_id,
+            total_deal_breakers_raised=3,
+            first_seen=datetime(2026, 10, 9, 13, 30),
+            last_updated=datetime(2026, 10, 9, 14, 15),
+        )
+        monkeypatch.setattr(analytics_routes, "get_tracker", lambda: tracker)
+
+        for path_id in (model_id, quote(model_id, safe="")):
+            response = client.get(f"/analytics/model/{path_id}")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["qa_model_name"] == model_id
+            assert data["total_deal_breakers_raised"] == 3
+            assert data["first_seen"] == "2026-10-09T13:30:00"
+            assert data["last_updated"] == "2026-10-09T14:15:00"
+
+        response = client.get("/analytics/model/namespace/nonexistent-model-xyz")
+        assert response.status_code == 404
+        assert response.json()["detail"] == (
+            "No statistics found for model: namespace/nonexistent-model-xyz"
+        )
 
 
 # ============================================================================
@@ -663,6 +736,11 @@ class TestGenerateEndpointValidation:
         async def invalid_preflight_stream(*args, **kwargs):
             yield '[{}]'
 
+        # The shipped default routes preflight to System One, which never parses
+        # free-form JSON. Pin a streaming LLM preflight model for this contract.
+        valid_generate_request_with_qa["llm_routing"] = {
+            "calls": {"preflight.validate": {"model": "gpt-4o"}},
+        }
         with patch.object(
             generation_routes.ai_service,
             "generate_content_stream",

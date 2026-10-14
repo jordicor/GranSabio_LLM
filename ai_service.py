@@ -19,11 +19,26 @@ import random
 import re
 import threading
 import warnings
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optional, Sequence, Set, Tuple, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypeVar,
+)
 from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
@@ -76,11 +91,13 @@ from local_endpoint_registry import (
 from local_execution_policy import LocalExecutionPolicyError
 from model_aliasing import PromptPart, PromptSource, assert_prompt_is_model_blind
 from model_capability_registry import (
-    model_supports as registry_model_supports,
-)
-from model_capability_registry import (
+    _openrouter_parameter_state,
+    find_model_spec,
     model_supports_generation_validation_tool_loop,
     normalize_provider,
+)
+from model_capability_registry import (
+    model_supports as registry_model_supports,
 )
 from provider_adapters import (
     DesiredOutputContract,
@@ -89,7 +106,9 @@ from provider_adapters import (
     ProviderCallContext,
     get_provider_adapter,
 )
+from provider_budget import BudgetPolicy, ProviderBudget
 from provider_capabilities import CapabilitySupport
+from provider_drain import ProviderDispatchClosed, raise_if_dispatch_closed
 from provider_errors import (
     ProviderErrorKind,
     ProviderFailure,
@@ -99,6 +118,23 @@ from provider_errors import (
 from provider_health import record_provider_failure, record_provider_success
 from request_timeouts import coerce_timeout_seconds, resolve_config_timeout
 from schema_utils import json_schema_to_pydantic
+from services.typesafe_client import (
+    TypeSafeConfigurationError,
+    TypeSafeEvaluation,
+    build_system_one_budget,
+    is_typesafe_provider,
+)
+from services.typesafe_client import (
+    evaluate as typesafe_evaluate,
+)
+from shared_context import (
+    CacheablePrompt,
+    prepend_gemini_context,
+    prepend_user_context,
+    supports_openai_explicit_cache,
+    validate_shared_context,
+    with_openai_cache_options,
+)
 from tool_loop_models import (
     JsonContractError,
     LoopScope,
@@ -210,12 +246,6 @@ def _local_openai_async_http_client() -> httpx.AsyncClient:
         limits=_sdk_http_limits(),
         follow_redirects=False,
     )
-
-
-def _openai_sync_http_client() -> httpx.Client:
-    """Build an OpenAI-compatible sync HTTP client with shared pool settings."""
-
-    return openai.DefaultHttpxClient(limits=_sdk_http_limits())
 
 
 def _anthropic_async_http_client() -> httpx.AsyncClient:
@@ -460,6 +490,7 @@ class GenerationStoppedUnexpectedly(RuntimeError):
         finish_reason_category: Optional[str],
         partial_content: str,
         usage: Optional[Dict[str, Any]] = None,
+        provider_failure: Optional[ProviderFailure] = None,
     ) -> None:
         super().__init__(message)
         self.provider = provider
@@ -469,6 +500,9 @@ class GenerationStoppedUnexpectedly(RuntimeError):
         self.partial_content = partial_content or ""
         self.partial_content_chars = len(self.partial_content)
         self.usage = usage or {}
+        self.prompt_block_reason = self.usage.get("prompt_block_reason")
+        self.native_finish_reason = self.usage.get("native_finish_reason")
+        self.provider_failure = provider_failure
 
 
 def is_content_filter_stop(exc: BaseException) -> bool:
@@ -479,6 +513,38 @@ def is_content_filter_stop(exc: BaseException) -> bool:
         and str(exc.finish_reason_category or "").strip().casefold()
         == "content_filter"
     )
+
+
+def find_terminal_refusal(
+    exc: BaseException,
+) -> ContextAdmissionError | LocalExecutionPolicyError | ProviderDispatchClosed | None:
+    """Return the admission, policy or dispatch refusal carried by ``exc`` or its chain.
+
+    Provider SDKs report any exception raised inside their HTTP transport as a
+    connection error (``raise APIConnectionError(...) from err``), so a refusal
+    raised at that boundary arrives disguised as a transient network failure.
+    A refusal is terminal: callers re-raise it unchanged instead of classifying,
+    retrying or counting it against provider health. Both ``__cause__`` and
+    ``__context__`` are followed, and a cyclic chain is visited once. A closed
+    dispatch gate (``provider_drain``) is a refusal too: the refused call never
+    reached the provider.
+    """
+
+    seen: Set[int] = set()
+    pending: List[BaseException] = [exc]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (ContextAdmissionError, LocalExecutionPolicyError, ProviderDispatchClosed)):
+            return current
+        pending.extend(
+            linked
+            for linked in (current.__context__, current.__cause__)
+            if linked is not None
+        )
+    return None
 
 
 class StreamChunk:
@@ -515,6 +581,21 @@ class StreamChunk:
 T = TypeVar("T")
 
 
+def _with_default_system_context(
+    system_prompt: str,
+    include_default_system_context: bool,
+) -> str:
+    """Append the generation language/date context only when requested."""
+    if not include_default_system_context:
+        return system_prompt
+    language_instruction = (
+        "\n\nIMPORTANT: Always respond in the same language as the user's request, "
+        "regardless of the language used in these instructions."
+    )
+    current_date = datetime.now().strftime("%Y/%m/%d")
+    return f"{system_prompt}{language_instruction}\n\nCurrent date: {current_date}"
+
+
 def _build_openai_params(model_id: str, messages: list, temperature: float, max_tokens: int, reasoning_effort: Optional[str] = None) -> dict:
     """Build correct parameters for OpenAI API calls based on model requirements."""
     requirements = get_model_parameter_requirements(model_id)
@@ -543,6 +624,18 @@ def _build_openai_params(model_id: str, messages: list, temperature: float, max_
 
 _shared_ai_service: Optional["AIService"] = None
 _ai_service_init_lock = threading.Lock()
+_ai_service_factory: Optional[Callable[[], "AIService"]] = None
+
+
+def register_ai_service_factory(factory: Callable[[], "AIService"]) -> None:
+    """Install one process-owned service factory before initialization."""
+    global _ai_service_factory
+    with _ai_service_init_lock:
+        if _shared_ai_service is not None or _ai_service_factory is not None:
+            raise RuntimeError("AI service composition is already configured")
+        if not callable(factory):
+            raise TypeError("AI service factory must be callable")
+        _ai_service_factory = factory
 
 
 def get_ai_service() -> "AIService":
@@ -551,7 +644,7 @@ def get_ai_service() -> "AIService":
     if _shared_ai_service is None:
         with _ai_service_init_lock:
             if _shared_ai_service is None:
-                _shared_ai_service = AIService()
+                _shared_ai_service = (_ai_service_factory or AIService)()
     return _shared_ai_service
 
 
@@ -568,10 +661,14 @@ async def call_ai_with_validation_tools(*args: Any, **kwargs: Any):
 class AIService:
     """Unified AI service for multiple providers"""
 
-    def __init__(self):
+    require_global_api_key = True
+
+    def __init__(self, *, require_global_api_key: bool = True):
         """Initialize AI service with API clients"""
+        self.require_global_api_key = require_global_api_key
+        budget_policy = BudgetPolicy.from_config(config)
+        self.provider_budget = ProviderBudget(budget_policy) if budget_policy is not None else None
         self.openai_client = None
-        self.openai_sync_client = None
         self.anthropic_client = None
         self.google_new_client = None
         self.xai_client = None
@@ -807,6 +904,18 @@ class AIService:
         )
 
     @staticmethod
+    def _assert_not_system_one_text_model(model: str) -> None:
+        """Fail fast when a System One model is asked to generate text."""
+
+        resolved = resolve_model_catalog_entry(model, config.model_specs)
+        provider = str(resolved.get("catalog_provider") or resolved.get("provider") or "")
+        if is_typesafe_provider(provider):
+            raise TypeSafeConfigurationError(
+                f"TypeSafe model '{model}' is a System One evaluator and does not generate text. "
+                "Use evaluate_system_one."
+            )
+
+    @staticmethod
     def _endpoint_accepts_local_provider(
         endpoint: LocalInferenceEndpoint, provider: str
     ) -> bool:
@@ -912,6 +1021,7 @@ class AIService:
         model_alias_registry: Optional[Any],
         prompt_safety_parts: Optional[List[Any]],
         boundary: str,
+        shared_context: Optional[str] = None,
     ) -> None:
         """Validate source-aware prompt fragments before a model-facing call."""
 
@@ -933,6 +1043,9 @@ class AIService:
             # the prompt as user supplied to preserve legitimate user mentions.
             parts.append(PromptPart(text=prompt, source="user_supplied", label=f"{boundary}.prompt"))
 
+        if shared_context:
+            parts.append(PromptPart(text=shared_context, source="user_supplied", label=f"{boundary}.shared_context"))
+
         assert_prompt_is_model_blind(parts, model_alias_registry)
 
     def _initialize_clients(self):
@@ -944,13 +1057,6 @@ class AIService:
                 timeout=float(config.SDK_OPENAI_TIMEOUT_SECONDS),
                 max_retries=3,  # Retry failed requests twice
                 http_client=_openai_async_http_client(),
-            )
-            # Initialize sync OpenAI client for O3-pro (Responses API requirement)
-            self.openai_sync_client = openai.OpenAI(
-                api_key=config.OPENAI_API_KEY,
-                timeout=float(config.SDK_OPENAI_SYNC_TIMEOUT_SECONDS),
-                max_retries=3,
-                http_client=_openai_sync_http_client(),
             )
         else:
             logger.warning("OpenAI API key not found")
@@ -1004,7 +1110,7 @@ class AIService:
                 api_key=config.OPENROUTER_API_KEY,
                 base_url="https://openrouter.ai/api/v1",
                 timeout=float(config.SDK_OPENROUTER_TIMEOUT_SECONDS),
-                max_retries=3,
+                max_retries=0 if self.provider_budget is not None else 3,
                 default_headers={
                     "HTTP-Referer": "https://github.com/jordicor/GranSabio_LLM",
                     "X-Title": "Gran Sabio LLM Engine"
@@ -1154,21 +1260,26 @@ class AIService:
             endpoint,
         )
 
+    @asynccontextmanager
+    async def _local_endpoint_request_slot(self, semaphore: asyncio.Semaphore):
+        """Reuse QA's held legacy slot; acquire any distinct endpoint queue."""
+
+        if (
+            semaphore is getattr(self, "_ollama_request_semaphore", None)
+            and _ollama_concurrency_depth.get() > 0
+        ):
+            yield None
+            return
+        async with semaphore:
+            yield None
+
     async def _generate_registered_local(
         self, provider: str, endpoint_id: Optional[str], **kwargs: Any
     ) -> Tuple[str, Any]:
         """Dispatch one non-stream local request through its admitted endpoint."""
 
-        # Lightweight test doubles and pre-Track-B embedders sometimes build
-        # AIService with __new__. Keep their established singleton adapters
-        # usable; production instances always have the registry initialized.
-        if not getattr(self, "_local_endpoints", None):
-            if provider == "ollama":
-                return await self._generate_ollama(**kwargs)
-            if provider == "llamacpp":
-                return await self._generate_llamacpp(**kwargs)
         client, semaphore, endpoint = self._local_endpoint_transport(provider, endpoint_id)
-        async with semaphore:
+        async with self._local_endpoint_request_slot(semaphore):
             return await self._generate_openai_compatible(
                 provider_key=provider,
                 client=client,
@@ -1182,7 +1293,7 @@ class AIService:
         """Stream through exactly one registered local endpoint and its queue."""
 
         client, semaphore, endpoint = self._local_endpoint_transport(provider, endpoint_id)
-        async with semaphore:
+        async with self._local_endpoint_request_slot(semaphore):
             async for chunk in self._stream_openai_compatible(
                 provider_key=provider,
                 client=client,
@@ -1565,6 +1676,19 @@ class AIService:
         )
 
     @staticmethod
+    def _raise_if_provider_content_policy(failure: ProviderFailure, cause: Exception) -> None:
+        """Propagate provider policy errors through the existing terminal-filter path."""
+        if failure.kind is ProviderErrorKind.CONTENT_POLICY:
+            usage = getattr(cause, "usage", None) or {}
+            raise GenerationStoppedUnexpectedly(
+                "Provider content policy stopped generation.",
+                provider=failure.provider, model_id=failure.model_id,
+                finish_reason=usage.get("finish_reason"),
+                finish_reason_category="content_filter", partial_content="",
+                usage=usage, provider_failure=failure,
+            ) from cause
+
+    @staticmethod
     def _should_wrap_provider_failure(failure: ProviderFailure) -> bool:
         """Return True when an exception should be surfaced as an AIRequestError."""
         return (
@@ -1623,6 +1747,7 @@ class AIService:
         extra_text_components: Optional[Sequence[Tuple[str, str, str]]] = None,
         output_fallback_model: Optional[str] = None,
         local_execution: Optional["LocalExecutionRuntime"] = None,
+        shared_context: Optional[str] = None,
     ) -> "context_budget.RenderedCallBudget":
         """Build a ``RenderedCallBudget`` from the logical payload of a chat call.
 
@@ -1640,6 +1765,17 @@ class AIService:
                     name="system_prompt",
                     text=system_prompt,
                     kind="system",
+                    provider=provider,
+                    model=model_id,
+                    hint=hint,
+                )
+            )
+        if shared_context:
+            components.append(
+                context_budget.make_payload_component(
+                    name="shared_context",
+                    text=shared_context,
+                    kind="message",
                     provider=provider,
                     model=model_id,
                     hint=hint,
@@ -1723,6 +1859,7 @@ class AIService:
         extra_text_components: Optional[Sequence[Tuple[str, str, str]]] = None,
         output_fallback_model: Optional[str] = None,
         local_execution: Optional["LocalExecutionRuntime"] = None,
+        shared_context: Optional[str] = None,
     ) -> "context_budget.CallAdmissionReport":
         """Admit one provider call against the budget service.
 
@@ -1748,6 +1885,7 @@ class AIService:
             json_output=json_output,
             extra_text_components=extra_text_components,
             output_fallback_model=output_fallback_model,
+            **({"shared_context": shared_context} if shared_context else {}),
         )
         report = await self._admit_budget(
             budget,
@@ -1768,6 +1906,9 @@ class AIService:
     ) -> "context_budget.CallAdmissionReport":
         """Run ``admit_call`` and make CAPACITY_UNKNOWN enforce errors actionable."""
 
+        provider_budget = getattr(self, "provider_budget", None)
+        if provider_budget is not None:
+            provider_budget.validate(budget)
         try:
             report = await context_budget.admit_call(
                 budget,
@@ -1782,6 +1923,8 @@ class AIService:
                 call_id=budget.call_id,
                 public_label=budget.call_id,
             ) from exc
+        if provider_budget is not None:
+            provider_budget.admit(budget)
         return report
 
     @staticmethod
@@ -2200,7 +2343,7 @@ class AIService:
         """Return a request-scoped OpenRouter client with no SDK retries when strict."""
         if not self.openrouter_client:
             raise ValueError("OpenRouter client not initialized")
-        if strict_single_generation_attempt:
+        if strict_single_generation_attempt or getattr(self, "provider_budget", None) is not None:
             return self.openrouter_client.with_options(max_retries=0)
         return self.openrouter_client
 
@@ -2389,6 +2532,9 @@ class AIService:
         for attempt in range(1, max_attempts + 1):
             process_deadline_expired = False
             try:
+                # Every attempt is a new provider request: none starts while a
+                # sibling failure drains the enclosing fan-out.
+                raise_if_dispatch_closed()
                 await self._raise_if_cancelled(cancellation_token)
                 if process_deadline is not None:
                     remaining_timeout = process_deadline - asyncio.get_running_loop().time()
@@ -2440,6 +2586,11 @@ class AIService:
             except GenerationStoppedUnexpectedly:
                 raise
             except Exception as exc:
+                refusal = find_terminal_refusal(exc)
+                if refusal is not None:
+                    # Raised inside the provider SDK's transport and wrapped as a
+                    # connection error: still terminal, never retried or counted.
+                    raise refusal
                 if cancellation_token and await cancellation_token.any_cancelled():
                     raise asyncio.CancelledError() from exc
                 last_exception = exc
@@ -2453,6 +2604,7 @@ class AIService:
                     attempted_feature=attempted_feature,
                 )
                 failure = self._failure_with_endpoint(failure, endpoint_id)
+                self._raise_if_provider_content_policy(failure, exc)
                 await self._record_provider_health_failure(failure)
                 if failure.kind is ProviderErrorKind.CONTEXT_OVERFLOW:
                     # Provider reported a context overflow despite the local guard:
@@ -2578,6 +2730,11 @@ class AIService:
         except GenerationStoppedUnexpectedly:
             raise
         except Exception as exc:
+            refusal = find_terminal_refusal(exc)
+            if refusal is not None:
+                # Raised inside the provider SDK's transport and wrapped as a
+                # connection error: still terminal, never counted as a failure.
+                raise refusal
             if cancellation_token and await cancellation_token.any_cancelled():
                 raise asyncio.CancelledError() from exc
             failure = self._classify_provider_failure(
@@ -2590,6 +2747,7 @@ class AIService:
                 attempted_feature=attempted_feature,
             )
             failure = self._failure_with_endpoint(failure, endpoint_id)
+            self._raise_if_provider_content_policy(failure, exc)
             await self._record_provider_health_failure(failure)
             if failure.kind is ProviderErrorKind.CONTEXT_OVERFLOW:
                 # Provider reported a context overflow despite the local guard:
@@ -2640,8 +2798,14 @@ class AIService:
         provider: str,
         max_tokens: Optional[int] = None,
         fallback_finish_reason: Any = None,
+        fallback_native_finish_reason: Any = None,
+        billing_envelope: Any = None,
     ) -> Dict[str, Any]:
-        """Combine token usage with provider stop/finish reason metadata."""
+        """Combine token usage with provider stop/finish reason metadata.
+
+        ``billing_envelope`` is the object ``provider_budget.settle`` received
+        for the same call; see ``runtime_usage.usage_with_finish_metadata``.
+        """
 
         return runtime_usage.usage_with_finish_metadata(
             usage_obj,
@@ -2649,7 +2813,31 @@ class AIService:
             provider=provider,
             max_tokens=max_tokens,
             fallback_finish_reason=fallback_finish_reason,
+            fallback_native_finish_reason=fallback_native_finish_reason,
+            billing_envelope=billing_envelope,
         )
+
+    def _raise_openrouter_response_error(self, response: Any, *, max_tokens: Optional[int]) -> None:
+        """HTTP 200 can carry a top-level or per-choice OpenRouter error."""
+        error = getattr(response, "error", None)
+        choices = getattr(response, "choices", None) or []
+        if not error and choices:
+            error = getattr(choices[0], "error", None)
+        if not error:
+            return
+        if not isinstance(error, Mapping):
+            raise RuntimeError("OpenRouter returned a malformed error payload.")
+        exc = openai.APIError(
+            "OpenRouter returned an error response.",
+            request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
+            body=dict(error),
+        )
+        exc.request_id = getattr(response, "id", None)
+        exc.usage = self._usage_with_finish_metadata(
+            getattr(response, "usage", None), response,
+            provider="openrouter", max_tokens=max_tokens, billing_envelope=response,
+        )
+        raise exc
 
     def _chat_completion_content_and_usage(
         self,
@@ -2675,6 +2863,7 @@ class AIService:
             response,
             provider=provider,
             max_tokens=max_tokens,
+            billing_envelope=response,
         )
         if not content.strip() and not usage_with_finish.get("finish_unusable"):
             raise GenerationStoppedUnexpectedly(
@@ -2716,20 +2905,24 @@ class AIService:
         provider: str,
         usage_obj: Any,
         extra: Optional[Dict[str, Any]] = None,
+        *,
+        billing_envelope: Any = None,
     ) -> None:
-        """Safely emit usage payload to the provided callback."""
+        """Safely emit usage payload to the provided callback.
+
+        ``billing_envelope`` is the object ``provider_budget.settle`` received
+        for a raw ``usage_obj`` (a stream's usage-bearing chunk, a completion);
+        a canonical payload from ``_usage_with_finish_metadata`` already carries
+        its billed cost and needs none.
+        """
 
         if not usage_callback:
             return
 
-        usage_payload = self._normalize_usage(usage_obj)
-        if not usage_payload:
-            usage_payload = {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": None,
-                "reasoning_tokens": None,
-            }
+        usage_payload = self._normalize_usage(usage_obj) or {}
+        runtime_usage.attach_provider_billed_cost(
+            usage_payload, usage_obj, provider=provider, billing_envelope=billing_envelope,
+        )
 
         payload: Dict[str, Any] = {
             "model": model_id,
@@ -2858,11 +3051,17 @@ class AIService:
         operation: str,
     ):
         """Register a provider call against a session before dispatch."""
+        raise_if_dispatch_closed()
+        provider_budget = getattr(self, "provider_budget", None)
+        if provider_budget is not None:
+            provider_budget.require_operation(provider, model_id, operation)
         if cancellation_token is None:
             yield None
             return
         await self._raise_if_cancelled(cancellation_token)
-        from core.cancellation import ProviderCallHandle
+        from core.cancellation import ProviderCallHandle, provider_call_context, provider_phase_override
+
+        phase = provider_phase_override.get() or cancellation_token.phase
 
         provider_task = asyncio.current_task()
 
@@ -2876,12 +3075,16 @@ class AIService:
             provider=provider,
             model_id=model_id,
             session_id=cancellation_token.session_id,
-            phase=cancellation_token.phase,
+            phase=phase,
             operation=operation,
             close=_cancel_provider_task,
         )
         async with cancellation_token.registry.begin_provider_call(handle) as registered:
-            yield registered
+            marker = provider_call_context.set((phase, operation))
+            try:
+                yield registered
+            finally:
+                provider_call_context.reset(marker)
 
     @staticmethod
     async def _raise_if_cancelled(cancellation_token: Optional["CancellationToken"]) -> None:
@@ -2903,7 +3106,11 @@ class AIService:
         model_id: Optional[str],
         operation: str,
     ):
-        """Throttle local model calls without affecting remote providers."""
+        """Reserve an Ollama scope before QA's per-evaluator timeout starts.
+
+        Legacy Ollama shares this slot with its endpoint queue. Multi-endpoint
+        registries retain this evaluator cap and separate per-request queues.
+        """
 
         provider_key = normalize_provider(str(provider or ""))
         if provider_key != "ollama":
@@ -2925,6 +3132,85 @@ class AIService:
                 yield None
             finally:
                 _ollama_concurrency_depth.reset(token)
+
+    async def evaluate_system_one(
+        self,
+        state: Any,
+        questions: Mapping[str, Any],
+        model: str,
+        usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        usage_extra: Optional[Dict[str, Any]] = None,
+        request_timeout: Optional[float] = None,
+        local_execution: Optional["LocalExecutionRuntime"] = None,
+        dispatch_call_id: Optional[str] = None,
+        dispatch_route_ordinal: int = 0,
+        client: Optional[httpx.AsyncClient] = None,
+        cancellation_token: Optional["CancellationToken"] = None,
+        api_key: Optional[str] = None,
+    ) -> TypeSafeEvaluation:
+        """Evaluate typed System One questions. TypeSafe does not generate text."""
+
+        catalog_model = str(model or "").strip()
+        if not catalog_model:
+            raise TypeSafeConfigurationError("An explicit TypeSafe model is required")
+        try:
+            model_info = config.get_model_info(catalog_model, require_api_key=False)
+        except RuntimeError as exc:
+            raise TypeSafeConfigurationError(str(exc)) from exc
+        provider = str(model_info.get("provider") or "")
+        if not is_typesafe_provider(provider):
+            raise TypeSafeConfigurationError(
+                f"Model '{catalog_model}' is not a TypeSafe System One model"
+            )
+        api_key = str(api_key if api_key is not None else model_info.get("api_key") or "").strip()
+        if not api_key:
+            raise TypeSafeConfigurationError(
+                "Missing API key for provider 'typesafe'. Set 'TYPESAFE_API_KEY' in your environment."
+            )
+        model_id = str(model_info.get("model_id") or catalog_model)
+        self._authorize_local_execution(
+            local_execution,
+            dispatch_call_id=dispatch_call_id,
+            dispatch_route_ordinal=dispatch_route_ordinal,
+            provider=provider,
+            model_id=model_id,
+        )
+        timeout_seconds = coerce_timeout_seconds(request_timeout)
+        system_one_call_id = dispatch_call_id or "systemone.evaluate"
+        provider_budget = getattr(self, "provider_budget", None)
+        async with self._provider_call_scope(
+            cancellation_token, provider=provider, model_id=model_id, operation="systemone.evaluate",
+        ):
+            report = await self._admit_budget(
+                build_system_one_budget(
+                    state, questions, model_id, call_id=system_one_call_id,
+                ),
+                local_execution=local_execution,
+            )
+            with (provider_budget.system_one_dispatch(model=model_id, call_id=system_one_call_id)
+                  if provider_budget is not None else nullcontext()) as reservation:
+                result = await typesafe_evaluate(
+                    state,
+                    questions,
+                    model=model_id,
+                    timeout=timeout_seconds,
+                    api_key=api_key,
+                    client=client,
+                )
+                if provider_budget is not None:
+                    provider_budget.settle(reservation, result.usage)
+        _last_admission_report.set(report)
+        extra_payload = {"requested_model": catalog_model}
+        if usage_extra:
+            extra_payload.update(usage_extra)
+        self._emit_usage(
+            usage_callback,
+            result.model,
+            provider,
+            result.usage,
+            extra_payload,
+        )
+        return result
 
     async def generate_content(
         self,
@@ -2955,6 +3241,8 @@ class AIService:
         dispatch_call_id: Optional[str] = None,
         dispatch_route_ordinal: int = 0,
         endpoint_id: Optional[str] = None,
+        include_default_system_context: bool = True,
+        shared_context: Optional[str] = None,
     ) -> str:
         """
         Generate content using specified AI model
@@ -2965,6 +3253,7 @@ class AIService:
             temperature: Generation temperature
             max_tokens: Maximum tokens
             system_prompt: Optional system prompt
+            include_default_system_context: Append the automatic language instruction and current date
             reasoning_effort: Reasoning effort level for GPT-5 models
             thinking_budget_tokens: Budget tokens for thinking/reasoning
             content_type: Type of content being generated (affects system prompt selection)
@@ -2974,6 +3263,7 @@ class AIService:
         Returns:
             Generated content as string
         """
+        validate_shared_context(shared_context)
         catalog_model, _effective_endpoint_id, local_endpoint = (
             self._resolve_endpoint_scoped_catalog_model(
                 model,
@@ -2983,6 +3273,7 @@ class AIService:
                 dispatch_route_ordinal=dispatch_route_ordinal,
             )
         )
+        self._assert_not_system_one_text_model(catalog_model)
         max_tokens, _token_budget_resolution = self._resolve_effective_output_max_tokens(
             catalog_model,
             max_tokens,
@@ -2991,7 +3282,8 @@ class AIService:
 
         # Intelligent validation and adjustment of all token parameters
         token_validation = config.validate_token_limits(
-            catalog_model, max_tokens, reasoning_effort, thinking_budget_tokens
+            catalog_model, max_tokens, reasoning_effort, thinking_budget_tokens,
+            require_api_key=self.require_global_api_key,
         )
         adjusted_max_tokens = token_validation["adjusted_tokens"]
         adjusted_reasoning_effort = token_validation["adjusted_reasoning_effort"]
@@ -3155,14 +3447,12 @@ class AIService:
             model_alias_registry=model_alias_registry,
             prompt_safety_parts=prompt_safety_parts,
             boundary="generate_content",
+            **({"shared_context": shared_context} if shared_context else {}),
         )
 
-        # Add language instruction and current date to system prompt (not user message)
-        # This avoids prompt contamination where models confuse system instructions with user content
-        current_date = datetime.now().strftime("%Y/%m/%d")
-        language_instruction = "\n\nIMPORTANT: Always respond in the same language as the user's request, regardless of the language used in these instructions."
-        date_instruction = f"\n\nCurrent date: {current_date}"
-        system_prompt = system_prompt + language_instruction + date_instruction
+        system_prompt = _with_default_system_context(
+            system_prompt, include_default_system_context
+        )
 
         async def _single_attempt() -> str:
             authorized_route = self._authorize_local_execution(
@@ -3192,6 +3482,7 @@ class AIService:
                 json_schema=effective_json_schema,
                 json_output=json_output,
                 local_execution=local_execution,
+                **({"shared_context": shared_context} if shared_context else {}),
             )
 
             # Log vision request if images provided
@@ -3211,6 +3502,7 @@ class AIService:
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     images=images,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 )
 
                 # Log full response if extra_verbose is enabled
@@ -3248,6 +3540,7 @@ class AIService:
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     images=images,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 )
 
                 # Log full response if extra_verbose is enabled
@@ -3284,6 +3577,7 @@ class AIService:
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     images=images,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 )
 
                 # Log full response if extra_verbose is enabled
@@ -3319,6 +3613,7 @@ class AIService:
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     images=images,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 )
 
                 # Log full response if extra_verbose is enabled
@@ -3355,6 +3650,8 @@ class AIService:
                     images=images,
                     provider_options=provider_options,
                     strict_single_generation_attempt=strict_single_generation_attempt,
+                    reasoning_effort=reasoning_effort,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 )
 
                 # Log full response if extra_verbose is enabled
@@ -3389,6 +3686,7 @@ class AIService:
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     images=images,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 )
 
                 if phase_logger:
@@ -3422,6 +3720,7 @@ class AIService:
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     images=images,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 )
 
                 if phase_logger:
@@ -3456,7 +3755,9 @@ class AIService:
                     request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
+                    images=images,
                     reasoning_effort=reasoning_effort,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 )
 
                 if phase_logger:
@@ -3491,7 +3792,9 @@ class AIService:
                     request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
+                    images=images,
                     reasoning_effort=reasoning_effort,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 )
 
                 # Log full response if extra_verbose is enabled
@@ -3525,6 +3828,7 @@ class AIService:
                     request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 )
 
                 # Log full response if extra_verbose is enabled
@@ -4347,6 +4651,13 @@ class AIService:
     ) -> Any:
         """Call Chat Completions and retry once if provider rejects effort level."""
         request_kwargs = request_kwargs or {}
+        if provider_key == "openai":
+            params = with_openai_cache_options(params)
+        if getattr(self, "provider_budget", None) is not None:
+            self.provider_budget.require_operation(provider_key, model_id, "tool_loop_generation")
+            return self._stream_bounded_openrouter_tool_request(
+                client, params, request_kwargs, model_id=model_id,
+            )
         try:
             return await client.chat.completions.create(**params, **request_kwargs)
         except Exception as exc:
@@ -4366,6 +4677,40 @@ class AIService:
             )
             return await client.chat.completions.create(**retry_params, **request_kwargs)
 
+    async def _stream_bounded_openrouter_tool_request(
+        self, client: Any, params: Dict[str, Any], request_kwargs: Dict[str, Any], *, model_id: str,
+    ) -> AsyncGenerator[Any, None]:
+        """Account each tool-turn HTTP attempt before any bytes reach the SDK."""
+        provider_budget = self.provider_budget
+        client = client.with_options(max_retries=0)
+        for attempt in range(2):
+            with provider_budget.tool_dispatch(
+                provider="openrouter", model=model_id, params=params, request_kwargs=request_kwargs,
+            ) as (bounded, reservation):
+                try:
+                    stream = await client.chat.completions.create(**bounded, **request_kwargs)
+                except Exception as exc:
+                    retry = None if attempt else self._adjust_reasoning_params_for_provider_retry(
+                        params, exc, surface="chat_completions",
+                    )
+                    if retry is None:
+                        raise
+                    params, reason = retry
+                    logger.warning(
+                        "Retrying bounded OpenRouter tool request after reasoning effort rejection (%s)", reason,
+                    )
+                    continue
+                try:
+                    async for chunk in stream:
+                        usage = getattr(chunk, "usage", None)
+                        if usage is not None:
+                            # Settlement precedes consumers, parsing and optional callbacks.
+                            provider_budget.settle(reservation, usage, response=chunk)
+                        yield chunk
+                finally:
+                    await stream.close()
+            return
+
     async def _call_responses_create_with_reasoning_retry(
         self,
         params: Dict[str, Any],
@@ -4377,6 +4722,7 @@ class AIService:
         if not self.openai_client:
             raise ValueError("OpenAI client not initialized")
         request_kwargs = request_kwargs or {}
+        params = with_openai_cache_options(params)
         try:
             return await self.openai_client.responses.create(**params, **request_kwargs)
         except Exception as exc:
@@ -4773,6 +5119,9 @@ class AIService:
             create_params["extra_body"] = self._with_openrouter_compression_disabled(
                 create_params.get("extra_body")
             )
+            if reasoning_effort:
+                # OpenRouter uses a nested extension, not OpenAI's top-level field.
+                create_params["extra_body"]["reasoning"] = {"effort": reasoning_effort}
 
         return create_params
 
@@ -4944,10 +5293,11 @@ class AIService:
         """Convert OpenAI chat content parts into Responses API input parts."""
 
         part_type = part.get("type")
-        if part_type == "text":
-            return {"type": "input_text", "text": str(part.get("text") or "")}
-        if part_type == "input_text":
-            return {"type": "input_text", "text": str(part.get("text") or "")}
+        if part_type in {"text", "input_text"}:
+            converted = {"type": "input_text", "text": str(part.get("text") or "")}
+            if "prompt_cache_breakpoint" in part:
+                converted["prompt_cache_breakpoint"] = dict(part["prompt_cache_breakpoint"])
+            return converted
         if part_type == "image_url":
             image_url = part.get("image_url")
             if isinstance(image_url, dict):
@@ -5268,8 +5618,13 @@ class AIService:
         loop_scope: LoopScope,
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]],
         cancellation_token: Optional["CancellationToken"],
-    ) -> Tuple[Any, Any, Optional[str]]:
-        """Stream one Chat Completions tool-loop turn and return an aggregated message."""
+    ) -> Tuple[Any, Any, Optional[str], Any]:
+        """Stream one Chat Completions tool-loop turn and return an aggregated message.
+
+        The fourth element is the billing envelope: the object the provider
+        budget settled against (the completion, or the usage-bearing chunk),
+        for ``_emit_usage`` to price the turn the same way.
+        """
 
         params = dict(create_params)
         params["stream"] = True
@@ -5384,110 +5739,118 @@ class AIService:
                 message,
                 getattr(response, "usage", None),
                 finish_reason,
+                response,
             )
         assistant_parts: List[str] = []
         tool_accumulators: Dict[int, Dict[str, Any]] = {}
         usage_meta = None
+        usage_envelope = None
         finish_reason: Optional[str] = None
 
-        async for chunk in stream:
-            await self._raise_if_cancelled(cancellation_token)
-            chunk_error = getattr(chunk, "error", None)
-            if chunk_error is not None:
-                if isinstance(chunk_error, dict):
-                    detail = str(chunk_error.get("message") or chunk_error)
-                else:
-                    detail = str(getattr(chunk_error, "message", None) or chunk_error)
-                await self._emit_tool_event_safe(
-                    tool_event_callback,
-                    "tool_loop_provider_terminal",
-                    {
-                        "provider": provider_key,
-                        "model": model_id,
-                        "turn": turn,
-                        "loop_scope": loop_scope.value,
-                        "api_surface": "chat_completions",
-                        "status": "error",
-                        "detail": detail[:500],
-                    },
-                )
-                raise RuntimeError(
-                    f"{provider_key} Chat Completions stream error: {detail[:500] or 'n/a'}"
-                )
-            usage_value = getattr(chunk, "usage", None)
-            if usage_value is not None:
-                usage_meta = usage_value
-            choices = getattr(chunk, "choices", None) or []
-            if not choices:
-                continue
+        try:
+            async for chunk in stream:
+                await self._raise_if_cancelled(cancellation_token)
+                chunk_error = getattr(chunk, "error", None)
+                if chunk_error is not None:
+                    if isinstance(chunk_error, dict):
+                        detail = str(chunk_error.get("message") or chunk_error)
+                    else:
+                        detail = str(getattr(chunk_error, "message", None) or chunk_error)
+                    await self._emit_tool_event_safe(
+                        tool_event_callback,
+                        "tool_loop_provider_terminal",
+                        {
+                            "provider": provider_key,
+                            "model": model_id,
+                            "turn": turn,
+                            "loop_scope": loop_scope.value,
+                            "api_surface": "chat_completions",
+                            "status": "error",
+                            "detail": detail[:500],
+                        },
+                    )
+                    raise RuntimeError(
+                        f"{provider_key} Chat Completions stream error: {detail[:500] or 'n/a'}"
+                    )
+                usage_value = getattr(chunk, "usage", None)
+                if usage_value is not None:
+                    usage_meta = usage_value
+                    usage_envelope = chunk
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
 
-            choice = choices[0]
-            choice_finish = getattr(choice, "finish_reason", None)
-            if choice_finish is not None:
-                finish_reason = _stringify_finish_reason(choice_finish)
+                choice = choices[0]
+                choice_finish = getattr(choice, "finish_reason", None)
+                if choice_finish is not None:
+                    finish_reason = _stringify_finish_reason(choice_finish)
 
-            delta = getattr(choice, "delta", None)
-            if delta is None:
-                continue
+                delta = getattr(choice, "delta", None)
+                if delta is None:
+                    continue
 
-            content_delta = getattr(delta, "content", None)
-            if content_delta:
-                text_delta = str(content_delta)
-                assistant_parts.append(text_delta)
-                await self._emit_tool_event_safe(
-                    tool_event_callback,
-                    "assistant_delta",
-                    {
-                        "provider": provider_key,
-                        "model": model_id,
-                        "turn": turn,
-                        "loop_scope": loop_scope.value,
-                        "api_surface": "chat_completions",
-                        "content": text_delta,
-                    },
-                )
+                content_delta = getattr(delta, "content", None)
+                if content_delta:
+                    text_delta = str(content_delta)
+                    assistant_parts.append(text_delta)
+                    await self._emit_tool_event_safe(
+                        tool_event_callback,
+                        "assistant_delta",
+                        {
+                            "provider": provider_key,
+                            "model": model_id,
+                            "turn": turn,
+                            "loop_scope": loop_scope.value,
+                            "api_surface": "chat_completions",
+                            "content": text_delta,
+                        },
+                    )
 
-            for tool_delta in getattr(delta, "tool_calls", None) or []:
-                index = getattr(tool_delta, "index", None)
-                if index is None:
-                    index = len(tool_accumulators)
-                acc = tool_accumulators.setdefault(
-                    int(index),
-                    {
-                        "id": "",
-                        "type": "function",
-                        "function": {"name": "", "arguments": ""},
-                    },
-                )
-                delta_id = getattr(tool_delta, "id", None)
-                if delta_id:
-                    acc["id"] = str(delta_id)
-                delta_type = getattr(tool_delta, "type", None)
-                if delta_type:
-                    acc["type"] = str(delta_type)
-                function_delta = getattr(tool_delta, "function", None)
-                name_delta = getattr(function_delta, "name", None)
-                arguments_delta = getattr(function_delta, "arguments", None)
-                if name_delta:
-                    acc["function"]["name"] += str(name_delta)
-                if arguments_delta:
-                    acc["function"]["arguments"] += str(arguments_delta)
-                await self._emit_tool_event_safe(
-                    tool_event_callback,
-                    "tool_call_delta",
-                    {
-                        "provider": provider_key,
-                        "model": model_id,
-                        "turn": turn,
-                        "loop_scope": loop_scope.value,
-                        "api_surface": "chat_completions",
-                        "index": int(index),
-                        "tool_call_id": acc.get("id") or None,
-                        "tool_name": acc["function"].get("name") or None,
-                        "delta": str(arguments_delta or name_delta or ""),
-                        "arguments_chars": len(acc["function"].get("arguments") or ""),
-                    },
-                )
+                for tool_delta in getattr(delta, "tool_calls", None) or []:
+                    index = getattr(tool_delta, "index", None)
+                    if index is None:
+                        index = len(tool_accumulators)
+                    acc = tool_accumulators.setdefault(
+                        int(index),
+                        {
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        },
+                    )
+                    delta_id = getattr(tool_delta, "id", None)
+                    if delta_id:
+                        acc["id"] = str(delta_id)
+                    delta_type = getattr(tool_delta, "type", None)
+                    if delta_type:
+                        acc["type"] = str(delta_type)
+                    function_delta = getattr(tool_delta, "function", None)
+                    name_delta = getattr(function_delta, "name", None)
+                    arguments_delta = getattr(function_delta, "arguments", None)
+                    if name_delta:
+                        acc["function"]["name"] += str(name_delta)
+                    if arguments_delta:
+                        acc["function"]["arguments"] += str(arguments_delta)
+                    await self._emit_tool_event_safe(
+                        tool_event_callback,
+                        "tool_call_delta",
+                        {
+                            "provider": provider_key,
+                            "model": model_id,
+                            "turn": turn,
+                            "loop_scope": loop_scope.value,
+                            "api_surface": "chat_completions",
+                            "index": int(index),
+                            "tool_call_id": acc.get("id") or None,
+                            "tool_name": acc["function"].get("name") or None,
+                            "delta": str(arguments_delta or name_delta or ""),
+                            "arguments_chars": len(acc["function"].get("arguments") or ""),
+                        },
+                    )
+
+        finally:
+            if getattr(self, "provider_budget", None) is not None:
+                await stream.aclose()
 
         if _is_unusable_openai_stream_finish(finish_reason):
             await self._emit_tool_event_safe(
@@ -5582,6 +5945,7 @@ class AIService:
             SimpleNamespace(content=assistant_text, tool_calls=tool_calls),
             usage_meta,
             finish_reason,
+            usage_envelope,
         )
 
     async def _run_openai_responses_tool_turn(
@@ -6607,6 +6971,7 @@ class AIService:
         dispatch_call_id: Optional[str] = None,
         dispatch_route_ordinal: int = 0,
         endpoint_id: Optional[str] = None,
+        shared_context: Optional[str] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on OpenAI-style chat APIs.
 
@@ -6653,11 +7018,11 @@ class AIService:
                 provider_key, transport_endpoint_id
             )
 
-        async def _stream_tool_turn(*args: Any, **kwargs: Any) -> Tuple[Any, Any, Optional[str]]:
+        async def _stream_tool_turn(*args: Any, **kwargs: Any) -> Tuple[Any, Any, Optional[str], Any]:
             if local_tool_semaphore is None:
                 _authorize_tool_turn()
                 return await self._stream_openai_compatible_tool_turn(*args, **kwargs)
-            async with local_tool_semaphore:
+            async with self._local_endpoint_request_slot(local_tool_semaphore):
                 _authorize_tool_turn()
                 return await self._stream_openai_compatible_tool_turn(*args, **kwargs)
 
@@ -6715,6 +7080,10 @@ class AIService:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ]
+
+        initial_messages = prepend_user_context(
+            initial_messages, shared_context, provider=provider_key, model_id=model_id
+        )
 
         request_kwargs: Dict[str, Any] = {}
         if request_timeout and request_timeout > 0:
@@ -6934,6 +7303,7 @@ class AIService:
                         provider_options=provider_options,
                     )
                 try:
+                    usage_envelope = None
                     if use_responses_api and use_responses_streaming:
                         _authorize_tool_turn()
                         message, usage_meta, _finish_reason = await self._stream_openai_responses_tool_turn(
@@ -6957,7 +7327,7 @@ class AIService:
                             cancellation_token=cancellation_token,
                         )
                     elif use_chat_streaming:
-                        message, usage_meta, _finish_reason = await _stream_tool_turn(
+                        message, usage_meta, _finish_reason, usage_envelope = await _stream_tool_turn(
                             client,
                             create_params,
                             request_kwargs,
@@ -6978,6 +7348,7 @@ class AIService:
                             model_id=model_id,
                         )
                         usage_meta = getattr(response, "usage", None)
+                        usage_envelope = response
                         message = response.choices[0].message
                 except Exception as provider_exc:
                     await self._maybe_raise_context_overflow_midloop(
@@ -6988,7 +7359,10 @@ class AIService:
                         tool_event_callback=tool_event_callback,
                     )
                     raise
-                self._emit_usage(usage_callback, model_id, provider_key, usage_meta, extra_payload)
+                self._emit_usage(
+                    usage_callback, model_id, provider_key, usage_meta, extra_payload,
+                    billing_envelope=usage_envelope,
+                )
 
                 candidate = (message.content or "").strip()
                 trace.append(
@@ -7129,6 +7503,7 @@ class AIService:
                 )
 
                 try:
+                    usage_envelope = None
                     if use_responses_api and use_responses_streaming:
                         _authorize_tool_turn()
                         message, usage_meta, _finish_reason = await self._stream_openai_responses_tool_turn(
@@ -7152,7 +7527,7 @@ class AIService:
                             cancellation_token=cancellation_token,
                         )
                     elif use_chat_streaming:
-                        message, usage_meta, _finish_reason = await _stream_tool_turn(
+                        message, usage_meta, _finish_reason, usage_envelope = await _stream_tool_turn(
                             client,
                             create_params,
                             request_kwargs,
@@ -7173,6 +7548,7 @@ class AIService:
                             model_id=model_id,
                         )
                         usage_meta = getattr(response, "usage", None)
+                        usage_envelope = response
                         message = response.choices[0].message
                 except Exception as provider_exc:
                     await self._maybe_raise_context_overflow_midloop(
@@ -7183,7 +7559,10 @@ class AIService:
                         tool_event_callback=tool_event_callback,
                     )
                     raise
-                self._emit_usage(usage_callback, model_id, provider_key, usage_meta, extra_payload)
+                self._emit_usage(
+                    usage_callback, model_id, provider_key, usage_meta, extra_payload,
+                    billing_envelope=usage_envelope,
+                )
 
                 assistant_text = message.content or ""
                 tool_calls = message.tool_calls or []
@@ -7743,8 +8122,7 @@ class AIService:
 
         block_accumulators: Dict[int, Dict[str, Any]] = {}
         usage_meta = None
-        input_tokens = 0
-        output_tokens = 0
+        captured_usage: Dict[str, Any] = {}
         stop_reason: Optional[str] = None
         message_stop_seen = False
         terminal_error_detail: Optional[str] = None
@@ -7759,8 +8137,7 @@ class AIService:
                     message = getattr(event, "message", None)
                     usage_value = getattr(message, "usage", None)
                     if usage_value is not None:
-                        usage_meta = usage_value
-                        input_tokens = getattr(usage_value, "input_tokens", input_tokens) or input_tokens
+                        runtime_usage.merge_anthropic_stream_usage(captured_usage, usage_value)
                     continue
 
                 if event_type == "message_delta":
@@ -7770,8 +8147,7 @@ class AIService:
                         stop_reason = _stringify_finish_reason(reason_value)
                     usage_value = getattr(event, "usage", None)
                     if usage_value is not None:
-                        usage_meta = usage_value
-                        output_tokens = getattr(usage_value, "output_tokens", output_tokens) or output_tokens
+                        runtime_usage.merge_anthropic_stream_usage(captured_usage, usage_value)
                     continue
 
                 if event_type == "message_stop":
@@ -8078,12 +8454,8 @@ class AIService:
                 },
             )
 
-        if usage_meta is None and (input_tokens > 0 or output_tokens > 0):
-            usage_meta = SimpleNamespace(
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                total_tokens=input_tokens + output_tokens,
-            )
+        if usage_meta is None and captured_usage:
+            usage_meta = captured_usage
 
         await self._emit_tool_event_safe(
             tool_event_callback,
@@ -8146,6 +8518,7 @@ class AIService:
         local_execution: Optional["LocalExecutionRuntime"] = None,
         dispatch_call_id: Optional[str] = None,
         dispatch_route_ordinal: int = 0,
+        shared_context: Optional[str] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on Claude messages API."""
         if not (enable_validate_draft or accent_context is not None):
@@ -8169,6 +8542,10 @@ class AIService:
             return text_content
 
         initial_messages: List[Dict[str, Any]] = [{"role": "user", "content": _build_user_content(prompt)}]
+
+        initial_messages = prepend_user_context(
+            initial_messages, shared_context, provider="claude", model_id=model_id
+        )
         request_kwargs: Dict[str, Any] = {}
         if request_timeout and request_timeout > 0:
             request_kwargs["timeout"] = request_timeout
@@ -9035,6 +9412,7 @@ class AIService:
         local_execution: Optional["LocalExecutionRuntime"] = None,
         dispatch_call_id: Optional[str] = None,
         dispatch_route_ordinal: int = 0,
+        shared_context: Optional[str] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on the new Gemini SDK."""
         if not (enable_validate_draft or accent_context is not None):
@@ -9067,6 +9445,7 @@ class AIService:
             initial_parts.extend(self._build_gemini_image_parts(images))
         initial_parts.append({"text": prompt})
         initial_contents: List[Any] = [{"role": "user", "parts": initial_parts}]
+        initial_contents = prepend_gemini_context(initial_contents, shared_context)
 
         thinking_config_kwargs = self._build_gemini_thinking_config_kwargs(
             model_id,
@@ -9106,9 +9485,12 @@ class AIService:
             include_audit_accent: bool = False,
         ) -> Any:
             config_params: Dict[str, Any] = {
-                "temperature": temperature,
                 "max_output_tokens": max_tokens,
             }
+            self._add_chat_parameter_if_allowed(
+                config_params, provider="gemini", model_id=model_id,
+                parameter_name="temperature", value=temperature,
+            )
             if tools_enabled:
                 declarations = _build_function_declarations(include_validate_draft, include_audit_accent)
                 if declarations:
@@ -9580,9 +9962,12 @@ class AIService:
                                 turn_accent_rejected_text = draft
                             latest_audit_result = audit_result
                             function_response_parts.append(
-                                types.Part.from_function_response(
-                                    name="audit_accent",
-                                    response=audit_result,
+                                types.Part(
+                                    function_response=types.FunctionResponse(
+                                        id=getattr(call, "id", None),
+                                        name="audit_accent",
+                                        response=audit_result,
+                                    ),
                                 )
                             )
                             trace.append({
@@ -9626,9 +10011,12 @@ class AIService:
                                 },
                             )
                             function_response_parts.append(
-                                types.Part.from_function_response(
-                                    name=call_name,
-                                    response={"error": "text_exceeds_limit"},
+                                types.Part(
+                                    function_response=types.FunctionResponse(
+                                        id=getattr(call, "id", None),
+                                        name=call_name,
+                                        response={"error": "text_exceeds_limit"},
+                                    ),
                                 )
                             )
                             trace.append(
@@ -9653,9 +10041,12 @@ class AIService:
                             ).strip()
                             latest_invalid_draft = draft
                         function_response_parts.append(
-                            types.Part.from_function_response(
-                                name=call_name,
-                                response=tool_payload.build_visible_payload(payload_scope),
+                            types.Part(
+                                function_response=types.FunctionResponse(
+                                    id=getattr(call, "id", None),
+                                    name=call_name,
+                                    response=tool_payload.build_visible_payload(payload_scope),
+                                ),
                             )
                         )
                         trace.append(
@@ -9953,6 +10344,8 @@ class AIService:
         dispatch_call_id: Optional[str] = None,
         dispatch_route_ordinal: int = 0,
         endpoint_id: Optional[str] = None,
+        include_default_system_context: bool = True,
+        shared_context: Optional[str] = None,
     ) -> Tuple[str, ToolLoopEnvelope]:
         """Reusable entry point for the shared ``validate_draft`` tool loop.
 
@@ -9978,6 +10371,7 @@ class AIService:
         wrappers around a JSON object/array; the first valid payload is
         extracted and normalized, but no payload is attached to the envelope.
         """
+        validate_shared_context(shared_context)
 
         # Live labelled tool-loop telemetry (C6). Every event the loop produces
         # reaches the consumer as it happens — assistant and thinking deltas,
@@ -10078,7 +10472,8 @@ class AIService:
             )
 
         token_validation = config.validate_token_limits(
-            catalog_model, max_tokens, reasoning_effort, thinking_budget_tokens
+            catalog_model, max_tokens, reasoning_effort, thinking_budget_tokens,
+            require_api_key=self.require_global_api_key,
         )
         adjusted_max_tokens = token_validation["adjusted_tokens"]
         adjusted_reasoning_effort = token_validation["adjusted_reasoning_effort"]
@@ -10166,12 +10561,12 @@ class AIService:
             model_alias_registry=model_alias_registry,
             prompt_safety_parts=prompt_safety_parts,
             boundary="call_ai_with_validation_tools",
+            **({"shared_context": shared_context} if shared_context else {}),
         )
 
-        current_date = datetime.now().strftime("%Y/%m/%d")
-        language_instruction = "\n\nIMPORTANT: Always respond in the same language as the user's request, regardless of the language used in these instructions."
-        date_instruction = f"\n\nCurrent date: {current_date}"
-        effective_system_prompt = (system_prompt or "") + language_instruction + date_instruction
+        effective_system_prompt = _with_default_system_context(
+            system_prompt or "", include_default_system_context
+        )
         if self._should_inject_json_prompt(provider, model_id, json_output_flag, json_schema_arg):
             json_instructions = (
                 "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, "
@@ -10225,7 +10620,7 @@ class AIService:
         # threshold (below it the banded policy admits, with a warning in the
         # tolerated band); observe mode falls back to the paranoid
         # TOOL_LOOP_MAX_PROMPT_CHARS hard cap.
-        prompt_chars = len(effective_system_prompt or "") + len(prompt or "")
+        prompt_chars = len(effective_system_prompt or "") + len(shared_context or "") + len(prompt or "")
         entry_tool_defs = self._serialize_tool_loop_tool_defs(
             provider_key,
             enable_validate_draft=enable_validate_draft,
@@ -10246,6 +10641,7 @@ class AIService:
             json_schema=json_schema_arg,
             json_output=json_output_flag,
             extra_text_components=entry_extra_components,
+            **({"shared_context": shared_context} if shared_context else {}),
         )
         entry_report = await context_budget.evaluate_call_admission(
             entry_budget,
@@ -10446,6 +10842,7 @@ class AIService:
                     strict_single_generation_attempt=strict_single_generation_attempt,
                     **loop_common_kwargs,
                     **local_transport_kwargs,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 )
             elif provider_key == "claude":
                 content, metadata = await self._run_claude_validation_tool_loop(
@@ -10470,6 +10867,7 @@ class AIService:
                     enable_validate_draft=enable_validate_draft,
                     accent_audit_timeout=resolved_accent_audit_timeout,
                     **loop_common_kwargs,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 )
             elif provider_key == "gemini":
                 if self.google_new_client:
@@ -10494,6 +10892,7 @@ class AIService:
                         enable_validate_draft=enable_validate_draft,
                         accent_audit_timeout=resolved_accent_audit_timeout,
                         **loop_common_kwargs,
+                        **({"shared_context": shared_context} if shared_context else {}),
                     )
                 else:
                     # Fail-fast fallback envelope when Gemini credentials are
@@ -10935,6 +11334,7 @@ class AIService:
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        shared_context: Optional[str] = None,
     ) -> Tuple[str, Any]:
         """Generate content using OpenAI API with optional JSON Schema and vision support"""
         if not self.openai_client:
@@ -10969,6 +11369,10 @@ class AIService:
                 {"role": "user", "content": effective_prompt}
             ]
 
+        messages = prepend_user_context(
+            messages, shared_context, provider="openai", model_id=model_id
+        )
+
         # --- Responses API models (o3-pro and catalog-marked variants) ---
         if self._is_openai_responses_api_model(model_id) and "gpt-5-pro" not in model_id.lower():
             if not self.openai_client:
@@ -10981,6 +11385,13 @@ class AIService:
                 input_content.append({"type": "input_text", "text": effective_prompt})
             else:
                 input_content = effective_prompt  # Plain string for text-only
+
+            if shared_context or (
+                isinstance(prompt, CacheablePrompt)
+                and prompt.cache_breakpoints
+                and supports_openai_explicit_cache(model_id)
+            ):
+                _, input_content = self._build_openai_responses_input_from_messages(messages)
 
             # IMPORTANT! In Responses API, use 'instructions' for the "system" prompt.
             create_params = {
@@ -11063,6 +11474,13 @@ class AIService:
                 input_content.append({"type": "input_text", "text": effective_prompt})
             else:
                 input_content = effective_prompt  # Plain string for text-only
+
+            if shared_context or (
+                isinstance(prompt, CacheablePrompt)
+                and prompt.cache_breakpoints
+                and supports_openai_explicit_cache(model_id)
+            ):
+                _, input_content = self._build_openai_responses_input_from_messages(messages)
 
             # GPT-5 Pro uses the Responses API, same as o3-pro
             create_params = {
@@ -11244,6 +11662,7 @@ class AIService:
         dispatch_call_id: Optional[str] = None,
         dispatch_route_ordinal: int = 0,
         endpoint_id: Optional[str] = None,
+        shared_context: Optional[str] = None,
     ) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
         """
         Generate content and return logprobs for the response tokens.
@@ -11273,6 +11692,7 @@ class AIService:
             ValueError: If model doesn't support logprobs
             Exception: If API call fails
         """
+        validate_shared_context(shared_context)
         # Validate model supports logprobs
         catalog_model, _effective_endpoint_id, local_endpoint = (
             self._resolve_endpoint_scoped_catalog_model(
@@ -11325,12 +11745,17 @@ class AIService:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
+        messages = prepend_user_context(
+            messages, shared_context, provider=provider, model_id=model_id
+        )
+
         self._assert_model_blind_prompt(
             prompt=prompt,
             system_prompt=system_prompt,
             model_alias_registry=model_alias_registry,
             prompt_safety_parts=prompt_safety_parts,
             boundary="generate_with_logprobs",
+            **({"shared_context": shared_context} if shared_context else {}),
         )
 
         # Build API parameters
@@ -11347,6 +11772,9 @@ class AIService:
                 None,
                 provider_options,
             )
+
+        if provider == "openai":
+            create_params = with_openai_cache_options(create_params)
 
         logger.debug(
             f"Generating with logprobs: model={model_id}, provider={provider}, "
@@ -11398,6 +11826,7 @@ class AIService:
             prompt=prompt,
             reserved_output_tokens=max_tokens,
             local_execution=local_execution,
+            **({"shared_context": shared_context} if shared_context else {}),
         )
         # This path reports usage through the manual callback below, never
         # through ``_emit_usage`` — consume the admission report immediately
@@ -11413,7 +11842,7 @@ class AIService:
             ):
                 await self._raise_if_cancelled(cancellation_token)
                 if provider in {"ollama", "llamacpp", "openai_compatible"}:
-                    async with local_semaphore:
+                    async with self._local_endpoint_request_slot(local_semaphore):
                         response = await client.chat.completions.create(**create_params)
                 else:
                     response = await client.chat.completions.create(**create_params)
@@ -11421,6 +11850,9 @@ class AIService:
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            refusal = find_terminal_refusal(e)
+            if refusal is not None:
+                raise refusal
             if cancellation_token and await cancellation_token.any_cancelled():
                 raise asyncio.CancelledError() from e
             failure = self._classify_provider_failure(
@@ -11518,6 +11950,8 @@ class AIService:
         dispatch_call_id: Optional[str] = None,
         dispatch_route_ordinal: int = 0,
         endpoint_id: Optional[str] = None,
+        include_default_system_context: bool = True,
+        shared_context: Optional[str] = None,
     ):
         """
         Generate content with streaming support
@@ -11528,6 +11962,7 @@ class AIService:
             temperature: Generation temperature
             max_tokens: Maximum tokens
             system_prompt: Optional system prompt
+            include_default_system_context: Append the automatic language instruction and current date
             reasoning_effort: Reasoning effort level for GPT-5 models
             thinking_budget_tokens: Budget tokens for thinking/reasoning
             content_type: Type of content being generated (affects system prompt selection)
@@ -11537,6 +11972,7 @@ class AIService:
         Yields:
             Generated content chunks as they are produced
         """
+        validate_shared_context(shared_context)
         catalog_model, _effective_endpoint_id, local_endpoint = (
             self._resolve_endpoint_scoped_catalog_model(
                 model,
@@ -11546,6 +11982,7 @@ class AIService:
                 dispatch_route_ordinal=dispatch_route_ordinal,
             )
         )
+        self._assert_not_system_one_text_model(catalog_model)
         max_tokens, _token_budget_resolution = self._resolve_effective_output_max_tokens(
             catalog_model,
             max_tokens,
@@ -11554,7 +11991,8 @@ class AIService:
 
         # Intelligent validation and adjustment of all token parameters
         token_validation = config.validate_token_limits(
-            catalog_model, max_tokens, reasoning_effort, thinking_budget_tokens
+            catalog_model, max_tokens, reasoning_effort, thinking_budget_tokens,
+            require_api_key=self.require_global_api_key,
         )
         adjusted_max_tokens = token_validation["adjusted_tokens"]
         adjusted_reasoning_effort = token_validation["adjusted_reasoning_effort"]
@@ -11701,14 +12139,12 @@ class AIService:
             model_alias_registry=model_alias_registry,
             prompt_safety_parts=prompt_safety_parts,
             boundary="generate_content_stream",
+            **({"shared_context": shared_context} if shared_context else {}),
         )
 
-        # Add language instruction and current date to system prompt (not user message)
-        # This avoids prompt contamination where models confuse system instructions with user content
-        current_date = datetime.now().strftime("%Y/%m/%d")
-        language_instruction = "\n\nIMPORTANT: Always respond in the same language as the user's request, regardless of the language used in these instructions."
-        date_instruction = f"\n\nCurrent date: {current_date}"
-        system_prompt = system_prompt + language_instruction + date_instruction
+        system_prompt = _with_default_system_context(
+            system_prompt, include_default_system_context
+        )
 
         stream_health_endpoint_id = self._effective_health_endpoint_id(
             endpoint_id, local_execution, dispatch_call_id, dispatch_route_ordinal
@@ -11750,6 +12186,7 @@ class AIService:
                     resolved_model_id=model_id,
                     usage_extra=extra_payload,
                     images=images,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 ):
                     yield chunk
             elif provider in {"anthropic", "claude"}:
@@ -11770,6 +12207,7 @@ class AIService:
                     resolved_model_id=model_id,
                     usage_extra=extra_payload,
                     images=images,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 ):
                     yield chunk
             elif provider in {"google", "gemini"}:
@@ -11788,6 +12226,7 @@ class AIService:
                     provider=provider,
                     usage_extra=extra_payload,
                     images=images,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 ):
                     yield chunk
             elif provider in {"xai", "grok"}:
@@ -11804,6 +12243,7 @@ class AIService:
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                     images=images,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 ):
                     yield chunk
             elif provider == "openrouter":
@@ -11821,6 +12261,8 @@ class AIService:
                     images=images,
                     provider_options=provider_options,
                     strict_single_generation_attempt=strict_single_generation_attempt,
+                    reasoning_effort=reasoning_effort,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 ):
                     yield chunk
             elif provider == "minimax":
@@ -11836,6 +12278,7 @@ class AIService:
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                     images=images,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 ):
                     yield chunk
             elif provider == "moonshot":
@@ -11851,6 +12294,7 @@ class AIService:
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                     images=images,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 ):
                     yield chunk
             elif provider == "llamacpp":
@@ -11865,9 +12309,11 @@ class AIService:
                     request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
+                    images=images,
                     reasoning_effort=reasoning_effort,
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 ):
                     yield chunk
             elif provider == "ollama":
@@ -11882,9 +12328,11 @@ class AIService:
                     request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
+                    images=images,
                     reasoning_effort=reasoning_effort,
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 ):
                     yield chunk
             elif provider == "openai_compatible":
@@ -11899,9 +12347,11 @@ class AIService:
                     request_timeout=request_timeout,
                     json_output=json_output,
                     json_schema=effective_json_schema,
+                    images=images,
                     reasoning_effort=reasoning_effort,
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 ):
                     yield chunk
             elif provider == "fake":
@@ -11916,6 +12366,7 @@ class AIService:
                     json_schema=effective_json_schema,
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 ):
                     yield chunk
             else:
@@ -11957,6 +12408,7 @@ class AIService:
                 json_schema=effective_json_schema,
                 json_output=json_output,
                 local_execution=local_execution,
+                **({"shared_context": shared_context} if shared_context else {}),
             )
             remaining_stream_timeout = (
                 stream_deadline - asyncio.get_running_loop().time()
@@ -12025,6 +12477,9 @@ class AIService:
                 raise
             except StructuredOutputSchemaError:
                 raise
+            except GenerationStoppedUnexpectedly:
+                # A terminal provider verdict is not an operational failure.
+                raise
             except ContextAdmissionError:
                 # Local admission guard verdict — non-retryable, never wrapped.
                 raise
@@ -12032,6 +12487,11 @@ class AIService:
                 # Transport authorization is terminal and must never retry or wrap.
                 raise
             except Exception as exc:
+                refusal = find_terminal_refusal(exc)
+                if refusal is not None:
+                    # Raised inside the provider SDK's transport and wrapped as a
+                    # connection error: still terminal, never retried or counted.
+                    raise refusal
                 if cancellation_token and await cancellation_token.any_cancelled():
                     raise asyncio.CancelledError() from exc
                 last_exception = exc
@@ -12045,6 +12505,7 @@ class AIService:
                     max_attempts=max_attempts,
                 )
                 failure = self._failure_with_endpoint(failure, stream_health_endpoint_id)
+                self._raise_if_provider_content_policy(failure, exc)
                 await self._record_provider_health_failure(failure)
                 if failure.kind is ProviderErrorKind.CONTEXT_OVERFLOW:
                     # Provider reported a context overflow despite the local
@@ -12137,6 +12598,7 @@ class AIService:
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        shared_context: Optional[str] = None,
     ) -> Tuple[str, Any]:
         """Generate content using Claude API with optional Structured Outputs and vision support
 
@@ -12172,6 +12634,10 @@ class AIService:
             return text_content
 
         messages = [{"role": "user", "content": _build_user_content(prompt)}]
+
+        messages = prepend_user_context(
+            messages, shared_context, provider="claude", model_id=model_id
+        )
         if use_structured_outputs:
             logger.info(f"Using Claude Structured Outputs (beta) with JSON Schema for {model_id}")
         elif json_output:
@@ -12276,6 +12742,7 @@ class AIService:
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        shared_context: Optional[str] = None,
     ) -> Tuple[str, Any]:
         """Generate content using Gemini API with optional JSON Schema and vision support"""
         if not self.google_new_client:
@@ -12292,6 +12759,7 @@ class AIService:
             json_output=json_output,
             json_schema=json_schema,
             images=images,
+            **({"shared_context": shared_context} if shared_context else {}),
         )
 
     async def _generate_gemini_new_sdk(
@@ -12307,6 +12775,7 @@ class AIService:
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        shared_context: Optional[str] = None,
     ) -> Tuple[str, Any]:
         """Generate content using new Google GenAI SDK with optional JSON Schema and vision support
 
@@ -12339,6 +12808,7 @@ class AIService:
                 parts.extend(self._build_gemini_image_parts(images))
             parts.append({"text": prompt})
             contents.append({"role": "user", "parts": parts})
+            contents = prepend_gemini_context(contents, shared_context)
 
             thinking_config_kwargs = self._build_gemini_thinking_config_kwargs(
                 model_id,
@@ -12347,10 +12817,11 @@ class AIService:
             )
 
             # Configure generation with system_instruction in config (not concatenated in user message)
-            config_params = {
-                "temperature": temperature,
-                "max_output_tokens": max_tokens
-            }
+            config_params = {"max_output_tokens": max_tokens}
+            self._add_chat_parameter_if_allowed(
+                config_params, provider="gemini", model_id=model_id,
+                parameter_name="temperature", value=temperature,
+            )
             if effective_system:
                 config_params["system_instruction"] = effective_system
 
@@ -12388,6 +12859,10 @@ class AIService:
                 provider="gemini",
                 max_tokens=max_tokens,
             )
+            if usage_with_finish.get("prompt_block_reason"):
+                # Let the public generation path emit usage, then raise its
+                # typed terminal verdict before accepting any content.
+                return "", usage_with_finish
             if content:
                 return content, usage_with_finish
 
@@ -12498,7 +12973,8 @@ class AIService:
         """Attach Claude sampling params only for models that support them."""
         if cls._claude_omits_sampling_params(model_id):
             return
-        params["temperature"] = temperature
+        # The current Anthropic SDK accepts supported sampling controls in extra_body.
+        params.setdefault("extra_body", {})["temperature"] = temperature
 
     @classmethod
     def _supports_claude_thinking(cls, model_id: str) -> bool:
@@ -12519,13 +12995,22 @@ class AIService:
 
     @staticmethod
     def _openrouter_accepts_temperature(model_id: str) -> bool:
-        """Return False for OpenRouter models documented to reject sampling params."""
+        """Apply catalog support and existing OpenRouter sampling restrictions."""
+        specs = getattr(config, "model_specs", {}) or {}
         if not runtime_parameters.accepts_parameter(
             "openrouter",
             model_id,
             "temperature",
-            specs=getattr(config, "model_specs", {}) or {},
+            specs=specs,
         ):
+            return False
+        temperature_state = _openrouter_parameter_state(
+            find_model_spec(specs, "openrouter", model_id),
+            {"temperature"},
+            details_name="supported_parameters",
+        )
+        # An absent catalog declaration keeps the existing compatibility rules.
+        if temperature_state.support == CapabilitySupport.UNSUPPORTED:
             return False
         normalized = (model_id or "").strip().lower().split(":", 1)[0].replace(".", "-")
         no_temperature_prefixes = (
@@ -12733,6 +13218,7 @@ class AIService:
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        shared_context: Optional[str] = None,
     ) -> Tuple[str, Any]:
         """Generate content using xAI Grok API with optional structured outputs and vision
 
@@ -12765,6 +13251,10 @@ class AIService:
             messages = [{"role": "user", "content": image_parts}]
         else:
             messages = [{"role": "user", "content": prompt}]
+
+        messages = prepend_user_context(
+            messages, shared_context, provider="xai", model_id=model_id
+        )
 
         # Always include system message (with or without JSON instructions)
         if effective_system:
@@ -12828,6 +13318,8 @@ class AIService:
         images: Optional[List["ImageData"]] = None,
         provider_options: Optional[Mapping[str, Any]] = None,
         strict_single_generation_attempt: bool = False,
+        reasoning_effort: Optional[str] = None,
+        shared_context: Optional[str] = None,
     ) -> Tuple[str, Any]:
         """Generate content using OpenRouter unified API with optional JSON Schema and vision support"""
         if not self.openrouter_client:
@@ -12849,6 +13341,10 @@ class AIService:
             messages = [{"role": "user", "content": image_parts}]
         else:
             messages = [{"role": "user", "content": prompt}]
+
+        messages = prepend_user_context(
+            messages, shared_context, provider="openrouter", model_id=model_id
+        )
 
         # Always include system message (with or without JSON instructions)
         if effective_system:
@@ -12894,18 +13390,30 @@ class AIService:
         request_kwargs["extra_body"] = self._with_openrouter_compression_disabled(
             request_kwargs.get("extra_body")
         )
+        if reasoning_effort is not None:
+            request_kwargs["extra_body"]["reasoning"] = {"effort": reasoning_effort}
         client = self._openrouter_client_for_attempt(strict_single_generation_attempt)
-        response = await client.chat.completions.create(
-            **request_params,
-            **request_kwargs,
-        )
-
-        return self._chat_completion_content_and_usage(
-            response,
-            provider="openrouter",
-            model_id=model_id,
-            max_tokens=max_tokens,
-        )
+        provider_budget = getattr(self, "provider_budget", None)
+        if provider_budget is not None:
+            request_kwargs["extra_body"] = provider_budget.constrain_routing(request_kwargs["extra_body"])
+        with (provider_budget.dispatch(model=model_id, max_tokens=max_tokens, images=images,
+                call_id="ai_service.generate_content") if provider_budget is not None else nullcontext()) as reservation:
+            response = await client.chat.completions.create(
+                **request_params,
+                **request_kwargs,
+            )
+            if provider_budget is not None:
+                # Settle raw metadata first: content validation or an optional
+                # usage callback can still fail after this point. Normalization
+                # keeps only the billed ``cost`` (see provider_billed_cost).
+                provider_budget.settle(reservation, getattr(response, "usage", None), response=response)
+            self._raise_openrouter_response_error(response, max_tokens=max_tokens)
+            return self._chat_completion_content_and_usage(
+                response,
+                provider="openrouter",
+                model_id=model_id,
+                max_tokens=max_tokens,
+            )
 
     async def _generate_openai_compatible(
         self,
@@ -12923,6 +13431,7 @@ class AIService:
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
         reasoning_effort: Optional[str] = None,
+        shared_context: Optional[str] = None,
     ) -> Tuple[str, Any]:
         """Generate content through an OpenAI-compatible Chat Completions provider."""
 
@@ -12944,6 +13453,10 @@ class AIService:
         else:
             messages = [{"role": "user", "content": prompt}]
 
+        messages = prepend_user_context(
+            messages, shared_context, provider=provider_key, model_id=model_id
+        )
+
         if effective_system:
             messages.insert(0, {"role": "system", "content": effective_system})
 
@@ -12962,7 +13475,7 @@ class AIService:
         )
         if provider_key == "minimax":
             request_params["extra_body"] = {"reasoning_split": True}
-        elif provider_key == "llamacpp" and reasoning_effort is not None:
+        elif provider_key in {"ollama", "llamacpp"} and reasoning_effort is not None:
             request_params["reasoning_effort"] = reasoning_effort
 
         request_kwargs: Dict[str, Any] = {}
@@ -13007,6 +13520,7 @@ class AIService:
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        shared_context: Optional[str] = None,
     ) -> Tuple[str, Any]:
         """Generate content using MiniMax's OpenAI-compatible API."""
 
@@ -13023,6 +13537,7 @@ class AIService:
             json_output=json_output,
             json_schema=json_schema,
             images=images,
+            **({"shared_context": shared_context} if shared_context else {}),
         )
 
     async def _generate_moonshot(
@@ -13036,6 +13551,7 @@ class AIService:
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        shared_context: Optional[str] = None,
     ) -> Tuple[str, Any]:
         """Generate content using Moonshot/Kimi's OpenAI-compatible API."""
 
@@ -13052,37 +13568,8 @@ class AIService:
             json_output=json_output,
             json_schema=json_schema,
             images=images,
+            **({"shared_context": shared_context} if shared_context else {}),
         )
-
-    async def _generate_llamacpp(
-        self,
-        prompt: str,
-        model_id: str,
-        temperature: float,
-        max_tokens: int,
-        system_prompt: str,
-        request_timeout: Optional[float] = None,
-        json_output: bool = False,
-        json_schema: Optional[Dict[str, Any]] = None,
-        reasoning_effort: Optional[str] = None,
-    ) -> Tuple[str, Any]:
-        """Generate through the configured llama.cpp OpenAI-compatible server."""
-
-        async with self._llamacpp_request_semaphore:
-            return await self._generate_openai_compatible(
-                provider_key="llamacpp",
-                client=self.llamacpp_client,
-                display_name="llama.cpp",
-                prompt=prompt,
-                model_id=model_id,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                system_prompt=system_prompt,
-                request_timeout=request_timeout,
-                json_output=json_output,
-                json_schema=json_schema,
-                reasoning_effort=reasoning_effort,
-            )
 
     async def health_check(self) -> Dict[str, bool]:
         """Check health of all AI service providers"""
@@ -13296,6 +13783,7 @@ class AIService:
         resolved_model_id: Optional[str] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        shared_context: Optional[str] = None,
     ):
         """Stream OpenAI content generation with optional JSON Schema and vision support"""
         if not self.openai_client:
@@ -13327,6 +13815,10 @@ class AIService:
                 {"role": "user", "content": prompt}
             ]
 
+        messages = prepend_user_context(
+            messages, shared_context, provider="openai", model_id=model_id
+        )
+
         # Log streaming start if extra_verbose is enabled
         if extra_verbose:
             logger.info(f"[EXTRA_VERBOSE] Starting streaming generation for model {model_id}")
@@ -13354,6 +13846,7 @@ class AIService:
                     json_output=json_output,
                     json_schema=json_schema,
                     images=images,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 )
                 yield content
                 yield StreamChunk(
@@ -13389,6 +13882,7 @@ class AIService:
                     json_output=json_output,
                     json_schema=json_schema,
                     images=images,
+                    **({"shared_context": shared_context} if shared_context else {}),
                 )
                 yield content
                 yield StreamChunk(
@@ -13486,13 +13980,10 @@ class AIService:
                 if extra_verbose:
                     logger.info(f"[EXTRA_VERBOSE] Standard OpenAI streaming with temperature: {temperature}")
 
-                create_params = {
-                    "model": model_id,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "stream": True,
-                }
+                create_params = _build_openai_params(
+                    model_id, messages, temperature, max_tokens, reasoning_effort
+                )
+                create_params["stream"] = True
 
                 create_params.setdefault("stream_options", {})["include_usage"] = True
 
@@ -13618,6 +14109,7 @@ class AIService:
         resolved_model_id: Optional[str] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        shared_context: Optional[str] = None,
     ):
         """Stream Claude content generation with optional Structured Outputs and vision support"""
         if not self.anthropic_client:
@@ -13642,6 +14134,10 @@ class AIService:
             return text_content
 
         messages = [{"role": "user", "content": _build_user_content(prompt)}]
+
+        messages = prepend_user_context(
+            messages, shared_context, provider="claude", model_id=model_id
+        )
         if use_structured_outputs:
             logger.info(f"Using Claude Structured Outputs (beta, streaming) with JSON Schema for {model_id}")
         elif json_output:
@@ -13711,15 +14207,14 @@ class AIService:
                 final_usage = None
                 final_response = None
                 stop_reason = None
-                input_tokens = 0
-                output_tokens = 0
+                captured_usage: Dict[str, Any] = {}
 
                 async for event in stream:
                     # Capture usage from message_start event (contains input_tokens)
                     if event.type == "message_start":
                         if hasattr(event, 'message') and hasattr(event.message, 'usage'):
                             usage_obj = event.message.usage
-                            input_tokens = getattr(usage_obj, 'input_tokens', 0)
+                            runtime_usage.merge_anthropic_stream_usage(captured_usage, usage_obj)
 
                     # Capture usage from message_delta event (contains cumulative output_tokens)
                     elif event.type == "message_delta":
@@ -13728,7 +14223,7 @@ class AIService:
                             stop_reason = getattr(delta, "stop_reason", None)
                         if hasattr(event, 'usage'):
                             usage_obj = event.usage
-                            output_tokens = getattr(usage_obj, 'output_tokens', 0)
+                            runtime_usage.merge_anthropic_stream_usage(captured_usage, usage_obj)
 
                     # Handle content streaming
                     elif event.type == "content_block_delta":
@@ -13752,22 +14247,15 @@ class AIService:
 
                 # Try to get final response, but fallback to captured usage if it fails
                 try:
-                    final_response = await stream.get_final_response()
+                    final_response = await stream.get_final_message()
                     final_usage = getattr(final_response, "usage", None)
                     stop_reason = getattr(final_response, "stop_reason", stop_reason)
                 except Exception:
                     final_usage = None
 
                 # If get_final_response failed, construct usage from captured events
-                if not final_usage and (input_tokens > 0 or output_tokens > 0):
-                    # Create a simple object with the captured usage
-                    class UsageData:
-                        def __init__(self, input_tokens, output_tokens):
-                            self.input_tokens = input_tokens
-                            self.output_tokens = output_tokens
-                            self.total_tokens = input_tokens + output_tokens
-
-                    final_usage = UsageData(input_tokens, output_tokens)
+                if final_usage is None and captured_usage:
+                    final_usage = captured_usage
 
                 usage_with_finish = self._usage_with_finish_metadata(
                     final_usage,
@@ -13813,6 +14301,7 @@ class AIService:
         provider: str = "gemini",
         usage_extra: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        shared_context: Optional[str] = None,
     ):
         """Stream Gemini content generation with optional JSON Schema and vision support"""
         extra_payload = usage_extra or {}
@@ -13833,6 +14322,7 @@ class AIService:
             provider=provider,
             usage_extra=extra_payload,
             images=images,
+            **({"shared_context": shared_context} if shared_context else {}),
         ):
             yield chunk
 
@@ -13852,6 +14342,7 @@ class AIService:
         provider: str = "gemini",
         usage_extra: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        shared_context: Optional[str] = None,
     ):
         """Stream content using new Google GenAI SDK with optional JSON Schema and vision support"""
         extra_payload = usage_extra or {}
@@ -13874,6 +14365,7 @@ class AIService:
                 parts.extend(self._build_gemini_image_parts(images))
             parts.append({"text": prompt})
             contents.append({"role": "user", "parts": parts})
+            contents = prepend_gemini_context(contents, shared_context)
 
             thinking_config_kwargs = self._build_gemini_thinking_config_kwargs(
                 model_id,
@@ -13882,10 +14374,11 @@ class AIService:
             )
 
             # Configure generation with system_instruction in config (not concatenated in user message)
-            config_params = {
-                "temperature": temperature,
-                "max_output_tokens": max_tokens
-            }
+            config_params = {"max_output_tokens": max_tokens}
+            self._add_chat_parameter_if_allowed(
+                config_params, provider="gemini", model_id=model_id,
+                parameter_name="temperature", value=temperature,
+            )
             if effective_system:
                 config_params["system_instruction"] = effective_system
 
@@ -13927,9 +14420,12 @@ class AIService:
             fallback_needed = False
             fallback_reason: Optional[BaseException] = None
             finish_reason = None
+            prompt_feedback_response = None
 
             try:
                 async for chunk in stream_response:
+                    if getattr(chunk, "prompt_feedback", None) is not None:
+                        prompt_feedback_response = chunk
                     candidates = getattr(chunk, "candidates", None) or []
                     if candidates:
                         candidate_finish = getattr(
@@ -13951,6 +14447,10 @@ class AIService:
                 fallback_reason = e
                 logger.error(f"New Gemini SDK streaming error: {e}")
             except Exception as e:
+                refusal = find_terminal_refusal(e)
+                if refusal is not None:
+                    # A refusal is terminal; it never falls back to a new request.
+                    raise refusal
                 fallback_needed = not yielded_chunks
                 fallback_reason = e
                 logger.error(f"New Gemini SDK streaming error: {e}")
@@ -13982,6 +14482,7 @@ class AIService:
                         json_output=json_output,
                         json_schema=json_schema,
                         images=images,
+                        **({"shared_context": shared_context} if shared_context else {}),
                     )
                     if fallback_text:
                         yielded_chunks = True
@@ -13996,7 +14497,7 @@ class AIService:
 
             usage_with_finish = self._usage_with_finish_metadata(
                 usage_metadata,
-                None,
+                prompt_feedback_response,
                 provider=provider,
                 max_tokens=max_tokens,
                 fallback_finish_reason=finish_reason,
@@ -14008,6 +14509,11 @@ class AIService:
                 usage_with_finish,
                 extra_payload,
             )
+            if usage_with_finish.get("prompt_block_reason"):
+                self._raise_if_generation_stopped_unusably(
+                    "", usage_with_finish, provider=provider,
+                    model_id=model_id, max_tokens=max_tokens,
+                )
             if not yielded_chunks:
                 raise GenerationStoppedUnexpectedly(
                     "Gemini streaming returned no text; the response should not "
@@ -14049,6 +14555,7 @@ class AIService:
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        shared_context: Optional[str] = None,
     ):
         """Stream xAI content generation with optional structured outputs and vision
 
@@ -14085,6 +14592,10 @@ class AIService:
             messages = [{"role": "user", "content": image_parts}]
         else:
             messages = [{"role": "user", "content": prompt}]
+
+        messages = prepend_user_context(
+            messages, shared_context, provider="xai", model_id=model_id
+        )
 
         # Always include system message (with or without JSON instructions)
         if effective_system:
@@ -14193,6 +14704,8 @@ class AIService:
         images: Optional[List["ImageData"]] = None,
         provider_options: Optional[Mapping[str, Any]] = None,
         strict_single_generation_attempt: bool = False,
+        reasoning_effort: Optional[str] = None,
+        shared_context: Optional[str] = None,
     ):
         """Stream OpenRouter content generation with optional JSON Schema and vision support"""
         if not self.openrouter_client:
@@ -14216,6 +14729,10 @@ class AIService:
             messages = [{"role": "user", "content": image_parts}]
         else:
             messages = [{"role": "user", "content": prompt}]
+
+        messages = prepend_user_context(
+            messages, shared_context, provider="openrouter", model_id=model_id
+        )
 
         # Always include system message (with or without JSON instructions)
         if effective_system:
@@ -14266,29 +14783,47 @@ class AIService:
             request_kwargs["extra_body"] = self._with_openrouter_compression_disabled(
                 request_kwargs.get("extra_body")
             )
+            if reasoning_effort is not None:
+                request_kwargs["extra_body"]["reasoning"] = {"effort": reasoning_effort}
             client = self._openrouter_client_for_attempt(strict_single_generation_attempt)
-            stream = await client.chat.completions.create(
-                **create_params,
-                **request_kwargs,
-            )
-
-            usage_obj = None
-            finish_reason = None
-            async for chunk in stream:
-                # Verify that choices exists and has elements before accessing
-                if chunk.choices and len(chunk.choices) > 0:
-                    if getattr(chunk.choices[0], "finish_reason", None) is not None:
-                        finish_reason = getattr(chunk.choices[0], "finish_reason", None)
-                    if chunk.choices[0].delta.content is not None:
-                        yield chunk.choices[0].delta.content
-                # Capture usage even if choices is empty
-                if hasattr(chunk, "usage") and chunk.usage:
-                    usage_obj = chunk.usage
-
-            if hasattr(stream, "response"):
-                usage_obj = getattr(stream.response, "usage", usage_obj)
-            elif hasattr(stream, "usage") and stream.usage:
-                usage_obj = stream.usage
+            provider_budget = getattr(self, "provider_budget", None)
+            if provider_budget is not None:
+                request_kwargs["extra_body"] = provider_budget.constrain_routing(request_kwargs["extra_body"])
+            with (provider_budget.dispatch(model=model_id, max_tokens=max_tokens, images=images,
+                    call_id="ai_service.generate_content_stream") if provider_budget is not None else nullcontext()) as reservation:
+                stream = await client.chat.completions.create(
+                    **create_params,
+                    **request_kwargs,
+                )
+                usage_obj = None
+                finish_reason = None
+                native_finish_reason = None
+                byok_metadata = None
+                try:
+                    async for chunk in stream:
+                        self._raise_openrouter_response_error(chunk, max_tokens=max_tokens)
+                        # Verify that choices exists and has elements before accessing.
+                        if chunk.choices and len(chunk.choices) > 0:
+                            if getattr(chunk.choices[0], "finish_reason", None) is not None:
+                                finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+                            native_finish_reason = (
+                                getattr(chunk.choices[0], "native_finish_reason", None) or native_finish_reason
+                            )
+                            if chunk.choices[0].delta.content is not None:
+                                yield chunk.choices[0].delta.content
+                        # Capture usage even if choices is empty.
+                        if hasattr(chunk, "usage") and chunk.usage:
+                            usage_obj = chunk.usage
+                            byok_metadata = chunk
+                    if hasattr(stream, "response"):
+                        usage_obj = getattr(stream.response, "usage", usage_obj)
+                    elif hasattr(stream, "usage") and stream.usage:
+                        usage_obj = stream.usage
+                    if provider_budget is not None:
+                        provider_budget.settle(reservation, usage_obj, response=byok_metadata)
+                finally:
+                    # Close on policy exceptions as well as normal completion.
+                    await stream.close()
 
             usage_with_finish = self._usage_with_finish_metadata(
                 usage_obj,
@@ -14296,6 +14831,8 @@ class AIService:
                 provider="openrouter",
                 max_tokens=max_tokens,
                 fallback_finish_reason=finish_reason,
+                fallback_native_finish_reason=native_finish_reason,
+                billing_envelope=byok_metadata,
             )
             self._emit_usage(
                 usage_callback,
@@ -14307,11 +14844,12 @@ class AIService:
             yield StreamChunk(
                 "",
                 is_thinking=False,
-                metadata=_build_finish_metadata(
-                    provider="openrouter",
-                    finish_reason=finish_reason,
-                    max_tokens=max_tokens,
-                ),
+                metadata={
+                    **_build_finish_metadata(
+                        provider="openrouter", finish_reason=finish_reason, max_tokens=max_tokens,
+                    ),
+                    **({"native_finish_reason": native_finish_reason} if native_finish_reason else {}),
+                },
             )
         except Exception as e:
             logger.error(f"OpenRouter streaming error: {e}")
@@ -14335,6 +14873,7 @@ class AIService:
         usage_extra: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
         reasoning_effort: Optional[str] = None,
+        shared_context: Optional[str] = None,
     ):
         """Stream content through an OpenAI-compatible Chat Completions provider."""
 
@@ -14357,6 +14896,10 @@ class AIService:
         else:
             messages = [{"role": "user", "content": prompt}]
 
+        messages = prepend_user_context(
+            messages, shared_context, provider=provider_key, model_id=model_id
+        )
+
         if effective_system:
             messages.insert(0, {"role": "system", "content": effective_system})
 
@@ -14376,8 +14919,13 @@ class AIService:
         )
         if provider_key == "minimax":
             create_params["extra_body"] = {"reasoning_split": True}
-        elif provider_key == "llamacpp" and reasoning_effort is not None:
+        elif provider_key in {"ollama", "llamacpp"} and reasoning_effort is not None:
             create_params["reasoning_effort"] = reasoning_effort
+        # MiniMax documents this option for M3; M2 support is not established.
+        if provider_key in {"ollama", "llamacpp", "openai_compatible", "moonshot"} or (
+            provider_key == "minimax" and model_id == "MiniMax-M3"
+        ):
+            create_params["stream_options"] = {"include_usage": True}
         request_kwargs: Dict[str, Any] = {}
         if request_timeout and request_timeout > 0:
             request_kwargs["timeout"] = request_timeout
@@ -14415,13 +14963,14 @@ class AIService:
                         finish_reason = getattr(chunk.choices[0], "finish_reason", None)
                     if chunk.choices[0].delta.content is not None:
                         yield chunk.choices[0].delta.content
-                if hasattr(chunk, "usage") and chunk.usage:
+                if getattr(chunk, "usage", None) is not None:
                     usage_obj = chunk.usage
 
-            if hasattr(stream, "response"):
-                usage_obj = getattr(stream.response, "usage", usage_obj)
-            elif hasattr(stream, "usage") and stream.usage:
-                usage_obj = stream.usage
+            final_usage = getattr(getattr(stream, "response", None), "usage", None)
+            if final_usage is None:
+                final_usage = getattr(stream, "usage", None)
+            if final_usage is not None:
+                usage_obj = final_usage
 
             usage_with_finish = self._usage_with_finish_metadata(
                 usage_obj,
@@ -14463,6 +15012,7 @@ class AIService:
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        shared_context: Optional[str] = None,
     ):
         """Stream MiniMax content generation."""
 
@@ -14481,6 +15031,7 @@ class AIService:
             usage_callback=usage_callback,
             usage_extra=usage_extra,
             images=images,
+            **({"shared_context": shared_context} if shared_context else {}),
         ):
             yield chunk
 
@@ -14497,6 +15048,7 @@ class AIService:
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
+        shared_context: Optional[str] = None,
     ):
         """Stream Moonshot/Kimi content generation."""
 
@@ -14515,261 +15067,9 @@ class AIService:
             usage_callback=usage_callback,
             usage_extra=usage_extra,
             images=images,
+            **({"shared_context": shared_context} if shared_context else {}),
         ):
             yield chunk
-
-    async def _stream_llamacpp(
-        self,
-        prompt: str,
-        model_id: str,
-        temperature: float,
-        max_tokens: int,
-        system_prompt: Optional[str],
-        request_timeout: Optional[float] = None,
-        json_output: bool = False,
-        json_schema: Optional[Dict[str, Any]] = None,
-        reasoning_effort: Optional[str] = None,
-        usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-        usage_extra: Optional[Dict[str, Any]] = None,
-    ):
-        """Stream through the configured llama.cpp server with its own queue."""
-
-        async with self._llamacpp_request_semaphore:
-            async for chunk in self._stream_openai_compatible(
-                provider_key="llamacpp",
-                client=self.llamacpp_client,
-                display_name="llama.cpp",
-                prompt=prompt,
-                model_id=model_id,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                system_prompt=system_prompt,
-                request_timeout=request_timeout,
-                json_output=json_output,
-                json_schema=json_schema,
-                reasoning_effort=reasoning_effort,
-                usage_callback=usage_callback,
-                usage_extra=usage_extra,
-            ):
-                yield chunk
-
-    async def _generate_ollama(
-        self,
-        prompt: str,
-        model_id: str,
-        temperature: float,
-        max_tokens: int,
-        system_prompt: str,
-        request_timeout: Optional[float] = None,
-        json_output: bool = False,
-        json_schema: Optional[Dict[str, Any]] = None,
-        reasoning_effort: Optional[str] = None,
-    ) -> Tuple[str, Any]:
-        """Generate content using Ollama local models (OpenAI-compatible API)
-
-        Args:
-            prompt: Generation prompt
-            model_id: Ollama model identifier (e.g., 'qwen2.5:14b', 'deepseek-r1:8b')
-            temperature: Generation temperature
-            max_tokens: Maximum tokens
-            system_prompt: System prompt
-            json_output: Enable JSON output mode
-            json_schema: Optional JSON schema for structured outputs
-        """
-        if not self.ollama_client:
-            raise ValueError("Ollama client not initialized. Set OLLAMA_HOST in your environment.")
-
-        # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
-        effective_system = system_prompt or ""
-        if self._should_inject_json_prompt("ollama", model_id, json_output, json_schema):
-            json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
-            if effective_system:
-                effective_system = f"{effective_system}\n\n{json_instructions}"
-            else:
-                effective_system = json_instructions
-
-        # User prompt stays clean
-        messages = [
-            {"role": "user", "content": prompt}
-        ]
-
-        # Always include system message (with or without JSON instructions)
-        if effective_system:
-            messages.insert(0, {"role": "system", "content": effective_system})
-
-        request_params = {
-            "model": model_id,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        if reasoning_effort is not None:
-            request_params["reasoning_effort"] = reasoning_effort
-        request_kwargs: Dict[str, Any] = {}
-        if request_timeout and request_timeout > 0:
-            request_kwargs["timeout"] = request_timeout
-
-        # Configure JSON output format (Ollama OpenAI-compatible API supports response_format)
-        if json_output:
-            if json_schema and self._supports_structured_outputs("ollama", model_id):
-                request_params["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "structured_output",
-                        "strict": True,
-                        "schema": json_schema,
-                    },
-                }
-                logger.info(f"Using Ollama JSON Schema structured outputs for {model_id}")
-            elif self._supports_json_object("ollama", model_id):
-                request_params["response_format"] = {"type": "json_object"}
-                logger.info(f"Using Ollama JSON mode for {model_id}")
-
-        async with self.model_call_concurrency_slot("ollama", model_id, "generate_content"):
-            response = await self.ollama_client.chat.completions.create(
-                **request_params,
-                **request_kwargs,
-            )
-
-        return self._chat_completion_content_and_usage(
-            response,
-            provider="ollama",
-            model_id=model_id,
-            max_tokens=max_tokens,
-        )
-
-    async def _stream_ollama(
-        self,
-        prompt: str,
-        model_id: str,
-        temperature: float,
-        max_tokens: int,
-        system_prompt: Optional[str],
-        request_timeout: Optional[float] = None,
-        json_output: bool = False,
-        json_schema: Optional[Dict[str, Any]] = None,
-        reasoning_effort: Optional[str] = None,
-        usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-        usage_extra: Optional[Dict[str, Any]] = None,
-    ):
-        """Stream Ollama content generation (OpenAI-compatible API)
-
-        Args:
-            prompt: Generation prompt
-            model_id: Ollama model identifier
-            temperature: Generation temperature
-            max_tokens: Maximum tokens
-            system_prompt: System prompt
-            request_timeout: Optional model-call process timeout in seconds
-            json_output: Enable JSON output mode
-            json_schema: Optional JSON schema for structured outputs
-            usage_callback: Callback for usage tracking
-            usage_extra: Extra usage tracking data
-        """
-        if not self.ollama_client:
-            raise ValueError("Ollama client not initialized. Set OLLAMA_HOST in your environment.")
-
-        extra_payload = usage_extra or {}
-
-        # Build system prompt with JSON instructions if needed (avoids prompt contamination in user message)
-        effective_system = system_prompt or ""
-        if self._should_inject_json_prompt("ollama", model_id, json_output, json_schema):
-            json_instructions = "IMPORTANT: Output valid JSON only. When including dialogue or quotes in string values, use single quotes (') instead of double quotes (\") to avoid JSON parsing errors. Example: He said 'hello' instead of He said \"hello\"."
-            if effective_system:
-                effective_system = f"{effective_system}\n\n{json_instructions}"
-            else:
-                effective_system = json_instructions
-
-        # User prompt stays clean
-        messages = [{"role": "user", "content": prompt}]
-
-        # Always include system message (with or without JSON instructions)
-        if effective_system:
-            messages.insert(0, {"role": "system", "content": effective_system})
-
-        try:
-            create_params = {
-                "model": model_id,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "stream": True
-            }
-            if reasoning_effort is not None:
-                create_params["reasoning_effort"] = reasoning_effort
-            request_kwargs: Dict[str, Any] = {}
-            if request_timeout and request_timeout > 0:
-                request_kwargs["timeout"] = request_timeout
-
-            # Include usage stats in streaming response (OpenAI-compatible API)
-            create_params.setdefault("stream_options", {})["include_usage"] = True
-
-            # Configure JSON output format (Ollama OpenAI-compatible API supports response_format)
-            if json_output:
-                if json_schema and self._supports_structured_outputs("ollama", model_id):
-                    create_params["response_format"] = {
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "structured_output",
-                            "strict": True,
-                            "schema": json_schema,
-                        },
-                    }
-                    logger.info(f"Using Ollama JSON Schema structured outputs (streaming) for {model_id}")
-                elif self._supports_json_object("ollama", model_id):
-                    create_params["response_format"] = {"type": "json_object"}
-                    logger.info(f"Using Ollama JSON mode (streaming) for {model_id}")
-
-            async with self.model_call_concurrency_slot("ollama", model_id, "generate_content_stream"):
-                stream = await self.ollama_client.chat.completions.create(
-                    **create_params,
-                    **request_kwargs,
-                )
-
-                usage_obj = None
-                finish_reason = None
-                async for chunk in stream:
-                    # Verify that choices exists and has elements before accessing
-                    if chunk.choices and len(chunk.choices) > 0:
-                        if getattr(chunk.choices[0], "finish_reason", None) is not None:
-                            finish_reason = getattr(chunk.choices[0], "finish_reason", None)
-                        if chunk.choices[0].delta.content is not None:
-                            yield chunk.choices[0].delta.content
-                    # Capture usage even if choices is empty
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        usage_obj = chunk.usage
-
-                if hasattr(stream, "response"):
-                    usage_obj = getattr(stream.response, "usage", usage_obj)
-                elif hasattr(stream, "usage") and stream.usage:
-                    usage_obj = stream.usage
-
-                usage_with_finish = self._usage_with_finish_metadata(
-                    usage_obj,
-                    None,
-                    provider="ollama",
-                    max_tokens=max_tokens,
-                    fallback_finish_reason=finish_reason,
-                )
-                self._emit_usage(
-                    usage_callback,
-                    model_id,
-                    "ollama",
-                    usage_with_finish,
-                    extra_payload,
-                )
-                yield StreamChunk(
-                    "",
-                    is_thinking=False,
-                    metadata=_build_finish_metadata(
-                        provider="ollama",
-                        finish_reason=finish_reason,
-                        max_tokens=max_tokens,
-                    ),
-                )
-        except Exception as e:
-            logger.error(f"Ollama streaming error: {e}")
-            raise
 
     async def _generate_fake(
         self,
@@ -14781,6 +15081,7 @@ class AIService:
         request_timeout: Optional[float] = None,
         json_output: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
+        shared_context: Optional[str] = None,
     ) -> tuple:
         """Generate content using Fake AI server (for testing).
 
@@ -14797,6 +15098,10 @@ class AIService:
             raise ValueError("Fake AI client not initialized. Set FAKE_AI_HOST in your environment.")
 
         messages = [{"role": "user", "content": prompt}]
+
+        messages = prepend_user_context(
+            messages, shared_context, provider="fake", model_id=model_id
+        )
         if system_prompt:
             messages.insert(0, {"role": "system", "content": system_prompt})
 
@@ -14837,6 +15142,7 @@ class AIService:
         json_schema: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
+        shared_context: Optional[str] = None,
     ):
         """Stream content generation using Fake AI server (for testing).
 
@@ -14857,6 +15163,10 @@ class AIService:
         extra_payload = usage_extra or {}
 
         messages = [{"role": "user", "content": prompt}]
+
+        messages = prepend_user_context(
+            messages, shared_context, provider="fake", model_id=model_id
+        )
         if system_prompt:
             messages.insert(0, {"role": "system", "content": system_prompt})
 
@@ -14993,6 +15303,10 @@ class AIService:
             return [item.embedding for item in response.data]
 
         except Exception as e:
+            refusal = find_terminal_refusal(e)
+            if refusal is not None:
+                # Never retried with the fallback model or swallowed into empty vectors.
+                raise refusal
             logger.error(f"OpenAI embedding error: {e}")
             last_error: Exception = e
             try:
@@ -15014,6 +15328,9 @@ class AIService:
                 # A fallback-model admission verdict is fatal — never empty vectors.
                 raise
             except Exception as e2:
+                refusal = find_terminal_refusal(e2)
+                if refusal is not None:
+                    raise refusal
                 logger.error(f"OpenAI embedding fallback failed: {e2}")
                 last_error = e2
 
@@ -15073,6 +15390,10 @@ class AIService:
             return embeddings
 
         except Exception as e:
+            refusal = find_terminal_refusal(e)
+            if refusal is not None:
+                # Never swallowed into empty vectors.
+                raise refusal
             logger.error(f"Google embedding error: {e}")
             # Degraded batch: keep the documented empty-vector fallback,
             # but count it in provider health (AIS-07).
@@ -15201,7 +15522,6 @@ class AIService:
 
         provider_clients = (
             ("OpenAI async client", getattr(self, "openai_client", None)),
-            ("OpenAI sync client", getattr(self, "openai_sync_client", None)),
             ("Anthropic client", getattr(self, "anthropic_client", None)),
             ("xAI client", getattr(self, "xai_client", None)),
             ("OpenRouter client", getattr(self, "openrouter_client", None)),

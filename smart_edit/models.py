@@ -17,7 +17,6 @@ QA Integration Types (for AI-assisted quality evaluation):
 - MarkerConfig: Configuration for paragraph markers
 - TextEditRange: A text range identified by QA for editing
 - EditContext: Context for applying edits
-- EditDecision: Strategic decision about edit approach
 - QAEvaluationWithRanges: Extended QA evaluation with edit ranges
 
 This module is designed to be self-contained for use as a standalone package.
@@ -585,28 +584,6 @@ class EditContext(EditBaseModel):
         None,
         description="Detected tone indicators"
     )
-
-
-class EditDecision(EditBaseModel):
-    """Strategic decision about correction approach."""
-
-    strategy: str = Field(
-        ...,
-        description="'incremental_edit' or 'full_regeneration'"
-    )
-    reason: str = Field(
-        ...,
-        description="Justification for the chosen strategy"
-    )
-
-    # For incremental editing
-    edit_ranges: Optional[List[TextEditRange]] = None
-    total_issues: int = 0
-    editable_issues: int = 0
-    estimated_tokens_saved: int = 0
-
-    # Applied thresholds
-    applied_thresholds: Optional[Dict[str, Any]] = None
 
 
 class QAEvaluationWithRanges(EditBaseModel):

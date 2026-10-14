@@ -38,7 +38,8 @@ from gran_sabio import GranSabioInvocationError, GranSabioProcessCancelled
 from llm_routing import endpoint_id_call_kwargs
 from local_execution_policy import LocalExecutionPolicyError
 from model_aliasing import ModelAliasRegistry, get_evaluator_alias
-from models import EvidenceGroundingConfig, EvidenceGroundingResult, QAEvaluation, QALayer
+from models import EvidenceGroundingConfig, EvidenceGroundingResult, QAEvaluation, QALayer, request_evidence_context
+from provider_drain import ProviderDispatchClosed, gather_draining, raise_if_dispatch_closed
 from qa_bypass_engine import QABypassEngine
 from qa_evaluation_service import QAEvaluationService, QAResponseParseError
 from qa_result_utils import (
@@ -60,6 +61,7 @@ from qa_scheduler import (
     QASchedulerUnavailableError,
 )
 from request_timeouts import coerce_timeout_seconds, resolve_request_timeout
+from services.typesafe_client import build_system_one_budget, is_typesafe_provider
 from usage_tracking import UsageTracker
 
 logger = logging.getLogger(__name__)
@@ -465,6 +467,10 @@ class QAEngine:
                     f"Evaluating without images."
                 )
 
+        # Import after QAEngine exists: core initializes the app and imports this class.
+        from core.cancellation import provider_phase_override
+
+        phase_marker = provider_phase_override.set("qa")
         try:
             return await self.qa_evaluator.evaluate_content(
                 content=content,
@@ -509,6 +515,8 @@ class QAEngine:
         except Exception as e:
             logger.error(f"QA evaluation failed for layer {layer.name} with model {model_config.model}: {str(e)}")
             raise
+        finally:
+            provider_phase_override.reset(phase_marker)
 
     async def evaluate_all_layers(
         self,
@@ -790,7 +798,7 @@ class QAEngine:
                     await progress_callback("Evidence grounding verification...")
 
                 grounding_config = plan_item["config"]
-                context = context_for_grounding or getattr(original_request, 'prompt', '')
+                context = context_for_grounding or request_evidence_context(original_request)
 
                 qa_eval, full_result = await self._evaluate_evidence_grounding(
                     content=content,
@@ -1424,7 +1432,7 @@ Source QA layers:
                 await progress_callback("Final verification: Evidence Grounding")
             qa_eval, full_result = await self._evaluate_evidence_grounding(
                 content=content,
-                context=context_for_grounding or getattr(original_request, "prompt", ""),
+                context=context_for_grounding or request_evidence_context(original_request),
                 grounding_config=grounding_config,
                 progress_callback=progress_callback,
                 stream_callback=stream_callback,
@@ -1479,23 +1487,17 @@ Source QA layers:
 
             async def run_item(item: Tuple[str, Any]) -> Tuple[str, Dict[str, QAEvaluation], Optional[Any]]:
                 async with semaphore:
+                    # A sibling failure may close dispatch while this item was queued.
+                    raise_if_dispatch_closed()
                     item_type, payload = item
                     if item_type == "evidence_grounding":
                         return await evaluate_grounding()
                     return await evaluate_layer(payload)
 
-            item_tasks = [asyncio.create_task(run_item(item)) for item in execution_items]
-            try:
-                item_results = await asyncio.gather(*item_tasks)
-            except BaseException:
-                # gather does not cancel siblings on a first raise; stop the
-                # remaining layer/grounding tasks so they do not keep burning
-                # paid API calls after the verification has already aborted.
-                for task in item_tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*item_tasks, return_exceptions=True)
-                raise
+            # A failing layer or grounding item fails the verification, but the
+            # provider calls its siblings already started finish first so their
+            # usage is measured; no sibling starts a new call.
+            item_results = await gather_draining(*(run_item(item) for item in execution_items))
         else:
             item_results = []
             for item_type, payload in execution_items:
@@ -2115,10 +2117,14 @@ Source QA layers:
                 # A context-admission error (local budget overflow, capacity
                 # unknown, or a provider-reported overflow) is NEVER a quorum-
                 # absorbable technical failure. Re-raise BEFORE the generic
-                # handler so the scheduler aborts the whole layer and cancels
-                # in-flight sibling slots instead of manufacturing a placeholder.
+                # handler so the scheduler fails the whole layer instead of
+                # manufacturing a placeholder.
                 raise
             except LocalExecutionPolicyError:
+                raise
+            except ProviderDispatchClosed:
+                # A sibling failure is draining the layer: this evaluator never
+                # reached a provider, so it is no evaluator failure.
                 raise
             except Exception as exc:
                 if is_content_filter_stop(exc):
@@ -2303,25 +2309,9 @@ Source QA layers:
             else None
         )
 
-        # Render the shared QA text payload once. The image note is included when
-        # the layer carries images (a small, constant overhead); the real
-        # per-image token cost is added per vision-capable evaluator below.
-        rendered = QAEvaluationService.render_qa_evaluation_prompt(
-            content=content,
-            criteria=layer.criteria,
-            layer_name=layer.name,
-            min_score=layer.min_score,
-            deal_breaker_criteria=getattr(layer, "deal_breaker_criteria", None),
-            concise_on_pass=getattr(layer, "concise_on_pass", True),
-            original_request=original_request,
-            request_edit_info=request_edit_info,
-            marker_mode=marker_mode,
-            marker_length=marker_length,
-            word_map_formatted=word_map_formatted,
-            draft_map_formatted=draft_map_formatted,
-            input_images=layer_images,
-            edit_history=edit_history,
-        )
+        # Render each distinct transport payload once, only when a slot uses it.
+        rendered = None
+        system_one_payload = None
 
         image_tokens = 0
         if layer_images:
@@ -2368,6 +2358,45 @@ Source QA layers:
                 else QAModelConfig(model=model_name)
             )
             provider = _provider_for(model_name)
+            if client_named:
+                labels.append(model_name)
+            elif model_alias_registry is not None:
+                labels.append(model_alias_registry.qa_alias(slot.index))
+            else:
+                labels.append(f"Evaluator {slot.index + 1}")
+            if is_typesafe_provider(provider):
+                if system_one_payload is None:
+                    system_one_payload = QAEvaluationService.build_system_one_qa_payload(
+                        content=content,
+                        criteria=layer.criteria,
+                        layer_name=layer.name,
+                        min_score=layer.min_score,
+                        deal_breaker_criteria=getattr(layer, "deal_breaker_criteria", None),
+                        original_request=original_request,
+                        edit_history=edit_history,
+                    )
+                state, questions = system_one_payload
+                budgets.append(build_system_one_budget(
+                    state, questions, model_name, call_id="qa.evaluate_layer",
+                ))
+                continue
+            if rendered is None:
+                rendered = QAEvaluationService.render_qa_evaluation_prompt(
+                    content=content,
+                    criteria=layer.criteria,
+                    layer_name=layer.name,
+                    min_score=layer.min_score,
+                    deal_breaker_criteria=getattr(layer, "deal_breaker_criteria", None),
+                    concise_on_pass=getattr(layer, "concise_on_pass", True),
+                    original_request=original_request,
+                    request_edit_info=request_edit_info,
+                    marker_mode=marker_mode,
+                    marker_length=marker_length,
+                    word_map_formatted=word_map_formatted,
+                    draft_map_formatted=draft_map_formatted,
+                    input_images=layer_images,
+                    edit_history=edit_history,
+                )
             reserved_output = config.resolve_qa_max_tokens(
                 model_name, model_config.max_tokens
             ) or 0
@@ -2385,6 +2414,11 @@ Source QA layers:
                     model_name,
                 ),
             ]
+            shared_context = getattr(original_request, "shared_context", None)
+            if shared_context:
+                components.append(context_budget.make_payload_component(
+                    "shared_context", shared_context, "message", provider, model_name,
+                ))
             if image_tokens and _model_supports_vision(model_name):
                 components.append(
                     context_budget.PayloadComponent(
@@ -2406,13 +2440,6 @@ Source QA layers:
                     content_type_hint="prose",
                 )
             )
-
-            if client_named:
-                labels.append(model_name)
-            elif model_alias_registry is not None:
-                labels.append(model_alias_registry.qa_alias(slot.index))
-            else:
-                labels.append(f"Evaluator {slot.index + 1}")
 
         native_counter = (
             None

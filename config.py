@@ -56,6 +56,16 @@ _REASONING_EFFORT_ORDER = (
 
 DEFAULT_OUTPUT_TOKEN_FALLBACK = 8192
 
+SYSTEM_ONE_NOUL_YES_THRESHOLD = 0.5
+SYSTEM_ONE_QA_SCORE_LEVELS = (
+    "Does not satisfy the criterion; the content is unusable for this requirement.",
+    "Mostly fails the criterion, with major errors or omissions.",
+    "Partially satisfies the criterion, but substantial corrections are needed.",
+    "Mostly satisfies the criterion, with several meaningful issues remaining.",
+    "Satisfies the criterion well, with only minor issues.",
+    "Fully satisfies the criterion, with no relevant errors or omissions.",
+)
+
 
 def _strip_model_prefix(model_name: str) -> str:
     """Remove any mechanical provider prefix from a model name."""
@@ -686,6 +696,11 @@ class Config(BaseModel):
     OPENROUTER_API_KEY: str = Field(default="", description="OpenRouter API key for unified model access")
     MINIMAX_API_KEY: str = Field(default="", description="MiniMax API key")
     MOONSHOT_API_KEY: str = Field(default="", description="Moonshot AI / Kimi API key")
+    TYPESAFE_API_KEY: str = Field(default="", description="TypeSafe API key for Jev System One")
+    TYPESAFE_BASE_URL: str = Field(
+        default="https://api.typesafe.ai",
+        description="TypeSafe System One API base URL",
+    )
     OLLAMA_HOST: str = Field(default="http://localhost:11434", description="Ollama server URL for local models")
     OLLAMA_ENDPOINT_ALIAS: str = Field(
         default="ollama",
@@ -812,7 +827,7 @@ Score scale:
 - 9-10: Excellent; meets all requirements
 
 Note: For non-text content (code, formulas, structured data), editable/edit_strategy fields are not needed.
-Evaluate based on the specific criteria provided, not on editorial or narrative quality.""")
+Evaluate only the specific dimensions requested by the provided criteria, including voice, editorial quality, or narrative quality when explicitly requested. Do not apply unrelated quality standards.""")
 
     CONSENSUS_SYSTEM_PROMPT: str = Field(default="""You are the editor-in-chief. Review all evaluator reports and provide a final consensus that weighs:
 1) Rater agreement/disagreement
@@ -954,6 +969,18 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         description="Input plus reserved-generation tokens above which unverified capacity is reject-eligible",
     )
     MAX_RETRIES: int = Field(default=3, description="Maximum retries for failed requests")
+    # Optional process-wide, durable dispatch budget. A missing ledger path keeps
+    # normal runtimes unchanged; an enabled policy requires all explicit bounds.
+    PROVIDER_BUDGET_LEDGER_PATH: str = Field(default="", description="Absolute private SQLite spend ledger; empty disables")
+    PROVIDER_BUDGET_LIMIT_USD: str = Field(default="", description="Accumulated external spend ceiling in USD")
+    PROVIDER_BUDGET_OPENROUTER_MODEL: str = Field(default="", description="One explicitly authorized OpenRouter model")
+    PROVIDER_BUDGET_INPUT_USD_PER_MILLION: str = Field(default="", description="Maximum prompt tariff in USD per million tokens")
+    PROVIDER_BUDGET_OUTPUT_USD_PER_MILLION: str = Field(default="", description="Maximum completion tariff in USD per million tokens")
+    PROVIDER_BUDGET_MAX_INPUT_TOKENS: int = Field(default=0, description="Verified model input ceiling, including framing")
+    PROVIDER_BUDGET_MAX_OUTPUT_TOKENS: int = Field(default=0, description="Verified max_tokens ceiling including reasoning")
+    PROVIDER_BUDGET_TYPESAFE_MODEL: str = Field(default="", description="Optional bounded TypeSafe wire model sharing the spend ledger")
+    PROVIDER_BUDGET_TYPESAFE_INPUT_USD_PER_MILLION: str = Field(default="", description="Verified TypeSafe input-only tariff")
+    PROVIDER_BUDGET_TYPESAFE_MAX_INPUT_TOKENS: int = Field(default=0, description="Verified TypeSafe input ceiling")
     RETRY_DELAY: float = Field(default=10.0, description="Base delay between retries in seconds")
     RETRY_BACKOFF_MULTIPLIER: float = Field(default=2.0, description="Multiplier for exponential backoff (delay = base * multiplier^attempt)")
     RETRY_MAX_DELAY: float = Field(default=120.0, description="Maximum delay between retries in seconds")
@@ -1014,13 +1041,6 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         le=50,
         description="Maximum number of paragraphs that can be edited in a single smart edit iteration. Maximum edits per run."
     )
-    DEFAULT_MAX_CONSECUTIVE_SMART_EDITS: int = Field(
-        default=50,
-        ge=1,
-        le=999,
-        description="Default maximum global number of consecutive smart edit iterations before forcing full regeneration"
-    )
-
     # Smart Edit Marker Configuration
     SMART_EDIT_MIN_PHRASE_LENGTH: int = Field(
         default=4,
@@ -1157,7 +1177,6 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
     # Provider SDK process/read timeouts. These are intentionally distinct from
     # low-level socket connect timeouts and can cut slow model calls.
     SDK_OPENAI_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="OpenAI async SDK process timeout")
-    SDK_OPENAI_SYNC_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="OpenAI sync SDK process timeout")
     SDK_ANTHROPIC_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="Anthropic SDK process timeout")
     SDK_XAI_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="xAI SDK process timeout")
     SDK_OPENROUTER_TIMEOUT_SECONDS: int = Field(default=12000, gt=0, description="OpenRouter SDK process timeout")
@@ -1425,6 +1444,10 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             or os.getenv("KIMI_API_KEY", "")
             or os.getenv("KIMI_OPEN_PLATFORM_API_KEY", "")
         )
+        self.TYPESAFE_API_KEY = os.getenv("TYPESAFE_API_KEY", "")
+        typesafe_base_url = os.getenv("TYPESAFE_BASE_URL", "").strip()
+        if typesafe_base_url:
+            self.TYPESAFE_BASE_URL = typesafe_base_url.rstrip("/")
         self.OLLAMA_HOST = os.getenv("OLLAMA_HOST", self.OLLAMA_HOST)
         self.LOCAL_ENDPOINTS_CONFIG_PATH = os.getenv(
             "LOCAL_ENDPOINTS_CONFIG_PATH", self.LOCAL_ENDPOINTS_CONFIG_PATH
@@ -1551,6 +1574,12 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                 "true",
                 "yes",
                 "on",
+            }
+
+        feedback_enabled_override = os.getenv("FEEDBACK_MEMORY_ENABLED")
+        if feedback_enabled_override is not None:
+            self.FEEDBACK_MEMORY.enabled = feedback_enabled_override.strip().lower() in {
+                "1", "true", "yes", "on"
             }
 
         debugger_enabled_override = os.getenv("DEBUGGER_ENABLED")
@@ -1733,10 +1762,6 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "MAX_PARAGRAPHS_PER_INCREMENTAL_RUN", os.getenv("MAX_PARAGRAPHS_PER_INCREMENTAL_RUN"), 12,
             field_name="MAX_PARAGRAPHS_PER_INCREMENTAL_RUN",
         )
-        self.DEFAULT_MAX_CONSECUTIVE_SMART_EDITS = self._parse_env_int(
-            "DEFAULT_MAX_CONSECUTIVE_SMART_EDITS", os.getenv("DEFAULT_MAX_CONSECUTIVE_SMART_EDITS"), 50,
-            field_name="DEFAULT_MAX_CONSECUTIVE_SMART_EDITS",
-        )
 
         # Smart Edit Marker Configuration
         self.SMART_EDIT_MIN_PHRASE_LENGTH = self._parse_env_int(
@@ -1842,14 +1867,6 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                 fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
             )
         )
-        self.SDK_OPENAI_SYNC_TIMEOUT_SECONDS = int(
-            resolve_env_timeout(
-                "SDK_OPENAI_SYNC_TIMEOUT_SECONDS",
-                self.REQUEST_TIMEOUTS,
-                ("sdk_model_timeouts", "openai_sync_seconds"),
-                fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
-            )
-        )
         self.SDK_ANTHROPIC_TIMEOUT_SECONDS = int(
             resolve_env_timeout(
                 "SDK_ANTHROPIC_TIMEOUT_SECONDS",
@@ -1898,6 +1915,15 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                 fallback=DEFAULT_PROCESS_TIMEOUT_SECONDS,
             )
         )
+        for budget_field in (
+            "PROVIDER_BUDGET_LEDGER_PATH", "PROVIDER_BUDGET_LIMIT_USD", "PROVIDER_BUDGET_OPENROUTER_MODEL",
+            "PROVIDER_BUDGET_INPUT_USD_PER_MILLION", "PROVIDER_BUDGET_OUTPUT_USD_PER_MILLION",
+            "PROVIDER_BUDGET_TYPESAFE_MODEL", "PROVIDER_BUDGET_TYPESAFE_INPUT_USD_PER_MILLION",
+        ):
+            setattr(self, budget_field, os.getenv(budget_field, ""))
+        for budget_field in ("PROVIDER_BUDGET_MAX_INPUT_TOKENS", "PROVIDER_BUDGET_MAX_OUTPUT_TOKENS",
+                             "PROVIDER_BUDGET_TYPESAFE_MAX_INPUT_TOKENS"):
+            setattr(self, budget_field, int(os.getenv(budget_field, "0")))
         self.SDK_LLAMACPP_TIMEOUT_SECONDS = int(
             resolve_env_timeout(
                 "SDK_LLAMACPP_TIMEOUT_SECONDS",
@@ -2252,6 +2278,9 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         elif provider == "moonshot":
             api_key = self.MOONSHOT_API_KEY
             env_hint = "MOONSHOT_API_KEY"
+        elif provider == "typesafe":
+            api_key = self.TYPESAFE_API_KEY
+            env_hint = "TYPESAFE_API_KEY"
         elif provider == "ollama":
             api_key = "ollama"
         elif provider == "llamacpp":
@@ -3226,6 +3255,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "openrouter": bool(self.OPENROUTER_API_KEY),
             "minimax": bool(self.MINIMAX_API_KEY),
             "moonshot": bool(self.MOONSHOT_API_KEY),
+            "typesafe": bool(self.TYPESAFE_API_KEY),
         }
 
     def validate_token_limits(

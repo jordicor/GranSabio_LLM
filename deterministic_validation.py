@@ -5,12 +5,15 @@ Shared deterministic validation helpers for generation and QA bypass.
 from __future__ import annotations
 
 import logging
+import re
 import statistics
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
+import json_utils
 from json_field_utils import try_extract_json_from_content
-from models import WordCountEnforcement, is_json_output_requested
+from models import QAEvaluation, WordCountEnforcement, is_json_output_requested
 from phrase_frequency_config import is_phrase_frequency_active
 from tool_loop_models import PayloadScope
 from tools.ai_json_cleanroom import ValidateOptions, validate_ai_json
@@ -150,6 +153,9 @@ def has_active_generation_validators(request: Any) -> bool:
 
 def _requires_text_for_validation(request: Any) -> bool:
     """Return True when active deterministic checks need extracted/plain text."""
+
+    if _segment_budget_contract_dict(request) is not None:
+        return True
 
     if getattr(request, "min_words", None) or getattr(request, "max_words", None):
         return True
@@ -667,6 +673,571 @@ def evaluate_cumulative_repetition_check(text: str, request: Any) -> Optional[De
     )
 
 
+# ---------------------------------------------------------------------------
+# Segment budgets contract (segment-budgets/v1)
+# ---------------------------------------------------------------------------
+
+#: Check/QA-layer name used by the deterministic segment budget guard.
+SEGMENT_BUDGET_CHECK_NAME = "Segment Budget Guard"
+
+_SEGMENT_BUDGET_SCHEMA_VERSION = "segment-budgets/v1"
+_SEGMENT_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+|$)(.*)$")
+_SEGMENT_ID_RE = re.compile(r"^[^:\s]+$")
+_SEGMENT_BUDGET_FIELDS = ("min_words", "target_words", "max_words")
+_SEGMENT_BUDGET_MAX_ISSUES = 6
+
+
+def _segment_budget_contract_dict(request: Any) -> Optional[Dict[str, Any]]:
+    """Return the normalized segment budgets contract, or None when inactive."""
+
+    contract = word_count_config_to_dict(getattr(request, "segment_budgets", None))
+    if not contract or not contract.get("enabled", True):
+        return None
+    return contract
+
+
+def _json_payload_from_context(context: DeterministicValidationContext) -> Any:
+    """Return the decoded JSON payload of the candidate when available."""
+
+    metadata = context.json_check.metadata if context.json_check else {}
+    data = metadata.get("data")
+    if data is None and isinstance(metadata.get("json_validation"), dict):
+        data = metadata["json_validation"].get("data")
+    if data is None:
+        try:
+            data = json_utils.loads(context.raw_content)
+        except Exception:
+            data = None
+    return data
+
+
+def _segment_budget_issue(
+    code: str,
+    message: str,
+    suggestion: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> DeterministicIssue:
+    """Build one hard segment-budget issue (all contract violations are hard)."""
+
+    return DeterministicIssue(
+        code=code,
+        severity="critical",
+        message=message,
+        hard=True,
+        suggestion=suggestion,
+        metadata=metadata or {},
+    )
+
+
+def _parse_segment_word_budget(
+    value: Any,
+    *,
+    label: str,
+    issues: List[DeterministicIssue],
+) -> Optional[Dict[str, int]]:
+    """Validate one min/target/max budget triple; extra keys are ignored (v1)."""
+
+    if not isinstance(value, dict) or any(
+        type(value.get(field)) is not int for field in _SEGMENT_BUDGET_FIELDS
+    ):
+        issues.append(_segment_budget_issue(
+            "segment_budget_structure_invalid",
+            f"{label} word_budget must declare integer min_words, target_words and max_words.",
+            suggestion="Declare all three budget fields as integers.",
+        ))
+        return None
+    budget = {field: int(value[field]) for field in _SEGMENT_BUDGET_FIELDS}
+    if (
+        not 0 <= budget["min_words"] <= budget["target_words"] <= budget["max_words"]
+        or budget["target_words"] < 1
+    ):
+        issues.append(_segment_budget_issue(
+            "segment_budget_structure_invalid",
+            f"{label} word_budget is incoherent (min={budget['min_words']}, "
+            f"target={budget['target_words']}, max={budget['max_words']}); "
+            "expected 0 <= min <= target <= max with target >= 1.",
+            suggestion="Fix the budget so that min <= target <= max and target >= 1.",
+        ))
+        return None
+    return budget
+
+
+def _validate_segment_budget_structure(
+    structure: Any,
+    *,
+    structure_field: str,
+    request_min_words: Optional[int],
+    request_max_words: Optional[int],
+) -> Tuple[Optional[Dict[str, int]], List[Dict[str, Any]], List[DeterministicIssue]]:
+    """Validate the self-declared structure object (segment-budgets/v1).
+
+    Returns ``(document_budget, sections, issues)``; the first two values are
+    only meaningful when ``issues`` is empty. Fields not owned by v1 are
+    ignored. Distribution rules and the request-bounds anti-elusion rule only
+    run when the base structure is fully valid, to avoid cascading noise.
+    """
+
+    issues: List[DeterministicIssue] = []
+    if not isinstance(structure, dict):
+        issues.append(_segment_budget_issue(
+            "segment_budget_structure_invalid",
+            f"Structure field '{structure_field}' is missing or is not a JSON object.",
+            suggestion=(
+                f"Return a '{structure_field}' JSON object declaring word_budget "
+                "and the ordered sections."
+            ),
+        ))
+        return None, [], issues
+
+    document_budget = _parse_segment_word_budget(
+        structure.get("word_budget"), label="Document", issues=issues,
+    )
+
+    raw_sections = structure.get("sections")
+    if not isinstance(raw_sections, list):
+        issues.append(_segment_budget_issue(
+            "segment_budget_structure_invalid",
+            "Structure 'sections' must be a list (empty for a continuous document).",
+            suggestion="Declare sections as an ordered list, or [] for a continuous document.",
+        ))
+        return document_budget, [], issues
+
+    sections: List[Dict[str, Any]] = []
+    by_id: Dict[str, Optional[str]] = {}
+    active_parent: Optional[str] = None
+    for index, raw_section in enumerate(raw_sections):
+        position = f"sections[{index}]"
+        if not isinstance(raw_section, dict):
+            issues.append(_segment_budget_issue(
+                "segment_budget_structure_invalid",
+                f"{position} must be a JSON object with title and word_budget.",
+            ))
+            continue
+        title = raw_section.get("title")
+        if (
+            not isinstance(title, str)
+            or not title.strip()
+            or title != title.strip()
+            or "\n" in title
+            or "\r" in title
+        ):
+            issues.append(_segment_budget_issue(
+                "segment_budget_structure_invalid",
+                f"{position} title must be a non-empty single-line string without "
+                "surrounding whitespace.",
+            ))
+            continue
+        subsection_id = raw_section.get("subsection_id")
+        if subsection_id is not None:
+            if not isinstance(subsection_id, str) or not _SEGMENT_ID_RE.fullmatch(subsection_id):
+                issues.append(_segment_budget_issue(
+                    "segment_budget_structure_invalid",
+                    f"{position} subsection_id '{subsection_id}' is invalid; it must "
+                    "be non-empty and contain no ':' or whitespace.",
+                ))
+                continue
+            if subsection_id in by_id:
+                issues.append(_segment_budget_issue(
+                    "segment_budget_structure_invalid",
+                    f"{position} duplicates subsection_id '{subsection_id}'.",
+                    suggestion="Keep every subsection_id unique.",
+                ))
+                continue
+        parent = raw_section.get("parent_subsection_id")
+        if parent is not None:
+            if not isinstance(parent, str) or parent not in by_id:
+                issues.append(_segment_budget_issue(
+                    "segment_budget_structure_invalid",
+                    f"{position} parent_subsection_id '{parent}' does not reference a "
+                    "preceding top-level section.",
+                ))
+                continue
+            if by_id[parent] is not None:
+                issues.append(_segment_budget_issue(
+                    "segment_budget_structure_invalid",
+                    f"{position} exceeds the maximum depth: only two section levels "
+                    "are allowed (section and subsection).",
+                ))
+                continue
+            if parent != active_parent:
+                issues.append(_segment_budget_issue(
+                    "segment_budget_structure_invalid",
+                    f"{position} is not contiguous to its parent '{parent}'; child "
+                    "sections must immediately follow their parent and siblings.",
+                ))
+                continue
+        section_budget = _parse_segment_word_budget(
+            raw_section.get("word_budget"),
+            label=f"Section '{title}'",
+            issues=issues,
+        )
+        if section_budget is None:
+            continue
+        if parent is None:
+            active_parent = subsection_id
+        if subsection_id is not None:
+            by_id[subsection_id] = parent
+        sections.append({
+            "title": title,
+            "subsection_id": subsection_id,
+            "parent_subsection_id": parent,
+            "word_budget": section_budget,
+        })
+
+    if issues or document_budget is None:
+        return document_budget, sections, issues
+
+    top_level = [section for section in sections if section["parent_subsection_id"] is None]
+    if top_level:
+        target_sum = sum(section["word_budget"]["target_words"] for section in top_level)
+        max_sum = sum(section["word_budget"]["max_words"] for section in top_level)
+        if target_sum != document_budget["target_words"]:
+            issues.append(_segment_budget_issue(
+                "segment_budget_distribution_invalid",
+                f"Top-level section targets sum to {target_sum}, but the document "
+                f"target is {document_budget['target_words']}.",
+                suggestion="Adjust section targets so they sum exactly to the document target.",
+            ))
+        if max_sum > document_budget["max_words"]:
+            issues.append(_segment_budget_issue(
+                "segment_budget_distribution_invalid",
+                f"Top-level section maximums sum to {max_sum}, above the document "
+                f"maximum of {document_budget['max_words']}.",
+                suggestion="Lower section maximums so their sum fits the document maximum.",
+            ))
+    for parent_section in top_level:
+        children = [
+            section for section in sections
+            if section["parent_subsection_id"] == parent_section["subsection_id"]
+            and parent_section["subsection_id"] is not None
+        ]
+        if not children:
+            continue
+        parent_budget = parent_section["word_budget"]
+        parent_label = f"'{parent_section['title']}' ({parent_section['subsection_id']})"
+        child_target_sum = sum(section["word_budget"]["target_words"] for section in children)
+        child_max_sum = sum(section["word_budget"]["max_words"] for section in children)
+        if child_target_sum != parent_budget["target_words"]:
+            issues.append(_segment_budget_issue(
+                "segment_budget_distribution_invalid",
+                f"Child targets of {parent_label} sum to {child_target_sum}, but the "
+                f"parent target is {parent_budget['target_words']}.",
+                suggestion="Adjust child targets so they sum exactly to the parent target.",
+            ))
+        if child_max_sum > parent_budget["max_words"]:
+            issues.append(_segment_budget_issue(
+                "segment_budget_distribution_invalid",
+                f"Child maximums of {parent_label} sum to {child_max_sum}, above the "
+                f"parent maximum of {parent_budget['max_words']}.",
+                suggestion="Lower child maximums so their sum fits the parent maximum.",
+            ))
+
+    if request_min_words is not None and document_budget["min_words"] < request_min_words:
+        issues.append(_segment_budget_issue(
+            "segment_budget_document_exceeds_request",
+            f"Declared document minimum ({document_budget['min_words']}) is below "
+            f"the request min_words ({request_min_words}).",
+            suggestion="Declare a document budget inside the request min_words/max_words.",
+        ))
+    if request_max_words is not None and document_budget["max_words"] > request_max_words:
+        issues.append(_segment_budget_issue(
+            "segment_budget_document_exceeds_request",
+            f"Declared document maximum ({document_budget['max_words']}) exceeds "
+            f"the request max_words ({request_max_words}).",
+            suggestion="Declare a document budget inside the request min_words/max_words.",
+        ))
+
+    return document_budget, sections, issues
+
+
+def _evaluate_segment_budget_text(
+    text: str,
+    document_budget: Dict[str, int],
+    sections: List[Dict[str, Any]],
+    *,
+    base_heading_level: int,
+) -> Tuple[List[DeterministicIssue], Dict[str, Any]]:
+    """Cross the target text with the declared structure.
+
+    Heading sequence and inclusive segment lengths mirror the reference
+    ``validate_composed_text`` semantics; word counting uses ``count_words``
+    (``\\w+`` runs, headings included).
+    """
+
+    lines = text.splitlines()
+    headings = [
+        (index, len(match.group(1)), match.group(2).rstrip())
+        for index, line in enumerate(lines)
+        if (match := _SEGMENT_HEADING_RE.match(line))
+    ]
+    expected = [
+        (
+            base_heading_level if section["parent_subsection_id"] is None else base_heading_level + 1,
+            section["title"],
+        )
+        for section in sections
+    ]
+    found = [(level, title) for _, level, title in headings]
+    if found != expected:
+        expected_render = " -> ".join(f"(H{level}) {title}" for level, title in expected)
+        if not expected_render:
+            expected_render = "no headings (continuous document)"
+        issue = _segment_budget_issue(
+            "segment_budget_headings_mismatch",
+            f"Text headings do not match the declared structure: expected "
+            f"{len(expected)} heading(s), found {len(found)}.",
+            suggestion=f"Use exactly these headings in this order: {expected_render}.",
+            metadata={
+                "expected_headings": [[level, title] for level, title in expected],
+                "found_headings": [[level, title] for level, title in found],
+            },
+        )
+        return [issue], {"headings_mismatch": issue.metadata}
+
+    issues: List[DeterministicIssue] = []
+    document_count = count_words(text)
+    document_report = {
+        "actual": document_count,
+        "min_words": document_budget["min_words"],
+        "max_words": document_budget["max_words"],
+        "within_budget": True,
+    }
+    if not document_budget["min_words"] <= document_count <= document_budget["max_words"]:
+        document_report["within_budget"] = False
+        if document_count < document_budget["min_words"]:
+            suggestion = (
+                f"Expand the document by at least "
+                f"{document_budget['min_words'] - document_count} words."
+            )
+        else:
+            suggestion = (
+                f"Condense the document by at least "
+                f"{document_count - document_budget['max_words']} words."
+            )
+        issues.append(_segment_budget_issue(
+            "segment_budget_document_out_of_bounds",
+            f"Document has {document_count} words; declared budget is "
+            f"{document_budget['min_words']}-{document_budget['max_words']}.",
+            suggestion=suggestion,
+            metadata=dict(document_report),
+        ))
+
+    section_reports: List[Dict[str, Any]] = []
+    for position, section in enumerate(sections):
+        start, level, _ = headings[position]
+        end = next(
+            (line for line, next_level, _ in headings[position + 1:] if next_level <= level),
+            len(lines),
+        )
+        section_count = count_words("\n".join(lines[start:end]))
+        budget = section["word_budget"]
+        within_budget = budget["min_words"] <= section_count <= budget["max_words"]
+        report = {
+            "title": section["title"],
+            "subsection_id": section["subsection_id"],
+            "actual": section_count,
+            "min_words": budget["min_words"],
+            "max_words": budget["max_words"],
+            "within_budget": within_budget,
+        }
+        section_reports.append(report)
+        if within_budget:
+            continue
+        id_part = (
+            f" (subsection_id '{section['subsection_id']}')"
+            if section["subsection_id"]
+            else ""
+        )
+        if section_count < budget["min_words"]:
+            suggestion = (
+                f"Expand section '{section['title']}' by at least "
+                f"{budget['min_words'] - section_count} words."
+            )
+        else:
+            suggestion = (
+                f"Trim section '{section['title']}' by at least "
+                f"{section_count - budget['max_words']} words."
+            )
+        issues.append(_segment_budget_issue(
+            "segment_budget_section_out_of_bounds",
+            f"Section '{section['title']}'{id_part} has {section_count} words; "
+            f"declared budget is {budget['min_words']}-{budget['max_words']}.",
+            suggestion=suggestion,
+            metadata=dict(report),
+        ))
+
+    return issues, {"document": document_report, "sections": section_reports}
+
+
+def _segment_budget_result(
+    issues: List[DeterministicIssue],
+    metadata: Dict[str, Any],
+) -> DeterministicCheckResult:
+    """Build the pass/fail result for the segment budget guard."""
+
+    passed = not issues
+    result_metadata = dict(metadata)
+    result_metadata["issues_count"] = len(issues)
+    if passed:
+        summary = "Text matches the self-declared segment budgets."
+    else:
+        summary = (
+            f"Segment budget validation failed with {len(issues)} issue(s); "
+            f"first: {issues[0].message}"
+        )
+    return DeterministicCheckResult(
+        name=SEGMENT_BUDGET_CHECK_NAME,
+        score=10.0 if passed else 0.0,
+        pass_threshold=10.0,
+        passed=passed,
+        deal_breaker=not passed,
+        summary=summary,
+        issues=issues[:_SEGMENT_BUDGET_MAX_ISSUES],
+        metadata=result_metadata,
+    )
+
+
+def evaluate_segment_budget_check(
+    context: DeterministicValidationContext,
+    request: Any,
+) -> Optional[DeterministicCheckResult]:
+    """Validate the candidate text against its self-declared segment budgets.
+
+    Contract ``segment-budgets/v1`` (opt-in via ``request.segment_budgets``):
+    the decoded JSON payload must declare the document budget and the ordered
+    sections in ``structure_field``; the target text must reproduce the
+    declared headings in order and keep every segment (heading included)
+    inside its budget. Returns None when the contract is inactive or the JSON
+    guard already rejects the candidate.
+    """
+
+    contract = _segment_budget_contract_dict(request)
+    if contract is None:
+        return None
+
+    structure_field = contract["structure_field"]
+    base_heading_level = contract["base_heading_level"]
+
+    if (
+        is_json_output_requested(request)
+        and context.json_check is not None
+        and not context.json_check.passed
+    ):
+        # The JSON guard already rejects this candidate; avoid duplicate noise.
+        return None
+
+    metadata: Dict[str, Any] = {
+        "schema_version": _SEGMENT_BUDGET_SCHEMA_VERSION,
+        "structure_field": structure_field,
+        "base_heading_level": base_heading_level,
+    }
+
+    if contract.get("schema_version", _SEGMENT_BUDGET_SCHEMA_VERSION) != _SEGMENT_BUDGET_SCHEMA_VERSION:
+        return _segment_budget_result(
+            [_segment_budget_issue(
+                "segment_budget_structure_invalid",
+                f"Unsupported segment budgets schema_version "
+                f"'{contract.get('schema_version')}'; expected '{_SEGMENT_BUDGET_SCHEMA_VERSION}'.",
+            )],
+            metadata,
+        )
+
+    payload = _json_payload_from_context(context)
+    if not isinstance(payload, dict):
+        return _segment_budget_result(
+            [_segment_budget_issue(
+                "segment_budget_structure_invalid",
+                "Candidate is not a JSON object; the segment budgets contract "
+                f"requires JSON output declaring '{structure_field}'.",
+                suggestion="Return one JSON object with the target text and the "
+                "self-declared structure.",
+            )],
+            metadata,
+        )
+
+    document_budget, sections, structure_issues = _validate_segment_budget_structure(
+        payload.get(structure_field),
+        structure_field=structure_field,
+        request_min_words=getattr(request, "min_words", None),
+        request_max_words=getattr(request, "max_words", None),
+    )
+    if structure_issues:
+        return _segment_budget_result(structure_issues, metadata)
+
+    text = context.text_for_validation
+    text_issues, text_metadata = _evaluate_segment_budget_text(
+        text,
+        document_budget or {"min_words": 0, "target_words": 1, "max_words": 1},
+        sections,
+        base_heading_level=base_heading_level,
+    )
+    metadata.update(text_metadata)
+    metadata["sections_checked"] = len(sections)
+    return _segment_budget_result(text_issues, metadata)
+
+
+def evaluate_segment_budget_gate(
+    raw_content: str,
+    request: Any,
+) -> Optional[DeterministicCheckResult]:
+    """Run only the segment budget check over one accepted-looking candidate.
+
+    Used by the post-generation gates (main loop and Gran Sabio fallback) so a
+    candidate that violates its self-declared budgets is never accepted, even
+    when a tool loop exhausted its rounds. Returns None when the contract is
+    not active or does not apply to this candidate.
+    """
+
+    if _segment_budget_contract_dict(request) is None:
+        return None
+    context = prepare_validation_context(raw_content, request)
+    if context.json_check is not None and not context.json_check.passed:
+        return _segment_budget_result(
+            [_segment_budget_issue(
+                "segment_budget_text_unavailable",
+                "Candidate JSON or target text could not be validated for segment budgets.",
+                suggestion=context.json_check.summary,
+            )],
+            {"schema_version": _SEGMENT_BUDGET_SCHEMA_VERSION},
+        )
+    return evaluate_segment_budget_check(context, request)
+
+
+def build_segment_budget_gate_evaluations(
+    check_result: DeterministicCheckResult,
+    qa_models: Optional[List[Any]],
+) -> Dict[str, QAEvaluation]:
+    """Build the synthetic deal-breaker QA evaluations for a gate rejection.
+
+    Mirrors the algorithmic bypass evaluations (``Arithmos-Prime``) so the
+    rejection flows through consensus and iteration feedback exactly like a
+    word count deal-breaker, forcing full regeneration with actionable
+    feedback instead of SmartEdit.
+    """
+
+    detail = _compact_feedback(False, list(check_result.issues), {})
+    feedback = (
+        "[ALGORITHMIC EVALUATION BY Arithmos-Prime]\n\n"
+        "Segment budget contract (segment-budgets/v1) analysis\n"
+        "Score: 0.0/10.0\n"
+        "Status: VIOLATION\n\n"
+        f"{detail}"
+    )
+    evaluation = QAEvaluation(
+        model="Arithmos-Prime (Algorithmic)",
+        layer=SEGMENT_BUDGET_CHECK_NAME,
+        score=0.0,
+        feedback=feedback,
+        deal_breaker=True,
+        deal_breaker_reason=check_result.summary,
+        passes_score=False,
+        timestamp=datetime.now(),
+        metadata=dict(check_result.metadata),
+    )
+    model_names = [model if isinstance(model, str) else model.model for model in qa_models or []]
+    return {model: evaluation for model in (model_names or ["default"])}
+
+
 def _compact_feedback(
     approved: bool,
     issues: List[DeterministicIssue],
@@ -710,6 +1281,7 @@ def _build_metrics_snapshot(
         or checks.get("phrase_frequency")
         or checks.get("lexical_diversity")
         or checks.get("cumulative_repetition")
+        or checks.get("segment_budgets")
     )
 
     metrics: Dict[str, Any] = {}
@@ -748,6 +1320,15 @@ def _build_metrics_snapshot(
         metrics["cumulative_repetition"] = {
             "issues_count": len(cumulative.metadata.get("issues", [])),
             "total_word_count": cumulative.metadata.get("total_word_count"),
+        }
+
+    segment_budgets = checks.get("segment_budgets")
+    if segment_budgets:
+        metrics["segment_budgets"] = {
+            "passed": segment_budgets.passed,
+            "issues_count": segment_budgets.metadata.get("issues_count"),
+            "document": segment_budgets.metadata.get("document"),
+            "sections_checked": segment_budgets.metadata.get("sections_checked"),
         }
 
     json_output = checks.get("json_output")
@@ -811,6 +1392,13 @@ def validate_generation_candidate(
         cumulative_repetition_check = evaluate_cumulative_repetition_check(context.text_for_validation, request)
         if cumulative_repetition_check:
             checks["cumulative_repetition"] = cumulative_repetition_check
+
+    # The segment budget check needs the decoded JSON payload, not just the
+    # extracted text, so it receives the full context and runs even when no
+    # text was extracted (structure failures must still fail hard).
+    segment_budget_check = evaluate_segment_budget_check(context, request)
+    if segment_budget_check:
+        checks["segment_budgets"] = segment_budget_check
 
     all_issues: List[DeterministicIssue] = []
     scored_checks: List[DeterministicCheckResult] = []

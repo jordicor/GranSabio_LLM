@@ -154,6 +154,24 @@ Reply with EXACTLY one token: YES, NO, or UNSURE"""
 # Logprobs Extraction
 # =============================================================================
 
+def _validated_token_logprob(item: Dict[str, Any]) -> Tuple[str, float]:
+    """Read a token measurement without substituting missing or invalid values."""
+    if not isinstance(item, dict):
+        raise ValueError("Invalid logprobs: token measurement must be an object")
+    token = item.get("token")
+    logprob = item.get("logprob")
+    if not isinstance(token, str) or not token:
+        raise ValueError("Invalid logprobs: token must be a nonempty string")
+    if (
+        isinstance(logprob, bool)
+        or not isinstance(logprob, (int, float))
+        or not math.isfinite(logprob)
+        or logprob > 0
+    ):
+        raise ValueError("Invalid logprobs: logprob must be a finite nonpositive number")
+    return token.strip().upper(), logprob
+
+
 def extract_yes_probability(
     logprobs_content: Optional[List[Dict[str, Any]]],
     default_uncertain: float = 0.33,
@@ -166,47 +184,43 @@ def extract_yes_probability(
     Args:
         logprobs_content: List of token logprob data from OpenAI response
             Each item has: token, logprob, top_logprobs
-        default_uncertain: Default probability if extraction fails
+        default_uncertain: Retained for call compatibility; missing measurements
+            always raise instead of returning this value.
 
     Returns:
         Estimated P(YES) in range [0, 1]
+
+    Raises:
+        ValueError: If P(YES) cannot be measured or bounded from valid logprobs
     """
-    if not logprobs_content:
-        logger.warning("No logprobs content received, using default")
-        return default_uncertain
+    if not isinstance(logprobs_content, list) or not logprobs_content:
+        raise ValueError("YES probability unavailable: no logprobs content received")
 
     first_token_data = logprobs_content[0]
-    top_logprobs = first_token_data.get("top_logprobs", [])
+    if not isinstance(first_token_data, dict):
+        raise ValueError("Invalid logprobs: first token measurement must be an object")
+    top_logprobs = first_token_data.get("top_logprobs")
+    if top_logprobs is not None and not isinstance(top_logprobs, list):
+        raise ValueError("Invalid logprobs: top_logprobs must be a list")
 
     if not top_logprobs:
         # No top_logprobs, try to use the token's own logprob
-        token = first_token_data.get("token", "").strip().upper()
-        logprob = first_token_data.get("logprob")
+        token, logprob = _validated_token_logprob(first_token_data)
 
-        if token == "YES" and logprob is not None:
+        if token == "YES":
             return math.exp(logprob)
-        logger.warning("No top_logprobs available, using default")
-        return default_uncertain
+        raise ValueError("YES probability unavailable: no YES measurement or top_logprobs")
 
-    # Search for YES, NO, UNSURE in top_logprobs
+    # Validate every top-k measurement before using a direct probability or bound.
     yes_logprob = None
-    no_logprob = None
-    unsure_logprob = None
     min_logprob = float('inf')
 
     for item in top_logprobs:
-        token = item.get("token", "").strip().upper()
-        logprob = item.get("logprob", float('-inf'))
+        token, logprob = _validated_token_logprob(item)
         min_logprob = min(min_logprob, logprob)
 
         if token == "YES":
             yes_logprob = logprob if yes_logprob is None else max(yes_logprob, logprob)
-        elif token == "NO":
-            no_logprob = logprob if no_logprob is None else max(no_logprob, logprob)
-        elif token == "UNSURE":
-            unsure_logprob = (
-                logprob if unsure_logprob is None else max(unsure_logprob, logprob)
-            )
 
     # If YES found directly, convert logprob to probability
     if yes_logprob is not None:
@@ -214,13 +228,9 @@ def extract_yes_probability(
 
     # YES not in top-k: use upper bound based on k-th token
     # P(YES) < P(k-th token) since YES would be in top-k if higher
-    if min_logprob != float('inf'):
-        upper_bound = math.exp(min_logprob)
-        logger.debug(f"YES not in top-k, using upper bound: {upper_bound:.4f}")
-        return upper_bound
-
-    logger.warning("Could not extract YES probability, using default")
-    return default_uncertain
+    upper_bound = math.exp(min_logprob)
+    logger.debug(f"YES not in top-k, using upper bound: {upper_bound:.4f}")
+    return upper_bound
 
 
 def normalize_yes_no_unsure(

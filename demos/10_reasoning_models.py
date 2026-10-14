@@ -40,6 +40,11 @@ from pathlib import Path
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from dotenv import load_dotenv
+
+# This executable demo owns its repository environment; process values win.
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
+
 from client import AsyncGranSabioClient
 from demos.common import print_generation_result, print_header, print_status, run_demo
 

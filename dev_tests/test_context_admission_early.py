@@ -92,9 +92,10 @@ async def _run(request, *, request_fields_set, native_counter=None, **kwargs):
 
 
 @pytest.mark.asyncio
-async def test_guaranteed_overflow_rejects_before_any_llm_call(monkeypatch):
+@pytest.mark.parametrize("source_field", ["source_text", "shared_context"])
+async def test_guaranteed_overflow_rejects_before_any_llm_call(monkeypatch, source_field):
     monkeypatch.setenv("CONTEXT_ADMISSION_MODE", "enforce")
-    request = _make_request(source_text=HUGE_SOURCE)
+    request = _make_request(**{source_field: HUGE_SOURCE})
     registry = _registry(request)
     native = AsyncMock()  # stands in for ai_service._native_token_count
 

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -137,65 +136,6 @@ def test_deeply_nested_json_falls_back_without_server_error() -> None:
 
     assert text == deeply_nested
     assert extracted is False
-
-
-@pytest.mark.parametrize(
-    ("timeouts", "timeout_seconds", "expected"),
-    [
-        pytest.param({"stream_seconds": 99_999}, None, 60, id="clamped"),
-        pytest.param({"stream_seconds": 30}, None, 30, id="preserved"),
-        pytest.param(None, 20, 20, id="default-field"),
-    ],
-)
-def test_client_stream_timeout_is_bounded_without_shortening_valid_values(
-    monkeypatch: pytest.MonkeyPatch,
-    timeouts: dict[str, int] | None,
-    timeout_seconds: int | None,
-    expected: int,
-) -> None:
-    import core.streaming_routes as streaming_routes
-
-    monkeypatch.setenv("STREAM_TIMEOUT_CLIENT_MAX_SECONDS", "60")
-    request_data = SimpleNamespace(
-        timeouts=timeouts,
-        timeout_seconds=timeout_seconds,
-    )
-
-    assert streaming_routes._resolve_direct_stream_timeout(request_data) == expected
-
-
-@pytest.mark.parametrize(
-    ("scenario", "expected_status"),
-    [
-        pytest.param("terminal", 409, id="terminal-session"),
-        pytest.param("concurrent", 409, id="concurrent-stream"),
-        pytest.param("cap", 429, id="per-session-cap"),
-    ],
-)
-def test_direct_stream_claim_rejects_unsafe_reentry(
-    monkeypatch: pytest.MonkeyPatch,
-    scenario: str,
-    expected_status: int,
-) -> None:
-    import core.streaming_routes as streaming_routes
-    from models import GenerationStatus
-
-    session: dict[str, Any] = {
-        "status": GenerationStatus.GENERATING,
-        "request": SimpleNamespace(prompt="Generate a short sample."),
-    }
-    if scenario == "terminal":
-        session["status"] = GenerationStatus.COMPLETED
-    elif scenario == "concurrent":
-        session["direct_stream_active"] = True
-    else:
-        monkeypatch.setenv("DIRECT_STREAM_MAX_PER_SESSION", "1")
-        session["direct_stream_count"] = 1
-
-    with pytest.raises(HTTPException) as exc_info:
-        streaming_routes._claim_direct_stream(session)
-
-    assert exc_info.value.status_code == expected_status
 
 
 @pytest.mark.asyncio

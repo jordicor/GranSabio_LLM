@@ -606,16 +606,17 @@ async def startup_event():
     await perform_session_cleanup()
     _session_cleanup_task = asyncio.create_task(session_cleanup_loop(), name="session-cleanup")
 
-    # Initialize feedback memory system
-    try:
-        await initialize_feedback_system()
-        logger.info("Feedback memory system initialized successfully")
-        # Run cleanup for feedback memory on startup
-        feedback_mgr = get_feedback_manager()
-        await feedback_mgr.cleanup_old_data()
-    except Exception as e:
-        logger.error(f"Failed to initialize feedback memory system: {e}")
-        # Don't fail startup, system can work without feedback memory
+    # Disabled deployments must not instantiate or open feedback storage.
+    if config.FEEDBACK_MEMORY.enabled:
+        try:
+            await initialize_feedback_system()
+            logger.info("Feedback memory system initialized successfully")
+            # Run cleanup for feedback memory on startup
+            feedback_mgr = get_feedback_manager()
+            await feedback_mgr.cleanup_old_data()
+        except Exception as e:
+            logger.error(f"Failed to initialize feedback memory system: {e}")
+            # Don't fail startup, system can work without feedback memory
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -2563,6 +2564,14 @@ async def session_cleanup_loop() -> None:
 
 # --- Project Status Utilities ---
 
+def is_monitor_session_active(status: str, phase: str) -> bool:
+    """Classify live monitor activity without reviving a terminal session."""
+    return status not in ("completed", "rejected", "failed", "error", "cancelled") and (
+        status in ("generating", "qa_evaluation", "consensus", "gran_sabio_review", "running", "initializing")
+        or phase in ("inline_deal_breaker_review", "gran_sabio_review", "gran_sabio_regeneration")
+    )
+
+
 async def get_project_status(
     project_id: str,
     *,
@@ -2608,6 +2617,7 @@ async def get_project_status(
 
             # Determine phase
             phase = session.get("current_phase", "initializing")
+            session_active = is_monitor_session_active(status_str, phase)
 
             # Check activity time
             activity_at = session.get("last_activity_at") or session.get("created_at")
@@ -2620,10 +2630,7 @@ async def get_project_status(
                 completed_count += 1
             elif status_str == "cancelled":
                 cancelled_count += 1
-            elif (
-                status_str in ("generating", "qa_evaluation", "consensus", "gran_sabio_review", "running", "initializing")
-                or phase in ("inline_deal_breaker_review", "gran_sabio_review", "gran_sabio_regeneration")
-            ):
+            elif session_active:
                 active_count += 1
 
             # Get generation info
@@ -2664,7 +2671,7 @@ async def get_project_status(
             approved = session.get("approved", False)
 
             # Gran Sabio info
-            gran_sabio_active = (
+            gran_sabio_active = session_active and (
                 status_str == "gran_sabio_review"
                 or phase in ("inline_deal_breaker_review", "gran_sabio_review", "gran_sabio_regeneration")
             )
@@ -2734,6 +2741,8 @@ async def get_project_status(
                 "error_type",
                 "error_code",
                 "finish_reason",
+                "prompt_block_reason",
+                "native_finish_reason",
             ):
                 value = (
                     final_result.get(key)

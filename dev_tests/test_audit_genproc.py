@@ -10,7 +10,6 @@ pruned) and QA-04 (no Gran Sabio engine passed to the grounding-only call).
 
 import inspect
 import logging
-import sys
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -18,17 +17,14 @@ from uuid import uuid4
 
 import pytest
 
-# The venv's libmagic native DLL crashes (segfault) on import in this Windows
-# environment, and attachment_manager treats python-magic as optional. Stub it
-# before importing the app modules (same approach as dev_tests/test_audit_attach.py).
-sys.modules["magic"] = None  # must precede attachment service imports
-
 import core.app_state as app_state
 import core.generation_processor as generation_processor_module
 import core.generation_routes as generation_routes_module
 import core.streaming_routes as streaming_routes_module
+import json_utils as json
 from ai_service import GenerationStoppedUnexpectedly, StreamChunk
 from config import config
+from consensus_engine import ConsensusEngine
 from content_events import ContentStatus, Visibility
 from context_budget import ContextAdmissionError
 from core.app_state import pop_session, register_session
@@ -41,7 +37,12 @@ from core.generation_processor import (
     add_to_session_field,
     process_content_generation,
 )
+from deal_breaker_tracker import DealBreakerTracker
+from gran_sabio import GranSabioEngine
+from model_aliasing import ModelAliasRegistry
 from models import ContentRequest, GenerationStatus, QALayer
+from qa_engine import QAEngine
+from services.attachment_manager import AttachmentError
 
 
 def _fake_model_specs() -> dict:
@@ -145,6 +146,9 @@ def _patch_process_common(monkeypatch, manager) -> None:
             storage_available=True,
             record_event=AsyncMock(),
             update_session_status=AsyncMock(),
+            record_content_trace=AsyncMock(
+                side_effect=lambda **kwargs: kwargs["expected_offset"] + len(kwargs["content_delta"])
+            ),
         ),
     )
     monkeypatch.setattr(generation_processor_module, "_debug_record_event", AsyncMock())
@@ -166,6 +170,398 @@ class _RecordingFeedbackManager:
 
     async def complete_session(self, session_id, success=True):
         self.complete_calls.append((session_id, success))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target_field_only,repair_method,json_output,regenerate_after_edit",
+    [(None, "smart_edit", True, False), (True, "smart_edit", True, False),
+     (None, "gran_sabio", True, False), (True, "gran_sabio", True, False),
+     (None, "gran_sabio_missing_field", True, False), (None, "gran_sabio", False, False),
+     (True, "gran_sabio", False, False), (None, "smart_edit", False, True),
+     (None, "smart_edit_noop", True, False)],
+)
+async def test_json_target_field_preserves_other_values_after_smart_edit(
+    monkeypatch, tmp_path, caplog, target_field_only, repair_method, json_output, regenerate_after_edit
+):
+    """Generate, evaluate, edit and reconstruct one JSON field through the processor."""
+
+    unchanged_paragraph = "The first paragraph already states the intended purpose."
+    original_paragraph = "The original paragraph needs a clearer ending."
+    edited_paragraph = (original_paragraph if repair_method == "smart_edit_noop"
+                        else "The revised paragraph preserves the intended meaning.")
+    original_text = f"{unchanged_paragraph}\n\n{original_paragraph}"
+    edited_text = f"{unchanged_paragraph}\n\n{edited_paragraph}"
+    original_json = {
+        "data": {"body": original_text, "caption": "Keep the caption"},
+        "notes": ["Keep this note", "Keep this other note"],
+        "metadata": {"count": 2, "verified": False},
+    }
+    qa_fail = {
+        "score": 6.0,
+        "feedback": "Improve the ending.",
+        "deal_breaker": False,
+        "deal_breaker_reason": None,
+        "editable": True,
+        "edit_strategy": "incremental",
+        "edit_groups": [{
+            "target_ids": ["p2"],
+            "operation_type": "rephrase" if repair_method == "smart_edit_noop" else "replace",
+            "instruction": "Replace the paragraph with the clearer version.",
+            "severity": "minor",
+            "exact_fragment": original_paragraph,
+            "suggested_text": None if repair_method == "smart_edit_noop" else edited_paragraph,
+        }],
+    }
+    qa_pass = {
+        "score": 9.0,
+        "feedback": "Passed",
+        "deal_breaker": False,
+        "deal_breaker_reason": None,
+        "editable": False,
+        "edit_strategy": None,
+        "edit_groups": [],
+    }
+    responses = [
+        ("fake-generator", original_json),
+        ("fake-qa", qa_fail),
+        ("fake-arbiter", {
+            "decisions": [{"edit_index": 0, "decision": "APPLY", "reason": "Matches the request."}],
+            "conflicts_resolved": [],
+            "reasoning": "Apply the proposed correction.",
+        }),
+        ("fake-qa", qa_pass),
+        ("fake-qa", qa_pass),
+    ]
+    uses_gran_sabio = repair_method.startswith("gran_sabio")
+    if uses_gran_sabio:
+        edited_json = {"data": {"body": edited_text, "caption": "Changed by the model"}, "notes": []}
+        if repair_method == "gran_sabio_missing_field":
+            edited_json["data"]["body"] = 7
+        responses = [
+            ("fake-generator", original_json),
+            ("fake-qa", {
+                **qa_fail,
+                "deal_breaker": True,
+                "deal_breaker_reason": "The ending changes the intended meaning.",
+                "editable": False,
+                "edit_strategy": None,
+                "edit_groups": [],
+            }),
+            ("fake-qa", qa_pass),
+            ("fake-gran-sabio", {
+                "decision": "APPROVED",
+                "reason": "A small correction preserves the meaning.",
+                "score": 9.0,
+                "modifications_made": True,
+                "final_content": (edited_text if target_field_only and not json_output
+                                  else json.dumps(edited_json)),
+            }),
+        ]
+        if repair_method != "gran_sabio_missing_field":
+            responses.extend([("fake-qa", qa_pass)] * 4)
+    if regenerate_after_edit:
+        responses.extend([
+            ("fake-generator", {**original_json, "data": {**original_json["data"], "body": edited_text}}),
+            ("fake-qa", {**qa_pass, "score": 10.0}),
+            ("fake-qa", {**qa_pass, "score": 10.0}),
+        ])
+    if repair_method == "smart_edit_noop":
+        responses.insert(3, ("fake-generator", original_paragraph))
+    provider_calls = []
+
+    def provider_response(kwargs):
+        expected_model, response = responses.pop(0)
+        assert kwargs["model"] == expected_model
+        provider_calls.append(kwargs)
+        return response if isinstance(response, str) else json.dumps(response)
+
+    async def generate_content_stream(**kwargs):
+        yield provider_response(kwargs)
+
+    async def generate_content(**kwargs):
+        return provider_response(kwargs)
+
+    ai_service = SimpleNamespace(
+        generate_content_stream=generate_content_stream, generate_content=generate_content,
+    )
+    manager = _RecordingFeedbackManager()
+    _patch_process_common(monkeypatch, manager)
+    request = _make_request(
+        content_type="article" if json_output or not uses_gran_sabio else "other",
+        json_output=json_output,
+        target_field="data.body",
+        llm_routing={"calls": {
+            **_fake_route_llm_routing()["calls"],
+            "generation.smart_edit": {"model": "fake-generator"},
+        }},
+        max_iterations=2 if regenerate_after_edit else 1,
+        min_global_score=9.5 if regenerate_after_edit else 8.0,
+        max_tokens=256,
+        max_edit_rounds_per_layer=2 if uses_gran_sabio else 1,
+        generation_tools_mode="never",
+        qa_tools_mode="never",
+        arbiter_tools_mode="never",
+        gransabio_tools_mode="never",
+        show_query_costs=0,
+        qa_models=["fake-qa"] * (2 if uses_gran_sabio else 1),
+        qa_layers=[QALayer(
+            name="Clarity", description="Check clarity", criteria="Use clear prose.",
+            min_score=9.5 if regenerate_after_edit else 8.0,
+            deal_breaker_criteria="Altered meaning" if uses_gran_sabio else None,
+        )],
+        qa_final_verification_mode="always",
+        **({"target_field_only": target_field_only} if target_field_only is not None else {}),
+    )
+    session_id = f"audit-json-single-field-{uuid4()}"
+    session = _base_session(session_id, request)
+    monkeypatch.setattr(app_state, "ai_service", ai_service)
+    monkeypatch.setattr(app_state, "qa_engine", QAEngine(ai_service))
+    monkeypatch.setattr(app_state, "consensus_engine", ConsensusEngine(ai_service))
+    monkeypatch.setattr(app_state, "gran_sabio", GranSabioEngine(ai_service))
+    tracker = DealBreakerTracker(persistence_path=str(tmp_path))
+    monkeypatch.setattr(generation_processor_module, "get_tracker", lambda: tracker)
+    await register_session(session_id, session)
+    try:
+        await process_content_generation(session_id, request)
+        result = await generation_routes_module.get_result(session_id)
+    finally:
+        await pop_session(session_id)
+
+    if repair_method == "gran_sabio_missing_field":
+        assert session["status"] == GenerationStatus.FAILED
+        assert result["approved"] is False
+        assert result["content"] == original_json
+        assert "Gran Sabio edited JSON must contain the selected string target_field" in caplog.text
+        assert len(provider_calls) == 4
+        assert responses == []
+        return
+
+    assert session["status"] == GenerationStatus.COMPLETED
+    final_document = result["content"] if json_output else json.loads(result["content"])
+    assert final_document == {
+        **original_json,
+        "data": {**original_json["data"], "body": edited_text},
+    }
+    if uses_gran_sabio:
+        assert tracker.get_session_events(session_id)[0]["was_real_deal_breaker"] is True
+    elif repair_method == "smart_edit_noop":
+        assert session.get("edit_history", []) == []
+    else:
+        edit_record = session["edit_history"][0]
+        assert edit_record["iteration"] == 1
+        assert edit_record["layer"] == request.qa_layers[0].name
+        assert edit_record["round"] == 1
+        assert edit_record["edits_applied"] == 1
+        assert session["iterations"][0]["generation_mode"] == "smart_edit"
+        assert session["iterations"][0]["smart_edit_applied"] is True
+        assert session["iterations"][0]["smart_edit_metadata"] == {
+            "rounds": 1, "total_edits": 1, "paragraphs_affected": 1,
+            "layers": [request.qa_layers[0].name],
+        }
+    if uses_gran_sabio or repair_method == "smart_edit_noop":
+        assert session["iterations"][0]["generation_mode"] == "normal"
+        assert session["iterations"][0]["smart_edit_applied"] is False
+        assert session["iterations"][0]["smart_edit_metadata"] is None
+    if regenerate_after_edit:
+        regeneration = next(call for call in provider_calls[1:] if call["model"] == "fake-generator")
+        assert "RECENT ITERATION MEMORY:" in regeneration["prompt"]
+        assert "Iteration 1 [smart_edit] was rejected" in regeneration["prompt"]
+        assert "1 target span(s) edited across 1 applied change(s)" in regeneration["prompt"]
+        assert session["iterations"][1]["generation_mode"] == "normal"
+        assert session["iterations"][1]["smart_edit_applied"] is False
+        assert session["iterations"][1]["smart_edit_metadata"] is None
+    assert request.target_field_only is bool(target_field_only)
+    qa_calls = [call for call in provider_calls if call["model"] == "fake-qa"]
+    expected_texts = [original_text, edited_text, edited_text]
+    if uses_gran_sabio:
+        expected_texts = [text for text in expected_texts for _ in range(2)]
+    if regenerate_after_edit:
+        expected_texts.extend([edited_text, edited_text])
+    assert len(qa_calls) == len(expected_texts)
+    for call, current_text in zip(qa_calls, expected_texts):
+        assert "generated from scratch" not in call["prompt"]
+        assert "Review the current content snapshot, including any edits already present" in call["prompt"]
+        evaluated_content = call["prompt"].split("--- START OF CONTENT TO EVALUATE ---\n", 1)[1]
+        evaluated_content = evaluated_content.split("\n--- END OF CONTENT TO EVALUATE ---", 1)[0]
+        if target_field_only:
+            assert evaluated_content == current_text
+            assert "Keep the caption" not in call["prompt"]
+            assert "Keep this note" not in call["prompt"]
+        else:
+            assert json.loads(evaluated_content) == {
+                **original_json,
+                "data": {**original_json["data"], "body": current_text},
+            }
+        if "<draft_map>" in call["prompt"]:
+            draft_map = call["prompt"].split("<draft_map>", 1)[1].split("</draft_map>", 1)[0]
+            assert '<p id="p2">' in draft_map
+            assert "Keep the caption" not in draft_map
+            assert "data" not in draft_map
+    if uses_gran_sabio:
+        gran_sabio_call = next(call for call in provider_calls if call["model"] == "fake-gran-sabio")
+        assert ("Keep the caption" in gran_sabio_call["prompt"]) is not bool(target_field_only)
+    assert "QA MODE: FINAL VERIFICATION" in qa_calls[-1]["prompt"]
+    assert "This pass is read-only" in qa_calls[-1]["prompt"]
+    assert len(provider_calls) == (8 if uses_gran_sabio or regenerate_after_edit
+                                   else 6 if repair_method == "smart_edit_noop" else 5)
+    assert responses == []
+
+
+@pytest.mark.asyncio
+async def test_autodetected_json_word_count_uses_only_the_selected_text(monkeypatch):
+    """The real layered bypass measures the text field, not its JSON siblings."""
+    body = (
+        "The first paragraph already states the intended purpose.\n\n"
+        "The second paragraph preserves the intended meaning."
+    )
+    document = {"body": body, "caption": "A short label", "metadata": {"count": 2}}
+    provider_calls = []
+
+    async def generate_content_stream(**kwargs):
+        provider_calls.append(kwargs)
+        assert kwargs["model"] == "fake-generator"
+        yield json.dumps(document)
+
+    ai_service = SimpleNamespace(generate_content_stream=generate_content_stream)
+    _patch_process_common(monkeypatch, _RecordingFeedbackManager())
+    request = _make_request(
+        content_type="other", json_output=False, smart_editing_mode="always",
+        max_words=200, max_tokens=256, word_count_enforcement={"enabled": True},
+        qa_models=["fake-qa"], qa_layers=[QALayer(
+            name="Word Count Enforcement", description="Word limit", criteria="Keep the word limit."
+        )],
+        qa_final_verification_mode="disabled", generation_tools_mode="never", max_iterations=1,
+    )
+    session_id = f"audit-json-bypass-{uuid4()}"
+    session = _base_session(session_id, request)
+    monkeypatch.setattr(app_state, "ai_service", ai_service)
+    monkeypatch.setattr(app_state, "qa_engine", QAEngine(ai_service))
+    monkeypatch.setattr(app_state, "consensus_engine", ConsensusEngine(ai_service))
+    await register_session(session_id, session)
+    try:
+        await process_content_generation(session_id, request)
+    finally:
+        await pop_session(session_id)
+
+    assert session["status"] == GenerationStatus.COMPLETED
+    assert session["json_context"]["target_field_paths"] == ["body"]
+    evaluation = session["iterations"][0]["qa_results"]["Word Count Enforcement"]["fake-qa"]
+    assert evaluation.metadata["actual_count"] == len(body.split())
+    assert len(provider_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_field_only", [False, True])
+async def test_final_verification_updates_supervisor_once_per_adjudication_pass(
+    monkeypatch, tmp_path, target_field_only
+):
+    """Final QA and Gran Sabio use their real parsers; only provider replies are fake."""
+    content = json.dumps({
+        "body": "The source supports the statement in this paragraph.",
+        "context": "Reference visible only with the full JSON scope.",
+    })
+    provider_calls = []
+    qa_fail = {
+        "score": 2.0,
+        "feedback": "A claim appears unsupported.",
+        "deal_breaker": True,
+        "deal_breaker_reason": "Unsupported claim",
+    }
+    qa_pass = {
+        "score": 9.0,
+        "feedback": "Passed",
+        "deal_breaker": False,
+        "deal_breaker_reason": None,
+    }
+    responses = [
+        ("fake-qa", qa_fail),
+        ("fake-qa", qa_pass),
+        ("fake-gran-sabio", {
+            "decision": "APPROVED",
+            "reason": "The source supports the disputed claim.",
+            "score": 9.0,
+            "modifications_made": False,
+            "final_content": None,
+        }),
+    ] * 2
+
+    async def generate_content_stream(**kwargs):
+        expected_model, response = responses.pop(0)
+        assert kwargs["model"] == expected_model
+        provider_calls.append(kwargs)
+        yield json.dumps(response)
+
+    ai_service = SimpleNamespace(generate_content_stream=generate_content_stream)
+    _patch_process_common(monkeypatch, _RecordingFeedbackManager())
+    tracker = DealBreakerTracker(persistence_path=str(tmp_path))
+    monkeypatch.setattr(generation_processor_module, "get_tracker", lambda: tracker)
+    monkeypatch.setattr(app_state, "qa_engine", QAEngine(ai_service))
+    monkeypatch.setattr(app_state, "gran_sabio", GranSabioEngine(ai_service))
+    request = _make_request(
+        content_type="article",
+        json_output=True,
+        target_field="body",
+        target_field_only=target_field_only,
+        qa_models=["fake-qa", "fake-qa"],
+        qa_execution_mode="parallel",
+        qa_final_verification_mode="always",
+        generation_tools_mode="never",
+        qa_tools_mode="never",
+        qa_layers=[QALayer(
+            name="Accuracy",
+            description="Check factual support",
+            criteria="Claims must be supported by the source.",
+            deal_breaker_criteria="Unsupported claims",
+            min_score=8.0,
+        )],
+    )
+    session_id = f"audit-final-supervisor-{uuid4()}"
+    session = _base_session(session_id, request)
+    request._model_alias_registry = ModelAliasRegistry.from_request(request)
+    await register_session(session_id, session)
+    try:
+        for iteration in (1, 2):
+            request._current_iteration = iteration
+            session["current_iteration"] = iteration
+            result = await generation_processor_module._maybe_run_final_verification(
+                content=content,
+                pre_qa_content_snapshot=content,
+                qa_layers_to_use=request.qa_layers,
+                grounding_config=None,
+                normalized_qa_models=request.qa_models,
+                request=request,
+                session=session,
+                session_id=session_id,
+                iteration=iteration,
+                usage_tracker=None,
+                phase_logger=None,
+                progress_callback=None,
+                stream_callback=AsyncMock(),
+                cancel_callback=None,
+                qa_input_images=None,
+                context_prompt="",
+            )
+            assert result["gran_sabio_adjudication"][0]["decision"] == "false_positive"
+    finally:
+        await pop_session(session_id)
+
+    events = tracker.get_session_events(session_id)
+    assert len(events) == 2
+    assert all(event["was_real_deal_breaker"] is False for event in events)
+    assert session["supervisor_flags"][0]["count"] == 2
+    assert session["gran_sabio_supervisor"]["bench_actions"] == []
+    reviews = [
+        call for call in generation_processor_module._debug_record_event.await_args_list
+        if call.args[1] == "gran_sabio_supervisor_review"
+    ]
+    assert len(reviews) == 2
+    assert len(provider_calls) == 6
+    assert all(
+        ("Reference visible only with the full JSON scope." in call["prompt"]) is not target_field_only
+        for call in provider_calls
+    )
+    assert responses == []
 
 
 class _FailingAIService:
@@ -218,6 +614,62 @@ def _diagnostic_text_size(value) -> int:
 # ---------------------------------------------------------------------------
 # GEN-03: feedback memory session is completed for every terminal state
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_required_attachment_context_failure_stops_before_ai_and_cleans_up(monkeypatch):
+    """A read failure must be visible through status/result and release runtime state."""
+
+    feedback_manager = _RecordingFeedbackManager()
+    _patch_process_common(monkeypatch, feedback_manager)
+    monkeypatch.setattr(config.FEEDBACK_MEMORY, "enabled", True)
+    get_feedback_manager = Mock(return_value=feedback_manager)
+    console_reset = Mock(wraps=generation_processor_module.reset_console_context)
+    monkeypatch.setattr(generation_processor_module, "get_feedback_manager", get_feedback_manager)
+    monkeypatch.setattr(generation_processor_module, "reset_console_context", console_reset)
+    ai_service = SimpleNamespace(generate_content=AsyncMock(), generate_content_stream=Mock())
+    monkeypatch.setattr(app_state, "ai_service", ai_service)
+    attachment_manager = SimpleNamespace(
+        load_text_preview=Mock(side_effect=AttachmentError("Unable to read attachment content")),
+    )
+    resolved_attachment = SimpleNamespace(record=SimpleNamespace(original_filename="notes.txt"))
+    request = _make_request(
+        max_iterations=1,
+        username="test-user",
+        context_documents=[{"username": "test-user", "upload_id": "test-context-file"}],
+    )
+    session_id = f"audit-context-read-fail-{uuid4()}"
+    session = _base_session(session_id, request)
+    await register_session(session_id, session)
+    await cancellation_registry.register_session(session_id, None, None)
+    try:
+        await process_content_generation(
+            session_id,
+            request,
+            resolved_attachments=[resolved_attachment],
+            attachment_manager=attachment_manager,
+        )
+        status = await generation_routes_module.get_status(session_id)
+        result = await generation_routes_module.get_result(session_id)
+        assert await cancellation_registry.has_session_runtime(session_id) is False
+    finally:
+        await pop_session(session_id)
+        await cancellation_registry.unregister_session(session_id)
+
+    attachment_manager.load_text_preview.assert_called_once_with(resolved_attachment, max_bytes=64 * 1024)
+    get_feedback_manager.assert_not_called()
+    ai_service.generate_content.assert_not_called()
+    ai_service.generate_content_stream.assert_not_called()
+    assert status["status"] == "failed"
+    assert status["error_code"] == "AttachmentError"
+    assert status["error"]
+    assert result["approved"] is False
+    assert result["content"] == "No content generated"
+    assert result["final_iteration"] == 0
+    assert session["generation_content"] == ""
+    assert result["error_code"] == "AttachmentError"
+    assert session["feedback_manager"] is None
+    console_reset.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -949,7 +1401,7 @@ async def test_content_filter_stop_finalizes_without_retry_or_internal_diagnosti
         )
         public_status = await generation_routes_module.get_status(session_id)
         monitor_snapshot = app_state._build_monitor_content_snapshot(session)
-        direct_stream_response = await streaming_routes_module.stream_content_direct(
+        direct_stream_response = await streaming_routes_module.stream_content(
             session_id
         )
         direct_stream_chunks = [
@@ -1537,7 +1989,7 @@ def test_fallback_qa_call_wires_visibility_and_labels():
 
 @pytest.mark.asyncio
 async def test_unexpected_smart_edit_error_forces_regeneration_fallback(monkeypatch):
-    """GEN-09: an unexpected error resets smart-edit mode like a SmartEditError."""
+    """GEN-09: an unexpected edit error preserves the original and clears its payload."""
     session_id = f"audit-gen09-{uuid4()}"
     request = _make_request()
     session = {
@@ -1546,8 +1998,6 @@ async def test_unexpected_smart_edit_error_forces_regeneration_fallback(monkeypa
         "current_phase": "smart_edit",
         "current_iteration": 1,
         "verbose_log": [],
-        "generation_mode": "smart_edit",
-        "smart_edit_consecutive": 1,
         "smart_edit_data": {"base_content": "BASE CONTENT", "edit_ranges": []},
     }
 
@@ -1570,15 +2020,13 @@ async def test_unexpected_smart_edit_error_forces_regeneration_fallback(monkeypa
             ai_service=None,
             usage_tracker=None,
             session_id=session_id,
-            iteration=0,
+            iteration=1,
         )
     finally:
         await pop_session(session_id)
 
     assert result == "BASE CONTENT"
-    assert session["generation_mode"] == "normal"
     assert session["smart_edit_data"] is None
-    assert session["smart_edit_consecutive"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1649,3 +2097,51 @@ def test_grounding_call_does_not_wire_gran_sabio_modified_branch():
     assert "gran_sabio_engine=gran_sabio" not in src
     assert "can_escalate_in_session" not in src
     assert "gran_sabio_inline_stream_callback" not in src
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty,expected_code", [
+    ("", "empty_content"), (" \t\n", "empty_content"),
+    ("\u2003\u3000" * 1500, "empty_content"), (None, "TypeError"),
+], ids=["empty", "ascii-space", "unicode-space", "invalid-type"])
+async def test_empty_candidate_terminal_has_stable_code_and_remains_failed(
+    monkeypatch, empty, expected_code,
+):
+    manager = _RecordingFeedbackManager()
+    _patch_process_common(monkeypatch, manager)
+    request = _make_request(max_iterations=1, max_tokens=256, gran_sabio_fallback=False)
+    session_id = f"audit-empty-terminal-{uuid4()}"
+    session = _base_session(session_id, request)
+    candidate = AsyncMock(return_value=SimpleNamespace(
+        content=empty, long_text_state=None, controller_summary=None,
+        diagnostics_summary=None, mode="normal", used_tool_loop=False,
+    ))
+    monkeypatch.setattr(generation_processor_module, "generate_iteration_candidate", candidate)
+    monkeypatch.setattr(app_state, "ai_service", SimpleNamespace())
+    await register_session(session_id, session)
+    try:
+        await process_content_generation(session_id, request)
+        result = await generation_routes_module.get_result(session_id)
+    finally:
+        await pop_session(session_id)
+
+    candidate.assert_awaited_once()
+    assert session["status"] == GenerationStatus.FAILED
+    assert session["final_result"]["error_code"] == result["error_code"] == expected_code
+    if expected_code == "empty_content":
+        assert session["final_result"]["content"] == result["content"] == ""
+    assert result["approved"] is False and result["final_iteration"] == 1
+    assert manager.complete_calls == [(session_id, False)]
+    native = generation_processor_module._debug_update_status.await_args_list[-1].kwargs["final_payload"]
+    assert native["error_code"] == expected_code
+    assert native["content"] == session["final_result"]["content"]
+    assert generation_processor_module._debug_update_status.await_args_list[-1].kwargs["status"] == "failed"
+    # Exercise the public result serialization and real SDK validation.
+    from client import GranSabioClientError
+    from client._common import validate_result
+
+    serialized_result = json.loads(json.dumps(result))
+    with pytest.raises(GranSabioClientError) as error:
+        validate_result(serialized_result)
+    assert error.value.details["status"] == "failed"
+    assert error.value.details["error_code"] == expected_code

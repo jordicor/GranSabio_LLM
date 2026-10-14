@@ -300,6 +300,33 @@ def _is_context_overflow_signal(
     return False
 
 
+_CONTENT_POLICY_MARKERS = frozenset({"prohibited_content"})
+
+
+def _is_content_policy_signal(
+    *,
+    provider: Optional[str],
+    err_type: Optional[str],
+    err_code: Optional[str],
+    message: Optional[str],
+) -> bool:
+    """Return True for explicit Gemini moderation protocol markers only.
+
+    ``PROHIBITED_CONTENT`` is a provider-generated status marker, not an
+    interpretation of the request. It may arrive through OpenRouter's Gemini
+    transport, whose outer HTTP status remains 403.
+    """
+
+    if (provider or "").strip().lower() not in {"gemini", "google", "openrouter"}:
+        return False
+
+    markers = _normalized_error_markers(err_type, err_code)
+    if markers.intersection(_CONTENT_POLICY_MARKERS):
+        return True
+
+    return "prohibited_content" in (message or "").strip().lower()
+
+
 def is_context_overflow_exception(exc: BaseException, *, provider: str) -> bool:
     """Return True when ``exc`` is a provider-reported context-window overflow.
 
@@ -375,6 +402,23 @@ def classify_provider_exception(
             _status_from_error_marker(err_code)
             or _status_from_error_marker(err_type)
         )
+    # OpenRouter reports policy verdicts in metadata, including inside HTTP 200.
+    # Match structured codes only; a bare 403 may genuinely mean missing access.
+    content_policy = False
+    if provider == "openrouter":
+        error = payload.get("error", payload)
+        metadata = error.get("metadata") if isinstance(error, Mapping) else None
+        if isinstance(metadata, Mapping):
+            error_type = metadata.get("error_type")
+            provider_code = metadata.get("provider_code")
+            if isinstance(error_type, str):
+                err_type = error_type
+            if isinstance(provider_code, str):
+                err_code = provider_code
+            content_policy = isinstance(error_type, str) and error_type in {"content_policy_violation", "refusal"}
+            # Older moderation responses expose reasons rather than error_type.
+            if error_type is None and isinstance(metadata.get("reasons"), list):
+                content_policy = bool(metadata["reasons"])
     request_id = _get_request_id(exc)
     message_lower = str(exc).lower()
     quota_or_billing_kind = _quota_or_billing_kind(
@@ -387,6 +431,8 @@ def classify_provider_exception(
 
     if isinstance(exc, asyncio.CancelledError):
         kind = ProviderErrorKind.CANCELLED
+    elif content_policy:
+        kind = ProviderErrorKind.CONTENT_POLICY
     elif isinstance(exc, asyncio.TimeoutError):
         kind = ProviderErrorKind.TIMEOUT
     elif status is None and "timeout" in message_lower:
@@ -422,6 +468,15 @@ def classify_provider_exception(
         # Checked before the generic 400/422 handling so it is not misclassified
         # as a plain invalid_request. Non-retryable by contract.
         kind = ProviderErrorKind.CONTEXT_OVERFLOW
+    elif _is_content_policy_signal(
+        provider=provider,
+        err_type=err_type,
+        err_code=err_code,
+        message=message_lower,
+    ):
+        # Explicit provider moderation protocol marker. This must be checked
+        # before generic 403 handling, which otherwise denotes access control.
+        kind = ProviderErrorKind.CONTENT_POLICY
     elif status == 400:
         if _feature_error_matches_attempt(
             attempted_feature,

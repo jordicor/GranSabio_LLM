@@ -61,14 +61,17 @@ class SegmentMap:
         """Render an XML-like view with stable structural IDs."""
 
         lines = ["<draft_map>"]
-        paragraphs = [node for node in self.nodes if node.kind == "paragraph"]
+        paragraphs: List[TextNode] = []
+        sentences_by_parent: Dict[Optional[str], List[TextNode]] = {}
+        for node in self.nodes:
+            if node.kind == "paragraph":
+                paragraphs.append(node)
+            elif node.kind == "sentence":
+                sentences_by_parent.setdefault(node.parent_id, []).append(node)
+
         for paragraph in paragraphs:
             lines.append(f'  <p id="{paragraph.node_id}">')
-            sentences = [
-                node
-                for node in self.nodes
-                if node.kind == "sentence" and node.parent_id == paragraph.node_id
-            ]
+            sentences = sentences_by_parent.get(paragraph.node_id)
             if sentences:
                 for sentence in sentences:
                     lines.append(

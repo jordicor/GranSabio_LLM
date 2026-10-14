@@ -112,6 +112,10 @@ def normalize_openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
     properties = schema.get("properties")
 
     for key, value in schema.items():
+        if key == "uniqueItems":
+            # Native strict output rejects this keyword. The original schema
+            # still enforces uniqueness in the generation JSON Guard.
+            continue
         if key == "properties" and isinstance(value, dict):
             result[key] = {
                 prop_name: normalize_openai_strict_schema(prop_schema)

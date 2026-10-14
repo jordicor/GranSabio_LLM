@@ -107,7 +107,6 @@ def base_test_client(mock_ai_service, mock_preflight_proceed):
          patch('core.app_state.ai_service', mock_ai_service), \
          patch('core.generation_routes.ai_service', mock_ai_service), \
          patch('core.generation_processor.ai_service', mock_ai_service), \
-         patch('core.streaming_routes.ai_service', mock_ai_service), \
          patch('preflight_validator.run_preflight_validation', AsyncMock(return_value=mock_preflight_proceed)):
         from main import app
         client = TestClient(app, headers={"X-Forwarded-For": "127.0.0.1"})
@@ -126,7 +125,6 @@ def rejection_test_client(mock_ai_service, mock_preflight_reject):
          patch('core.app_state.ai_service', mock_ai_service), \
          patch('core.generation_routes.ai_service', mock_ai_service), \
          patch('core.generation_processor.ai_service', mock_ai_service), \
-         patch('core.streaming_routes.ai_service', mock_ai_service), \
          patch('core.generation_routes.run_preflight_validation', AsyncMock(return_value=mock_preflight_reject)):
         from main import app
         client = TestClient(app, headers={"X-Forwarded-For": "127.0.0.1"})

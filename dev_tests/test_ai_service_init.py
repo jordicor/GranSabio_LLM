@@ -33,7 +33,6 @@ def mock_all_api_clients():
 
         # Configure OpenAI mock
         mock_openai.AsyncOpenAI = MagicMock(return_value=MagicMock())
-        mock_openai.OpenAI = MagicMock(return_value=MagicMock())
 
         # Configure Anthropic mock
         mock_anthropic.AsyncAnthropic = MagicMock(return_value=MagicMock())
@@ -65,8 +64,8 @@ def mock_config_with_keys():
     mock_cfg.LLAMACPP_ENDPOINT_ALIAS = "llamacpp"
     mock_cfg.LLAMACPP_MAX_CONCURRENT_REQUESTS = 1
     mock_cfg.FAKE_AI_HOST = None
+    mock_cfg.PROVIDER_BUDGET_LEDGER_PATH = ""
     mock_cfg.SDK_OPENAI_TIMEOUT_SECONDS = 12000
-    mock_cfg.SDK_OPENAI_SYNC_TIMEOUT_SECONDS = 12000
     mock_cfg.SDK_ANTHROPIC_TIMEOUT_SECONDS = 12000
     mock_cfg.SDK_XAI_TIMEOUT_SECONDS = 12000
     mock_cfg.SDK_OPENROUTER_TIMEOUT_SECONDS = 12000
@@ -96,6 +95,7 @@ def mock_config_no_keys():
     mock_cfg.LLAMACPP_MAX_CONCURRENT_REQUESTS = 1
     mock_cfg.SDK_LLAMACPP_TIMEOUT_SECONDS = 12000
     mock_cfg.FAKE_AI_HOST = None
+    mock_cfg.PROVIDER_BUDGET_LEDGER_PATH = ""
     return mock_cfg
 
 
@@ -104,8 +104,10 @@ def reset_singleton():
     """Reset the singleton instance before each test."""
     import ai_service
     ai_service._shared_ai_service = None
+    ai_service._ai_service_factory = None
     yield
     ai_service._shared_ai_service = None
+    ai_service._ai_service_factory = None
 
 
 # ============================================================================
@@ -114,6 +116,16 @@ def reset_singleton():
 
 class TestSingletonPattern:
     """Tests for get_ai_service() singleton pattern."""
+
+    def test_registered_factory_is_used_once(self, reset_singleton):
+        from ai_service import get_ai_service, register_ai_service_factory
+
+        factory = MagicMock(return_value=object())
+        register_ai_service_factory(factory)
+        assert get_ai_service() is get_ai_service()
+        factory.assert_called_once_with()
+        with pytest.raises(RuntimeError):
+            register_ai_service_factory(factory)
 
     def test_get_ai_service_returns_instance(self, mock_all_api_clients, mock_config_with_keys, reset_singleton):
         """
@@ -251,21 +263,6 @@ class TestOpenAIClientInit:
             assert openai_call[1]["timeout"] == 12000.0
             assert openai_call[1]["max_retries"] == 3
 
-    def test_openai_sync_client_initialized(self, mock_all_api_clients, mock_config_with_keys, reset_singleton):
-        """
-        Given: OPENAI_API_KEY is set
-        When: AIService is initialized
-        Then: Sync OpenAI client is also created (for Responses API)
-        """
-        with patch("ai_service.config", mock_config_with_keys):
-            from ai_service import AIService
-
-            service = AIService()
-
-            mock_all_api_clients["openai"].OpenAI.assert_called_once()
-            call_kwargs = mock_all_api_clients["openai"].OpenAI.call_args[1]
-            assert call_kwargs["api_key"] == "sk-test-openai-key"
-
     def test_sdk_http_clients_use_extended_keepalive(self, mock_all_api_clients, mock_config_with_keys, reset_singleton):
         """
         Given: Provider SDK clients are initialized
@@ -284,9 +281,6 @@ class TestOpenAIClientInit:
                 assert limits.keepalive_expiry == SDK_HTTP_KEEPALIVE_EXPIRY_SECONDS
                 assert limits.max_connections == 1000
                 assert limits.max_keepalive_connections == 100
-
-            openai_sync_limits = mock_all_api_clients["openai"].DefaultHttpxClient.call_args.kwargs["limits"]
-            assert openai_sync_limits.keepalive_expiry == SDK_HTTP_KEEPALIVE_EXPIRY_SECONDS
 
             anthropic_limits = mock_all_api_clients["anthropic"].DefaultAsyncHttpxClient.call_args.kwargs["limits"]
             assert anthropic_limits.keepalive_expiry == SDK_HTTP_KEEPALIVE_EXPIRY_SECONDS
@@ -381,7 +375,6 @@ class TestGoogleClientInit:
              patch("ai_service.aiohttp.TCPConnector"):
 
             mock_openai.AsyncOpenAI = MagicMock()
-            mock_openai.OpenAI = MagicMock()
             mock_anthropic.AsyncAnthropic = MagicMock()
 
             from ai_service import AIService
@@ -580,6 +573,7 @@ class TestOllamaClientInit:
         Then: Ollama client is created with correct base_url
         """
         mock_cfg = MagicMock()
+        mock_cfg.PROVIDER_BUDGET_LEDGER_PATH = ""
         mock_cfg.OPENAI_API_KEY = "sk-test"
         mock_cfg.ANTHROPIC_API_KEY = "sk-ant-test"
         mock_cfg.GOOGLE_API_KEY = None
@@ -608,6 +602,7 @@ class TestOllamaClientInit:
         Then: http:// is added automatically
         """
         mock_cfg = MagicMock()
+        mock_cfg.PROVIDER_BUDGET_LEDGER_PATH = ""
         mock_cfg.OPENAI_API_KEY = "sk-test"
         mock_cfg.ANTHROPIC_API_KEY = "sk-ant-test"
         mock_cfg.GOOGLE_API_KEY = None
@@ -635,6 +630,7 @@ class TestOllamaClientInit:
         Then: the outbound client connects to localhost instead
         """
         mock_cfg = MagicMock()
+        mock_cfg.PROVIDER_BUDGET_LEDGER_PATH = ""
         mock_cfg.OPENAI_API_KEY = "sk-test"
         mock_cfg.ANTHROPIC_API_KEY = "sk-ant-test"
         mock_cfg.GOOGLE_API_KEY = None
@@ -662,6 +658,7 @@ class TestOllamaClientInit:
         Then: that host is preserved as the outbound target
         """
         mock_cfg = MagicMock()
+        mock_cfg.PROVIDER_BUDGET_LEDGER_PATH = ""
         mock_cfg.OPENAI_API_KEY = "sk-test"
         mock_cfg.ANTHROPIC_API_KEY = "sk-ant-test"
         mock_cfg.GOOGLE_API_KEY = None
@@ -758,6 +755,7 @@ class TestLlamaCppClientInit:
 
     def test_llamacpp_client_uses_configured_v1_base_url(self, mock_all_api_clients, reset_singleton):
         mock_cfg = MagicMock()
+        mock_cfg.PROVIDER_BUDGET_LEDGER_PATH = ""
         mock_cfg.OPENAI_API_KEY = None
         mock_cfg.ANTHROPIC_API_KEY = None
         mock_cfg.GOOGLE_API_KEY = None
@@ -787,61 +785,6 @@ class TestLlamaCppClientInit:
         assert llamacpp_call is not None
         assert llamacpp_call[1]["base_url"] == "http://192.0.2.10:11435/v1"
         assert llamacpp_call[1]["api_key"] == "local-safe-key"
-
-    @pytest.mark.asyncio
-    async def test_llamacpp_generation_wrapper_serializes_calls(self):
-        from ai_service import AIService
-
-        service = AIService.__new__(AIService)
-        service.llamacpp_client = object()
-        service._llamacpp_request_semaphore = asyncio.Semaphore(1)
-        active = 0
-        maximum = 0
-
-        async def fake_generate(**kwargs):
-            nonlocal active, maximum
-            assert kwargs["provider_key"] == "llamacpp"
-            assert kwargs["model_id"] == "server-model-q4"
-            assert kwargs["reasoning_effort"] == "none"
-            active += 1
-            maximum = max(maximum, active)
-            await asyncio.sleep(0.01)
-            active -= 1
-            return "ok", {}
-
-        service._generate_openai_compatible = fake_generate
-        await asyncio.gather(
-            *(
-                service._generate_llamacpp(
-                    "p", "server-model-q4", 0.2, 64, "s", reasoning_effort="none"
-                )
-                for _ in range(3)
-            )
-        )
-        assert maximum == 1
-
-    @pytest.mark.asyncio
-    async def test_llamacpp_stream_wrapper_preserves_upstream_model_id(self):
-        from ai_service import AIService
-
-        service = AIService.__new__(AIService)
-        service.llamacpp_client = object()
-        service._llamacpp_request_semaphore = asyncio.Semaphore(1)
-
-        async def fake_stream(**kwargs):
-            assert kwargs["provider_key"] == "llamacpp"
-            assert kwargs["model_id"] == "server-model-q4"
-            assert kwargs["reasoning_effort"] == "none"
-            yield "ok"
-
-        service._stream_openai_compatible = fake_stream
-        chunks = []
-        async for chunk in service._stream_llamacpp(
-            "p", "server-model-q4", 0.2, 64, "s", reasoning_effort="none"
-        ):
-            chunks.append(chunk)
-        assert chunks == ["ok"]
-
 
 # ============================================================================
 # Provider Routing Tests (10 tests)
@@ -998,7 +941,7 @@ class TestProviderRouting:
         """
         Given: Model info with provider='ollama'
         When: generate_content routes the request
-        Then: _generate_ollama is called
+        Then: the registered local Ollama transport is selected
         """
         assert mock_model_info_ollama["provider"] == "ollama"
 

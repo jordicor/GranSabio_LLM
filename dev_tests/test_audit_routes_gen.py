@@ -31,6 +31,7 @@ from core.generation.idempotency import (
 )
 from core.generation.prestart_flow import PrestartFlowResult
 from core.generation_routes import GenerationAdmissionGate
+from local_execution_policy import LocalExecutionPolicyError
 from llm_routing import (
     LLMRoutingError,
     get_default_routing,
@@ -204,6 +205,9 @@ async def test_generate_returns_503_with_retry_after_when_at_capacity(
 
     assert caught.value.status_code == 503
     assert caught.value.headers["Retry-After"] == "5"
+    # Capacity, not the payload, refused this request: the idempotency layer
+    # must not store it under the client's request ID.
+    assert isinstance(caught.value, generation_routes.TransientAdmissionRefusal)
     # The rejected request must not consume or release foreign slots.
     assert fresh_gate.active_count == 2
 
@@ -452,6 +456,100 @@ async def test_admission_cancelled_error_marks_session_cancelled(
     try:
         assert session is not None
         assert session["status"] == GenerationStatus.CANCELLED
+        assert not await generation_routes.cancellation_registry.has_session_runtime(session_id)
+        assert fresh_gate.active_count == 0
+    finally:
+        await app_state.pop_session(session_id)
+
+
+def _prestart_raising_after_registration(captured: dict[str, str], error: Exception):
+    """A prestart that registered the temp session before the local route check failed."""
+
+    async def prestart(**kwargs):
+        session_id = kwargs["session_id"]
+        captured["session_id"] = session_id
+        await generation_routes.cancellation_registry.register_session(
+            session_id,
+            kwargs["project_id"],
+            kwargs["project_epoch"],
+        )
+        await app_state.register_session(
+            session_id,
+            _admission_session_payload(session_id, kwargs["project_id"], kwargs["request"]),
+        )
+        raise error
+
+    return prestart
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code",
+    ["local_endpoint_unavailable", "local_model_not_announced", "local_discovery_invalid"],
+)
+async def test_transient_local_refusal_after_registration_discards_the_temp_session(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_gate: GenerationAdmissionGate,
+    caplog: pytest.LogCaptureFixture,
+    code: str,
+) -> None:
+    """A normal-scope explicit local route is verified at its first SDK call,
+    after prestart registered the temp session: the refusal must discard that
+    session like a preflight rejection, not record an internal-error failure,
+    and must not be stored under the client's request ID."""
+    _admission_patches(monkeypatch)
+    await generation_routes.generation_idempotency_registry.clear()
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(
+        generation_routes,
+        "run_prestart_flow",
+        _prestart_raising_after_registration(
+            captured, LocalExecutionPolicyError(code, "endpoint 'local-a' did not answer")
+        ),
+    )
+
+    with caplog.at_level("ERROR"), pytest.raises(generation_routes.TransientAdmissionRefusal) as caught:
+        await generation_routes.generate_content(_route_request(), "saas-local-transient")
+
+    session_id = captured["session_id"]
+    assert "Generation admission failed" not in caplog.text
+    assert caught.value.status_code == 503
+    assert caught.value.detail == {"code": code, "detail": "endpoint 'local-a' did not answer"}
+    assert app_state.active_sessions.get(session_id) is None
+    assert not await generation_routes.cancellation_registry.has_session_runtime(session_id)
+    assert fresh_gate.active_count == 0
+    assert await generation_routes.get_saas_generation_request("saas-local-transient") == {
+        "found": False,
+        "request_id": "saas-local-transient",
+    }
+
+
+@pytest.mark.asyncio
+async def test_deterministic_local_policy_error_after_registration_still_fails_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_gate: GenerationAdmissionGate,
+) -> None:
+    _admission_patches(monkeypatch)
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(
+        generation_routes,
+        "run_prestart_flow",
+        _prestart_raising_after_registration(
+            captured, LocalExecutionPolicyError("local_unknown_call", "call id is not routable")
+        ),
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await generation_routes._generate_content_once(_route_request())
+
+    session_id = captured["session_id"]
+    session = app_state.active_sessions.get(session_id)
+    try:
+        assert not isinstance(caught.value, generation_routes.TransientAdmissionRefusal)
+        assert caught.value.status_code == 400
+        assert session is not None
+        assert session["status"] == GenerationStatus.FAILED
+        assert session["error_type"] == "internal_error"
         assert not await generation_routes.cancellation_registry.has_session_runtime(session_id)
         assert fresh_gate.active_count == 0
     finally:

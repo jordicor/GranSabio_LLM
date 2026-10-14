@@ -109,10 +109,11 @@ Arguments:
   - context: Additional context about the code
   - focus_areas: Array of areas to focus on (security, performance, bugs, style, all)
 
-  # Reasoning Configuration (optional):
+  # Model and Reasoning Configuration (optional):
   - generator_model: Override generator model
   - qa_models: Override QA models list
-  - reasoning_effort: "none" | "low" | "medium" | "high" (for GPT-5/O1/O3)
+  - gran_sabio_model: Override Gran Sabio escalation model
+  - reasoning_effort: "none" | "low" | "medium" | "high" (for compatible models)
   - thinking_budget_tokens: integer >= 1024 (for Claude models)
   - qa_reasoning_effort: Reasoning effort for QA models
 
@@ -147,9 +148,12 @@ Arguments:
   - issue_description (required): What issue is being fixed
   - language: Programming language
 
-  # Reasoning Configuration (optional):
+  # Model and Reasoning Configuration (optional):
   - generator_model: Override generator model
+  - qa_models: Override QA models list
+  - gran_sabio_model: Override Gran Sabio escalation model
   - reasoning_effort: Reasoning depth for analysis
+  - thinking_budget_tokens: integer >= 1024 (for compatible models)
   - qa_reasoning_effort: Reasoning depth for QA evaluation
 
 Returns:
@@ -180,23 +184,39 @@ Generate content with multi-model quality assurance.
 ```
 Arguments:
   - prompt (required): The generation prompt
-  - content_type: Type of content (code, documentation, article, json)
+  - content_type: Supported content type, e.g. technical (default), article, json
   - qa_criteria: Custom QA criteria array
   - min_score: Minimum score to approve (default: 7.5)
   - max_iterations: Maximum generation attempts (default: 3)
 
-  # Reasoning Configuration (optional):
+  # Model and Reasoning Configuration (optional):
   - generator_model: Override generator model
   - qa_models: Override QA models list
+  - gran_sabio_model: Override Gran Sabio escalation model
   - reasoning_effort: Reasoning depth for generation
   - thinking_budget_tokens: Thinking tokens for Claude
   - qa_reasoning_effort: Reasoning depth for QA
 
 Returns:
-  - Generated content (only if approved)
+  - Generated candidate content, when returned by the engine
+  - Approval status
   - Final score
   - QA summary
 ```
+
+All three generation tools can return an initial refusal with `success: false`
+and no session. For `status: "preflight_rejected"`, the MCP result includes
+`decision`, `feedback` (the engine's user feedback) and `issues`.
+`decision: "manual_review"` means the request needs clarification or human
+review; `decision: "reject"` is a rejection. The server's status remains
+`preflight_rejected` in both cases. For `status: "auto_qa_rejected"`, the result
+includes `feedback` and the complete `auto_qa_feedback` object.
+
+These are business outcomes, and do not indicate that the API is unavailable.
+MCP does not poll, retry `/generate`, or approve the request automatically.
+Revise the request before submitting it again. After a session starts, a final
+QA outcome with `status: "rejected"` remains valid and is returned with
+`success: false` and any candidate content the engine provides.
 
 ### `gransabio_check_health`
 
@@ -225,13 +245,24 @@ All configuration is via environment variables:
 
 ### Optional Model Overrides
 
-MCP does not define model defaults. When these variables are unset, the Gran Sabio API resolves models through its own `llm_routing` configuration.
+MCP does not define model defaults. When these variables are unset or empty,
+the Gran Sabio API resolves models through its own `llm_routing` configuration.
+The `.mcp.json.example` placeholders default to empty model and effort
+overrides, so copying the example preserves the API's routing defaults.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GRANSABIO_GENERATOR_MODEL` | unset | Explicit generator model override |
 | `GRANSABIO_QA_MODELS` | unset | Comma-separated QA model overrides |
-| `GRANSABIO_ARBITER_MODEL` | unset | Explicit Gran Sabio/arbiter model override |
+| `GRANSABIO_ARBITER_MODEL` | unset | Explicit Gran Sabio model override, sent as `gran_sabio_model` |
+
+The environment name `GRANSABIO_ARBITER_MODEL` is retained for existing
+configurations. It selects the API's Gran Sabio model; it does not set
+`arbiter_model`, which belongs to the Arbiter that resolves edits within a QA
+layer. The per-call argument is `gran_sabio_model` on all three generation tools
+and takes precedence over that environment variable. The diagnostic field
+`gransabio_get_config.models.arbiter_override` retains its existing name and
+reports this same Gran Sabio override.
 
 ### Reasoning Configuration
 
@@ -239,17 +270,31 @@ MCP does not define model defaults. When these variables are unset, the Gran Sab
 |----------|---------|-------------|
 | `GRANSABIO_GENERATOR_REASONING` | unset | Optional reasoning effort override for generator (`none`, `low`, `medium`, `high`) |
 | `GRANSABIO_QA_REASONING` | unset | Optional reasoning effort override for QA models |
-| `GRANSABIO_ARBITER_REASONING` | unset | Optional reasoning effort override for arbiter |
-| `GRANSABIO_THINKING_BUDGET` | `0` | Optional thinking budget override for compatible models (0 = API routing) |
+| `GRANSABIO_THINKING_BUDGET` | `0` | Optional thinking budget override for compatible models (`0` = API routing; otherwise integer >= 1024) |
+
+`GRANSABIO_ARBITER_REASONING` is no longer supported. It was never forwarded
+to the API and did not affect reasoning. Remove it from older MCP environment
+configurations, including copies of `.mcp.json.example`; the server now rejects
+it at startup and before tool dispatch. Configure reasoning for the intended
+Gran Sabio or Arbiter call in the API's existing `llm_routing` document.
+It is not reported as an active override by `gransabio_get_config`.
 
 ### Reasoning Effort Levels
 
 | Level | Description | Use Case |
 |-------|-------------|----------|
-| `none` | No extended reasoning | Simple tasks, fast responses |
+| `none` | Omit MCP override and use API routing | Keep the API's configured reasoning |
 | `low` | Light reasoning | Routine code reviews |
 | `medium` | Balanced reasoning | Most analysis tasks |
 | `high` | Deep reasoning | Complex security analysis, critical fixes |
+
+`none` and its supported aliases `off`, `disabled`, `0`, and `false` are string
+values that omit the MCP reasoning override. They do not disable provider
+reasoning. A per-call inheritance value overrides the corresponding MCP
+environment setting. Environment effort labels are case-insensitive and
+trimmed. Invalid effort values or thinking budgets are rejected instead of
+being silently discarded. The per-call `thinking_budget_tokens` argument
+requires an integer >= 1024; only the environment accepts `0` for API routing.
 
 **Example with custom configuration:**
 ```bash

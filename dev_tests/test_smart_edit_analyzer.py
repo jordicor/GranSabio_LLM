@@ -2,96 +2,17 @@
 Tests for the Smart Edit Analyzer module (Phase 6).
 
 Tests cover:
-- Basic pattern matching analysis (no AI)
+- Explicit analysis failures and full admitted text scope
 - AI response parsing
 - Action conversion
 - Statistics calculation
 - Integration with mock AI service
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-
-class TestAnalyzeBasic:
-    """Tests for the analyze_basic method (pattern matching, no AI)."""
-
-    def test_detects_double_words(self):
-        """Should detect repeated words like 'very very'."""
-        from smart_edit.analyzer import TextAnalyzer
-
-        analyzer = TextAnalyzer.__new__(TextAnalyzer)
-        text = "The weather is very very nice today."
-
-        actions = analyzer.analyze_basic(text)
-
-        assert len(actions) >= 1
-        assert actions[0]["type"] == "delete"
-        assert "very" in actions[0]["target"]["value"].lower()
-        assert actions[0]["category"] == "redundancy"
-        assert actions[0]["ai_required"] is False
-
-    def test_detects_intensifier_duplications(self):
-        """Should detect duplicate intensifiers."""
-        from smart_edit.analyzer import TextAnalyzer
-
-        analyzer = TextAnalyzer.__new__(TextAnalyzer)
-        text = "This is really really important and quite quite obvious."
-
-        actions = analyzer.analyze_basic(text)
-
-        assert len(actions) >= 2
-        categories = [a["category"] for a in actions]
-        assert all(c == "redundancy" for c in categories)
-
-    def test_ignores_semantic_redundant_phrases(self):
-        """Semantic phrase detection was removed per repo policy (AUX-10).
-
-        Patterns like "in the year X" or "due to the fact that" are natural
-        language style judgments, not mechanical checks, so the fallback must
-        no longer flag them; only the AI analysis path may suggest them.
-        """
-        from smart_edit.analyzer import TextAnalyzer
-
-        analyzer = TextAnalyzer.__new__(TextAnalyzer)
-        text = "She was born in the year 1985. Due to the fact that she worked hard, she succeeded."
-
-        actions = analyzer.analyze_basic(text)
-
-        assert actions == []
-
-    def test_respects_max_issues_limit(self):
-        """Should respect the max_issues parameter."""
-        from smart_edit.analyzer import TextAnalyzer
-
-        analyzer = TextAnalyzer.__new__(TextAnalyzer)
-        text = "very very very very word word text text test test"
-
-        actions = analyzer.analyze_basic(text, max_issues=2)
-
-        assert len(actions) <= 2
-
-    def test_empty_text_returns_empty_list(self):
-        """Should return empty list for empty text."""
-        from smart_edit.analyzer import TextAnalyzer
-
-        analyzer = TextAnalyzer.__new__(TextAnalyzer)
-
-        actions = analyzer.analyze_basic("")
-
-        assert actions == []
-
-    def test_clean_text_returns_empty_list(self):
-        """Should return empty list for text without issues."""
-        from smart_edit.analyzer import TextAnalyzer
-
-        analyzer = TextAnalyzer.__new__(TextAnalyzer)
-        text = "This is a clean sentence without any issues."
-
-        actions = analyzer.analyze_basic(text)
-
-        assert len(actions) == 0
 
 
 class TestCalculateStats:
@@ -196,16 +117,16 @@ class TestParseResponse:
         assert len(issues) == 1
         assert issues[0]["target"] == "test"
 
-    def test_returns_empty_for_invalid_json(self):
-        """Should return empty list for invalid JSON."""
-        from smart_edit.analyzer import TextAnalyzer
+    @pytest.mark.parametrize("response", ["This is not valid JSON", '{}', '{"issues": null}'])
+    def test_rejects_invalid_analysis_response(self, response):
+        """Invalid or missing analysis is distinct from an empty issues list."""
+        from smart_edit.analyzer import TextAnalysisError, TextAnalyzer
 
         analyzer = TextAnalyzer.__new__(TextAnalyzer)
-        response = "This is not valid JSON"
 
-        issues = analyzer._parse_response(response)
-
-        assert issues == []
+        with pytest.raises(TextAnalysisError):
+            analyzer._parse_response(response)
+        assert analyzer._parse_response('{"issues": []}') == []
 
     def test_handles_list_format(self):
         """Should handle response that is just a list."""
@@ -238,7 +159,7 @@ class TestIssuesToActions:
         from smart_edit.analyzer import TextAnalyzer
 
         analyzer = TextAnalyzer.__new__(TextAnalyzer)
-        issues = [{"target": "very ", "type": "delete", "description": "Remove duplicate", "category": "redundancy"}]
+        issues = [{"target": "very very", "type": "delete", "description": "Remove duplicate", "category": "redundancy"}]
         text = "This is very very nice."
 
         actions = analyzer._issues_to_actions(issues, text)
@@ -310,17 +231,17 @@ class TestIssuesToActions:
         assert actions[0]["ai_required"] is True
         assert actions[0]["estimated_ms"] == 2500
 
-    def test_skips_target_not_found_in_text(self):
-        """Should skip issues where target not found in text."""
-        from smart_edit.analyzer import TextAnalyzer
+    @pytest.mark.parametrize("target", ["nonexistent text", ""])
+    def test_rejects_target_not_found_in_text(self, target):
+        """An unverifiable issue cannot become a successful empty analysis."""
+        from smart_edit.analyzer import TextAnalysisError, TextAnalyzer
 
         analyzer = TextAnalyzer.__new__(TextAnalyzer)
-        issues = [{"target": "nonexistent text", "type": "delete", "description": "Remove", "category": "redundancy"}]
+        issues = [{"target": target, "type": "delete", "description": "Remove", "category": "redundancy"}]
         text = "This is completely different text."
 
-        actions = analyzer._issues_to_actions(issues, text)
-
-        assert len(actions) == 0
+        with pytest.raises(TextAnalysisError):
+            analyzer._issues_to_actions(issues, text)
 
     def test_generates_sequential_ids(self):
         """Should generate sequential action IDs."""
@@ -442,6 +363,129 @@ class TestAnalysisPrompt:
 
         assert "JSON" in prompt
         assert '"issues"' in prompt
+
+
+@pytest.fixture
+def analysis_api(monkeypatch):
+    """Exercise the real router with only the AI service boundary simulated."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import ai_service
+    from smart_edit.router import router
+
+    generate = AsyncMock(return_value='{"issues": []}')
+    service = SimpleNamespace(generate_content=generate)
+    monkeypatch.setattr(ai_service, "get_ai_service", lambda: service)
+    app = FastAPI()
+    app.include_router(router, prefix="/smart-edit")
+    with TestClient(app) as client:
+        yield client, generate
+
+
+@pytest.mark.parametrize("failure", ["provider", "response", "replacement", "capacity"])
+def test_analysis_error_is_not_success(analysis_api, failure):
+    """The HTTP analysis path keeps provider, parser and capacity failures visible."""
+    from context_budget import ContextCapacityUnknown
+
+    client, generate = analysis_api
+    if failure == "provider":
+        generate.side_effect = RuntimeError("private provider details")
+        status, error_code = 502, "smart_edit_analysis_failed"
+    elif failure == "response":
+        generate.return_value = "No valid JSON was supplied"
+        status, error_code = 502, "smart_edit_analysis_invalid"
+    elif failure == "replacement":
+        generate.return_value = '{"issues": [{"target": "very very cold", "type": "replace"}]}'
+        status, error_code = 502, "smart_edit_analysis_invalid"
+    else:
+        generate.side_effect = ContextCapacityUnknown(call_id="smart_edit.analyze")
+        status, error_code = 400, "context_capacity_unknown"
+
+    response = client.post("/smart-edit/analyze", json={"text": "very very cold"})
+
+    assert response.status_code == status
+    assert response.json()["detail"]["error_code"] == error_code
+    assert "actions" not in response.json()
+    assert "private provider details" not in response.text
+    generate.assert_awaited_once()
+
+
+def test_analysis_processes_full_accepted_scope(analysis_api):
+    """The 50000-character admission boundary is not truncated in the AI prompt."""
+    import json_utils as json
+
+    client, generate = analysis_api
+    tail = "TAIL TO EDIT"
+    text = "x" * (50000 - len(tail)) + tail
+    generate.return_value = json.dumps({"issues": [{
+        "target": tail, "type": "replace", "replacement": "fixed", "category": "grammar",
+    }]})
+
+    response = client.post("/smart-edit/analyze", json={"text": text})
+
+    assert response.status_code == 200
+    assert text in generate.call_args.kwargs["prompt"]
+    assert response.json()["actions"][0]["target"]["value"] == tail
+    rejected = client.post("/smart-edit/analyze", json={"text": text + "x"})
+    assert rejected.status_code == 422
+    generate.assert_awaited_once()
+
+
+@pytest.fixture
+def repeated_edit_analysis():
+    """One repeated fragment, disambiguated by its surrounding text."""
+    return {
+        "text": "very very quiet. Later, very very busy. Banana.",
+        "issues": [
+            {"target": "very very quiet.", "type": "replace", "replacement": "quiet."},
+            {"target": "very very busy.", "type": "replace", "replacement": "busy."},
+        ],
+    }
+
+
+@pytest.mark.parametrize("target", ["very very", "VERY VERY", "ana", "ANA"])
+def test_analysis_rejects_repeated_fragment(analysis_api, repeated_edit_analysis, target):
+    """Neither exact nor casing recovery may silently choose the first match."""
+    import json_utils as json
+
+    client, generate = analysis_api
+    generate.return_value = json.dumps({"issues": [{"target": target, "type": "delete"}]})
+
+    response = client.post("/smart-edit/analyze", json={"text": repeated_edit_analysis["text"]})
+
+    assert response.status_code == 502
+    assert "ambiguous" in response.json()["detail"]["message"]
+    assert "actions" not in response.json()
+
+
+def test_generated_actions_revalidate_current_text(analysis_api, repeated_edit_analysis):
+    """Serial edits locate the current text and fail when an earlier edit makes it ambiguous."""
+    import json_utils as json
+
+    client, generate = analysis_api
+    generate.return_value = json.dumps({"issues": repeated_edit_analysis["issues"]})
+    text = repeated_edit_analysis["text"]
+    analysis = client.post("/smart-edit/analyze", json={"text": text})
+    assert analysis.status_code == 200
+    actions = analysis.json()["actions"]
+
+    applied = client.post("/smart-edit/execute-batch", json={"text": text, "actions": actions})
+
+    assert applied.status_code == 200
+    assert applied.json()["success"] is True
+    assert applied.json()["text_final"] == "quiet. Later, busy. Banana."
+
+    actions[0]["content"] = actions[1]["target"]["value"]
+    ambiguous = client.post("/smart-edit/execute-batch", json={"text": text, "actions": actions})
+
+    assert ambiguous.status_code == 200
+    result = ambiguous.json()
+    assert result["success"] is False
+    assert result["text_final"] == "very very busy. Later, very very busy. Banana."
+    assert result["results"][0]["success"] is True
+    assert result["results"][1]["success"] is False
+    assert "ambiguous" in result["results"][1]["error"]
 
 
 if __name__ == "__main__":

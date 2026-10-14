@@ -9,8 +9,11 @@ Tests various combinations of:
 
 This file also provides a comprehensive matrix test runner.
 
-IMPORTANT: These tests make real API calls and incur costs.
-Set SKIP_EXPENSIVE_TESTS=1 to skip API tests.
+IMPORTANT: ``TestAPIIntegrationMatrix`` makes real API calls and incurs costs.
+It is opt-in (marker ``integration``, deselected by default) and needs the
+engine server running at API_BASE (default http://localhost:8000):
+
+    pytest -m integration dev_tests/test_tokens_combinations.py
 """
 
 import os
@@ -25,9 +28,6 @@ import httpx
 import pytest
 
 import config
-
-# Skip expensive API tests unless explicitly enabled
-SKIP_EXPENSIVE = os.environ.get("SKIP_EXPENSIVE_TESTS", "0") == "1"
 
 # API configuration
 API_BASE = os.environ.get("API_BASE", "http://localhost:8000")
@@ -252,6 +252,8 @@ class TestCrossProviderValidation:
         print("\n" + "=" * 100)
 
 
+@pytest.mark.integration
+@pytest.mark.usefixtures("live_engine_server")
 class TestAPIIntegrationMatrix:
     """Integration tests for API calls with different parameter combinations."""
 
@@ -268,7 +270,6 @@ class TestAPIIntegrationMatrix:
             "max_tokens": 500,
         }
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_quick_matrix_all_providers(self, base_payload):
         """Quick matrix test: one model per provider with low reasoning."""
         test_configs = [
@@ -393,6 +394,7 @@ def run_all_tests():
         __file__,
         "-v",
         "--tb=short",
+        "-m", "integration or not integration",
     ])
 
 

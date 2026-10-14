@@ -1,6 +1,17 @@
 {
   "version": 1,
   "models": {
+    "gpt-5.6-luna": {
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "max_total_context_tokens": 1050000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "within_output",
+      "source": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+      "verified_at": "2026-09-15",
+      "provenance": "manual_curated",
+      "note": "Reasoning tokens share the output allowance. Requests over 272K input use long-context pricing."
+    },
     "gpt-5.4-mini": {
       "max_input_tokens": null,
       "max_output_tokens": 128000,
@@ -177,6 +188,122 @@
       "verified_at": "2026-07-12",
       "provenance": "manual_curated",
       "note": "SHUT DOWN 2026-01-14 (embeddings model; no output budget)."
+    },
+    "jev-latest": {
+      "max_input_tokens": 32000,
+      "max_output_tokens": 256,
+      "max_total_context_tokens": 32000,
+      "output_accounting": "separate",
+      "reasoning_accounting": "within_output",
+      "provider": "typesafe",
+      "source": "https://docs.typesafe.ai/models",
+      "verified_at": "2026-09-17",
+      "provenance": "manual_curated",
+      "note": "TypeSafe System One alias. Input-priced; does not generate chat text."
+    },
+    "jev-1.13.0": {
+      "max_input_tokens": 32000,
+      "max_output_tokens": 256,
+      "max_total_context_tokens": 32000,
+      "output_accounting": "separate",
+      "reasoning_accounting": "within_output",
+      "provider": "typesafe",
+      "source": "https://docs.typesafe.ai/models",
+      "verified_at": "2026-09-17",
+      "provenance": "manual_curated",
+      "note": "TypeSafe System One Jev 1.13. Input-priced; does not generate chat text."
+    },
+    "gpt-6-luna": {
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "max_total_context_tokens": 1050000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "within_output",
+      "provider": "openai",
+      "source": "https://developers.openai.com/api/docs/models/gpt-6-luna",
+      "verified_at": "2026-10-05",
+      "provenance": "manual_curated"
+    },
+    "gpt-6-sol": {
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "max_total_context_tokens": 1050000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "within_output",
+      "provider": "openai",
+      "source": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+      "verified_at": "2026-09-25",
+      "provenance": "manual_curated"
+    },
+    "claude-sonnet-5": {
+      "max_input_tokens": null,
+      "max_output_tokens": 128000,
+      "max_total_context_tokens": 1000000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "within_output",
+      "provider": "anthropic",
+      "source": "https://platform.claude.com/docs/en/models/sonnet-5/overview",
+      "verified_at": "2026-09-25",
+      "provenance": "manual_curated"
+    },
+    "gemini-3.8-flash": {
+      "max_input_tokens": 1048576,
+      "max_output_tokens": 65536,
+      "max_total_context_tokens": null,
+      "output_accounting": "separate",
+      "reasoning_accounting": "within_output",
+      "provider": "google",
+      "source": "https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash",
+      "verified_at": "2026-09-25",
+      "provenance": "manual_curated",
+      "note": "Provider API exposes independent input and output limits; reasoning shares the output allowance."
+    },
+    "gpt-6.1-sol": {
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "max_total_context_tokens": 1050000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "within_output",
+      "provider": "openai",
+      "source": "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+      "verified_at": "2026-10-05",
+      "provenance": "manual_curated",
+      "note": "Reasoning tokens share the output allowance. Tool calling requires Responses; reasoning effort none is not supported."
+    },
+    "gpt-6-astra": {
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "max_total_context_tokens": 1050000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "within_output",
+      "provider": "openai",
+      "source": "https://developers.openai.com/api/docs/models/gpt-6-astra",
+      "verified_at": "2026-10-05",
+      "provenance": "manual_curated",
+      "note": "Reasoning tokens share the output allowance. Tool calling requires Responses; reasoning effort none is not supported."
+    },
+    "openai/gpt-6-luna": {
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "max_total_context_tokens": 1050000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "within_output",
+      "provider": "openrouter",
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-10-05",
+      "provenance": "manual_curated"
+    },
+    "openai/gpt-6.1-sol": {
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "max_total_context_tokens": 1050000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "within_output",
+      "provider": "openrouter",
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-10-05",
+      "provenance": "manual_curated",
+      "note": "Reasoning tokens share the output allowance. Tool calling requires Responses; reasoning effort none is not supported."
     }
   }
 }

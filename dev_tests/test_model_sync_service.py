@@ -8,6 +8,7 @@ local catalog loader, safe sync path, and reference validation.
 from __future__ import annotations
 
 import logging
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -44,9 +45,11 @@ class _FakeResponse:
 
 
 class _FakeOllamaSession:
-    def __init__(self, *, version_status=200, tags_payload=None):
+    def __init__(self, *, version_status=200, tags_payload=None, show_payloads=None, show_status=200):
         self.version_status = version_status
         self.tags_payload = tags_payload if tags_payload is not None else {"models": []}
+        self.show_payloads = show_payloads or {}
+        self.show_status = show_status
         self.urls = []
         self.request_kwargs = []
 
@@ -68,6 +71,17 @@ class _FakeOllamaSession:
         if url.endswith("/api/tags"):
             return _FakeResponse(payload=self.tags_payload)
         raise AssertionError(f"Unexpected URL: {url}")
+
+    def post(self, url, **kwargs):
+        self.urls.append(url)
+        self.request_kwargs.append(kwargs)
+        if not url.endswith("/api/show"):
+            raise AssertionError(f"Unexpected URL: {url}")
+        return _FakeResponse(
+            status=self.show_status,
+            payload=self.show_payloads.get(kwargs["json"]["model"], {"capabilities": ["completion"]}),
+            text="metadata unavailable",
+        )
 
 
 class _FakeLlamaCppSession:
@@ -221,6 +235,40 @@ def service(tmp_path, sample_model_specs):
     )
     svc.backup_dir = tmp_path / "backups"
     return svc
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux release symlinks; exercised under WSL.")
+def test_atomic_catalog_update_preserves_release_symlink(service, tmp_path):
+    release = tmp_path / "release"
+    release.mkdir()
+    link = release / "model_specs.json"
+    link.symlink_to(service.specs_path)
+    linked = ModelSyncService(service.config, service.logger, specs_path=link)
+    updated = {"model_specifications": {}, "aliases": {}}
+
+    linked._write_specs_atomic(updated)
+
+    assert link.is_symlink()
+    assert json.loads(service.specs_path.read_text(encoding="utf-8")) == updated
+    assert not (release / "model_specs.json.tmp").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux release symlinks; exercised under WSL.")
+def test_context_suspect_update_preserves_release_symlink(service, tmp_path, monkeypatch):
+    from config import config
+
+    service._write_specs_atomic({"model_specifications": {
+        "openrouter": {"owned-model": {"model_id": "provider/owned-model"}},
+    }})
+    link = tmp_path / "release-catalog.json"
+    link.symlink_to(service.specs_path)
+    monkeypatch.setattr(type(config), "reload_model_specifications", lambda self: None)
+
+    model_sync.mark_model_context_suspect("provider/owned-model", specs_path=link)
+
+    assert link.is_symlink()
+    stored = json.loads(service.specs_path.read_text(encoding="utf-8"))
+    assert stored["model_specifications"]["openrouter"]["owned-model"]["sync_metadata"]["context_suspect"]
 
 
 def test_get_local_catalog_includes_sync_metadata(service):
@@ -496,6 +544,7 @@ async def test_fetch_ollama_remote_models_from_local_tags(service, monkeypatch):
     assert fake_session.urls == [
         "http://localhost:11434/api/version",
         "http://localhost:11434/api/tags",
+        "http://localhost:11434/api/show",
     ]
     assert all(kwargs["allow_redirects"] is False for kwargs in fake_session.request_kwargs)
     assert result["provider"] == "ollama"
@@ -510,6 +559,78 @@ async def test_fetch_ollama_remote_models_from_local_tags(service, monkeypatch):
     assert model["source"] == "local/ollama"
     assert "8B" in model["description"]
     assert "Q4_K_M" in model["description"]
+
+
+@pytest.mark.parametrize(
+    ("show_payload", "local_capabilities", "expected_capabilities"),
+    [
+        ({"capabilities": ["completion", "vision"]}, ["text"], ["text", "vision"]),
+        ({"capabilities": ["completion"]}, ["text", "vision"], ["text"]),
+        ({}, ["text", "vision"], ["text"]),
+    ],
+)
+@pytest.mark.asyncio
+async def test_sync_ollama_preserves_only_declared_vision(
+    service, monkeypatch, show_payload, local_capabilities, expected_capabilities
+):
+    """/api/show capabilities follow Ollama's documented response contract.
+
+    Source: https://docs.ollama.com/api-reference/show-model-details
+    Missing metadata must not infer vision from a family or a stale template.
+    """
+    model_id = "gemma3:4b"
+    local_spec = {
+        "model_id": model_id,
+        "input_tokens": 32768,
+        "output_tokens": 8192,
+        "context_window": 32768,
+        "capabilities": local_capabilities,
+    }
+    specs = service.load_specs()
+    specs["model_specifications"]["ollama"] = {
+        model_id: local_spec,
+        "local-only:latest": {**local_spec, "model_id": "local-only:latest"},
+    }
+    service.specs_path.write_text(json.dumps(specs), encoding="utf-8")
+    fake_session = _FakeOllamaSession(
+        tags_payload={"models": [{"model": model_id, "name": model_id, "details": {"family": "gemma3"}}]},
+        show_payloads={model_id: show_payload},
+    )
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+
+    result = await service.fetch_remote_models("ollama")
+    discovered = next(model for model in result["models"] if model["key"] == model_id)
+    assert discovered["capabilities"] == expected_capabilities
+    assert fake_session.urls.count("http://localhost:11434/api/show") == 1
+    assert fake_session.request_kwargs[-1]["json"] == {"model": model_id}
+    assert fake_session.request_kwargs[-1]["allow_redirects"] is False
+
+    service.sync_provider("ollama", result["models"])
+    synced = service.load_specs()["model_specifications"]["ollama"]
+    assert synced[model_id]["capabilities"] == expected_capabilities
+    assert synced["local-only:latest"] == specs["model_specifications"]["ollama"]["local-only:latest"]
+
+
+@pytest.mark.parametrize(
+    ("show_status", "show_payload"),
+    [(500, {}), (200, {"capabilities": "vision"})],
+)
+@pytest.mark.asyncio
+async def test_fetch_ollama_metadata_failure_preserves_catalog(service, monkeypatch, show_status, show_payload):
+    before = service.specs_path.read_bytes()
+    fake_session = _FakeOllamaSession(
+        tags_payload={"models": [{"model": "llava:latest"}]},
+        show_payloads={"llava:latest": show_payload},
+        show_status=show_status,
+    )
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+
+    with pytest.raises(ModelSyncError, match="Ollama.*(metadata|capabilities)"):
+        await service.fetch_remote_models("ollama")
+
+    assert service.specs_path.read_bytes() == before
+    service.config.reload_model_specifications.assert_not_called()
+    assert fake_session.urls.count("http://localhost:11434/api/show") == 1
 
 
 @pytest.mark.asyncio
@@ -548,24 +669,38 @@ async def test_fetch_llamacpp_discovers_effective_context_without_generation(ser
     assert model["sync_metadata"]["endpoint_alias"] == "llamacpp-test"
 
 
+@pytest.mark.parametrize("modalities", [{"vision": True}, {"vision": False}, None])
 @pytest.mark.asyncio
-async def test_fetch_llamacpp_advertises_reasoning_only_when_server_reports_support(
-    service, monkeypatch
+async def test_sync_llamacpp_preserves_only_declared_capabilities(
+    service, monkeypatch, modalities
 ):
+    """GET /props declares supported modalities; no additional probe is needed.
+
+    Source: https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#get-props-get-server-global-properties
+    """
     service.config.LLAMACPP_BASE_URL = "http://192.0.2.10:11435/v1"
+    props = {
+        "n_ctx": 32768,
+        "chat_template_caps": {"supports_reasoning_effort": True},
+    }
+    if modalities is not None:
+        props["modalities"] = modalities
     fake_session = _FakeLlamaCppSession(
-        props_payload={
-            "n_ctx": 32768,
-            "chat_template_caps": {"supports_reasoning_effort": True},
-        }
+        props_payload=props,
     )
     monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
 
     result = await service.fetch_remote_models("llamacpp")
 
     model = result["models"][0]
-    assert model["capabilities"] == ["text", "reasoning"]
+    expected_capabilities = ["text", "reasoning"]
+    if modalities == {"vision": True}:
+        expected_capabilities.insert(1, "vision")
+    assert model["capabilities"] == expected_capabilities
     assert model["supported_parameters"] == ["reasoning_effort"]
+    service.sync_provider("llamacpp", [model])
+    synced = service.load_specs()["model_specifications"]["llamacpp"]
+    assert synced[model["model_id"]]["capabilities"] == expected_capabilities
 
 
 @pytest.mark.asyncio
@@ -683,3 +818,222 @@ def test_openrouter_merge_preserves_supported_parameters_for_local_only(service)
     assert merged
     assert merged[0]["local_only"] is True
     assert merged[0]["supported_parameters"] == ["tools", "tool_choice"]
+
+
+# OpenRouter's public catalog entry for a cache-priced, long-context model
+# (per-token strings) and the per-million catalog block it must become.
+LUNA_REMOTE_PRICING = {
+    "prompt": "0.0000001",
+    "completion": "0.0000005",
+    "web_search": "0.01",
+    "input_cache_read": "0.00000001",
+    "input_cache_write": "0.000000125",
+    "overrides": [
+        {
+            "min_prompt_tokens": 272000,
+            "prompt": "0.0000002",
+            "completion": "0.00000075",
+            "input_cache_read": "0.00000002",
+            "input_cache_write": "0.00000025",
+        }
+    ],
+}
+LUNA_CATALOG_PRICING = {
+    "input_per_million": 0.1,
+    "output_per_million": 0.5,
+    "cached_input_per_million": 0.01,
+    "cache_write_per_million": 0.125,
+    "long_context": {
+        "threshold_tokens": 272000,
+        "input_per_million": 0.2,
+        "output_per_million": 0.75,
+        "cached_input_per_million": 0.02,
+        "cache_write_per_million": 0.25,
+    },
+}
+PLAIN_REMOTE_PRICING = {"prompt": "0.00000008", "completion": "0.0000003"}
+PLAIN_CATALOG_PRICING = {"input_per_million": 0.08, "output_per_million": 0.3}
+
+
+def test_openrouter_pricing_maps_cache_rates_and_long_context_override():
+    assert model_sync.openrouter_pricing_from_remote(LUNA_REMOTE_PRICING) == LUNA_CATALOG_PRICING
+
+
+@pytest.mark.parametrize(
+    "pricing",
+    [
+        PLAIN_REMOTE_PRICING,
+        {**PLAIN_REMOTE_PRICING, "input_cache_read": None, "input_cache_write": "", "overrides": []},
+        {**PLAIN_REMOTE_PRICING, "overrides": [{"prompt": "0.0000002"}, "not-a-mapping"]},
+        {**PLAIN_REMOTE_PRICING, "input_cache_read": "not-a-price", "input_cache_write": "-1"},
+    ],
+)
+def test_openrouter_pricing_omits_rates_the_catalog_does_not_list(pricing):
+    assert model_sync.openrouter_pricing_from_remote(pricing) == PLAIN_CATALOG_PRICING
+
+
+@pytest.mark.parametrize(
+    "pricing",
+    [
+        {"prompt": "-1", "completion": "-1"},
+        {"prompt": "-1", "completion": "-1", "input_cache_read": "-1", "overrides": [{"min_prompt_tokens": 1}]},
+        {},
+        {"prompt": None, "completion": "", "web_search": "0.01"},
+    ],
+)
+def test_openrouter_pricing_never_invents_a_base_rate(pricing):
+    """OpenRouter lists -1 for router models priced per routed request
+    (openrouter/auto and the like); that sentinel, like a missing rate, leaves
+    the key out so the catalog estimate is unknown rather than free."""
+    assert model_sync.openrouter_pricing_from_remote(pricing) == {}
+    assert model_sync._normalize_pricing_block(model_sync.openrouter_pricing_from_remote(pricing)) == {}
+
+
+def test_openrouter_pricing_keeps_listed_zero_rates_and_partial_overrides():
+    pricing = model_sync.openrouter_pricing_from_remote(
+        {
+            "prompt": "0",
+            "completion": "0",
+            "input_cache_read": "0",
+            "overrides": [{"min_prompt_tokens": 128000, "prompt": "0.000001"}],
+        }
+    )
+
+    assert pricing == {
+        "input_per_million": 0.0,
+        "output_per_million": 0.0,
+        "cached_input_per_million": 0.0,
+        "long_context": {"threshold_tokens": 128000, "input_per_million": 1.0},
+    }
+
+
+@pytest.mark.asyncio
+async def test_fetch_openrouter_remote_maps_cache_and_long_context_pricing(service, monkeypatch):
+    fake_session = _FakeSingleGetSession(
+        payload={
+            "data": [
+                {
+                    "id": "openai/gpt-6-luna",
+                    "name": "OpenAI: GPT-6 Luna",
+                    "context_length": 1050000,
+                    "pricing": LUNA_REMOTE_PRICING,
+                    "architecture": {"input_modalities": ["text", "image"]},
+                    "top_provider": {"max_completion_tokens": 128000},
+                    "supported_parameters": ["tools"],
+                },
+                {
+                    "id": "meta-llama/llama-4-scout",
+                    "name": "Meta: Llama 4 Scout",
+                    "context_length": 256000,
+                    "pricing": PLAIN_REMOTE_PRICING,
+                    "architecture": {"input_modalities": ["text"]},
+                    "top_provider": {},
+                },
+            ]
+        }
+    )
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+
+    result = await service.fetch_remote_models("openrouter")
+
+    assert fake_session.urls == [model_sync.OPENROUTER_MODELS_URL]
+    by_id = {model["id"]: model for model in result["models"]}
+    assert by_id["openai/gpt-6-luna"]["pricing"] == LUNA_CATALOG_PRICING
+    assert by_id["meta-llama/llama-4-scout"]["pricing"] == PLAIN_CATALOG_PRICING
+    # The persisted entry still carries the old two-key pricing, so it is an update.
+    assert by_id["meta-llama/llama-4-scout"]["status"] == "update"
+
+
+def test_sync_provider_persists_cache_and_long_context_pricing(service):
+    selection = [
+        {
+            "key": "openai/gpt-6-luna",
+            "model_id": "openai/gpt-6-luna",
+            "name": "OpenAI: GPT-6 Luna",
+            "description": "OpenRouter model",
+            "context_window": 1050000,
+            "input_tokens": 1050000,
+            "output_tokens": 128000,
+            "pricing": LUNA_CATALOG_PRICING,
+            "capabilities": ["text", "vision"],
+            "supported_parameters": ["tools"],
+            "source": "https://openrouter.ai/models/openai/gpt-6-luna",
+        },
+        {
+            "key": "meta-llama/llama-4-scout",
+            "model_id": "meta-llama/llama-4-scout",
+            "name": "Llama 4 Scout",
+            "description": "OpenRouter model",
+            "context_window": 256000,
+            "input_tokens": 256000,
+            "output_tokens": 8192,
+            "pricing": PLAIN_CATALOG_PRICING,
+            "capabilities": ["text"],
+            "supported_parameters": ["tools"],
+            "source": "https://openrouter.ai/models/meta-llama/llama-4-scout",
+        },
+    ]
+
+    result = service.sync_provider("openrouter", selection)
+
+    assert result["success"] is True
+    persisted = json.loads(service.specs_path.read_text(encoding="utf-8"))["model_specifications"]["openrouter"]
+    assert persisted["openai/gpt-6-luna"]["pricing"] == LUNA_CATALOG_PRICING
+    assert persisted["meta-llama/llama-4-scout"]["pricing"] == PLAIN_CATALOG_PRICING
+
+
+def test_admin_ui_sync_payload_persists_the_full_pricing_block(service):
+    """The exact shape static/js/models_admin.js posts (normalizeModel output
+    with the catalog pricing block carried through) must persist every rate
+    and leave the model 'enabled', not permanently flagged as an update."""
+    remote_pricing = model_sync.openrouter_pricing_from_remote(LUNA_REMOTE_PRICING)
+    ui_model = {
+        "id": "openai/gpt-6-luna",
+        "provider": "openrouter",
+        "name": "OpenAI: GPT-6 Luna",
+        "description": "OpenRouter model",
+        "input_tokens": 1050000,
+        "output_tokens": 128000,
+        "context_window": 1050000,
+        "pricing": json.loads(json.dumps(remote_pricing)),
+        "capabilities": ["text", "vision"],
+        "supported_parameters": ["tools"],
+        "verified_at": "",
+        "created_at": "",
+        "source": "https://openrouter.ai/models/openai/gpt-6-luna",
+        "status": "new",
+        "enabled": True,
+        "raw": {"id": "openai/gpt-6-luna", "pricing": remote_pricing},
+    }
+
+    result = service.sync_provider("openrouter", [ui_model])
+
+    assert result["success"] is True
+    persisted = json.loads(service.specs_path.read_text(encoding="utf-8"))["model_specifications"]["openrouter"]
+    assert persisted["openai/gpt-6-luna"]["pricing"] == remote_pricing == LUNA_CATALOG_PRICING
+    assert service._determine_remote_status("openrouter", ui_model, persisted["openai/gpt-6-luna"]) == "enabled"
+
+
+def test_discovery_sync_preserves_curated_cache_pricing(service):
+    """A re-sync of a discovery provider must not strip curated cache or long-context rates."""
+    current = service.load_specs()["model_specifications"]["openai"]
+    curated_pricing = {
+        "input_per_million": 2.5,
+        "output_per_million": 10.0,
+        "cached_input_per_million": 1.25,
+        "long_context": {"threshold_tokens": 128000, "input_per_million": 5.0, "output_per_million": 20.0},
+    }
+    current["gpt-4o"]["pricing"] = {**curated_pricing, "long_context": {**curated_pricing["long_context"],
+                                                                        "cached_input_per_million": None}}
+
+    entry = service._build_discovery_entry(
+        provider="openai",
+        model_id="gpt-4o",
+        display_name="gpt-4o",
+        remote_created_at=None,
+        current_provider_specs=current,
+    )
+    spec = service._build_provider_spec("openai", entry, current["gpt-4o"])
+
+    assert entry["pricing"] == curated_pricing
+    assert spec["pricing"] == curated_pricing

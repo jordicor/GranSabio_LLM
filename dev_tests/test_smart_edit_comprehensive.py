@@ -25,6 +25,10 @@ Usage:
     python dev_tests/test_smart_edit_comprehensive.py --category localization
     python dev_tests/test_smart_edit_comprehensive.py --category ai
     python dev_tests/test_smart_edit_comprehensive.py --category edge
+
+    # Under pytest, the AI-assisted tests make real provider calls, which cost
+    # money, so they are opt-in (marker ``integration``, deselected by default):
+    pytest -m integration dev_tests/test_smart_edit_comprehensive.py
 """
 
 import argparse
@@ -36,6 +40,8 @@ import traceback
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional
+
+import pytest
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1352,6 +1358,7 @@ def test_smart_edit_markers_at_boundaries():
 # AI-ASSISTED OPERATION TESTS (Require AI Service)
 # =============================================================================
 
+@pytest.mark.integration
 async def test_smart_edit_ai_rephrase():
     """Test AI-assisted rephrasing."""
     try:
@@ -1377,6 +1384,7 @@ async def test_smart_edit_ai_rephrase():
     return True
 
 
+@pytest.mark.integration
 async def test_smart_edit_ai_apply_edit():
     """Test AI-assisted custom edit."""
     try:
@@ -1403,6 +1411,7 @@ async def test_smart_edit_ai_apply_edit():
     return True
 
 
+@pytest.mark.integration
 async def test_smart_edit_ai_improve():
     """Test AI-assisted improvement."""
     try:
@@ -1425,6 +1434,7 @@ async def test_smart_edit_ai_improve():
     return True
 
 
+@pytest.mark.integration
 async def test_smart_edit_ai_with_markdown():
     """Test AI edit on markdown text."""
     try:
@@ -1448,6 +1458,7 @@ async def test_smart_edit_ai_with_markdown():
     return True
 
 
+@pytest.mark.integration
 async def test_smart_edit_ai_with_long_text():
     """Test AI edit on longer text."""
     try:
@@ -1470,6 +1481,7 @@ async def test_smart_edit_ai_with_long_text():
     return True
 
 
+@pytest.mark.integration
 async def test_smart_edit_ai_random_instruction():
     """Test AI edit with random creative instruction."""
     try:
@@ -1588,6 +1600,7 @@ def test_smart_edit_full_workflow_direct():
     return True
 
 
+@pytest.mark.integration
 async def test_smart_edit_full_workflow_ai():
     """Test complete workflow with AI operations."""
     try:

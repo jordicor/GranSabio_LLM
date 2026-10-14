@@ -35,6 +35,7 @@ import requests
 from dotenv import load_dotenv
 
 import json_utils as json
+from services.model_sync import openrouter_pricing_from_remote
 
 # Load environment variables
 load_dotenv()
@@ -159,12 +160,10 @@ class OpenRouterSync:
                 self.log(f"Skipping model without ID: {model}")
                 return None
 
-            # Extract pricing (OpenRouter uses different units)
-            pricing_data = model.get("pricing", {})
-            pricing = {
-                "input_per_million": float(pricing_data.get("prompt", 0)) * 1000000,
-                "output_per_million": float(pricing_data.get("completion", 0)) * 1000000
-            }
+            # OpenRouter prices per token; the catalog stores per-million rates,
+            # cache read/write rates and the long-context override, each only
+            # when listed (an unlisted rate or the -1 sentinel stays unknown).
+            pricing = openrouter_pricing_from_remote(model.get("pricing") or {})
 
             # Extract context window info
             context_length = model.get("context_length", 8192)

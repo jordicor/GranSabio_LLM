@@ -146,6 +146,7 @@ cache/
 *.pdf
 !**/README.md
 !requirements.txt
+!requirements-dev.txt
 !core/trusted_proxies.txt
 !dev_tests/fake_ai/*.txt
 !/docs/

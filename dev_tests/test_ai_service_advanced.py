@@ -11,7 +11,6 @@ This module tests:
 """
 
 import asyncio
-from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any, Dict
 from unittest.mock import AsyncMock, Mock, patch
@@ -96,7 +95,7 @@ class _FakeClaudeStream:
         except StopIteration:
             raise StopAsyncIteration
 
-    async def get_final_response(self):
+    async def get_final_message(self):
         if self._final_response is None:
             raise RuntimeError("no final response")
         return self._final_response
@@ -115,12 +114,6 @@ class _FakeOpenAICompatibleStream:
             return next(self._iter)
         except StopIteration:
             raise StopAsyncIteration
-
-
-@asynccontextmanager
-async def _unrestricted_model_call_slot(*_args, **_kwargs):
-    """Avoid catalog-backed concurrency setup in request-payload unit tests."""
-    yield
 
 
 def _claude_message_delta(stop_reason: str):
@@ -210,7 +203,8 @@ class TestMiniMaxOpenAICompatibleRuntime:
         assert "reasoning_effort" not in request_kwargs
 
     @pytest.mark.asyncio
-    async def test_stream_minimax_requests_reasoning_split(self, ai_service_instance):
+    @pytest.mark.parametrize("model_id", ["MiniMax-M3", "MiniMax-M2"])
+    async def test_stream_minimax_requests_reasoning_split(self, ai_service_instance, model_id):
         ai_service_instance.minimax_client = Mock()
         ai_service_instance.minimax_client.chat = Mock()
         ai_service_instance.minimax_client.chat.completions = Mock()
@@ -242,7 +236,7 @@ class TestMiniMaxOpenAICompatibleRuntime:
         chunks = []
         async for chunk in ai_service_instance._stream_minimax(
             prompt="Reply with exactly: hello",
-            model_id="MiniMax-M3",
+            model_id=model_id,
             temperature=1.0,
             max_tokens=128,
             system_prompt="Reply minimally.",
@@ -253,132 +247,10 @@ class TestMiniMaxOpenAICompatibleRuntime:
         request_kwargs = ai_service_instance.minimax_client.chat.completions.create.await_args.kwargs
         assert request_kwargs["extra_body"] == {"reasoning_split": True}
         assert "reasoning_effort" not in request_kwargs
-
-
-class TestLocalOpenAICompatibleReasoningEffort:
-    """Local providers forward explicit reasoning mode only on their own paths."""
-
-    @pytest.mark.asyncio
-    async def test_generate_llamacpp_forwards_reasoning_effort(self, ai_service_instance):
-        ai_service_instance.llamacpp_client = Mock()
-        ai_service_instance.llamacpp_client.chat = Mock()
-        ai_service_instance.llamacpp_client.chat.completions = Mock()
-        ai_service_instance.llamacpp_client.chat.completions.create = AsyncMock(
-            return_value=SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content="hello"), finish_reason="stop")],
-                usage=None,
-            )
-        )
-
-        content, _usage = await ai_service_instance._generate_llamacpp(
-            prompt="Reply with exactly: hello",
-            model_id="server-model-q4",
-            temperature=0.2,
-            max_tokens=128,
-            system_prompt="Reply minimally.",
-            reasoning_effort="none",
-        )
-
-        assert content == "hello"
-        request_kwargs = ai_service_instance.llamacpp_client.chat.completions.create.await_args.kwargs
-        assert request_kwargs["reasoning_effort"] == "none"
-
-    @pytest.mark.asyncio
-    async def test_stream_llamacpp_forwards_reasoning_effort(self, ai_service_instance):
-        ai_service_instance.llamacpp_client = Mock()
-        ai_service_instance.llamacpp_client.chat = Mock()
-        ai_service_instance.llamacpp_client.chat.completions = Mock()
-        ai_service_instance.llamacpp_client.chat.completions.create = AsyncMock(
-            return_value=_FakeOpenAICompatibleStream(
-                [
-                    SimpleNamespace(
-                        choices=[SimpleNamespace(delta=SimpleNamespace(content="hello"), finish_reason=None)],
-                        usage=None,
-                    ),
-                    SimpleNamespace(
-                        choices=[SimpleNamespace(delta=SimpleNamespace(content=None), finish_reason="stop")],
-                        usage=None,
-                    ),
-                ]
-            )
-        )
-
-        chunks = []
-        async for chunk in ai_service_instance._stream_llamacpp(
-            prompt="Reply with exactly: hello",
-            model_id="server-model-q4",
-            temperature=0.2,
-            max_tokens=128,
-            system_prompt="Reply minimally.",
-            reasoning_effort="none",
-        ):
-            chunks.append(chunk)
-
-        assert chunks[0] == "hello"
-        request_kwargs = ai_service_instance.llamacpp_client.chat.completions.create.await_args.kwargs
-        assert request_kwargs["reasoning_effort"] == "none"
-
-    @pytest.mark.asyncio
-    async def test_generate_ollama_forwards_reasoning_effort(self, ai_service_instance):
-        ai_service_instance.ollama_client = Mock()
-        ai_service_instance.ollama_client.chat = Mock()
-        ai_service_instance.ollama_client.chat.completions = Mock()
-        ai_service_instance.ollama_client.chat.completions.create = AsyncMock(
-            return_value=SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content="hello"), finish_reason="stop")],
-                usage=None,
-            )
-        )
-        ai_service_instance.model_call_concurrency_slot = _unrestricted_model_call_slot
-
-        content, _usage = await ai_service_instance._generate_ollama(
-            prompt="Reply with exactly: hello",
-            model_id="qwen3.8:latest",
-            temperature=0.2,
-            max_tokens=128,
-            system_prompt="Reply minimally.",
-            reasoning_effort="none",
-        )
-
-        assert content == "hello"
-        request_kwargs = ai_service_instance.ollama_client.chat.completions.create.await_args.kwargs
-        assert request_kwargs["reasoning_effort"] == "none"
-
-    @pytest.mark.asyncio
-    async def test_stream_ollama_forwards_reasoning_effort(self, ai_service_instance):
-        ai_service_instance.ollama_client = Mock()
-        ai_service_instance.ollama_client.chat = Mock()
-        ai_service_instance.ollama_client.chat.completions = Mock()
-        ai_service_instance.ollama_client.chat.completions.create = AsyncMock(
-            return_value=_FakeOpenAICompatibleStream(
-                [
-                    SimpleNamespace(
-                        choices=[SimpleNamespace(delta=SimpleNamespace(content="hello"), finish_reason=None)],
-                        usage=None,
-                    ),
-                    SimpleNamespace(
-                        choices=[SimpleNamespace(delta=SimpleNamespace(content=None), finish_reason="stop")],
-                        usage=None,
-                    ),
-                ]
-            )
-        )
-        ai_service_instance.model_call_concurrency_slot = _unrestricted_model_call_slot
-
-        chunks = []
-        async for chunk in ai_service_instance._stream_ollama(
-            prompt="Reply with exactly: hello",
-            model_id="qwen3.8:latest",
-            temperature=0.2,
-            max_tokens=128,
-            system_prompt="Reply minimally.",
-            reasoning_effort="none",
-        ):
-            chunks.append(chunk)
-
-        assert chunks[0] == "hello"
-        request_kwargs = ai_service_instance.ollama_client.chat.completions.create.await_args.kwargs
-        assert request_kwargs["reasoning_effort"] == "none"
+        if model_id == "MiniMax-M3":
+            assert request_kwargs["stream_options"] == {"include_usage": True}
+        else:
+            assert "stream_options" not in request_kwargs
 
 
 # ============================================================================
@@ -1224,6 +1096,81 @@ class TestSupportsClaudeThinking:
 class TestOpenRouterTemperatureParams:
     """Tests for OpenRouter model-specific temperature compatibility."""
 
+    @pytest.mark.parametrize(
+        "model_id,temperature_supported",
+        [("openai/gpt-5.6-luna", False), ("google/gemini-3.1-pro-preview", True)],
+    )
+    def test_tool_builder_observes_catalog_temperature_without_changing_contract(
+        self, mock_config, model_id, temperature_supported
+    ):
+        supported_parameters = [
+            "max_tokens", "max_completion_tokens", "response_format",
+            "structured_outputs", "tools", "tool_choice",
+        ]
+        if temperature_supported:
+            supported_parameters.append("temperature")
+        mock_config.model_specs = {
+            "model_specifications": {
+                "openrouter": {
+                    model_id: {"supported_parameters": supported_parameters},
+                },
+            },
+        }
+        schema = {
+            "type": "object",
+            "properties": {"value": {"type": "integer"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        }
+        # The builder is pure; no provider clients or generated responses are needed.
+        service = AIService.__new__(AIService)
+        messages = [{"role": "user", "content": "Return one integer."}]
+        params = service._build_openai_compatible_tool_params(
+            provider="openrouter",
+            model_id=model_id,
+            current_messages=messages,
+            temperature=0.3,
+            max_tokens=121600,
+            reasoning_effort=None,
+            json_output=True,
+            json_schema=schema,
+            tools_enabled=True,
+        )
+
+        assert params["model"] == model_id
+        assert params["messages"] == messages
+        assert params["max_tokens"] == 121600
+        assert "max_completion_tokens" not in params
+        assert ("temperature" in params) is temperature_supported
+        if temperature_supported:
+            assert params["temperature"] == 0.3
+        assert params["response_format"] == {
+            "type": "json_schema",
+            "json_schema": {"name": "structured_output", "strict": True, "schema": schema},
+        }
+        assert params["tools"] == [service._build_openai_validation_tool_schema()]
+        assert params["tool_choice"] == "auto"
+        assert params["extra_body"]["provider"]["require_parameters"] is True
+
+    @pytest.mark.parametrize(
+        "model_data,expected",
+        [
+            ({}, True),
+            ({"supported_parameters": []}, False),
+            ({"sync_metadata": {"supported_parameters": ["max_tokens"]}}, False),
+            ({"sync_metadata": {"supported_parameters": ["temperature"]}}, True),
+            ({"supported_parameters": ["temperature"],
+              "parameter_constraints": {"temperature": {"mode": "omit"}}}, False),
+        ],
+    )
+    def test_catalog_support_preserves_unknown_and_explicit_constraints(
+        self, mock_config, model_data, expected
+    ):
+        mock_config.model_specs = {
+            "model_specifications": {"openrouter": {"catalog/model": model_data}},
+        }
+        assert AIService._openrouter_accepts_temperature("catalog/model") is expected
+
     def test_moonshot_kimi_27_openrouter_omits_temperature(self):
         assert AIService._openrouter_accepts_temperature("moonshotai/kimi-k2.7-code") is False
 
@@ -1254,7 +1201,15 @@ class TestOpenRouterTemperatureParams:
     def test_new_claude_models_omit_temperature(self, model_id):
         assert AIService._openrouter_accepts_temperature(model_id) is False
 
-    def test_other_openrouter_models_keep_temperature(self):
+    def test_other_openrouter_models_keep_temperature(self, mock_config):
+        mock_config.model_specs = {
+            "model_specifications": {
+                "openrouter": {
+                    model_id: {"supported_parameters": ["temperature"]}
+                    for model_id in ("google/gemini-3.1-pro-preview", "x-ai/grok-4-fast")
+                },
+            },
+        }
         assert AIService._openrouter_accepts_temperature("google/gemini-3.1-pro-preview") is True
         assert AIService._openrouter_accepts_temperature("x-ai/grok-4-fast") is True
 
@@ -1442,6 +1397,7 @@ class TestMoonshotKimiParameterPolicy:
         assert "temperature" not in request_kwargs
         assert request_kwargs["max_completion_tokens"] == 64
         assert "max_tokens" not in request_kwargs
+        assert request_kwargs["stream_options"] == {"include_usage": True}
         assert "ok" in chunks
 
     @pytest.mark.asyncio
@@ -2085,7 +2041,7 @@ class TestClaudeStructuredOutputsParams:
         async def on_event(event_type, payload):
             events.append((event_type, payload))
 
-        message, usage, finish_reason = await ai_service_instance._stream_openai_compatible_tool_turn(
+        message, usage, finish_reason, billing_envelope = await ai_service_instance._stream_openai_compatible_tool_turn(
             client,
             {"model": "gpt-5.4-mini", "messages": []},
             {},
@@ -2103,6 +2059,8 @@ class TestClaudeStructuredOutputsParams:
         assert message.tool_calls[0].function.arguments == '{"text":"Draft text"}'
         assert usage.total_tokens == 12
         assert finish_reason == "tool_calls"
+        # The billing envelope is the chunk that carried the usage.
+        assert billing_envelope.usage is usage
         assert any(event_type == "assistant_delta" for event_type, _ in events)
         assert any(event_type == "tool_call_delta" for event_type, _ in events)
         assert any(event_type == "tool_call_ready" for event_type, _ in events)
@@ -3390,7 +3348,8 @@ class TestClaudeStructuredOutputsParams:
         assert "json_schema" not in params["text"]["format"]
 
     @pytest.mark.asyncio
-    async def test_generate_openai_responses_paths_use_responses_text_format_shape(self, ai_service_instance):
+    @pytest.mark.parametrize("model_id", ["o3-pro", "gpt-5-pro", "gpt-6-luna", "gpt-6-sol"])
+    async def test_generate_openai_responses_paths_use_responses_text_format_shape(self, ai_service_instance, model_id):
         """Non-tool-loop Responses calls use the same direct text.format contract."""
 
         schema = {
@@ -3411,25 +3370,19 @@ class TestClaudeStructuredOutputsParams:
 
         await ai_service_instance._generate_openai(
             prompt="Return a decision",
-            model_id="o3-pro",
+            model_id=model_id,
             temperature=0.7,
             max_tokens=128,
             system_prompt="system",
             json_output=True,
             json_schema=schema,
-        )
-        await ai_service_instance._generate_openai(
-            prompt="Return a decision",
-            model_id="gpt-5-pro",
-            temperature=0.7,
-            max_tokens=128,
-            system_prompt="system",
-            json_output=True,
-            json_schema=schema,
+            reasoning_effort="medium",
         )
 
-        assert len(captured_params) == 2
+        assert len(captured_params) == 1
         for params in captured_params:
+            assert params["reasoning"] == {"effort": "medium"}
+            assert "temperature" not in params
             assert params["text"] == {
                 "format": {
                     "type": "json_schema",
@@ -3573,6 +3526,64 @@ class TestGetThinkingBudgetForModel:
 
 class TestNormalizeUsage:
     """Tests for _normalize_usage() static method."""
+
+    @pytest.mark.parametrize("as_dict", [False, True])
+    @pytest.mark.parametrize("provider, completion_tokens", [("xai", 168), ("openai", 472)])
+    def test_chat_reasoning_is_billed_once(self, as_dict, provider, completion_tokens):
+        """xAI excludes reasoning from completions; OpenAI already includes it."""
+        from openai.types.completion_usage import CompletionUsage
+
+        # xAI's documented example: 26 prompt + 168 visible + 304 reasoning.
+        usage = {
+            "prompt_tokens": 26,
+            "completion_tokens": completion_tokens,
+            "total_tokens": 498,
+            "completion_tokens_details": {"reasoning_tokens": 304},
+        }
+        if not as_dict:
+            usage = CompletionUsage(**usage)
+
+        service = AIService.__new__(AIService)
+        result = service._usage_with_finish_metadata(
+            usage, None, provider=provider, fallback_finish_reason="stop",
+        )
+        emitted = []
+        service._emit_usage(emitted.append, "test-model", provider, result)
+        repeated = service._usage_with_finish_metadata(result, None, provider=provider)
+        for payload in (result, repeated, emitted[0]):
+            assert payload["input_tokens"] == 26
+            assert payload["output_tokens"] == 472
+            assert payload["reasoning_tokens"] == 304
+            assert payload["total_tokens"] == 498
+
+    @pytest.mark.parametrize("as_dict", [False, True])
+    @pytest.mark.parametrize("thoughts, tool_input", [(None, None), (30, 7)])
+    def test_extracts_gemini_billable_usage(self, as_dict, thoughts, tool_input):
+        """Gemini native counts include thinking once in billable output."""
+        from google.genai.types import GenerateContentResponseUsageMetadata
+
+        expected_input = 100 + (tool_input or 0)
+        expected_output = 20 + (thoughts or 0)
+        usage = {
+            "prompt_token_count": 100,
+            "candidates_token_count": 20,
+            "thoughts_token_count": thoughts,
+            "tool_use_prompt_token_count": tool_input,
+            "total_token_count": expected_input + expected_output,
+        }
+        if not as_dict:
+            usage = GenerateContentResponseUsageMetadata(**usage)
+
+        result = AIService._normalize_usage(usage)
+        assert result["input_tokens"] == expected_input
+        assert result["output_tokens"] == expected_output
+        assert result["reasoning_tokens"] == thoughts
+        assert result["total_tokens"] == expected_input + expected_output
+
+        # _emit_usage normalizes the finish-enriched payload a second time.
+        repeated = AIService._normalize_usage(result)
+        for field in ("input_tokens", "output_tokens", "reasoning_tokens", "total_tokens"):
+            assert repeated[field] == result[field]
 
     def test_extracts_openai_usage(self):
         """
@@ -5595,9 +5606,6 @@ class TestProviderResourceLifecycle:
             async_clients[attribute] = close
             setattr(service, attribute, SimpleNamespace(close=close))
 
-        sync_close = Mock()
-        service.openai_sync_client = SimpleNamespace(close=sync_close)
-
         google_async_close = AsyncMock()
         google_sync_close = Mock()
         service.google_new_client = SimpleNamespace(
@@ -5613,7 +5621,6 @@ class TestProviderResourceLifecycle:
         await service.close()
 
         failing_close.assert_awaited_once()
-        sync_close.assert_called_once()
         for close in async_clients.values():
             close.assert_awaited_once()
         google_async_close.assert_awaited_once()

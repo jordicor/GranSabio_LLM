@@ -201,7 +201,7 @@ async def test_generate_full_content_records_tool_loop_output_truncation():
 
 @pytest.mark.asyncio
 async def test_generate_full_content_raises_on_unusable_stream_finish():
-    request = _tool_request(generator_model="gemini-2.5-pro", max_tokens=1024)
+    request = _tool_request(generator_model="gemini-2.5-pro", max_tokens=1024, include_default_system_context=False)
 
     async def _stream():
         yield StreamChunk(
@@ -250,6 +250,7 @@ async def test_generate_full_content_raises_on_unusable_stream_finish():
     assert exc_info.value.finish_reason == "SAFETY"
     assert exc_info.value.finish_reason_category == "content_filter"
     assert session["generation_finish_metadata"]["provider_stop_reason"] == "SAFETY"
+    assert ai_service.generate_content_stream.call_args.kwargs["include_default_system_context"] is False
     assert ai_service.generate_content_stream.call_args.kwargs["provider_options"] == {
         "max_price": {"prompt": 0, "completion": 0},
         "allow_fallbacks": False,
@@ -296,6 +297,34 @@ def test_build_generation_error_result_surfaces_provider_quota():
     assert result["provider_error"]["provider_error_code"] == "insufficient_quota"
     assert result["provider_error"]["retryable"] is False
     assert session["provider_error"]["status_code"] == 429
+
+
+def test_build_generation_error_result_surfaces_content_policy():
+    failure = ProviderFailure(
+        provider="openrouter",
+        model_id="google/gemini-2.5-pro",
+        operation="tool_loop_generation",
+        kind=ProviderErrorKind.CONTENT_POLICY,
+        message="Gemini blocked the request: PROHIBITED_CONTENT",
+        retryable=False,
+        status_code=403,
+        provider_error_code="403",
+    )
+    exc = AIRequestError(
+        provider="openrouter",
+        model="google/gemini-2.5-pro",
+        attempts=1,
+        max_attempts=1,
+        cause=RuntimeError("content policy"),
+        provider_failure=failure,
+    )
+
+    result = _build_generation_error_result({}, _tool_request(), exc)
+
+    assert result["error_code"] == "content_policy"
+    assert result["provider_error"]["kind"] == "content_policy"
+    assert "Provider content policy stopped generation" in result["failure_reason"]
+    assert "permissions" not in result["failure_reason"]
 
 
 def test_auto_mode_supports_non_openai_tool_loop_providers():
@@ -429,9 +458,11 @@ def test_claude_request_schema_normalization_raises_typed_error():
 
 
 @pytest.mark.asyncio
-async def test_generate_full_content_routes_json_without_schema_as_json_loose():
+@pytest.mark.parametrize("shared_context", [None, "Stable source data for retry testing."])
+async def test_generate_full_content_routes_json_without_schema_as_json_loose(shared_context):
     expectations = [{"path": "ok", "required": True}]
     request = _tool_request(
+        shared_context=shared_context,
         content_type="json",
         json_output=False,
         json_schema=None,
@@ -459,6 +490,8 @@ async def test_generate_full_content_routes_json_without_schema_as_json_loose():
 
     assert content == '{"ok": true}'
     kwargs = ai_service.call_ai_with_validation_tools.await_args.kwargs
+    assert kwargs.get("shared_context") == shared_context
+    assert ("shared_context" in kwargs) == (shared_context is not None)
     assert kwargs["output_contract"] == OutputContract.JSON_LOOSE
     assert kwargs["response_format"] is None
     assert kwargs["json_expectations"] is expectations
@@ -467,7 +500,7 @@ async def test_generate_full_content_routes_json_without_schema_as_json_loose():
 
 @pytest.mark.asyncio
 async def test_generate_full_content_forwards_strict_flag_to_primary_tool_loop():
-    request = _tool_request(strict_single_generation_attempt=True)
+    request = _tool_request(strict_single_generation_attempt=True, include_default_system_context=False)
     ai_service = SimpleNamespace(
         call_ai_with_validation_tools=AsyncMock(
             return_value=("accepted prose", _accepted_envelope())
@@ -491,6 +524,7 @@ async def test_generate_full_content_forwards_strict_flag_to_primary_tool_loop()
         )
 
     assert content == "accepted prose"
+    assert ai_service.call_ai_with_validation_tools.await_args.kwargs["include_default_system_context"] is False
     assert (
         ai_service.call_ai_with_validation_tools.await_args.kwargs[
             "strict_single_generation_attempt"
@@ -645,8 +679,10 @@ async def test_generate_full_content_routes_json_with_schema_as_json_structured(
 
 
 @pytest.mark.asyncio
-async def test_generate_full_content_standard_streaming_keeps_retry_without_tool_loop():
+@pytest.mark.parametrize("shared_context", [None, "Stable source data for retry testing."])
+async def test_generate_full_content_standard_streaming_keeps_retry_without_tool_loop(shared_context):
     request = _tool_request(
+        shared_context=shared_context,
         content_type="json",
         json_output=False,
         json_schema=None,
@@ -700,15 +736,20 @@ async def test_generate_full_content_standard_streaming_keeps_retry_without_tool
             await app_state.pop_session(session_id)
 
     assert content == '{"ok": true}'
+    assert all(call.get("shared_context") == shared_context for call in attempts)
+    assert all(("shared_context" in call) == (shared_context is not None) for call in attempts)
     assert len(attempts) == 2
     assert all(call["json_output"] is True for call in attempts)
     ai_service.call_ai_with_validation_tools.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_process_content_generation_keeps_json_retry_without_tool_loop():
+@pytest.mark.parametrize("shared_context", [None, "Stable source data for retry testing."])
+async def test_process_content_generation_keeps_json_retry_without_tool_loop(shared_context):
     request = ContentRequest(
+        shared_context=shared_context,
         prompt="Generate JSON profile data for retry testing.",
+        include_default_system_context=False,
         content_type="json",
         json_output=False,
         json_retry_without_iteration=True,
@@ -741,8 +782,11 @@ async def test_process_content_generation_keeps_json_retry_without_tool_loop():
              patch("core.generation_processor._debug_update_status", new=AsyncMock()):
             await process_content_generation(session_id, request)
 
+        assert fake_ai_service.retry_calls[0].get("shared_context") == shared_context
+        assert ("shared_context" in fake_ai_service.retry_calls[0]) == (shared_context is not None)
         assert len(fake_ai_service.retry_calls) == 1
         assert fake_ai_service.retry_calls[0]["json_output"] is True
+        assert fake_ai_service.retry_calls[0]["include_default_system_context"] is False
         assert session["json_guard_failures"] == 1
         assert [entry["retry"] for entry in session["json_guard_history"]] == [0, 1]
         assert session["final_result"]["content"] == {"ok": True}
@@ -817,3 +861,12 @@ async def test_fail_open_does_not_fallback_on_semantic_accent_rejection():
     assert session["accent_guard_details"] == {"score": 4.0, "path": "path_c"}
     assert session.get("accent_fail_open_count") is None
     ai_service.generate_content_stream.assert_not_called()
+
+
+def test_content_request_serializes_system_context_flag_and_retains_default():
+    request = ContentRequest(prompt="Generate the requested temporal plan.")
+    assert request.include_default_system_context is True
+    exact_request = ContentRequest(
+        prompt=request.prompt, include_default_system_context=False
+    )
+    assert exact_request.model_dump(mode="json")["include_default_system_context"] is False

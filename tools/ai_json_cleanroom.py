@@ -2,9 +2,9 @@
 
 """
 A compact, dependency-optional JSON validator tailored for AI model outputs.
-This version prefers `orjson` for speed/strictness and automatically falls back
-to the stdlib `json` where `orjson` is limited (e.g., indent > 2, ensure_ascii=True)
-or when `orjson` raises for a given input.
+Parsing uses stdlib `json` with an object-pairs hook to reject duplicate keys
+before any dictionary can overwrite them. Serialization prefers `orjson` and
+falls back to stdlib for unsupported options (e.g., indent > 2, ensure_ascii=True).
 
 Features
 --------
@@ -136,6 +136,22 @@ def _reject_invalid_constant(value: str):
     raise ValueError(f"Invalid constant '{value}' in JSON input.")
 
 
+class DuplicateJSONKeyError(ValueError):
+    """Reject ambiguous JSON without retaining a private key or value."""
+
+    def __init__(self) -> None:
+        super().__init__("JSON object keys must be unique.")
+
+
+def _unique_object_pairs(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJSONKeyError()
+        result[key] = value
+    return result
+
+
 # --------------------- User-regex safety (audit UTL-02) ---------------------
 
 # Ceiling for the length of any user-supplied regex (schema ``pattern`` /
@@ -210,12 +226,12 @@ def _pattern_rejection_reason(pattern: Any) -> Optional[str]:
     return None
 
 
-# --------------------------- JSON Engine (orjson-first) ---------------------------
+# --------------------------- JSON Engine ---------------------------
 
 class JSONEngine:
     """
-    A thin facade over orjson (preferred) with automatic fallback to stdlib json.
-    - loads(): try orjson.loads first, fallback to json.loads.
+    Strict unique-key parsing, with orjson preferred for serialization.
+    - loads(): use stdlib object_pairs_hook; orjson discards duplicate keys.
     - dumps(): use orjson when possible (indent in {None, 2} and ensure_ascii=False),
                otherwise fallback to json.dumps with requested options.
     Exposes *with_backend variants to return which backend was actually used.
@@ -235,26 +251,7 @@ class JSONEngine:
 
     # ---------- loads ----------
     def loads(self, s: Union[str, bytes, bytearray], *, sanitize_curly_quotes: bool = True) -> Any:
-        if isinstance(s, str):
-            if sanitize_curly_quotes:
-                s = _sanitize_curly_quotes(s)
-        elif isinstance(s, (bytes, bytearray)):
-            if sanitize_curly_quotes:
-                decoded = s.decode("utf-8", errors="replace")
-                decoded = _sanitize_curly_quotes(decoded)
-                s = decoded.encode("utf-8")
-
-        if self.orjson is not None:
-            try:
-                if isinstance(s, (bytes, bytearray)):
-                    return self.orjson.loads(s)
-                return self.orjson.loads(s.encode("utf-8"))
-            except Exception:
-                # Fallback to stdjson
-                pass
-        if isinstance(s, (bytes, bytearray)):
-            s = s.decode("utf-8", errors="replace")
-        return self.stdjson.loads(s, parse_constant=_reject_invalid_constant)
+        return self.loads_with_backend(s, sanitize_curly_quotes=sanitize_curly_quotes)[0]
 
     def loads_with_backend(
         self,
@@ -271,17 +268,12 @@ class JSONEngine:
                 decoded = _sanitize_curly_quotes(decoded)
                 s = decoded.encode("utf-8")
 
-        if self.orjson is not None:
-            try:
-                if isinstance(s, (bytes, bytearray)):
-                    return self.orjson.loads(s), "orjson"
-                return self.orjson.loads(s.encode("utf-8")), "orjson"
-            except Exception:
-                # Fallback to stdjson
-                pass
         if isinstance(s, (bytes, bytearray)):
             s = s.decode("utf-8", errors="replace")
-        return self.stdjson.loads(s, parse_constant=_reject_invalid_constant), "json"
+        return self.stdjson.loads(
+            s, parse_constant=_reject_invalid_constant,
+            object_pairs_hook=_unique_object_pairs,
+        ), "json"
 
     # ---------- dumps ----------
     def dumps(
@@ -340,6 +332,7 @@ json_engine = JSONEngine()
 
 class ErrorCode(str, Enum):
     PARSE_ERROR = "parse_error"
+    DUPLICATE_KEY = "duplicate_key"
     TRUNCATED = "truncated"
     MISSING_REQUIRED = "missing_required"
     TYPE_MISMATCH = "type_mismatch"
@@ -760,6 +753,8 @@ def _parse_with_options(
         try:
             obj, backend = json_engine.loads_with_backend(s, sanitize_curly_quotes=False)
             return obj, backend, False
+        except DuplicateJSONKeyError:
+            raise
         except Exception:
             obj, backend = json_engine.loads_with_backend(s, sanitize_curly_quotes=True)
             return obj, backend, True
@@ -773,6 +768,8 @@ def _loads_ok(s: str, options: ValidateOptions) -> bool:
     try:
         _parse_with_options(s, options)
         return True
+    except DuplicateJSONKeyError:
+        raise
     except Exception:
         return False
 
@@ -1283,9 +1280,14 @@ def attempt_safe_json_repair(payload: str, options: ValidateOptions) -> Tuple[Op
         try:
             _parse_with_options(txt, options)
             return True
+        except DuplicateJSONKeyError:
+            raise
         except Exception:
             return False
 
+    # This advanced helper can also be called directly. Never let a custom
+    # repair hook erase a duplicate that the original parser already detects.
+    _try_parse(payload)
     candidate = payload
 
     # Pass A: escape inner quotes + controls in strings
@@ -1379,6 +1381,8 @@ def attempt_safe_json_repair(payload: str, options: ValidateOptions) -> Tuple[Op
         for hook in options.custom_repair_hooks:
             try:
                 repaired, changes, hook_meta = hook(candidate, options)
+            except DuplicateJSONKeyError:
+                raise
             except Exception as ex:
                 # Skip failing hook but record attempt
                 info.setdefault("hooks_errors", []).append(
@@ -1480,7 +1484,8 @@ class SimpleJSONSchemaValidator:
         nullable = bool(schema.get("nullable", False))
         if typespec is not None:
             if value is None:
-                if not nullable and not (isinstance(typespec, list) and "null" in typespec):
+                if (not nullable and typespec != "null"
+                        and not (isinstance(typespec, list) and "null" in typespec)):
                     self._err(ErrorCode.TYPE_MISMATCH, path, f"Expected type {typespec}, got null.")
                     return
             else:
@@ -2129,6 +2134,28 @@ def validate_ai_json(
     expectations: Optional[List[Dict[str, Any]]] = None,
     options: Optional[ValidateOptions] = None
 ) -> ValidationResult:
+    """Validate JSON; a duplicate-key rejection is terminal across all repairs."""
+    try:
+        return _validate_ai_json(input_data, schema, expectations, options)
+    except DuplicateJSONKeyError:
+        return ValidationResult(
+            json_valid=False,
+            likely_truncated=False,
+            errors=[ValidationIssue(
+                code=ErrorCode.DUPLICATE_KEY,
+                path="$",
+                message="JSON object keys must be unique.",
+            )],
+            data=None,
+        )
+
+
+def _validate_ai_json(
+    input_data: Union[str, bytes, Dict[str, Any], List[Any], Any],
+    schema: Optional[Dict[str, Any]] = None,
+    expectations: Optional[List[Dict[str, Any]]] = None,
+    options: Optional[ValidateOptions] = None
+) -> ValidationResult:
     """
     Validate AI output against JSON parseability + optional schema + expectations.
     Returns a non-throwing ValidationResult.
@@ -2231,6 +2258,8 @@ def validate_ai_json(
                     path="$",
                     message="Top-level value is not object/array (allow_bare_top_level_scalars=False)."
                 ))
+        except DuplicateJSONKeyError:
+            raise
         except Exception as e:
             # detect truncation on the extracted payload
             likely_truncated, reasons = detect_truncation(payload)
@@ -2252,6 +2281,8 @@ def validate_ai_json(
                             message="Input JSON was repaired by conservative heuristics.",
                             detail={"applied": repair_info.get("applied", []), "counts": repair_info.get("counts", {})}
                         ))
+                    except DuplicateJSONKeyError:
+                        raise
                     except Exception:
                         # even after repair, failed -> fall back to original error path
                         errors.append(ValidationIssue(
@@ -2387,7 +2418,7 @@ def validate_loose_json(
 # ------------------------------ CLI (optional) ------------------------------
 
 def _load_json_file(path: str) -> Any:
-    # Read as bytes, prefer orjson for loads, fallback handled by JSONEngine
+    # File inputs use the same unique-key parser as model outputs.
     with open(path, "rb") as f:
         content = f.read()
     return json_engine.loads(content)

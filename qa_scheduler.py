@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from models import QAEvaluation
+from provider_drain import gather_draining, raise_if_dispatch_closed
 from qa_result_utils import (
     build_deal_breaker_consensus,
     build_qa_counts,
@@ -178,21 +179,12 @@ class QAScheduler:
                     )
                     layer_results[slot.result_key] = result
 
-            tasks = [asyncio.create_task(guarded(slot)) for slot in batch]
-            try:
-                await asyncio.gather(*tasks)
-            except BaseException:
-                # Any failure (context admission, scheduler policy abort, or
-                # cancellation) must stop the whole batch immediately. gather
-                # does NOT cancel siblings on a first raise, so explicitly
-                # cancel any in-flight slot tasks and drain them before
-                # re-raising; otherwise they keep burning paid API calls (or
-                # local Ollama slots) after the layer has already aborted.
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                raise
+            # A failure (context admission, scheduler policy abort) fails the
+            # whole batch, but the evaluators already querying a provider
+            # finish within their own timeout so their usage is measured;
+            # queued slots and retries never dispatch. Cancellation still
+            # stops every slot at once.
+            await gather_draining(*(guarded(slot) for slot in batch))
 
         if mode == "parallel":
             await run_batch(remaining)
@@ -303,6 +295,8 @@ class QAScheduler:
         max_provider_failure_attempts = 1 + max(0, self.policy.provider_failure_retries)
         max_parse_attempts = 1 + max(0, self.policy.parse_error_retries)
 
+        # A sibling failure may close dispatch while this slot was queued.
+        raise_if_dispatch_closed()
         if on_evaluation_dispatched is not None:
             await on_evaluation_dispatched(slot, layer_name)
 
@@ -313,6 +307,9 @@ class QAScheduler:
         try:
             while True:
                 attempts += 1
+                if attempts > 1:
+                    # A retry is a new provider call.
+                    raise_if_dispatch_closed()
                 try:
                     evaluation = await evaluate_slot(slot, attempts)
                     return evaluation

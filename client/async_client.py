@@ -23,15 +23,9 @@ import logging
 import os
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
+from urllib.parse import quote
 
 import aiohttp
-
-# Load environment variables
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
 
 # Import shared exceptions from package
 from . import (
@@ -44,13 +38,17 @@ from ._common import (
     POLL_RETRY_BACKOFF_SECONDS,
     RESULT_POLL_GRACE_SECONDS,
     RESULT_POLL_INTERVAL_SECONDS,
+    SAAS_REQUEST_ID_HEADER,
     STREAM_ACTIVITY_CHECK_SECONDS,
     ActivityMonitor,
+    admission_rejection_error,
     compute_generation_timeout,
     compute_token_budgets,
-    payload_error_metadata,
+    generation_http_error_details,
     resolve_model_token_fallback,
+    session_list_params,
     validate_result,
+    validate_saas_request_id,
 )
 from ._sse import (
     SessionEventRouter,
@@ -107,6 +105,7 @@ class AsyncGranSabioClient:
         api_key: Optional[str] = None,
         timeout: Optional[aiohttp.ClientTimeout] = None,
         provider_keys: Optional[Dict[str, str]] = None,
+        force_close: bool = False,
     ):
         """
         Initialize the async Gran Sabio client.
@@ -118,10 +117,14 @@ class AsyncGranSabioClient:
             provider_keys: Optional provider API key headers. Only values passed
                 explicitly here are sent; provider credentials are never loaded
                 implicitly from the environment.
+            force_close: Use a fresh connection for each HTTP request. Useful
+                when synchronous work can delay processing an idle server close;
+                avoids reusing that socket for a non-idempotent POST, without retries.
         """
         self.base_url = (base_url or os.getenv("GRANSABIO_BASE_URL", self.DEFAULT_BASE_URL)).rstrip("/")
         self.api_key = api_key or os.getenv("GRANSABIO_API_KEY")
         self.timeout = timeout or self.DEFAULT_TIMEOUT
+        self.force_close = force_close
         self._session: Optional[aiohttp.ClientSession] = None
         self._owns_session = True
         self.provider_keys = dict(provider_keys or {})
@@ -136,7 +139,10 @@ class AsyncGranSabioClient:
     async def connect(self) -> None:
         """Initialize the HTTP session."""
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=self.timeout)
+            self._session = aiohttp.ClientSession(
+                timeout=self.timeout,
+                connector=aiohttp.TCPConnector(force_close=self.force_close),
+            )
             self._owns_session = True
 
     async def close(self) -> None:
@@ -203,9 +209,14 @@ class AsyncGranSabioClient:
             ) from e
         # ServerDisconnectedError and ClientPayloadError name specific mid-
         # response failure modes (connection closed or compressed/chunked body
-        # truncated while aiohttp was still reading). They are genuinely
-        # retryable on an idempotent GET.
+        # truncated while aiohttp was still reading). ClientOSError is the
+        # same closed connection seen by the socket layer (reset or aborted
+        # while sending): Windows reports a pooled connection the server closed
+        # this way, where Linux raises ServerDisconnectedError. They are
+        # genuinely retryable on an idempotent GET. ClientConnectorError (a
+        # ClientOSError) is handled above.
         except (aiohttp.ServerDisconnectedError,
+                aiohttp.ClientOSError,
                 aiohttp.ClientPayloadError) as e:
             raise TransientGranSabioError(
                 f"Transient protocol error on request to {endpoint}: {e}"
@@ -307,6 +318,27 @@ class AsyncGranSabioClient:
                     status_code=response.status
                 )
             return await self._read_json(response, "/models")
+
+    async def evaluate_system_one(
+        self,
+        state: Any,
+        questions: Dict[str, Any],
+        model: str,
+    ) -> Dict[str, Any]:
+        """Evaluate typed System One questions. Does not create a generation session."""
+
+        payload: Dict[str, Any] = {"state": state, "questions": questions, "model": model}
+        async with await self._request("POST", "/systemone", json_data=payload) as response:
+            body = await self._read_json(response, "/systemone")
+            if response.status != 200:
+                detail = body.get("detail") if isinstance(body, dict) else body
+                raise GranSabioClientError(
+                    f"System One evaluation failed: {detail}",
+                    status_code=response.status,
+                )
+            if not isinstance(body, dict) or "answers" not in body:
+                raise GranSabioClientError("System One evaluation returned an invalid body")
+            return body
 
     async def is_available(self) -> bool:
         """Check if the API is reachable and healthy."""
@@ -416,6 +448,9 @@ class AsyncGranSabioClient:
         poll_interval: float = DEFAULT_POLL_INTERVAL,
         max_wait: float = DEFAULT_MAX_WAIT,
         on_status: Optional[Callable[[Dict[str, Any]], None]] = None,
+        *,
+        request_id: Optional[str] = None,
+        shared_context: Optional[str] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -453,11 +488,42 @@ class AsyncGranSabioClient:
             poll_interval: Seconds between status checks
             max_wait: Maximum seconds to wait for completion
             on_status: Callback for status updates during polling
+            request_id: Optional idempotency key (1-128 ASCII letters, digits
+                or ``._:-``), sent as the ``X-GranSabio-SaaS-Request-ID``
+                header of this POST only. Re-sending the same payload with the
+                same key replays the original admission (same ``session_id``)
+                instead of starting another session, while the server keeps the
+                entry (process-local, 24 h). A different payload under a used
+                key is rejected with HTTP 409. An invalid key raises
+                ``ValueError`` before anything is sent.
+            shared_context: Stable source data sent at user level before the task prompt.
             **kwargs: Additional parameters passed to API
 
         Returns:
             Generation result with content, score, and metadata
+
+        Raises:
+            TransientGranSabioError: HTTP 202 when the original admission
+                under ``request_id`` is still in progress; ``details`` carries
+                ``retry_after_seconds`` (when sent) and ``request_id``. Retry
+                with the same payload and ``request_id``.
+            GranSabioClientError: Any other non-200 answer. ``details`` carries
+                ``json_error_detail`` (whether the engine itself answered with
+                a JSON ``detail`` body, as opposed to a proxy or gateway page),
+                ``retry_after_seconds`` when sent, and ``request_id`` when given.
+                An HTTP 400, 409 or 422 the engine answered from the payload
+                under ``request_id`` is stored and replayed for the key's
+                lifetime, so a new attempt needs a new key (a preflight or
+                Auto-QA rejection is an HTTP 200 result, replayed the same
+                way). A capacity HTTP 503 (admission gate, unavailable local
+                runtime, idempotency registry full) is not stored: re-send the
+                same payload with the same key, after ``retry_after_seconds``
+                when sent; transport failures, proxy or gateway answers and
+                HTTP 202 are likewise safe to re-send under the same key.
         """
+        if request_id is not None:
+            validate_saas_request_id(request_id)
+
         # Build payload
         payload = {
             "prompt": prompt,
@@ -513,14 +579,37 @@ class AsyncGranSabioClient:
         if qa_timeout_retries is not None:
             payload["qa_timeout_retries"] = qa_timeout_retries
 
+        if shared_context is not None:
+            payload["shared_context"] = shared_context
+
         # Additional kwargs
         payload.update(kwargs)
 
+        headers = self._headers()
+        if request_id is not None:
+            headers[SAAS_REQUEST_ID_HEADER] = request_id
+
         # Start generation
-        async with await self._request("POST", "/generate", json_data=payload) as response:
+        async with await self._request(
+            "POST", "/generate", json_data=payload, headers=headers,
+        ) as response:
             if response.status != 200:
                 text = await self._read_error_text(response, "/generate")
-                error_details = {"payload_metadata": payload_error_metadata(payload)}
+                error_details = generation_http_error_details(
+                    payload, body_text=text, headers=response.headers, request_id=request_id,
+                )
+                if response.status == 202 and request_id is not None:
+                    # Only an idempotent replay answers 202: the original
+                    # admission under this request ID has not finished yet. A
+                    # POST without a key cannot be a replay and keeps the plain
+                    # error path below, so a caller retrying transient errors
+                    # never re-submits without an idempotency key.
+                    raise TransientGranSabioError(
+                        "Generation admission for this request ID is still in progress "
+                        "(HTTP 202); retry with the same payload and request_id.",
+                        status_code=202,
+                        details=error_details,
+                    )
                 raise GranSabioClientError(
                     f"Generation request failed: {text}",
                     status_code=response.status,
@@ -529,20 +618,10 @@ class AsyncGranSabioClient:
 
             result = await self._read_json_no_retry(response, "/generate")
 
-        # Handle preflight rejection
-        if result.get("status") in {"preflight_rejected", "rejected"} and result.get("preflight_feedback"):
-            feedback = result.get("preflight_feedback", {})
-            raise GranSabioClientError(
-                f"Request rejected by preflight: {feedback.get('user_feedback', 'Unknown reason')}",
-                details={"preflight_feedback": feedback}
-            )
-
-        if result.get("status") == "auto_qa_rejected" and result.get("auto_qa_feedback"):
-            feedback = result.get("auto_qa_feedback", {})
-            raise GranSabioClientError(
-                f"Request rejected by Auto-QA: {feedback.get('message', 'Unknown reason')}",
-                details={"auto_qa_feedback": feedback}
-            )
+        # A preflight or Auto-QA rejection carries no session to wait for.
+        rejection = admission_rejection_error(result)
+        if rejection is not None:
+            raise rejection
 
         session_id = result.get("session_id")
         if not session_id:
@@ -607,6 +686,106 @@ class AsyncGranSabioClient:
 
             return await self._read_json(response, endpoint)
 
+    async def get_session_details(self, session_id: str) -> Dict[str, Any]:
+        """Read original request evidence without submitting or retrying generation.
+
+        Pass the raw session ID; the SDK encodes it as one URL segment. This
+        authenticated debugger response can contain private prompts and results.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("A non-empty session ID is required.")
+        endpoint = f"/debugger/sessions/{quote(session_id, safe='')}"
+        async with await self._request("GET", endpoint) as response:
+            if response.status in _RETRYABLE_POLL_STATUS_CODES:
+                raise TransientGranSabioError(
+                    f"Transient HTTP {response.status} getting session details.",
+                    status_code=response.status,
+                )
+            if response.status != 200:
+                raise GranSabioClientError(
+                    f"Failed to get session details (HTTP {response.status}).",
+                    status_code=response.status,
+                )
+            return await self._read_json(response, endpoint)
+
+    async def get_request_status(
+        self, request_id: str, *, max_wait: float = 60.0,
+    ) -> Dict[str, Any]:
+        """Look up one idempotent generation submission by its request ID.
+
+        Returns the server's reconciliation snapshot: ``{"found": False,
+        "request_id": ...}`` when the server holds no entry (never sent, expired
+        after 24 h, or lost on a server restart), otherwise ``found``,
+        ``state`` (``pending`` / ``completed`` / ``error``), ``status``,
+        ``session_id``, ``project_id`` and ``init_response``. An ``error``
+        snapshot also carries ``error`` with the stored ``status_code`` and
+        ``detail``. This is an idempotent GET: transient transport failures and
+        HTTP 425/429/503 are retried with the polling backoff within
+        ``max_wait`` seconds; other HTTP errors (400, 404, ...) raise
+        ``GranSabioClientError`` immediately.
+        """
+        validate_saas_request_id(request_id)
+        endpoint = f"/api/saas/requests/{quote(request_id, safe='')}"
+
+        async def read() -> Dict[str, Any]:
+            async with await self._request("GET", endpoint) as response:
+                if response.status in _RETRYABLE_POLL_STATUS_CODES:
+                    raise TransientGranSabioError(
+                        f"Transient HTTP {response.status} looking up a generation request.",
+                        status_code=response.status,
+                    )
+                if response.status != 200:
+                    raise GranSabioClientError(
+                        f"Failed to look up the generation request (HTTP {response.status}).",
+                        status_code=response.status,
+                    )
+                return await self._read_json(response, endpoint)
+
+        return await self._call_with_retry(
+            "get_request_status", request_id, read, time.monotonic(), max_wait,
+            resource="request",
+        )
+
+    async def list_sessions(
+        self,
+        limit: int = 25,
+        offset: int = 0,
+        project_id: Optional[str] = None,
+        *,
+        max_wait: float = 60.0,
+    ) -> Dict[str, Any]:
+        """List debugger sessions, most recently updated first.
+
+        Returns the ``{"sessions": [...], "project_id": ...}`` body; each row
+        has ``session_id``, ``created_at``, ``updated_at`` (UTC
+        ``YYYY-MM-DD HH:MM:SS``), ``status``, ``phase``, ``project_id`` and
+        ``request_name``. The server caps ``limit`` (100 by default) and answers
+        404 when its debugger is disabled. Retries follow
+        ``get_request_status``. Meant as secondary reconciliation evidence, not
+        as a progress feed.
+        """
+        params = session_list_params(limit, offset, project_id)
+        endpoint = "/debugger/sessions"
+
+        async def read() -> Dict[str, Any]:
+            async with await self._request("GET", endpoint, params=params) as response:
+                if response.status in _RETRYABLE_POLL_STATUS_CODES:
+                    raise TransientGranSabioError(
+                        f"Transient HTTP {response.status} listing debugger sessions.",
+                        status_code=response.status,
+                    )
+                if response.status != 200:
+                    raise GranSabioClientError(
+                        f"Failed to list debugger sessions (HTTP {response.status}).",
+                        status_code=response.status,
+                    )
+                return await self._read_json(response, endpoint)
+
+        return await self._call_with_retry(
+            "list_sessions", endpoint, read, time.monotonic(), max_wait,
+            resource="listing",
+        )
+
     async def stop_session(self, session_id: str) -> Dict[str, Any]:
         """Cancel an active generation session."""
         endpoint = f"/stop/{session_id}"
@@ -622,28 +801,35 @@ class AsyncGranSabioClient:
     async def _call_with_retry(
         self,
         op_name: str,
-        session_id: str,
+        resource_id: str,
         func: Callable[[], Awaitable[_RetryT]],
         start_time: float,
         max_wait: float,
+        *,
+        resource: str = "session",
     ) -> _RetryT:
         """
-        Invoke an idempotent polling operation (get_status / get_result / raw
-        GET /result) with exponential backoff on transient network errors.
+        Invoke an idempotent GET (get_status / get_result, or a ``resource``
+        lookup such as get_request_status) with exponential backoff on
+        transient transport, JSON, or HTTP errors.
         Non-transient errors propagate immediately. Retry sleeps count against
         the deadline implied by ``start_time + max_wait``; if the budget
         expires mid-sleep, the call is aborted.
 
-        The retry budget is whatever the caller chose by passing ``start_time``.
-        Callers that pass a fresh ``start_time`` per invocation (as
-        ``_fetch_result_polling`` does) give each call its own full retry
-        budget. Callers that pass a shared ``start_time`` (as
-        ``wait_for_result`` does) make retries compete for the overall deadline
-        -- intentional, so long-stalled sessions don't silently extend past
-        ``max_wait`` via retries.
+        ``wait_for_result`` shares its start time across calls for an overall
+        deadline. ``_fetch_result_polling`` supplies the remaining time in its
+        current activity-aware window, so retries cannot restart that window.
+        ``resource`` and ``resource_id`` name the polled resource (a session
+        ID, a request ID, or an endpoint) in messages; only a ``"session"``
+        resource adds the hint that the session may still run.
         """
         retries = len(_POLL_RETRY_BACKOFF_SECONDS)
         last_err: Optional[TransientGranSabioError] = None
+        hint = (
+            f" Session {resource_id} may still be running on the server. "
+            f"Check with GET /result/{resource_id} or GET /status/{resource_id}."
+            if resource == "session" else ""
+        )
 
         # Initial attempt (not counted as a retry in log messages).
         try:
@@ -655,9 +841,9 @@ class AsyncGranSabioClient:
         # naturally indexes into it without an awkward `+ 1`.
         for retry_number, sleep_for in enumerate(_POLL_RETRY_BACKOFF_SECONDS, start=1):
             logger.warning(
-                "Transient error polling session %s via %s (retry %d/%d): %s. "
+                "Transient error polling %s %s via %s (retry %d/%d): %s. "
                 "Retrying in %ds.",
-                session_id, op_name, retry_number, retries, last_err, sleep_for,
+                resource, resource_id, op_name, retry_number, retries, last_err, sleep_for,
             )
 
             # Respect the overall max_wait budget. If the backoff would push us
@@ -666,10 +852,8 @@ class AsyncGranSabioClient:
             if elapsed + sleep_for > max_wait:
                 assert last_err is not None
                 raise GranSabioClientError(
-                    f"Timed out waiting for session {session_id} after {max_wait}s "
-                    f"while backing off from transient error: {last_err}. "
-                    f"Session {session_id} may still be running on the server. "
-                    f"Check with GET /result/{session_id} or GET /status/{session_id}."
+                    f"Timed out waiting for {resource} {resource_id} after {max_wait}s "
+                    f"while backing off from transient error: {last_err}.{hint}"
                 ) from last_err
             await asyncio.sleep(sleep_for)
 
@@ -680,16 +864,12 @@ class AsyncGranSabioClient:
 
         assert last_err is not None
         logger.error(
-            "Transient error polling session %s via %s exhausted %d retries: %s. "
-            "Session may still be running on the server. "
-            "Check with GET /result/%s or GET /status/%s.",
-            session_id, op_name, retries, last_err, session_id, session_id,
+            "Transient error polling %s %s via %s exhausted %d retries: %s.%s",
+            resource, resource_id, op_name, retries, last_err, hint,
         )
         raise GranSabioClientError(
-            f"Transient network errors exhausted retries for session {session_id} "
-            f"during {op_name}: {last_err}. Session {session_id} may still be "
-            f"running on the server. Check with GET /result/{session_id} or "
-            f"GET /status/{session_id}."
+            f"Transient network errors exhausted retries for {resource} {resource_id} "
+            f"during {op_name}: {last_err}.{hint}"
         ) from last_err
 
     async def wait_for_result(
@@ -704,10 +884,10 @@ class AsyncGranSabioClient:
 
         Transient failures during status or result polling are retried with
         exponential backoff (_POLL_RETRY_BACKOFF_SECONDS) before giving up:
-        network errors (connection drops, timeouts, mid-response protocol
-        errors) and retryable HTTP statuses (202/425/429/503, e.g. a brief
-        proxy flap or rate limit). Retry sleeps count against max_wait.
-        Other non-transient errors (HTTP 4xx/5xx, etc.) fail fast.
+        transport or JSON-read errors and retryable HTTP statuses
+        (202/425/429/503, e.g. a brief proxy flap or rate limit). HTTP 202
+        from get_result keeps polling, including after a terminal status.
+        Retry sleeps count against max_wait. Other HTTP errors fail fast.
 
         Args:
             session_id: Session to wait for
@@ -748,13 +928,9 @@ class AsyncGranSabioClient:
                     start_time,
                     max_wait,
                 )
-                if final.get("status") == "in_progress":
-                    raise GranSabioClientError(
-                        f"Generation returned terminal status '{current_status}' but final result is not ready yet",
-                        details=status,
-                    )
-                validate_result(final)
-                return final
+                if final.get("status") != "in_progress":
+                    validate_result(final)
+                    return final
 
             # Bound the poll sleep by the remaining max_wait budget. Without
             # this, a full poll_interval sleep can push total wait up to
@@ -1304,117 +1480,15 @@ class AsyncGranSabioClient:
         Returns:
             Final generation result dict.
         """
-        result_url = f"/result/{session_id}"
         deadline = time.monotonic() + timeout_seconds if timeout_seconds else None
-        # Per-invocation retry budget for transient network errors on the
-        # idempotent GET /result call. When no outer timeout is set, the retry
-        # layer still caps its own backoff sleeps (they remain bounded by
-        # _POLL_RETRY_BACKOFF_SECONDS).
-        retry_max_wait = float(timeout_seconds) if timeout_seconds else float("inf")
-
-        async def _fetch_once() -> Tuple[int, Optional[Dict[str, Any]], str, str]:
-            """One GET /result attempt. Returns (status, parsed_json, detail, text_body).
-
-            Transient failures propagate as TransientGranSabioError so the retry
-            layer can handle them. Body-read transients include ClientPayloadError,
-            ServerDisconnectedError, ClientConnectionError, and asyncio.TimeoutError;
-            additional transients may originate in _request. text_body is only
-            populated when the caller will need it for an error message
-            (non-retryable non-200 status).
-            """
-            transient_body_errors = (
-                aiohttp.ClientPayloadError,
-                aiohttp.ServerDisconnectedError,
-                aiohttp.ClientConnectionError,
-                asyncio.TimeoutError,
-            )
-            async with await self._request("GET", result_url) as response:
-                status_code = response.status
-                if status_code == 200:
-                    try:
-                        body = await response.json()
-                    except transient_body_errors as exc:
-                        # Mid-response truncation on the success branch is
-                        # transient for an idempotent GET -- let the retry
-                        # layer try again.
-                        raise TransientGranSabioError(
-                            f"Transient protocol error reading /result/{session_id}: {exc}"
-                        ) from exc
-                    except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError) as exc:
-                        raise TransientGranSabioError(
-                            f"Transient protocol error reading /result/{session_id}: {exc}"
-                        ) from exc
-                    return status_code, body, "", ""
-
-                parsed: Optional[Dict[str, Any]] = None
-                detail = ""
-                is_retryable_status = status_code in (202, 425, 503, 400)
-                try:
-                    parsed = await response.json()
-                    if isinstance(parsed, dict):
-                        detail = str(parsed.get("detail", ""))
-                except transient_body_errors as exc:
-                    if is_retryable_status:
-                        raise TransientGranSabioError(
-                            f"Transient protocol error reading /result/{session_id}: {exc}"
-                        ) from exc
-                    parsed = None
-                except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError):
-                    parsed = None
-
-                text_body = ""
-                # Only bother reading the body text when we may need it for an
-                # error message (non-retryable status). Retryable statuses skip
-                # this to avoid wasted I/O.
-                if not is_retryable_status:
-                    try:
-                        text_body = await response.text()
-                    except transient_body_errors as exc:
-                        logger.warning("Could not read /result/%s error body: %s", session_id, exc)
-                        text_body = "<body unreadable>"
-
-                return status_code, parsed, detail, text_body
-
         while True:
             call_start = time.monotonic()
-            status_code, _payload, detail_message, text_body = await self._call_with_retry(
-                "get_result",
-                session_id,
-                _fetch_once,
-                call_start,
-                retry_max_wait,
-            )
-
-            if status_code == 200:
-                final_result = _payload if isinstance(_payload, dict) else {}
-                logger.info(
-                    "Final result retrieved for session %s: status = %s",
-                    session_id,
-                    final_result.get("status", "unknown"),
-                )
-                return final_result
-
-            should_retry = False
-            if status_code in (202, 425, 503, 400):
-                lower_detail = detail_message.lower()
-                if "not finished" in lower_detail or "still in progress" in lower_detail:
-                    should_retry = True
-                elif status_code == 202 and not detail_message:
-                    should_retry = True
-
-            if not should_retry:
-                raise GranSabioClientError(
-                    f"Result retrieval failed: {status_code} - {text_body}",
-                    status_code=status_code,
-                )
-
-            # Retryable (server reports in-progress) -- check deadline.
-            now = time.monotonic()
-            if deadline is not None and now >= deadline:
+            if deadline is not None and call_start >= deadline:
+                # Preserve the activity-aware window before budgeting retries.
                 if activity_monitor and timeout_seconds:
                     latest_activity = activity_monitor.last_activity_timestamp()
-                    if now - latest_activity <= timeout_seconds:
-                        deadline = time.monotonic() + timeout_seconds
+                    if call_start - latest_activity <= timeout_seconds:
+                        deadline = call_start + timeout_seconds
                         snapshot = activity_monitor.describe()
                         logger.debug(
                             "[RESULT_FETCH] Extended deadline due to stream activity "
@@ -1431,6 +1505,24 @@ class AsyncGranSabioClient:
                         f"Timed out waiting for final result of session {session_id}"
                     )
 
+            retry_max_wait = float("inf") if deadline is None else max(0.0, deadline - call_start)
+            final_result = await self._call_with_retry(
+                "get_result",
+                session_id,
+                lambda: self.get_result(session_id),
+                call_start,
+                retry_max_wait,
+            )
+
+            if final_result.get("status") != "in_progress":
+                logger.info(
+                    "Final result retrieved for session %s: status = %s",
+                    session_id,
+                    final_result.get("status", "unknown"),
+                )
+                return final_result
+
+            now = time.monotonic()
             remaining = None if deadline is None else max(0.0, deadline - now)
             # Clamp the sleep to remaining budget (not to a 1s floor) so we
             # never overshoot the deadline. If remaining is 0 the sleep is a
@@ -1571,6 +1663,7 @@ class AsyncGranSabioClient:
         qa_callback: Optional[Callable[[str, str, str], None]] = None,
         on_session_start: Optional[Callable[[str], None]] = None,
         error_callback: Optional[Callable[[str, Exception], None]] = None,
+        shared_context: Optional[str] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """Generate content with real-time SSE streaming.
@@ -1682,6 +1775,8 @@ class AsyncGranSabioClient:
             gen_kwargs["gran_sabio_model"] = gran_sabio_model
         if max_tokens is not None:
             gen_kwargs["max_tokens"] = max_tokens
+        if shared_context is not None:
+            gen_kwargs["shared_context"] = shared_context
         gen_kwargs.update(kwargs)
 
         # Start generation without waiting

@@ -8,11 +8,14 @@ No HTTP calls are made from this module.
 
 from __future__ import annotations
 
+import email.utils
 import hashlib
 import json
 import logging
 import threading
 import time
+from collections.abc import Mapping
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -35,6 +38,148 @@ STREAM_ACTIVITY_CHECK_SECONDS = 30.0
 # working on. POST /generate is not retried here because retrying it would start
 # duplicate sessions.
 POLL_RETRY_BACKOFF_SECONDS: Tuple[int, ...] = (5, 10, 20, 40, 60, 60, 60, 60, 60, 60)
+
+
+# ---------------------------------------------------------------------------
+# Idempotent generation submissions
+# ---------------------------------------------------------------------------
+
+# POST /generate deduplicates submissions that carry this header: the same ID
+# with the same payload replays the original admission (same session_id)
+# instead of starting a second session, for as long as the server keeps the
+# entry (process-local registry, 24 h TTL by default).
+SAAS_REQUEST_ID_HEADER = "X-GranSabio-SaaS-Request-ID"
+SAAS_REQUEST_ID_MAX_CHARS = 128
+_SAAS_REQUEST_ID_PUNCTUATION = frozenset("._:-")
+
+
+def validate_saas_request_id(request_id: Any) -> str:
+    """Return ``request_id`` when it satisfies the server's key grammar.
+
+    The server accepts 1-128 ASCII letters, digits and ``._:-``. An invalid key
+    is a caller bug, so it fails before any request is sent.
+    """
+    if (
+        not isinstance(request_id, str)
+        or not request_id
+        or len(request_id) > SAAS_REQUEST_ID_MAX_CHARS
+        or not all(
+            character.isascii()
+            and (character.isalnum() or character in _SAAS_REQUEST_ID_PUNCTUATION)
+            for character in request_id
+        )
+    ):
+        raise ValueError(
+            "request_id must be 1-128 ASCII letters, digits or '._:-' characters."
+        )
+    return request_id
+
+
+def parse_retry_after_seconds(headers: Any) -> Optional[float]:
+    """Return a ``Retry-After`` header as non-negative seconds, or ``None``.
+
+    Accepts delta-seconds and HTTP-date values. Anything absent, malformed or
+    not a header mapping yields ``None``; callers keep their own backoff.
+    """
+    if not isinstance(headers, Mapping):
+        return None
+    value = headers.get("Retry-After")
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if value.isascii() and value.isdigit():
+        return float(int(value))
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when.tzinfo is None:
+        return None
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+def _body_has_json_detail(body_text: str) -> bool:
+    """Whether an error body is a JSON object with a ``detail`` member.
+
+    The engine's HTTP errors use that shape; proxy and gateway error pages
+    (HTML or empty bodies) do not. Callers use this flag, never the body
+    itself, to tell an engine answer from a transport intermediary.
+    """
+    try:
+        body = json.loads(body_text)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(body, dict) and "detail" in body
+
+
+def generation_http_error_details(
+    payload: Dict[str, Any],
+    *,
+    body_text: str,
+    headers: Any,
+    request_id: Optional[str],
+) -> Dict[str, Any]:
+    """Build non-sensitive details for a failed POST /generate.
+
+    ``json_error_detail`` tells whether the engine itself answered;
+    ``retry_after_seconds`` and ``request_id`` appear only when known.
+    """
+    details: Dict[str, Any] = {
+        "payload_metadata": payload_error_metadata(payload),
+        "json_error_detail": _body_has_json_detail(body_text),
+    }
+    retry_after = parse_retry_after_seconds(headers)
+    if retry_after is not None:
+        details["retry_after_seconds"] = retry_after
+    if request_id is not None:
+        details["request_id"] = request_id
+    return details
+
+
+def admission_rejection_error(init_response: Any) -> Optional[Exception]:
+    """Return the error for an admission that preflight or Auto-QA rejected.
+
+    ``generate()`` raises this ``GranSabioClientError`` (``provider_outcome``
+    ``"rejected"``) instead of returning such a response. Reconciliation callers
+    read the ``init_response`` of a ``get_request_status()`` snapshot with the
+    same rule. Returns ``None`` for any other admission response.
+    """
+    from . import GranSabioClientError
+
+    if not isinstance(init_response, Mapping):
+        return None
+    status = init_response.get("status")
+    feedback = init_response.get("preflight_feedback")
+    if status in {"preflight_rejected", "rejected"} and isinstance(feedback, Mapping) and feedback:
+        return GranSabioClientError(
+            f"Request rejected by preflight: {feedback.get('user_feedback', 'Unknown reason')}",
+            details={"preflight_feedback": feedback, "response": init_response},
+            provider_outcome="rejected",
+        )
+    feedback = init_response.get("auto_qa_feedback")
+    if status == "auto_qa_rejected" and isinstance(feedback, Mapping) and feedback:
+        return GranSabioClientError(
+            f"Request rejected by Auto-QA: {feedback.get('message', 'Unknown reason')}",
+            details={"auto_qa_feedback": feedback, "response": init_response},
+            provider_outcome="rejected",
+        )
+    return None
+
+
+def session_list_params(
+    limit: Any, offset: Any, project_id: Optional[str],
+) -> Dict[str, Any]:
+    """Validate ``GET /debugger/sessions`` paging before any request is sent."""
+    if type(limit) is not int or limit < 1:
+        raise ValueError("limit must be a positive integer.")
+    if type(offset) is not int or offset < 0:
+        raise ValueError("offset must be a non-negative integer.")
+    params: Dict[str, Any] = {"limit": limit, "offset": offset}
+    if project_id is not None:
+        if not isinstance(project_id, str) or not project_id.strip():
+            raise ValueError("project_id must be a non-empty string or None.")
+        params["project_id"] = project_id
+    return params
 
 
 def payload_error_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -307,6 +452,30 @@ def resolve_model_token_fallback(model: str) -> int:
 # Result status validation (shared between sync and async)
 # ---------------------------------------------------------------------------
 
+def _terminal_failure_details(result: Dict[str, Any], raw_status: Any) -> Dict[str, Any]:
+    """Build the details allowlist for a non-success generation result.
+
+    The terminal fields ``finish_reason_category``, ``retryable``, and
+    ``prompt_block_reason`` / ``native_finish_reason`` are included only when the
+    server actually sent them, so results from older
+    servers do not acquire new ``None``-valued keys.
+    """
+    details = {
+        "status": raw_status,
+        "failure_reason": result.get("failure_reason"),
+        "error_type": result.get("error_type"),
+        "error_code": result.get("error_code"),
+        "output_truncated": result.get("output_truncated"),
+        "finish_reason": result.get("finish_reason"),
+        "provider_error": result.get("provider_error"),
+        "session_id": result.get("session_id"),
+    }
+    for terminal_key in ("finish_reason_category", "retryable", "prompt_block_reason", "native_finish_reason"):
+        if terminal_key in result:
+            details[terminal_key] = result[terminal_key]
+    return details
+
+
 def validate_result(result: Dict[str, Any]) -> None:
     """Validate a generation result dict.
 
@@ -345,17 +514,10 @@ def validate_result(result: Dict[str, Any]) -> None:
         raise GranSabioGenerationRejected(
             f"Generation rejected by QA ({failure}).",
             details={
-                "status": raw_status,
-                "failure_reason": result.get("failure_reason"),
-                "error_type": result.get("error_type"),
-                "error_code": result.get("error_code"),
-                "output_truncated": result.get("output_truncated"),
-                "finish_reason": result.get("finish_reason"),
-                "provider_error": result.get("provider_error"),
+                **_terminal_failure_details(result, raw_status),
                 "qa_summary": result.get("qa_summary"),
                 "qa_results": result.get("qa_results"),
                 "final_score": result.get("final_score"),
-                "session_id": result.get("session_id"),
             },
         )
 
@@ -368,16 +530,7 @@ def validate_result(result: Dict[str, Any]) -> None:
         )
         raise GranSabioClientError(
             f"Generation returned status '{status}' ({message}).",
-            details={
-                "status": raw_status,
-                "failure_reason": result.get("failure_reason"),
-                "error_type": result.get("error_type"),
-                "error_code": result.get("error_code"),
-                "output_truncated": result.get("output_truncated"),
-                "finish_reason": result.get("finish_reason"),
-                "provider_error": result.get("provider_error"),
-                "session_id": result.get("session_id"),
-            },
+            details=_terminal_failure_details(result, raw_status),
         )
 
     if status and status not in {"completed", "success", "succeeded"}:
@@ -389,16 +542,7 @@ def validate_result(result: Dict[str, Any]) -> None:
         )
         raise GranSabioClientError(
             f"Generation returned status '{status}' ({message}).",
-            details={
-                "status": raw_status,
-                "failure_reason": result.get("failure_reason"),
-                "error_type": result.get("error_type"),
-                "error_code": result.get("error_code"),
-                "output_truncated": result.get("output_truncated"),
-                "finish_reason": result.get("finish_reason"),
-                "provider_error": result.get("provider_error"),
-                "session_id": result.get("session_id"),
-            },
+            details=_terminal_failure_details(result, raw_status),
         )
 
     if result.get("approved") is False:

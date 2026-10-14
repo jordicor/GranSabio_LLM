@@ -107,3 +107,9 @@ class TestHealthVersionField:
         assert isinstance(started_at, str)
         parsed = datetime.datetime.fromisoformat(started_at)
         assert isinstance(parsed, datetime.datetime)
+
+
+def test_health_advertises_default_system_context_control(client):
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["capabilities"]["include_default_system_context"] is True

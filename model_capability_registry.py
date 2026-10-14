@@ -202,6 +202,11 @@ def _docs_rule_state(provider: str, model_id: str, capability: str) -> Capabilit
     model_lower = (model_id or "").lower()
 
     if capability == "responses_api":
+        if provider_key == "openai" and model_lower.startswith(
+            ("gpt-6-luna", "gpt-6-sol", "gpt-6-astra")
+        ):
+            # GPT-6 reasoning with tools uses the Responses contract.
+            return capability_state(True, source=CapabilitySource.OFFICIAL_DOCS)
         is_gpt56_sol = (
             model_lower == "gpt-5.6-sol"
             or model_lower.startswith("gpt-5.6-sol-")
@@ -240,6 +245,7 @@ def _docs_rule_state(provider: str, model_id: str, capability: str) -> Capabilit
     if capability == "json_schema":
         if provider_key == "openai":
             supported_prefixes = (
+                "gpt-6",
                 "gpt-5",
                 "gpt-4.1",
                 "gpt-4o",
@@ -272,6 +278,7 @@ def _docs_rule_state(provider: str, model_id: str, capability: str) -> Capabilit
     if capability == "tool_calling":
         if provider_key == "openai":
             supported_prefixes = (
+                "gpt-6",
                 "gpt-3.5",
                 "gpt-4",
                 "gpt-4.1",
@@ -312,6 +319,12 @@ def _capability_for(
             return _openrouter_parameter_state(model_data, {"tools"}, details_name="supported_parameters")
         if capability == "tool_choice":
             return _openrouter_parameter_state(model_data, {"tool_choice"}, details_name="supported_parameters")
+        if capability == "reasoning_effort":
+            state = _openrouter_parameter_state(
+                model_data, {"reasoning", "reasoning_effort"}, details_name="supported_parameters",
+            )
+            if state.support != CapabilitySupport.UNKNOWN:
+                return state
         if capability == "logprobs":
             return _openrouter_parameter_state(
                 model_data,

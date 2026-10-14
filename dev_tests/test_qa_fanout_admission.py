@@ -6,7 +6,7 @@ Covers:
 - heterogeneous per-receptor capacities + the public per-receptor table (mirror
   rule labels + numbers).
 - a context error is NEVER absorbed by quorum / reclassified as model_unavailable;
-  the scheduler aborts the layer and cancels in-flight sibling slots.
+  the scheduler fails the layer once in-flight sibling slots have finished.
 - QA tool-loop ``context_too_large`` surfaces as ``ContextBudgetExceeded`` (not a
   bare RuntimeError absorbed as an "unexpected" technical failure).
 - final-verification path reuses the same admission.
@@ -298,26 +298,30 @@ async def test_observe_mode_fanout_proceeds(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Context error never absorbed by quorum + sibling cancellation (scheduler)
+# Context error never absorbed by quorum + sibling drain (scheduler)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_context_error_aborts_layer_and_cancels_siblings():
-    cancelled = {"sibling": False}
+async def test_context_error_fails_layer_after_draining_siblings():
+    sibling = {"cancelled": False, "completed": False}
+    sibling_in_flight = asyncio.Event()
 
     async def evaluate_slot(slot, attempt):
         if slot.index == 0:
+            await sibling_in_flight.wait()
             raise ContextBudgetExceeded(
                 "mid-flight provider overflow",
                 call_id="qa.evaluate_layer",
                 public_label=slot.evaluator_label,
             )
+        sibling_in_flight.set()
         try:
-            await asyncio.sleep(10)
+            await asyncio.sleep(0.05)
         except asyncio.CancelledError:
-            cancelled["sibling"] = True
+            sibling["cancelled"] = True
             raise
+        sibling["completed"] = True
         return None
 
     scheduler = QAScheduler(QASchedulerPolicy(execution_mode="parallel"))
@@ -331,7 +335,7 @@ async def test_context_error_aborts_layer_and_cancels_siblings():
             evaluate_slot=evaluate_slot,
         )
 
-    assert cancelled["sibling"] is True
+    assert sibling == {"cancelled": False, "completed": True}
 
 
 @pytest.mark.asyncio
@@ -500,3 +504,23 @@ def test_gran_sabio_reqa_reraises_context_admission_before_generic_handler():
     assert ctx_idx < generic_idx
     # ...and its body re-raises rather than swallowing.
     assert "raise" in region[ctx_idx:generic_idx]
+
+
+@pytest.mark.asyncio
+async def test_shared_source_overflow_blocks_qa_before_dispatch(monkeypatch):
+    monkeypatch.setenv("CONTEXT_ADMISSION_MODE", "enforce")
+    engine = _make_engine()
+    engine.evaluate_content = AsyncMock()
+    models = ["qa-a"]
+    request = _request(models)
+    request.shared_context = BIG_CONTENT
+    registry = ModelAliasRegistry.from_request(request)
+    with patch.object(context_budget, "resolve_token_limits",
+                      side_effect=lambda m: _limits(m, max_total=16000)), \
+         patch.object(__import__("config").config.__class__, "resolve_qa_max_tokens", return_value=100):
+        with pytest.raises(FanoutAdmissionError):
+            await engine._evaluate_single_semantic_layer(
+                content="The launch was in 2024.", layer=_layer(), qa_models=models,
+                qa_model_names=models, original_request=request, model_alias_registry=registry,
+            )
+    engine.evaluate_content.assert_not_awaited()

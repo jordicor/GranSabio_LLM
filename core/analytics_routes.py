@@ -45,6 +45,7 @@ async def health_check():
         "active_sessions": len(active_sessions),
         "timestamp": datetime.now().isoformat(),
         "version": BUILD_VERSION_INFO,
+        "capabilities": {"include_default_system_context": True},
     }
 
 
@@ -98,7 +99,7 @@ async def get_analytics():
         )
 
 
-@app.get("/analytics/model/{model_name}")
+@app.get("/analytics/model/{model_name:path}")
 async def get_model_analytics(model_name: str):
     """Get reliability statistics for a specific QA model"""
     try:
@@ -112,7 +113,7 @@ async def get_model_analytics(model_name: str):
             )
 
         return JSONResponse(
-            content=stats.dict(),
+            content=stats.model_dump(mode="json"),
             status_code=200
         )
 
@@ -127,7 +128,52 @@ async def get_model_analytics(model_name: str):
         )
 
 
-@app.get("/models/{model_name}")
+@app.get("/models/qa/available")
+async def get_qa_models():
+    """Get list of models suitable for QA evaluation"""
+    from config import config
+    all_models = config.get_available_models()
+    defaults = legacy_default_models_view()
+
+    qa_suitable_models = []
+
+    # Add models from each provider with QA suitability info
+    for provider, models in all_models.items():
+        for model in models:
+            qa_priority = "standard"
+
+            # Prioritize models based on speed/cost for QA tasks
+            model_key = model["key"]
+            if "haiku" in model_key.lower() or "mini" in model_key.lower() or "flash" in model_key.lower():
+                qa_priority = "fast"
+            elif "opus" in model_key.lower() or "gpt-4o" == model_key or "gpt-5" in model_key:
+                qa_priority = "premium"
+
+            qa_suitable_models.append({
+                "key": model_key,
+                "name": model["name"],
+                "provider": provider,
+                "description": model["description"],
+                "qa_priority": qa_priority,
+                "output_tokens": model["output_tokens"],
+                "pricing": model["pricing"]
+            })
+
+    # Sort by QA priority (fast first, then standard, then premium)
+    priority_order = {"fast": 1, "standard": 2, "premium": 3}
+    qa_suitable_models.sort(key=lambda x: (priority_order.get(x["qa_priority"], 2), x["name"]))
+    return {
+        "qa_models": qa_suitable_models,
+        "recommendations": {
+            "fast": [m["key"] for m in qa_suitable_models if m["qa_priority"] == "fast"][:3],
+            "balanced": [m["key"] for m in qa_suitable_models if m["qa_priority"] == "standard"][:3],
+            "premium": [m["key"] for m in qa_suitable_models if m["qa_priority"] == "premium"][:2],
+        },
+        "defaults": defaults,
+    }
+
+
+@app.get("/models/{model_name:path}")
 async def get_model_info(model_name: str):
     """Get detailed information about a specific model"""
     from config import config, resolve_model_catalog_entry
@@ -188,50 +234,3 @@ async def api_documentation(
 async def api_usage_documentation(request: Request):
     """Serve the public API usage guide"""
     return templates.TemplateResponse("api_usage.html", {"request": request})
-
-
-
-
-@app.get("/models/qa/available")
-async def get_qa_models():
-    """Get list of models suitable for QA evaluation"""
-    from config import config
-    all_models = config.get_available_models()
-    defaults = legacy_default_models_view()
-
-    qa_suitable_models = []
-
-    # Add models from each provider with QA suitability info
-    for provider, models in all_models.items():
-        for model in models:
-            qa_priority = "standard"
-
-            # Prioritize models based on speed/cost for QA tasks
-            model_key = model["key"]
-            if "haiku" in model_key.lower() or "mini" in model_key.lower() or "flash" in model_key.lower():
-                qa_priority = "fast"
-            elif "opus" in model_key.lower() or "gpt-4o" == model_key or "gpt-5" in model_key:
-                qa_priority = "premium"
-
-            qa_suitable_models.append({
-                "key": model_key,
-                "name": model["name"],
-                "provider": provider,
-                "description": model["description"],
-                "qa_priority": qa_priority,
-                "output_tokens": model["output_tokens"],
-                "pricing": model["pricing"]
-            })
-
-    # Sort by QA priority (fast first, then standard, then premium)
-    priority_order = {"fast": 1, "standard": 2, "premium": 3}
-    qa_suitable_models.sort(key=lambda x: (priority_order.get(x["qa_priority"], 2), x["name"]))
-    return {
-        "qa_models": qa_suitable_models,
-        "recommendations": {
-            "fast": [m["key"] for m in qa_suitable_models if m["qa_priority"] == "fast"][:3],
-            "balanced": [m["key"] for m in qa_suitable_models if m["qa_priority"] == "standard"][:3],
-            "premium": [m["key"] for m in qa_suitable_models if m["qa_priority"] == "premium"][:2],
-        },
-        "defaults": defaults,
-    }

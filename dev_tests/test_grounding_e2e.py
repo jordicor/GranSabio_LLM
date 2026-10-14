@@ -1,15 +1,17 @@
 """
 End-to-End tests for Evidence Grounding with real API calls.
 
-Phase 7 of Strawberry Integration: E2E tests that verify the complete
-evidence grounding pipeline using real API calls to OpenAI for logprobs.
+E2E tests verify the complete evidence grounding pipeline using real API
+calls to OpenAI for logprobs.
 
 IMPORTANT: These tests make real API calls and incur costs.
-- Set SKIP_EXPENSIVE_TESTS=1 to skip these tests
+- Opt-in: marker ``integration``, deselected by default. Run with
+  ``pytest -m integration dev_tests/test_grounding_e2e.py``
 - Requires OPENAI_API_KEY to be configured
-- Server must be running at API_BASE (default: http://localhost:8000)
+- Server must be running at API_BASE (default: http://localhost:8000), except
+  for ``TestGroundingDirectModule``, which calls the providers directly
 
-Test fixtures from STRAWBERRY_INTEGRATION.md:
+Scenarios covered by the fixtures:
 - Confabulation case: Model claims something contradicting context
 - Grounded case: Model correctly uses evidence
 - No evidence case: Model makes claims without supporting context
@@ -26,9 +28,8 @@ from typing import Any, Dict
 import httpx
 import pytest
 
-# Check if we should skip expensive tests
-SKIP_EXPENSIVE = os.environ.get("SKIP_EXPENSIVE_TESTS", "0") == "1"
-SKIP_REASON = "Skipping expensive E2E tests (set SKIP_EXPENSIVE_TESTS=0 to run)"
+# Opt-in live tests: real provider calls.
+pytestmark = pytest.mark.integration
 
 # API configuration
 API_BASE = os.environ.get("API_BASE", "http://localhost:8000")
@@ -103,25 +104,9 @@ def get_result(session_id: str) -> Dict[str, Any]:
     return response.json()
 
 
-def check_server_running() -> bool:
-    """Check if the server is running."""
-    try:
-        response = httpx.get(f"{API_BASE}/health", timeout=5)
-        return response.status_code == 200
-    except Exception:
-        return False
-
-
 # =============================================================================
 # Fixtures
 # =============================================================================
-
-@pytest.fixture(scope="module")
-def server_check():
-    """Check server is running before tests."""
-    if not check_server_running():
-        pytest.skip(f"Server not running at {API_BASE}")
-
 
 @pytest.fixture
 def base_grounding_config():
@@ -190,11 +175,10 @@ Write 50-100 words about Marie Curie's discoveries.
 # E2E Tests - Basic Functionality
 # =============================================================================
 
-@pytest.mark.skipif(SKIP_EXPENSIVE, reason=SKIP_REASON)
 class TestGroundingE2EBasic:
     """Basic E2E tests for evidence grounding functionality."""
 
-    def test_grounding_enabled_returns_result(self, server_check, base_grounding_config):
+    def test_grounding_enabled_returns_result(self, live_engine_server, base_grounding_config):
         """
         Given: Request with evidence_grounding enabled (no semantic QA layers needed)
         When: Generation completes
@@ -233,7 +217,7 @@ class TestGroundingE2EBasic:
         print(f"\nGrounding result: passed={grounding['passed']}, "
               f"flagged={grounding['flagged_claims']}/{grounding['claims_verified']}")
 
-    def test_grounding_disabled_returns_none(self, server_check):
+    def test_grounding_disabled_returns_none(self, live_engine_server):
         """
         Given: Request without evidence_grounding
         When: Generation completes
@@ -262,7 +246,7 @@ class TestGroundingE2EBasic:
         grounding = result.get("evidence_grounding")
         assert grounding is None, f"Expected None, got: {grounding}"
 
-    def test_grounding_works_without_semantic_qa_layers(self, server_check, base_grounding_config):
+    def test_grounding_works_without_semantic_qa_layers(self, live_engine_server, base_grounding_config):
         """
         Given: Request with evidence_grounding enabled and empty qa_layers
         When: Generation completes
@@ -301,11 +285,10 @@ class TestGroundingE2EBasic:
 # E2E Tests - Grounded Content
 # =============================================================================
 
-@pytest.mark.skipif(SKIP_EXPENSIVE, reason=SKIP_REASON)
 class TestGroundingE2EGroundedContent:
     """E2E tests for well-grounded content detection."""
 
-    def test_grounded_biography_passes(self, server_check, grounded_request):
+    def test_grounded_biography_passes(self, live_engine_server, grounded_request):
         """
         Given: Request with rich context and prompt to use it
         When: Model generates content based on context
@@ -349,11 +332,10 @@ class TestGroundingE2EGroundedContent:
 # E2E Tests - Confabulation Detection
 # =============================================================================
 
-@pytest.mark.skipif(SKIP_EXPENSIVE, reason=SKIP_REASON)
 class TestGroundingE2EConfabulation:
     """E2E tests for confabulation detection."""
 
-    def test_no_evidence_flags_claims(self, server_check, no_evidence_request):
+    def test_no_evidence_flags_claims(self, live_engine_server, no_evidence_request):
         """
         Given: Request with minimal context that doesn't support the prompt
         When: Model generates content (likely using world knowledge)
@@ -398,11 +380,10 @@ class TestGroundingE2EConfabulation:
 # E2E Tests - Edge Cases
 # =============================================================================
 
-@pytest.mark.skipif(SKIP_EXPENSIVE, reason=SKIP_REASON)
 class TestGroundingE2EEdgeCases:
     """E2E tests for edge cases in evidence grounding."""
 
-    def test_trivial_content_no_claims(self, server_check, base_grounding_config):
+    def test_trivial_content_no_claims(self, live_engine_server, base_grounding_config):
         """
         Given: Content that is purely decorative/trivial
         When: Claim extraction runs
@@ -447,7 +428,7 @@ class TestGroundingE2EEdgeCases:
         if grounding['total_claims_extracted'] > 2:
             print(f"NOTE: Extracted {grounding['total_claims_extracted']} claims from trivial content - extractor may be aggressive")
 
-    def test_deal_breaker_config(self, server_check):
+    def test_deal_breaker_config(self, live_engine_server):
         """
         Given: Evidence grounding configured as deal_breaker
         When: Claims are flagged
@@ -500,11 +481,10 @@ Write 50-100 words.
 # E2E Tests - Claim Details Verification
 # =============================================================================
 
-@pytest.mark.skipif(SKIP_EXPENSIVE, reason=SKIP_REASON)
 class TestGroundingE2EClaimDetails:
     """E2E tests verifying claim detail structure."""
 
-    def test_claim_structure_complete(self, server_check, base_grounding_config):
+    def test_claim_structure_complete(self, live_engine_server, base_grounding_config):
         """
         Given: Request with evidence grounding enabled
         When: Claims are extracted and scored
@@ -577,7 +557,6 @@ Write 30-60 words.
 # Direct Module Tests (No Server Required)
 # =============================================================================
 
-@pytest.mark.skipif(SKIP_EXPENSIVE, reason=SKIP_REASON)
 class TestGroundingDirectModule:
     """Tests that call the grounding module directly (no server needed)."""
 
@@ -676,23 +655,11 @@ if __name__ == "__main__":
     """Run tests directly for debugging."""
     import subprocess
 
-    # Check if server is running
-    if not check_server_running():
-        print(f"WARNING: Server not running at {API_BASE}")
-        print("Start the server with: python main.py")
-        print("\nRunning only direct module tests...")
-        subprocess.run([
-            "python", "-m", "pytest",
-            __file__,
-            "-v",
-            "-k", "TestGroundingDirectModule",
-            "--tb=short"
-        ])
-    else:
-        print(f"Server running at {API_BASE}")
-        subprocess.run([
-            "python", "-m", "pytest",
-            __file__,
-            "-v",
-            "--tb=short"
-        ])
+    # Server-backed tests fail fast when nothing answers at API_BASE.
+    subprocess.run([
+        "python", "-m", "pytest",
+        __file__,
+        "-v",
+        "-m", "integration",
+        "--tb=short"
+    ])

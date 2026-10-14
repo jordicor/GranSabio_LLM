@@ -5,7 +5,10 @@ Tests that thinking_budget_tokens and reasoning_effort are correctly
 handled when making actual requests to Claude models through the API.
 
 IMPORTANT: These tests make real API calls and incur costs.
-Set SKIP_EXPENSIVE_TESTS=1 to skip these tests.
+They are opt-in (marker ``integration``, deselected by default) and need the
+engine server running at API_BASE (default http://localhost:8000):
+
+    pytest -m integration dev_tests/test_tokens_claude_api.py
 """
 
 import os
@@ -19,8 +22,8 @@ from typing import Any, Dict
 import httpx
 import pytest
 
-# Skip expensive API tests unless explicitly enabled
-SKIP_EXPENSIVE = os.environ.get("SKIP_EXPENSIVE_TESTS", "0") == "1"
+# Opt-in live tests: real provider calls through a running engine server.
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("live_engine_server")]
 
 # API configuration
 API_BASE = os.environ.get("API_BASE", "http://localhost:8000")
@@ -79,7 +82,6 @@ def base_payload():
 class TestClaudeThinkingBudgetViaAPI:
     """Test Claude thinking budget through the generation API."""
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_claude_sonnet_with_thinking_budget_direct(self, base_payload):
         """Test Claude Sonnet with direct thinking_budget_tokens value."""
         payload = {
@@ -104,7 +106,6 @@ class TestClaudeThinkingBudgetViaAPI:
         print(f"\n[OK] Claude Sonnet with thinking_budget_tokens=4096 completed")
         print(f"    Content length: {len(result['content'])} chars")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_claude_sonnet_with_reasoning_effort_low(self, base_payload):
         """Test Claude Sonnet with reasoning_effort=low (should convert to tokens)."""
         payload = {
@@ -128,7 +129,6 @@ class TestClaudeThinkingBudgetViaAPI:
         print(f"\n[OK] Claude Sonnet with reasoning_effort='low' completed")
         print(f"    Content length: {len(result['content'])} chars")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_claude_sonnet_with_reasoning_effort_medium(self, base_payload):
         """Test Claude Sonnet with reasoning_effort=medium."""
         payload = {
@@ -151,7 +151,6 @@ class TestClaudeThinkingBudgetViaAPI:
 
         print(f"\n[OK] Claude Sonnet with reasoning_effort='medium' completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_claude_sonnet_with_reasoning_effort_high(self, base_payload):
         """Test Claude Sonnet with reasoning_effort=high."""
         payload = {
@@ -174,7 +173,6 @@ class TestClaudeThinkingBudgetViaAPI:
 
         print(f"\n[OK] Claude Sonnet with reasoning_effort='high' completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_claude_sonnet_45_with_thinking(self, base_payload):
         """Test Claude Sonnet 4.5 with thinking budget."""
         payload = {
@@ -194,7 +192,6 @@ class TestClaudeThinkingBudgetViaAPI:
 
         print(f"\n[OK] Claude Sonnet 4.5 with thinking_budget_tokens=8192 completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_claude_haiku_with_thinking_disabled_by_default(self, base_payload):
         """Test Claude Haiku 4.5 - thinking disabled by default (default=0)."""
         payload = {
@@ -215,7 +212,6 @@ class TestClaudeThinkingBudgetViaAPI:
 
         print(f"\n[OK] Claude Haiku 4.5 without thinking (default=0) completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_claude_haiku_with_thinking_enabled(self, base_payload):
         """Test Claude Haiku 4.5 with explicit thinking budget."""
         payload = {
@@ -239,7 +235,6 @@ class TestClaudeThinkingBudgetViaAPI:
 class TestClaudeThinkingBudgetAliases:
     """Test that reasoning_effort aliases work correctly for Claude."""
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_claude_with_min_alias(self, base_payload):
         """Test 'min' alias converts to 'minimal'."""
         payload = {
@@ -257,7 +252,6 @@ class TestClaudeThinkingBudgetAliases:
 
         print(f"\n[OK] Claude with reasoning_effort='min' (alias) completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_claude_with_mid_alias(self, base_payload):
         """Test 'mid' alias converts to 'medium'."""
         payload = {
@@ -275,7 +269,6 @@ class TestClaudeThinkingBudgetAliases:
 
         print(f"\n[OK] Claude with reasoning_effort='mid' (alias) completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_claude_with_hi_alias(self, base_payload):
         """Test 'hi' alias converts to 'high'."""
         payload = {
@@ -297,7 +290,6 @@ class TestClaudeThinkingBudgetAliases:
 class TestClaudeThinkingTokenValidation:
     """Test thinking token validation and adjustment for Claude."""
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_claude_thinking_budget_capped_by_model_limit(self, base_payload):
         """Test that extremely large thinking budget is capped."""
         payload = {
@@ -318,7 +310,6 @@ class TestClaudeThinkingTokenValidation:
 
         print(f"\n[OK] Claude with excessive thinking budget was capped and completed")
 
-    @pytest.mark.skipif(SKIP_EXPENSIVE, reason="Expensive API test")
     def test_claude_thinking_budget_below_minimum(self, base_payload):
         """Test that thinking budget below minimum is raised to minimum."""
         payload = {

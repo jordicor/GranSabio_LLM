@@ -235,9 +235,11 @@ class TestReviewMinorityUsesToolLoop:
 
 class TestRegenerateContentUsesToolLoop:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("shared_context", [None, "Shared interview evidence."])
     async def test_routes_to_tool_loop_with_free_text_contract(
-        self, request_with_tools, tool_loop_config
+        self, request_with_tools, tool_loop_config, shared_context
     ):
+        request_with_tools.shared_context = shared_context
         service = _make_ai_service_with_tool_loop(
             approve_payload={},
             free_text_content="Regenerated body.",
@@ -259,6 +261,8 @@ class TestRegenerateContentUsesToolLoop:
 
         service.call_ai_with_validation_tools.assert_awaited_once()
         call_kwargs = service.call_ai_with_validation_tools.call_args.kwargs
+        assert call_kwargs.get("shared_context") == shared_context
+        assert ("shared_context" in call_kwargs) == (shared_context is not None)
         assert call_kwargs["output_contract"] == OutputContract.FREE_TEXT
         assert call_kwargs["stop_on_approval"] is True
         assert call_kwargs["loop_scope"] == LoopScope.GRAN_SABIO

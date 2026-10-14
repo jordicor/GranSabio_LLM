@@ -7,7 +7,9 @@ from auto_qa_planner import (
     AUTO_QA_PLAN_SCHEMA,
     AUTO_QA_REQUEST_OVERRIDE_FIELDS,
     AutoQAPlanningError,
+    _build_planner_prompt,
     apply_auto_qa_plan,
+    build_auto_qa_planning_payload,
     validate_auto_qa_effective_contract,
     validate_auto_qa_plan,
 )
@@ -123,6 +125,30 @@ def test_model_alias_prompt_snapshot_includes_safe_capabilities(monkeypatch):
     assert "provider" not in snapshot_text
     assert "pricing" not in snapshot_text
     assert "Internal Model Name" not in snapshot_text
+
+
+@pytest.mark.parametrize(("rigor", "max_semantic_layers", "expected"), [
+    ("light", None, {"min": 1, "max": 2}),
+    ("strict", None, {"min": 2, "max": 4}),
+    ("max", 5, {"min": 4, "max": 5}),
+    ("strict", 1, {"min": 1, "max": 1}),
+])
+def test_planner_is_told_the_layer_range_the_validator_enforces(monkeypatch, rigor, max_semantic_layers, expected):
+    monkeypatch.setattr(config, "model_specs", _fake_specs())
+    request = _request(rigor=rigor)
+    request.auto_qa.max_semantic_layers = max_semantic_layers
+    registry = ModelAliasRegistry.from_request(request, preflight_model="fake-preflight")
+
+    payload = build_auto_qa_planning_payload(request, model_alias_registry=registry)
+    prompt = _build_planner_prompt(payload)
+
+    assert payload["auto_qa"]["qa_layer_count"] == expected
+    assert "auto_qa.qa_layer_count.min" in prompt and "auto_qa.qa_layer_count.max" in prompt
+    too_many = {**_plan(), "qa_layers": [{**_plan()["qa_layers"][0], "name": f"Layer {index}", "order": index}
+                                         for index in range(1, expected["max"] + 2)]}
+    with pytest.raises(AutoQAPlanningError) as caught:
+        validate_auto_qa_plan(too_many, request, image_info=None, model_alias_registry=registry)
+    assert caught.value.code == "auto_qa_too_many_layers"
 
 
 def test_auto_qa_schema_accepts_required_nullable_overrides():

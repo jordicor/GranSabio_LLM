@@ -32,6 +32,51 @@ Every developer using AI for content generation faces the same challenges:
 
 ---
 
+## Shared source data
+
+`POST /generate` and the sync/async SDK accept optional `shared_context` text.
+Use it for a stable document or transcript and keep the changing task in `prompt`.
+The source stays at user level, before the task; it is reference data and cannot
+replace system instructions. Generation, retries, QA, preflight, grounding and
+escalation retain that evidence. Admission counts the full source. Omitting the
+field or sending `null` adds no shared-source message and preserves request identity.
+A supplied source changes request and feedback identity; moving an existing source
+from `prompt` into `shared_context` starts a new identity and may incur a cold paid
+run. No historical result or accounting record is migrated automatically.
+
+This contract supports standard generation, streaming, tool loops and vision.
+Enabled Long Text Mode currently rejects `shared_context` before model dispatch;
+set `long_text_mode="off"` when supplying shared context. Provider prompt caching
+is an optimization, not a promise of reuse, lower costs or identical answers.
+The shared source block receives an explicit cache boundary on supported OpenAI,
+Anthropic and OpenRouter routes. Keep the source and preceding instructions
+identical across related requests; put changing questions and run metadata after
+the shared source. The first request or a changed source may still incur cache
+write costs.
+
+```python
+result = await client.generate(
+    prompt="Return the launch date stated in the document.",
+    shared_context=document_text,
+    long_text_mode="off",
+    # Keep the usual model, QA and output settings for your application.
+)
+```
+
+GranSabio also marks existing attachment text and the stable
+request prefix before retry feedback, without adding API or SDK fields. QA and
+preflight put existing `source_text` before changing task/round metadata; Auto-QA
+preserves its existing source-length limit. Attachment previews, source scope,
+output schemas and idempotency rules remain unchanged. Ordinary one-shot text
+requests without attachments keep their original transport when no retry is
+configured. These boundaries reuse complete prefixes, not independent arbitrary
+chunks or previous answers.
+
+Long Text Mode requires its optional controller package. When it is absent,
+`long_text_mode="auto"` uses standard generation with the requested word limits
+and an advisory if long-text activation would otherwise apply. Explicit
+`long_text_mode="on"` requests return HTTP 400 before model dispatch.
+
 ## How It Works
 
 ```
@@ -176,6 +221,11 @@ QA scheduling is configurable through `qa_execution_mode`, `on_qa_model_unavaila
 ### Request Timeouts
 
 Request process timeouts are centralized in `request_timeouts.default.json`. Create a local `request_timeouts.json` to override defaults without changing tracked files. These values are for model generation, streaming, QA, Gran Sabio, Long Text, SDK waits, and MCP waits; provider connection/health/model-sync timeouts remain separate.
+
+OpenAI Chat and Responses both use the asynchronous client and
+`SDK_OPENAI_TIMEOUT_SECONDS` (`sdk_model_timeouts.openai_seconds`). The unused
+synchronous client and its `SDK_OPENAI_SYNC_TIMEOUT_SECONDS` /
+`sdk_model_timeouts.openai_sync_seconds` settings have been removed.
 
 The default process timeout is intentionally high: `12000` seconds. Per request you can override it globally or by phase:
 
@@ -357,6 +407,21 @@ Block specific phrases or patterns:
   }
 }
 ```
+
+---
+
+### Generation System Context
+
+`include_default_system_context` defaults to `true`: generation appends the
+automatic same-language instruction and current date to the system prompt.
+Set it to `false` when supplying a fixed generation system prompt. This removes
+only that automatic suffix; JSON/tool instructions, validation prompts, and
+other generation constraints still apply. The flag also covers Long Text
+generation and JSON correction retries.
+
+Backends supporting this flag advertise
+`capabilities.include_default_system_context: true` in `/health`. Clients that
+require a fixed prompt should check this capability before requesting generation.
 
 ---
 
@@ -585,7 +650,85 @@ PEPPER=any-random-string-here
 
 > **Note:** You only need keys for the providers you want to use. At minimum, configure one provider.
 
+#### Optional accumulated provider budget
+
+An isolated runtime can enable a durable USD ceiling for one OpenRouter text
+model. Leave `PROVIDER_BUDGET_LEDGER_PATH` empty for normal behavior. When enabled,
+configure every bound explicitly and use the same model for generation and
+preflight. This scope supports ordinary and streaming text/JSON calls, including
+the normal generation loop's local `validate_draft` tool and its final turn.
+Other providers, external tools, accent auditing, images, embeddings and explicit
+separate thinking budgets fail before dispatch. Preflight and generation
+validation retain their normal behavior.
+
+```env
+PROVIDER_BUDGET_LEDGER_PATH=/absolute/private/provider-spend.sqlite
+PROVIDER_BUDGET_LIMIT_USD=60
+PROVIDER_BUDGET_OPENROUTER_MODEL=google/gemini-3.1-flash-lite-preview
+PROVIDER_BUDGET_INPUT_USD_PER_MILLION=0.25
+PROVIDER_BUDGET_OUTPUT_USD_PER_MILLION=1.5
+PROVIDER_BUDGET_MAX_INPUT_TOKENS=1048576
+PROVIDER_BUDGET_MAX_OUTPUT_TOKENS=65536
+```
+
+The example's [model limits and tariffs](https://openrouter.ai/api/v1/models/google/gemini-3.1-flash-lite-preview/endpoints)
+were checked on September 11, 2026;
+verify the selected model's current contract before configuring another runtime.
+The bound assumes output `max_tokens` includes all billed reasoning and no
+billable dimensions beyond text and a zero request fee. Every HTTP attempt
+reserves twice the full input-window quote plus its actual output limit. The
+request enforces prompt/completion price ceilings, a zero request price and no
+provider fallback through [OpenRouter routing options](https://openrouter.ai/docs/guides/routing/provider-selection).
+SDK retries are disabled in this mode; each ordinary GranSabio retry, tool turn
+and reasoning-parameter retry reserves separately. Tool streaming settles raw
+usage before its parser or event callbacks and closes the transport on cancellation.
+All processes sharing this ledger share one ceiling.
+
+TypeSafe System One may share that same ledger through an explicit optional
+model and verified input tariff. These settings default to disabled:
+
+```env
+PROVIDER_BUDGET_TYPESAFE_MODEL=jev-latest
+PROVIDER_BUDGET_TYPESAFE_INPUT_USD_PER_MILLION=0.042
+PROVIDER_BUDGET_TYPESAFE_MAX_INPUT_TOKENS=32768
+```
+
+The [TypeSafe launch pricing](https://typesafe.ai/blog/introducing-system-one-models-and-jev)
+quotes USD 0.042 per million input tokens and free output (checked September 21,
+2026). No chat output allowance is reserved or sent to TypeSafe. Each typed
+attempt reserves twice the entire input-window quote and settles from valid
+native input usage at the configured tariff, marked `conservative` rather than
+invoice cost. Failed or malformed attempts keep the full reservation; usage
+over the input ceiling halts further dispatch. The configured wire model is
+allowed only for standalone System One, semantic preflight and QA evaluation.
+Adding it to an existing ledger requires the documented offline
+`transition_policy` operation, preserving the same path, cumulative ceiling and
+all prior attempts; changing environment variables alone fails closed.
+
+Settlement uses complete raw [OpenRouter usage metadata](https://openrouter.ai/docs/cookbook/administration/usage-accounting)
+before normalization or optional callbacks. Explicit non-BYOK usage counts the
+account cost; BYOK adds known upstream cost. When BYOK is unspecified but both
+costs exist, their sum is labeled conservative. Missing metadata, interruption
+or failure retains the reservation as uncertain; a process crash can leave an
+unsettled reserved row, which also continues to count in full. Nothing expires
+or refunds automatically. Actual and conservative settled amounts are distinct
+from outstanding reserves in `ProviderBudget.summary()`. The ledger contains
+only accounting metadata, never prompts, outputs or credentials.
+
+Keep the ledger outside releases and preserve it across restarts. Configuration
+changes against the same ledger are rejected. If reported usage exceeds its
+contracted bound, future dispatch stops pending accounting verification. This
+ceiling covers this runtime's attempts; unrelated provider calls need their own
+accounting within the owner's overall budget.
+
 For local Ollama models, `OLLAMA_MAX_CONCURRENT_REQUESTS` defaults to `1` so local generation and QA model calls are queued instead of hitting the same GPU in parallel. Increase it only if your local hardware can handle concurrent Ollama requests. `OLLAMA_ENDPOINT_ALIAS` gives that administrator-configured endpoint a stable audit identity; requests cannot supply or override its URL.
+
+All local calls use registered endpoints, including those configured through
+the legacy environment settings. QA retains its global Ollama admission limit;
+each endpoint also applies its own queue. When both refer to the same legacy
+queue, a QA call reuses the slot it already holds. Embedders should initialize
+`AIService` normally; the old private provider helpers and the transport fallback
+for partially initialized instances have been removed.
 
 For a separate `llama.cpp` server exposing OpenAI-compatible Chat Completions,
 set `LLAMACPP_BASE_URL` (including `/v1`), optionally set `LLAMACPP_API_KEY`,
@@ -656,6 +799,23 @@ python main.py
 
 Server starts at `http://localhost:8000`
 
+On Windows, the PowerShell launcher provides a local start/stop menu. Pass the
+Python executable from your virtual environment:
+
+```powershell
+powershell -NoProfile -File .\tools\windows_launcher.ps1 -PythonPath .\venv\Scripts\python.exe -Port 8000
+```
+
+Use `-Port 8001` or the menu to select another port; `.env` is never rewritten.
+
+The server opens in a separate console with file logging and extra verbosity.
+Exiting the menu leaves it running. Reopening the menu also detects servers
+started manually in Windows once they are listening. Status comes from the OS
+listener, process identity, `/api`, and `/health`; no lock/PID file is needed.
+An unidentified occupied port cannot be started over or stopped. Stopping a
+verified instance is immediate and interrupts its running analyses. Instances
+whose `/api` does not respond must be stopped from their own console.
+
 ### 4. Generate Your First Content
 
 ```bash
@@ -712,6 +872,79 @@ configuration or `model_specs.json`.
 }
 ```
 
+### Default model roles and Jev preflight
+
+The default routes in `llm_routing.default.json` use GPT-6 Luna with low
+reasoning for drafts and auxiliary work, GPT-6 Luna / Claude Sonnet 5 /
+Gemini 3.8 Flash for QA, and GPT-6 Sol with medium reasoning for arbitration
+and Gran Sabio decisions. Model selection is per role.
+
+Jev is a TypeSafe evaluator for typed decisions, not a text generator.
+Semantic preflight now defaults to the pinned `jev-1.13.0`. One System One
+request selects `proceed` or one of three rejection reasons:
+`conflicting_requirements`, `qa_incompatible_with_task`, or
+`missing_required_basis`. Each rejection has a fixed message; no chat model
+is called to explain it. Parallel questions identify redundant length-only
+QA. Technical failures retain separate error codes and fail closed.
+
+The decision checks the intended result after instruction precedence and
+conditional branches. A repair task is not rejected merely because its input
+contains the defect to repair. Optional missing sources and ambitious quality
+targets are not hard blockers. Context admission remains enforced, with no
+silent fallback or source truncation.
+
+Configure `TYPESAFE_API_KEY` in your local `.env` and register the default
+`jev-1.13.0` under the `typesafe` provider in the ignored `model_specs.json`
+catalog. Sync/register the other default model IDs above on each host too.
+The tracked curated token limits do not register models or credentials.
+
+To override preflight or explicitly opt into Jev QA, use the request routing fields:
+
+```json
+{
+  "llm_routing": {
+    "calls": {
+      "preflight.validate": {"model": "jev-latest"},
+      "qa.evaluate_layer": {"models": [{"model": "jev-latest"}]}
+    }
+  }
+}
+```
+
+Each override is independent; omit a call to keep its normal model. Jev QA
+receives the original prompt and complete source text, uses six descriptive
+levels converted to the engine's 0–10 scale, and does not produce SmartEdit
+instructions. Oversized state or questions fail context admission before the
+provider call when `CONTEXT_ADMISSION_MODE=enforce`.
+
+The deterministic `/context/preflight` contract identifies typed QA participants
+with `call_kind: "system_one"`, zero output/reasoning reservation and the full
+future candidate reservation. It counts the largest actual per-layer typed
+payload, including the original prompt, complete source and typed questions.
+Ordinary participants retain `call_kind: "chat"`. Consumers must preserve this
+distinction when validating a mixed jury's output allowances.
+
+For a standalone decision, `POST /systemone` requires an explicit `model`:
+
+```json
+{
+  "model": "jev-latest",
+  "state": {"message": "The delivery is late."},
+  "questions": {
+    "delivery_issue": {
+      "type": "noul",
+      "instructions": "Does the message report a delivery problem?"
+    }
+  }
+}
+```
+
+Both Python clients expose
+`evaluate_system_one(state, questions, model="jev-latest")`. Score questions
+accept 2–10 ordered levels; the standalone response retains TypeSafe's raw
+0-based level scale. See the [TypeSafe API](https://docs.typesafe.ai/api) and
+[Score contract](https://docs.typesafe.ai/primitives/score).
+
 ### Fail-closed local execution
 
 Set `execution_policy.scope` to `local_only` when every AI dispatch in a
@@ -730,7 +963,6 @@ never falls back to a cloud provider.
   "llm_routing": {
     "calls": {
       "generation.main": {"model": "your-local-model"},
-      "generation.direct_stream": {"model": "your-local-model"},
       "preflight.validate": {"model": "your-local-model"}
     }
   },
@@ -781,6 +1013,9 @@ See the complete list and documentation: **[demos/README.md](demos/README.md)**
 
 ## API Documentation
 
+OpenRouter error handling distinguishes content-policy rejections, errors inside
+HTTP 200/SSE responses, and native finish reasons.
+
 Full interactive documentation available at:
 - **Swagger UI:** `http://localhost:8000/docs`
 - **ReDoc:** `http://localhost:8000/redoc`
@@ -792,12 +1027,26 @@ Full interactive documentation available at:
 |----------|--------|-------------|
 | `/generate` | POST | Start content generation with QA |
 | `/status/{session_id}` | GET | Check session status |
+| `/stream-content/{session_id}` | GET | Observe existing generation content as SSE |
 | `/stream/project/{project_id}` | GET | Real-time SSE progress stream (project_id = session_id when not explicit) |
 | `/result/{session_id}` | GET | Get final approved content |
 | `/stop/{session_id}` | POST | Cancel active generation |
 | `/models` | GET | List available AI models |
 | `/debugger` | GET | Session history and inspection UI |
 | `/admin/models` | GET | Manage local model catalog and provider sync |
+
+`GET /stream-content-direct/{session_id}` is retired and returns HTTP 410. It
+started a separate generation outside the normal input and QA pipeline. Use
+`POST /generate` to start a session, then `GET /stream-content/{session_id}`
+to observe its content, or `GET /stream/{session_id}` and
+`GET /stream/project/{project_id}` for labelled events. Observing a session
+does not start another generation. References to the direct route in older
+audit and test reports describe historical behavior.
+
+The `generation.direct_stream` routing call ID is also retired. Before
+upgrading, remove that entry from operator routing files and request overlays;
+unknown call IDs are rejected. The local-only policy admits only calls the
+normal generation can reach and needs no separate route for observation.
 
 ### Analysis Endpoints
 
@@ -1080,7 +1329,9 @@ For execution timing and per-call visibility, use `show_query_stats`:
 }
 ```
 
-`show_query_stats=1` returns phase/model/provider aggregates, `2` adds iteration and layer detail, and `3` adds prompt-free per-call rows with duration, tokens, provider, model, finish reason, and estimated cost. Local spans such as consensus and smart-edit timing are included without increasing the LLM call count.
+`show_query_stats=1` returns phase/model/provider aggregates, `2` adds iteration and layer detail, and `3` adds prompt-free per-call rows with duration, tokens, provider, model, finish reason, and cost. A per-call `cost_basis` says whether `estimated_cost_usd` is the amount the provider reported as billed (`provider_billed`, OpenRouter's `usage.cost`, plus the upstream charge for BYOK requests) or a `catalog_estimate` from the model's `pricing` block; a call with neither leaves the cost `null`, and any such call keeps the aggregate cost `null` as well. The OpenRouter sync writes each catalog rate (`input_per_million`, `output_per_million`, `cached_input_per_million`, `cache_write_per_million`, and the `long_context` override above its `threshold_tokens`) only when OpenRouter lists it; a router model priced per routed request (OpenRouter lists `-1`) therefore has no catalog rate and stays `null` unless the call reported its billed cost. Local spans such as consensus and smart-edit timing are included without increasing the LLM call count.
+
+Unreported token counts and costs are `null` (`unknown` in the text cost block), rather than zero. An aggregate is unavailable when a contributing call lacks the corresponding measurement; measured zero remains zero. A provider-reported total can still be available when its input/output breakdown is not.
 
 ---
 

@@ -12,7 +12,7 @@ import shutil
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import aiohttp
 
@@ -103,11 +103,117 @@ def _iso_from_unix_timestamp(value: Any) -> str | None:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
 
 
-def _price_per_million_from_token_price(value: Any) -> float:
-    raw_value = _safe_float(value, default=0.0)
-    if raw_value <= 0:
-        return 0.0
+def _listed_price_per_million_from_token_price(value: Any) -> float | None:
+    """Per-million rate for a listed per-token price; ``None`` when none is listed.
+
+    A catalog that lists no rate for a token category must not produce one:
+    cost estimation treats a missing rate as an unknown price, never as free.
+    OpenRouter lists ``-1`` for router models priced per routed request
+    (``openrouter/auto`` and the like); that sentinel is not a rate either.
+    """
+    if value is None or isinstance(value, bool) or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        raw_value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if raw_value < 0:
+        return None
     return round(raw_value * 1_000_000, 4)
+
+
+def _listed_rate_per_million(value: Any) -> float | None:
+    """Round a catalog per-million rate; ``None`` when the entry has none."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        rate = float(value)
+    except (TypeError, ValueError):
+        return None
+    if rate < 0:
+        return None
+    return round(rate, 4)
+
+
+# OpenRouter per-token price keys and the catalog per-million keys they feed.
+# Every rate is written only when OpenRouter lists it; none is ever invented.
+OPENROUTER_PRICING_FIELDS = (
+    ("prompt", "input_per_million"),
+    ("completion", "output_per_million"),
+    ("input_cache_read", "cached_input_per_million"),
+    ("input_cache_write", "cache_write_per_million"),
+)
+PRICING_RATE_KEYS = tuple(local_key for _remote_key, local_key in OPENROUTER_PRICING_FIELDS)
+
+
+def openrouter_pricing_from_remote(pricing: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Map one OpenRouter ``pricing`` object to the catalog's per-million block.
+
+    ``input_per_million`` (``prompt``), ``output_per_million`` (``completion``),
+    ``cached_input_per_million`` (``input_cache_read``) and
+    ``cache_write_per_million`` (``input_cache_write``) are copied only when
+    OpenRouter lists a rate; an unlisted rate or the ``-1`` dynamic-pricing
+    sentinel leaves the key out, so ``UsageTracker._estimate_cost`` reports the
+    cost as unknown instead of free. The first ``overrides`` entry carrying
+    ``min_prompt_tokens`` becomes the ``long_context`` block that
+    ``_estimate_cost`` applies when ``input_tokens`` exceeds ``threshold_tokens``;
+    its rates follow the same rule, and an override listing no rate at all is
+    dropped. OpenRouter names the first prompt size the override may apply to,
+    so a prompt of exactly ``threshold_tokens`` tokens is estimated at the base
+    rate.
+    """
+    pricing = pricing or {}
+    result: dict[str, Any] = {}
+    for remote_key, local_key in OPENROUTER_PRICING_FIELDS:
+        rate = _listed_price_per_million_from_token_price(pricing.get(remote_key))
+        if rate is not None:
+            result[local_key] = rate
+    overrides = pricing.get("overrides")
+    if isinstance(overrides, list):
+        for override in overrides:
+            if not isinstance(override, Mapping):
+                continue
+            threshold_tokens = _safe_int(override.get("min_prompt_tokens"), 0)
+            if threshold_tokens <= 0:
+                continue
+            long_context: dict[str, Any] = {"threshold_tokens": threshold_tokens}
+            for remote_key, local_key in OPENROUTER_PRICING_FIELDS:
+                rate = _listed_price_per_million_from_token_price(override.get(remote_key))
+                if rate is not None:
+                    long_context[local_key] = rate
+            if len(long_context) > 1:
+                result["long_context"] = long_context
+            break
+    return result
+
+
+def _normalize_pricing_block(pricing: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Round a catalog pricing block for persistence without losing rate keys.
+
+    Each rate (base input/output, cache read/write) is written when the synced
+    or curated entry lists it and left out otherwise, and the ``long_context``
+    block survives with the same rule, so a re-sync never strips prices that
+    ``UsageTracker._estimate_cost`` needs and never turns an unknown price into
+    a free one.
+    """
+    pricing = pricing or {}
+    normalized: dict[str, Any] = {}
+    for key in PRICING_RATE_KEYS:
+        rate = _listed_rate_per_million(pricing.get(key))
+        if rate is not None:
+            normalized[key] = rate
+    long_context = pricing.get("long_context")
+    if isinstance(long_context, Mapping):
+        threshold_tokens = _safe_int(long_context.get("threshold_tokens"), 0)
+        if threshold_tokens > 0:
+            block: dict[str, Any] = {"threshold_tokens": threshold_tokens}
+            for key in PRICING_RATE_KEYS:
+                rate = _listed_rate_per_million(long_context.get(key))
+                if rate is not None:
+                    block[key] = rate
+            if len(block) > 1:
+                normalized["long_context"] = block
+    return normalized
 
 
 def _price_per_million_from_cents_per_100m(value: Any) -> float:
@@ -330,7 +436,9 @@ class ModelSyncService:
     def __init__(self, config: Any, logger: Any, specs_path: Path | None = None):
         self.config = config
         self.logger = logger
-        self.specs_path = specs_path or MODEL_SPECS_PATH
+        # Releases may link the mutable catalog into private shared storage.
+        # Atomic replacement must target that file, not replace the release link.
+        self.specs_path = (specs_path or MODEL_SPECS_PATH).resolve()
         self.backup_dir = MODEL_SPECS_BACKUP_DIR
 
     def get_sync_mode(self, provider: str) -> str:
@@ -620,10 +728,7 @@ class ModelSyncService:
                     "input_tokens": context_length,
                     "output_tokens": output_tokens,
                     "token_limits_provenance": token_provenance,
-                    "pricing": {
-                        "input_per_million": _price_per_million_from_token_price(pricing.get("prompt")),
-                        "output_per_million": _price_per_million_from_token_price(pricing.get("completion")),
-                    },
+                    "pricing": openrouter_pricing_from_remote(pricing),
                     "capabilities": _dedupe_strings(capabilities),
                     "supported_parameters": supported_parameters,
                     "parameter_constraints": _parameter_constraints_for_model(
@@ -752,7 +857,8 @@ class ModelSyncService:
         host = getattr(self.config, "OLLAMA_HOST", "")
         version_url = _ollama_api_url(host, "version")
         tags_url = _ollama_api_url(host, "tags")
-        if not version_url or not tags_url:
+        show_url = _ollama_api_url(host, "show")
+        if not version_url or not tags_url or not show_url:
             raise ModelSyncError("OLLAMA_HOST is not configured.")
 
         headers = _remote_json_headers()
@@ -790,9 +896,48 @@ class ModelSyncService:
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                 raise ModelSyncError(f"Failed to fetch Ollama models from {tags_url}: {exc}") from exc
 
-        models_payload = payload.get("models", []) if isinstance(payload, dict) else []
-        if not isinstance(models_payload, list):
-            raise ModelSyncError("Ollama API returned an invalid /api/tags payload.")
+            models_payload = payload.get("models", []) if isinstance(payload, dict) else []
+            if not isinstance(models_payload, list):
+                raise ModelSyncError("Ollama API returned an invalid /api/tags payload.")
+
+            # /api/tags does not declare modalities. Read /api/show only during
+            # this explicit catalog fetch, once per installed model, without
+            # generation or loading a model. Missing capabilities stay unknown.
+            remote_capabilities: dict[str, list[str]] = {}
+            for model in models_payload:
+                if not isinstance(model, dict):
+                    continue
+                model_id = str(model.get("model") or model.get("name") or "").strip()
+                if not model_id or model_id in remote_capabilities:
+                    continue
+                try:
+                    async with session.post(
+                        show_url,
+                        json={"model": model_id},
+                        headers=headers,
+                        timeout=timeout,
+                        allow_redirects=False,
+                    ) as response:
+                        if response.status != 200:
+                            raise ModelSyncError(
+                                f"Ollama metadata error for '{model_id}' at {show_url}: {await response.text()}"
+                            )
+                        show_payload = await response.json()
+                except ModelSyncError:
+                    raise
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+                    raise ModelSyncError(
+                        f"Failed to fetch Ollama metadata for '{model_id}' at {show_url}: {exc}"
+                    ) from exc
+
+                if not isinstance(show_payload, dict):
+                    raise ModelSyncError(f"Ollama metadata for '{model_id}' is not an object.")
+                declared_capabilities = show_payload.get("capabilities")
+                if declared_capabilities is None:
+                    declared_capabilities = []
+                if not isinstance(declared_capabilities, list):
+                    raise ModelSyncError(f"Ollama capabilities for '{model_id}' are not a list.")
+                remote_capabilities[model_id] = _dedupe_strings(declared_capabilities)
 
         current_specs = self._get_provider_specs(self.load_specs(), "ollama")
         remote_models: list[dict[str, Any]] = []
@@ -827,6 +972,13 @@ class ModelSyncService:
                 or _title_case_model_name(model_id.replace(":", "-"))
             )
             description = local_template.get("description") or _ollama_description(model_id, details)
+            capabilities = [
+                capability
+                for capability in local_template.get("capabilities") or ["text"]
+                if capability != "vision"
+            ] or ["text"]
+            if "vision" in remote_capabilities[model_id]:
+                capabilities.append("vision")
 
             remote_models.append(
                 {
@@ -845,7 +997,7 @@ class ModelSyncService:
                         "input_per_million": 0.0,
                         "output_per_million": 0.0,
                     },
-                    "capabilities": _dedupe_strings(local_template.get("capabilities") or ["text"]),
+                    "capabilities": _dedupe_strings(capabilities),
                     "supported_parameters": _dedupe_strings(local_template.get("supported_parameters") or []),
                     "supported": True,
                     "needs_review": False,
@@ -951,6 +1103,9 @@ class ModelSyncService:
             and chat_template_caps.get("supports_reasoning_effort") is True
         )
         capabilities = ["text"]
+        modalities = props.get("modalities")
+        if isinstance(modalities, dict) and modalities.get("vision") is True:
+            capabilities.append("vision")
         supported_parameters: list[str] = []
         if supports_reasoning_effort:
             capabilities.append("reasoning")
@@ -1319,10 +1474,7 @@ class ModelSyncService:
             "context_window": context_window,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "pricing": {
-                "input_per_million": round(_safe_float(pricing.get("input_per_million")), 4),
-                "output_per_million": round(_safe_float(pricing.get("output_per_million")), 4),
-            },
+            "pricing": _normalize_pricing_block(pricing),
             "capabilities": _dedupe_strings(capabilities or ["text"]),
             "supported": bool(template) or provider in DISCOVERY_SYNC_PROVIDERS,
             "needs_review": needs_review,
@@ -1749,10 +1901,7 @@ class ModelSyncService:
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "context_window": context_window,
-                "pricing": {
-                    "input_per_million": round(_safe_float(pricing.get("input_per_million")), 4),
-                    "output_per_million": round(_safe_float(pricing.get("output_per_million")), 4),
-                },
+                "pricing": _normalize_pricing_block(pricing),
                 "capabilities": _dedupe_strings(capabilities or ["text"]),
                 "supported_parameters": _dedupe_strings(supported_parameters or []),
                 "parameter_constraints": (
@@ -1900,7 +2049,7 @@ def mark_model_context_suspect(model_id: str, *, specs_path: Path | None = None)
     if not identifier:
         return
 
-    path = specs_path or MODEL_SPECS_PATH
+    path = (specs_path or MODEL_SPECS_PATH).resolve()
     # Hold the shared write lock across the whole read-modify-write so a
     # concurrent sync/delete/toggle cannot slip a stale write in between our
     # read and write and drop the suspect flag (lost-update protection).

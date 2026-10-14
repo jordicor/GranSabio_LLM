@@ -57,6 +57,11 @@ from pathlib import Path
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import json_utils as json
+from dotenv import load_dotenv
+
+# This executable demo owns its repository environment; process values win.
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
+
 from client import AsyncGranSabioClient
 from demos.common import colorize, print_header, print_json_content, run_demo, safe_print
 

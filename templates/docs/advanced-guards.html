@@ -1,0 +1,282 @@
+<section id="word-count-enforcement" class="docs-section">
+                <h2 class="docs-subheading">Word Count Enforcement</h2>
+                <p>Word Count Enforcement allows strict validation of content length with configurable flexibility margins. When enabled, the system automatically injects a QA layer to validate word count compliance.</p>
+
+                <h3 class="docs-minor-heading">Configuration Parameters</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">enabled</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Enable word count enforcement. Requires min_words and/or max_words to be set.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name required">flexibility_percent</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Allowed deviation percentage (0-100). Required when enabled=true.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">direction</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Flexibility direction: "both" (default), "more", "less"</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">severity</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Enforcement severity: "important" (default), "deal_breaker"</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Direction Options</h3>
+                <ul class="docs-list">
+                    <li><strong>both:</strong> Content can be either more or less than target (±flexibility%)</li>
+                    <li><strong>more:</strong> Content can exceed target but not go under (+flexibility%)</li>
+                    <li><strong>less:</strong> Content can be under target but not exceed (-flexibility%)</li>
+                </ul>
+
+                <h3 class="docs-minor-heading">Severity Levels</h3>
+                <ul class="docs-list">
+                    <li><strong>important:</strong> Non-compliance results in lower QA scores but doesn't trigger regeneration</li>
+                    <li><strong>deal_breaker:</strong> Non-compliance triggers immediate rejection and regeneration</li>
+                </ul>
+
+                <h3 class="docs-minor-heading">Example Configurations</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">// Example 1: Strict enforcement with deal-breaker severity
+{
+  "prompt": "Generate a story in JSON format with metadata",
+  "min_words": 500,
+  "max_words": 500,
+  "target_field": "generated_text",
+  "word_count_enforcement": {
+    "enabled": true,
+    "flexibility_percent": 10,
+    "direction": "both",
+    "severity": "deal_breaker"
+  }
+}
+// Word count uses request's target_field automatically
+// Acceptable range: 450-550 words (in generated_text field)
+
+// Example 2: Flexible enforcement with nested JSON field
+{
+  "prompt": "Generate structured content",
+  "min_words": 200,
+  "max_words": 300,
+  "target_field": "data.story.content",
+  "word_count_enforcement": {
+    "enabled": true,
+    "flexibility_percent": 15,
+    "direction": "both",
+    "severity": "important"
+  }
+}
+// Acceptable range: 170-345 words (in data.story.content field)
+
+// Example 3: Plain text enforcement (no JSON)
+{
+  "min_words": 800,
+  "max_words": 1200,
+  "word_count_enforcement": {
+    "enabled": true,
+    "flexibility_percent": 20,
+    "direction": "more",
+    "severity": "important"
+  }
+}
+// No target_field, counts entire content
+// Acceptable range: 800-1440 words
+
+// Example 4: Minimum-only enforcement
+{
+  "min_words": 300,
+  "target_field": "main_content",
+  "word_count_enforcement": {
+    "enabled": true,
+    "flexibility_percent": 15,
+    "direction": "less",
+    "severity": "deal_breaker"
+  }
+}
+// Acceptable range: 255+ words (in main_content field)</code></pre>
+                </div>
+
+                <div class="alert info">
+                    <strong>Note:</strong> Word Count Enforcement automatically injects a QA layer that runs first (order=0) to validate content length before other quality assessments. When <code>target_field</code> is defined in the request, Word Count automatically operates on the extracted text from that field.
+                </div>
+            </section>
+
+            <!-- Phrase Frequency Guard Section -->
+            <section id="phrase-frequency-guard" class="docs-section">
+                <h2 class="docs-subheading">Phrase Frequency Guard</h2>
+                <p>Phrase Frequency Guard executes the <code>utils/repetition_analyzer.py</code> module to detect excessively repeated phrases. The analysis uses <code>word_punct</code> tokenization, respects sentence boundaries, and automatically selects the optimal algorithm (Counter &lt; 50K tokens, Multiprocess ≥ 50K tokens).</p>
+
+                <div class="info-box">
+                    <ul>
+                        <li>Automatically injected right after Word Count (if present) and before manual QA layers.</li>
+                        <li>Produces actionable feedback and marks as deal-breaker when critical rules are exceeded.</li>
+                        <li>Saves metadata in each iteration (<code>iteration["phrase_frequency"]</code>) to enrich the rewriting prompt.</li>
+                    </ul>
+                </div>
+
+                <h3 class="docs-minor-heading">Configuration Parameters</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">enabled</div>
+                        <div class="param-type">boolean</div>
+                        <div class="param-desc">Enables the algorithmic layer. Requires at least one rule.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">min_n / max_n</div>
+                        <div class="param-type">integer | null</div>
+                        <div class="param-desc">Global range of n-grams to analyze. If not specified, calculated from rules (including exact phrases).</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">min_count</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Minimum frequency to include a phrase in analysis (default: 2).</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">mp_threshold_tokens</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Number of tokens from which the multiprocess algorithm is used (default: 50,000).</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">workers</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Explicit workers for multiprocess (0 = auto based on physical cores).</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">summary_top_k</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Number of phrases per n included in the aggregate summary.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">diagnostics_*</div>
+                        <div class="param-type">various</div>
+                        <div class="param-desc">Optional parameters to enable math reports (length by bins, density, minimum distance, etc.).</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Rule Fields</h3>
+                <div class="parameter-table">
+                    <div class="param-row">
+                        <div class="param-name required">name</div>
+                        <div class="param-type">string</div>
+                        <div class="param-desc">Unique rule identifier (used in feedback).</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">min_length / max_length</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Minimum and maximum length in tokens. If <code>phrase</code> is defined, length is deduced automatically.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name required">max_repetitions</div>
+                        <div class="param-type">integer</div>
+                        <div class="param-desc">Maximum number of occurrences allowed before triggering the rule.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">phrase</div>
+                        <div class="param-type">string | null</div>
+                        <div class="param-desc">Exact phrase to monitor (normalized with same tokenizer). If omitted, applies to any phrase within the length range.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">severity</div>
+                        <div class="param-type">"warn" | "deal_breaker"</div>
+                        <div class="param-desc">Defines whether the violation generates a warning (reduces score) or blocks the iteration.</div>
+                    </div>
+                    <div class="param-row">
+                        <div class="param-name">guidance</div>
+                        <div class="param-type">string | null</div>
+                        <div class="param-desc">Additional message to guide rewriting (added to feedback).</div>
+                    </div>
+                </div>
+
+                <h3 class="docs-minor-heading">Example Configuration</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">"phrase_frequency": {
+  "enabled": true,
+  "min_count": 2,
+  "summary_top_k": 25,
+  "rules": [
+    {
+      "name": "short_cliches",
+      "min_length": 3,
+      "max_length": 6,
+      "max_repetitions": 2,
+      "severity": "warn",
+      "guidance": "Vary the wording of short clichés."
+    },
+    {
+      "name": "then_went_to_guard",
+      "phrase": "then went to",
+      "max_repetitions": 1,
+      "severity": "deal_breaker",
+      "guidance": "Rephrase the complete sentence; can only appear once."
+    }
+  ]
+}</code></pre>
+                </div>
+
+                <div class="alert info">
+                    <strong>Note:</strong> When <code>target_field</code> is defined in the request, Phrase Frequency Guard automatically operates on the extracted text from that field.
+                </div>
+
+                <div class="alert info">
+                    <strong>Tip:</strong> Aggregate findings (top phrases and violated rules) are available in the iteration history and can be queried via <code>GET /status/{session_id}</code> for advanced debugging.
+                </div>
+            </section>
+
+            <!-- Lexical Diversity Guard Section -->
+            <section id="lexical-diversity-guard" class="docs-section">
+                <h2 class="docs-subheading">Lexical Diversity Guard</h2>
+                <p>The Lexical Diversity Guard measures vocabulary variety before phrase repetition checks. It wraps <code>tools/lexical_diversity.py</code> through <code>tools/lexical_diversity_utils.py</code> and evaluates MTLD, HD-D, Herdan's C, Yule's K, plus optional distinct-n metrics.</p>
+                <p>When a draft fails or produces a low score, the guard injects the top repeated words (50 by default) and window highlights into the next generator prompt so the rewrite can focus on variety.</p>
+
+                <div class="info-box">
+                    <ul>
+                        <li>Runs entirely inside the QA Bypass Engine, avoiding extra QA model calls.</li>
+                        <li>Automatically triggers token or paragraph window analysis for long drafts or RED decisions.</li>
+                        <li>Deal-breaker policy is configurable via <code>decision</code> (e.g., RED-only or also AMBER).</li>
+                        <li>Score mapping is tunable through <code>scoring</code>; GREEN defaults to ≥8.0 with a 9.0 assignment.</li>
+                    </ul>
+                </div>
+
+                <h3 class="docs-minor-heading">Example Configuration</h3>
+                <div class="code-example">
+                    <div class="code-header">
+                        <span class="code-lang">JSON</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">"lexical_diversity": {
+  "enabled": true,
+  "metrics": "auto",
+  "top_words_k": 50,
+  "decision": {
+    "deal_breaker_on_red": true,
+    "deal_breaker_on_amber": false,
+    "require_majority": 2
+  },
+  "windows": {
+    "analyze_windows": false,
+    "auto_window_on_large_text": true,
+    "auto_window_token_threshold": 1200,
+    "auto_window_on_decision": ["RED"]
+  },
+  "scoring": {
+    "green_score": 9.0,
+    "amber_score": 7.0,
+    "red_score": 3.0
+  }
+}</code></pre>
+                </div>
+            </section>
+
+            <!-- JSON Schema Structured Outputs Section -->

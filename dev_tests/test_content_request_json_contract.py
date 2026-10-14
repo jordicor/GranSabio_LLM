@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from config import config
@@ -22,6 +25,32 @@ def _specs_with_defaults(specs: dict) -> dict:
         },
         **specs,
     }
+
+
+@pytest.mark.parametrize("field_name", ["target_field", "text_field_path"])
+@pytest.mark.parametrize("paths", [[], ["body"], ["body", "notes"]])
+def test_generate_rejects_target_field_lists_before_dispatch(monkeypatch, field_name, paths):
+    """The public route rejects every list shape through either input name."""
+
+    from core import generation_routes
+    from main import app
+
+    dispatch = AsyncMock()
+    process = AsyncMock()
+    monkeypatch.setattr("core.security.is_ip_allowed", lambda *_: True)
+    monkeypatch.setattr(generation_routes, "_generate_content_once", dispatch)
+    monkeypatch.setattr(generation_routes, "process_content_generation", process)
+    client = TestClient(app)
+
+    response = client.post(
+        "/generate",
+        json={**_base_request_kwargs(), "json_output": True, field_name: paths},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", field_name]
+    dispatch.assert_not_called()
+    process.assert_not_called()
 
 
 def test_content_type_json_is_effective_json_alias():
@@ -192,3 +221,27 @@ def test_inline_accent_guard_defers_disabled_model_to_route_validation(monkeypat
     )
 
     assert request.generator_model == "disabled-model"
+
+
+@pytest.mark.parametrize("retired_limit", [10, None])
+def test_generate_rejects_retired_outer_smart_edit_limit_before_dispatch(
+    monkeypatch, retired_limit
+):
+    """The removed limit is rejected even though other extra inputs stay ignored."""
+    from core import generation_routes
+    from main import app
+
+    dispatch = AsyncMock()
+    monkeypatch.setattr("core.security.is_ip_allowed", lambda *_: True)
+    monkeypatch.setattr(generation_routes, "_generate_content_once", dispatch)
+
+    response = TestClient(app).post(
+        "/generate",
+        json={**_base_request_kwargs(), "max_consecutive_smart_edits": retired_limit},
+    )
+
+    assert response.status_code == 422
+    assert "max_consecutive_smart_edits was removed" in response.json()["detail"][0]["msg"]
+    dispatch.assert_not_called()
+    request = ContentRequest(**_base_request_kwargs(), unrelated_extra="still ignored")
+    assert request.prompt == _base_request_kwargs()["prompt"]

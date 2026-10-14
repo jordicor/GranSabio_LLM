@@ -16,13 +16,16 @@ import logging
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import AliasChoices, BaseModel, Field, model_validator
 
+from context_budget import ContextAdmissionError
 from template_compat import enable_template_response_compat
 
+from .analyzer import TextAnalysisError
+from .locators import _find_phrase_in_text
 from .models import EditResult, TargetMode, TextTarget
 from .operations import SmartTextEditor
 
@@ -410,12 +413,10 @@ async def analyze_text(request: AnalyzeRequest):
     - Style improvements
     - Formatting suggestions
 
-    Phase 6: Full AI analysis implementation.
-    Falls back to mechanical duplicate-word detection if AI is unavailable.
+    Analysis failures are explicit errors; no fallback edits are generated.
     """
     start_time = time.perf_counter()
 
-    actions = []
     from llm_routing import attach_request_llm_routing, resolve_call
 
     attach_request_llm_routing(request)
@@ -423,7 +424,6 @@ async def analyze_text(request: AnalyzeRequest):
     analysis_model_used = request.analysis_model or analysis_route.model
 
     try:
-        # Try AI-powered analysis
         from ai_service import get_ai_service
 
         from .analyzer import TextAnalyzer, calculate_stats
@@ -456,19 +456,19 @@ async def analyze_text(request: AnalyzeRequest):
 
         stats = calculate_stats(actions)
 
-    except Exception as e:
-        # Fallback to mechanical duplicate-word detection (no semantic
-        # pattern matching, per repo policy - see AUX-10)
-        from .analyzer import TextAnalyzer, calculate_stats
-
-        # Use dummy analyzer with basic method
-        analyzer = TextAnalyzer.__new__(TextAnalyzer)
-        actions = analyzer.analyze_basic(request.text, max_issues=request.max_actions)
-        stats = calculate_stats(actions)
-        analysis_model_used = "pattern-matching (fallback)"
-
-        # Log the error for debugging
-        logger.warning(f"AI analysis failed, using fallback: {e}")
+    except ContextAdmissionError as exc:
+        raise HTTPException(status_code=400, detail=exc.to_public_dict()) from exc
+    except TextAnalysisError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"error_code": "smart_edit_analysis_invalid", "message": str(exc)},
+        ) from exc
+    except Exception as exc:
+        logger.exception("Smart Edit AI analysis failed")
+        raise HTTPException(
+            status_code=502,
+            detail={"error_code": "smart_edit_analysis_failed", "message": "AI analysis failed"},
+        ) from exc
 
     analysis_time_ms = int((time.perf_counter() - start_time) * 1000)
 
@@ -524,6 +524,20 @@ async def execute_single_action(request: ExecuteRequest):
         target = _build_text_target(action.target)
         # User regexes run off-thread with a timeout (ReDoS guard, AUX-02)
         run_in_thread = target.mode == TargetMode.REGEX
+
+        if action.metadata.get("_require_unique_target"):
+            if target.mode != TargetMode.EXACT or target.occurrence != 1:
+                raise ValueError("Invalid analyzed target; analyze the current text again")
+            positions = _find_phrase_in_text(
+                request.text,
+                target.value,
+                case_sensitive=target.case_sensitive,
+                use_normalized_fallback=False,
+            )
+            if not positions:
+                raise ValueError("Analyzed target is no longer present; analyze the current text again")
+            if len(positions) != 1:
+                raise ValueError("Analyzed target is ambiguous; analyze the current text again")
 
         # Determine if this is an AI operation
         ai_operations = {"rephrase", "improve", "fix_grammar", "fix_style", "expand", "condense"}

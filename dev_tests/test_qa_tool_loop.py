@@ -831,8 +831,9 @@ async def test_evaluate_content_single_shot_when_not_eligible():
 
 
 @pytest.mark.asyncio
-async def test_evaluate_content_tool_skip_falls_back_to_single_shot():
-    request = _make_request(json_output=True, json_schema={"type": "object"})
+@pytest.mark.parametrize("shared_context", [None, "User source for the accuracy layer."])
+async def test_evaluate_content_tool_skip_falls_back_to_single_shot(shared_context):
+    request = _make_request(shared_context=shared_context, json_output=True, json_schema={"type": "object"})
     layer = _make_layer()
     envelope = ToolLoopEnvelope(
         loop_scope=LoopScope.QA,
@@ -867,6 +868,8 @@ async def test_evaluate_content_tool_skip_falls_back_to_single_shot():
 
     ai_service.call_ai_with_validation_tools.assert_awaited_once()
     ai_service.generate_content.assert_awaited_once()
+    assert ai_service.call_ai_with_validation_tools.await_args.kwargs.get("shared_context") == shared_context
+    assert ai_service.generate_content.await_args.kwargs.get("shared_context") == shared_context
     assert evaluation.score == 8.0
     assert evaluation.feedback == "Fallback passed"
 

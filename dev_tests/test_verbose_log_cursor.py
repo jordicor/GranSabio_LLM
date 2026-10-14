@@ -346,15 +346,27 @@ async def test_status_route_parses_the_cursor_query_parameter(
         100,
         raising=False,
     )
+
+    class _NoEscalations:
+        def get_session_escalations(self, _session_id):
+            return []
+
+    monkeypatch.setattr(
+        generation_routes_module,
+        "get_tracker",
+        lambda: _NoEscalations(),
+    )
     session_id = f"verbose-{uuid4()}"
     _new_session(isolated_sessions, session_id)
     for index in range(3):
         await add_verbose_log(session_id, f"entry-{index}")
 
-    with TestClient(app_state_module.app) as client:
-        full = client.get(f"/status/{session_id}")
-        incremental = client.get(f"/status/{session_id}", params={"verbose_since": 2})
-        invalid = client.get(f"/status/{session_id}", params={"verbose_since": -1})
+    # No context manager: it would run the real app startup and shutdown
+    # (AI services, debugger persistence, cleanup loop). Only the route matters.
+    client = TestClient(app_state_module.app)
+    full = client.get(f"/status/{session_id}")
+    incremental = client.get(f"/status/{session_id}", params={"verbose_since": 2})
+    invalid = client.get(f"/status/{session_id}", params={"verbose_since": -1})
 
     assert full.status_code == 200
     assert full.json()["verbose_next_offset"] == 3

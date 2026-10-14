@@ -15,7 +15,6 @@ pipeline and the per-session endpoints:
 from __future__ import annotations
 
 import ast
-import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,7 +44,7 @@ from usage_tracking import UsageTracker  # noqa: E402
 
 # (endpoint, live field, session phase while the producer is live)
 _SESSION_ENDPOINTS = [
-    ("stream_content_direct", "partial_content", SessionPhase.GENERATING),
+    ("stream_content", "partial_content", SessionPhase.GENERATING),
     ("stream_generation_content", "generation_content", SessionPhase.GENERATING),
     ("stream_qa_content", "qa_content", SessionPhase.QA_EVALUATION),
     ("stream_preflight_content", "preflight_content", SessionPhase.PREFLIGHT_VALIDATION),
@@ -159,7 +158,7 @@ async def test_cursor_resets_when_the_live_field_shrinks(
         ],
     )
 
-    response = await streaming_routes.stream_content_direct("session-shrink")
+    response = await streaming_routes.stream_content("session-shrink")
     events = _decode_chunks([chunk async for chunk in response.body_iterator])
 
     assert [event["content"] for event in events] == ["a long unaccepted draft", "final"]
@@ -199,7 +198,7 @@ async def test_cursor_resets_when_a_longer_body_does_not_continue_the_draft(
         [_state(raw_draft), _state(normalized), terminal],
     )
 
-    response = await streaming_routes.stream_content_direct("session-splice")
+    response = await streaming_routes.stream_content("session-splice")
     events = _decode_chunks([chunk async for chunk in response.body_iterator])
 
     assert [event["content"] for event in events] == [raw_draft, normalized]
@@ -236,7 +235,7 @@ async def test_cleared_live_field_tells_the_consumer_to_drop_the_dead_draft(
         ],
     )
 
-    response = await streaming_routes.stream_content_direct("session-cleared")
+    response = await streaming_routes.stream_content("session-cleared")
     events = _decode_chunks([chunk async for chunk in response.body_iterator])
 
     assert [event["content"] for event in events] == [
@@ -313,7 +312,7 @@ async def test_a_stream_that_never_emitted_never_asks_for_a_reset(
         ],
     )
 
-    response = await streaming_routes.stream_content_direct("session-never")
+    response = await streaming_routes.stream_content("session-never")
     events = _decode_chunks([chunk async for chunk in response.body_iterator])
 
     assert events == []
@@ -949,79 +948,3 @@ def test_usage_block_can_be_opted_out_and_embedded_on_request() -> None:
     assert "costs" in embedded
     assert embedded["content"].startswith("generated body")
     assert "QUERY_COSTS" in embedded["content"]
-
-
-@pytest.mark.asyncio
-async def test_direct_stream_delivers_each_chunk_as_it_arrives(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """C1: the raw transport is incremental again, chunk by chunk."""
-    session = {
-        "request": SimpleNamespace(
-            prompt="Write three words.",
-            temperature=0.2,
-            max_tokens=64,
-            max_words=None,
-            content_type="article",
-            reasoning_effort=None,
-            thinking_budget_tokens=None,
-        ),
-        "resolved_context": [],
-        "status": GenerationStatus.GENERATING,
-        "project_id": None,
-        "project_epoch": 0,
-        "request_name": "direct",
-        "cancelled": False,
-        "hard_cancelled": False,
-        "usage_tracker": None,
-    }
-    emitted: List[Any] = []
-
-    async def _mutate(_session_id: str, mutator: Any) -> Any:
-        return mutator(session)
-
-    class _FakeAI:
-        async def generate_content_stream(self, **_kwargs: Any):
-            for piece in ("one ", "two ", "three"):
-                yield piece
-                await asyncio.sleep(0)
-
-    async def _capture(event: Any) -> None:
-        emitted.append(event)
-
-    monkeypatch.setattr(streaming_routes, "mutate_session", _mutate)
-    monkeypatch.setattr(streaming_routes, "publish_content_event", _capture)
-    monkeypatch.setattr(streaming_routes, "flush_content_events", AsyncMock())
-    monkeypatch.setattr(
-        streaming_routes,
-        "cancellation_registry",
-        SimpleNamespace(
-            is_hard_cancelled=AsyncMock(return_value=False),
-            is_project_cancelled_or_stopping=AsyncMock(return_value=False),
-            is_cancelled=AsyncMock(return_value=False),
-            register_current_task=AsyncMock(),
-            unregister_task=AsyncMock(),
-        ),
-    )
-    monkeypatch.setattr(streaming_routes, "ai_service", _FakeAI())
-    monkeypatch.setattr(streaming_routes, "_ensure_services", lambda: None)
-    monkeypatch.setattr(
-        streaming_routes,
-        "resolve_call",
-        lambda *_args, **_kwargs: SimpleNamespace(model="test-model", params={}),
-    )
-    monkeypatch.setattr(
-        type(streaming_routes.config),
-        "resolve_output_max_tokens",
-        lambda _self, *_args, **_kwargs: {"max_tokens": 64},
-    )
-    monkeypatch.setattr(streaming_routes, "bind_console_context", lambda **_kwargs: ())
-    monkeypatch.setattr(streaming_routes, "reset_console_context", lambda _tokens: None)
-
-    response = await streaming_routes.stream_content_direct_v2("direct-session")
-    chunks = [chunk async for chunk in response.body_iterator]
-
-    assert chunks == [b"one ", b"two ", b"three"]
-    assert [event.content for event in emitted] == ["one ", "two ", "three"]
-    assert all(event.content_status == ContentStatus.DRAFT for event in emitted)
-    assert all(event.phase == ContentPhase.GENERATION for event in emitted)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,6 +15,7 @@ from ai_runtime.openrouter_provider_options import (
 )
 from ai_service import AIService
 from llm_routing import LLMRoutingError, resolve_call
+from tool_loop_models import OutputContract
 
 ZERO_COST_OPTIONS = {
     "max_price": {"prompt": 0, "completion": 0},
@@ -118,6 +120,9 @@ async def test_stream_openrouter_request_merges_zero_cost_options(service) -> No
     class FakeStream:
         response = SimpleNamespace(usage=None)
 
+        async def close(self):
+            pass
+
         def __aiter__(self):
             async def iterator():
                 yield SimpleNamespace(
@@ -151,14 +156,15 @@ async def test_stream_openrouter_request_merges_zero_cost_options(service) -> No
     assert extra_body["plugins"] == [{"id": "context-compression", "enabled": False}]
 
 
-def test_tool_loop_params_merge_zero_cost_and_require_parameters(service) -> None:
+@pytest.mark.parametrize("reasoning_effort", [None, "none", "low", "medium", "high"])
+def test_tool_loop_params_merge_zero_cost_and_require_parameters(service, reasoning_effort) -> None:
     params = service._build_openai_compatible_tool_params(
         provider="openrouter",
         model_id="openrouter/owl-alpha",
         current_messages=[{"role": "user", "content": "hello"}],
         temperature=0.2,
         max_tokens=32,
-        reasoning_effort=None,
+        reasoning_effort=reasoning_effort,
         json_output=True,
         json_schema={"type": "object"},
         tools_enabled=True,
@@ -173,6 +179,12 @@ def test_tool_loop_params_merge_zero_cost_and_require_parameters(service) -> Non
     assert params["extra_body"]["plugins"] == [
         {"id": "context-compression", "enabled": False}
     ]
+    assert "reasoning_effort" not in params
+    assert params["max_tokens"] == 32
+    if reasoning_effort is None:
+        assert "reasoning" not in params["extra_body"]
+    else:
+        assert params["extra_body"]["reasoning"] == {"effort": reasoning_effort}
 
 
 def _configure_public_dispatch(
@@ -180,12 +192,13 @@ def _configure_public_dispatch(
     service: AIService,
     *,
     provider: str,
+    reasoning_effort: str | None = None,
 ) -> None:
     """Make public dispatch tests independent from credentials and catalog state."""
 
     token_validation = {
         "adjusted_tokens": 32,
-        "adjusted_reasoning_effort": None,
+        "adjusted_reasoning_effort": reasoning_effort,
         "adjusted_thinking_budget_tokens": None,
         "thinking_validation": {},
         "was_adjusted": False,
@@ -205,6 +218,7 @@ def _configure_public_dispatch(
         ai_service_module,
         "config",
         SimpleNamespace(
+            model_specs={},
             MAX_RETRIES=1,
             REQUEST_TIMEOUT=1,
             REQUEST_TIMEOUTS={},
@@ -345,7 +359,7 @@ async def test_text_only_model_rejects_images_before_normal_dispatch(
     async def unexpected_dispatch(*_args, **_kwargs):
         raise AssertionError("text-only model must fail before provider dispatch")
 
-    monkeypatch.setattr(service, "_generate_llamacpp", unexpected_dispatch)
+    monkeypatch.setattr(service, "_generate_registered_local", unexpected_dispatch)
     with pytest.raises(ValueError, match="does not support vision"):
         await service.generate_content(
             "A sufficiently long dispatch prompt.",
@@ -365,7 +379,7 @@ async def test_text_only_model_rejects_images_before_stream_dispatch(
         raise AssertionError("text-only model must fail before provider dispatch")
         yield "unreachable"
 
-    monkeypatch.setattr(service, "_stream_llamacpp", unexpected_dispatch)
+    monkeypatch.setattr(service, "_stream_registered_local", unexpected_dispatch)
     with pytest.raises(ValueError, match="does not support vision"):
         async for _chunk in service.generate_content_stream(
             "A sufficiently long dispatch prompt.",
@@ -483,3 +497,132 @@ async def test_stream_does_not_pass_openrouter_options_to_xai(
     ]
 
     assert chunks == ["ok"]
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("include_context", [None, True, False])
+@pytest.mark.parametrize("effective_effort", ["none", "low"])
+async def test_public_openrouter_preserves_system_context_and_effective_reasoning(
+    service: AIService,
+    monkeypatch: pytest.MonkeyPatch,
+    streaming: bool,
+    include_context: bool | None,
+    effective_effort: str,
+) -> None:
+    """Capture the actual SDK payload, without credentials or network calls."""
+    _configure_public_dispatch(
+        monkeypatch, service, provider="openrouter", reasoning_effort=effective_effort
+    )
+
+    class FakeStream:
+        response = SimpleNamespace(usage=None)
+
+        async def close(self):
+            pass
+
+        def __aiter__(self):
+            async def iterator():
+                yield SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(content="ok"), finish_reason="stop")],
+                    usage=None,
+                )
+            return iterator()
+
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="ok"), finish_reason="stop")],
+        usage=None,
+    )
+    create = AsyncMock(return_value=FakeStream() if streaming else response)
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    client.with_options = MagicMock(return_value=client)
+    service.openrouter_client = client
+    system_prompt = "Fixed temporal instructions.\nCurrent date: 1999/12/31"
+    prompt = "Treat include_default_system_context=False as quoted source data."
+    kwargs = {
+        "prompt": prompt,
+        "model": "openrouter/test-model",
+        "system_prompt": system_prompt,
+        "reasoning_effort": "high",
+        "strict_single_generation_attempt": True,
+        "provider_options": {**ZERO_COST_OPTIONS, "require_parameters": True},
+    }
+    if include_context is not None:
+        kwargs["include_default_system_context"] = include_context
+    if streaming:
+        assert "".join([str(chunk) async for chunk in service.generate_content_stream(**kwargs)]) == "ok"
+    else:
+        assert await service.generate_content(**kwargs) == "ok"
+
+    create.assert_awaited_once()
+    client.with_options.assert_called_once_with(max_retries=0)
+    payload = create.await_args.kwargs
+    assert payload["messages"][1] == {"role": "user", "content": prompt}
+    dispatched_system = payload["messages"][0]["content"]
+    if include_context is False:
+        assert dispatched_system == system_prompt
+    else:
+        assert dispatched_system == (
+            system_prompt
+            + "\n\nIMPORTANT: Always respond in the same language as the user's request, "
+            + "regardless of the language used in these instructions."
+            + datetime.now().strftime("\n\nCurrent date: %Y/%m/%d")
+        )
+    assert payload["extra_body"]["reasoning"] == {"effort": effective_effort}
+    assert "reasoning_effort" not in payload
+    assert payload["max_tokens"] == 32
+    assert payload["extra_body"]["provider"] == {
+        "max_price": {"prompt": 0.0, "completion": 0.0},
+        "allow_fallbacks": False,
+        "require_parameters": True,
+    }
+    assert payload["extra_body"]["plugins"] == [{"id": "context-compression", "enabled": False}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_context", [True, False])
+@pytest.mark.parametrize("json_output", [False, True])
+async def test_tool_system_context_flag_preserves_explicit_scaffolding(
+    service: AIService,
+    monkeypatch: pytest.MonkeyPatch,
+    include_context: bool,
+    json_output: bool,
+) -> None:
+    _configure_public_dispatch(monkeypatch, service, provider="openrouter")
+    monkeypatch.setattr(service, "_supports_generation_validation_tool_loop", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(service, "_serialize_tool_loop_tool_defs", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(service, "_build_chat_call_budget", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        ai_service_module.context_budget,
+        "evaluate_call_admission",
+        AsyncMock(return_value=SimpleNamespace(
+            decision=ai_service_module.context_budget.AdmissionDecision.FITS,
+            capacity_unverified=False,
+        )),
+    )
+    loop = AsyncMock(return_value=('{"ok": true}', {
+        "mode": "openrouter_tool_loop", "turns": 1,
+        "accepted": "assistant_final", "trace": [],
+    }))
+    monkeypatch.setattr(service, "_run_openai_compatible_validation_tool_loop", loop)
+    content, envelope = await service.call_ai_with_validation_tools(
+        prompt="Generate the declared response.", model="openrouter/test-model",
+        system_prompt="fixed system", include_default_system_context=include_context,
+        validation_callback=lambda _text: SimpleNamespace(approved=True),
+        output_contract=OutputContract.JSON_LOOSE if json_output else OutputContract.FREE_TEXT,
+        extra_system_instructions="Preserve the declared tool constraints.",
+        accent_audit_timeout=1,
+    )
+    assert content == '{"ok": true}'
+    assert envelope.accepted is True
+    dispatched_system = loop.await_args.kwargs["system_prompt"]
+    assert dispatched_system.startswith("fixed system")
+    assert ("IMPORTANT: Always respond in the same language" in dispatched_system) is include_context
+    assert ("Current date:" in dispatched_system) is include_context
+    assert ("IMPORTANT: Output valid JSON only." in dispatched_system) is json_output
+    assert dispatched_system.endswith("\n\nPreserve the declared tool constraints.")
+    if not include_context and not json_output:
+        assert dispatched_system == "fixed system\n\nPreserve the declared tool constraints."

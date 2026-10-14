@@ -15,7 +15,6 @@ sys.modules.setdefault("magic", MagicMock())
 import core.app_state as app_state_module
 import core.generation_processor as generation_processor_module
 import core.generation_routes as generation_routes_module
-import core.streaming_routes as streaming_routes_module
 from ai_service import AIRequestError, AIService
 from config import config
 from core.app_state import (
@@ -338,76 +337,6 @@ async def test_project_hard_stop_closes_registry_provider_before_session_lock():
     result = await stop_task
 
     assert result["provider_calls_closed"] == 1
-    await pop_session(session_id)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("cancel_mode", ["pause", "hard_stop"])
-async def test_project_cancel_closes_direct_stream_provider_call(monkeypatch, cancel_mode):
-    project_id = f"test-project-{uuid4()}"
-    session_id = f"test-session-{uuid4()}"
-    started = asyncio.Event()
-    service = AIService.__new__(AIService)
-    request = ContentRequest(
-        prompt="Write a concise direct stream cancellation test.",
-        generator_model="fake-generator",
-        qa_models=[],
-        qa_layers=[],
-        gran_sabio_model="fake-gran-sabio",
-        arbiter_model="fake-arbiter",
-        auto_qa={"enabled": False},
-        long_text_mode="off",
-    )
-
-    class SlowDirectStreamAI:
-        async def generate_content_stream(self, *args, cancellation_token=None, **kwargs):
-            assert cancellation_token is not None
-            assert cancellation_token.project_id == project_id
-            async with service._provider_call_scope(
-                cancellation_token,
-                provider="fake",
-                model_id="fake-generator",
-                operation="direct_content_stream",
-            ):
-                started.set()
-                await asyncio.sleep(30)
-                yield "late content"
-
-    # API-04: the direct-stream claim rejects terminal sessions with 409, so
-    # the session must be active for the stream (and its provider call) to
-    # exist when the project cancel lands.
-    await register_session(
-        session_id,
-        {
-            "session_id": session_id,
-            "project_id": project_id,
-            "project_epoch": 0,
-            "status": GenerationStatus.GENERATING,
-            "current_phase": "generation",
-            "current_iteration": 1,
-            "verbose_log": [],
-            "request": request,
-            "resolved_context": [],
-        },
-    )
-    monkeypatch.setattr(streaming_routes_module, "ai_service", SlowDirectStreamAI())
-    # resolve_call("generation.direct_stream") validates the routed model
-    # against the catalog; register the fake specs so the fake generator
-    # resolves (same pattern as the other fake-model tests in this file).
-    monkeypatch.setattr(config, "model_specs", _fake_model_specs())
-
-    response = await streaming_routes_module.stream_content_direct_v2(session_id)
-    stream_task = asyncio.create_task(response.body_iterator.__anext__())
-    await started.wait()
-
-    if cancel_mode == "pause":
-        result = await pause_project_runtime(project_id)
-    else:
-        result = await hard_stop_project_runtime(project_id)
-
-    assert result["provider_calls_closed"] == 1
-    with pytest.raises((StopAsyncIteration, asyncio.CancelledError)):
-        await stream_task
     await pop_session(session_id)
 
 
@@ -855,59 +784,6 @@ async def test_project_stream_manager_closes_on_project_end_event():
 
 
 @pytest.mark.asyncio
-async def test_direct_stream_rejects_session_from_old_project_epoch(monkeypatch):
-    project_id = f"test-project-{uuid4()}"
-    session_id = f"test-session-{uuid4()}"
-    epoch = await cancellation_registry.begin_project_admission(project_id)
-    provider_called = asyncio.Event()
-    request = ContentRequest(
-        prompt="Write a concise direct stream old epoch test.",
-        generator_model="fake-generator",
-        qa_models=[],
-        qa_layers=[],
-        gran_sabio_model="fake-gran-sabio",
-        arbiter_model="fake-arbiter",
-        auto_qa={"enabled": False},
-        long_text_mode="off",
-    )
-
-    class UnexpectedDirectStreamAI:
-        async def generate_content_stream(self, *args, **kwargs):
-            provider_called.set()
-            yield "should not stream"
-
-    await register_session(
-        session_id,
-        {
-            "session_id": session_id,
-            "project_id": project_id,
-            "project_epoch": epoch,
-            "status": GenerationStatus.COMPLETED,
-            "current_phase": "completed",
-            "current_iteration": 1,
-            "verbose_log": [],
-            "request": request,
-            "resolved_context": [],
-            "final_result": {"content": "done", "status": "completed"},
-        },
-    )
-    await hard_stop_project_runtime(project_id)
-    start_result = await start_project_runtime(project_id)
-    assert start_result["project_epoch"] == epoch + 1
-    monkeypatch.setattr(streaming_routes_module, "ai_service", UnexpectedDirectStreamAI())
-
-    # API-04: a terminal session from a previous project epoch is rejected at
-    # claim time with 409, before any paid provider call can start.
-    with pytest.raises(HTTPException) as exc_info:
-        await streaming_routes_module.stream_content_direct_v2(session_id)
-
-    assert exc_info.value.status_code == 409
-    assert exc_info.value.detail == "Session already finished"
-    assert not provider_called.is_set()
-    await pop_session(session_id)
-
-
-@pytest.mark.asyncio
 async def test_project_hard_stop_finishes_registry_state_when_publish_fails(monkeypatch):
     project_id = f"test-project-{uuid4()}"
     session_id = f"test-session-{uuid4()}"
@@ -1280,7 +1156,9 @@ async def test_hard_cancel_runtime_keeps_tombstone_after_tasks_finish():
 
 
 @pytest.mark.asyncio
-async def test_soft_cancel_stops_generation_stream_before_late_chunks():
+async def test_soft_cancel_stops_generation_stream_before_late_chunks(monkeypatch):
+    # Generation resolves reasoning telemetry against the catalog first.
+    monkeypatch.setattr(config, "model_specs", _fake_model_specs())
     session_id = f"test-session-{uuid4()}"
     session = {
         "session_id": session_id,
@@ -1291,9 +1169,11 @@ async def test_soft_cancel_stops_generation_stream_before_late_chunks():
         "generation_content": "",
         "partial_content": "",
     }
+    # max_tokens is resolved by /generate before generation starts.
     request = ContentRequest(
         prompt="Write a concise implementation note for cancellation testing.",
         generator_model="fake-generator",
+        max_tokens=128,
         qa_models=[],
         qa_layers=[],
         gran_sabio_model="fake-gran-sabio",
@@ -1302,12 +1182,16 @@ async def test_soft_cancel_stops_generation_stream_before_late_chunks():
         long_text_mode="off",
     )
 
+    produced: list[str] = []
+
     class FakeStreamingAI:
         async def generate_content_stream(self, *args, cancel_callback=None, **kwargs):
+            produced.append("first")
             yield "first"
             await cancellation_registry.request_soft_cancel(session_id)
             if cancel_callback and await cancel_callback():
                 return
+            produced.append("second")
             yield "second"
 
     await cancellation_registry.register_session(session_id, None, None)
@@ -1325,8 +1209,11 @@ async def test_soft_cancel_stops_generation_stream_before_late_chunks():
             json_output_requested=False,
         )
 
-    assert session["generation_content"] == "first"
-    assert session["partial_content"] == "first"
+    assert produced == ["first"]
+    # An attempt that never committed leaves no live content behind; its draft
+    # lives labelled in the project stream and the debugger trace.
+    assert session["generation_content"] == ""
+    assert session["partial_content"] == ""
     await pop_session(session_id)
 
 

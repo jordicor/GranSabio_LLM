@@ -34,6 +34,7 @@ from core.cancellation import ProviderCallHandle
 from llm_routing import endpoint_id_call_kwargs, resolve_call, resolve_temperature
 from model_aliasing import ModelAliasRegistry, PromptPart
 from model_capability_registry import resolve_model_capability_context
+from models import shared_context_call_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -615,6 +616,7 @@ Provide a JSON response with:
             )["max_tokens"]
             response = await self.ai_service.generate_content(
                 prompt=prompt,
+                **shared_context_call_kwargs(request),
                 model=model_name,
                 temperature=resolve_temperature(route, default=self.config.analysis_temperature),
                 max_tokens=feedback_max_tokens,
@@ -863,6 +865,7 @@ Each rule should be imperative and actionable (e.g., "ALWAYS include publication
             )["max_tokens"]
             response = await self.ai_service.generate_content(
                 prompt=prompt,
+                **shared_context_call_kwargs(request),
                 model=model_name,
                 temperature=resolve_temperature(route),
                 max_tokens=feedback_max_tokens,
@@ -933,6 +936,9 @@ class FeedbackMemoryManager:
             str(request.generator_model) if hasattr(request, 'generator_model') else '',
             str(request.content_type) if hasattr(request, 'content_type') else ''
         ]
+        shared_context = getattr(request, "shared_context", None)
+        if shared_context is not None:
+            key_parts.append("shared_context=" + shared_context)
         return sha1_hash('|'.join(key_parts))
 
     async def initialize_session(
@@ -1363,8 +1369,8 @@ async def initialize_feedback_system():
 
 
 async def shutdown_feedback_system():
-    """Shutdown the feedback system cleanly"""
-    manager = get_feedback_manager()
+    """Close an existing manager without creating one in disabled deployments."""
+    manager = _feedback_manager
     if manager:
         await manager.close()
     logger.info("Feedback memory system shutdown complete")

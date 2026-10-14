@@ -354,7 +354,7 @@ async def test_local_admission_caches_discovery_by_endpoint_id() -> None:
     await admit_local_only(
         [
             LocalRouteRequirement("generation.main", 0, "writer-local", endpoint_id="spark_a"),
-            LocalRouteRequirement("generation.direct_stream", 0, "writer-local", endpoint_id="spark_a"),
+            LocalRouteRequirement("generation.json_retry", 0, "writer-local", endpoint_id="spark_a"),
             LocalRouteRequirement("generation.smart_edit", 0, "writer-local", endpoint_id="spark_b"),
         ],
         config_obj=config_obj,

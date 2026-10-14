@@ -64,8 +64,8 @@
     </div>
     <div class="param-row">
       <div class="param-name">target_field</div>
-      <div class="param-type">string | array</div>
-      <div class="param-desc">Path(s) to primary text field(s) in JSON output using jmespath notation. Required only when text validators or QA need a specific string field; pure JSON object/array validation does not require extractable text.</div>
+      <div class="param-type">string</div>
+      <div class="param-desc">Path to one primary text field in JSON output using jmespath notation. The alias text_field_path accepts the same single path; lists return HTTP 422. Required only when text validators or QA need a specific string field; pure JSON object/array validation does not require extractable text.</div>
     </div>
     <div class="param-row">
       <div class="param-name">target_field_only</div>
@@ -888,7 +888,7 @@
   <h2 class="docs-subheading">Smart Editing Workflow</h2>
   <p>Smart Content Editor applies targeted paragraph edits instead of regenerating the entire document. Each QA layer is processed sequentially with edits applied immediately.</p>
   <p>Controlled by max_edit_rounds_per_layer (default: 5); each layer can iterate up to this limit before passing content to the next layer.</p>
-  <p><strong>JSON Support:</strong> When generating JSON-wrapped content, use target_field to specify which field(s) contain the primary text. Smart Edit extracts text from these fields, applies edits, and reconstructs the JSON. Use target_field_only=true to send only text to AI QA (saves tokens). Algorithmic guards always use extracted text when target_field is set.</p>
+  <p><strong>JSON Support:</strong> When generating JSON-wrapped content, use target_field to specify one field containing the primary text. Smart Edit extracts text from this field, applies edits, and reconstructs the JSON while preserving all other fields. Use target_field_only=true to send only text to AI QA (saves tokens). Algorithmic guards always use extracted text when target_field is set.</p>
 </section>
 
 <section id="gran-sabio-escalation" class="docs-section">

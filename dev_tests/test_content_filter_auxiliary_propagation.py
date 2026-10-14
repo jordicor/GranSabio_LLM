@@ -22,7 +22,7 @@ from arbiter import Arbiter, ArbiterContext, EditDistribution, LayerEditHistory
 from content_events import ContentEvent, ContentStatus
 from feedback_memory import FeedbackConfig, FeedbackProcessor
 from gran_sabio import GranSabioEngine, _extract_error_reason
-from models import ContentRequest, QALayer
+from models import ContentRequest, QAEvaluation, QALayer
 from qa_engine import QAEngine
 from qa_evaluation_service import QAEvaluationService, QAResponseParseError
 from smart_edit.operations import SmartTextEditor
@@ -327,7 +327,7 @@ async def test_qa_invalid_json_never_reaches_phase_or_console_logs(
 
 
 @pytest.mark.asyncio
-async def test_qa_engine_content_filter_skips_retry_quorum_and_cancels_sibling(
+async def test_qa_engine_content_filter_skips_retry_quorum_and_drains_sibling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = QAEngine(ai_service=MagicMock(), bypass_engine=MagicMock())
@@ -335,6 +335,7 @@ async def test_qa_engine_content_filter_skips_retry_quorum_and_cancels_sibling(
     started = asyncio.Event()
     calls = {"filter-model": 0, "slow-model": 0}
     cancelled: list[str] = []
+    completed: list[str] = []
 
     async def evaluate_content(_content, _layer, model, *_args, **_kwargs):
         calls[model] += 1
@@ -343,10 +344,19 @@ async def test_qa_engine_content_filter_skips_retry_quorum_and_cancels_sibling(
             raise _stop()
         started.set()
         try:
-            await asyncio.sleep(30)
+            await asyncio.sleep(0.05)
         except asyncio.CancelledError:
             cancelled.append(model)
             raise
+        completed.append(model)
+        return QAEvaluation(
+            model=model,
+            layer="Accuracy",
+            score=9.0,
+            feedback="ok",
+            deal_breaker=False,
+            passes_score=True,
+        )
 
     engine.evaluate_content = evaluate_content
     monkeypatch.setattr(qa_engine, "resolve_qa_timeout_for_model", lambda *_a, **_k: 60.0)
@@ -376,7 +386,8 @@ async def test_qa_engine_content_filter_skips_retry_quorum_and_cancels_sibling(
 
     assert is_content_filter_stop(raised.value)
     assert calls == {"filter-model": 1, "slow-model": 1}
-    assert cancelled == ["slow-model"]
+    assert completed == ["slow-model"]
+    assert cancelled == []
 
 
 @pytest.mark.asyncio

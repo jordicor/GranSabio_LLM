@@ -10,13 +10,15 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 # Use optimized JSON helper
 import json_utils as json
+from ai_runtime.usage import PROVIDER_BILLED_COST_BASIS
 from config import config
 
 MILLION = 1_000_000
+CATALOG_ESTIMATE_COST_BASIS = "catalog_estimate"
 
 
 def _normalize_endpoint_id(value: Any) -> Optional[str]:
@@ -26,6 +28,16 @@ def _normalize_endpoint_id(value: Any) -> Optional[str]:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def _sum_measured_tokens(values: Iterable[Optional[int]]) -> Optional[int]:
+    """Return a total only when every participating call has a measurement."""
+    total = 0
+    for value in values:
+        if value is None:
+            return None
+        total += value
+    return total
 
 
 @dataclass
@@ -43,11 +55,16 @@ class UsageRecord:
     layer: Optional[str] = None
     operation: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
-    input_tokens: int = 0
-    output_tokens: int = 0
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
     reasoning_tokens: Optional[int] = None
+    cached_input_tokens: Optional[int] = None
+    cache_write_input_tokens: Optional[int] = None
     cost_usd: Optional[float] = None
+    # PROVIDER_BILLED_COST_BASIS when the provider reported the billed amount,
+    # CATALOG_ESTIMATE_COST_BASIS when cost_usd comes from model pricing.
+    cost_basis: Optional[str] = None
     status: str = "success"
     duration_ms: Optional[int] = None
     started_at: Optional[str] = None
@@ -59,6 +76,15 @@ class UsageRecord:
     context_admission_decision: Optional[str] = None
     context_count_method: Optional[str] = None
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+    @property
+    def resolved_total_tokens(self) -> Optional[int]:
+        """Use the provider's total or derive it from two measured counts."""
+        if self.total_tokens is not None:
+            return self.total_tokens
+        if self.input_tokens is None or self.output_tokens is None:
+            return None
+        return self.input_tokens + self.output_tokens
 
     def _context_admission_fields(self) -> Dict[str, Any]:
         """Return the context-admission telemetry keys, only when populated.
@@ -91,9 +117,7 @@ class UsageRecord:
             "metadata": self.metadata or {},
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
-            "total_tokens": self.total_tokens
-            if self.total_tokens is not None
-            else self.input_tokens + self.output_tokens,
+            "total_tokens": self.resolved_total_tokens,
             "reasoning_tokens": self.reasoning_tokens,
             "cost": round(self.cost_usd, 6) if isinstance(self.cost_usd, (int, float)) else None,
             "status": self.status,
@@ -107,6 +131,9 @@ class UsageRecord:
         }
         if self.endpoint_id is not None:
             payload["endpoint_id"] = self.endpoint_id
+        for field_name in ("cached_input_tokens", "cache_write_input_tokens", "cost_basis"):
+            if getattr(self, field_name) is not None:
+                payload[field_name] = getattr(self, field_name)
         payload.update(self._context_admission_fields())
         return payload
 
@@ -127,9 +154,7 @@ class UsageRecord:
             "duration_ms": self.duration_ms,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
-            "total_tokens": self.total_tokens
-            if self.total_tokens is not None
-            else self.input_tokens + self.output_tokens,
+            "total_tokens": self.resolved_total_tokens,
             "reasoning_tokens": self.reasoning_tokens,
             "estimated_cost_usd": round(self.cost_usd, 6)
             if isinstance(self.cost_usd, (int, float))
@@ -142,6 +167,9 @@ class UsageRecord:
         if self.endpoint_id is not None:
             payload["endpoint_id"] = self.endpoint_id
 
+        for field_name in ("cached_input_tokens", "cache_write_input_tokens", "cost_basis"):
+            if getattr(self, field_name) is not None:
+                payload[field_name] = getattr(self, field_name)
         payload.update(self._context_admission_fields())
 
         safe_metadata = {}
@@ -274,10 +302,12 @@ class UsageTracker:
                     model=usage_payload.get("model"),
                     provider=usage_payload.get("provider"),
                     endpoint_id=usage_payload.get("endpoint_id"),
-                    input_tokens=usage_payload.get("input_tokens", 0) or 0,
-                    output_tokens=usage_payload.get("output_tokens", 0) or 0,
+                    input_tokens=usage_payload.get("input_tokens"),
+                    output_tokens=usage_payload.get("output_tokens"),
                     total_tokens=usage_payload.get("total_tokens"),
                     reasoning_tokens=usage_payload.get("reasoning_tokens"),
+                    cached_input_tokens=usage_payload.get("cached_input_tokens"),
+                    cache_write_input_tokens=usage_payload.get("cache_write_input_tokens"),
                     iteration=iteration,
                     layer=layer,
                     operation=operation or usage_payload.get("operation"),
@@ -336,10 +366,12 @@ class UsageTracker:
         model: Optional[str],
         provider: Optional[str],
         endpoint_id: Optional[str] = None,
-        input_tokens: int,
-        output_tokens: int,
+        input_tokens: Optional[int],
+        output_tokens: Optional[int],
         total_tokens: Optional[int] = None,
         reasoning_tokens: Optional[int] = None,
+        cached_input_tokens: Optional[int] = None,
+        cache_write_input_tokens: Optional[int] = None,
         iteration: Optional[int] = None,
         layer: Optional[str] = None,
         operation: Optional[str] = None,
@@ -365,9 +397,19 @@ class UsageTracker:
         provider_name = str(provider) if provider else "unknown"
         normalized_endpoint_id = _normalize_endpoint_id(endpoint_id)
         cost = cost_override
+        cost_basis: Optional[str] = None
 
-        if cost is None:
-            cost = self._estimate_cost(model_name, input_tokens, output_tokens)
+        if cost is not None:
+            # The provider reported what it billed; no catalog estimate is used.
+            cost_basis = PROVIDER_BILLED_COST_BASIS
+        else:
+            cost = self._estimate_cost(
+                model_name, input_tokens, output_tokens,
+                cached_input_tokens=cached_input_tokens or 0,
+                cache_write_input_tokens=cache_write_input_tokens or 0,
+            )
+            if cost is not None:
+                cost_basis = CATALOG_ESTIMATE_COST_BASIS
 
         kind_name = str(kind or "llm_call")
         if kind_name == "llm_call":
@@ -388,15 +430,18 @@ class UsageTracker:
             layer=layer,
             operation=operation,
             metadata=metadata.copy() if metadata else {},
-            input_tokens=int(input_tokens or 0),
-            output_tokens=int(output_tokens or 0),
+            input_tokens=int(input_tokens) if input_tokens is not None else None,
+            output_tokens=int(output_tokens) if output_tokens is not None else None,
             total_tokens=int(total_tokens)
             if total_tokens is not None
             else None,
             reasoning_tokens=int(reasoning_tokens)
             if reasoning_tokens is not None
             else None,
+            cached_input_tokens=cached_input_tokens,
+            cache_write_input_tokens=cache_write_input_tokens,
             cost_usd=float(cost) if cost is not None else None,
+            cost_basis=cost_basis,
             status=str(status or "success"),
             duration_ms=int(duration_ms) if duration_ms is not None else None,
             started_at=str(started_at) if started_at else None,
@@ -521,11 +566,15 @@ class UsageTracker:
         grand = summary["grand_totals"]
         cost_value = grand.get("cost")
         cost_str = f"{cost_value:.6f}" if isinstance(cost_value, (int, float)) else "unknown"
+
+        def _format_count(value: Optional[int]) -> str:
+            return str(value) if value is not None else "unknown"
+
         header = (
             f'[[QUERY_COSTS mode="{summary["mode"]}" currency="USD" '
-            f'grand_input="{grand.get("input_tokens", 0)}" '
-            f'grand_output="{grand.get("output_tokens", 0)}" '
-            f'grand_total="{grand.get("total_tokens", 0)}" '
+            f'grand_input="{_format_count(grand.get("input_tokens"))}" '
+            f'grand_output="{_format_count(grand.get("output_tokens"))}" '
+            f'grand_total="{_format_count(grand.get("total_tokens"))}" '
             f'grand_cost="{cost_str}"]]'
         )
 
@@ -541,13 +590,13 @@ class UsageTracker:
                 else ""
             )
             return (
-                f"{label}: in={totals.get('input_tokens', 0)} "
-                f"out={totals.get('output_tokens', 0)} "
-                f"total={totals.get('total_tokens', 0)} {cost_fmt}{reasoning_part}"
+                f"{label}: in={_format_count(totals.get('input_tokens'))} "
+                f"out={_format_count(totals.get('output_tokens'))} "
+                f"total={_format_count(totals.get('total_tokens'))} {cost_fmt}{reasoning_part}"
             )
 
         for phase, totals in summary.get("phases", {}).items():
-            if totals.get("input_tokens") or totals.get("output_tokens"):
+            if totals.get("input_tokens") != 0 or totals.get("output_tokens") != 0:
                 lines.append(_format_totals(phase.title(), totals))
 
         if summary["mode"] == "detailed":
@@ -585,25 +634,44 @@ class UsageTracker:
 
     # Internal helpers -------------------------------------------------
 
-    def _estimate_cost(self, model: str, input_tokens: int, output_tokens: int) -> Optional[float]:
+    def _estimate_cost(
+        self, model: str, input_tokens: Optional[int], output_tokens: Optional[int], *,
+        cached_input_tokens: int = 0, cache_write_input_tokens: int = 0,
+    ) -> Optional[float]:
         """Calculate approximate USD cost using model specifications."""
+        if input_tokens is None or output_tokens is None:
+            return None
         try:
-            model_info = config.get_model_info(model)
+            model_info = config.get_model_info(model, require_api_key=False)
         except RuntimeError:
             return None
 
         pricing = model_info.get("pricing") or {}
+        long_context = pricing.get("long_context") or {}
+        if long_context and input_tokens > long_context["threshold_tokens"]:
+            pricing = {**pricing, **long_context}
         input_rate = pricing.get("input_per_million")
         output_rate = pricing.get("output_per_million")
 
         if input_rate is None and output_rate is None:
             return None
 
+        ordinary_tokens = input_tokens - cached_input_tokens - cache_write_input_tokens
+        if min(ordinary_tokens, cached_input_tokens, cache_write_input_tokens) < 0:
+            return None
         input_cost = (
-            (input_tokens / MILLION) * float(input_rate)
+            (ordinary_tokens / MILLION) * float(input_rate)
             if input_rate is not None
             else 0.0
         )
+        for count, rate_key in (
+            (cached_input_tokens, "cached_input_per_million"),
+            (cache_write_input_tokens, "cache_write_per_million"),
+        ):
+            if count:
+                if pricing.get(rate_key) is None:
+                    return None
+                input_cost += (count / MILLION) * float(pricing[rate_key])
         output_cost = (
             (output_tokens / MILLION) * float(output_rate)
             if output_rate is not None
@@ -616,28 +684,22 @@ class UsageTracker:
 
         def _combine(records: List[UsageRecord]) -> Dict[str, Any]:
             combined: Dict[str, Any] = {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
+                "input_tokens": _sum_measured_tokens(rec.input_tokens for rec in records),
+                "output_tokens": _sum_measured_tokens(rec.output_tokens for rec in records),
+                "total_tokens": _sum_measured_tokens(rec.resolved_total_tokens for rec in records),
                 "reasoning_tokens": 0,
                 "cost": 0.0,
             }
-            cost_available = False
+            cost_available = bool(records)
             reasoning_available = False
             for rec in records:
-                combined["input_tokens"] += rec.input_tokens
-                combined["output_tokens"] += rec.output_tokens
-                combined["total_tokens"] += (
-                    rec.total_tokens
-                    if rec.total_tokens is not None
-                    else rec.input_tokens + rec.output_tokens
-                )
                 if rec.reasoning_tokens is not None:
                     combined["reasoning_tokens"] += rec.reasoning_tokens
                     reasoning_available = True
                 if rec.cost_usd is not None:
                     combined["cost"] += rec.cost_usd
-                    cost_available = True
+                else:
+                    cost_available = False
             if not cost_available:
                 combined["cost"] = None
             if not reasoning_available:
@@ -740,21 +802,14 @@ class UsageTracker:
     def _aggregate_query_stats(self) -> Dict[str, Any]:
         """Build prompt-free call, phase, iteration, provider, and model stats."""
 
-        def _total_tokens(record: UsageRecord) -> int:
-            return (
-                record.total_tokens
-                if record.total_tokens is not None
-                else record.input_tokens + record.output_tokens
-            )
-
         def _span_ms(records: List[UsageRecord]) -> Optional[int]:
             starts = [
-                _parse_iso_ms(record.started_at)
+                parsed_timestamps[record.started_at]
                 for record in records
                 if record.started_at
             ]
             ends = [
-                _parse_iso_ms(record.ended_at)
+                parsed_timestamps[record.ended_at]
                 for record in records
                 if record.ended_at
             ]
@@ -786,11 +841,13 @@ class UsageTracker:
             payload: Dict[str, Any] = {
                 "calls": len(llm_records),
                 "spans": len(span_records),
-                "input_tokens": sum(record.input_tokens for record in llm_records),
-                "output_tokens": sum(record.output_tokens for record in llm_records),
-                "total_tokens": sum(_total_tokens(record) for record in llm_records),
+                "input_tokens": _sum_measured_tokens(record.input_tokens for record in llm_records),
+                "output_tokens": _sum_measured_tokens(record.output_tokens for record in llm_records),
+                "total_tokens": _sum_measured_tokens(record.resolved_total_tokens for record in llm_records),
                 "reasoning_tokens": sum(reasoning_values) if reasoning_values else None,
-                "estimated_cost_usd": round(sum(costs), 6) if costs else None,
+                "estimated_cost_usd": round(sum(costs), 6)
+                if costs and len(costs) == len(llm_records)
+                else None,
                 "duration_ms": _span_ms(records),
                 "call_duration_sum_ms": sum(call_duration_values) if call_duration_values else None,
                 "span_duration_sum_ms": sum(span_duration_values) if span_duration_values else None,
@@ -840,6 +897,12 @@ class UsageTracker:
             return details
 
         records = list(self._records)
+        parsed_timestamps: Dict[str, Optional[int]] = {}
+        for record in records:
+            for value in (record.started_at, record.ended_at):
+                if value and value not in parsed_timestamps:
+                    parsed_timestamps[value] = _parse_iso_ms(value)
+
         llm_records = [record for record in records if record.kind == "llm_call"]
         span_records = [record for record in records if record.kind != "llm_call"]
         iteration_groups: Dict[int, List[UsageRecord]] = {}
@@ -857,29 +920,27 @@ class UsageTracker:
         )
 
         calls = [record.as_query_call_dict() for record in llm_records]
-        slowest_duration = sorted(
-            (
-                record.as_query_call_dict()
-                for record in llm_records
-                if record.duration_ms is not None
-            ),
-            key=lambda item: item.get("duration_ms") or 0,
-            reverse=True,
-        )[:10]
+        slowest_duration = [
+            record.as_query_call_dict()
+            for record in sorted(
+                (record for record in llm_records if record.duration_ms is not None),
+                key=lambda record: record.duration_ms or 0,
+                reverse=True,
+            )[:10]
+        ]
         largest_token_calls = sorted(
             calls,
             key=lambda item: item.get("total_tokens") or 0,
             reverse=True,
         )[:10]
-        slowest_spans = sorted(
-            (
-                record.as_query_call_dict()
-                for record in span_records
-                if record.duration_ms is not None
-            ),
-            key=lambda item: item.get("duration_ms") or 0,
-            reverse=True,
-        )[:10]
+        slowest_spans = [
+            record.as_query_call_dict()
+            for record in sorted(
+                (record for record in span_records if record.duration_ms is not None),
+                key=lambda record: record.duration_ms or 0,
+                reverse=True,
+            )[:10]
+        ]
 
         return {
             "session": {

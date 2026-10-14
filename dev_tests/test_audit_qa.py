@@ -246,22 +246,30 @@ class TestQA02NonFiniteScoresRejected:
 
 
 # ============================================================================
-# QA-03: gather must cancel sibling tasks on any failure
+# QA-03: a failure never orphans sibling tasks; started provider calls drain
 # ============================================================================
 
-class TestQA03GatherCancelsSiblings:
+class TestQA03FailureDrainsSiblings:
     @pytest.mark.asyncio
-    async def test_scheduler_batch_cancels_siblings_on_policy_abort(self):
+    async def test_scheduler_batch_drains_siblings_on_policy_abort(self):
+        started = []
+        siblings_in_flight = asyncio.Event()
+        completed = []
         cancelled = []
 
         async def evaluate(slot, attempt):
             if slot.index == 0:
+                await siblings_in_flight.wait()
                 raise QASchedulerTechnicalFailure("api_failure", "provider down", retryable=False)
+            started.append(slot.model_name)
+            if len(started) == 2:
+                siblings_in_flight.set()
             try:
-                await asyncio.sleep(30)
+                await asyncio.sleep(0.05)
             except asyncio.CancelledError:
                 cancelled.append(slot.model_name)
                 raise
+            completed.append(slot.model_name)
             return _slot_eval(slot)
 
         scheduler = QAScheduler(
@@ -275,21 +283,27 @@ class TestQA03GatherCancelsSiblings:
                 evaluate_slot=evaluate,
             )
 
-        assert sorted(cancelled) == ["model-1", "model-2"]
+        assert sorted(completed) == ["model-1", "model-2"]
+        assert cancelled == []
 
     @pytest.mark.asyncio
-    async def test_final_verification_cancels_sibling_layers(self):
+    async def test_final_verification_drains_sibling_layers(self):
         engine = QAEngine(ai_service=MagicMock(), bypass_engine=MagicMock())
+        slow_in_flight = asyncio.Event()
+        completed = []
         cancelled = []
 
         async def fake_single_layer(content, layer, **kwargs):
             if layer.name == "Failing":
+                await slow_in_flight.wait()
                 raise QASchedulerUnavailableError("QA quorum impossible")
+            slow_in_flight.set()
             try:
-                await asyncio.sleep(30)
+                await asyncio.sleep(0.05)
             except asyncio.CancelledError:
                 cancelled.append(layer.name)
                 raise
+            completed.append(layer.name)
             return {}, None
 
         engine._evaluate_single_semantic_layer = fake_single_layer
@@ -302,7 +316,8 @@ class TestQA03GatherCancelsSiblings:
                 strategy="full_parallel",
             )
 
-        assert cancelled == ["Slow"]
+        assert completed == ["Slow"]
+        assert cancelled == []
 
 
 # ============================================================================
@@ -488,12 +503,15 @@ class TestQA06CumulativeRepetitionThreshold:
 
 
 # ============================================================================
-# QA-07: preflight raw output is truncated in logs
+# QA-07: preflight raw output stays out of the logs
 # ============================================================================
 
-class TestQA07PreflightLogTruncation:
+class TestQA07PreflightRawOutputLogging:
     @pytest.mark.asyncio
-    async def test_raw_output_truncated_in_info_and_warning_logs(self, caplog):
+    async def test_unparseable_raw_output_is_never_logged(self, caplog):
+        # QA-07 first truncated the raw output in the INFO and WARNING logs.
+        # Since a419fc7 it becomes loggable only after parse and decision
+        # validation, so an unparseable response logs its length alone.
         raw_output = "X" * 5000
         ai_service = MagicMock()
         ai_service.generate_content = AsyncMock(return_value=raw_output)
@@ -523,11 +541,10 @@ class TestQA07PreflightLogTruncation:
                 )
 
         assert result.decision == "reject"
-        raw_info = [r for r in caplog.records if "Preflight validator raw output" in r.getMessage()]
         unparseable = [r for r in caplog.records if "unparseable output" in r.getMessage()]
-        assert raw_info, "expected the raw-output INFO log"
         assert unparseable, "expected the unparseable-output WARNING log"
-        for record in raw_info + unparseable:
-            message = record.getMessage()
-            assert "X" * 500 in message
-            assert "X" * 501 not in message
+        for record in unparseable:
+            assert record.levelno == logging.WARNING
+            assert "chars=5000" in record.getMessage()
+        for record in caplog.records:
+            assert "X" * 20 not in record.getMessage()

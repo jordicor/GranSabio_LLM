@@ -20,9 +20,11 @@ from local_endpoint_registry import LocalEndpointRegistry, LocalInferenceEndpoin
 def stub_model_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
     import config as config_module
 
-    def fake_model_info(_self: object, model_name: str) -> dict[str, object]:
+    def fake_model_info(_self: object, model_name: str, **_kwargs: object) -> dict[str, object]:
         model_lower = model_name.lower()
-        if model_lower.startswith("claude-"):
+        if "jev" in model_lower or model_lower.startswith("typesafe"):
+            provider = "typesafe"
+        elif model_lower.startswith("claude-"):
             provider = "anthropic"
         elif model_lower.startswith("gemini-") or model_lower.startswith("models/"):
             provider = "google"
@@ -61,6 +63,7 @@ def test_default_routing_resolves_every_registered_call() -> None:
 
 def test_request_overlay_can_override_exact_call_without_grouping() -> None:
     request = SimpleNamespace(
+        generator_model="gpt-4o-mini",
         llm_routing={
             "calls": {
                 "generation.main": {"model": "gpt-4o-mini"},
@@ -69,9 +72,11 @@ def test_request_overlay_can_override_exact_call_without_grouping() -> None:
         }
     )
 
-    attach_request_llm_routing(request, set())
+    attach_request_llm_routing(request, {"generator_model"})
 
     assert resolve_call("generation.main", request=request).model == "gpt-4o-mini"
+    assert resolve_call("generation.json_retry", request=request).model == "gpt-4o-mini"
+    assert resolve_call("long_text.section_draft", request=request).model == "gpt-4o-mini"
     assert resolve_call("gransabio.review", request=request).model == "claude-haiku-4-5"
     assert resolve_call("gransabio.regenerate", request=request).model != "claude-haiku-4-5"
 
@@ -284,6 +289,16 @@ def test_global_openrouter_provider_options_require_a_global_openrouter_model() 
         }
 
 
+def test_system_one_is_default_for_preflight_and_can_be_overridden() -> None:
+    defaults = get_default_routing()
+    assert resolve_call("preflight.validate", routing=defaults).model == "jev-1.13.0"
+    assert "systemone.evaluate" not in defaults["calls"]
+    overridden = merge_routing_documents(defaults, {
+        "calls": {"preflight.validate": {"model": "gpt-6-luna"}},
+    })
+    assert resolve_call("preflight.validate", routing=overridden).model == "gpt-6-luna"
+
+
 def test_unknown_call_id_fails_fast() -> None:
     with pytest.raises(LLMRoutingError, match="Unknown llm_routing call id"):
         merge_routing_documents(
@@ -319,7 +334,102 @@ def test_unsupported_optional_param_warns_and_drops_by_default() -> None:
 
     assert resolution.params == {"reasoning_effort": "low"}
     assert resolution.warnings
-    assert "temperature" in resolution.warnings[0]
+    assert any("temperature" in warning for warning in resolution.warnings)
+
+
+@pytest.mark.parametrize(
+    "model, provider, metadata",
+    [
+        (
+            "claude-fable-5-1",
+            "anthropic",
+            {"reasoning_effort": {"supported": True, "parameter_name": "output_config.effort"}},
+        ),
+        (
+            "grok-4.6",
+            "xai",
+            {"reasoning_effort": {"supported": True, "parameter_name": "reasoning_effort"}},
+        ),
+        (
+            "gpt-6-astra",
+            "openai",
+            {"reasoning_effort": {"supported": True, "parameter_name": "reasoning_effort"}},
+        ),
+        (
+            "anthropic/claude-fable-5.1",
+            "openrouter",
+            {"supported_parameters": ["max_tokens", "reasoning_effort"]},
+        ),
+    ],
+)
+def test_catalog_reasoning_metadata_preserves_single_and_qa_route_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    provider: str,
+    metadata: dict[str, object],
+) -> None:
+    """Named effort must survive routing for catalog-supported model families."""
+    import config as config_module
+
+    monkeypatch.setattr(
+        config_module.Config,
+        "get_model_info",
+        lambda _self, _model: {
+            "model_id": model,
+            "provider": provider,
+            "capabilities": ["text"],
+            **metadata,
+        },
+    )
+    route = {"model": model, "params": {"reasoning_effort": "high"}}
+    routing = {
+        "policy": {"unsupported_optional_params": "fail_fast"},
+        "calls": {
+            "preflight.validate": route,
+            "qa.evaluate_layer": {"models": [route]},
+        },
+    }
+
+    single = resolve_call("preflight.validate", routing=routing)
+    qa = resolve_call_models("qa.evaluate_layer", routing=routing)
+
+    assert single.params == {"reasoning_effort": "high"}
+    assert qa.models[0]["params"] == {"reasoning_effort": "high"}
+    assert single.warnings == qa.warnings == []
+
+
+def test_explicit_unsupported_reasoning_overrides_model_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit catalog restriction wins over inferred model-family support."""
+    import config as config_module
+
+    monkeypatch.setattr(
+        config_module.Config,
+        "get_model_info",
+        lambda _self, _model: {
+            "model_id": "gpt-5-mini",
+            "provider": "openai",
+            "reasoning_effort": {"supported": False},
+        },
+    )
+    routing = {
+        "calls": {
+            "generation.main": {
+                "model": "gpt-5-mini",
+                "params": {"reasoning_effort": "high"},
+            },
+        },
+    }
+
+    resolution = resolve_call("generation.main", routing=routing)
+    assert resolution.params == {}
+    assert len(resolution.warnings) == 1
+    assert "reasoning_effort" in resolution.warnings[0]
+
+    routing["policy"] = {"unsupported_optional_params": "fail_fast"}
+    with pytest.raises(LLMRoutingError, match="reasoning_effort"):
+        resolve_call("generation.main", routing=routing)
 
 
 def test_explicit_llamacpp_reasoning_metadata_preserves_effort(
@@ -343,6 +453,39 @@ def test_explicit_llamacpp_reasoning_metadata_preserves_effort(
             "calls": {
                 "generation.main": {
                     "model": "llamacpp/server-model-q4",
+                    "params": {"reasoning_effort": "none"},
+                }
+            }
+        },
+    )
+
+    resolution = resolve_call("generation.main", routing=routing)
+
+    assert resolution.params == {"reasoning_effort": "none"}
+    assert resolution.warnings == []
+
+
+def test_explicit_ollama_reasoning_metadata_preserves_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import config as config_module
+
+    monkeypatch.setattr(
+        config_module.Config,
+        "get_model_info",
+        lambda _self, _model: {
+            "model_id": "qwen3.8:27b",
+            "provider": "ollama",
+            "capabilities": ["text", "reasoning"],
+            "supported_parameters": ["reasoning_effort"],
+        },
+    )
+    routing = merge_routing_documents(
+        get_default_routing(),
+        {
+            "calls": {
+                "generation.main": {
+                    "model": "ollama/qwen3.8:27b",
                     "params": {"reasoning_effort": "none"},
                 }
             }
@@ -406,7 +549,7 @@ def test_kimi_27_temperature_warns_and_drops_by_default() -> None:
 
     assert resolution.params == {}
     assert resolution.warnings
-    assert "temperature" in resolution.warnings[0]
+    assert any("temperature" in warning for warning in resolution.warnings)
 
 
 def test_kimi_27_top_p_warns_and_drops_by_default() -> None:

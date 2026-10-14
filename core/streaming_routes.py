@@ -5,48 +5,28 @@ Streaming endpoints for Gran Sabio LLM.
 from __future__ import annotations
 
 import asyncio
-import os
 import time
-from typing import Any, AsyncIterator, Dict, FrozenSet, List, Optional
-from uuid import uuid4
+from typing import Any, AsyncIterator, Dict, FrozenSet, Optional
 
 from fastapi import HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 import json_utils as json
-from ai_service import StreamChunk, is_content_filter_stop
-from attachments_router import get_attachment_manager
-from config import config
 from content_events import (
     GENERATION_SESSION_PHASES,
     GRAN_SABIO_SESSION_PHASES,
     QA_SESSION_PHASES,
-    ContentEvent,
-    ContentEventTemplate,
-    ContentPhase,
-    ContentStatus,
-    ContentSubphase,
     SessionPhase,
     live_attempt_key,
     parse_visibility,
 )
-from content_stream import flush_content_events, publish_content_event
-from llm_routing import endpoint_id_call_kwargs, resolve_call
 from models import GenerationStatus
-from request_timeouts import (
-    get_request_default_timeout,
-    get_request_timeout_field,
-    resolve_request_timeout,
-)
-from services.attachment_manager import AttachmentError
 from services.project_stream import (
     ProjectStreamManager,
     SessionStreamManager,
     SubscriptionError,
     parse_phases,
 )
-from services.runtime_console import bind_console_context, reset_console_context
-from word_count_utils import build_word_count_instructions
 
 # Route order is a contract, not an accident: /stream/console and
 # /stream/{session_id} have the same shape, and FastAPI resolves them in
@@ -55,25 +35,10 @@ from word_count_utils import build_word_count_instructions
 # imports its route modules in.
 from . import console_routes  # noqa: F401
 from .app_state import (
-    _ensure_services,
     app,
     logger,
     mutate_session,
 )
-from .cancellation import CancellationToken, cancellation_registry
-from .generation_processor import ai_service, build_context_prompt
-
-# ---------------------------------------------------------------------------
-# Direct stream hardening (API-04 / API-09)
-# ---------------------------------------------------------------------------
-
-# Maximum number of paid direct-stream runs allowed per session.
-MAX_DIRECT_STREAMS_PER_SESSION = 3
-_DIRECT_STREAM_CONTENT_FILTER_TERMINAL = (
-    b"Error: Provider content policy stopped generation."
-)
-# Subphase carried by the labelled copy of the raw direct-stream chunks.
-_DIRECT_STREAM_SUBPHASE = "direct_stream"
 
 # Live SSE polling of the per-session endpoints.
 _SESSION_STREAM_POLL_SECONDS = 0.1
@@ -87,308 +52,18 @@ _TERMINAL_SESSION_STATUSES = {
 }
 
 
-def _direct_stream_max_per_session() -> int:
-    """Return the per-session direct-stream cap (env DIRECT_STREAM_MAX_PER_SESSION)."""
-    raw = os.getenv("DIRECT_STREAM_MAX_PER_SESSION", "")
-    try:
-        return max(1, int(raw))
-    except (TypeError, ValueError):
-        return MAX_DIRECT_STREAMS_PER_SESSION
-
-
-def _claim_direct_stream(session: Dict[str, Any]) -> Dict[str, Any]:
-    """Validate direct-stream eligibility and mark the session atomically.
-
-    Runs inside the session lock via mutate_session, so the state checks and
-    the "active" marker cannot race between concurrent requests (API-04).
-    """
-    status_value = session.get("status")
-    if status_value == GenerationStatus.CANCELLED:
-        raise HTTPException(status_code=409, detail="Session is stopped")
-    if status_value in _TERMINAL_SESSION_STATUSES:
-        raise HTTPException(status_code=409, detail="Session already finished")
-    if session.get("direct_stream_active"):
-        raise HTTPException(status_code=409, detail="Direct stream already active for this session")
-    count = int(session.get("direct_stream_count", 0) or 0)
-    if count >= _direct_stream_max_per_session():
-        raise HTTPException(status_code=429, detail="Direct stream limit reached for this session")
-    session["direct_stream_count"] = count + 1
-    session["direct_stream_active"] = True
-    return {
-        "request": session.get("request"),
-        "resolved_context": session.get("resolved_context") or [],
-        "status": session.get("status"),
-        "project_id": session.get("project_id"),
-        "project_epoch": session.get("project_epoch"),
-        "request_name": session.get("request_name"),
-        "cancelled": session.get("cancelled", False),
-        "hard_cancelled": session.get("hard_cancelled", False),
-        "usage_tracker": session.get("usage_tracker"),
-        "local_execution": session.get("local_execution"),
-        "direct_stream_count": count + 1,
-    }
-
-
-async def _release_direct_stream(session_id: str) -> None:
-    """Clear the active direct-stream marker for a session (API-04)."""
-    await mutate_session(session_id, lambda session: session.update({"direct_stream_active": False}))
-
-
-def _client_stream_timeout_ceiling() -> float:
-    """Ceiling applied to client-supplied stream timeouts (API-09)."""
-    raw = os.getenv("STREAM_TIMEOUT_CLIENT_MAX_SECONDS", "")
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        value = 0.0
-    if value > 0:
-        return value
-    return float(getattr(config, "REQUEST_TIMEOUT", 12000) or 12000)
-
-
-def _resolve_direct_stream_timeout(request_data: Any) -> float:
-    """Resolve the direct-stream timeout, clamping client-supplied values (API-09).
-
-    Client timeout fields keep their precedence (see
-    request_timeouts.resolve_request_timeout) but are capped at
-    STREAM_TIMEOUT_CLIENT_MAX_SECONDS; operator config keeps its value.
-    """
-    resolved = resolve_request_timeout(
-        request_data,
-        "stream_seconds",
-        settings=getattr(config, "REQUEST_TIMEOUTS", {}) or {},
-        config_path=("streaming", "stream_seconds"),
-        fallback=float(getattr(config, "REQUEST_TIMEOUT", 12000) or 12000),
-    )
-    client_supplied = get_request_timeout_field(request_data, "stream_seconds")
-    if client_supplied is None:
-        client_supplied = get_request_default_timeout(request_data)
-    if client_supplied is None:
-        return resolved
-    return min(resolved, _client_stream_timeout_ceiling())
-
-
-@app.get("/stream-content-direct/{session_id}")
-async def stream_content_direct_v2(session_id: str):
-    '''Direct provider content using a streaming transport, bypassing complex QA.
-
-    Restricted to active sessions: terminal sessions are rejected and each
-    session gets a bounded number of paid direct-stream runs (API-04).
-    Every provider chunk is delivered as it arrives (C1) so the caller can stop
-    a derailed generation before paying for the whole output. The same chunks
-    go through the central content handler, which labels them
-    ``content_status="draft"`` on the project stream and persists the verbatim
-    trace in the debugger. If the provider stops the response by content
-    policy, emission stops and a terminal marker is appended: what was already
-    delivered is not "unsent", which is accepted by design - those tokens had
-    already been handed to the engine and the caller owns the session.
-    '''
-    snapshot = await mutate_session(session_id, _claim_direct_stream)
-    if snapshot is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    try:
-        request_data = snapshot.get("request")
-        resolved_context = snapshot.get("resolved_context") or []
-        project_id = snapshot.get("project_id")
-        project_epoch = snapshot.get("project_epoch")
-
-        if (
-            snapshot.get("cancelled")
-            or snapshot.get("hard_cancelled")
-            or await cancellation_registry.is_hard_cancelled(session_id)
-        ):
-            raise HTTPException(status_code=409, detail="Session is stopped")
-        if project_id and await cancellation_registry.is_project_cancelled_or_stopping(project_id):
-            raise HTTPException(status_code=409, detail="Project is stopped")
-
-        context_prompt = ""
-        if resolved_context:
-            try:
-                context_prompt = build_context_prompt(get_attachment_manager(), resolved_context)
-            except AttachmentError as exc:
-                logger.warning("Failed to compose context prompt for streaming: %s", exc)
-                context_prompt = ""
-
-        if not request_data:
-            raise HTTPException(status_code=400, detail="No request data found")
-    except Exception:
-        # Release the direct-stream claim when validation fails after claiming.
-        await _release_direct_stream(session_id)
-        raise
-
-    logger.info(
-        "Direct stream claimed for session %s (run %d/%d)",
-        session_id,
-        snapshot["direct_stream_count"],
-        _direct_stream_max_per_session(),
-    )
-
-    async def direct_content_generator():
-        console_context_tokens = bind_console_context(
-            session_id=session_id,
-            project_id=project_id,
-            phase="direct_stream",
-        )
-        current_task = asyncio.current_task()
-        registered_task = False
-        content_filter_stopped = False
-        content_template = ContentEventTemplate(
-            phase=ContentPhase.GENERATION,
-            session_id=session_id,
-            project_id=project_id,
-            project_epoch=project_epoch,
-            request_name=snapshot.get("request_name"),
-            attempt=1,
-            subphase=_DIRECT_STREAM_SUBPHASE,
-        )
-
-        async def _publish_filtered_terminal() -> None:
-            """Close the trace with the filtered verdict before the marker."""
-            await publish_content_event(
-                ContentEvent(
-                    phase=ContentPhase.GENERATION,
-                    subphase=_DIRECT_STREAM_SUBPHASE,
-                    session_id=session_id,
-                    project_id=project_id,
-                    project_epoch=project_epoch,
-                    request_name=snapshot.get("request_name"),
-                    attempt=1,
-                    content_status=ContentStatus.FILTERED,
-                    reason="Provider content policy stopped generation.",
-                )
-            )
-
-        try:
-            await cancellation_registry.register_current_task(
-                session_id,
-                "direct_content_stream",
-                project_id=project_id,
-                project_epoch=project_epoch,
-            )
-            registered_task = current_task is not None
-            cancellation_token = CancellationToken(
-                session_id=session_id,
-                project_id=project_id,
-                phase="streaming",
-                operation="direct_content_stream",
-                registry=cancellation_registry,
-            )
-            _ensure_services()
-            usage_tracker = snapshot.get("usage_tracker")
-            prompt = request_data.prompt
-            word_instructions = build_word_count_instructions(request_data) if (
-                hasattr(request_data, 'max_words') and request_data.max_words
-            ) else ""
-
-            prompt_sections: List[str] = []
-            if context_prompt:
-                prompt_sections.append(context_prompt)
-            prompt_sections.append(prompt)
-            if word_instructions:
-                prompt_sections.append(word_instructions)
-            final_prompt = "\n\n".join(section.strip() for section in prompt_sections if section)
-            route = resolve_call("generation.direct_stream", request=request_data)
-            route_params = route.params
-            token_resolution = config.resolve_output_max_tokens(
-                route.model,
-                requested_max_tokens=getattr(request_data, 'max_tokens', None),
-                routed_max_tokens=route_params.get("max_tokens"),
-                call_id="generation.direct_stream",
-            )
-            requested_max_tokens = token_resolution["max_tokens"]
-
-            async def direct_stream_cancelled() -> bool:
-                return await cancellation_token.any_cancelled()
-
-            stream_timeout = _resolve_direct_stream_timeout(request_data)
-
-            async for chunk in ai_service.generate_content_stream(
-                prompt=final_prompt,
-                model=route.model,
-                temperature=route_params.get("temperature", request_data.temperature),
-                max_tokens=requested_max_tokens,
-                reasoning_effort=route_params.get("reasoning_effort", getattr(request_data, 'reasoning_effort', None)),
-                thinking_budget_tokens=route_params.get("thinking_budget_tokens", getattr(request_data, 'thinking_budget_tokens', None)),
-                content_type=getattr(request_data, 'content_type', 'biography'),
-                llm_routing=getattr(request_data, "_llm_routing", None),
-                provider_options=getattr(route, "provider_options", {}),
-                **endpoint_id_call_kwargs(getattr(route, "endpoint_id", None)),
-                request_timeout=stream_timeout,
-                usage_callback=usage_tracker.create_callback(
-                    phase="direct_stream",
-                    role="generator",
-                    operation="direct_content_stream",
-                ) if usage_tracker else None,
-                cancellation_token=cancellation_token,
-                cancel_callback=direct_stream_cancelled,
-                local_execution=snapshot.get("local_execution"),
-                dispatch_call_id="generation.direct_stream",
-                dispatch_route_ordinal=0,
-            ):
-                if await direct_stream_cancelled():
-                    raise asyncio.CancelledError()
-                # Keep thinking and content together on this raw endpoint; the
-                # labelled separation lives on /stream/project (C8).
-                is_thinking = False
-                if isinstance(chunk, StreamChunk):
-                    finish_category = str(
-                        (chunk.metadata or {}).get("finish_reason_category") or ""
-                    ).strip().casefold()
-                    if finish_category == "content_filter":
-                        content_filter_stopped = True
-                        continue
-                    chunk_text = chunk.text
-                    is_thinking = bool(chunk.is_thinking)
-                else:
-                    chunk_text = chunk
-                if chunk_text and not content_filter_stopped:
-                    await publish_content_event(
-                        content_template.chunk(
-                            chunk_text,
-                            is_thinking=is_thinking,
-                            subphase=(
-                                ContentSubphase.THINKING
-                                if is_thinking
-                                else _DIRECT_STREAM_SUBPHASE
-                            ),
-                        )
-                    )
-                    yield chunk_text.encode("utf-8")
-
-            if content_filter_stopped:
-                await _publish_filtered_terminal()
-                yield _DIRECT_STREAM_CONTENT_FILTER_TERMINAL
-
-        except asyncio.CancelledError:
-            logger.info("Direct content stream cancelled for session %s", session_id)
-        except Exception as exc:
-            if content_filter_stopped or is_content_filter_stop(exc):
-                logger.warning(
-                    "Direct streaming stopped by provider content policy for session %s",
-                    session_id,
-                )
-                await _publish_filtered_terminal()
-                yield _DIRECT_STREAM_CONTENT_FILTER_TERMINAL
-                return
-            error_id = uuid4().hex[:8]
-            logger.exception(
-                "Direct streaming failed for session %s [error_id=%s]",
-                session_id,
-                error_id,
-            )
-            yield f"Error: direct streaming failed (error_id={error_id})".encode('utf-8')
-        finally:
-            await flush_content_events(session_id, phase=ContentPhase.GENERATION)
-            await _release_direct_stream(session_id)
-            if registered_task and current_task is not None:
-                await cancellation_registry.unregister_task(session_id, current_task)
-            reset_console_context(console_context_tokens)
-
-    return StreamingResponse(
-        direct_content_generator(),
-        media_type="text/plain",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+@app.get("/stream-content-direct/{session_id}", status_code=410, deprecated=True)
+async def stream_content_direct_retired(session_id: str) -> None:
+    """Reject the retired endpoint that started a separate generation."""
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "This endpoint is retired because it started a separate generation "
+            "outside the normal input and QA pipeline. "
+            f"Use GET /stream-content/{session_id} to observe the existing generation "
+            f"or GET /stream/{session_id} for session events. "
+            "Start a new generation with POST /generate."
+        ),
     )
 
 
@@ -552,7 +227,7 @@ async def _require_session(session_id: str) -> None:
 
 
 @app.get("/stream-content/{session_id}")
-async def stream_content_direct(session_id: str):
+async def stream_content(session_id: str) -> StreamingResponse:
     """Stream the live generation text of a session in SSE format.
 
     Emits the draft of the attempt in progress as it is produced and the

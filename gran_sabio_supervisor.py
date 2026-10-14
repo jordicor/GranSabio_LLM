@@ -68,7 +68,7 @@ class GranSabioSupervisor:
                         "slot_id": slot_id,
                         "model": model,
                         "reason": f"{count} Gran Sabio-confirmed false positives in this session/layer",
-                        "replacement": self._explicit_replacement_for(request, layer, slot_id, model),
+                        "replacement": None,
                     }
                 )
 
@@ -85,24 +85,6 @@ class GranSabioSupervisor:
                     }
                 )
 
-        replacement_enabled = self._replacement_policy_enabled(request)
-        bench_actions: List[Dict[str, Any]] = []
-        if replacement_enabled and bench_recommendations:
-            for recommendation in bench_recommendations:
-                tracker.record_model_benched(
-                    session_id=session_id,
-                    layer_name=recommendation["layer"],
-                    model_name=recommendation["model"],
-                    slot_id=recommendation["slot_id"],
-                    reason=recommendation["reason"],
-                )
-                bench_actions.append(
-                    {
-                        **recommendation,
-                        "replacement_available": bool(recommendation.get("replacement")),
-                    }
-                )
-
         health_state = "ok"
         if any(flag.get("type") == "technical_failure_pattern" for flag in flags):
             health_state = "degraded"
@@ -111,11 +93,7 @@ class GranSabioSupervisor:
 
         recommended_action = "continue"
         if bench_recommendations:
-            recommended_action = (
-                "bench_with_explicit_replacement"
-                if any(rec.get("replacement") for rec in bench_recommendations)
-                else "review_bench_recommendations"
-            )
+            recommended_action = "review_bench_recommendations"
         elif flags:
             recommended_action = "monitor"
 
@@ -124,7 +102,7 @@ class GranSabioSupervisor:
             "supervisor_flags": flags,
             "recommended_action": recommended_action,
             "bench_recommendations": bench_recommendations,
-            "bench_actions": bench_actions,
+            "bench_actions": [],
         }
 
         if session is not None:
@@ -133,32 +111,3 @@ class GranSabioSupervisor:
             session["bench_recommendations"] = bench_recommendations
 
         return result
-
-    def _replacement_policy_enabled(self, request: Optional[Any]) -> bool:
-        policy = getattr(request, "qa_replacement_policy", None) if request else None
-        if not isinstance(policy, dict):
-            return False
-        return bool(policy.get("enabled") or policy.get("bench_enabled"))
-
-    def _explicit_replacement_for(
-        self,
-        request: Optional[Any],
-        layer: str,
-        slot_id: str,
-        model: str,
-    ) -> Optional[Any]:
-        policy = getattr(request, "qa_replacement_policy", None) if request else None
-        if not isinstance(policy, dict):
-            return None
-
-        replacements = policy.get("replacements") or {}
-        if isinstance(replacements, dict):
-            for key in (f"{layer}::{slot_id}", f"{layer}::{model}", slot_id, model):
-                if key in replacements:
-                    return replacements[key]
-
-        substitutes = policy.get("substitutes") or policy.get("replacement_models")
-        if isinstance(substitutes, list) and substitutes:
-            return substitutes[0]
-
-        return None

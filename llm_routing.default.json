@@ -12,19 +12,19 @@
   },
   "calls": {
     "generation.main": {
-      "model": "gpt-5.4-mini",
-      "params": {}
-    },
-    "generation.direct_stream": {
-      "model": "gpt-5.4-mini",
-      "params": {}
+      "model": "gpt-6-luna",
+      "params": {
+        "reasoning_effort": "low"
+      }
     },
     "generation.json_retry": {
-      "model": "gpt-5.4-mini",
-      "params": {}
+      "model": "gpt-6-luna",
+      "params": {
+        "reasoning_effort": "low"
+      }
     },
     "generation.smart_edit": {
-      "model": "gpt-5-nano",
+      "model": "gpt-6-luna",
       "params": {
         "reasoning_effort": "low"
       }
@@ -32,85 +32,94 @@
     "qa.evaluate_layer": {
       "models": [
         {
-          "model": "gpt-5-mini",
+          "model": "gpt-6-luna",
           "params": {
+            "max_tokens": 6000,
+            "reasoning_effort": "low"
+          }
+        },
+        {
+          "model": "claude-sonnet-5",
+          "params": {
+            "max_tokens": 6000,
             "reasoning_effort": "medium"
           }
         },
         {
-          "model": "claude-sonnet-4-6",
+          "model": "gemini-3.8-flash",
           "params": {
-            "temperature": 0.3
-          }
-        },
-        {
-          "model": "gemini-2.5-flash",
-          "params": {
-            "temperature": 0.3
+            "max_tokens": 6000,
+            "reasoning_effort": "low"
           }
         }
       ]
     },
     "auto_qa.plan": {
-      "model": "kimi-k2.7-code",
+      "model": "gpt-6-luna",
       "params": {
-        "max_tokens": 6000
+        "max_tokens": 6000,
+        "reasoning_effort": "low"
       }
     },
     "gransabio.review": {
-      "model": "kimi-k2.7-code",
+      "model": "gpt-6.1-sol",
       "params": {
-        "max_tokens": 8000
+        "max_tokens": 8000,
+        "reasoning_effort": "medium"
       }
     },
     "gransabio.regenerate": {
-      "model": "kimi-k2.7-code",
-      "params": {}
+      "model": "gpt-6.1-sol",
+      "params": {
+        "reasoning_effort": "medium"
+      }
     },
     "gransabio.escalation": {
-      "model": "kimi-k2.7-code",
+      "model": "gpt-6.1-sol",
       "params": {
-        "max_tokens": 8000
+        "max_tokens": 8000,
+        "reasoning_effort": "medium"
       }
     },
     "arbiter.resolve": {
-      "model": "gpt-5-mini",
+      "model": "gpt-6.1-sol",
       "params": {
         "reasoning_effort": "medium",
         "max_tokens": 8000
       }
     },
     "preflight.validate": {
-      "model": "grok-4-fast-non-reasoning",
-      "params": {
-        "temperature": 0.2,
-        "max_tokens": 800
-      }
+      "model": "jev-1.13.0",
+      "params": {}
     },
     "long_text.section_draft": {
-      "model": "gpt-5.4-mini",
-      "params": {}
+      "model": "gpt-6-luna",
+      "params": {
+        "reasoning_effort": "low"
+      }
     },
     "long_text.section_tools": {
-      "model": "gpt-5.4-mini",
-      "params": {}
+      "model": "gpt-6-luna",
+      "params": {
+        "reasoning_effort": "low"
+      }
     },
     "long_text.semantic_eval": {
-      "model": "gpt-5-mini",
+      "model": "gpt-6-luna",
       "params": {
-        "reasoning_effort": "medium",
+        "reasoning_effort": "low",
         "max_tokens": 4096
       }
     },
     "evidence.extract_claims": {
-      "model": "gpt-5-nano",
+      "model": "gpt-6-luna",
       "params": {
         "reasoning_effort": "low",
         "max_tokens": 4000
       }
     },
     "evidence.classify_spans": {
-      "model": "gpt-5-nano",
+      "model": "gpt-6-luna",
       "params": {
         "reasoning_effort": "low",
         "max_tokens": 4000
@@ -127,14 +136,14 @@
       }
     },
     "feedback.analyze": {
-      "model": "gpt-5-nano",
+      "model": "gpt-6-luna",
       "params": {
         "reasoning_effort": "low",
         "max_tokens": 2000
       }
     },
     "feedback.synthesize_rules": {
-      "model": "gpt-5-nano",
+      "model": "gpt-6-luna",
       "params": {
         "reasoning_effort": "low",
         "max_tokens": 2000
@@ -171,29 +180,30 @@
       ]
     },
     "accent.audit": {
-      "model": "gpt-5-mini",
+      "model": "gpt-6-luna",
       "params": {
         "reasoning_effort": "low"
       }
     },
     "smart_edit.analyze": {
-      "model": "gpt-5-nano",
+      "model": "gpt-6-luna",
       "params": {
         "reasoning_effort": "low",
         "max_tokens": 4096
       }
     },
     "smart_edit.apply": {
-      "model": "gpt-5-nano",
+      "model": "gpt-6-luna",
       "params": {
         "reasoning_effort": "low",
         "max_tokens": 4096
       }
     },
     "health.openai": {
-      "model": "gpt-4o-mini",
+      "model": "gpt-6-luna",
       "params": {
-        "max_tokens": 5
+        "max_tokens": 32,
+        "reasoning_effort": "none"
       }
     },
     "health.claude": {
@@ -203,7 +213,11 @@
       }
     },
     "health.gemini": {
-      "model": "gemini-2.0-flash"
+      "model": "gemini-3.8-flash",
+      "params": {
+        "max_tokens": 256,
+        "reasoning_effort": "low"
+      }
     },
     "health.xai": {
       "model": "grok-4-0709",

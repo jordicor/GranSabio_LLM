@@ -116,7 +116,6 @@ def build_session_payload(
             "accepted_section_ids": [],
             "failed_section_ids": [],
             "pending_repair_targets": [],
-            "candidate_history": [],
             "outer_feedback_digest": None,
             "last_controller_summary": None,
             "plan_invalidation_count": 0,

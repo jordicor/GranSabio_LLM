@@ -205,6 +205,7 @@ async def test_openai_tool_loop_passes_image_tokens_to_revalidation(service):
             SimpleNamespace(content="", tool_calls=[_openai_tool_call(draft)]),
             None,
             "tool_calls",
+            None,
         )
 
     service._stream_openai_compatible_tool_turn = fake_turn
@@ -358,14 +359,6 @@ async def test_stream_openai_compatible_fails_fast_without_client(service):
     service._initialize_clients.assert_not_called()
 
 
-async def test_stream_ollama_fails_fast_without_client(service):
-    service._initialize_clients = Mock()
-    with pytest.raises(ValueError, match="Ollama client not initialized"):
-        async for _ in service._stream_ollama("p", "qwen2.5:14b", 0.7, 100, "sys"):
-            pass
-    service._initialize_clients.assert_not_called()
-
-
 # ---------------------------------------------------------------------------
 # AIS-11: max_tool_calls wired into the tool-call budget
 # ---------------------------------------------------------------------------
@@ -393,6 +386,7 @@ async def test_tool_loop_honors_max_tool_calls(service):
             SimpleNamespace(content="", tool_calls=[_openai_tool_call("final draft")]),
             None,
             "tool_calls",
+            None,
         )
 
     service._stream_openai_compatible_tool_turn = fake_turn
@@ -523,7 +517,7 @@ def test_normalize_usage_coerces_numeric_strings():
     assert result["total_tokens"] == 50
 
 
-def test_normalize_usage_malformed_tokens_degrade_to_zero_or_none():
+def test_normalize_usage_malformed_tokens_remain_unavailable():
     """CFG-02: structures/garbage degrade with a warning, never an exception."""
     result = normalize_usage(
         {
@@ -532,8 +526,8 @@ def test_normalize_usage_malformed_tokens_degrade_to_zero_or_none():
             "total_tokens": {"value": 3},
         }
     )
-    assert result["input_tokens"] == 0
-    assert result["output_tokens"] == 0
+    assert result["input_tokens"] is None
+    assert result["output_tokens"] is None
     assert result["total_tokens"] is None
 
 

@@ -4,7 +4,7 @@ Provides endpoints for listing active projects and sessions.
 """
 
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict
 
 from fastapi import APIRouter, HTTPException
 
@@ -18,7 +18,10 @@ async def list_active_connections(
     limit: int = 100,
 ):
     """
-    List all active projects and standalone sessions for the monitor UI.
+    List active projects and their sessions for the monitor UI.
+
+    Every admitted session has a project ID. The legacy standalone_sessions
+    response field remains an empty list for existing clients.
 
     Each project carries its sessions with the phase they are in, so the
     operator sees WHERE a project is without opening a stream. The list is
@@ -46,19 +49,16 @@ async def list_active_connections(
                     "last_activity": str (ISO timestamp)
                 }
             ],
-            "standalone_sessions": [
-                {
-                    "session_id": str,
-                    "request_name": str | None,
-                    "status": str,
-                    "phase": str,
-                    "created_at": str (ISO timestamp)
-                }
-            ],
+            "standalone_sessions": [],
             "timestamp": str (ISO timestamp)
         }
     """
-    from .app_state import active_sessions, active_sessions_lock, reserved_project_ids
+    from .app_state import (
+        active_sessions,
+        active_sessions_lock,
+        is_monitor_session_active,
+        reserved_project_ids,
+    )
 
     if limit < 1 or limit > 500:
         raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
@@ -72,73 +72,60 @@ async def list_active_connections(
         )
 
     projects_map: Dict[str, Dict] = {}
-    standalone: List[Dict] = []
 
     lock = active_sessions_lock
 
     def _process_sessions(items):
         for session_id, session in items:
             project_id = session.get("project_id")
+            if not project_id:
+                continue
             status_enum = session.get("status")
             status_str = status_enum.value if hasattr(status_enum, "value") else str(status_enum)
             phase = session.get("current_phase", "unknown")
 
-            if project_id:
-                # Group by project
-                if project_id not in projects_map:
-                    projects_map[project_id] = {
-                        "project_id": project_id,
-                        "status": "idle",
-                        "session_count": 0,
-                        "active_sessions": 0,
-                        "sessions": [],
-                        "last_activity": None
-                    }
+            # Group by project
+            if project_id not in projects_map:
+                projects_map[project_id] = {
+                    "project_id": project_id,
+                    "status": "idle",
+                    "session_count": 0,
+                    "active_sessions": 0,
+                    "sessions": [],
+                    "last_activity": None
+                }
 
-                proj = projects_map[project_id]
-                proj["session_count"] += 1
-                if len(proj["sessions"]) < limit:
-                    proj["sessions"].append({
-                        "session_id": session_id,
-                        "request_name": session.get("request_name"),
-                        "status": status_str,
-                        "phase": phase,
-                        "current_iteration": session.get("current_iteration", 0),
-                        "max_iterations": session.get("max_iterations", 0),
-                    })
-
-                # Count active
-                if (
-                    status_str in ("generating", "qa_evaluation", "consensus", "gran_sabio_review", "initializing", "running")
-                    or phase in ("inline_deal_breaker_review", "gran_sabio_review", "gran_sabio_regeneration")
-                ):
-                    proj["active_sessions"] += 1
-                    proj["status"] = "running"
-                elif status_str == "completed" and proj["status"] != "running":
-                    proj["status"] = "completed"
-                elif status_str == "rejected" and proj["status"] not in ("running", "completed"):
-                    proj["status"] = "rejected"
-                elif status_str in ("failed", "error") and proj["status"] not in ("running", "completed", "rejected"):
-                    proj["status"] = "failed"
-                elif status_str == "cancelled" and proj["status"] not in ("running", "completed", "rejected", "failed"):
-                    proj["status"] = "cancelled"
-
-                # Track last activity
-                activity = session.get("last_activity_at") or session.get("created_at")
-                if activity:
-                    activity_iso = activity.isoformat() if isinstance(activity, datetime) else str(activity)
-                    if proj["last_activity"] is None or activity_iso > proj["last_activity"]:
-                        proj["last_activity"] = activity_iso
-            else:
-                # Standalone session (no project_id)
-                created = session.get("created_at")
-                standalone.append({
+            proj = projects_map[project_id]
+            proj["session_count"] += 1
+            if len(proj["sessions"]) < limit:
+                proj["sessions"].append({
                     "session_id": session_id,
                     "request_name": session.get("request_name"),
                     "status": status_str,
                     "phase": phase,
-                    "created_at": created.isoformat() if isinstance(created, datetime) else str(created) if created else None
+                    "current_iteration": session.get("current_iteration", 0),
+                    "max_iterations": session.get("max_iterations", 0),
                 })
+
+            # Count active
+            if is_monitor_session_active(status_str, phase):
+                proj["active_sessions"] += 1
+                proj["status"] = "running"
+            elif status_str == "completed" and proj["status"] != "running":
+                proj["status"] = "completed"
+            elif status_str == "rejected" and proj["status"] not in ("running", "completed"):
+                proj["status"] = "rejected"
+            elif status_str in ("failed", "error") and proj["status"] not in ("running", "completed", "rejected"):
+                proj["status"] = "failed"
+            elif status_str == "cancelled" and proj["status"] not in ("running", "completed", "rejected", "failed"):
+                proj["status"] = "cancelled"
+
+            # Track last activity
+            activity = session.get("last_activity_at") or session.get("created_at")
+            if activity:
+                activity_iso = activity.isoformat() if isinstance(activity, datetime) else str(activity)
+                if proj["last_activity"] is None or activity_iso > proj["last_activity"]:
+                    proj["last_activity"] = activity_iso
 
     if lock is None:
         _process_sessions(list(active_sessions.items()))
@@ -184,7 +171,7 @@ async def list_active_connections(
 
     return {
         "projects": projects[:limit],
-        "standalone_sessions": standalone,
+        "standalone_sessions": [],
         "filter": requested_status,
         "include_reserved": include_reserved,
         "timestamp": datetime.utcnow().isoformat()
