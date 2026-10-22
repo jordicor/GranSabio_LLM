@@ -374,7 +374,7 @@ def test_catalog_reasoning_metadata_preserves_single_and_qa_route_effort(
     monkeypatch.setattr(
         config_module.Config,
         "get_model_info",
-        lambda _self, _model: {
+        lambda _self, _model, **_kwargs: {
             "model_id": model,
             "provider": provider,
             "capabilities": ["text"],
@@ -407,7 +407,7 @@ def test_explicit_unsupported_reasoning_overrides_model_family(
     monkeypatch.setattr(
         config_module.Config,
         "get_model_info",
-        lambda _self, _model: {
+        lambda _self, _model, **_kwargs: {
             "model_id": "gpt-5-mini",
             "provider": "openai",
             "reasoning_effort": {"supported": False},
@@ -440,7 +440,7 @@ def test_explicit_llamacpp_reasoning_metadata_preserves_effort(
     monkeypatch.setattr(
         config_module.Config,
         "get_model_info",
-        lambda _self, _model: {
+        lambda _self, _model, **_kwargs: {
             "model_id": "server-model-q4",
             "provider": "llamacpp",
             "capabilities": ["text", "reasoning"],
@@ -473,7 +473,7 @@ def test_explicit_ollama_reasoning_metadata_preserves_effort(
     monkeypatch.setattr(
         config_module.Config,
         "get_model_info",
-        lambda _self, _model: {
+        lambda _self, _model, **_kwargs: {
             "model_id": "qwen3.8:27b",
             "provider": "ollama",
             "capabilities": ["text", "reasoning"],
@@ -506,7 +506,7 @@ def test_llamacpp_without_reasoning_metadata_drops_effort(
     monkeypatch.setattr(
         config_module.Config,
         "get_model_info",
-        lambda _self, _model: {
+        lambda _self, _model, **_kwargs: {
             "model_id": "server-model-q4",
             "provider": "llamacpp",
             "capabilities": ["text"],

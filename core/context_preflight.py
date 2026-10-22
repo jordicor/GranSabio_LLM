@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import context_budget
@@ -97,25 +97,8 @@ class OperationalPolicy:
 
     context_fraction: float
     minimum_working_context_tokens: int
-    maximum_working_context_tokens: int
+    maximum_working_context_tokens: Optional[int]
     safety_margin_fraction: float
-
-    @classmethod
-    def configured(cls) -> "OperationalPolicy":
-        """The engine's own single global policy (env-overridable)."""
-
-        return cls(
-            context_fraction=float(os.getenv("GRANSABIO_CONTEXT_POLICY_FRACTION", "0.25")),
-            minimum_working_context_tokens=int(
-                os.getenv("GRANSABIO_CONTEXT_POLICY_MIN_TOKENS", "16384")
-            ),
-            maximum_working_context_tokens=int(
-                os.getenv("GRANSABIO_CONTEXT_POLICY_MAX_TOKENS", "65536")
-            ),
-            safety_margin_fraction=float(
-                os.getenv("GRANSABIO_CONTEXT_POLICY_SAFETY_MARGIN", "0.05")
-            ),
-        )
 
     @classmethod
     def from_payload(cls, raw: Any) -> Tuple["OperationalPolicy", Dict[str, Any]]:
@@ -128,13 +111,14 @@ class OperationalPolicy:
                 f"{POLICY_SCHEMA_VERSION!r} value or a supported legacy alias"
             )
         try:
+            maximum = raw.get("maximum_working_context_tokens")
             policy = cls(
                 context_fraction=float(raw["context_fraction"]),
                 minimum_working_context_tokens=int(raw["minimum_working_context_tokens"]),
-                maximum_working_context_tokens=int(raw["maximum_working_context_tokens"]),
+                maximum_working_context_tokens=int(maximum) if maximum is not None else None,
                 safety_margin_fraction=float(raw["safety_margin_fraction"]),
             )
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise MalformedRequest(
                 f"context_budget_policy has invalid numeric fields: {exc}"
             ) from exc
@@ -144,7 +128,10 @@ class OperationalPolicy:
             raise MalformedRequest(
                 "context_budget_policy.minimum_working_context_tokens must be positive"
             )
-        if policy.maximum_working_context_tokens < policy.minimum_working_context_tokens:
+        if (
+            policy.maximum_working_context_tokens is not None
+            and policy.maximum_working_context_tokens < policy.minimum_working_context_tokens
+        ):
             raise MalformedRequest(
                 "context_budget_policy.maximum_working_context_tokens must be at "
                 "least the minimum"
@@ -155,27 +142,13 @@ class OperationalPolicy:
             )
         return policy, raw
 
-    def matches_configured(self) -> bool:
-        """Accept a run policy within the service's ceiling and safety margin.
-
-        The configured fraction and floor are defaults, not mandatory values:
-        enforcing equality prevented callers from choosing a smaller operating
-        window, or a fixed window independent of model size.
-        """
-        configured = OperationalPolicy.configured()
-        return (
-            self.maximum_working_context_tokens <= configured.maximum_working_context_tokens
-            and self.safety_margin_fraction >= configured.safety_margin_fraction
-        )
-
     def working_context_tokens(self, context_window_tokens: int) -> int:
-        """``W_model``: fraction of the physical window, floored and capped."""
+        """Use the model's window, with an optional smaller caller budget."""
 
         fractional = math.floor(self.context_fraction * context_window_tokens)
-        bounded = max(
-            self.minimum_working_context_tokens,
-            min(self.maximum_working_context_tokens, fractional),
-        )
+        if self.maximum_working_context_tokens is not None:
+            fractional = min(self.maximum_working_context_tokens, fractional)
+        bounded = max(self.minimum_working_context_tokens, fractional)
         return min(context_window_tokens, bounded)
 
     def safety_margin_tokens(self, working_context_tokens: int) -> int:
@@ -866,13 +839,15 @@ def _serialized_request_skeleton(payload: Dict[str, Any]) -> str:
 
     Mirror that with a JSON dump of every payload field except the bulky
     content bodies (prompt/source_text/json_schema), which are counted as
-    their own components.
+    their own components. Non-empty shared_context is transported as source
+    data separately and is likewise counted once in its own component.
     """
 
     skeleton = {
         key: value
         for key, value in payload.items()
         if key not in {"prompt", "source_text", "json_schema"}
+        and not (key == "shared_context" and value)
     }
     return json.dumps(skeleton, default=str)
 
@@ -1298,6 +1273,19 @@ def _build_participant_specs(payload: Dict[str, Any]) -> List[ParticipantSpec]:
         )
     )
 
+    if runtime_request.shared_context:
+        # Every chat participant receives this separate user source message.
+        # Typed QA already includes it inside its complete System One state.
+        specs = [
+            replace(
+                spec,
+                fixed_components=spec.fixed_components + (
+                    ("shared_context", runtime_request.shared_context, "prose"),
+                ),
+            ) if spec.call_kind == "chat" else spec
+            for spec in specs
+        ]
+
     return specs
 
 
@@ -1362,13 +1350,13 @@ def build_context_preflight_response(payload: Dict[str, Any]) -> Dict[str, Any]:
             capacity_rejections.append(rejection)
 
     rejection: Optional[Dict[str, Any]] = None
-    if not policy.matches_configured():
+    minimum_safety_margin = float(os.getenv("GRANSABIO_CONTEXT_POLICY_SAFETY_MARGIN", "0.05"))
+    if not policy.safety_margin_fraction >= minimum_safety_margin:
         rejection = {
             "code": CODE_POLICY_MISMATCH,
             "message": (
-                "The requested context_budget_policy exceeds this engine's "
-                "operating ceiling or reduces its minimum safety margin "
-                f"(configured={OperationalPolicy.configured()!r})."
+                "The requested context_budget_policy reduces this engine's "
+                f"minimum safety margin (configured={minimum_safety_margin!r})."
             ),
         }
     if rejection is None:

@@ -129,11 +129,13 @@ from services.typesafe_client import (
 )
 from shared_context import (
     CacheablePrompt,
+    consume_prompt_cache_report,
     prepend_gemini_context,
     prepend_user_context,
     supports_openai_explicit_cache,
     validate_shared_context,
     with_openai_cache_options,
+    with_openrouter_cache_options,
 )
 from tool_loop_models import (
     JsonContractError,
@@ -2311,6 +2313,7 @@ class AIService:
         provider_options: Optional[Mapping[str, Any]],
         *,
         require_parameters: bool = False,
+        model_id: str = "",
     ) -> Dict[str, Any]:
         """Merge validated route options with mandatory OpenRouter safeguards.
 
@@ -2337,7 +2340,7 @@ class AIService:
             provider_payload["require_parameters"] = True
         if provider_payload:
             merged["provider"] = provider_payload
-        return merged
+        return with_openrouter_cache_options(merged, model_id)
 
     def _openrouter_client_for_attempt(self, strict_single_generation_attempt: bool) -> Any:
         """Return a request-scoped OpenRouter client with no SDK retries when strict."""
@@ -2916,6 +2919,7 @@ class AIService:
         its billed cost and needs none.
         """
 
+        cache_report = consume_prompt_cache_report(provider, model_id)
         if not usage_callback:
             return
 
@@ -2929,6 +2933,8 @@ class AIService:
             "provider": provider,
         }
         payload.update({k: v for k, v in usage_payload.items() if v is not None})
+        if cache_report is not None:
+            payload["prompt_cache"] = cache_report
 
         if extra:
             payload.update(extra)
@@ -5110,6 +5116,7 @@ class AIService:
             create_params["extra_body"] = self._with_openrouter_provider_options(
                 create_params.get("extra_body"),
                 provider_options,
+                model_id=model_id,
                 require_parameters=any(
                     key in create_params
                     for key in ("response_format", "tools", "tool_choice", "parallel_tool_calls")
@@ -9445,7 +9452,7 @@ class AIService:
             initial_parts.extend(self._build_gemini_image_parts(images))
         initial_parts.append({"text": prompt})
         initial_contents: List[Any] = [{"role": "user", "parts": initial_parts}]
-        initial_contents = prepend_gemini_context(initial_contents, shared_context)
+        initial_contents = prepend_gemini_context(initial_contents, shared_context, model_id=model_id)
 
         thinking_config_kwargs = self._build_gemini_thinking_config_kwargs(
             model_id,
@@ -11771,6 +11778,7 @@ class AIService:
             create_params["extra_body"] = self._with_openrouter_provider_options(
                 None,
                 provider_options,
+                model_id=model_id,
             )
 
         if provider == "openai":
@@ -12808,7 +12816,7 @@ class AIService:
                 parts.extend(self._build_gemini_image_parts(images))
             parts.append({"text": prompt})
             contents.append({"role": "user", "parts": parts})
-            contents = prepend_gemini_context(contents, shared_context)
+            contents = prepend_gemini_context(contents, shared_context, model_id=model_id)
 
             thinking_config_kwargs = self._build_gemini_thinking_config_kwargs(
                 model_id,
@@ -13384,6 +13392,7 @@ class AIService:
         request_kwargs["extra_body"] = self._with_openrouter_provider_options(
             request_kwargs.get("extra_body"),
             provider_options,
+            model_id=model_id,
             require_parameters=bool(json_output and "response_format" in request_params),
         )
         # Disable provider context compression on every OpenRouter payload (D15).
@@ -14365,7 +14374,7 @@ class AIService:
                 parts.extend(self._build_gemini_image_parts(images))
             parts.append({"text": prompt})
             contents.append({"role": "user", "parts": parts})
-            contents = prepend_gemini_context(contents, shared_context)
+            contents = prepend_gemini_context(contents, shared_context, model_id=model_id)
 
             thinking_config_kwargs = self._build_gemini_thinking_config_kwargs(
                 model_id,
@@ -14777,6 +14786,7 @@ class AIService:
             request_kwargs["extra_body"] = self._with_openrouter_provider_options(
                 request_kwargs.get("extra_body"),
                 provider_options,
+                model_id=model_id,
                 require_parameters=bool(json_output and "response_format" in create_params),
             )
             # Disable provider context compression on every OpenRouter payload (D15).

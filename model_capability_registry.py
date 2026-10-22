@@ -10,8 +10,93 @@ from provider_capabilities import (
     CapabilityState,
     CapabilitySupport,
     ModelCapabilities,
+    PromptCacheCapabilities,
     capability_state,
 )
+
+
+def validate_prompt_cache_rules(payload: Mapping[str, Any]) -> None:
+    """Validate the small, data-only cache overlay when configuration is loaded."""
+    if payload.get("version") != 1 or not isinstance(payload.get("rules"), list):
+        raise ValueError("model_cache.curated.json requires version=1 and a rules list")
+    fields = {
+        "provider", "models", "model_prefixes", "source", "verified_at", "note",
+        "automatic", "explicit_prefix", "explicit_only", "off", "marker",
+        "max_breakpoints", "min_prefix_tokens", "ttl", "boundary_selection",
+    }
+    for rule in payload["rules"]:
+        if not isinstance(rule, dict) or not rule.get("provider") or not rule.get("source") or not rule.get("verified_at"):
+            raise ValueError("Cache rules require provider, source and verified_at")
+        if set(rule) - fields:
+            raise ValueError("Unknown cache rule fields: " + ", ".join(sorted(set(rule) - fields)))
+        for field in ("models", "model_prefixes"):
+            values = rule.get(field, [])
+            if not isinstance(values, list) or any(not isinstance(v, str) or not v for v in values):
+                raise ValueError(f"Invalid cache rule {field}")
+        for field in ("automatic", "explicit_prefix", "explicit_only", "off"):
+            if field in rule:
+                CapabilitySupport(rule[field])
+        if rule.get("marker") not in (None, "cache_control", "prompt_cache_breakpoint"):
+            raise ValueError("Unknown cache marker transport")
+        for field in ("max_breakpoints", "min_prefix_tokens"):
+            value = rule.get(field)
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError(f"Invalid cache rule {field}")
+        if rule.get("boundary_selection", "all") not in ("all", "last"):
+            raise ValueError("Invalid cache boundary selection")
+        if rule.get("ttl") not in (None, "30m", "5m"):
+            raise ValueError("Cache TTL has no implemented transport")
+
+
+def get_prompt_cache_capabilities(
+    *, specs: Mapping[str, Any], rules: Mapping[str, Any], provider: str, model_id: str,
+) -> PromptCacheCapabilities:
+    """Resolve provider metadata plus curated rules without IO or credentials.
+
+    Rules use exact model IDs or explicit prefixes, never a comparison which
+    implicitly grants controls to future model generations. Curated values win;
+    sync dates do not refresh the evidence date of a curated contract.
+    """
+    provider = normalize_provider(provider)
+    model_id = model_id.lower()
+    data = find_model_spec(specs, provider, model_id)
+    remote = (data.get("provider_capabilities") or {}).get("prompt_cache", {})
+    resolved = dict(remote) if isinstance(remote, Mapping) else {}
+    states = {}
+    for field in ("automatic", "explicit_prefix", "explicit_only", "off"):
+        states[field] = capability_state(
+            resolved.get(field), source=CapabilitySource.PROVIDER_API,
+            verified_at=resolved.get("verified_at"),
+            details={"source_url": resolved.get("source"), "note": resolved.get("note")},
+        )
+    for rule in rules.get("rules", []):
+        if normalize_provider(rule["provider"]) != provider:
+            continue
+        models, prefixes = rule.get("models", []), rule.get("model_prefixes", [])
+        if (models or prefixes) and model_id not in models and not any(model_id.startswith(p) for p in prefixes):
+            continue
+        resolved.update(rule)
+        for field in states:
+            if field in rule:
+                states[field] = capability_state(
+                    rule[field], source=CapabilitySource.OFFICIAL_DOCS,
+                    verified_at=rule["verified_at"],
+                    details={"source_url": rule["source"], "note": rule.get("note")},
+                )
+    marker = resolved.get("marker")
+    transport_available = (
+        marker == "cache_control" and provider in {"claude", "openrouter"}
+        or marker == "prompt_cache_breakpoint" and (
+            provider == "openai" or provider == "openrouter" and model_id.startswith("openai/")
+        )
+    )
+    return PromptCacheCapabilities(
+        **states, marker=marker, transport_available=transport_available,
+        max_breakpoints=resolved.get("max_breakpoints"),
+        min_prefix_tokens=resolved.get("min_prefix_tokens"), ttl=resolved.get("ttl"),
+        boundary_selection=resolved.get("boundary_selection", "all"),
+        rule_version=rules.get("version", 1),
+    )
 
 TOOL_LOOP_RUNTIME_PROVIDERS = frozenset(
     {"openai", "openrouter", "xai", "claude", "gemini", "ollama", "llamacpp", "openai_compatible"}

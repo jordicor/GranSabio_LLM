@@ -20,6 +20,7 @@ from model_capability_registry import (
 from phrase_frequency_config import normalize_phrase_frequency_config
 from request_timeouts import clamp_client_timeout
 from schema_utils import validate_json_schema_complexity
+from shared_context import PromptCachePolicy
 from smart_edit import TextEditRange
 
 
@@ -1045,6 +1046,16 @@ class ExecutionPolicy(BaseModel):
 class ContentRequest(BaseModel):
     """Request model for content generation"""
     prompt: str = Field(..., min_length=10, max_length=MAX_PROMPT_CHARS, description="The content generation prompt")
+    prompt_cache: Optional[PromptCachePolicy] = Field(
+        default=None,
+        description=(
+            "Optional request-wide cache policy: auto preserves existing behavior; off disables writes; "
+            "explicit uses only the supplied generator prompt endpoints; adaptive uses supported "
+            "prefix controls per route, otherwise provider defaults. Breakpoints are positive, "
+            "exclusive Unicode code-point offsets in prompt (not bytes or UTF-16 units), sorted, "
+            "unique, at most four, and no greater than len(prompt)."
+        ),
+    )
     shared_context: Optional[str] = Field(
         default=None,
         max_length=MAX_SOURCE_TEXT_CHARS,
@@ -1588,6 +1599,18 @@ class ContentRequest(BaseModel):
             if not is_valid:
                 raise ValueError(error)
         return v
+
+    @model_validator(mode="after")
+    def _validate_prompt_cache_offsets(self):
+        """Validate original-prompt endpoints before any orchestration or provider work."""
+        if self.prompt_cache:
+            leading = len(self.prompt) - len(self.prompt.lstrip())
+            for offset in self.prompt_cache.breakpoints:
+                if not leading < offset <= len(self.prompt):
+                    raise ValueError(
+                        "prompt_cache.breakpoints must end after leading whitespace and within prompt"
+                    )
+        return self
 
     @model_validator(mode="after")
     def _validate_json_schema_not_empty_when_requested(self):

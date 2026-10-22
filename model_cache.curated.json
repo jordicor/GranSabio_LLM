@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "provider": "openai",
+      "models": ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-5", "gpt-5-mini", "gpt-5-nano"],
+      "automatic": "supported", "explicit_prefix": "unsupported", "explicit_only": "unsupported", "off": "unsupported",
+      "source": "https://developers.openai.com/api/docs/guides/prompt-caching", "verified_at": "2026-10-22"
+    },
+    {
+      "provider": "openai",
+      "models": ["gpt-5.6", "gpt-6", "gpt-6.1"],
+      "model_prefixes": ["gpt-5.6-", "gpt-6-", "gpt-6.1-"],
+      "automatic": "supported", "explicit_prefix": "supported", "explicit_only": "supported", "off": "supported",
+      "marker": "prompt_cache_breakpoint", "max_breakpoints": 4, "min_prefix_tokens": 1024, "ttl": "30m",
+      "source": "https://developers.openai.com/api/docs/guides/prompt-caching", "verified_at": "2026-10-22",
+      "note": "The implemented default is 30m on Chat/Responses; no opt-in to longer, more expensive writes. New generations require review."
+    },
+    {
+      "provider": "openrouter",
+      "models": ["openai/gpt-4o", "openai/gpt-4o-mini", "openai/gpt-4.1", "openai/gpt-4.1-mini", "openai/gpt-4.1-nano", "openai/gpt-5", "openai/gpt-5-mini", "openai/gpt-5-nano"],
+      "automatic": "supported", "explicit_prefix": "unsupported", "explicit_only": "unsupported", "off": "unsupported",
+      "source": "https://openrouter.ai/docs/guides/best-practices/prompt-caching", "verified_at": "2026-10-22"
+    },
+    {
+      "provider": "openrouter",
+      "models": ["openai/gpt-5.6", "openai/gpt-6", "openai/gpt-6.1"],
+      "model_prefixes": ["openai/gpt-5.6-", "openai/gpt-6-", "openai/gpt-6.1-"],
+      "automatic": "supported", "explicit_prefix": "supported", "explicit_only": "supported", "off": "supported",
+      "marker": "prompt_cache_breakpoint", "max_breakpoints": 4, "min_prefix_tokens": 1024, "ttl": "30m",
+      "source": "https://openrouter.ai/docs/guides/best-practices/prompt-caching", "verified_at": "2026-10-22"
+    },
+    {
+      "provider": "claude",
+      "automatic": "supported", "explicit_prefix": "supported", "explicit_only": "supported", "off": "supported",
+      "marker": "cache_control", "max_breakpoints": 4, "ttl": "5m",
+      "source": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching", "verified_at": "2026-10-22",
+      "note": "Automatic caching requires request-level opt-in. We use explicit blocks only. Minimum prefix length varies by model; no universal minimum is assumed."
+    },
+    {
+      "provider": "openrouter", "model_prefixes": ["anthropic/"],
+      "automatic": "supported", "explicit_prefix": "supported", "explicit_only": "supported", "off": "supported",
+      "marker": "cache_control", "max_breakpoints": 4, "ttl": "5m",
+      "source": "https://openrouter.ai/docs/guides/best-practices/prompt-caching", "verified_at": "2026-10-22",
+      "note": "Automatic caching requires opt-in. Minimum prefix length varies by model."
+    },
+    {
+      "provider": "gemini", "model_prefixes": ["gemini-2.5-", "gemini-3-", "gemini-3.1-", "gemini-3.6-", "gemini-3.8-", "gemini-4-"],
+      "automatic": "supported", "explicit_prefix": "unsupported", "explicit_only": "unsupported", "off": "unknown",
+      "source": "https://ai.google.dev/gemini-api/docs/caching", "verified_at": "2026-10-22",
+      "note": "Native inline prefix markers are not supported. Cache objects on eligible generateContent models need a separate lifecycle, which this transport does not implement."
+    },
+    {
+      "provider": "openrouter", "models": ["google/gemini-2.5-flash"],
+      "automatic": "supported", "explicit_prefix": "supported", "explicit_only": "unknown", "off": "unknown",
+      "marker": "cache_control", "boundary_selection": "last", "max_breakpoints": 1, "min_prefix_tokens": 1024, "ttl": "5m",
+      "source": "https://openrouter.ai/docs/guides/best-practices/prompt-caching", "verified_at": "2026-10-22",
+      "note": "OpenRouter manages cache objects; only the last user-content prefix is used. Implicit cache is not disabled."
+    },
+    {
+      "provider": "openrouter", "models": ["google/gemini-2.5-pro"],
+      "automatic": "supported", "explicit_prefix": "supported", "explicit_only": "unknown", "off": "unknown",
+      "marker": "cache_control", "boundary_selection": "last", "max_breakpoints": 1, "min_prefix_tokens": 4096, "ttl": "5m",
+      "source": "https://openrouter.ai/docs/guides/best-practices/prompt-caching", "verified_at": "2026-10-22",
+      "note": "OpenRouter manages cache objects; only the last user-content prefix is used. Implicit cache is not disabled."
+    },
+    {
+      "provider": "openrouter", "model_prefixes": ["moonshotai/"],
+      "automatic": "supported", "explicit_prefix": "unknown", "explicit_only": "unknown", "off": "unknown",
+      "source": "https://openrouter.ai/docs/guides/best-practices/prompt-caching", "verified_at": "2026-10-22",
+      "note": "No control is needed for automatic caching. A cache hit does not establish an off contract."
+    },
+    {
+      "provider": "openrouter",
+      "models": ["deepseek/deepseek-v3.2", "qwen/qwen3-max", "qwen/qwen-plus", "qwen/qwen3.6-plus", "qwen/qwen3-coder-plus", "qwen/qwen3-coder-flash"],
+      "automatic": "unknown", "explicit_prefix": "conditional", "explicit_only": "unknown", "off": "unknown",
+      "marker": "cache_control", "ttl": "5m",
+      "source": "https://openrouter.ai/docs/guides/best-practices/prompt-caching", "verified_at": "2026-10-22",
+      "note": "Explicit support is documented for the Alibaba endpoint. The current router cannot pin that endpoint; adaptive sends no controls and preserves routing."
+    },
+    {
+      "provider": "openrouter", "models": ["qwen/qwen3.5-plus-02-15", "qwen/qwen3.5-flash-02-23"],
+      "explicit_prefix": "unsupported", "explicit_only": "unsupported", "off": "unknown",
+      "source": "https://openrouter.ai/docs/guides/best-practices/prompt-caching", "verified_at": "2026-10-22",
+      "note": "These snapshot endpoints do not support explicit caching."
+    }
+  ]
+}

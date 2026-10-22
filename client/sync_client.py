@@ -110,22 +110,30 @@ class GranSabioClient:
         api_key: Optional[str] = None,
         timeout: tuple = DEFAULT_TIMEOUT,
         provider_keys: Optional[Dict[str, str]] = None,
+        request_headers: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize the Gran Sabio client.
 
         Args:
             base_url: API base URL (default: http://localhost:8000 or GRANSABIO_BASE_URL env)
-            api_key: Optional API key (default: GRANSABIO_API_KEY env)
+            api_key: Optional API key (None uses GRANSABIO_API_KEY; '' sends no Bearer)
             timeout: Request timeout tuple (connect_timeout, read_timeout)
             provider_keys: Optional dict of provider API keys as HTTP headers.
                 Only keys passed explicitly here are sent to the server; provider
                 credentials are never loaded implicitly from the environment.
+            request_headers: Extra HTTP headers copied for this client instance.
+                Authorization and Content-Type are reserved; provider_keys must not overlap.
         """
         self.base_url = (base_url or os.getenv("GRANSABIO_BASE_URL", self.DEFAULT_BASE_URL)).rstrip("/")
-        self.api_key = api_key or os.getenv("GRANSABIO_API_KEY")
+        self.api_key = os.getenv("GRANSABIO_API_KEY") if api_key is None else api_key
         self.timeout = timeout
         self.provider_keys = dict(provider_keys or {})
+        self.request_headers = dict(request_headers or {})
+        reserved = {"authorization", "content-type", *(name.lower() for name in self.provider_keys)}
+        names = [name.lower() for name in self.request_headers]
+        if reserved.intersection(names) or len(names) != len(set(names)):
+            raise ValueError("request_headers must not repeat Authorization, Content-Type or provider_keys")
         self._model_token_cache: Dict[str, int] = {}
         self._model_timeout_cache: Dict[str, int] = {}
         # Streaming failures of the last generate_streaming call. A stream is
@@ -134,12 +142,13 @@ class GranSabioClient:
         # generation the engine is still running.
         self.last_stream_errors: List[Dict[str, str]] = []
 
-    def _headers(self) -> Dict[str, str]:
+    def _headers(self, *, json_content: bool = True) -> Dict[str, str]:
         """Build request headers including provider API keys."""
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"} if json_content else {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         headers.update(self.provider_keys)
+        headers.update(self.request_headers)
         return headers
 
     def _request(
@@ -405,6 +414,7 @@ class GranSabioClient:
         *,
         request_id: Optional[str] = None,
         shared_context: Optional[str] = None,
+        prompt_cache: Optional[Dict[str, Any]] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -451,6 +461,7 @@ class GranSabioClient:
                 key is rejected with HTTP 409. An invalid key raises
                 ``ValueError`` before anything is sent.
             shared_context: Stable source data sent at user level before the task prompt.
+            prompt_cache: Cache policy (auto/off/explicit/adaptive); breakpoints count Unicode code points in prompt.
             **kwargs: Additional parameters passed to API
 
         Returns:
@@ -535,6 +546,8 @@ class GranSabioClient:
 
         if shared_context is not None:
             payload["shared_context"] = shared_context
+        if prompt_cache is not None:
+            payload["prompt_cache"] = prompt_cache
 
         # Additional kwargs
         payload.update(kwargs)
@@ -985,6 +998,7 @@ class GranSabioClient:
         on_session_start: Optional[Callable[[str], None]] = None,
         error_callback: Optional[Callable[[str, Exception], None]] = None,
         shared_context: Optional[str] = None,
+        prompt_cache: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -1124,6 +1138,8 @@ class GranSabioClient:
 
         if shared_context is not None:
             payload["shared_context"] = shared_context
+        if prompt_cache is not None:
+            payload["prompt_cache"] = prompt_cache
         payload.update(kwargs)
 
         # -----------------------------------------------------------------
@@ -1704,10 +1720,7 @@ class GranSabioClient:
         # but they must go through _request so connection/timeout failures map
         # to the documented GranSabioClientError/TransientGranSabioError
         # hierarchy instead of leaking raw requests exceptions.
-        headers = {}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        headers.update(self.provider_keys)
+        headers = self._headers(json_content=False)
 
         response = self._request(
             "POST",

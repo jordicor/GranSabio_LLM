@@ -96,13 +96,15 @@ def _candidate(content):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("nested_retry", [False, True])
-async def test_real_generation_builders_mark_initial_and_json_retry(monkeypatch, nested_retry):
+@pytest.mark.parametrize("mode", ["auto", "off", "explicit"])
+async def test_real_generation_builders_mark_initial_and_json_retry(monkeypatch, nested_retry, mode):
     request = ContentRequest(
         prompt="Generate JSON profile data.", shared_context="Complete separate evidence.",
         include_default_system_context=False, content_type="json", json_output=False,
         json_retry_without_iteration=nested_retry,
         generator_model="gpt-4o", max_iterations=1 if nested_retry else 2,
         qa_layers=[], feedback_memory_enabled=False, min_words=1, max_words=20,
+        prompt_cache={"mode": mode, "breakpoints": [13] if mode == "explicit" else []},
     )
     attachment = SimpleNamespace(record=SimpleNamespace(
         original_filename="facts.txt", mime_type="text/plain", size_bytes=32,
@@ -144,11 +146,18 @@ async def test_real_generation_builders_mark_initial_and_json_retry(monkeypatch,
         retry = calls[0]["prompt"] if nested_retry else candidate.await_args_list[1].kwargs["final_prompt"]
         words = build_word_count_instructions(request)
         legacy_initial = "\n\n".join(part.strip() for part in [context, request.prompt, words] if part)
-        assert isinstance(initial, CacheablePrompt)
         assert str(initial) == legacy_initial
-        assert initial.cache_breakpoints == retry.cache_breakpoints
-        assert initial == retry[:retry.cache_breakpoints[-1]]
-        assert initial[:initial.cache_breakpoints[0]] == context
+        if mode == "off":
+            assert type(initial) is type(retry) is str
+        else:
+            assert isinstance(initial, CacheablePrompt)
+            assert initial.cache_breakpoints == retry.cache_breakpoints
+            if mode == "auto":
+                assert initial == retry[:retry.cache_breakpoints[-1]]
+                assert initial[:initial.cache_breakpoints[0]] == context
+            else:
+                assert initial.cache_breakpoints == (len(context) + 2 + 13,)
+                assert initial[:initial.cache_breakpoints[0]] == context + "\n\n" + request.prompt[:13]
         assert "JSON" in retry[len(initial):]
         assert session["json_guard_failures"] == 1
         assert session["final_result"]["content"] == {"ok": True}

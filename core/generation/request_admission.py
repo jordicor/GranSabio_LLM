@@ -321,6 +321,12 @@ def resolve_long_text_mode(
             detail="shared_context is not supported with enabled Long Text Mode; set long_text_mode='off'.",
         )
 
+    if request.prompt_cache and request.prompt_cache.breakpoints:
+        raise HTTPException(
+            status_code=400,
+            detail="prompt_cache.breakpoints requires standard generation; set long_text_mode='off'.",
+        )
+
     resolved["enabled"] = True
     resolved["activation_reason"] = (
         f"Long Text Mode enabled ({requested_mode}) with a derived target of {derived_target_words} words."

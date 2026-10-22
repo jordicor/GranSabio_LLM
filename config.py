@@ -25,6 +25,7 @@ import context_budget
 
 # Use optimized JSON (3.6x faster than standard json)
 import json_utils as json
+from provider_capabilities import PromptCacheCapabilities
 from request_timeouts import (
     DEFAULT_PROCESS_TIMEOUT_SECONDS,
     coerce_timeout_retries,
@@ -1244,6 +1245,8 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         description="Directory to persist tracking data"
     )
 
+    MODEL_CACHE_CAPABILITIES: Dict[str, Any] = Field(default_factory=dict, exclude=True)
+
     # FastAPI Configuration
     APP_HOST: str = Field(default="0.0.0.0", description="FastAPI host")
     APP_PORT: int = Field(default=8000, description="FastAPI port")
@@ -1254,6 +1257,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         self.load_model_specifications()
         self.load_model_token_limits()
         self.load_model_family_floors()
+        self.load_model_cache_capabilities()
         self.load_request_timeout_settings()
         self.load_from_environment()
         self.setup_legacy_models()
@@ -1292,6 +1296,23 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         )
         self._validate_model_family_floors()
 
+    def load_model_cache_capabilities(self) -> None:
+        """Load tracked cache rules alongside the mutable discovery catalog."""
+        from model_capability_registry import validate_prompt_cache_rules
+
+        payload = _load_curated_json(_curated_repo_path(None, "model_cache.curated.json"), required=True)
+        validate_prompt_cache_rules(payload)
+        self.MODEL_CACHE_CAPABILITIES = payload
+
+    def get_prompt_cache_capabilities(self, provider: str, model_id: str) -> PromptCacheCapabilities:
+        """Return the resolved cache contract for this actual provider/model route."""
+        from model_capability_registry import get_prompt_cache_capabilities
+
+        return get_prompt_cache_capabilities(
+            specs=self.model_specs, rules=self.MODEL_CACHE_CAPABILITIES,
+            provider=provider, model_id=model_id,
+        )
+
     def load_request_timeout_settings(self) -> None:
         """Load central request-process timeout settings."""
 
@@ -1313,6 +1334,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         self.load_model_specifications()
         self.load_model_token_limits()
         self.load_model_family_floors()
+        self.load_model_cache_capabilities()
         self.OPENAI_MODELS = {}
         self.CLAUDE_MODELS = {}
         self.GEMINI_MODELS = {}

@@ -4,6 +4,7 @@ Analytics, documentation, and auxiliary API routes.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime
 from uuid import uuid4
 
@@ -212,6 +213,9 @@ async def get_model_info(model_name: str):
         "capabilities": model_data.get("capabilities", []),
         "special_features": model_data.get("special_features", []),
         "provider_capabilities": model_data.get("provider_capabilities", {}),
+        "prompt_cache_capabilities": asdict(config.get_prompt_cache_capabilities(
+            resolved["provider"], resolved["model_id"],
+        )),
         "supported_parameters": model_data.get("supported_parameters", []),
         "sync_metadata": model_data.get("sync_metadata", {}),
         "reasoning_effort": model_data.get("reasoning_effort", {}),

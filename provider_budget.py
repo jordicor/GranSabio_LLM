@@ -317,12 +317,15 @@ class ProviderBudget:
         tools = params.get("tools") or []
         if (set(params) - allowed or set(request_kwargs) - {"timeout"}
                 or params.get("model") != model or params.get("stream") is not True
-                or not isinstance(extra, Mapping) or set(extra) - {"provider", "transforms", "plugins", "reasoning"}
+                or not isinstance(extra, Mapping) or set(extra) - {"provider", "transforms", "plugins", "reasoning", "prompt_cache_options"}
                 or extra.get("transforms", []) != []
                 or extra.get("plugins", []) not in ([], [{"id": "context-compression", "enabled": False}])
                 or params.get("stream_options") != {"include_usage": True}
                 or not isinstance(messages, list) or not messages or not isinstance(tools, list)):
             raise ProviderBudgetError("This tool request has no configured spend bound.")
+        if ("prompt_cache_options" in extra
+                and extra["prompt_cache_options"] != {"mode": "explicit", "ttl": "30m"}):
+            raise ProviderBudgetError("This cache policy has no configured spend bound.")
         if "reasoning" in extra:
             reasoning = extra["reasoning"]
             # Effort shares the existing max_tokens ceiling; separate token budgets
@@ -339,8 +342,18 @@ class ProviderBudget:
         for message in messages:
             if (not isinstance(message, Mapping)
                     or set(message) - {"role", "content", "tool_calls", "tool_call_id", "name"}
-                    or message.get("role") not in {"system", "user", "assistant", "tool"}
-                    or (message.get("content") is not None and not isinstance(message["content"], str))):
+                    or message.get("role") not in {"system", "user", "assistant", "tool"}):
+                raise ProviderBudgetError("Only text tool-loop messages have a configured spend bound.")
+            content = message.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if (not isinstance(part, Mapping) or part.get("type") != "text"
+                            or not isinstance(part.get("text"), str)
+                            or set(part) - {"type", "text", "cache_control", "prompt_cache_breakpoint"}
+                            or ("cache_control" in part and part["cache_control"] != {"type": "ephemeral"})
+                            or ("prompt_cache_breakpoint" in part and part["prompt_cache_breakpoint"] != {"mode": "explicit"})):
+                        raise ProviderBudgetError("Only bounded text cache blocks are supported.")
+            elif content is not None and not isinstance(content, str):
                 raise ProviderBudgetError("Only text tool-loop messages have a configured spend bound.")
             calls = message.get("tool_calls") or []
             if not isinstance(calls, list) or any(

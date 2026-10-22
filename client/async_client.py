@@ -106,13 +106,14 @@ class AsyncGranSabioClient:
         timeout: Optional[aiohttp.ClientTimeout] = None,
         provider_keys: Optional[Dict[str, str]] = None,
         force_close: bool = False,
+        request_headers: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize the async Gran Sabio client.
 
         Args:
             base_url: API base URL (default: http://localhost:8000 or GRANSABIO_BASE_URL env)
-            api_key: Optional API key (default: GRANSABIO_API_KEY env)
+            api_key: Optional API key (None uses GRANSABIO_API_KEY; '' sends no Bearer)
             timeout: Request timeout configuration
             provider_keys: Optional provider API key headers. Only values passed
                 explicitly here are sent; provider credentials are never loaded
@@ -120,14 +121,21 @@ class AsyncGranSabioClient:
             force_close: Use a fresh connection for each HTTP request. Useful
                 when synchronous work can delay processing an idle server close;
                 avoids reusing that socket for a non-idempotent POST, without retries.
+            request_headers: Extra HTTP headers copied for this client instance.
+                Authorization and Content-Type are reserved; provider_keys must not overlap.
         """
         self.base_url = (base_url or os.getenv("GRANSABIO_BASE_URL", self.DEFAULT_BASE_URL)).rstrip("/")
-        self.api_key = api_key or os.getenv("GRANSABIO_API_KEY")
+        self.api_key = os.getenv("GRANSABIO_API_KEY") if api_key is None else api_key
         self.timeout = timeout or self.DEFAULT_TIMEOUT
         self.force_close = force_close
         self._session: Optional[aiohttp.ClientSession] = None
         self._owns_session = True
         self.provider_keys = dict(provider_keys or {})
+        self.request_headers = dict(request_headers or {})
+        reserved = {"authorization", "content-type", *(name.lower() for name in self.provider_keys)}
+        names = [name.lower() for name in self.request_headers]
+        if reserved.intersection(names) or len(names) != len(set(names)):
+            raise ValueError("request_headers must not repeat Authorization, Content-Type or provider_keys")
         self._model_token_cache: Dict[str, int] = {}
         self._model_timeout_cache: Dict[str, int] = {}
         # Streaming failures of the last generate_streaming call. A stream is
@@ -167,12 +175,13 @@ class AsyncGranSabioClient:
             )
         return self._session
 
-    def _headers(self) -> Dict[str, str]:
+    def _headers(self, *, json_content: bool = True) -> Dict[str, str]:
         """Build request headers including provider API keys."""
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"} if json_content else {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         headers.update(self.provider_keys)
+        headers.update(self.request_headers)
         return headers
 
     async def _request(
@@ -451,6 +460,7 @@ class AsyncGranSabioClient:
         *,
         request_id: Optional[str] = None,
         shared_context: Optional[str] = None,
+        prompt_cache: Optional[Dict[str, Any]] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -497,6 +507,7 @@ class AsyncGranSabioClient:
                 key is rejected with HTTP 409. An invalid key raises
                 ``ValueError`` before anything is sent.
             shared_context: Stable source data sent at user level before the task prompt.
+            prompt_cache: Cache policy (auto/off/explicit/adaptive); breakpoints count Unicode code points in prompt.
             **kwargs: Additional parameters passed to API
 
         Returns:
@@ -581,6 +592,8 @@ class AsyncGranSabioClient:
 
         if shared_context is not None:
             payload["shared_context"] = shared_context
+        if prompt_cache is not None:
+            payload["prompt_cache"] = prompt_cache
 
         # Additional kwargs
         payload.update(kwargs)
@@ -1221,10 +1234,7 @@ class AsyncGranSabioClient:
         # but they must go through _request so connection/timeout failures map
         # to the documented GranSabioClientError/TransientGranSabioError
         # hierarchy instead of leaking raw aiohttp exceptions.
-        headers = {}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        headers.update(self.provider_keys)
+        headers = self._headers(json_content=False)
 
         async with await self._request(
             "POST",
@@ -1664,6 +1674,7 @@ class AsyncGranSabioClient:
         on_session_start: Optional[Callable[[str], None]] = None,
         error_callback: Optional[Callable[[str, Exception], None]] = None,
         shared_context: Optional[str] = None,
+        prompt_cache: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """Generate content with real-time SSE streaming.
@@ -1777,6 +1788,8 @@ class AsyncGranSabioClient:
             gen_kwargs["max_tokens"] = max_tokens
         if shared_context is not None:
             gen_kwargs["shared_context"] = shared_context
+        if prompt_cache is not None:
+            gen_kwargs["prompt_cache"] = prompt_cache
         gen_kwargs.update(kwargs)
 
         # Start generation without waiting

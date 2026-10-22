@@ -50,7 +50,9 @@ def test_routing_exposes_validated_zero_cost_options(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         config_module.Config,
         "get_model_info",
-        lambda _self, _model: {"model_id": _model, "provider": "openrouter", "capabilities": ["text"]},
+        lambda _self, _model, *, require_api_key=True: {
+            "model_id": _model, "provider": "openrouter", "capabilities": ["text"],
+        },
     )
     route = resolve_call(
         "generation.main",

@@ -465,7 +465,7 @@ def _provider_key(model_info: Mapping[str, Any]) -> str:
 
 def _validate_known_model(model: str, call_id: str, config_obj: Any) -> Dict[str, Any]:
     try:
-        return config_obj.get_model_info(model)
+        return config_obj.get_model_info(model, require_api_key=False)
     except Exception as exc:
         model_lower = model.lower()
         if "embedding" in model_lower:

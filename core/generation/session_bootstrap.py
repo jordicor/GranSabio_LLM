@@ -24,6 +24,7 @@ class SessionBootstrapDeps:
     process_content_generation: Any
     logger: Any
     background_task_hook: Any = None
+    prepare_background_task: Any = None
 
 
 def build_session_payload(
@@ -243,16 +244,26 @@ async def finalize_generation_session(
             exc,
         )
 
-    task = await deps.cancellation_registry.create_task(
-        session_id,
-        "process_content_generation",
-        lambda: deps.process_content_generation(
+    def task_factory():
+        return deps.process_content_generation(
             session_id,
             request,
             resolved_attachments,
             attachment_manager,
             resolved_images,
-        ),
+        )
+
+    acceptance = GenerationInitResponse(
+        status="initialized", session_id=session_id, project_id=project_id,
+        request_name=getattr(request, "request_name", None),
+        recommended_timeout_seconds=recommended_timeout_seconds,
+        advisories=(long_text_advisories or None), auto_qa_plan=auto_qa_plan_payload,
+    )
+    if deps.prepare_background_task is not None:
+        task_factory = await deps.prepare_background_task(session_id, project_id, task_factory, acceptance)
+
+    task = await deps.cancellation_registry.create_task(
+        session_id, "process_content_generation", task_factory,
     )
     if task is None:
         return GenerationInitResponse(
@@ -268,12 +279,4 @@ async def finalize_generation_session(
     if deps.background_task_hook is not None:
         deps.background_task_hook(task)
 
-    return GenerationInitResponse(
-        status="initialized",
-        session_id=session_id,
-        project_id=project_id,
-        request_name=getattr(request, "request_name", None),
-        recommended_timeout_seconds=recommended_timeout_seconds,
-        advisories=(long_text_advisories or None),
-        auto_qa_plan=auto_qa_plan_payload,
-    )
+    return acceptance

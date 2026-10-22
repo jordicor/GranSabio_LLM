@@ -753,6 +753,17 @@ async def _discard_admission_session(
 
 
 async def _generate_content_once(request: ContentRequest):
+    """Keep request policy isolated while admission and background tasks inherit it."""
+    from shared_context import PromptCachePolicyError, prompt_cache_scope
+
+    with prompt_cache_scope(request.prompt_cache):
+        try:
+            return await _generate_content_once_with_cache_policy(request)
+        except PromptCachePolicyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+async def _generate_content_once_with_cache_policy(request: ContentRequest):
     """
     Generate content using the Gran Sabio LLM Engine
 
@@ -853,12 +864,17 @@ async def _generate_content_once(request: ContentRequest):
     def _ensure_model_known(model_name: str, field_label: str) -> None:
         """Validate that a model exists in model_specs.json, raising HTTP 400 otherwise."""
         try:
-            config.get_model_info(model_name)
+            model_info = config.get_model_info(model_name, require_api_key=False)
         except RuntimeError as exc:
             raise HTTPException(
                 status_code=400,
                 detail=f"Invalid {field_label} '{model_name}': {exc}",
             ) from exc
+        if request.prompt_cache and request.prompt_cache.mode != "auto":
+            from shared_context import validate_prompt_cache_support
+
+            if model_info["provider"] != "typesafe":
+                validate_prompt_cache_support(model_info["provider"], model_info["model_id"])
 
     _ensure_model_known(request.generator_model, "generator_model")
 
@@ -1189,6 +1205,12 @@ async def _generate_content_once(request: ContentRequest):
         except Exception as exc:
             logger.debug("Could not resolve preflight max_tokens for admission: %s", exc)
 
+    if request.prompt_cache and request.prompt_cache.mode != "auto":
+        if preflight_will_run and selected_preflight_model:
+            _ensure_model_known(selected_preflight_model, "preflight.validate")
+        if auto_qa_requested and auto_qa_admission_model:
+            _ensure_model_known(auto_qa_admission_model, "auto_qa.plan")
+
     technical_admission = await admission_helpers.run_technical_context_admission(
         request,
         request_fields_set=request_fields_set,
@@ -1363,6 +1385,7 @@ async def _generate_content_once(request: ContentRequest):
                 process_content_generation=process_content_generation,
                 logger=logger,
                 background_task_hook=_on_background_task_started,
+                prepare_background_task=getattr(app.state, "prepare_generation_task", None),
             ),
         )
     except LocalExecutionPolicyError as exc:
@@ -1416,6 +1439,8 @@ def _generation_request_fingerprint(request: ContentRequest) -> str:
     payload = request.model_dump(mode="json")
     if request.shared_context is None:
         payload.pop("shared_context", None)  # Preserve legacy request identities.
+    if request.prompt_cache is None or request.prompt_cache.mode == "auto":
+        payload.pop("prompt_cache", None)
     serialized = json.dumps(payload, sort_keys=True)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 

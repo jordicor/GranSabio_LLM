@@ -95,7 +95,7 @@ from services.attachment_manager import (
     ResolvedAttachment,
 )
 from services.runtime_console import bind_console_context, reset_console_context
-from shared_context import CacheablePrompt
+from shared_context import CacheablePrompt, PromptCachePolicy
 
 # Smart Edit imports (standalone module)
 from smart_edit import (
@@ -1051,6 +1051,7 @@ def _build_generation_prompt(
     variable_sections: List[str],
     *,
     cache_retry_prefix: bool,
+    prompt_cache: Optional[PromptCachePolicy] = None,
 ) -> str:
     """Keep the existing prompt text and mark reusable section ends.
 
@@ -1061,6 +1062,7 @@ def _build_generation_prompt(
     sections: List[str] = []
     breakpoints: List[int] = []
     length = 0
+    mode = prompt_cache.mode if prompt_cache else "auto"
 
     def append_sections(values: Iterable[str]) -> None:
         nonlocal length
@@ -1071,15 +1073,28 @@ def _build_generation_prompt(
                 sections.append(text)
 
     append_sections([context_prompt])
-    if length:
+    if length and mode == "auto":
         breakpoints.append(length)
-    append_sections(stable_sections)
-    if cache_retry_prefix and length:
+    for index, section in enumerate(stable_sections):
+        start = length + (2 if sections else 0)
+        append_sections([section])
+        if index == 0 and mode in {"explicit", "adaptive"}:
+            # The first stable section is the original request.prompt. Preserve
+            # existing strip/join behavior and translate its original endpoints.
+            leading = len(section) - len(section.lstrip())
+            text_length = len(section.strip())
+            breakpoints.extend(
+                start + min(offset - leading, text_length)
+                for offset in prompt_cache.breakpoints
+            )
+    if cache_retry_prefix and length and mode == "auto":
         breakpoints.append(length)
     append_sections(variable_sections)
     prompt = "\n\n".join(sections)
     if breakpoints:
-        return CacheablePrompt(prompt, breakpoints=tuple(dict.fromkeys(breakpoints)))
+        return CacheablePrompt(
+            prompt, breakpoints=tuple(dict.fromkeys(breakpoints)), explicit=mode in {"explicit", "adaptive"},
+        )
     return prompt
 
 
@@ -2797,6 +2812,7 @@ def _resolve_generation_reasoning_telemetry(
         getattr(request, "max_tokens", None),
         requested_effort,
         requested_thinking_budget,
+        require_api_key=False,
     )
     effective_effort = validation.get("adjusted_reasoning_effort")
     effective_thinking_budget = validation.get("adjusted_thinking_budget_tokens")
@@ -7081,6 +7097,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                 context_prompt,
                 stable_prompt_sections,
                 prompt_sections,
+                prompt_cache=request.prompt_cache,
                 cache_retry_prefix=(
                     request.max_iterations > 1
                     or (
@@ -7410,6 +7427,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                                 [request.prompt, word_instructions],
                                 [json_error_context],
                                 cache_retry_prefix=True,
+                                prompt_cache=request.prompt_cache,
                             )
 
                             # Regenerate content

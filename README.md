@@ -2,12 +2,12 @@
 
 ### Multi-Layer AI Quality Assurance for Content Generation
 
-**Your AI generates content but you can't trust it blindly?** Put Gran Sabio LLM in the middle. Multiple AI models evaluate, score, and approve every piece of content before it reaches you.
+**Your AI generates content but you can't trust it blindly?** Gran Sabio LLM coordinates generation and configurable review by multiple AI models. Results report the actual quality verdict; a completed generation or a run without QA does not imply reviewer approval.
 
 ---
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](#license)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com/)
 [![Self-Hosted](https://img.shields.io/badge/Self--Hosted-BYOK-orange.svg)](#self-hosting-bring-your-own-api-keys)
 
@@ -71,6 +71,118 @@ output schemas and idempotency rules remain unchanged. Ordinary one-shot text
 requests without attachments keep their original transport when no retry is
 configured. These boundaries reuse complete prefixes, not independent arbitrary
 chunks or previous answers.
+
+### Per-request prompt cache policy
+
+`POST /generate`, `generate()` and `generate_streaming()` accept `prompt_cache`.
+This changes cache controls only: the engine keeps the existing prompt rendering,
+message roles/order, selected models and provider routing.
+
+| Policy | Behavior |
+| --- | --- |
+| Omitted, `null`, or `{"mode": "auto"}` | Existing automatic boundaries and provider defaults. |
+| `{"mode": "off"}` | No cache writes anywhere in this request, including preflight, QA, retries and tools. |
+| `{"mode": "explicit", "breakpoints": [1200, 2400]}` | Write only at these endpoints in the existing generator `prompt`; suppress all engine-added boundaries and automatic suffix writes. |
+| `{"mode": "adaptive", "breakpoints": [1200, 2400]}` | Use supported prefix controls on each actual route; otherwise send no cache controls and retain provider defaults. Internal phases use their own existing source boundaries. |
+
+Breakpoints are **exclusive Unicode code-point offsets in the original `prompt`**:
+`n` ends the prefix `prompt[:n]` in Python. Use `len(prefix)` in Python or
+`Array.from(prefix).length` in JavaScript, not UTF-8 byte counts or JavaScript
+string `.length` (UTF-16 units). Supply at most four positive, strictly increasing,
+unique integers, each no larger than the original prompt length. Positions are
+not offsets in `shared_context`, system instructions, attachments or token IDs.
+The existing renderer trims outer whitespace; leading-whitespace-only endpoints
+are rejected, trailing-whitespace endpoints map to the trimmed end, and resulting
+duplicate endpoints merge. No whitespace is newly trimmed by the policy.
+
+```python
+# Keep the application's existing prompt and model/QA settings.
+result = await client.generate(prompt=existing_prompt, prompt_cache={"mode": "off"})
+
+result = await client.generate(
+    prompt=existing_prompt,
+    prompt_cache={"mode": "explicit", "breakpoints": [stable_prefix_end]},
+    long_text_mode="off",
+)
+```
+
+Each endpoint caches the **complete preceding provider prefix**, including earlier
+system instructions, tools and any existing context messages; it is not an
+independent text chunk. Only generator prompts use the supplied offsets. In strict
+`explicit` mode, other phases inherit the write policy with no automatic boundary. An empty explicit
+breakpoint list has the same write behavior as `off`. Provider minimum sizes,
+expiry and prefix equality still determine
+whether a marked prefix is written or reused.
+
+Strict `off` and `explicit` require a verified route contract: native Claude,
+the curated OpenAI GPT-5.6/6/6.1 families, and those models through OpenRouter.
+OpenAI (including through OpenRouter) receives
+`prompt_cache_options={"mode":"explicit","ttl":"30m"}` even with **no**
+breakpoints, preventing implicit writes of the rest. Claude receives only the
+requested `cache_control` blocks, with no automatic request-level cache control.
+Unsupported routes, including older OpenAI models, Gemini and generic router
+aliases, are rejected before their provider call rather than silently ignoring
+the policy. Predictable generation, QA, fallback and admission routes are checked
+before generation starts; conditional later routes are checked at dispatch.
+TypeSafe's non-token-based evaluation transport is unaffected. Enabled Long Text
+rejects nonempty breakpoints in both `explicit` and `adaptive`; use standard generation for these offsets.
+
+#### Adaptive policy and capability discovery
+
+`adaptive` is opt-in and does not change omitted/`auto` requests. The application
+still chooses its generator prefix endpoints. `shared_context` retains its existing
+user role and position and may receive a boundary on a compatible route. Preflight,
+Auto-QA and QA use only the stable source boundaries their own builders already
+produce; generator offsets are never applied to these prompts. No prompt is
+reordered, padded or interpreted to discover a prefix. Without any selected or
+existing source boundary, a route with explicit-only controls writes no prefix;
+a route without those controls keeps its provider defaults, which can include writes.
+
+The existing `GET /models/{model_name}` response includes `prompt_cache_capabilities`:
+independent `automatic`, `explicit_prefix`, `explicit_only` and `off` support states,
+their evidence sources/dates, marker transport, minimum prefix size when known,
+boundary limit/selection and implemented TTL. Unknown and conditional support are
+not treated as confirmed support. `explicit_prefix` means inline prefix controls;
+it does not mean support for a separate cache-object lifecycle. `transport_available`
+only describes the implemented wire format; capability conditions must also hold.
+
+| Route | `adaptive` behavior | Strict `off` / `explicit` |
+| --- | --- | --- |
+| Curated OpenAI GPT-5.6/6/6.1, native or OpenRouter | Explicit prefixes, 30-minute TTL; implicit suffix writes disabled | Supported |
+| Claude, native or OpenRouter | Explicit `cache_control` blocks with default 5-minute TTL | Supported |
+| OpenRouter Gemini 2.5 Flash/Pro | Last user-content prefix only; implicit caching stays provider-managed | Rejected: no verified disable/exclusive contract |
+| Native Gemini, older OpenAI, OpenRouter Moonshot/Kimi | Provider defaults; no extra cache controls | Rejected |
+| Selected OpenRouter Qwen/Alibaba models | Provider defaults: endpoint-specific support is conditional and routing is not changed | Rejected |
+| Other/new models, generic router aliases, local routes | Provider defaults; unknown controls are omitted | Rejected until verified |
+
+Caller endpoints take priority over an additional `shared_context` boundary when
+all four available slots are used. Gemini's last-boundary rule is applied explicitly
+and reported; the request API still accepts at most four caller endpoints. Minimum
+sizes are provider token counts, not character offsets: the engine does not add a
+token-count request, pad a short prefix or promise a cache hit.
+
+Each non-default transport records `requested`, `effective`, `reason`, applied
+boundary count and adaptations in the existing logger and matching usage callback's
+`prompt_cache` metadata. Effective values are `explicit`, `off`, `prefix` (implicit
+cache may remain active), or `provider_default`. These describe controls, not measured
+cache hits; use the normal read/write usage counters for actual reuse. No source text
+is logged. A provider failure never triggers a cache-policy fallback or extra generation.
+Normal retry/idempotency behavior is unchanged; `adaptive` and its endpoints are part
+of the request fingerprint, so changed policy requires a new request identity.
+
+`model_cache.curated.json` is a tracked, reviewed overlay loaded by the existing
+capability registry over optional `provider_capabilities.prompt_cache` catalog data.
+It reloads with the existing model-catalog reload; there are no runtime network
+lookups or background refresh services. Model sync preserves separate cache evidence
+dates rather than presenting its sync time as verification. Curated values win over
+catalog hints. Missing parameters or cache prices are not proof of unsupported or
+supported controls. Update bounded model rules from the corresponding official route
+contract; new wire protocols also require transport code and tests. Legacy `auto`
+retains its prior marker behavior for compatibility; it is not a capability certificate.
+
+Protocol references: [OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching),
+[OpenRouter prompt caching](https://openrouter.ai/docs/guides/best-practices/prompt-caching),
+[Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
 
 Long Text Mode requires its optional controller package. When it is absent,
 `long_text_mode="auto"` uses standard generation with the requested word limits
@@ -173,6 +285,26 @@ in ignored `model_limits.curated.local.json` and
 limit, the risk bands count serialized input plus reserved output and thinking
 tokens.
 
+`POST /context/preflight` sizes every participating model without generating
+content. There is no global context ceiling: `GRANSABIO_CONTEXT_POLICY_MAX_TOKENS`
+is retired and ignored. To use each model's full native window, send this policy:
+
+```json
+{
+  "schema_version": "gransabio_context_budget_policy.v1",
+  "context_fraction": 1.0,
+  "minimum_working_context_tokens": 1,
+  "safety_margin_fraction": 0.05
+}
+```
+
+An omitted or `null` `maximum_working_context_tokens` follows the model capacity;
+an explicit integer remains an optional per-request cap. Output/reasoning
+reservations, native input limits and the safety margin still reduce the usable
+input budget. The combined budget is limited by the smallest participating
+model. `GRANSABIO_CONTEXT_POLICY_SAFETY_MARGIN` sets the service's minimum margin
+(default `0.05`); callers may request a larger margin, but cannot reduce it.
+
 ---
 
 ### Session Debugger: Full Transparency
@@ -216,7 +348,12 @@ Define what "quality" means for YOUR use case:
 }
 ```
 
-QA scheduling is configurable through `qa_execution_mode`, `on_qa_model_unavailable`, `on_qa_timeout`, `min_valid_qa_models`, `min_valid_qa_model_ratio`, and `qa_replacement_policy`. The default `auto` mode uses progressive quorum for deal-breaker layers, so it may stop once a reliable quorum is guaranteed, and bounded parallel execution for normal scoring layers. Retryable QA provider failures use the bounded `MAX_QA_PROVIDER_RETRIES` budget before the evaluator is marked as a technical failure.
+QA scheduling is configurable through `qa_execution_mode`, `on_qa_model_unavailable`, `on_qa_timeout`, `min_valid_qa_models`, and `min_valid_qa_model_ratio`. The default `auto` mode uses progressive quorum for deal-breaker layers, so it may stop once a reliable quorum is guaranteed, and bounded parallel execution for normal scoring layers. Retryable QA provider failures use the bounded `MAX_QA_PROVIDER_RETRIES` budget before the evaluator is marked as a technical failure.
+
+The supervisor observes process health and reports recommendations; it does not
+replace evaluators. The legacy `qa_replacement_policy` field is accepted only
+with replacement and benching disabled. Enabling either is rejected during
+request validation.
 
 ### Request Timeouts
 
@@ -1138,7 +1275,7 @@ Gran Sabio LLM includes a **Model Context Protocol (MCP) server** that integrate
 
 **1. Install MCP dependencies:**
 ```bash
-pip install -r mcp/requirements.txt
+pip install -r mcp_server/requirements.txt
 ```
 
 **2. Run the installer script:**
@@ -1197,9 +1334,10 @@ Reviewed by: GPT-5-Codex, Claude Opus 4.5, GLM-4.7
 Consensus: 3/3 models agree
 ```
 
-### Remote/SaaS Configuration
+### Remote Engine Configuration
 
-For hosted Gran Sabio LLM instances:
+For a remote engine behind your own authenticated proxy (the engine itself
+does not validate this API key):
 ```bash
 claude mcp add gransabio-llm \
   --env GRANSABIO_API_URL=https://api.gransabio.example.com \
@@ -1207,7 +1345,7 @@ claude mcp add gransabio-llm \
   -- python /path/to/gransabio_mcp_server.py
 ```
 
-See full documentation: **[mcp/README.md](mcp/README.md)**
+See full documentation: **[mcp_server/README.md](mcp_server/README.md)**
 
 ---
 
@@ -1222,7 +1360,7 @@ Gran Sabio LLM is currently a **self-hosted solution**. You deploy it on your in
 | **API Keys** | You obtain and configure keys from OpenAI, Anthropic, Google, xAI, MiniMax, Moonshot/Kimi, and/or OpenRouter |
 | **Billing** | Each provider bills you directly based on your usage |
 | **Infrastructure** | You host and maintain the server |
-| **Data Privacy** | Your prompts and content stay on your infrastructure |
+| **Data Privacy** | You control storage and routing; selected remote providers receive the inputs needed for their calls |
 | **Models Available** | All models your API keys have access to, plus 200+ via OpenRouter |
 
 ### Why Self-Hosting?
@@ -1241,17 +1379,23 @@ Gran Sabio LLM is currently a **self-hosted solution**. You deploy it on your in
 - Recommended: 4GB RAM minimum
 - Pillow library (auto-installed, required for vision/image processing)
 
-**Quality assurance:** The codebase includes 950+ automated tests covering API endpoints, engines, client SDK, and integrations.
+**Quality assurance:** Automated tests cover API endpoints, engines, the client
+SDK, and integrations. Live provider tests are opt-in; a passing offline suite
+does not certify every provider or deployment.
 
 ### Production Deployment
 
 ```bash
 # With uvicorn
-uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
 
 # With gunicorn + uvicorn workers
-gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000
+gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000
 ```
+
+Use one worker for this deployment model: active sessions and generation tasks
+are held in process memory. Independent workers do not share that state, and
+restarting the process does not resume an in-flight generation.
 
 ### Security Model: No Built-In Authentication
 
@@ -1259,32 +1403,25 @@ Gran Sabio LLM does not include authentication, user management, or access contr
 
 This is a self-hosted engine meant to run on your own infrastructure, behind your own security perimeter (firewall, VPN, reverse proxy). Adding application-level auth would duplicate what your infrastructure already provides and add complexity that self-hosting users don't need.
 
-If you need multi-user access with authentication, billing, and user management, that's exactly what the upcoming **[Gran Sabio LLM Cloud](#coming-soon-gran-sabio-llm-cloud)** provides as a managed service.
+Multi-user product access, billing, and account management belong to the
+separately maintained **[hosted product](#hosted-gran-sabio)**.
 
 ### A Note on the Codebase
 
-The current development priority is the engine's core capabilities — generation quality, QA accuracy, and multi-model orchestration. These are the features that directly affect the output you get. Internal code structure and tooling refinements (containerization, CI/CD, etc.) are on the roadmap and will receive dedicated investment as the project grows, but they take a back seat to what matters most: the quality of results the engine delivers.
+This repository documents the engine's implemented generation, QA and
+orchestration features. Architecture proposals and historical audits are not
+commitments that an unimplemented option is available today.
 
 ---
 
-## Coming Soon: Gran Sabio LLM Cloud
+## Hosted Gran Sabio
 
-**Don't want to manage API keys and infrastructure?** A hosted version is in development.
+The hosted product is maintained separately from this open-source engine.
+Access, available features and commercial terms are announced through the
+product's own channels. The engine's HTTP API and MCP configuration do not
+promise a public commercial API, an active subscription offer or open signup.
 
-### What's Coming
-
-| Feature | Cloud Version |
-|---------|---------------|
-| **API Keys** | None required - we handle all provider connections |
-| **Setup** | Zero - just sign up and start making API calls |
-| **Billing** | Single subscription covers all AI providers |
-| **Models** | All supported models, always up to date |
-| **Features** | Everything in self-hosted, fully managed |
-| **Web Interface** | Polished, production-ready UI for non-developers |
-
-### Get Early Access
-
-Want to be notified when the Cloud version launches? **Star this repo** and **follow me on [GitHub](https://github.com/jordicor)** or my social media channels - I'll announce early access there first.
+Follow development on [GitHub](https://github.com/jordicor).
 
 *Self-hosting will always remain available for those who prefer full control.*
 
@@ -1362,7 +1499,7 @@ The result: a name that immediately tells you what you're getting - an AI conten
 This project is actively developed. If you find it useful:
 
 - **Star this repo** to follow updates and new features
-- **Follow me on social media** for development insights, AI tips, and early announcements about the upcoming Cloud version
+- **Follow me on social media** for development insights, AI tips, and product announcements
 
 Find my social links on my [GitHub profile](https://github.com/jordicor).
 
@@ -1370,7 +1507,8 @@ Find my social links on my [GitHub profile](https://github.com/jordicor).
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+The project declares MIT licensing. This source snapshot does not include a
+standalone license text.
 
 ---
 

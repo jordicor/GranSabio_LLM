@@ -17,6 +17,14 @@ SDK 1.3.0 includes original-request session evidence (`get_session_details`) and
 
 Importing the SDK does not load `.env` or mutate the process environment. Both clients read `GRANSABIO_BASE_URL` and `GRANSABIO_API_KEY` when instantiated; explicit constructor arguments take precedence. Provider credentials are forwarded only through explicit `provider_keys`.
 
+Both clients accept optional `request_headers` for a gateway's per-request
+metadata. The constructor copies the mapping for that client instance and sends
+it on normal requests, streams and multipart uploads. `Authorization`,
+`Content-Type`, and headers already supplied through `provider_keys` are rejected
+case-insensitively. Set `api_key=""` to explicitly omit the engine Bearer header;
+`api_key=None` retains the environment fallback. Keep private headers in the
+calling server and create a separate client when the request scope changes.
+
 Applications own environment-file loading. If your executable uses a file, load an explicit path before importing configuration-dependent modules and keep process variables authoritative:
 
 ```python
@@ -30,6 +38,29 @@ from client import GranSabioClient
 `python-dotenv` is an application dependency when using this optional pattern; it is not required by the SDK. The twelve repository demo scripts explicitly load the repository `.env` and require the repository's demo dependencies. Embedded hosts supply their own environment and do not inherit the SDK repository's `.env`. Server/SaaS settings retain their own explicit bootstrap.
 
 ## Quick Start
+
+Both clients accept `prompt_cache` in `generate()` and `generate_streaming()`:
+
+```python
+result = client.generate(existing_prompt, prompt_cache={"mode": "off"})
+result = client.generate(
+    existing_prompt,
+    prompt_cache={"mode": "adaptive", "breakpoints": [stable_prefix_end]},
+    long_text_mode="off",
+)
+```
+
+Omitting the policy or using `{"mode": "auto"}` preserves existing behavior.
+`off` suppresses provider writes throughout the request. `explicit` writes only at
+the supplied generator-prefix endpoints and disables automatic writes elsewhere.
+`adaptive` applies available prefix controls for each model, including the source
+boundaries already built by internal phases, and otherwise preserves provider defaults.
+It never changes models/routing or retries a failed call with another cache policy.
+Inspect `GET /models/{model_name}` → `prompt_cache_capabilities` for route support.
+Endpoints count Unicode code points from the start of the original `prompt`
+(`prompt[:n]`, exclusive), not bytes or UTF-16 units; there may be up to four,
+positive, sorted and unique. The text, message order and models stay unchanged.
+See the [full policy, whitespace rules and supported providers](../README.md#per-request-prompt-cache-policy).
 
 ### Synchronous Client
 
@@ -396,6 +427,6 @@ for provider, model_list in models.items():
 
 ## See Also
 
-- `demos/` - Example scripts demonstrating various features
-- `CLAUDE.md` - Architecture documentation
+- [Demos](../demos/README.md) - Example scripts demonstrating various features
+- [Engine README](../README.md) - Public behavior and configuration
 - API docs at `http://localhost:8000/api-docs`

@@ -854,6 +854,37 @@ async def test_tool_missing_usage_exhausts_cap_before_another_http_attempt(servi
     assert len(sent) == 1 and rows(service.provider_budget)[0]["state"] == "uncertain"
 
 
+@pytest.mark.parametrize("mode", ["off", "explicit"])
+def test_cache_policy_keeps_tool_spend_bound_and_transcript(service, mode):
+    from shared_context import CacheablePrompt, PromptCachePolicy, prepend_user_context, prompt_cache_scope
+
+    model = "openai/gpt-6-luna"
+    service.provider_budget = ProviderBudget(replace(
+        service.provider_budget.policy, model=model,
+        path=service.provider_budget.policy.path.with_name("cache-policy.sqlite"),
+    ))
+    with prompt_cache_scope(PromptCachePolicy(mode=mode)):
+        messages = prepend_user_context(
+            [{"role": "user", "content": CacheablePrompt("stable prefix and task", (13,), explicit=True)}],
+            None, provider="openrouter", model_id=model,
+        )
+        params = service._build_openai_compatible_tool_params(
+            provider="openrouter", model_id=model, current_messages=messages,
+            temperature=0.2, max_tokens=100, reasoning_effort=None,
+            json_output=False, json_schema=None, tools_enabled=True,
+        )
+        params.update(stream=True, stream_options={"include_usage": True})
+        with service.provider_budget.tool_dispatch(
+            provider="openrouter", model=model, params=params, request_kwargs={},
+        ) as (bounded, reservation):
+            assert bounded["messages"] == messages
+            assert bounded["extra_body"]["prompt_cache_options"] == {"mode": "explicit", "ttl": "30m"}
+            assert bounded["extra_body"]["provider"]["allow_fallbacks"] is False
+            assert reservation.upper_micro_usd < 1000
+            service.provider_budget.settle(reservation, raw_usage())
+    assert rows(service.provider_budget)[0]["state"] == "settled"
+
+
 @pytest.mark.asyncio
 async def test_tool_cancellation_closes_sdk_stream_and_keeps_reservation(service):
     class WireBytes(httpx.AsyncByteStream):
@@ -889,6 +920,10 @@ async def test_tool_cancellation_closes_sdk_stream_and_keeps_reservation(service
     {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "wire"}}]}]},
     {"tools": [{"type": "function", "function": {"name": "audit_accent"}}]},
     {"extra_body": {"plugins": [{"id": "web"}]}}, {"modalities": ["audio"]}, {"n": 2},
+    {"extra_body": {"prompt_cache_options": {"mode": "explicit", "ttl": "24h"}}},
+    {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "wire", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+    ]}]},
     *({"extra_body": {"reasoning": reasoning}} for reasoning in (
         None, {}, "medium", {"effort": True}, {"effort": []}, {"effort": "unknown"},
         {"effort": "medium", "max_tokens": 1000}, {"effort": "medium", "mode": "pro"},

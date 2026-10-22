@@ -812,6 +812,18 @@ def test_provider_spec_preserves_remote_text_only_capabilities_for_non_reasoning
     assert spec["sync_metadata"]["needs_review"] is True
 
 
+def test_sync_preserves_cache_evidence_date(service):
+    """A model catalog refresh must not redate a cache contract as reverified."""
+    evidence = {"explicit_prefix": "unknown", "verified_at": "2026-10-01"}
+    current = {"provider_capabilities": {"prompt_cache": evidence}}
+    result = service._build_provider_spec("openrouter", {
+        "model_id": "vendor/model", "context_window": 8192, "output_tokens": 1024,
+        "supported_parameters": ["tools"],
+    }, current)
+    assert result["provider_capabilities"]["prompt_cache"] == evidence
+    assert result["sync_metadata"]["last_synced_at"] != evidence["verified_at"]
+
+
 def test_openrouter_merge_preserves_supported_parameters_for_local_only(service):
     merged = service._merge_remote_with_local("openrouter", [])
 

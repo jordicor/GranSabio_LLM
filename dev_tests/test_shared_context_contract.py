@@ -36,6 +36,7 @@ def test_default_identity_matches_legacy_serialization_and_changed_source_confli
     legacy = request()
     payload = legacy.model_dump(mode="json")
     payload.pop("shared_context")
+    payload.pop("prompt_cache")
     expected = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
     assert _generation_request_fingerprint(legacy) == expected
     assert _generation_request_fingerprint(request(shared_context=None)) == expected

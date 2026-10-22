@@ -35,6 +35,23 @@ class CapabilityState:
 
 
 @dataclass(frozen=True)
+class PromptCacheCapabilities:
+    """Cache contract for one provider/model route, not evidence of a cache hit."""
+
+    automatic: CapabilityState
+    explicit_prefix: CapabilityState
+    explicit_only: CapabilityState
+    off: CapabilityState
+    marker: Optional[str] = None
+    max_breakpoints: Optional[int] = None
+    min_prefix_tokens: Optional[int] = None
+    ttl: Optional[str] = None
+    boundary_selection: str = "all"
+    transport_available: bool = False
+    rule_version: int = 1
+
+
+@dataclass(frozen=True)
 class ModelCapabilities:
     provider: str
     model_id: str

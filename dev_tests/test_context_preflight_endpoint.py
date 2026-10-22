@@ -408,7 +408,7 @@ def _assert_client_contract(response: dict, payload: dict) -> None:
             max(
                 int(policy["minimum_working_context_tokens"]),
                 min(
-                    int(policy["maximum_working_context_tokens"]),
+                    int(policy.get("maximum_working_context_tokens") or context_window),
                     math.floor(float(policy["context_fraction"]) * context_window),
                 ),
             ),
@@ -1122,8 +1122,12 @@ def test_unknown_routed_model_is_malformed_like_generate():
         context_preflight.build_context_preflight_response(payload)
 
 
-def test_output_overflow_rejected():
-    payload = _payload(model="tiny-model", max_tokens=8192)  # tiny allows only 4096 out
+@pytest.mark.parametrize("maximum", [65536, None])
+def test_output_overflow_rejected(maximum):
+    payload = _payload(
+        model="tiny-model", max_tokens=8192,  # tiny allows only 4096 out
+        context_budget_policy=_policy(maximum_working_context_tokens=maximum),
+    )
     response = context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is False
     assert response["rejection"]["code"] == "output_budget_exceeds_model_limit"
@@ -1131,11 +1135,13 @@ def test_output_overflow_rejected():
     _assert_client_contract(response, payload)
 
 
-def test_tiny_window_prompt_too_large():
+@pytest.mark.parametrize("maximum", [65536, None])
+def test_tiny_window_prompt_too_large(maximum):
     payload = _payload(
         model="tiny-model",
         max_tokens=4096,
         source_text="z" * 200_000,
+        context_budget_policy=_policy(maximum_working_context_tokens=maximum),
     )
     response = context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is False
@@ -1144,12 +1150,61 @@ def test_tiny_window_prompt_too_large():
     _assert_client_contract(response, payload)
 
 
-def test_policy_mismatch_rejected():
-    ceiling = context_preflight.OperationalPolicy.configured().maximum_working_context_tokens
-    payload = _payload(context_budget_policy=_policy(maximum_working_context_tokens=ceiling + 1))
+@pytest.mark.parametrize("configured,requested", [(0.05, 0.04), (0.08, 0.05)])
+def test_minimum_safety_margin_enforced_without_service_ceiling(monkeypatch, configured, requested):
+    monkeypatch.setenv("GRANSABIO_CONTEXT_POLICY_SAFETY_MARGIN", str(configured))
+    payload = _payload(context_budget_policy=_policy(
+        maximum_working_context_tokens=None, safety_margin_fraction=requested,
+    ))
     response = context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is False
     assert response["rejection"]["code"] == "context_budget_policy_mismatch"
+    _assert_client_contract(response, payload)
+
+
+@pytest.mark.parametrize("context_window", [262144, 1050000, 2000000])
+def test_model_capacity_replaces_retired_service_ceiling(monkeypatch, context_window):
+    monkeypatch.setenv("GRANSABIO_CONTEXT_POLICY_MAX_TOKENS", "262144")
+    monkeypatch.setitem(FAKE_LIMITS, "gen-model", _limits(
+        context_window=context_window, max_input=context_window - 128000,
+        max_output=128000,
+    ))
+    payload = _payload(max_tokens=32768, context_budget_policy=_policy(
+        context_fraction=1, minimum_working_context_tokens=1,
+        maximum_working_context_tokens=None,
+    ))
+    response = context_preflight.build_context_preflight_response(payload)
+    assert response["accepted"] is True
+    assert response["working_context_tokens"] == context_window
+    generator = response["participants"][0]
+    assert generator["reserved_context_tokens"] == 32768
+    assert generator["safety_margin_tokens"] == math.ceil(context_window * 0.05)
+    assert generator["usable_input_tokens"] == context_window - 128000
+    _assert_client_contract(response, payload)
+
+
+def test_omitted_maximum_uses_each_participants_native_window():
+    policy = _policy(context_fraction=1, minimum_working_context_tokens=1)
+    del policy["maximum_working_context_tokens"]
+    payload = _payload(
+        context_budget_policy=policy,
+        qa_models=["qa-model-a", "qa-model-b"], qa_layers=[_qa_layer()],
+    )
+    response = context_preflight.build_context_preflight_response(payload)
+    assert response["accepted"] is True
+    assert response["working_context_tokens"] == 200000
+    assert {p["working_context_tokens"] for p in response["participants"]} == {200000, 1000000}
+    _assert_client_contract(response, payload)
+
+
+def test_explicit_ceiling_above_model_capacity_is_clamped_to_model(monkeypatch):
+    monkeypatch.setenv("GRANSABIO_CONTEXT_POLICY_MAX_TOKENS", "262144")
+    payload = _payload(context_budget_policy=_policy(
+        context_fraction=1, maximum_working_context_tokens=2000000,
+    ))
+    response = context_preflight.build_context_preflight_response(payload)
+    assert response["accepted"] is True
+    assert response["working_context_tokens"] == 1000000
     _assert_client_contract(response, payload)
 
 
@@ -1224,6 +1279,13 @@ def test_unknown_policy_schema_is_malformed():
     payload = _payload(
         context_budget_policy=_policy(schema_version="consumer_policy.v99")
     )
+    with pytest.raises(context_preflight.MalformedRequest):
+        context_preflight.build_context_preflight_response(payload)
+
+
+@pytest.mark.parametrize("maximum", [0, -1, "not-a-number", float("inf")])
+def test_invalid_explicit_maximum_is_malformed(maximum):
+    payload = _payload(context_budget_policy=_policy(maximum_working_context_tokens=maximum))
     with pytest.raises(context_preflight.MalformedRequest):
         context_preflight.build_context_preflight_response(payload)
 
@@ -1350,3 +1412,116 @@ def test_context_preflight_preserves_exact_generator_system_prompt(
         assert "\n\nCurrent date:" in counted_system
     else:
         assert counted_system == system_prompt
+
+
+@pytest.mark.parametrize("qa_active,fallback", [
+    (False, False), (False, True), (True, False), (True, True),
+])
+def test_shared_context_is_counted_once_for_each_chat_participant(
+    qa_active: bool, fallback: bool,
+) -> None:
+    source = 'Complete shared evidence.\nQuoted observation: "verified".\n' * 20
+    payload = _payload(
+        gran_sabio_fallback=fallback,
+        source_text="A separate legacy source remains present.",
+        qa_layers=[_qa_layer()] if qa_active else [],
+    )
+    baseline = context_preflight.build_context_preflight_response(payload)
+    sourced = {**payload, "shared_context": source}
+    response = context_preflight.build_context_preflight_response(sourced)
+    specs = context_preflight._build_participant_specs(sourced)
+    expected_kinds = {"generator", "prompt_preflight"}
+    if qa_active:
+        expected_kinds.update({"qa_evaluator", "arbiter", "gran_sabio_review"})
+    if fallback:
+        expected_kinds.update({
+            "gran_sabio_review", "gran_sabio_regeneration", "gran_sabio_fallback",
+        })
+    assert {spec.participant_kind for spec in specs} == expected_kinds
+    assert baseline["accepted"] is response["accepted"] is True
+    baseline_by_name = {item["participant"]: item for item in baseline["participants"]}
+    response_by_name = {item["participant"]: item for item in response["participants"]}
+    for spec in specs:
+        assert spec.call_kind == "chat"
+        evidence = [item for item in spec.fixed_components if item[0] == "shared_context"]
+        assert evidence == [("shared_context", source, "prose")]
+        assert all(source not in text for name, text, _hint in spec.fixed_components
+                   if name != "shared_context")
+        before = baseline_by_name[spec.participant]
+        after = response_by_name[spec.participant]
+        capacity = context_preflight._resolve_capacity(spec.requested_model)
+        source_tokens = context_preflight.context_budget.make_payload_component(
+            "shared_context", source, "message", capacity.provider,
+            capacity.effective_model, "prose", keep_text=False,
+        ).tokens_estimate
+        assert source_tokens > 0
+        assert after["fixed_input_tokens"] - before["fixed_input_tokens"] == source_tokens
+        assert before["evidence_tokens"] - after["evidence_tokens"] == source_tokens
+    _assert_client_contract(response, sourced)
+
+
+def test_shared_context_stays_inside_the_single_system_one_qa_payload() -> None:
+    source = 'Full shared evidence.\nQuoted observation: "verified".\n' * 20
+    payload = _payload(
+        shared_context=source,
+        source_text="Independent legacy reference data.",
+        qa_models=["jev-latest", "qa-model-a"],
+        qa_global_config={"max_tokens": 2048},
+        qa_layers=[_qa_layer(), {
+            **_qa_layer("Detailed fidelity"),
+            "criteria": "Check the supplied reference in full. " * 20,
+        }],
+    )
+    specs = context_preflight._build_participant_specs(payload)
+    typed = next(spec for spec in specs if spec.participant == "qa:1")
+    assert typed.call_kind == "system_one"
+    assert len(typed.fixed_components) == 1
+    name, encoded, hint = typed.fixed_components[0]
+    assert name == "system_one_request"
+    assert hint == "json"
+    state = context_preflight.json.loads(encoded)["state"]
+    assert state["shared_context"] == source
+    assert state["source_text"] == payload["source_text"]
+    assert state["original_prompt"] == payload["prompt"]
+    response = context_preflight.build_context_preflight_response(payload)
+    assert response["accepted"] is True
+    reported = next(item for item in response["participants"]
+                    if item["participant"] == typed.participant)
+    expected_tokens = context_preflight.context_budget.make_payload_component(
+        name, encoded, "message", "typesafe", "jev-latest", hint,
+        keep_text=False,
+    ).tokens_estimate
+    assert reported["fixed_input_tokens"] == expected_tokens
+    assert reported["output_tokens"] == 0
+    _assert_client_contract(response, payload)
+
+
+@pytest.mark.parametrize("shared_context", [None, ""])
+def test_empty_shared_context_preserves_legacy_component_accounting(shared_context) -> None:
+    baseline = _payload()
+    payload = {**baseline, "shared_context": shared_context}
+    specs = context_preflight._build_participant_specs(payload)
+    baseline_specs = context_preflight._build_participant_specs(baseline)
+    for actual, previous in zip(specs, baseline_specs, strict=True):
+        assert all(name != "shared_context" for name, _text, _hint in actual.fixed_components)
+        if actual.participant != "preflight:validator":
+            assert actual == previous
+    # Null/empty values are not transported as source data by existing runtime
+    # calls; retain their prior metadata serialization rather than changing it.
+    fields = context_preflight.json.loads(context_preflight._serialized_request_skeleton(payload))
+    assert fields["shared_context"] == shared_context
+    assert "shared_context" not in context_preflight.json.loads(
+        context_preflight._serialized_request_skeleton(baseline)
+    )
+
+
+def test_oversized_shared_context_rejects_the_generator_budget() -> None:
+    payload = _payload(model="tiny-model", max_tokens=1024)
+    assert context_preflight.build_context_preflight_response(payload)["accepted"] is True
+    payload["shared_context"] = "Complete reference data retained without truncation.\n" * 2000
+    response = context_preflight.build_context_preflight_response(payload)
+    assert response["accepted"] is False
+    assert response["rejection"]["code"] == "prompt_too_large"
+    assert response["rejection"]["participant"] == "generator"
+    generator = next(item for item in response["participants"] if item["participant"] == "generator")
+    assert generator["evidence_tokens"] < 0
