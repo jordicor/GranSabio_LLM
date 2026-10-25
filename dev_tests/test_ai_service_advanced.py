@@ -1217,6 +1217,9 @@ class TestOpenRouterTemperatureParams:
     @pytest.mark.parametrize(
         "model_id",
         [
+            "anthropic/claude-opus-5.5",
+            "anthropic/claude-future",
+            "openai/gpt-6-luna",
             "anthropic/claude-fable-5",
             "anthropic/claude-mythos-5",
             "anthropic/claude-opus-4.7",
@@ -1225,7 +1228,7 @@ class TestOpenRouterTemperatureParams:
             "~anthropic/claude-fable-latest",
         ],
     )
-    async def test_generate_openrouter_does_not_send_temperature_for_restricted_claude(
+    async def test_generate_openrouter_omits_temperature_for_new_models(
         self,
         ai_service_instance,
         model_id,
@@ -1254,21 +1257,35 @@ class TestOpenRouterTemperatureParams:
         assert request_kwargs["max_tokens"] == 64
         assert "temperature" not in request_kwargs
 
-    def test_openrouter_tool_params_omit_temperature_for_restricted_opus(self, ai_service_instance):
+    @pytest.mark.parametrize(
+        "provider,model_id,allowed",
+        [
+            ("openai", "gpt-4o-mini", True),
+            ("openai", "o3", False),
+            ("openai", "gpt-6-luna", False),
+            ("openai", "gpt-future", False),
+            ("openrouter", "openai/gpt-6-luna", False),
+            ("openrouter", "anthropic/claude-opus-5.5", False),
+        ],
+    )
+    def test_tool_params_apply_temperature_policy(self, ai_service_instance, provider, model_id, allowed):
         params = ai_service_instance._build_openai_compatible_tool_params(
-            provider="openrouter",
-            model_id="anthropic/claude-opus-4.8",
+            provider=provider,
+            model_id=model_id,
             current_messages=[{"role": "user", "content": "Hello"}],
             temperature=0.4,
             max_tokens=64,
             reasoning_effort=None,
             json_output=False,
             json_schema=None,
-            tools_enabled=False,
+            tools_enabled=True,
         )
 
-        assert params["model"] == "anthropic/claude-opus-4.8"
-        assert "temperature" not in params
+        assert params["model"] == model_id
+        assert ("temperature" in params) is allowed
+        if allowed:
+            assert params["temperature"] == 0.4
+        assert params["tools"] == [ai_service_instance._build_openai_validation_tool_schema()]
 
     def test_openrouter_tool_params_omit_temperature_for_kimi_27(self, ai_service_instance):
         params = ai_service_instance._build_openai_compatible_tool_params(
@@ -1441,6 +1458,8 @@ class TestClaudeAdaptiveModelCompatibility:
             "claude-opus-4-7",
             "claude-opus-4-8",
             "claude-sonnet-5",
+            "claude-opus-5-5",
+            "claude-future",
         ],
     )
     def test_direct_claude_restricted_models_omit_sampling_params(self, model_id):
@@ -1457,6 +1476,7 @@ class TestClaudeAdaptiveModelCompatibility:
             "claude-mythos-5",
             "claude-opus-4-8",
             "claude-sonnet-5",
+            "claude-opus-5-5",
         ],
     )
     async def test_generate_claude_omits_restricted_params_by_default(
@@ -1487,6 +1507,7 @@ class TestClaudeAdaptiveModelCompatibility:
         request_kwargs = create.await_args.kwargs
         assert request_kwargs["model"] == model_id
         assert "temperature" not in request_kwargs
+        assert "temperature" not in request_kwargs.get("extra_body", {})
         assert "thinking" not in request_kwargs
 
     @pytest.mark.asyncio
@@ -1497,6 +1518,7 @@ class TestClaudeAdaptiveModelCompatibility:
             "claude-mythos-5",
             "claude-opus-4-8",
             "claude-sonnet-5",
+            "claude-opus-5-5",
         ],
     )
     async def test_generate_claude_translates_manual_thinking_budget_to_adaptive(
@@ -1527,6 +1549,7 @@ class TestClaudeAdaptiveModelCompatibility:
         request_kwargs = create.await_args.kwargs
         assert request_kwargs["thinking"] == {"type": "adaptive"}
         assert "temperature" not in request_kwargs
+        assert "temperature" not in request_kwargs.get("extra_body", {})
 
     @pytest.mark.asyncio
     async def test_generate_claude_uses_output_config_effort_for_opus_48(self, ai_service_instance):
@@ -1553,6 +1576,30 @@ class TestClaudeAdaptiveModelCompatibility:
         request_kwargs = create.await_args.kwargs
         assert request_kwargs["output_config"]["effort"] == "max"
         assert request_kwargs["thinking"] == {"type": "adaptive"}
+
+
+    def test_unknown_sampling_support_does_not_imply_adaptive_thinking(self):
+        assert AIService._claude_omits_sampling_params("claude-future") is True
+        assert AIService._claude_uses_adaptive_thinking_only("claude-future") is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model_id,allowed", [("claude-opus-4-6", True), ("claude-opus-5-5", False)])
+    async def test_stream_claude_applies_temperature_policy(self, ai_service_instance, model_id, allowed):
+        stream = Mock(return_value=_FakeClaudeStream([
+            SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(type="text_delta", text="ok")),
+            _claude_message_delta("end_turn"),
+        ], final_response=SimpleNamespace(usage=None, stop_reason="end_turn")))
+        ai_service_instance.anthropic_client = SimpleNamespace(messages=SimpleNamespace(stream=stream))
+
+        chunks = [chunk async for chunk in ai_service_instance._stream_claude(
+            prompt="Hello", model_id=model_id, temperature=0.4, max_tokens=64,
+            system_prompt="System", extra_verbose=False,
+        )]
+
+        assert "".join(str(chunk) for chunk in chunks) == "ok"
+        params = stream.call_args.kwargs
+        assert "temperature" not in params
+        assert params.get("extra_body", {}).get("temperature") == (0.4 if allowed else None)
 
 
 class TestNonStreamingFinishReasonHandling:
@@ -5564,6 +5611,32 @@ class TestProviderResourceLifecycle:
 
         assert received == ["partial"]
         stream.aclose.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model_id,allowed", [("gpt-4o-mini", True), ("gpt-future", False)])
+    async def test_logprobs_applies_temperature_policy(self, ai_service_instance, mock_config, model_id, allowed):
+        mock_config.model_specs = {}
+        mock_config.get_model_info.side_effect = None
+        mock_config.get_model_info.return_value = {
+            "provider": "openai", "model_id": model_id,
+            "provider_capabilities": {"logprobs": True},
+        }
+        create = AsyncMock(return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"), logprobs=None)],
+            usage=None,
+        ))
+        ai_service_instance.openai_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+        with patch.object(ai_service_instance, "_admit_chat_call", new=AsyncMock()), \
+             patch.object(ai_service_instance, "_record_provider_health_success", new=AsyncMock()):
+            content, _ = await ai_service_instance.generate_with_logprobs(
+                prompt="Hello", model=model_id, temperature=0.4,
+            )
+
+        assert content == "ok"
+        params = create.await_args.kwargs
+        assert params["logprobs"] is True
+        assert params.get("temperature") == (0.4 if allowed else None)
 
     @pytest.mark.asyncio
     async def test_logprobs_runtime_rejects_o4_from_central_capability(

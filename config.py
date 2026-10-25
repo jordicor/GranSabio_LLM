@@ -3974,6 +3974,8 @@ def get_model_parameter_requirements(model_name: str) -> Dict[str, Any]:
     Get parameter requirements for specific model based on research.
     Returns dict with required parameter formats and constraints.
     """
+    from ai_runtime.parameters import accepts_parameter
+
     model_lower = model_name.lower()
 
     # OpenAI o-series reasoning models use max_completion_tokens and do not support free temperature.
@@ -3994,26 +3996,27 @@ def get_model_parameter_requirements(model_name: str) -> Dict[str, Any]:
             "supports_reasoning_effort": True,
             "supports_thinking_budget": False,
             "default_temperature": None,
-            "forced_temperature": 1.0,
         }
 
-    # GPT-5 series (reasoning models - no temperature support, use reasoning_effort instead)
-    if "gpt-5" in model_lower:
+    # GPT-5/6 chat calls use completion tokens and reasoning effort, not temperature.
+    if "gpt-5" in model_lower or "gpt-6" in model_lower:
         return {
             "max_tokens_param": "max_completion_tokens",
-            "supports_temperature": False,  # GPT-5 reasoning models don't support temperature
+            "supports_temperature": False,
             "supports_reasoning_effort": True,
-            "supports_thinking_budget": False,  # GPT-5 uses reasoning_effort instead
-            "default_temperature": None  # Temperature not supported at all
+            "supports_thinking_budget": False,  # GPT-5/6 use reasoning_effort instead
+            "default_temperature": None  # Sampling is omitted by runtime policy
         }
 
-    # Legacy models (GPT-4, etc. - use max_tokens)
+    # Unknown/new models must not inherit the legacy sampling contract.
     return {
         "max_tokens_param": "max_tokens",
-        "supports_temperature": True,
+        "supports_temperature": accepts_parameter(
+            "openai", model_name, "temperature", specs=config.model_specs
+        ),
         "supports_reasoning_effort": False,
         "supports_thinking_budget": False,
-        "default_temperature": None  # Can use any temperature
+        "default_temperature": None
     }
 
 # Runtime model aliases/defaults are resolved through model_specs.json and llm_routing.default.json.

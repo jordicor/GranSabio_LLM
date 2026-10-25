@@ -610,8 +610,6 @@ def _build_openai_params(model_id: str, messages: list, temperature: float, max_
     # Apply temperature constraints
     if requirements["supports_temperature"]:
         params["temperature"] = temperature
-    elif requirements.get("forced_temperature") is not None:
-        params["temperature"] = requirements["forced_temperature"]
 
     # Apply correct token parameter
     token_param = requirements["max_tokens_param"]
@@ -11770,10 +11768,11 @@ class AIService:
             "model": model_id,
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": temperature,
             "logprobs": True,
             "top_logprobs": top_logprobs,
         }
+        if self._chat_parameter_allowed(provider, model_id, "temperature"):
+            create_params["temperature"] = temperature
         if provider == "openrouter":
             create_params["extra_body"] = self._with_openrouter_provider_options(
                 None,
@@ -12955,21 +12954,24 @@ class AIService:
 
     @staticmethod
     def _claude_omits_sampling_params(model_id: str) -> bool:
-        """Return True for Claude Messages models that reject sampling params."""
+        """Omit temperature unless the model has a known legacy sampling contract."""
+        return not runtime_parameters.accepts_parameter(
+            "claude", model_id, "temperature", specs=getattr(config, "model_specs", {}) or {}
+        )
+
+    @staticmethod
+    def _claude_uses_adaptive_thinking_only(model_id: str) -> bool:
+        """Keep thinking capabilities independent of the conservative sampling policy."""
         normalized = (model_id or "").strip().lower().replace(".", "-")
         restricted_markers = (
             "claude-fable-5",
             "claude-mythos",
             "claude-opus-4-7",
             "claude-opus-4-8",
+            "claude-opus-5",
             "claude-sonnet-5",
         )
         return any(marker in normalized for marker in restricted_markers)
-
-    @classmethod
-    def _claude_uses_adaptive_thinking_only(cls, model_id: str) -> bool:
-        """Return True when manual extended thinking budgets are rejected."""
-        return cls._claude_omits_sampling_params(model_id)
 
     @classmethod
     def _add_claude_sampling_params(
@@ -13017,27 +13019,7 @@ class AIService:
             {"temperature"},
             details_name="supported_parameters",
         )
-        # An absent catalog declaration keeps the existing compatibility rules.
-        if temperature_state.support == CapabilitySupport.UNSUPPORTED:
-            return False
-        normalized = (model_id or "").strip().lower().split(":", 1)[0].replace(".", "-")
-        no_temperature_prefixes = (
-            "anthropic/claude-fable-5",
-            "anthropic/claude-mythos",
-            "anthropic/claude-opus-4-7",
-            "anthropic/claude-opus-4-8",
-            "anthropic/claude-sonnet-5",
-        )
-        no_temperature_models = (
-            "anthropic/claude-sonnet-4-6",
-            "~anthropic/claude-fable-latest",
-            "~anthropic/claude-opus-latest",
-            "~anthropic/claude-sonnet-latest",
-        )
-        return not (
-            any(normalized.startswith(marker) for marker in no_temperature_prefixes)
-            or any(normalized == marker for marker in no_temperature_models)
-        )
+        return temperature_state.support != CapabilitySupport.UNSUPPORTED
 
     @staticmethod
     def _chat_parameter_allowed(provider: str, model_id: str, parameter_name: str) -> bool:

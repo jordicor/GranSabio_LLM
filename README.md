@@ -710,6 +710,13 @@ Process images alongside text for multimodal content generation:
 
 ### Reasoning Models Support
 
+OpenAI and Anthropic requests omit `temperature` by default, including calls through
+OpenRouter. Only known older compatible models receive the configured value; the
+allowlists in `ai_runtime/parameters.py` recognize their dated snapshots and OpenAI
+fine-tunes. Catalog restrictions can disable temperature for an older model but
+cannot enable it for a newer or unrecognized one. This policy applies to generation,
+streaming, tool calls, and logprob probes. Other providers keep their own policies.
+
 For complex tasks, enable deep thinking:
 
 **OpenAI Reasoning:**

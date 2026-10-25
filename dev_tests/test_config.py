@@ -1722,11 +1722,12 @@ class TestModuleLevelFunctions:
                 config_module.get_default_models()
             assert "generation.main" in str(exc_info.value)
 
-    def test_get_model_parameter_requirements_gpt5(self):
-        """Given: GPT-5 model, Then: Returns correct parameters"""
+    @pytest.mark.parametrize("model_id", ["gpt-5", "gpt-6-luna", "gpt-6.1-sol"])
+    def test_get_model_parameter_requirements_reasoning(self, model_id):
+        """Reasoning models omit temperature and use completion token budgets."""
         from config import get_model_parameter_requirements
 
-        params = get_model_parameter_requirements("gpt-5")
+        params = get_model_parameter_requirements(model_id)
         assert params["max_tokens_param"] == "max_completion_tokens"
         assert params["supports_temperature"] is False
         assert params["supports_reasoning_effort"] is True
@@ -1738,7 +1739,7 @@ class TestModuleLevelFunctions:
         params = get_model_parameter_requirements("o3")
         assert params["max_tokens_param"] == "max_completion_tokens"
         assert params["supports_temperature"] is False
-        assert params["forced_temperature"] == 1.0
+        assert "forced_temperature" not in params
 
     def test_get_model_parameter_requirements_legacy(self):
         """Given: Legacy GPT-4 model, Then: Returns correct parameters"""

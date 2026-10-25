@@ -178,6 +178,7 @@ def test_request_identity_keeps_legacy_auto_but_distinguishes_policy():
 
 @pytest.mark.asyncio
 async def test_unsupported_generator_rejected_before_input_resolution(monkeypatch):
+    monkeypatch.setattr(routes.config, "OPENAI_API_KEY", "test-key")
     monkeypatch.setattr(routes, "_apply_request_model_routing", Mock())
     resolve_inputs = AsyncMock(side_effect=AssertionError("Admission must stop before resolving inputs"))
     monkeypatch.setattr(routes, "resolve_generation_inputs", resolve_inputs)

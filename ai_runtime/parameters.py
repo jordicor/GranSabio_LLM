@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping, MutableMapping
 
 from model_capability_registry import find_model_spec, normalize_provider
@@ -13,6 +14,40 @@ KIMI_FIXED_SAMPLING_PARAMETER_POLICY: dict[str, Any] = {
     "presence_penalty": {"mode": "omit", "fixed_value": 0.0},
     "frequency_penalty": {"mode": "omit", "fixed_value": 0.0},
 }
+
+
+_OPENAI_TEMPERATURE_MODELS = frozenset({
+    "gpt-3.5-turbo", "gpt-3.5-turbo-16k", "gpt-3.5-turbo-instruct",
+    "gpt-4", "gpt-4-32k", "gpt-4-turbo", "gpt-4-turbo-preview", "gpt-4-vision-preview",
+    "gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest",
+    "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano",
+})
+_CLAUDE_TEMPERATURE_MODELS = frozenset({
+    "claude-instant-1", "claude-instant-1-2", "claude-2", "claude-2-0", "claude-2-1",
+    "claude-3-haiku", "claude-3-sonnet", "claude-3-opus",
+    "claude-3-5-haiku", "claude-3-5-sonnet", "claude-3-7-sonnet",
+    "claude-opus-4", "claude-opus-4-1", "claude-opus-4-5", "claude-opus-4-6",
+    "claude-sonnet-4", "claude-sonnet-4-5", "claude-sonnet-4-6", "claude-haiku-4-5",
+})
+
+
+def openai_supports_temperature(model_id: str) -> bool:
+    """Opt in known older OpenAI models, including snapshots and fine-tunes."""
+    name = model_id.strip().lower().removeprefix("~").removeprefix("openai/")
+    if name.startswith("ft:"):
+        name = name.split(":", 2)[1]
+    else:
+        name = name.split(":", 1)[0]
+    name = re.sub(r"-(?:\d{4}-\d{2}-\d{2}|\d{4})(?:-preview)?$", "", name)
+    return name in _OPENAI_TEMPERATURE_MODELS
+
+
+def claude_supports_temperature(model_id: str) -> bool:
+    """Opt in known Claude models through Opus 4.6; unknown models omit it."""
+    name = model_id.strip().lower().removeprefix("~").removeprefix("anthropic/")
+    name = name.removeprefix("anthropic.").split(":", 1)[0]
+    name = re.sub(r"-(?:\d{8}|latest)$", "", name).replace(".", "-")
+    return name in _CLAUDE_TEMPERATURE_MODELS
 
 
 def normalize_parameter_model_id(model_id: str) -> str:
@@ -71,6 +106,17 @@ def parameter_policy(
     for name, constraint in constraints.items():
         if isinstance(constraint, Mapping):
             policy[str(name)] = dict(constraint)
+
+    model_lower = model_id.strip().lower().removeprefix("~")
+    if provider_key == "openai" or (provider_key == "openrouter" and model_lower.startswith("openai/")):
+        if not openai_supports_temperature(model_id):
+            policy["temperature"] = {"mode": "omit"}
+    if provider_key == "claude" or (provider_key == "openrouter" and model_lower.startswith("anthropic/")):
+        if not claude_supports_temperature(model_id):
+            policy["temperature"] = {"mode": "omit"}
+        # Keep the existing routed Sonnet 4.6 restriction separate from native Messages.
+        if provider_key == "openrouter" and normalize_parameter_model_id(model_id) == "anthropic/claude-sonnet-4-6":
+            policy["temperature"] = {"mode": "omit"}
 
     if is_kimi_fixed_sampling_model(provider_key, model_id):
         policy.update(KIMI_FIXED_SAMPLING_PARAMETER_POLICY)
