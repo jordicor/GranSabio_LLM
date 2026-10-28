@@ -882,7 +882,7 @@ async def test_registered_local_serializes_explicit_reasoning_effort(
     monkeypatch.setattr(
         config_module.Config,
         "get_model_info",
-        lambda _self, _model: {
+        lambda _self, _model, *, require_api_key=True: {
             "model_id": "qwen3.8:27b",
             "provider": provider,
             "capabilities": ["text", "reasoning"],

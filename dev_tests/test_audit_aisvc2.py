@@ -17,6 +17,7 @@ from ai_runtime import vision as runtime_vision
 from ai_runtime.usage import normalize_usage
 from ai_service import AIService
 from deterministic_validation import DraftValidationResult
+from provider_capabilities import CapabilitySupport
 from tool_loop_models import ValidationToolInputTooLarge
 
 
@@ -185,6 +186,7 @@ async def test_revalidation_budget_without_images_has_no_image_component(service
 
 async def test_openai_tool_loop_passes_image_tokens_to_revalidation(service):
     """AIS-08: vision loops revalidate with the entry image estimate wired in."""
+    service._is_openai_responses_api_model = Mock(return_value=False)  # Exercise the Chat tool-loop transport.
     images = [SimpleNamespace(width=512, height=512, detail="high")]
     expected_tokens = runtime_vision.estimate_vision_request_tokens(images, "openai")
     assert expected_tokens > 0
@@ -247,9 +249,7 @@ async def test_health_check_clears_admission_report(service, monkeypatch):
 
     service._admit_chat_call = fake_admit
     service.openai_client = SimpleNamespace(
-        chat=SimpleNamespace(
-            completions=SimpleNamespace(create=AsyncMock(return_value=SimpleNamespace()))
-        )
+        responses=SimpleNamespace(create=AsyncMock(return_value=SimpleNamespace()))
     )
     monkeypatch.setattr(
         "ai_service.resolve_call",
@@ -272,20 +272,8 @@ async def test_generate_with_logprobs_clears_admission_report(service, monkeypat
 
     service._admit_chat_call = fake_admit
     service.openai_client = SimpleNamespace(
-        chat=SimpleNamespace(
-            completions=SimpleNamespace(
-                create=AsyncMock(
-                    return_value=SimpleNamespace(
-                        choices=[
-                            SimpleNamespace(
-                                message=SimpleNamespace(content="ok"),
-                                logprobs=None,
-                            )
-                        ],
-                        usage=None,
-                    )
-                )
-            )
+        responses=SimpleNamespace(
+            create=AsyncMock(return_value=SimpleNamespace(output_text="ok", output=[], usage=None))
         )
     )
     monkeypatch.setattr(
@@ -295,7 +283,7 @@ async def test_generate_with_logprobs_clears_admission_report(service, monkeypat
     )
     monkeypatch.setattr(
         "model_capability_registry.model_supports",
-        lambda **kwargs: SimpleNamespace(supported=True),
+        lambda **kwargs: SimpleNamespace(supported=True, support=CapabilitySupport.SUPPORTED),
     )
     ai_service._last_admission_report.set(None)
 
@@ -375,6 +363,7 @@ def test_tool_loop_call_budget_clamps_down_only():
 
 async def test_tool_loop_honors_max_tool_calls(service):
     """AIS-11: the loop budget event reflects the clamped budget."""
+    service._is_openai_responses_api_model = Mock(return_value=False)  # Exercise the Chat tool-loop transport.
     service.openai_client = SimpleNamespace()
     events = []
 
@@ -421,43 +410,33 @@ async def test_tool_loop_honors_max_tool_calls(service):
 # ---------------------------------------------------------------------------
 
 
-async def test_gpt5_chat_completions_reraises_original_exception(service):
-    """AIS-12: a provider 429 keeps its cause/status instead of a bare Exception."""
+async def test_gpt5_responses_reraises_original_exception(service):
+    """AIS-12: a provider 429 reaches classification with its own status."""
     service.openai_client = SimpleNamespace()
-    service._is_openai_responses_api_model = lambda model_id: False
     original = Exception("rate limit exceeded")
     original.status_code = 429
-    service._call_chat_completions_create_with_reasoning_retry = AsyncMock(
-        side_effect=original
-    )
+    service._call_responses_create_with_reasoning_retry = AsyncMock(side_effect=original)
 
-    with pytest.raises(RuntimeError) as exc_info:
+    with pytest.raises(Exception) as exc_info:
         await service._generate_openai("p", "gpt-5", 0.7, 100, "sys")
 
-    wrapped = exc_info.value
-    assert type(wrapped) is RuntimeError
-    assert wrapped.__cause__ is original
-    assert wrapped.status_code == 429
+    assert exc_info.value is original
+    assert exc_info.value.status_code == 429
 
 
 async def test_gpt5_streaming_reraises_original_exception(service):
-    """AIS-12: stream initialization preserves cause and structured status."""
+    """AIS-12: Responses stream initialization keeps the provider exception."""
     service.openai_client = SimpleNamespace()
     original = Exception("upstream exploded")
     original.status_code = 500
-    service._call_chat_completions_create_with_reasoning_retry = AsyncMock(
-        side_effect=original
-    )
+    service._call_responses_create_with_reasoning_retry = AsyncMock(side_effect=original)
 
-    with pytest.raises(RuntimeError) as exc_info:
+    with pytest.raises(Exception) as exc_info:
         async for _ in service._stream_openai("p", "gpt-5", 0.7, 100, "sys", False):
             pass
 
-    wrapped = exc_info.value
-    assert type(wrapped) is RuntimeError
-    assert "GPT-5 streaming initialization failed" in str(wrapped)
-    assert wrapped.__cause__ is original
-    assert wrapped.status_code == 500
+    assert exc_info.value is original
+    assert exc_info.value.status_code == 500
 
 
 # ---------------------------------------------------------------------------

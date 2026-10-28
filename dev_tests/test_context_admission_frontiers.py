@@ -984,7 +984,7 @@ def test_mark_model_context_suspect_unknown_model_is_noop(tmp_path):
 
 
 def test_responses_tool_params_disable_truncation(service):
-    params = service._build_openai_responses_tool_params(
+    params = service._build_openai_responses_params(
         model_id="gpt-5-pro",
         current_messages=[{"role": "user", "content": "hi"}],
         max_tokens=100,

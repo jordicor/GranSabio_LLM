@@ -204,6 +204,7 @@ async def test_openai_zero_output_stream_emits_filter_metadata_not_runtime_error
     service = AIService.__new__(AIService)
     service.openai_client = object()
     service._should_inject_json_prompt = Mock(return_value=False)
+    service._is_openai_responses_api_model = Mock(return_value=False)  # Exercise the Chat stream transport.
 
     class FilteredStream:
         def __init__(self) -> None:
@@ -259,6 +260,7 @@ async def test_openai_unexplained_zero_output_keeps_runtime_error_path() -> None
     service = AIService.__new__(AIService)
     service.openai_client = object()
     service._should_inject_json_prompt = Mock(return_value=False)
+    service._is_openai_responses_api_model = Mock(return_value=False)  # Exercise the Chat stream transport.
 
     class EmptyStopStream:
         def __init__(self) -> None:

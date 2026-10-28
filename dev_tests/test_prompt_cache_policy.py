@@ -16,7 +16,7 @@ import json_utils as json
 from client import AsyncGranSabioClient, GranSabioClient
 from core.generation_processor import _build_generation_prompt
 from dev_tests.test_internal_cache_transport import service as service
-from dev_tests.test_shared_context_transport import FakeStream
+from dev_tests.test_shared_context_transport import FakeResponsesStream, FakeStream
 from models import ContentRequest
 from shared_context import (
     CacheablePrompt,
@@ -198,7 +198,8 @@ async def test_unsupported_generator_rejected_before_input_resolution(monkeypatc
 async def test_native_openai_wire_disables_implicit_suffix(service, streaming, responses, mode):
     response = SimpleNamespace(output_text="ok", usage=None,
                                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
-    create = AsyncMock(return_value=FakeStream() if streaming and not responses else response)
+    create = AsyncMock(return_value=(FakeResponsesStream() if responses else FakeStream())
+                       if streaming else response)
     service.openai_client = SimpleNamespace(responses=SimpleNamespace(create=create),
         chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     service._is_openai_responses_api_model = Mock(return_value=responses)

@@ -30,6 +30,19 @@ class FakeStream:
         pass
 
 
+class FakeResponsesStream:
+    """Minimal Responses SSE stream: one text delta and a completed response."""
+
+    def __aiter__(self):
+        async def items():
+            yield SimpleNamespace(type="response.output_text.delta", delta="ok")
+            yield SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", output_text="ok", output=[], usage=None),
+            )
+        return items()
+
+
 @pytest.fixture
 def service(monkeypatch):
     instance = AIService.__new__(AIService)
@@ -152,7 +165,7 @@ async def test_responses_transports_prefix_without_system_promotion(service, mod
     if source:
         assert params["input"] == [{"role": "user", "content": SOURCE}, {"role": "user", "content": TASK}]
     else:
-        assert params["input"] == TASK
+        assert params["input"] == [{"role": "user", "content": TASK}]
 
 
 @pytest.mark.parametrize("responses", [False, True])
@@ -249,7 +262,7 @@ async def test_tool_transcript_includes_source_and_can_be_counted(service):
     service._provider_call_scope = scope
     service._execute_without_retries = execute
     service._is_openai_responses_api_model = Mock(return_value=True)
-    service._openai_responses_tool_streaming_supported = Mock(return_value=False)
+    service._openai_responses_streaming_supported = Mock(return_value=False)
     service._run_openai_responses_tool_turn = AsyncMock(side_effect=StopBeforeDispatch)
     with pytest.raises(StopBeforeDispatch):
         await service._run_openai_compatible_validation_tool_loop(

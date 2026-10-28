@@ -89,6 +89,8 @@ from local_endpoint_registry import (
     build_local_endpoint_registry,
 )
 from local_execution_policy import LocalExecutionPolicyError
+from local_resource_backend import LocalResourceError
+from local_resources import get_local_resource_manager
 from model_aliasing import PromptPart, PromptSource, assert_prompt_is_model_blind
 from model_capability_registry import (
     _openrouter_parameter_state,
@@ -596,6 +598,10 @@ def _with_default_system_context(
     )
     current_date = datetime.now().strftime("%Y/%m/%d")
     return f"{system_prompt}{language_instruction}\n\nCurrent date: {current_date}"
+
+
+# The Responses API rejects max_output_tokens below this wire minimum.
+OPENAI_RESPONSES_MIN_OUTPUT_TOKENS = 16
 
 
 def _build_openai_params(model_id: str, messages: list, temperature: float, max_tokens: int, reasoning_effort: Optional[str] = None) -> dict:
@@ -1179,6 +1185,7 @@ class AIService:
             logger.exception("Invalid local endpoint configuration")
             raise
         self.local_endpoint_registry = registry
+        self._local_resource_manager = get_local_resource_manager(config, registry)
         self._local_endpoints = {endpoint.endpoint_id: endpoint for endpoint in registry}
         if registry.legacy and not any(
             endpoint.adapter == "ollama" for endpoint in registry
@@ -1261,6 +1268,21 @@ class AIService:
         )
 
     @asynccontextmanager
+    async def _local_resource_slot(self, semaphore: asyncio.Semaphore):
+        """Apply shared GPU admission even when QA already owns the endpoint slot."""
+        manager = getattr(self, "_local_resource_manager", None)
+        if manager is None:
+            yield None
+            return
+        endpoint_id = next(
+            (key for key, value in self._local_endpoint_semaphores.items() if value is semaphore), None
+        )
+        if endpoint_id is None:
+            raise LocalResourceError("resource_endpoint_unknown", "The local transport has no registered endpoint identity.")
+        async with manager.admission(endpoint_id):
+            yield None
+
+    @asynccontextmanager
     async def _local_endpoint_request_slot(self, semaphore: asyncio.Semaphore):
         """Reuse QA's held legacy slot; acquire any distinct endpoint queue."""
 
@@ -1268,10 +1290,12 @@ class AIService:
             semaphore is getattr(self, "_ollama_request_semaphore", None)
             and _ollama_concurrency_depth.get() > 0
         ):
-            yield None
+            async with self._local_resource_slot(semaphore):
+                yield None
             return
         async with semaphore:
-            yield None
+            async with self._local_resource_slot(semaphore):
+                yield None
 
     async def _generate_registered_local(
         self, provider: str, endpoint_id: Optional[str], **kwargs: Any
@@ -2880,6 +2904,65 @@ class AIService:
             )
         return content, usage_with_finish
 
+    def _responses_content_and_usage(
+        self,
+        response: Any,
+        *,
+        model_id: str,
+        max_tokens: Optional[int],
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Normalize an OpenAI Responses result into (content, usage metadata).
+
+        Failed or cancelled responses fail before returning any text.
+        Mirrors ``_chat_completion_content_and_usage``: a refusal is a typed
+        content-filter stop, and empty output that no unusable finish reason
+        explains fails fast instead of passing as a completed generation.
+        """
+
+        content = self._extract_openai_responses_text(response)
+        usage_with_finish = self._usage_with_finish_metadata(
+            getattr(response, "usage", None),
+            response,
+            provider="openai",
+            max_tokens=max_tokens,
+            billing_envelope=response,
+        )
+        if usage_with_finish.get("finish_reason_category") == "provider_error":
+            self._raise_if_generation_stopped_unusably(
+                content,
+                usage_with_finish,
+                provider="openai",
+                model_id=model_id,
+                max_tokens=max_tokens,
+            )
+        if content.strip():
+            return content, usage_with_finish
+        refusal = self._extract_openai_responses_refusal(response).strip()
+        if refusal:
+            raise GenerationStoppedUnexpectedly(
+                f"openai model '{model_id}' returned a refusal instead of content: "
+                f"{_truncate_to_bytes(refusal, 500)!r}",
+                provider="openai",
+                model_id=model_id,
+                finish_reason="refusal",
+                finish_reason_category="content_filter",
+                partial_content="",
+                usage={**usage_with_finish, "provider_stop_reason": "refusal"},
+            )
+        if not usage_with_finish.get("finish_unusable"):
+            raise GenerationStoppedUnexpectedly(
+                f"openai model '{model_id}' returned no content and the "
+                "response carries no unusable finish reason; it should not be "
+                "treated as a completed generation.",
+                provider="openai",
+                model_id=model_id,
+                finish_reason=usage_with_finish.get("finish_reason"),
+                finish_reason_category=usage_with_finish.get("finish_reason_category"),
+                partial_content="",
+                usage=dict(usage_with_finish),
+            )
+        return content, usage_with_finish
+
     @staticmethod
     def _resolve_effective_output_max_tokens(
         model: str,
@@ -4180,9 +4263,9 @@ class AIService:
         """Return True when the given OpenAI model id uses the Responses API.
 
         Reads the ``responses_api`` capability from already-loaded ``config.model_specs``
-        (no disk IO). Matches both the model key and the ``model_id`` field so dated
-        variants (e.g. ``o3-pro-2025-06-10``) resolve correctly. Returns False when the
-        model is unknown (fail-safe).
+        (no disk IO). Responses is the default for every native OpenAI model; only
+        an explicit catalog ``provider_capabilities.responses_api`` value or the
+        Chat Completions-only list in ``model_capability_registry`` selects Chat.
         """
         if not model_id:
             return False
@@ -5305,12 +5388,17 @@ class AIService:
             return converted
         if part_type == "image_url":
             image_url = part.get("image_url")
+            detail = None
             if isinstance(image_url, dict):
                 url = image_url.get("url")
+                detail = image_url.get("detail")
             else:
                 url = image_url
             if url:
-                return {"type": "input_image", "image_url": url}
+                converted = {"type": "input_image", "image_url": url}
+                if detail and detail != "auto":
+                    converted["detail"] = detail
+                return converted
         if part_type == "input_image":
             return dict(part)
         return None
@@ -5388,7 +5476,7 @@ class AIService:
 
         return "\n\n".join(instructions), input_items
 
-    def _build_openai_responses_tool_params(
+    def _build_openai_responses_params(
         self,
         model_id: str,
         current_messages: List[Dict[str, Any]],
@@ -5398,8 +5486,9 @@ class AIService:
         json_schema: Optional[Dict[str, Any]],
         tools_enabled: bool,
         tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        temperature: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Build Responses API params for OpenAI tool-loop turns."""
+        """Build Responses API params for OpenAI generations and tool-loop turns."""
 
         instructions, input_items = self._build_openai_responses_input_from_messages(
             current_messages
@@ -5407,14 +5496,17 @@ class AIService:
         create_params: Dict[str, Any] = {
             "model": model_id,
             "input": input_items,
-            "max_output_tokens": max_tokens,
+            # Responses rejects caps below its wire minimum; Chat accepted them.
+            "max_output_tokens": max(int(max_tokens), OPENAI_RESPONSES_MIN_OUTPUT_TOKENS),
             # Disable provider input truncation explicitly (D15): the admission
             # policy forbids silent context transformations.
             "truncation": "disabled",
         }
         if instructions:
             create_params["instructions"] = instructions
-        if reasoning_effort:
+        if temperature is not None and self._chat_parameter_allowed("openai", model_id, "temperature"):
+            create_params["temperature"] = temperature
+        if reasoning_effort and get_model_parameter_requirements(model_id)["supports_reasoning_effort"]:
             create_params["reasoning"] = {"effort": reasoning_effort}
 
         if json_output and json_schema:
@@ -5444,18 +5536,21 @@ class AIService:
         return create_params
 
     @staticmethod
-    def _openai_responses_tool_streaming_supported(model_id: str) -> bool:
-        """Return False for Responses tool-loop transports quarantined from SSE."""
+    def _openai_responses_streaming_supported(model_id: str) -> bool:
+        """Return False for Responses transports quarantined from SSE.
+
+        o1-pro, o3-pro and GPT-5.5 Pro sheets document no streaming; GPT-5 Pro
+        and GPT-5.6 Sol keep their existing single non-stream create quarantine.
+        """
 
         model_lower = (model_id or "").lower()
         is_gpt56_sol = (
             model_lower == "gpt-5.6-sol"
             or model_lower.startswith("gpt-5.6-sol-")
         )
-        return (
-            not is_gpt56_sol
-            and "o3-pro" not in model_lower
-            and "gpt-5-pro" not in model_lower
+        return not is_gpt56_sol and not any(
+            marker in model_lower
+            for marker in ("o1-pro", "o3-pro", "gpt-5-pro", "gpt-5.5-pro")
         )
 
     @staticmethod
@@ -7066,7 +7161,7 @@ class AIService:
             )
         use_responses_streaming = (
             use_responses_api
-            and self._openai_responses_tool_streaming_supported(model_id)
+            and self._openai_responses_streaming_supported(model_id)
         )
         use_chat_streaming = (
             provider_key in {"openai", "xai", "ollama", "llamacpp", "openai_compatible"}
@@ -7285,8 +7380,9 @@ class AIService:
                     local_execution=local_execution,
                 )
                 if use_responses_api:
-                    create_params = self._build_openai_responses_tool_params(
+                    create_params = self._build_openai_responses_params(
                         model_id=model_id,
+                        temperature=temperature,
                         current_messages=forced_messages,
                         max_tokens=max_tokens,
                         reasoning_effort=reasoning_effort,
@@ -7475,8 +7571,9 @@ class AIService:
                         local_execution=local_execution,
                     )
                 if use_responses_api:
-                    create_params = self._build_openai_responses_tool_params(
+                    create_params = self._build_openai_responses_params(
                         model_id=model_id,
+                        temperature=temperature,
                         current_messages=messages,
                         max_tokens=max_tokens,
                         reasoning_effort=reasoning_effort,
@@ -11378,276 +11475,68 @@ class AIService:
             messages, shared_context, provider="openai", model_id=model_id
         )
 
-        # --- Responses API models (o3-pro and catalog-marked variants) ---
-        if self._is_openai_responses_api_model(model_id) and "gpt-5-pro" not in model_id.lower():
-            if not self.openai_client:
-                raise ValueError("OpenAI async client not initialized for O3-pro")
-
-            # Build input for Responses API (supports vision)
-            if images:
-                # Responses API format with images
-                input_content = self._build_openai_image_content(images, use_responses_api=True)
-                input_content.append({"type": "input_text", "text": effective_prompt})
-            else:
-                input_content = effective_prompt  # Plain string for text-only
-
-            if shared_context or (
-                isinstance(prompt, CacheablePrompt)
-                and prompt.cache_breakpoints
-                and supports_openai_explicit_cache(model_id)
-            ):
-                _, input_content = self._build_openai_responses_input_from_messages(messages)
-
-            # IMPORTANT! In Responses API, use 'instructions' for the "system" prompt.
-            create_params = {
-                "model": model_id,
-                "input": input_content,
-                "instructions": effective_system_prompt,
-                "max_output_tokens": max_tokens,
-                # Disable provider input truncation explicitly (D15): the
-                # admission policy forbids silent context transformations.
-                "truncation": "disabled",
-            }
-            if reasoning_effort:
-                create_params["reasoning"] = {"effort": reasoning_effort}
-
-            # Configure structured output when a concrete schema is available.
-            if json_output and json_schema:
-                create_params["text"] = {
-                    "format": {
-                        "type": "json_schema",
-                        "name": "structured_output",
-                        "strict": True,
-                        "schema": json_schema,
-                    }
-                }
-                logger.info("Using O3-Pro JSON Schema structured outputs")
-
+        # --- Responses API (default for every native OpenAI model) ---
+        if self._is_openai_responses_api_model(model_id):
+            create_params = self._build_openai_responses_params(
+                model_id=model_id,
+                current_messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+                json_output=json_output,
+                json_schema=json_schema,
+                tools_enabled=False,
+            )
             if extra_verbose:
-                logger.info(f"[EXTRA_VERBOSE] O3-pro responses parameters: {create_params}")
+                logger.info(f"[EXTRA_VERBOSE] OpenAI Responses parameters: {create_params}")
 
             response = await self._call_responses_create_with_reasoning_retry(
                 create_params,
                 request_kwargs,
                 model_id=model_id,
             )
-
-            # Robust text extraction: 1) output_text; 2) assemble from 'output'
-            content = getattr(response, "output_text", None) or ""
-            if not content.strip():
-                try:
-                    data = response.model_dump() if hasattr(response, "model_dump") else None
-                except Exception:
-                    data = None
-
-                if data and isinstance(data, dict):
-                    pieces: List[str] = []
-                    for item in data.get("output", []) or []:
-                        if item.get("type") == "message":
-                            for part in item.get("content", []) or []:
-                                txt = part.get("text")
-                                if txt:
-                                    pieces.append(txt)
-                    content = "".join(pieces).strip()
-
-            # If still empty, likely token limit or SDK regression
-            if not content:
-                logger.warning(
-                    "O3-pro returned empty output_text. Possible causes: "
-                    "1) insufficient max_output_tokens (includes reasoning), "
-                    "2) SDK regression in output_text. Suggestion: increase max_output_tokens."
-                )
-
-            return content or "", self._usage_with_finish_metadata(
-                getattr(response, "usage", None),
+            return self._responses_content_and_usage(
                 response,
-                provider="openai",
+                model_id=model_id,
                 max_tokens=max_tokens,
             )
 
-        # --- GPT-5 Pro: Responses API ---
-        elif "gpt-5-pro" in model_id.lower() or (
-            self._is_openai_responses_api_model(model_id) and "gpt-5" in model_id.lower()
-        ):
-            if not self.openai_client:
-                raise ValueError("OpenAI async client not initialized for GPT-5 Pro")
+        # --- Chat Completions-only models ---
+        if extra_verbose:
+            logger.info(f"[EXTRA_VERBOSE] Standard OpenAI non-streaming with temperature: {temperature}")
+        standard_params = _build_openai_params(model_id, messages, temperature, max_tokens, reasoning_effort)
 
-            # Build input for Responses API (supports vision)
-            if images:
-                # Responses API format with images
-                input_content = self._build_openai_image_content(images, use_responses_api=True)
-                input_content.append({"type": "input_text", "text": effective_prompt})
-            else:
-                input_content = effective_prompt  # Plain string for text-only
-
-            if shared_context or (
-                isinstance(prompt, CacheablePrompt)
-                and prompt.cache_breakpoints
-                and supports_openai_explicit_cache(model_id)
-            ):
-                _, input_content = self._build_openai_responses_input_from_messages(messages)
-
-            # GPT-5 Pro uses the Responses API, same as o3-pro
-            create_params = {
-                "model": model_id,
-                "input": input_content,
-                "instructions": effective_system_prompt,
-                "max_output_tokens": max_tokens,
-                # Disable provider input truncation explicitly (D15): the
-                # admission policy forbids silent context transformations.
-                "truncation": "disabled",
-            }
-
-            # GPT-5 Pro defaults to high reasoning effort
-            if reasoning_effort:
-                create_params["reasoning"] = {"effort": reasoning_effort}
-            else:
-                create_params["reasoning"] = {"effort": "high"}
-
-            # Configure structured output when a concrete schema is available.
-            if json_output and json_schema:
-                create_params["text"] = {
-                    "format": {
-                        "type": "json_schema",
+        # Configure JSON output format
+        if json_output:
+            if json_schema:
+                # Use JSON Schema for structured outputs (GPT-4o-2024-08-06+)
+                standard_params["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
                         "name": "structured_output",
                         "strict": True,
-                        "schema": json_schema,
+                        "schema": json_schema
                     }
                 }
-                logger.info("Using GPT-5 Pro JSON Schema structured outputs")
+                logger.info(f"Using OpenAI JSON Schema structured outputs for {model_id}")
+            else:
+                # Use basic JSON mode (flexible structure)
+                standard_params["response_format"] = {"type": "json_object"}
+                logger.info(f"Using OpenAI JSON mode (flexible) for {model_id}")
 
-            if extra_verbose:
-                logger.info(f"[EXTRA_VERBOSE] GPT-5 Pro responses parameters: {create_params}")
-
-            response = await self._call_responses_create_with_reasoning_retry(
-                create_params,
-                request_kwargs,
-                model_id=model_id,
-            )
-
-            # Robust text extraction (same as o3-pro)
-            content = getattr(response, "output_text", None) or ""
-            if not content.strip():
-                try:
-                    data = response.model_dump() if hasattr(response, "model_dump") else None
-                except Exception:
-                    data = None
-
-                if data and isinstance(data, dict):
-                    pieces: List[str] = []
-                    for item in data.get("output", []) or []:
-                        if item.get("type") == "message":
-                            for part in item.get("content", []) or []:
-                                txt = part.get("text")
-                                if txt:
-                                    pieces.append(txt)
-                    content = "".join(pieces).strip()
-
-            # If still empty, warn
-            if not content:
-                logger.warning(
-                    "GPT-5 Pro returned empty output_text. Possible causes: "
-                    "1) insufficient max_output_tokens (includes reasoning tokens), "
-                    "2) SDK regression in output_text. Suggestion: increase max_output_tokens."
-                )
-
-            return content or "", self._usage_with_finish_metadata(
-                getattr(response, "usage", None),
-                response,
-                provider="openai",
-                max_tokens=max_tokens,
-            )
-
-        # --- GPT-5 via Chat Completions ---
-        elif "gpt-5" in model_id.lower():
-            create_params = _build_openai_params(model_id, messages, temperature, max_tokens, reasoning_effort)
-
-            # Configure JSON output format
-            if json_output:
-                if json_schema:
-                    # Use JSON Schema for structured outputs
-                    create_params["response_format"] = {
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "structured_output",
-                            "strict": True,
-                            "schema": json_schema
-                        }
-                    }
-                    logger.info(f"Using GPT-5 JSON Schema structured outputs for {model_id}")
-                else:
-                    # Use basic JSON mode (flexible structure)
-                    create_params["response_format"] = {"type": "json_object"}
-                    logger.info(f"Using GPT-5 JSON mode (flexible) for {model_id}")
-
-            if extra_verbose:
-                logger.info(f"[EXTRA_VERBOSE] GPT-5 non-streaming parameters: {create_params}")
-
-            try:
-                response = await self._call_chat_completions_create_with_reasoning_retry(
-                    self.openai_client,
-                    create_params,
-                    request_kwargs,
-                    provider_key="openai",
-                    model_id=model_id,
-                )
-            except Exception as e:
-                logger.error(f"GPT-5 model '{model_id}' failed: {str(e)}")
-                # Wrap in RuntimeError (never a bare generic Exception) while
-                # preserving the cause chain and structured provider signals
-                # (status, request_id) for failure classification (AIS-12).
-                raise _wrap_preserving_provider_signals(
-                    f"GPT-5 model '{model_id}' failed: {str(e)}", e
-                )
-
-            # Use the shared adapter so an empty response explained by a
-            # provider finish reason (notably ``content_filter``) reaches the
-            # typed finish guard instead of being replaced by a generic
-            # RuntimeError inside the retry loop.
-            return self._chat_completion_content_and_usage(
-                response,
-                provider="openai",
-                model_id=model_id,
-                max_tokens=max_tokens,
-            )
-
-        # --- Standard models via Chat Completions ---
-        else:
-            if extra_verbose:
-                logger.info(f"[EXTRA_VERBOSE] Standard OpenAI non-streaming with temperature: {temperature}")
-            standard_params = _build_openai_params(model_id, messages, temperature, max_tokens, reasoning_effort)
-
-            # Configure JSON output format
-            if json_output:
-                if json_schema:
-                    # Use JSON Schema for structured outputs (GPT-4o-2024-08-06+)
-                    standard_params["response_format"] = {
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "structured_output",
-                            "strict": True,
-                            "schema": json_schema
-                        }
-                    }
-                    logger.info(f"Using OpenAI JSON Schema structured outputs for {model_id}")
-                else:
-                    # Use basic JSON mode (flexible structure)
-                    standard_params["response_format"] = {"type": "json_object"}
-                    logger.info(f"Using OpenAI JSON mode (flexible) for {model_id}")
-
-            response = await self._call_chat_completions_create_with_reasoning_retry(
-                self.openai_client,
-                standard_params,
-                request_kwargs,
-                provider_key="openai",
-                model_id=model_id,
-            )
-            return self._chat_completion_content_and_usage(
-                response,
-                provider="openai",
-                model_id=model_id,
-                max_tokens=max_tokens,
-            )
+        response = await self._call_chat_completions_create_with_reasoning_retry(
+            self.openai_client,
+            standard_params,
+            request_kwargs,
+            provider_key="openai",
+            model_id=model_id,
+        )
+        return self._chat_completion_content_and_usage(
+            response,
+            provider="openai",
+            model_id=model_id,
+            max_tokens=max_tokens,
+        )
 
     async def generate_with_logprobs(
         self,
@@ -11743,6 +11632,10 @@ class AIService:
         # OpenAI: 1-20, xAI: 1-8
         max_logprobs = 8 if provider == "xai" else 20
         top_logprobs = max(1, min(max_logprobs, top_logprobs))
+        use_openai_responses = provider == "openai" and self._is_openai_responses_api_model(model_id)
+        if use_openai_responses:
+            # Responses rejects caps below its wire minimum; admit the real cap.
+            max_tokens = max(max_tokens, OPENAI_RESPONSES_MIN_OUTPUT_TOKENS)
 
         # Build messages
         messages = []
@@ -11764,15 +11657,29 @@ class AIService:
         )
 
         # Build API parameters
-        create_params = {
-            "model": model_id,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "logprobs": True,
-            "top_logprobs": top_logprobs,
-        }
-        if self._chat_parameter_allowed(provider, model_id, "temperature"):
-            create_params["temperature"] = temperature
+        if use_openai_responses:
+            create_params = self._build_openai_responses_params(
+                model_id=model_id,
+                current_messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                reasoning_effort=None,
+                json_output=False,
+                json_schema=None,
+                tools_enabled=False,
+            )
+            create_params["top_logprobs"] = top_logprobs
+            create_params["include"] = ["message.output_text.logprobs"]
+        else:
+            create_params = {
+                "model": model_id,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "logprobs": True,
+                "top_logprobs": top_logprobs,
+            }
+            if self._chat_parameter_allowed(provider, model_id, "temperature"):
+                create_params["temperature"] = temperature
         if provider == "openrouter":
             create_params["extra_body"] = self._with_openrouter_provider_options(
                 None,
@@ -11851,6 +11758,8 @@ class AIService:
                 if provider in {"ollama", "llamacpp", "openai_compatible"}:
                     async with self._local_endpoint_request_slot(local_semaphore):
                         response = await client.chat.completions.create(**create_params)
+                elif use_openai_responses:
+                    response = await client.responses.create(**create_params)
                 else:
                     response = await client.chat.completions.create(**create_params)
                 await self._raise_if_cancelled(cancellation_token)
@@ -11886,33 +11795,48 @@ class AIService:
             provider, model_id, "generate_with_logprobs", effective_endpoint_id
         )
 
-        # Extract content
-        content = response.choices[0].message.content or ""
+        # Extract content and logprobs
+        if use_openai_responses:
+            content, _usage_meta = self._responses_content_and_usage(
+                response, model_id=model_id, max_tokens=max_tokens,
+            )
+            token_entries = [
+                token_data
+                for item in self._openai_responses_output_items(response)
+                if self._obj_get(item, "type") == "message"
+                for part in self._obj_get(item, "content", []) or []
+                if self._obj_get(part, "type") == "output_text"
+                for token_data in self._obj_get(part, "logprobs", []) or []
+            ]
+        else:
+            content = response.choices[0].message.content or ""
+            choice_logprobs = response.choices[0].logprobs
+            token_entries = list(choice_logprobs.content or []) if choice_logprobs else []
 
-        # Extract logprobs
         logprobs_data = None
-        if response.choices[0].logprobs and response.choices[0].logprobs.content:
-            logprobs_data = []
-            for token_data in response.choices[0].logprobs.content:
-                token_info = {
-                    "token": token_data.token,
-                    "logprob": token_data.logprob,
-                    "top_logprobs": [],
+        if token_entries:
+            logprobs_data = [
+                {
+                    "token": self._obj_get(token_data, "token"),
+                    "logprob": self._obj_get(token_data, "logprob"),
+                    "top_logprobs": [
+                        {"token": self._obj_get(top, "token"), "logprob": self._obj_get(top, "logprob")}
+                        for top in self._obj_get(token_data, "top_logprobs", []) or []
+                    ],
                 }
-                if token_data.top_logprobs:
-                    for top in token_data.top_logprobs:
-                        token_info["top_logprobs"].append({
-                            "token": top.token,
-                            "logprob": top.logprob,
-                        })
-                logprobs_data.append(token_info)
+                for token_data in token_entries
+            ]
 
         # Track usage
         if usage_callback and hasattr(response, "usage") and response.usage:
             usage_info = {
                 "model": model_id,
-                "input_tokens": response.usage.prompt_tokens,
-                "output_tokens": response.usage.completion_tokens,
+                "input_tokens": (
+                    response.usage.input_tokens if use_openai_responses else response.usage.prompt_tokens
+                ),
+                "output_tokens": (
+                    response.usage.output_tokens if use_openai_responses else response.usage.completion_tokens
+                ),
                 "total_tokens": response.usage.total_tokens,
                 "timestamp": datetime.now().isoformat(),
             }
@@ -13578,11 +13502,24 @@ class AIService:
                     prompt="Hello",
                     reserved_output_tokens=route.params.get("max_tokens", 5),
                 )
-                await self.openai_client.chat.completions.create(
-                    model=route.model,
-                    messages=[{"role": "user", "content": "Hello"}],
-                    max_tokens=route.params.get("max_tokens", 5)
-                )
+                if self._is_openai_responses_api_model(route.model):
+                    await self.openai_client.responses.create(
+                        **self._build_openai_responses_params(
+                            model_id=route.model,
+                            current_messages=[{"role": "user", "content": "Hello"}],
+                            max_tokens=route.params.get("max_tokens", 5),
+                            reasoning_effort=route.params.get("reasoning_effort"),
+                            json_output=False,
+                            json_schema=None,
+                            tools_enabled=False,
+                        )
+                    )
+                else:
+                    await self.openai_client.chat.completions.create(
+                        model=route.model,
+                        messages=[{"role": "user", "content": "Hello"}],
+                        max_tokens=route.params.get("max_tokens", 5)
+                    )
                 health_status["openai"] = True
             else:
                 health_status["openai"] = False
@@ -13756,6 +13693,135 @@ class AIService:
         _last_admission_report.set(None)
         return health_status
 
+    async def _stream_openai_responses(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        model_id: str,
+        temperature: float,
+        max_tokens: int,
+        reasoning_effort: Optional[str],
+        json_output: bool,
+        json_schema: Optional[Dict[str, Any]],
+        request_kwargs: Dict[str, Any],
+        usage_callback: Optional[Callable[[Dict[str, Any]], None]],
+        provider: str,
+        resolved_model_id: Optional[str],
+        extra_payload: Dict[str, Any],
+        extra_verbose: bool,
+    ):
+        """Stream one OpenAI Responses generation with the Chat streaming contract.
+
+        Text deltas are yielded as they arrive, followed by one finish-metadata
+        chunk; usage is emitted from the terminal response. Refusals, failed
+        responses, SSE errors and a stream without a terminal event fail fast.
+        """
+        create_params = self._build_openai_responses_params(
+            model_id=model_id,
+            current_messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            json_output=json_output,
+            json_schema=json_schema,
+            tools_enabled=False,
+        )
+        create_params["stream"] = True
+        if extra_verbose:
+            logger.info(f"[EXTRA_VERBOSE] OpenAI Responses streaming parameters: {create_params}")
+
+        stream = await self._call_responses_create_with_reasoning_retry(
+            create_params,
+            request_kwargs,
+            model_id=model_id,
+        )
+        text_parts: List[str] = []
+        refusal_parts: List[str] = []
+        final_response = None
+        error_code: Optional[str] = None
+        error_message: Optional[str] = None
+        async for event in stream:
+            event_type = getattr(event, "type", "")
+            if event_type == "response.output_text.delta":
+                delta = str(getattr(event, "delta", "") or "")
+                if delta:
+                    text_parts.append(delta)
+                    yield delta
+            elif event_type == "response.refusal.delta":
+                refusal_parts.append(str(getattr(event, "delta", "") or ""))
+            elif event_type in {"response.completed", "response.incomplete", "response.failed"}:
+                final_response = getattr(event, "response", None)
+            elif event_type in {"error", "response.error"}:
+                error_code, error_message, _param = self._openai_responses_error_fields(event)
+
+        content = "".join(text_parts)
+        usage_with_finish = self._usage_with_finish_metadata(
+            getattr(final_response, "usage", None),
+            final_response,
+            provider=provider,
+            max_tokens=max_tokens,
+        )
+        status = _stringify_finish_reason(self._obj_get(final_response, "status", None))
+        refusal = (
+            "".join(refusal_parts) or self._extract_openai_responses_refusal(final_response)
+        ).strip()
+        if refusal and not content.strip():
+            raise GenerationStoppedUnexpectedly(
+                f"openai model '{model_id}' streamed a refusal instead of content: "
+                f"{_truncate_to_bytes(refusal, 500)!r}",
+                provider=provider,
+                model_id=model_id,
+                finish_reason="refusal",
+                finish_reason_category="content_filter",
+                partial_content="",
+                usage={**usage_with_finish, "provider_stop_reason": "refusal"},
+            )
+        if error_code or error_message or status == "failed" or final_response is None:
+            if not (error_code or error_message):
+                error_code, error_message, _param = self._openai_responses_error_fields(
+                    self._obj_get(final_response, "error", None)
+                )
+            stop_reason = error_code or status or "missing_terminal_event"
+            raise GenerationStoppedUnexpectedly(
+                f"OpenAI Responses stream for '{model_id}' ended without a usable "
+                f"response (status={status or 'n/a'}, code={error_code or 'n/a'}, "
+                f"detail={error_message or 'n/a'})",
+                provider=provider,
+                model_id=model_id,
+                finish_reason=stop_reason,
+                finish_reason_category=(
+                    "content_filter" if stop_reason == "content_filter" else "provider_error"
+                ),
+                partial_content=content,
+                usage={**usage_with_finish, "provider_stop_reason": stop_reason},
+            )
+        # Same contract as the Chat stream: a classified unusable finish
+        # (truncation, content filter) reaches consumers as terminal metadata.
+        if not content.strip() and not usage_with_finish.get("finish_unusable"):
+            error_msg = (
+                f"Streaming completed but no content received from {model_id} "
+                f"(Responses status: {status or 'n/a'})"
+            )
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
+        self._emit_usage(
+            usage_callback,
+            resolved_model_id or model_id,
+            provider,
+            usage_with_finish,
+            extra_payload,
+        )
+        yield StreamChunk(
+            "",
+            is_thinking=False,
+            metadata=_build_finish_metadata(
+                provider=provider,
+                finish_reason=usage_with_finish.get("finish_reason") or status,
+                max_tokens=max_tokens,
+            ),
+        )
+
     async def _stream_openai(
         self,
         prompt: str,
@@ -13782,7 +13848,8 @@ class AIService:
 
         extra_payload = usage_extra or {}
 
-        effective_system_prompt = system_prompt if system_prompt is not None else config.GENERATOR_SYSTEM_PROMPT
+        base_system_prompt = system_prompt if system_prompt is not None else config.GENERATOR_SYSTEM_PROMPT
+        effective_system_prompt = base_system_prompt
         request_kwargs: Dict[str, Any] = {}
         if request_timeout and request_timeout > 0:
             request_kwargs["timeout"] = request_timeout
@@ -13817,192 +13884,99 @@ class AIService:
             logger.info(f"[EXTRA_VERBOSE] Max tokens: {max_tokens}")
 
         try:
-            # Responses-capability models must not fall through to the legacy
-            # Chat Completions branch. The regular generator already owns the
-            # Responses request shape and preserves the requested effort.
-            if self._is_openai_responses_api_model(model_id) or "o3-pro" in model_id.lower():
-                logger.info(
-                    "Using regular Responses generation for streaming request model %s",
-                    model_id,
-                )
-                content, usage_meta = await self._generate_openai(
-                    prompt,
-                    model_id,
-                    temperature,
-                    max_tokens,
-                    effective_system_prompt,
-                    reasoning_effort,
-                    extra_verbose,
-                    request_timeout=request_timeout,
-                    json_output=json_output,
-                    json_schema=json_schema,
-                    images=images,
-                    **({"shared_context": shared_context} if shared_context else {}),
-                )
-                yield content
-                yield StreamChunk(
-                    "",
-                    is_thinking=False,
-                    metadata=_build_finish_metadata(
-                        provider=provider,
-                        finish_reason=(usage_meta or {}).get("finish_reason") if isinstance(usage_meta, dict) else None,
-                        max_tokens=max_tokens,
-                    ),
-                )
-                self._emit_usage(
-                    usage_callback,
-                    resolved_model_id or model_id,
-                    provider,
-                    usage_meta,
-                    extra_payload,
-                )
-                return
-
-            # Handle GPT-5 Pro models (no streaming support, use regular generation)
-            elif "gpt-5-pro" in model_id.lower():
-                logger.info(f"GPT-5 Pro doesn't support streaming, using regular generation")
-                content, usage_meta = await self._generate_openai(
-                    prompt,
-                    model_id,
-                    temperature,
-                    max_tokens,
-                    effective_system_prompt,
-                    reasoning_effort,
-                    extra_verbose,
-                    request_timeout=request_timeout,
-                    json_output=json_output,
-                    json_schema=json_schema,
-                    images=images,
-                    **({"shared_context": shared_context} if shared_context else {}),
-                )
-                yield content
-                yield StreamChunk(
-                    "",
-                    is_thinking=False,
-                    metadata=_build_finish_metadata(
-                        provider=provider,
-                        finish_reason=(usage_meta or {}).get("finish_reason") if isinstance(usage_meta, dict) else None,
-                        max_tokens=max_tokens,
-                    ),
-                )
-                self._emit_usage(
-                    usage_callback,
-                    resolved_model_id or model_id,
-                    provider,
-                    usage_meta,
-                    extra_payload,
-                )
-                return
-
-            elif "gpt-5" in model_id.lower():
-                # GPT-5 models: use max_completion_tokens, NO temperature parameter
-                create_params = {
-                    "model": model_id,
-                    "messages": messages,
-                    "max_completion_tokens": max_tokens,
-                    "stream": True
-                }
-
-                # Add reasoning_effort if provided
-                if reasoning_effort:
-                    create_params["reasoning_effort"] = reasoning_effort
-                    logger.info(f"Using reasoning effort: {reasoning_effort} for streaming model {model_id}")
-
-                # Configure JSON output format
-                if json_output:
-                    if json_schema:
-                        # Use JSON Schema for structured outputs
-                        create_params["response_format"] = {
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": "structured_output",
-                                "strict": True,
-                                "schema": json_schema
-                            }
-                        }
-                        logger.info(f"Using GPT-5 JSON Schema structured outputs (streaming) for {model_id}")
-                    else:
-                        # Use basic JSON mode (flexible structure)
-                        create_params["response_format"] = {"type": "json_object"}
-                        logger.info(f"Using GPT-5 JSON mode (streaming, flexible) for {model_id}")
-
-                create_params.setdefault("stream_options", {})["include_usage"] = True
-
-                if extra_verbose:
-                    logger.info(f"[EXTRA_VERBOSE] GPT-5 streaming parameters: {create_params}")
-
-                try:
-                    stream = await self._call_chat_completions_create_with_reasoning_retry(
-                        self.openai_client,
-                        create_params,
-                        request_kwargs,
-                        provider_key=provider,
+            if self._is_openai_responses_api_model(model_id):
+                if self._openai_responses_streaming_supported(model_id):
+                    async for piece in self._stream_openai_responses(
+                        messages,
                         model_id=model_id,
-                    )
-                except Exception as stream_error:
-                    logger.error(f"GPT-5 streaming failed to initialize: {str(stream_error)}")
-                    # Never log full payloads at ERROR: messages may contain
-                    # user text, attachments or PII. Log metadata only; the
-                    # full payload stays behind the opt-in extra_verbose channel.
-                    failed_messages = create_params.get("messages") or []
-                    failed_message_chars = sum(
-                        len(msg.get("content") or "")
-                        for msg in failed_messages
-                        if isinstance(msg, dict) and isinstance(msg.get("content"), str)
-                    )
-                    logger.error(
-                        f"GPT-5 failed parameters summary: model={create_params.get('model')}, "
-                        f"max_completion_tokens={create_params.get('max_completion_tokens')}, "
-                        f"messages={len(failed_messages)} (text_chars={failed_message_chars}), "
-                        f"json_mode={'response_format' in create_params}, "
-                        f"reasoning_effort={create_params.get('reasoning_effort')}"
-                    )
-                    if extra_verbose:
-                        logger.info(f"[EXTRA_VERBOSE] GPT-5 parameters that failed: {create_params}")
-                    # Wrap in RuntimeError (never a bare generic Exception)
-                    # while preserving the cause chain and structured provider
-                    # signals for failure classification (AIS-12).
-                    raise _wrap_preserving_provider_signals(
-                        f"GPT-5 streaming initialization failed: {str(stream_error)}",
-                        stream_error,
-                    )
-            else:
-                # Standard GPT models
-                if extra_verbose:
-                    logger.info(f"[EXTRA_VERBOSE] Standard OpenAI streaming with temperature: {temperature}")
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        reasoning_effort=reasoning_effort,
+                        json_output=json_output,
+                        json_schema=json_schema,
+                        request_kwargs=request_kwargs,
+                        usage_callback=usage_callback,
+                        provider=provider,
+                        resolved_model_id=resolved_model_id,
+                        extra_payload=extra_payload,
+                        extra_verbose=extra_verbose,
+                    ):
+                        yield piece
+                    return
 
-                create_params = _build_openai_params(
-                    model_id, messages, temperature, max_tokens, reasoning_effort
+                logger.info(
+                    "Model %s has no Responses streaming; using one non-stream create",
+                    model_id,
                 )
-                create_params["stream"] = True
+                content, usage_meta = await self._generate_openai(
+                    prompt,
+                    model_id,
+                    temperature,
+                    max_tokens,
+                    base_system_prompt,
+                    reasoning_effort,
+                    extra_verbose,
+                    request_timeout=request_timeout,
+                    json_output=json_output,
+                    json_schema=json_schema,
+                    images=images,
+                    **({"shared_context": shared_context} if shared_context else {}),
+                )
+                yield content
+                yield StreamChunk(
+                    "",
+                    is_thinking=False,
+                    metadata=_build_finish_metadata(
+                        provider=provider,
+                        finish_reason=(usage_meta or {}).get("finish_reason") if isinstance(usage_meta, dict) else None,
+                        max_tokens=max_tokens,
+                    ),
+                )
+                self._emit_usage(
+                    usage_callback,
+                    resolved_model_id or model_id,
+                    provider,
+                    usage_meta,
+                    extra_payload,
+                )
+                return
 
-                create_params.setdefault("stream_options", {})["include_usage"] = True
+            # Chat Completions-only models
+            if extra_verbose:
+                logger.info(f"[EXTRA_VERBOSE] Standard OpenAI streaming with temperature: {temperature}")
 
-                # Configure JSON output format
-                if json_output:
-                    if json_schema:
-                        # Use JSON Schema for structured outputs (GPT-4o-2024-08-06+)
-                        create_params["response_format"] = {
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": "structured_output",
-                                "strict": True,
-                                "schema": json_schema
-                            }
+            create_params = _build_openai_params(
+                model_id, messages, temperature, max_tokens, reasoning_effort
+            )
+            create_params["stream"] = True
+
+            create_params.setdefault("stream_options", {})["include_usage"] = True
+
+            # Configure JSON output format
+            if json_output:
+                if json_schema:
+                    # Use JSON Schema for structured outputs (GPT-4o-2024-08-06+)
+                    create_params["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "structured_output",
+                            "strict": True,
+                            "schema": json_schema
                         }
-                        logger.info(f"Using OpenAI JSON Schema structured outputs (streaming) for {model_id}")
-                    else:
-                        # Use basic JSON mode (flexible structure)
-                        create_params["response_format"] = {"type": "json_object"}
-                        logger.info(f"Using OpenAI JSON mode (streaming, flexible) for {model_id}")
+                    }
+                    logger.info(f"Using OpenAI JSON Schema structured outputs (streaming) for {model_id}")
+                else:
+                    # Use basic JSON mode (flexible structure)
+                    create_params["response_format"] = {"type": "json_object"}
+                    logger.info(f"Using OpenAI JSON mode (streaming, flexible) for {model_id}")
 
-                stream = await self._call_chat_completions_create_with_reasoning_retry(
-                    self.openai_client,
-                    create_params,
-                    request_kwargs,
-                    provider_key=provider,
-                    model_id=model_id,
-                )
+            stream = await self._call_chat_completions_create_with_reasoning_retry(
+                self.openai_client,
+                create_params,
+                request_kwargs,
+                provider_key=provider,
+                model_id=model_id,
+            )
 
             chunk_count = 0
             total_content = ""

@@ -9,7 +9,7 @@ import pytest
 
 import ai_service as module
 from ai_service import AIService
-from dev_tests.test_shared_context_transport import FakeStream
+from dev_tests.test_shared_context_transport import FakeResponsesStream, FakeStream
 from shared_context import CacheablePrompt, prepend_user_context
 
 TEXT = "Stable data: caf\u00e9 \n\nStable task.\nVariable retry."
@@ -113,7 +113,8 @@ def test_all_request_boundaries_respect_provider_limit():
 async def test_openai_adapters_retain_boundaries_without_shared_context(service, streaming, responses, with_images):
     response = SimpleNamespace(output_text="ok", usage=None,
                                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
-    create = AsyncMock(return_value=FakeStream() if streaming and not responses else response)
+    create = AsyncMock(return_value=(FakeResponsesStream() if responses else FakeStream())
+                       if streaming else response)
     service.openai_client = SimpleNamespace(responses=SimpleNamespace(create=create),
         chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     service._is_openai_responses_api_model = Mock(return_value=responses)
@@ -144,14 +145,13 @@ async def test_openai_adapters_retain_boundaries_without_shared_context(service,
 
 
 @pytest.mark.asyncio
-async def test_older_responses_model_keeps_plain_string_input(service):
+async def test_older_responses_model_sends_unmarked_text_input(service):
     create = AsyncMock(return_value=SimpleNamespace(output_text="ok", usage=None))
     service.openai_client = SimpleNamespace(responses=SimpleNamespace(create=create))
     service._is_openai_responses_api_model = Mock(return_value=True)
     await service._generate_openai(CacheablePrompt(TEXT, BOUNDARIES), "o3-pro", 0.2, 32, "system")
     params = create.await_args.kwargs
-    assert isinstance(params["input"], str)
-    assert params["input"] == TEXT
+    assert params["input"] == [{"role": "user", "content": TEXT}]
     assert "extra_body" not in params
 
 

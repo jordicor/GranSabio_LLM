@@ -1,0 +1,10 @@
+{
+  "resources": [
+    {
+      "id": "shared_gpu",
+      "gpu_uuid": "GPU-REPLACE-WITH-VERIFIED-PHYSICAL-UUID",
+      "endpoint_ids": ["ollama"],
+      "external_service_url": "http://gpu-host.local:8188"
+    }
+  ]
+}

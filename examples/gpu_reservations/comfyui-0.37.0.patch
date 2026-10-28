@@ -1,0 +1,237 @@
+--- a/main.py
++++ b/main.py
+@@ -384,29 +384,39 @@
+                 logging.info("Prompt executed in {:.2f} seconds".format(execution_time), extra={'color': 'green'})
+
+         flags = q.get_flags()
+-        free_memory = flags.get("free_memory", False)
+-
+-        if flags.get("unload_models", free_memory):
+-            comfy.model_management.unload_all_models()
+-            need_gc = True
+-            last_gc_collect = 0
+-
+-        if free_memory:
+-            e.reset()
+-            need_gc = True
+-            last_gc_collect = 0
+-
+-        if need_gc:
+-            current_time = time.perf_counter()
+-            if (current_time - last_gc_collect) > gc_collect_interval:
+-                gc.collect()
+-                comfy.model_management.soft_empty_cache()
+-                last_gc_collect = current_time
+-                need_gc = False
+-                hook_breaker_ac10a0.restore_functions()
+-
+-                asset_manager.queue_output_scan()
+-                asset_manager.resume_background_scan()
++        barrier_request = flags.get("gransabio_release_request")
++        try:
++            free_memory = flags.get("free_memory", False)
++
++            if flags.get("unload_models", free_memory):
++                comfy.model_management.unload_all_models()
++                need_gc = True
++                last_gc_collect = 0
++
++            if free_memory:
++                e.reset()
++                need_gc = True
++                last_gc_collect = 0
++
++            if need_gc:
++                current_time = time.perf_counter()
++                if barrier_request or (current_time - last_gc_collect) > gc_collect_interval:
++                    gc.collect()
++                    comfy.model_management.soft_empty_cache()
++                    last_gc_collect = current_time
++                    need_gc = False
++                    hook_breaker_ac10a0.restore_functions()
++
++                    asset_manager.queue_output_scan()
++                    asset_manager.resume_background_scan()
++            if barrier_request:
++                comfy.model_management.torch.cuda.synchronize(comfy.model_management.get_torch_device())
++                q.resource_barrier.complete(barrier_request)
++        except Exception:
++            if not barrier_request:
++                raise
++            q.resource_barrier.fail(barrier_request, "worker_cleanup_failed")
++            logging.exception("ComfyUI resource release did not complete")
+
+
+ async def run(server_instance, address='', port=8188, verbose=True, call_on_start=None):
+--- a/server.py
++++ b/server.py
+@@ -1192,6 +1192,42 @@
+
+             return web.Response(status=200)
+
++        @routes.get("/gransabio/resource-barrier")
++        async def gransabio_resource_status(request):
++            try:
++                return web.json_response(self.prompt_queue.resource_barrier.status())
++            except Exception:
++                logging.exception("Resource barrier status unavailable")
++                return web.json_response({"error": "barrier_unavailable"}, status=503)
++
++        @routes.get("/gransabio/resource-barrier/{request_id}")
++        async def gransabio_release_status(request):
++            try:
++                result = self.prompt_queue.resource_barrier.status(request.match_info["request_id"])
++                return web.json_response(result)
++            except KeyError:
++                return web.json_response({"error": "unknown_operation"}, status=404)
++            except Exception:
++                logging.exception("Resource release status unavailable")
++                return web.json_response({"error": "barrier_unavailable"}, status=503)
++
++        @routes.post("/gransabio/resource-barrier/release")
++        async def gransabio_request_release(request):
++            from gransabio_resource_barrier import ResourceBarrierBusy
++            try:
++                data = await request.json()
++                if not isinstance(data, dict) or set(data) != {"request_id"} or not isinstance(data["request_id"], str):
++                    raise ValueError("Expected only request_id UUID")
++                result = self.prompt_queue.resource_barrier.request_release(data["request_id"])
++                return web.json_response(result, status=202 if result["state"] == "pending" else 200)
++            except (ValueError, TypeError):
++                return web.json_response({"error": "invalid_request_id"}, status=422)
++            except ResourceBarrierBusy:
++                return web.json_response({"error": "resource_busy"}, status=409)
++            except Exception:
++                logging.exception("Resource release unavailable")
++                return web.json_response({"error": "barrier_unavailable"}, status=503)
++
+         @routes.post("/free")
+         async def post_free(request):
+             json_data = await request.json()
+--- a/execution.py
++++ b/execution.py
+@@ -1,4 +1,5 @@
+ import copy
++from gransabio_resource_barrier import ResourceBarrier
+ import heapq
+ import inspect
+ import logging
+@@ -1293,9 +1294,11 @@
+         self.currently_running = {}
+         self.history = {}
+         self.flags = {}
++        self.resource_barrier = ResourceBarrier(self)
+
+     def put(self, item):
+         with self.mutex:
++            self.resource_barrier.work_queued()
+             heapq.heappush(self.queue, item)
+             self.server.queue_updated()
+             self.not_empty.notify()
+--- /dev/null
++++ b/gransabio_resource_barrier.py
+@@ -0,0 +1,104 @@
++"""Correlated model-release receipts from ComfyUI's existing prompt worker.
++
++Proposed companion: no CUDA import or lifecycle operation occurs on import.
++Only the prompt worker may call complete(), after native memory cleanup.
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import Callable
++from uuid import UUID, uuid4
++
++PROTOCOL = "gransabio.gpu-barrier.v1"
++
++
++class ResourceBarrierBusy(RuntimeError):
++    """The queue or another release operation owns the worker."""
++
++
++def physical_gpu_uuid() -> str:
++    """Identify the actual single CUDA device; never substitute an ordinal."""
++    import comfy.model_management as management
++
++    devices = management.get_all_torch_devices()
++    if len(devices) != 1 or devices[0].type != "cuda":
++        raise RuntimeError("The resource barrier requires exactly one visible CUDA device")
++    value = str(management.torch.cuda.get_device_properties(devices[0]).uuid)
++    value = value.removeprefix("GPU-")
++    return f"GPU-{UUID(value)}"
++
++
++def loaded_model_classes() -> list[str]:
++    """Report current model classes; these are not invented model filenames."""
++    import comfy.model_management as management
++
++    return [type(getattr(item.model, "model", item.model)).__name__ for item in list(management.current_loaded_models)]
++
++
++class ResourceBarrier:
++    """Keep queue admission and release acknowledgment under the same mutex."""
++
++    def __init__(self, queue, *, gpu_uuid: Callable[[], str] = physical_gpu_uuid,
++                 loaded_models: Callable[[], list[str]] = loaded_model_classes):
++        self.queue = queue
++        self.gpu_uuid = gpu_uuid
++        self.loaded_models = loaded_models
++        self.instance_id = str(uuid4())
++        self.generation = 0
++        self.memory_released = False
++        self.operations: dict[str, dict] = {}
++
++    def work_queued(self) -> None:
++        """Invalidate old memory receipts before a new prompt becomes visible."""
++        with self.queue.mutex:
++            self.generation += 1
++            self.memory_released = False
++
++    def status(self, request_id: str | None = None) -> dict:
++        """Return historical operation state together with current device state."""
++        with self.queue.mutex:
++            operation = self.operations[request_id] if request_id is not None else None
++            models = self.loaded_models()
++            idle = not self.queue.queue and not self.queue.currently_running
++            result = {"protocol": PROTOCOL, "instance_id": self.instance_id,
++                      "gpu_uuid": self.gpu_uuid(), "idle": idle,
++                      "memory_released": self.memory_released and idle and not models,
++                      "loaded_model_classes": models}
++            if operation is not None:
++                result.update(request_id=request_id, state=operation["state"], error=operation.get("error"))
++            return result
++
++    def request_release(self, request_id: str) -> dict:
++        """Queue native cleanup once; HTTP acceptance is never completion."""
++        request_id = str(UUID(request_id))
++        with self.queue.mutex:
++            if request_id in self.operations:
++                return self.status(request_id)
++            if self.queue.queue or self.queue.currently_running or any(item["state"] == "pending" for item in self.operations.values()):
++                raise ResourceBarrierBusy("ComfyUI has active/queued work or another release")
++            self.gpu_uuid()  # Reject unsupported/unknown device identity before setting flags.
++            self.operations[request_id] = {"state": "pending", "generation": self.generation}
++            self.memory_released = False
++            self.queue.set_flag("gransabio_release_request", request_id)
++            self.queue.set_flag("unload_models", True)
++            self.queue.set_flag("free_memory", True)
++            return self.status(request_id)
++
++    def complete(self, request_id: str) -> None:
++        """Acknowledge only after the real worker's full cleanup and CUDA sync."""
++        with self.queue.mutex:
++            operation = self.operations[request_id]
++            if (operation["generation"] != self.generation or self.queue.queue
++                    or self.queue.currently_running or self.loaded_models()):
++                self.fail(request_id, "work_changed_or_models_remain")
++                return
++            operation["state"] = "completed"
++            self.memory_released = True
++
++    def fail(self, request_id: str, reason: str) -> None:
++        """Preserve a failed operation instead of issuing a success receipt."""
++        with self.queue.mutex:
++            self.operations[request_id].update(state="failed", error=reason)
++            self.memory_released = False
++            logging.error("GPU release barrier %s failed: %s", request_id, reason)

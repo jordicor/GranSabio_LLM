@@ -716,6 +716,14 @@ class Config(BaseModel):
         default="",
         description="Administrative JSON file registering local inference API endpoints",
     )
+    LOCAL_RESOURCES_CONFIG_PATH: str = Field(
+        default="",
+        description="Opt-in JSON mapping physical GPUs to local endpoint IDs and ComfyUI services",
+    )
+    LOCAL_RESOURCES_STATE_PATH: str = Field(
+        default="data/local_resources.sqlite3",
+        description="Durable local GPU reservation state; one coordinator process owns this local file",
+    )
     LLAMACPP_BASE_URL: str = Field(
         default="",
         description="OpenAI-compatible llama.cpp server URL (for example http://host:11435/v1)",
@@ -1473,6 +1481,12 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         self.OLLAMA_HOST = os.getenv("OLLAMA_HOST", self.OLLAMA_HOST)
         self.LOCAL_ENDPOINTS_CONFIG_PATH = os.getenv(
             "LOCAL_ENDPOINTS_CONFIG_PATH", self.LOCAL_ENDPOINTS_CONFIG_PATH
+        )
+        self.LOCAL_RESOURCES_CONFIG_PATH = os.getenv(
+            "LOCAL_RESOURCES_CONFIG_PATH", self.LOCAL_RESOURCES_CONFIG_PATH
+        )
+        self.LOCAL_RESOURCES_STATE_PATH = os.getenv(
+            "LOCAL_RESOURCES_STATE_PATH", self.LOCAL_RESOURCES_STATE_PATH
         )
         self.OLLAMA_ENDPOINT_ALIAS = os.getenv(
             "OLLAMA_ENDPOINT_ALIAS", self.OLLAMA_ENDPOINT_ALIAS

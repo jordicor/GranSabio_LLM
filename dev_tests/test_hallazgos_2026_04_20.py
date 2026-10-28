@@ -19,7 +19,7 @@ Each finding gets at least one focused test:
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
@@ -96,6 +96,7 @@ async def test_measurement_only_assistant_final_skips_validation_callback():
     the callback and accept the candidate directly.
     """
     service = AIService.__new__(AIService)
+    service._is_openai_responses_api_model = Mock(return_value=False)  # Exercise the Chat tool-loop transport.
 
     qa_json = '{"score": 9.5, "issues": []}'
     fake_response = _FakeResponse(content=qa_json, tool_calls=[])
@@ -160,6 +161,7 @@ async def test_measurement_only_assistant_final_skips_validation_callback():
 async def test_generator_mode_assistant_final_still_validates():
     """The GENERATOR scope keeps the callback as the authoritative gate."""
     service = AIService.__new__(AIService)
+    service._is_openai_responses_api_model = Mock(return_value=False)  # Exercise the Chat tool-loop transport.
 
     draft = "a short draft"
     fake_response = _FakeResponse(content=draft, tool_calls=[])
@@ -300,6 +302,7 @@ async def test_call_ai_context_too_large_envelope_propagates_reason():
 async def test_retries_disabled_skips_execute_with_retries_openai_loop():
     """When ``retries_enabled=False``, OpenAI loop must not wrap in retries."""
     service = AIService.__new__(AIService)
+    service._is_openai_responses_api_model = Mock(return_value=False)  # Exercise the Chat tool-loop transport.
 
     fake_response = _FakeResponse(content="ok", tool_calls=[])
     fake_client = MagicMock()
@@ -457,6 +460,7 @@ async def test_openai_loop_catches_validate_draft_input_too_large():
     4. NOT abort the whole request.
     """
     service = AIService.__new__(AIService)
+    service._is_openai_responses_api_model = Mock(return_value=False)  # Exercise the Chat tool-loop transport.
 
     # First turn returns a tool_call with an oversize text argument.
     huge_text = "x" * 250_000

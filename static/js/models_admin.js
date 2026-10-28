@@ -191,6 +191,7 @@
       context_window: contextWindow,
       pricing,
       capabilities,
+      provider_capabilities: entry.provider_capabilities || entry.raw?.provider_capabilities || {},
       supported_parameters: supportedParameters,
       verified_at: entry.verified_at || entry.updated_at || entry.created_at || "",
       created_at: entry.created_at || entry.remote_created_at || "",
@@ -302,6 +303,7 @@
       output_tokens: model.output_tokens || 0,
       pricing: model.pricing || {},
       capabilities: [...(model.capabilities || [])].sort(),
+      vision_input: model.provider_capabilities?.vision_input?.support ?? model.provider_capabilities?.vision_input ?? null,
       supported_parameters: [...(model.supported_parameters || [])].sort(),
       source: model.source || "",
     };
@@ -1219,6 +1221,12 @@
       ];
 
       let diffs = "";
+
+      const oldVision = localModel.provider_capabilities?.vision_input?.support ?? localModel.provider_capabilities?.vision_input ?? "unknown";
+      const newVision = remoteModel.provider_capabilities?.vision_input?.support ?? remoteModel.provider_capabilities?.vision_input ?? "unknown";
+      if (oldVision !== newVision) {
+        diffs += `<div class="diff-field">Image input: <span class="diff-old">${escapeHtml(String(oldVision))}</span> -> <span class="diff-new">${escapeHtml(String(newVision))}</span></div>`;
+      }
 
       for (const f of fields) {
         const oldVal = localModel[f.key];

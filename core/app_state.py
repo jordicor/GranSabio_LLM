@@ -161,9 +161,11 @@ from smart_edit.router import router as smart_edit_router
 app.include_router(smart_edit_router, prefix="/smart-edit")
 
 # Monitor routes
+from .local_resource_routes import router as local_resource_router
 from .monitor_routes import router as monitor_router
 
 app.include_router(monitor_router)
+app.include_router(local_resource_router)
 
 # Templates
 templates = enable_template_response_compat(Jinja2Templates(directory="templates"))
@@ -646,6 +648,11 @@ async def shutdown_event():
                 logger.info("AI service connections closed successfully")
     except Exception as e:
         logger.error(f"Error closing AI service: {e}")
+
+    # Preserve resource reservations while closing the coordinator.
+    from local_resources import close_local_resource_manager
+
+    await close_local_resource_manager()
 
     # Shutdown feedback memory system
     try:

@@ -25,7 +25,7 @@ def client() -> TestClient:
 @pytest.fixture(autouse=True)
 def _allow_testserver_admin_host(monkeypatch):
     # API-05: admin mutations now validate the Host header against a hostname
-    # allowlist (loopback by default). These tests exercise the same-origin
+    # allowlist. These tests exercise the same-origin
     # logic, so the TestClient hostname is explicitly allowlisted the same way
     # a real deployment would via ADMIN_ALLOWED_HOSTNAMES.
     monkeypatch.setenv("ADMIN_ALLOWED_HOSTNAMES", "testserver")
@@ -53,6 +53,83 @@ def mock_model_sync_service(monkeypatch):
     service.fetch_remote_models = AsyncMock(return_value={"models": []})
     monkeypatch.setattr(openrouter_routes, "_get_model_sync_service", lambda: service)
     return service
+
+
+@pytest.mark.parametrize(
+    ("host", "expected_status"),
+    [
+        ("localhost", 200),
+        ("127.0.0.1", 200),
+        ("[::1]", 200),
+        ("198.51.100.10", 200),
+        ("[2001:db8:1::10]", 200),
+        ("203.0.113.10", 403),
+        ("attacker.example.test", 403),
+        ("198.51.100.10.attacker.example.test", 403),
+    ],
+)
+def test_admin_sync_default_hosts_follow_internal_networks(
+    monkeypatch, mock_model_sync_service, host, expected_status,
+):
+    monkeypatch.delenv("ADMIN_ALLOWED_HOSTNAMES", raising=False)
+    # Documentation-only networks represent the configured LAN and VPN.
+    monkeypatch.setenv(
+        "INTERNAL_ALLOWED_CIDRS",
+        "127.0.0.0/8,::1/128,198.51.100.0/24,2001:db8:1::/64",
+    )
+    origin = f"http://{host}:8000"
+    client = TestClient(app, client=("198.51.100.42", 50000))
+
+    response = client.post(
+        "/api/admin/models/providers/openrouter/sync",
+        json={"models": []},
+        headers={"host": f"{host}:8000", "origin": origin},
+    )
+
+    assert response.status_code == expected_status
+    if expected_status == 200:
+        mock_model_sync_service.sync_provider.assert_called_once_with("openrouter", [])
+    else:
+        assert response.json()["detail"] == "Admin mutation rejected: untrusted Host header"
+        mock_model_sync_service.sync_provider.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("host", "expected_status"),
+    [("admin.example.test", 200), ("198.51.100.11", 200), ("198.51.100.10", 403)],
+)
+def test_admin_sync_explicit_hosts_override_network_defaults(
+    monkeypatch, mock_model_sync_service, host, expected_status,
+):
+    monkeypatch.setenv("ADMIN_ALLOWED_HOSTNAMES", " Admin.Example.Test. , 198.51.100.11 ")
+    monkeypatch.setenv("INTERNAL_ALLOWED_CIDRS", "127.0.0.0/8,198.51.100.0/24")
+    origin = f"http://{host}:8000"
+    client = TestClient(app, base_url=origin)
+
+    response = client.post(
+        "/api/admin/models/providers/openrouter/sync",
+        json={"models": []},
+        headers={"origin": origin},
+    )
+
+    assert response.status_code == expected_status
+    if expected_status == 200:
+        mock_model_sync_service.sync_provider.assert_called_once_with("openrouter", [])
+    else:
+        mock_model_sync_service.sync_provider.assert_not_called()
+
+
+@pytest.mark.parametrize("origin", ["http://[::1", "http://testserver:invalid"])
+def test_admin_sync_rejects_malformed_origin(client, mock_model_sync_service, origin):
+    response = client.post(
+        "/api/admin/models/providers/openrouter/sync",
+        json={"models": []},
+        headers={"origin": origin, "sec-fetch-site": "same-origin"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Admin mutation rejected: invalid Origin/Referer"
+    mock_model_sync_service.sync_provider.assert_not_called()
 
 
 @pytest.mark.parametrize(

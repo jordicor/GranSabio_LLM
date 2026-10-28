@@ -21,6 +21,8 @@ def test_provider_finish_reasons_get_actionable_categories():
     cases = [
         ("openai", "content_filter", "content_filter", False),
         ("openai", "max_output_tokens", "output_token_limit", True),
+        ("openai", "failed", "provider_error", False),
+        ("openai", "cancelled", "provider_error", False),
         ("claude", "model_context_window_exceeded", "context_limit", False),
         ("claude", "pause_turn", "pause_turn", False),
         ("claude", "refusal", "content_filter", False),

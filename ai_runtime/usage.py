@@ -73,7 +73,7 @@ PAUSE_REASONS_BY_PROVIDER = {
 }
 
 ERROR_REASONS_BY_PROVIDER = {
-    "openai": {"incomplete"},
+    "openai": {"incomplete", "failed", "cancelled"},
     "openrouter": {"error"},
     "xai": {"incomplete"},
     "gemini": {"other", "finish_reason_unspecified"},

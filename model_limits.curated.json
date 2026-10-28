@@ -142,6 +142,105 @@
       "provenance": "manual_curated",
       "note": "Retired 2026-05-15; served by grok-4.3 (1M window). Curated as served (max_total 1000000)."
     },
+    "grok-4.7": {
+      "max_input_tokens": null,
+      "max_output_tokens": null,
+      "max_total_context_tokens": 500000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "unknown",
+      "source": "https://docs.x.ai/developers/models/grok-4.7",
+      "verified_at": "2026-10-27",
+      "provenance": "manual_curated",
+      "note": "Official 500K context window (maxPromptLength). The xAI model-list API publishes no token limits; max output cap is unpublished."
+    },
+    "grok-4.6": {
+      "max_input_tokens": null,
+      "max_output_tokens": null,
+      "max_total_context_tokens": 500000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "unknown",
+      "source": "https://docs.x.ai/developers/models/grok-4.6",
+      "verified_at": "2026-10-27",
+      "provenance": "manual_curated",
+      "note": "Official 500K context window (maxPromptLength). The xAI model-list API publishes no token limits; max output cap is unpublished."
+    },
+    "grok-4.5": {
+      "max_input_tokens": null,
+      "max_output_tokens": null,
+      "max_total_context_tokens": 500000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "unknown",
+      "source": "https://docs.x.ai/developers/models/grok-4.5",
+      "verified_at": "2026-10-27",
+      "provenance": "manual_curated",
+      "note": "Official 500K context window (maxPromptLength). The xAI model-list API publishes no token limits; max output cap is unpublished."
+    },
+    "grok-4.3": {
+      "max_input_tokens": null,
+      "max_output_tokens": null,
+      "max_total_context_tokens": 1000000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "unknown",
+      "source": "https://docs.x.ai/developers/models/grok-4.3",
+      "verified_at": "2026-10-27",
+      "provenance": "manual_curated",
+      "note": "Official 1M context window (maxPromptLength). The xAI model-list API publishes no token limits; max output cap is unpublished."
+    },
+    "grok-4.20-0309-reasoning": {
+      "max_input_tokens": null,
+      "max_output_tokens": null,
+      "max_total_context_tokens": 1000000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "unknown",
+      "source": "https://docs.x.ai/developers/models/grok-4.20-0309-reasoning",
+      "verified_at": "2026-10-27",
+      "provenance": "manual_curated",
+      "note": "Official 1M context window (maxPromptLength). The xAI model-list API publishes no token limits; max output cap is unpublished."
+    },
+    "grok-4.20-0309-non-reasoning": {
+      "max_input_tokens": null,
+      "max_output_tokens": null,
+      "max_total_context_tokens": 1000000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "unknown",
+      "source": "https://docs.x.ai/developers/models/grok-4.20-0309-non-reasoning",
+      "verified_at": "2026-10-27",
+      "provenance": "manual_curated",
+      "note": "Official 1M context window (maxPromptLength). The xAI model-list API publishes no token limits; max output cap is unpublished."
+    },
+    "grok-4.20-multi-agent-0309": {
+      "max_input_tokens": null,
+      "max_output_tokens": null,
+      "max_total_context_tokens": 1000000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "unknown",
+      "source": "https://docs.x.ai/developers/models/grok-4.20-multi-agent-0309",
+      "verified_at": "2026-10-27",
+      "provenance": "manual_curated",
+      "note": "Official 1M context window (maxPromptLength). The xAI model-list API publishes no token limits; max output cap is unpublished."
+    },
+    "grok-build-0.1": {
+      "max_input_tokens": null,
+      "max_output_tokens": null,
+      "max_total_context_tokens": 256000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "unknown",
+      "source": "https://docs.x.ai/developers/models/grok-build-0.1",
+      "verified_at": "2026-10-27",
+      "provenance": "manual_curated",
+      "note": "Official 256K context window (maxPromptLength). The xAI model-list API publishes no token limits; max output cap is unpublished."
+    },
+    "grok-code-fast-1": {
+      "max_input_tokens": null,
+      "max_output_tokens": null,
+      "max_total_context_tokens": 256000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "unknown",
+      "source": "https://docs.x.ai/developers/models/grok-build-0.1",
+      "verified_at": "2026-10-27",
+      "provenance": "manual_curated",
+      "note": "xAI lists grok-code-fast-1 as an alias of grok-build-0.1 (official 256K context window). Max output cap is unpublished."
+    },
     "MiniMax-M3": {
       "max_input_tokens": null,
       "max_output_tokens": 524288,
@@ -269,6 +368,18 @@
       "verified_at": "2026-10-05",
       "provenance": "manual_curated",
       "note": "Reasoning tokens share the output allowance. Tool calling requires Responses; reasoning effort none is not supported."
+    },
+    "gpt-6.1-terra": {
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "max_total_context_tokens": 1050000,
+      "output_accounting": "within_total",
+      "reasoning_accounting": "within_output",
+      "provider": "openai",
+      "source": "https://developers.openai.com/api/docs/models/gpt-6.1-terra",
+      "verified_at": "2026-10-27",
+      "provenance": "manual_curated",
+      "note": "Reasoning tokens share the output allowance. Tool calling requires Responses; reasoning effort supports none through max."
     },
     "gpt-6-astra": {
       "max_input_tokens": 922000,

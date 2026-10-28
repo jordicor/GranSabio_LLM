@@ -23,6 +23,11 @@ from local_endpoint_registry import (
     endpoint_url,
     normalize_endpoint_base_url,
 )
+from services.model_vision_metadata import (
+    api_image_support,
+    fetch_gemini_vision_metadata,
+    fetch_openai_vision_metadata,
+)
 
 logger = logging.getLogger(__name__)
 from ai_runtime.parameters import (
@@ -63,6 +68,13 @@ MOONSHOT_MODELS_URL = "https://api.moonshot.ai/v1/models"
 OLLAMA_MODEL_LIST_SOURCE = "local/ollama"
 OLLAMA_DEFAULT_CONTEXT_WINDOW = 32768
 OLLAMA_DEFAULT_OUTPUT_TOKENS = 8192
+OLLAMA_CAPABILITY_MAP = {
+    "completion": "text",
+    "vision": "vision",
+    "thinking": "reasoning",
+    "embedding": "embeddings",
+    "tools": "tool_calling",
+}
 LLAMACPP_MODEL_LIST_SOURCE = "local/llama.cpp"
 ANTHROPIC_API_VERSION = "2023-06-01"
 REMOTE_JSON_HEADERS = {
@@ -77,6 +89,24 @@ class ModelSyncError(RuntimeError):
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _apply_image_support(entry: dict[str, Any], supported: bool | None, *, source: str, source_url: str) -> None:
+    """Keep legacy capability tags and the capability registry in agreement."""
+    if supported is None:
+        return
+    capabilities = [cap for cap in entry.get("capabilities", []) if str(cap).lower() != "vision"]
+    if supported:
+        capabilities.append("vision")
+    entry["capabilities"] = _dedupe_strings(capabilities)
+    provider_caps = dict(entry.get("provider_capabilities") or {})
+    provider_caps["vision_input"] = {
+        "support": "supported" if supported else "unsupported",
+        "source": source,
+        "source_url": source_url,
+        "verified_at": _utc_now_iso(),
+    }
+    entry["provider_capabilities"] = provider_caps
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -493,6 +523,7 @@ class ModelSyncService:
                         "input_tokens": model_data.get("input_tokens", model_data.get("context_window", 0)),
                         "output_tokens": model_data.get("output_tokens", 0),
                         "capabilities": model_data.get("capabilities", []),
+                        "provider_capabilities": model_data.get("provider_capabilities", {}),
                         "supported_parameters": model_data.get("supported_parameters", []),
                         "parameter_constraints": model_data.get("parameter_constraints", {}),
                         "pricing": model_data.get("pricing", {}),
@@ -831,9 +862,19 @@ class ModelSyncService:
                     raise ModelSyncError(f"OpenAI API error: {await response.text()}")
                 payload = await response.json()
 
+            models = [model for model in payload.get("data", []) or []
+                      if isinstance(model, dict) and _is_openai_text_candidate(str(model.get("id", "")))]
+            # Prefer API metadata if OpenAI starts publishing it. Until then,
+            # resolve exact IDs through the provider's official model sheets.
+            docs_vision = await fetch_openai_vision_metadata(
+                session,
+                {model["id"] for model in models if api_image_support(model) is None},
+                self.logger,
+            )
+
         current_specs = self._get_provider_specs(self.load_specs(), "openai")
         remote_models: list[dict[str, Any]] = []
-        for model in payload.get("data", []) or []:
+        for model in models:
             model_id = str(model.get("id", "")).strip()
             if not model_id or not _is_openai_text_candidate(model_id):
                 continue
@@ -846,6 +887,12 @@ class ModelSyncService:
             )
             # OpenAI's model-list API does not publish token limits.
             entry["token_limits_provenance"] = TOKEN_PROVENANCE_INFERRED
+            image_support = api_image_support(model)
+            if image_support is not None:
+                _apply_image_support(entry, image_support, source="provider_api", source_url=OPENAI_MODEL_LIST_URL)
+            elif model_id in docs_vision:
+                supported, source_url = docs_vision[model_id]
+                _apply_image_support(entry, supported, source="official_docs", source_url=source_url)
             remote_models.append(entry)
 
         remote_models.sort(key=lambda item: (item.get("remote_created_at") or "", item["model_id"]), reverse=True)
@@ -902,13 +949,13 @@ class ModelSyncService:
 
             # /api/tags does not declare modalities. Read /api/show only during
             # this explicit catalog fetch, once per installed model, without
-            # generation or loading a model. Missing capabilities stay unknown.
-            remote_capabilities: dict[str, list[str]] = {}
+            # generation or loading a model. Undeclared capabilities are not granted.
+            remote_metadata: dict[str, dict[str, Any]] = {}
             for model in models_payload:
                 if not isinstance(model, dict):
                     continue
                 model_id = str(model.get("model") or model.get("name") or "").strip()
-                if not model_id or model_id in remote_capabilities:
+                if not model_id or model_id in remote_metadata:
                     continue
                 try:
                     async with session.post(
@@ -937,7 +984,10 @@ class ModelSyncService:
                     declared_capabilities = []
                 if not isinstance(declared_capabilities, list):
                     raise ModelSyncError(f"Ollama capabilities for '{model_id}' are not a list.")
-                remote_capabilities[model_id] = _dedupe_strings(declared_capabilities)
+                remote_metadata[model_id] = {
+                    **show_payload,
+                    "capabilities": _dedupe_strings(declared_capabilities),
+                }
 
         current_specs = self._get_provider_specs(self.load_specs(), "ollama")
         remote_models: list[dict[str, Any]] = []
@@ -948,11 +998,13 @@ class ModelSyncService:
             if not model_id:
                 continue
 
-            local_template = self._find_best_local_template("ollama", model_id, current_specs)
-            details = model.get("details") if isinstance(model.get("details"), dict) else {}
+            # Local limits and controls belong to this exact installed model.
+            # A shared name prefix is not evidence of identity or capabilities.
+            local_template = current_specs.get(model_id, {})
+            metadata = remote_metadata[model_id]
+            details = metadata.get("details") or model.get("details") or {}
             context_window = _safe_int(
-                model.get("context_length"),
-                _safe_int(local_template.get("context_window"), OLLAMA_DEFAULT_CONTEXT_WINDOW),
+                local_template.get("context_window"), OLLAMA_DEFAULT_CONTEXT_WINDOW,
             )
             output_tokens = _safe_int(
                 local_template.get("output_tokens"),
@@ -966,19 +1018,23 @@ class ModelSyncService:
             if output_tokens <= 0:
                 output_tokens = OLLAMA_DEFAULT_OUTPUT_TOKENS
 
-            display_name = (
-                local_template.get("name")
-                or str(model.get("name") or "").strip()
-                or _title_case_model_name(model_id.replace(":", "-"))
+            # num_ctx is a configured runtime limit; architectural context_length
+            # in model_info is not evidence that the local server can use it.
+            configured_context = re.search(
+                r"(?m)^\s*num_ctx\s+(\d+)\s*$", str(metadata.get("parameters") or "")
             )
-            description = local_template.get("description") or _ollama_description(model_id, details)
+            if configured_context and int(configured_context.group(1)) > 0:
+                context_window = min(context_window, int(configured_context.group(1)))
+                input_tokens = min(input_tokens, context_window)
+                output_tokens = min(output_tokens, context_window)
+
+            display_name = str(model.get("name") or model_id).strip()
+            description = _ollama_description(model_id, details)
             capabilities = [
-                capability
-                for capability in local_template.get("capabilities") or ["text"]
-                if capability != "vision"
-            ] or ["text"]
-            if "vision" in remote_capabilities[model_id]:
-                capabilities.append("vision")
+                mapped
+                for native, mapped in OLLAMA_CAPABILITY_MAP.items()
+                if native in metadata["capabilities"]
+            ]
 
             remote_models.append(
                 {
@@ -998,6 +1054,14 @@ class ModelSyncService:
                         "output_per_million": 0.0,
                     },
                     "capabilities": _dedupe_strings(capabilities),
+                    "provider_capabilities": {
+                        "text": {
+                            "support": "supported" if "text" in capabilities else "unsupported",
+                            "source": "provider_api",
+                            "source_url": show_url,
+                            "verified_at": _utc_now_iso(),
+                        },
+                    },
                     "supported_parameters": _dedupe_strings(local_template.get("supported_parameters") or []),
                     "supported": True,
                     "needs_review": False,
@@ -1009,6 +1073,7 @@ class ModelSyncService:
                         "digest": model.get("digest"),
                         "size": model.get("size"),
                         "details": details,
+                        "capabilities": metadata["capabilities"],
                         "ollama_version": version_payload.get("version") if isinstance(version_payload, dict) else None,
                     },
                 }
@@ -1185,19 +1250,32 @@ class ModelSyncService:
                 "anthropic-version": ANTHROPIC_API_VERSION,
             }
         )
+        all_models: list[dict[str, Any]] = []
+        seen_cursors: set[str] = set()
+        params = {"limit": 1000}
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                ANTHROPIC_MODEL_LIST_URL,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as response:
-                if response.status != 200:
-                    raise ModelSyncError(f"Anthropic API error: {await response.text()}")
-                payload = await response.json()
+            while True:
+                async with session.get(
+                    ANTHROPIC_MODEL_LIST_URL,
+                    headers=headers,
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as response:
+                    if response.status != 200:
+                        raise ModelSyncError(f"Anthropic API error: {await response.text()}")
+                    payload = await response.json()
+                all_models.extend(payload.get("data", []) or [])
+                if not payload.get("has_more"):
+                    break
+                cursor = payload.get("last_id")
+                if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+                    raise ModelSyncError("Anthropic returned an invalid model-list pagination cursor.")
+                seen_cursors.add(cursor)
+                params = {"limit": 1000, "after_id": cursor}
 
         current_specs = self._get_provider_specs(self.load_specs(), "anthropic")
         remote_models: list[dict[str, Any]] = []
-        for model in payload.get("data", []) or []:
+        for model in all_models:
             model_id = str(model.get("id", "")).strip()
             if not model_id or not model_id.startswith("claude-"):
                 continue
@@ -1208,6 +1286,12 @@ class ModelSyncService:
                 remote_created_at=model.get("created_at"),
                 current_provider_specs=current_specs,
             )
+            # Prefer an explicit provider declaration over stale local metadata.
+            # Missing/unknown metadata must not erase a manually verified value.
+            _apply_image_support(
+                entry, api_image_support(model), source="provider_api", source_url=ANTHROPIC_MODEL_LIST_URL,
+            )
+
             # The Anthropic Models API now returns per-model context/output limits.
             api_max_input = _safe_int(model.get("max_input_tokens"))
             api_max_output = _safe_int(_nested_lookup(model, "max_tokens", "max_output_tokens"))
@@ -1285,6 +1369,17 @@ class ModelSyncService:
                 page_token = data.get("nextPageToken")
                 if not page_token:
                     break
+
+            # The Models API publishes no modalities; resolve exact model codes
+            # through the provider's official per-model documentation tables.
+            docs_vision = await fetch_gemini_vision_metadata(
+                session, {entry["model_id"] for entry in all_models}, self.logger,
+            )
+
+        for entry in all_models:
+            if entry["model_id"] in docs_vision:
+                supported, source_url = docs_vision[entry["model_id"]]
+                _apply_image_support(entry, supported, source="official_docs", source_url=source_url)
 
         self.logger.info("Fetched %d text-generation models from Google API", len(all_models))
         return all_models
@@ -1476,6 +1571,7 @@ class ModelSyncService:
             "output_tokens": output_tokens,
             "pricing": _normalize_pricing_block(pricing),
             "capabilities": _dedupe_strings(capabilities or ["text"]),
+            "provider_capabilities": dict(existing.get("provider_capabilities") or {}) if existing else {},
             "supported": bool(template) or provider in DISCOVERY_SYNC_PROVIDERS,
             "needs_review": needs_review,
             "sync_mode": "discovery-assisted",
@@ -1846,7 +1942,9 @@ class ModelSyncService:
             output_tokens = max(context_window // 4, 8192) if context_window else 8192
 
         pricing = model.get("pricing") or {}
-        capabilities = model.get("capabilities") or current_spec.get("capabilities") or ["text"]
+        capabilities = model.get("capabilities")
+        if capabilities is None or (not capabilities and provider != "ollama"):
+            capabilities = current_spec.get("capabilities") or ["text"]
         supported_parameters = model.get("supported_parameters")
         if supported_parameters is None:
             supported_parameters = current_spec.get("supported_parameters")
@@ -1890,6 +1988,25 @@ class ModelSyncService:
             )
 
         new_spec = dict(current_spec)
+        # The admin UI wraps remote fields in raw. Merge only declared values;
+        # missing metadata must not erase vision evidence or unrelated controls.
+        provider_caps = dict(current_spec.get("provider_capabilities") or {})
+        remote_provider_caps = _nested_lookup(model, "provider_capabilities")
+        if isinstance(remote_provider_caps, Mapping):
+            for capability, value in remote_provider_caps.items():
+                if capability == "vision_input":
+                    support = value.get("support") if isinstance(value, Mapping) else value
+                    if support not in ("supported", "unsupported") and not isinstance(support, bool):
+                        continue
+                provider_caps[capability] = value
+        if provider_caps:
+            new_spec["provider_capabilities"] = provider_caps
+        vision = provider_caps.get("vision_input")
+        support = vision.get("support") if isinstance(vision, Mapping) else vision
+        if provider in {"anthropic", "openai", "google"} and (support in ("supported", "unsupported") or isinstance(support, bool)):
+            capabilities = [cap for cap in capabilities if str(cap).lower() != "vision"]
+            if support is True or support == "supported":
+                capabilities.append("vision")
         # Preserve a curated per-model token_limits sub-object across syncs.
         if isinstance(current_spec.get("token_limits"), dict):
             new_spec["token_limits"] = current_spec["token_limits"]
@@ -1902,7 +2019,7 @@ class ModelSyncService:
                 "output_tokens": output_tokens,
                 "context_window": context_window,
                 "pricing": _normalize_pricing_block(pricing),
-                "capabilities": _dedupe_strings(capabilities or ["text"]),
+                "capabilities": _dedupe_strings(capabilities),
                 "supported_parameters": _dedupe_strings(supported_parameters or []),
                 "parameter_constraints": (
                     dict(parameter_constraints)

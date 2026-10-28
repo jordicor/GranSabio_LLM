@@ -1,0 +1,22 @@
+{
+  "target": "ComfyUI 0.37.0",
+  "source_revision": "b33e2b55cae074eca5aec96283cceac19aa249ba",
+  "files": {
+    "main.py": {
+      "base_sha256": "5a958d6975d8b6096887df7f5160cecf760e5b434a5471bb5f8efaae73bcfd96",
+      "result_sha256": "38cd6a5c397ac12b583c13729667fa9e96ac2dece5da7fa738798e68599e4e0d"
+    },
+    "server.py": {
+      "base_sha256": "ebed5d21252caf640030a5c1bd60301404e5ee795e448b241da947efb45638c3",
+      "result_sha256": "0b631f09efef6ee0cb97881e28d1b713c96c081d11a4b201bb78774ddbede4e9"
+    },
+    "execution.py": {
+      "base_sha256": "dbf84f520bdafbdec014cf595838ccbca4fb08888e2be4064b1d105816ab0d3b",
+      "result_sha256": "9074d386dee2323ec3af560512d8dc955156178d164a4a1c2733f62cfd906d0f"
+    },
+    "gransabio_resource_barrier.py": {
+      "base_sha256": null,
+      "result_sha256": "96d13763092de857f7eb91379f184047d89b934ec8d68a961ffe42e80ad67a53"
+    }
+  }
+}

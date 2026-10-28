@@ -274,12 +274,38 @@ Use `/admin/models` to manage the local model catalog without hand-editing `mode
 - Fetch remote provider catalogs
 - Run **Sync All** for the selected provider/model entries
 
+Admin changes require a matching browser origin and an allowed client IP.
+By default, the admin Host accepts loopback and literal server IPs in the
+networks configured by `INTERNAL_ALLOWED_CIDRS` (or the internal-network defaults).
+This supports direct LAN/VPN access without listing each server IP separately.
+For DNS names or a narrower Host policy, set `ADMIN_ALLOWED_HOSTNAMES` to a
+comma-separated list of hostnames/IPs without schemes or ports. That explicit
+list replaces the default Host policy; it does not replace client-IP filtering.
+Arbitrary DNS names remain rejected even when their Origin matches their Host.
+
+Vision metadata is refreshed for native Anthropic, OpenAI and Google models
+during catalog sync. Anthropic supplies `capabilities.image_input.supported`;
+OpenAI's model-list API currently omits modalities, so sync reads the structured
+input modality fields and exact snapshot IDs in its official model
+documentation. The Gemini Models API also omits modalities, so sync reads each
+model page's "Model code" and "Supported data types" table rows (Markdown
+`.md.txt` pages); only the IDs in that code cell share the declaration.
+Explicit declarations update both `capabilities` and
+`provider_capabilities.vision_input`, including their source and verification
+date. Missing, malformed or unavailable metadata preserves the last known value;
+new models without a declaration remain unverified rather than inheriting vision
+from a similar name. These metadata requests run only when refreshing the
+catalog, not during generation. Apply the selected updates to save them in the
+local, ignored `model_specs.json`.
+
 Context admission prefers exact per-model limits from `model_limits.curated.json`
 or provider metadata cached by model sync. If a newly discovered direct-provider
 text-generation model has no trusted numeric capacity, the versioned and expiring
 `model_family_floors.json` policy may supply a conservative family floor. It
 never applies to OpenRouter, embeddings, realtime/audio/image surfaces, unknown
-families, lookalike names, or expired rules. Machine-specific overrides belong
+families, lookalike names, or expired rules. The xAI language-models API
+publishes no token limits, so new Grok models stay on the family floor until
+their documented context window is curated. Machine-specific overrides belong
 in ignored `model_limits.curated.local.json` and
 `model_family_floors.local.json` files. For capacity without any usable numeric
 limit, the risk bands count serialized input plus reserved output and thinking
@@ -717,6 +743,16 @@ fine-tunes. Catalog restrictions can disable temperature for an older model but
 cannot enable it for a newer or unrecognized one. This policy applies to generation,
 streaming, tool calls, and logprob probes. Other providers keep their own policies.
 
+Native OpenAI models use the Responses API by default, which OpenAI recommends for
+all integrations and which every current text model supports (several only support
+Responses). Generation, real streaming, tool loops, logprob probes and the health
+probe all use it. Only the model sheets without a `/v1/responses` route (audio,
+gpt-4o search previews, `o1-mini`, `o1-preview`) stay on Chat Completions; the
+allowlist in `model_capability_registry.py` recognizes their snapshots and
+fine-tunes, and an explicit catalog `provider_capabilities.responses_api` value
+overrides the default. Responses rejects `max_output_tokens` below 16, so smaller
+caps (such as the 5-token evidence probe) are raised to that minimum.
+
 For complex tasks, enable deep thinking:
 
 **OpenAI Reasoning:**
@@ -932,8 +968,52 @@ each route its stable `endpoint_id`, including each QA entry:
 ```
 
 `loaded` is the default availability policy: GranSabio verifies that the model
-is already resident when a backend distinguishes it. It never loads or unloads
-models, schedules GPUs, balances requests, or fails over to another endpoint.
+is already resident when a backend distinguishes it. Endpoint discovery itself
+does not load/unload models, manage GPUs or fail over to another endpoint.
+
+#### Optional shared GPU resources
+
+`LOCAL_RESOURCES_CONFIG_PATH` enables cooperative ownership of a physical GPU
+shared with an external application. Start from
+[`local_resources.example.json`](local_resources.example.json). The administrator
+links the physical GPU UUID, existing endpoint IDs and `external_service_url`.
+Clients cannot supply execution URLs. With no configuration, the API reports
+`enabled: false` and normal dispatch behavior is unchanged.
+
+Use one engine coordinator process and keep `LOCAL_RESOURCES_STATE_PATH`
+(default `data/local_resources.sqlite3`) on persistent local disk. The coordinator
+is shared by all `AIService` instances; an OS lock rejects a second owner.
+Reservations and operation IDs survive restarts and never expire automatically.
+
+| Method and path | Body / behavior |
+| --- | --- |
+| `GET /local-resources` | Configured identities, loaded models, active dispatches, reservations and verified external-service status. |
+| `POST /local-resources/{id}/reserve` | `request_id` UUID and a descriptive `purpose`, e.g. `video-render`. Close new local admission, drain calls, unload linked Ollama models and verify completion. |
+| `POST /local-resources/{id}/release` | Fresh `request_id` UUID and `reservation_id` (the acquire UUID). Cancel a pending acquire or verify external cleanup before releasing a ready reservation. |
+| `POST /local-resources/{id}/unload` | Fresh `request_id`, `target: "ollama"`, `endpoint_id`, optional exact `model`; or `target: "external"`. Refuse busy work without interrupting jobs. |
+
+The internal API uses existing IP, shared-secret and cross-site protections.
+HTTP 202 plus `Retry-After` means retry the identical body within the caller's
+deadline. Start external work only with HTTP 200, `complete: true`,
+`state: "reserved"` and `reservation.ready: true`. Only `resource_busy` among 409
+errors is normal waiting; uncertain responses must not be retried with new IDs.
+Cancellation of a pending acquire is explicit. Ending a client's wait is not
+release. Other GPUs and cloud providers remain independent.
+
+The external service must implement `gransabio.gpu-barrier.v1`: a correlated
+acknowledgment from its actual worker after model/cache cleanup, with process
+identity, physical GPU identity and current idle/released status. An HTTP
+acceptance response, an empty queue or a free-VRAM reading is insufficient.
+Unverified cleanup or uncertain inference keeps admission closed. This is a
+cooperative protocol, not an operating-system GPU lock; direct clients bypassing
+it are outside its guarantee. Native model unloading currently supports Ollama.
+
+The [integration guide and versioned ComfyUI example](examples/gpu_reservations/README.md)
+show how to request ownership and implement that worker contract in another
+application. ComfyUI is optional and is never installed or restarted by GranSabio.
+Its initial `comfyui_url`, `purpose: "comfyui"`, `target: "comfyui"` and inventory
+fields remain accepted for compatibility. The example patch has offline checks;
+live device affinity and memory release still require target-machine validation.
 
 ### 3. Start the Server
 
@@ -1227,6 +1307,15 @@ Group multiple sessions under a single project ID:
 
 Provider sync covers OpenAI, Anthropic, Google, xAI, OpenRouter, MiniMax,
 Moonshot/Kimi, and the legacy local `OLLAMA_HOST`/`LLAMACPP_BASE_URL` settings.
+Ollama sync reads native `/api/show` capabilities for each installed model:
+completion maps to text, vision to vision, thinking to reasoning, embedding
+to embeddings, and tools to tool calling. Embedding models remain in the
+catalog without text generation support. Names and descriptions use native
+metadata; local limits and controls are reused only for the exact model ID.
+An explicit `num_ctx` caps those limits; architectural context sizes do not
+increase them. A failed metadata lookup aborts the fetch without changing the
+catalog. [Ollama API contract](https://github.com/ollama/ollama/blob/main/docs/openapi.yaml).
+
 For `LOCAL_ENDPOINTS_CONFIG_PATH`, local-only admission uses read-only live
 discovery per registered endpoint: Ollama uses `/api/ps` for `loaded` (or
 `/api/tags` for `available`), while llama.cpp and OpenAI-compatible services use

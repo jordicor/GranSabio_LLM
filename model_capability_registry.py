@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
@@ -282,26 +283,39 @@ def _openrouter_parameter_state(
     )
 
 
+# OpenAI model sheets whose endpoint table has Chat Completions but no
+# /v1/responses route (verified 2026-10-27). Every other native OpenAI model
+# uses Responses, which OpenAI recommends for all integrations.
+_OPENAI_CHAT_COMPLETIONS_ONLY_MODELS = frozenset({
+    "gpt-4o-audio-preview", "gpt-4o-mini-audio-preview",
+    "gpt-audio", "gpt-audio-mini", "gpt-audio-1.5",
+    "gpt-4o-search-preview", "gpt-4o-mini-search-preview",
+    "o1-mini", "o1-preview",
+})
+
+
+def openai_requires_chat_completions(model_id: str) -> bool:
+    """Opt in known Chat Completions-only models, including snapshots and fine-tunes."""
+    name = (model_id or "").strip().lower()
+    if name.startswith("ft:"):
+        name = name.split(":", 2)[1]
+    else:
+        name = name.split(":", 1)[0]
+    name = re.sub(r"-(?:\d{4}-\d{2}-\d{2}|\d{4})(?:-preview)?$", "", name)
+    return name in _OPENAI_CHAT_COMPLETIONS_ONLY_MODELS
+
+
 def _docs_rule_state(provider: str, model_id: str, capability: str) -> CapabilityState:
     provider_key = normalize_provider(provider)
     model_lower = (model_id or "").lower()
 
-    if capability == "responses_api":
-        if provider_key == "openai" and model_lower.startswith(
-            ("gpt-6-luna", "gpt-6-sol", "gpt-6-astra")
-        ):
-            # GPT-6 reasoning with tools uses the Responses contract.
-            return capability_state(True, source=CapabilitySource.OFFICIAL_DOCS)
-        is_gpt56_sol = (
-            model_lower == "gpt-5.6-sol"
-            or model_lower.startswith("gpt-5.6-sol-")
+    if capability == "responses_api" and provider_key == "openai":
+        # Discovery entries start with placeholder tags, so the default cannot
+        # depend on the catalog; an explicit provider_capabilities value wins.
+        return capability_state(
+            not openai_requires_chat_completions(model_id),
+            source=CapabilitySource.OFFICIAL_DOCS,
         )
-        if provider_key == "openai" and is_gpt56_sol:
-            # GPT-5.6 Sol exposes its reasoning/tool contract through Responses.
-            # Keep this tracked docs rule independent of the discovery catalog,
-            # whose newly discovered entries can initially contain text-only
-            # placeholder capabilities.
-            return capability_state(True, source=CapabilitySource.OFFICIAL_DOCS)
     if capability == "chat_completions_api":
         return capability_state(provider_key != "claude" and provider_key != "gemini", source=CapabilitySource.OFFICIAL_DOCS)
     if capability == "streaming":
@@ -583,22 +597,14 @@ def model_qualifies_for_inline_accent_guard(
 ) -> bool:
     """Return whether inline accent guard can run for the generator model."""
 
-    provider_key = normalize_provider(provider)
-    if not model_supports_generation_validation_tool_loop(
-        provider_key,
+    # OpenAI Responses models qualify: the shared tool loop runs both the
+    # validate_draft and audit_accent tools over Responses.
+    return model_supports_generation_validation_tool_loop(
+        normalize_provider(provider),
         model_id,
         specs,
         model_data=model_data,
-    ):
-        return False
-    if provider_key == "openai" and model_uses_responses_api(
-        provider_key,
-        model_id,
-        specs,
-        model_data=model_data,
-    ):
-        return False
-    return True
+    )
 
 
 def model_supports_long_text_section_tool_loop(

@@ -5,6 +5,7 @@ Unified model admin and provider sync routes for Gran Sabio LLM.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import os
 from pathlib import Path
 from urllib.parse import urlparse
@@ -15,7 +16,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from services.model_sync import SUPPORTED_SYNC_PROVIDERS, ModelSyncError, ModelSyncService
 
 from .app_state import app, config, logger, templates
-from .security import require_internal_ip
+from .security import is_ip_allowed, require_internal_ip
 
 _specs_write_lock = asyncio.Lock()
 _MODELS_ADMIN_JS_PATH = Path(__file__).resolve().parents[1] / "static" / "js" / "models_admin.js"
@@ -32,20 +33,29 @@ def _default_port(scheme: str) -> int | None:
 # Hostnames allowed to serve admin mutations (API-05). Comparing Origin with
 # the Host header is not enough against DNS rebinding, where an attacker
 # domain resolves to this server and both headers carry the attacker's name.
-# Default: loopback only. Override for LAN/remote deployments with
-# ADMIN_ALLOWED_HOSTNAMES="host1,host2".
+# Default: loopback and literal IPs in the existing internal-network policy.
+# DNS names still require an explicit ADMIN_ALLOWED_HOSTNAMES="host1,host2"
+# override; never resolve an arbitrary hostname to decide whether to trust it.
 _DEFAULT_ADMIN_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
-def _admin_allowed_hostnames() -> frozenset[str]:
-    """Return the admin hostname allowlist from the environment (or loopback)."""
+def _is_admin_host_allowed(hostname: str) -> bool:
+    """Trust explicit hosts, or default to loopback and allowed internal IPs."""
     raw = os.getenv("ADMIN_ALLOWED_HOSTNAMES", "")
     hostnames = {
         entry.strip().lower().rstrip(".")
         for entry in raw.split(",")
         if entry.strip()
     }
-    return frozenset(hostnames) if hostnames else _DEFAULT_ADMIN_HOSTNAMES
+    if hostnames:
+        return hostname in hostnames
+    if hostname in _DEFAULT_ADMIN_HOSTNAMES:
+        return True
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return is_ip_allowed(hostname)
 
 
 def require_admin_same_origin(request: Request) -> None:
@@ -66,7 +76,14 @@ def require_admin_same_origin(request: Request) -> None:
             detail="Admin mutation rejected: missing Origin/Referer",
         )
 
-    parsed = urlparse(source)
+    try:
+        parsed = urlparse(source)
+        source_port = parsed.port or _default_port(parsed.scheme)
+    except ValueError:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin mutation rejected: invalid Origin/Referer",
+        ) from None
     request_url = request.url
     if not parsed.scheme or not parsed.hostname or parsed.scheme not in {"http", "https"}:
         raise HTTPException(
@@ -75,13 +92,12 @@ def require_admin_same_origin(request: Request) -> None:
         )
 
     request_hostname = (request_url.hostname or "").lower().rstrip(".")
-    if request_hostname not in _admin_allowed_hostnames():
+    if not _is_admin_host_allowed(request_hostname):
         raise HTTPException(
             status_code=403,
             detail="Admin mutation rejected: untrusted Host header",
         )
 
-    source_port = parsed.port or _default_port(parsed.scheme)
     request_port = request_url.port or _default_port(request_url.scheme)
     if (
         parsed.scheme == request_url.scheme

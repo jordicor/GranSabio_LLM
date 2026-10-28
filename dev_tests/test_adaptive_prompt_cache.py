@@ -15,7 +15,7 @@ from core.analytics_routes import get_model_info
 from core.generation_routes import _generation_request_fingerprint
 from dev_tests.test_internal_cache_transport import service as service
 from dev_tests.test_prompt_cache_policy import END, PROMPT, flattened, render
-from dev_tests.test_shared_context_transport import FakeStream
+from dev_tests.test_shared_context_transport import FakeResponsesStream, FakeStream
 from model_capability_registry import get_prompt_cache_capabilities, validate_prompt_cache_rules
 from models import ContentRequest
 from provider_capabilities import CapabilitySupport
@@ -261,7 +261,8 @@ async def test_provider_failure_does_not_retry_with_another_policy(service):
 async def test_adaptive_native_openai_responses_and_streaming(service, streaming, responses):
     response = SimpleNamespace(output_text="ok", usage=None,
                                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
-    create = AsyncMock(return_value=FakeStream() if streaming and not responses else response)
+    create = AsyncMock(return_value=(FakeResponsesStream() if responses else FakeStream())
+                       if streaming else response)
     service.openai_client = SimpleNamespace(responses=SimpleNamespace(create=create),
                                            chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     service._is_openai_responses_api_model = Mock(return_value=responses)

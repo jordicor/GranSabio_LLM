@@ -19,6 +19,7 @@ function loadHelpers() {
     vm.runInContext([
         slice('  function toArray(', '  function formatDate('),
         slice('  const PRICING_RATE_KEYS = [', '  function normalizeCapabilities('),
+        slice('  function normalizeCapabilities(', '  function flattenModelCollection('),
         slice('  function fingerprint(model) {', '  function modelKey('),
     ].join('\n'), context);
     // Objects built inside the vm realm have their own Object.prototype, so
@@ -26,10 +27,22 @@ function loadHelpers() {
     const plain = (fn) => (...args) => JSON.parse(JSON.stringify(fn(...args)));
     return {
         normalizePricing: plain(vm.runInContext('normalizePricing', context)),
+        normalizeModel: plain(vm.runInContext('normalizeModel', context)),
         formatLongContext: vm.runInContext('formatLongContext', context),
         fingerprint: vm.runInContext('fingerprint', context),
     };
 }
+
+test('vision evidence survives normalization and refresh timestamps do not create false updates', () => {
+    const { normalizeModel, fingerprint } = loadHelpers();
+    const evidence = { support: 'unsupported', source: 'official_docs', verified_at: '2026-10-24' };
+    const original = { id: 'gpt-text-only', capabilities: ['text'], provider_capabilities: { vision_input: evidence } };
+    const normalized = normalizeModel(original, 'openai');
+    assert.deepEqual(normalized.provider_capabilities.vision_input, evidence);
+    const refreshed = normalizeModel({ ...original, provider_capabilities: { vision_input: { ...evidence, verified_at: '2026-10-25' } } }, 'openai');
+    assert.equal(fingerprint(normalized), fingerprint(refreshed));
+    assert.notEqual(fingerprint(normalized), fingerprint(normalizeModel({ ...original, provider_capabilities: {} }, 'openai')));
+});
 
 // services/model_sync.openrouter_pricing_from_remote output for a cache-priced,
 // long-context model, as /api/admin/models/providers/openrouter/remote serves it.

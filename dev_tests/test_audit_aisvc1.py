@@ -10,7 +10,7 @@ import copy
 import json
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -81,6 +81,7 @@ def _openai_tool_call(draft_text: str) -> SimpleNamespace:
 @pytest.mark.asyncio
 async def test_openai_tool_loop_retry_starts_with_clean_transcript(service):
     """AIS-01 (OpenAI loop): a retry must not inherit the failed attempt's messages."""
+    service._is_openai_responses_api_model = Mock(return_value=False)  # Exercise the Chat tool-loop transport.
     captured = []
     calls = {"n": 0}
 
@@ -681,10 +682,10 @@ async def test_gpt5_stream_init_error_logs_metadata_not_prompts(service, caplog)
         raise RuntimeError("400 boom from provider")
 
     service.openai_client = SimpleNamespace()
-    service._call_chat_completions_create_with_reasoning_retry = failing_create
+    service._call_responses_create_with_reasoning_retry = failing_create
 
     with caplog.at_level(logging.ERROR):
-        with pytest.raises(Exception, match="GPT-5 streaming initialization failed"):
+        with pytest.raises(RuntimeError, match="400 boom from provider"):
             async for _chunk in service._stream_openai(
                 secret_prompt,
                 "gpt-5.1",
@@ -700,8 +701,7 @@ async def test_gpt5_stream_init_error_logs_metadata_not_prompts(service, caplog)
     )
     assert secret_prompt not in error_text
     assert secret_system not in error_text
-    assert "GPT-5 failed parameters summary" in error_text
-    assert "messages=2" in error_text
+    assert "OpenAI streaming error: 400 boom from provider" in error_text
 
 
 @pytest.mark.asyncio
@@ -713,10 +713,10 @@ async def test_gpt5_stream_init_error_full_payload_only_with_extra_verbose(servi
         raise RuntimeError("400 boom from provider")
 
     service.openai_client = SimpleNamespace()
-    service._call_chat_completions_create_with_reasoning_retry = failing_create
+    service._call_responses_create_with_reasoning_retry = failing_create
 
     with caplog.at_level(logging.INFO):
-        with pytest.raises(Exception, match="GPT-5 streaming initialization failed"):
+        with pytest.raises(RuntimeError, match="400 boom from provider"):
             async for _chunk in service._stream_openai(
                 secret_prompt,
                 "gpt-5.1",
@@ -730,7 +730,7 @@ async def test_gpt5_stream_init_error_full_payload_only_with_extra_verbose(servi
     verbose_lines = [
         record.getMessage()
         for record in caplog.records
-        if "[EXTRA_VERBOSE] GPT-5 parameters that failed" in record.getMessage()
+        if "[EXTRA_VERBOSE] OpenAI Responses streaming parameters" in record.getMessage()
     ]
     assert verbose_lines and secret_prompt in verbose_lines[0]
 

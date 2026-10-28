@@ -180,7 +180,8 @@ def test_model_uses_responses_api_matches_key_model_id_and_overrides():
 
     assert model_uses_responses_api("openai", "gpt-5-pro", specs) is True
     assert model_uses_responses_api("openai", "gpt-5-pro-2025-10-06", specs) is True
-    assert model_uses_responses_api("openai", "missing-model", specs) is False
+    # Responses is the native default; an explicit catalog value still wins.
+    assert model_uses_responses_api("openai", "missing-model", specs) is True
     assert model_uses_responses_api("openai", "gpt-5-chat", specs) is False
 
 
@@ -199,17 +200,33 @@ def test_gpt56_sol_uses_responses_when_discovery_catalog_is_still_text_only():
 
     assert model_uses_responses_api("openai", "gpt-5.6-sol", specs) is True
     assert model_uses_responses_api("openai", "gpt-5.6-sol-2026-08-01", specs) is True
-    assert model_uses_responses_api("openai", "gpt-5.6-solar", specs) is False
+    assert model_uses_responses_api("openai", "o1-mini-2024-09-12", specs) is False
 
 
 def test_gpt6_default_models_use_responses_tools_and_structured_output():
     """Provider discovery alone must not route reasoning models to chat."""
-    for model_id in ("gpt-6-luna", "gpt-6-sol"):
+    for model_id in ("gpt-6-luna", "gpt-6-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra"):
         for capability in ("responses_api", "json_schema", "tool_calling"):
             assert model_supports(
                 specs={}, provider="openai", model_id=model_id,
                 capability=capability, model_data={"capabilities": ["text"]},
             ).support == CapabilitySupport.SUPPORTED
+
+
+def test_discovered_gpt61_terra_routes_tools_through_responses():
+    """A discovery entry with only text/vision tags must not fall back to chat tools."""
+    specs = {"model_specifications": {"openai": {"gpt-6.1-terra": {
+        "model_id": "gpt-6.1-terra",
+        "capabilities": ["text", "vision"],
+        "provider_capabilities": {"vision_input": {"support": "supported", "source": "official_docs"}},
+        "sync_metadata": {"needs_review": True},
+    }}}}
+
+    assert model_uses_responses_api("openai", "gpt-6.1-terra", specs) is True
+    assert model_supports(
+        specs={}, provider="openrouter", model_id="openai/gpt-6.1-terra",
+        capability="responses_api", model_data={"capabilities": ["text"]},
+    ).support != CapabilitySupport.SUPPORTED
 
 
 def test_resolve_model_capability_context_statuses_without_credentials():
@@ -289,7 +306,7 @@ def test_generation_validation_tool_loop_runtime_matrix_and_openrouter_tools():
     assert model_supports_generation_validation_tool_loop("ollama", "local-no-tools", specs) is False
 
 
-def test_inline_and_long_text_wrappers_exclude_openai_responses_api():
+def test_inline_and_long_text_wrappers_accept_openai_responses_api():
     specs = {
         "model_specifications": {
             "openai": {
@@ -307,8 +324,8 @@ def test_inline_and_long_text_wrappers_exclude_openai_responses_api():
 
     assert model_qualifies_for_inline_accent_guard("openai", "gpt-4o", specs) is True
     assert model_supports_long_text_section_tool_loop("openai", "gpt-4o", specs) is True
-    assert model_qualifies_for_inline_accent_guard("openai", "gpt-5-pro", specs) is False
-    assert model_supports_long_text_section_tool_loop("openai", "gpt-5-pro", specs) is False
+    assert model_qualifies_for_inline_accent_guard("openai", "gpt-5-pro", specs) is True
+    assert model_supports_long_text_section_tool_loop("openai", "gpt-5-pro", specs) is True
 
 
 def test_tool_calling_docs_rules_cover_known_provider_model_families():

@@ -10,18 +10,26 @@ from __future__ import annotations
 import logging
 import os
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import json_utils as json
 import services.model_sync as model_sync
+from model_capability_registry import model_supports
 from services.model_sync import (
     ModelSyncError,
     ModelSyncService,
     _normalize_ollama_host,
     _normalize_openai_compatible_base_url,
     _remote_json_headers,
+)
+from services.model_vision_metadata import (
+    GEMINI_DOCS_BASE,
+    OPENAI_DOCS_BASE,
+    api_image_support,
+    parse_gemini_model_vision,
+    parse_openai_model_vision,
 )
 
 
@@ -436,6 +444,214 @@ async def test_fetch_minimax_remote_models_as_discovery_entries(service, monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "local_capabilities,remote_capabilities,expected",
+    [
+        (None, {"image_input": {"supported": True}}, ["text", "vision"]),
+        (["text", "reasoning"], {"image_input": {"supported": True}}, ["text", "reasoning", "vision"]),
+        (["text", "vision", "reasoning"], {"image_input": {"supported": False}}, ["text", "reasoning"]),
+        (None, None, ["text"]),
+        (["text", "vision"], None, ["text", "vision"]),
+        (["text", "vision"], {"image_input": {}}, ["text", "vision"]),
+        (["text"], {"image_input": {"supported": "true"}}, ["text"]),
+    ],
+)
+async def test_anthropic_image_support_survives_discovery_and_sync(
+    service, monkeypatch, local_capabilities, remote_capabilities, expected,
+):
+    model_id = "claude-opus-5-5"
+    if local_capabilities is not None:
+        specs = service.load_specs()
+        specs["model_specifications"]["anthropic"] = {
+            model_id: {"model_id": model_id, "capabilities": local_capabilities},
+        }
+        service.specs_path.write_text(json.dumps(specs), encoding="utf-8")
+    fake_session = _FakeSingleGetSession(payload={"data": [{
+        "id": model_id,
+        "display_name": "Claude Opus 5.5",
+        "capabilities": remote_capabilities,
+        "max_input_tokens": 1000000,
+        "max_tokens": 128000,
+    }]})
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+
+    remote = await service.fetch_remote_models("anthropic")
+
+    model = remote["models"][0]
+    assert model["capabilities"] == expected
+    service.sync_provider("anthropic", [model])
+    saved = service.load_specs()["model_specifications"]["anthropic"][model_id]
+    assert saved["capabilities"] == expected
+    assert saved["input_tokens"] == 1000000 and saved["output_tokens"] == 128000
+    declared = (remote_capabilities or {}).get("image_input", {}).get("supported")
+    if isinstance(declared, bool):
+        evidence = saved["provider_capabilities"]["vision_input"]
+        assert evidence["support"] == ("supported" if declared else "unsupported")
+        assert evidence["source"] == "provider_api"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_reads_all_pages_and_rejects_repeated_cursor(service, monkeypatch):
+    class PagedSession(_FakeSingleGetSession):
+        repeat = False
+
+        def get(self, url, **kwargs):
+            cursor = kwargs["params"].get("after_id")
+            self.urls.append(cursor)
+            return _FakeResponse(payload={
+                "data": [{"id": "claude-new" if cursor is None else "claude-old",
+                          "capabilities": {"image_input": {"supported": True}}}],
+                "has_more": cursor is None or self.repeat,
+                "last_id": "claude-new",
+            })
+
+    session = PagedSession()
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: session)
+    remote = await service.fetch_remote_models("anthropic")
+    assert {m["id"] for m in remote["models"]} == {"claude-new", "claude-old"}
+    assert session.urls == [None, "claude-new"]
+    assert all("vision" in m["capabilities"] for m in remote["models"])
+    session.repeat = True
+    with pytest.raises(ModelSyncError, match="pagination cursor"):
+        await service.fetch_remote_models("anthropic")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supported", [True, False])
+async def test_synced_vision_controls_the_actual_fourteen_image_admission(service, monkeypatch, supported):
+    from fastapi import HTTPException
+
+    from config import config
+    from core.generation.input_resolution import resolve_generation_inputs
+    from model_capability_registry import model_supports
+
+    session = _FakeSingleGetSession(payload={"data": [{
+        "id": "claude-opus-5-5", "capabilities": {"image_input": {"supported": supported}},
+    }]})
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: session)
+    remote = await service.fetch_remote_models("anthropic")
+    service.sync_provider("anthropic", remote["models"])
+    monkeypatch.setattr(config, "model_specs", service.load_specs())
+    assert model_supports(specs=config.model_specs, provider="anthropic", model_id="claude-opus-5-5",
+                          capability="vision_input").supported is supported
+    request = SimpleNamespace(
+        context_documents=[], username="vision-test", generator_model="claude-opus-5-5",
+        images=[SimpleNamespace(username="vision-test", upload_id=str(i)) for i in range(14)],
+    )
+    images = [SimpleNamespace(estimated_tokens=10, original_filename="test.png", size_bytes=10, detail="auto")
+              for _ in range(14)]
+    kwargs = dict(
+        attachment_manager_factory=MagicMock(return_value=MagicMock()),
+        config_obj=SimpleNamespace(get_model_info=config.get_model_info, IMAGE=SimpleNamespace(max_images_per_request=20)),
+        resolve_images_for_generation_fn=AsyncMock(return_value=images), logger=service.logger,
+    )
+    if supported:
+        result = await resolve_generation_inputs(request, **kwargs)
+        assert result.preflight_image_info["count"] == 14
+        assert result.preflight_image_info["generator_supports_vision"] is True
+    else:
+        with pytest.raises(HTTPException, match="does not support vision/images"):
+            await resolve_generation_inputs(request, **kwargs)
+
+
+@pytest.mark.parametrize("metadata,expected", [
+    ({"input_modalities": ["text", "image"]}, True),
+    ({"input_modalities": ["text"]}, False),
+    ({"input_modalities": []}, None),
+    ({"input_modalities": ["new-unknown-format"]}, None),
+    ({"capabilities": {"image_input": {"supported": "false"}}}, None),
+])
+def test_image_metadata_does_not_confuse_unknown_with_unsupported(metadata, expected):
+    assert api_image_support(metadata) is expected
+
+
+def test_openai_docs_require_structured_input_modalities_and_exact_identifiers():
+    doc = (
+        'Model ID: `gpt-example`\n- Input modalities: text, image\n'
+        '## Snapshots\n- `gpt-example-2026-10-25`\n## Pricing\n- `unrelated-id`\n'
+    )
+    assert parse_openai_model_vision(doc) == ({"gpt-example", "gpt-example-2026-10-25"}, True)
+    assert parse_openai_model_vision(doc.replace("Input modalities", "Output modalities")) == (set(), None)
+    assert parse_openai_model_vision(doc + '- Input modalities: text\n') == (set(), None)
+
+
+@pytest.mark.asyncio
+async def test_openai_vision_refresh_roundtrip_preserves_evidence_on_docs_failure(service, monkeypatch):
+    specs = service.load_specs()
+    specs["model_specifications"]["openai"]["gpt-text-only"] = {
+        "model_id": "gpt-text-only", "capabilities": ["text", "vision", "reasoning"],
+        "pricing": {"input_per_million": 2, "output_per_million": 8},
+        "provider_capabilities": {"prompt_cache": {"off": "supported"}, "vision_input": True},
+    }
+    service.specs_path.write_text(json.dumps(specs), encoding="utf-8")
+
+    class DocsSession(_FakeSingleGetSession):
+        docs_unavailable = False
+
+        def get(self, url, **kwargs):
+            if url == model_sync.OPENAI_MODEL_LIST_URL:
+                return _FakeResponse(payload={"data": [
+                    {"id": "gpt-future"}, {"id": "gpt-future-2026-10-25"},
+                    {"id": "gpt-future-unlisted-variant"}, {"id": "gpt-text-only"},
+                    {"id": "gpt-api-vision", "capabilities": {"image_input": {"supported": True}}},
+                ]})
+            assert "Authorization" not in kwargs.get("headers", {})
+            self.urls.append(url)
+            if self.docs_unavailable:
+                return _FakeResponse(status=503)
+            documents = {
+                OPENAI_DOCS_BASE + ".md": (
+                    '- [Future](/api/docs/models/gpt-future.md)\n'
+                    '- [Text](/api/docs/models/gpt-text-only.md)\n'
+                    '- [API](/api/docs/models/gpt-api-vision.md)\n'
+                ),
+                OPENAI_DOCS_BASE + "/gpt-future.md": (
+                    'Model ID: `gpt-future`\n- Input modalities: text, image\n'
+                    '## Snapshots\n- `gpt-future-2026-10-25`\n'
+                ),
+                OPENAI_DOCS_BASE + "/gpt-text-only.md": (
+                    'Model ID: `gpt-text-only`\n- Input modalities: text\n'
+                ),
+            }
+            return _FakeResponse(text=documents[url])
+
+    session = DocsSession()
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: session)
+    remote = await service.fetch_remote_models("openai")
+    models = {m["id"]: m for m in remote["models"]}
+    for mid in ("gpt-future", "gpt-future-2026-10-25", "gpt-api-vision"):
+        assert "vision" in models[mid]["capabilities"]
+    assert models["gpt-text-only"]["capabilities"] == ["text", "reasoning"]
+    assert models["gpt-future-unlisted-variant"]["capabilities"] == ["text"]
+    assert models["gpt-future-unlisted-variant"]["needs_review"] is True
+    assert len(session.urls) == 3  # index plus two pages; no docs needed for API metadata
+
+    # Match the admin UI payload, including metadata carried under raw.
+    service.sync_provider("openai", [
+        {"id": m["id"], "capabilities": m["capabilities"], "pricing": m["pricing"],
+         "input_tokens": m["input_tokens"], "output_tokens": m["output_tokens"],
+         "context_window": m["context_window"], "raw": m}
+        for m in remote["models"]
+    ])
+    saved = service.load_specs()["model_specifications"]["openai"]
+    evidence = saved["gpt-future"]["provider_capabilities"]["vision_input"]
+    assert evidence["source"] == "official_docs" and evidence["verified_at"]
+    text_model = saved["gpt-text-only"]
+    assert text_model["pricing"] == {"input_per_million": 2, "output_per_million": 8}
+    assert text_model["provider_capabilities"]["prompt_cache"] == {"off": "supported"}
+    assert text_model["provider_capabilities"]["vision_input"]["support"] == "unsupported"
+    assert next(m for m in service.get_local_catalog()["models"] if m["id"] == "gpt-future")["provider_capabilities"]["vision_input"] == evidence
+
+    session.docs_unavailable = True
+    remote = await service.fetch_remote_models("openai")
+    service.sync_provider("openai", remote["models"])
+    saved = service.load_specs()["model_specifications"]["openai"]
+    assert saved["gpt-future"]["provider_capabilities"]["vision_input"] == evidence
+    assert "vision" in saved["gpt-future"]["capabilities"]
+    assert "vision" not in saved["gpt-text-only"]["capabilities"]
+
+
+@pytest.mark.asyncio
 async def test_fetch_google_uses_exact_models_api_token_limits(service, monkeypatch):
     fake_session = _FakeSingleGetSession(
         payload={
@@ -461,8 +677,9 @@ async def test_fetch_google_uses_exact_models_api_token_limits(service, monkeypa
 
     result = await service.fetch_remote_models("google")
 
-    assert fake_session.urls == [model_sync.GOOGLE_MODELS_URL]
+    assert fake_session.urls == [model_sync.GOOGLE_MODELS_URL, f"{GEMINI_DOCS_BASE}/gemini-3.99-flash.md.txt"]
     assert fake_session.headers[0]["x-goog-api-key"] == "google-test"
+    assert "x-goog-api-key" not in fake_session.headers[1]
     assert result["stats"]["review"] == 1
     assert len(result["models"]) == 1
     model = result["models"][0]
@@ -472,6 +689,118 @@ async def test_fetch_google_uses_exact_models_api_token_limits(service, monkeypa
     assert model["output_tokens"] == 65536
     assert model["token_limits_provenance"] == "provider_api"
     assert model["source"] == model_sync.GOOGLE_MODELS_URL
+
+
+GEMINI_FLASH_DOC = (
+    "## gemini-3.6-flash\n\n"
+    "| Property | Description |\n"
+    "|---|---|\n"
+    "| Model code | `gemini-3.6-flash` |\n"
+    "| Supported data types | **Inputs** Text, Image, Video, Audio, and PDF **Output** Text |\n"
+    "| Versions | Read the patterns. - Deprecated: `gemini-3.5-flash` - Preview: `gemini-3-flash-preview` |\n"
+)
+
+
+def test_gemini_docs_require_model_code_and_structured_inputs():
+    inputs = "Text, Image, Video, Audio, and PDF"
+    assert parse_gemini_model_vision(GEMINI_FLASH_DOC) == {"gemini-3.6-flash": True}
+    assert parse_gemini_model_vision(GEMINI_FLASH_DOC.replace(inputs, "Audio (up to 1 hour)")) == {
+        "gemini-3.6-flash": False,
+    }
+    assert parse_gemini_model_vision(GEMINI_FLASH_DOC.replace(inputs, "Audio, images, video, and text")) == {
+        "gemini-3.6-flash": True,
+    }
+    assert parse_gemini_model_vision(GEMINI_FLASH_DOC.replace(inputs, "Text, Holograms")) == {}
+    assert parse_gemini_model_vision(GEMINI_FLASH_DOC.replace("Model code", "Model name")) == {}
+    assert parse_gemini_model_vision(GEMINI_FLASH_DOC + "| Model code | `gemini-other` |\n") == {}
+    two_tables = (
+        GEMINI_FLASH_DOC + "\n## streaming\n\n| Property | Description |\n|---|---|\n"
+        "| Model code | `gemini-robotics-x` |\n"
+        "| Supported data types | **Inputs** Text **Output** Audio |\n"
+    )
+    assert parse_gemini_model_vision(two_tables) == {"gemini-3.6-flash": True, "gemini-robotics-x": False}
+    assert parse_gemini_model_vision(two_tables.replace("`gemini-robotics-x`", "`gemini-3.6-flash`")) == {}
+
+
+@pytest.mark.asyncio
+async def test_gemini_vision_refresh_roundtrip_preserves_evidence_on_docs_failure(service, monkeypatch):
+    from config import config
+
+    specs = service.load_specs()
+    specs["model_specifications"]["google"] = {
+        "gemini-3.6-flash": {
+            "model_id": "gemini-3.6-flash", "capabilities": ["text", "reasoning", "thinking"],
+            "pricing": {"input_per_million": 2, "output_per_million": 12},
+        },
+        "gemini-legacy-vision": {
+            "model_id": "gemini-legacy-vision", "capabilities": ["text", "vision"],
+            "provider_capabilities": {"vision_input": True},
+        },
+    }
+    service.specs_path.write_text(json.dumps(specs), encoding="utf-8")
+    api_ids = ("gemini-3.6-flash", "gemini-3.5-transcribe", "gemini-legacy-vision", "gemini-undocumented")
+
+    class DocsSession(_FakeSingleGetSession):
+        docs_unavailable = False
+
+        def get(self, url, **kwargs):
+            if url == model_sync.GOOGLE_MODELS_URL:
+                return _FakeResponse(payload={"models": [
+                    {"name": f"models/{mid}", "inputTokenLimit": 1048576, "outputTokenLimit": 65536,
+                     "supportedGenerationMethods": ["generateContent"]}
+                    for mid in api_ids
+                ]})
+            assert "x-goog-api-key" not in kwargs.get("headers", {})
+            self.urls.append(url)
+            if self.docs_unavailable:
+                return _FakeResponse(status=503)
+            documents = {
+                f"{GEMINI_DOCS_BASE}/gemini-3.6-flash.md.txt": GEMINI_FLASH_DOC,
+                f"{GEMINI_DOCS_BASE}/gemini-3.5-transcribe.md.txt": GEMINI_FLASH_DOC.replace(
+                    "gemini-3.6-flash", "gemini-3.5-transcribe",
+                ).replace("Text, Image, Video, Audio, and PDF", "Audio (up to 1 hour)"),
+            }
+            if url in documents:
+                return _FakeResponse(text=documents[url])
+            return _FakeResponse(status=404, text="<!doctype html>")
+
+    session = DocsSession()
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: session)
+    remote = await service.fetch_remote_models("google")
+    models = {m["id"]: m for m in remote["models"]}
+    assert models["gemini-3.6-flash"]["capabilities"] == ["text", "reasoning", "thinking", "vision"]
+    assert models["gemini-3.5-transcribe"]["capabilities"] == ["text"]
+    assert models["gemini-legacy-vision"]["capabilities"] == ["text", "vision"]
+    assert models["gemini-undocumented"]["capabilities"] == ["text"]
+    assert "vision_input" not in models["gemini-undocumented"]["provider_capabilities"]
+    assert sorted(session.urls) == sorted(f"{GEMINI_DOCS_BASE}/{mid}.md.txt" for mid in api_ids)
+
+    # Match the admin UI payload, including metadata carried under raw.
+    service.sync_provider("google", [
+        {"id": m["id"], "capabilities": m["capabilities"], "pricing": m["pricing"],
+         "input_tokens": m["input_tokens"], "output_tokens": m["output_tokens"],
+         "context_window": m["context_window"], "raw": m}
+        for m in remote["models"]
+    ])
+    saved = service.load_specs()["model_specifications"]["google"]
+    evidence = saved["gemini-3.6-flash"]["provider_capabilities"]["vision_input"]
+    assert evidence["support"] == "supported" and evidence["source"] == "official_docs" and evidence["verified_at"]
+    assert evidence["source_url"] == f"{GEMINI_DOCS_BASE}/gemini-3.6-flash.md.txt"
+    assert saved["gemini-3.6-flash"]["pricing"] == {"input_per_million": 2, "output_per_million": 12}
+    assert saved["gemini-3.5-transcribe"]["provider_capabilities"]["vision_input"]["support"] == "unsupported"
+    assert "vision" not in saved["gemini-3.5-transcribe"]["capabilities"]
+    assert saved["gemini-legacy-vision"]["provider_capabilities"]["vision_input"] is True
+    monkeypatch.setattr(config, "model_specs", service.load_specs())
+    assert "vision" in config.get_model_info("gemini-3.6-flash", require_api_key=False)["capabilities"]
+
+    session.docs_unavailable = True
+    remote = await service.fetch_remote_models("google")
+    service.sync_provider("google", remote["models"])
+    saved = service.load_specs()["model_specifications"]["google"]
+    assert saved["gemini-3.6-flash"]["provider_capabilities"]["vision_input"] == evidence
+    assert "vision" in saved["gemini-3.6-flash"]["capabilities"]
+    assert "vision" not in saved["gemini-3.5-transcribe"]["capabilities"]
+    assert "vision" in saved["gemini-legacy-vision"]["capabilities"]
 
 
 @pytest.mark.asyncio
@@ -566,17 +895,28 @@ async def test_fetch_ollama_remote_models_from_local_tags(service, monkeypatch):
     [
         ({"capabilities": ["completion", "vision"]}, ["text"], ["text", "vision"]),
         ({"capabilities": ["completion"]}, ["text", "vision"], ["text"]),
-        ({}, ["text", "vision"], ["text"]),
+        ({}, ["text", "vision"], []),
+        ({"capabilities": []}, ["text", "reasoning"], []),
+        (
+            {"capabilities": ["completion", "vision", "tools", "thinking"]},
+            ["text"],
+            ["text", "vision", "reasoning", "tool_calling"],
+        ),
+        (
+            {"capabilities": ["tools", "embedding"]},
+            ["text", "reasoning"],
+            ["embeddings", "tool_calling"],
+        ),
     ],
 )
 @pytest.mark.asyncio
-async def test_sync_ollama_preserves_only_declared_vision(
+async def test_sync_ollama_preserves_only_native_capabilities(
     service, monkeypatch, show_payload, local_capabilities, expected_capabilities
 ):
     """/api/show capabilities follow Ollama's documented response contract.
 
     Source: https://docs.ollama.com/api-reference/show-model-details
-    Missing metadata must not infer vision from a family or a stale template.
+    Missing metadata must not infer capabilities from a family or stale entry.
     """
     model_id = "gemma3:4b"
     local_spec = {
@@ -608,7 +948,89 @@ async def test_sync_ollama_preserves_only_declared_vision(
     service.sync_provider("ollama", result["models"])
     synced = service.load_specs()["model_specifications"]["ollama"]
     assert synced[model_id]["capabilities"] == expected_capabilities
+    text_support = model_supports(
+        specs=service.load_specs(), provider="ollama", model_id=model_id, capability="text"
+    )
+    assert text_support.supported == ("text" in expected_capabilities)
     assert synced["local-only:latest"] == specs["model_specifications"]["ollama"]["local-only:latest"]
+
+
+@pytest.mark.asyncio
+async def test_ollama_metadata_uses_exact_identity_and_retains_local_controls(service, monkeypatch):
+    model_id = "qwen3.5:4b-q4_K_M"
+    unrelated_id = "qwen3:30b-a3b"
+    specs = service.load_specs()
+    specs["model_specifications"]["ollama"] = {
+        unrelated_id: {
+            "model_id": unrelated_id,
+            "name": "Qwen3 30B A3B",
+            "description": "Unrelated reasoning model",
+            "context_window": 131072,
+            "input_tokens": 131072,
+            "output_tokens": 16384,
+            "capabilities": ["text", "reasoning"],
+            "supported_parameters": ["reasoning_effort"],
+        },
+    }
+    service.specs_path.write_text(json.dumps(specs), encoding="utf-8")
+    fake_session = _FakeOllamaSession(
+        tags_payload={"models": [{"model": model_id, "name": model_id, "context_length": 262144}]},
+        show_payloads={model_id: {
+            "capabilities": ["completion"],
+            "details": {"parameter_size": "4.7B", "quantization_level": "Q4_K_M"},
+            "model_info": {"qwen35.context_length": 262144},
+        }},
+    )
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+
+    remote = (await service.fetch_remote_models("ollama"))["models"]
+    model = next(item for item in remote if item["key"] == model_id)
+    assert model["name"] == model_id
+    assert "4.7B" in model["description"]
+    assert model["capabilities"] == ["text"]
+    assert model["context_window"] == 32768
+    assert model["output_tokens"] == 8192
+    assert model["supported_parameters"] == []
+
+    # An existing entry may already contain a name/capabilities polluted by the
+    # old fuzzy match. Refresh metadata while preserving its configured limits.
+    specs["model_specifications"]["ollama"][model_id] = {
+        **specs["model_specifications"]["ollama"][unrelated_id],
+        "model_id": model_id,
+        "context_window": 16384,
+        "input_tokens": 12288,
+        "output_tokens": 2048,
+        "supported_parameters": ["temperature"],
+        "parameter_constraints": {"temperature": {"max": 1.0}},
+    }
+    service.specs_path.write_text(json.dumps(specs), encoding="utf-8")
+    remote = (await service.fetch_remote_models("ollama"))["models"]
+    service.sync_provider("ollama", remote)
+    synced = service.load_specs()["model_specifications"]["ollama"][model_id]
+    assert synced["name"] == model_id
+    assert "4.7B" in synced["description"]
+    assert synced["capabilities"] == ["text"]
+    assert (synced["context_window"], synced["input_tokens"], synced["output_tokens"]) == (16384, 12288, 2048)
+    assert synced["supported_parameters"] == ["temperature"]
+    assert synced["parameter_constraints"] == {"temperature": {"max": 1.0}}
+
+
+@pytest.mark.asyncio
+async def test_ollama_configured_num_ctx_caps_catalog_without_architectural_inflation(service, monkeypatch):
+    fake_session = _FakeOllamaSession(
+        tags_payload={"models": [{"model": "custom:latest"}]},
+        show_payloads={"custom:latest": {
+            "capabilities": ["completion"],
+            "parameters": "temperature 0\nnum_ctx 4096\nstop \"<end>\"",
+            "model_info": {"llama.context_length": 131072},
+        }},
+    )
+    monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: fake_session)
+    result = await service.fetch_remote_models("ollama")
+    service.sync_provider("ollama", result["models"])
+    model = service.load_specs()["model_specifications"]["ollama"]["custom:latest"]
+    assert (model["context_window"], model["input_tokens"], model["output_tokens"]) == (4096, 4096, 4096)
+    assert model["sync_metadata"]["token_limits_provenance"] == "local_config"
 
 
 @pytest.mark.parametrize(

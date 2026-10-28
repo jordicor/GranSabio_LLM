@@ -2764,7 +2764,7 @@ class TestClaudeStructuredOutputsParams:
         ],
     )
     def test_gpt56_sol_tool_streaming_is_quarantined(self, model_id):
-        assert AIService._openai_responses_tool_streaming_supported(model_id) is False
+        assert AIService._openai_responses_streaming_supported(model_id) is False
 
     @pytest.mark.parametrize(
         "model_id",
@@ -2776,7 +2776,7 @@ class TestClaudeStructuredOutputsParams:
         ],
     )
     def test_gpt56_sol_tool_streaming_quarantine_does_not_drift(self, model_id):
-        assert AIService._openai_responses_tool_streaming_supported(model_id) is True
+        assert AIService._openai_responses_streaming_supported(model_id) is True
 
     @pytest.mark.asyncio
     async def test_gpt56_sol_tool_loop_uses_one_nonstream_responses_create(
@@ -3293,7 +3293,7 @@ class TestClaudeStructuredOutputsParams:
     def test_openai_responses_params_convert_chat_tool_transcript(self, ai_service_instance):
         """Responses params preserve function-call ids and tool outputs."""
 
-        params = ai_service_instance._build_openai_responses_tool_params(
+        params = ai_service_instance._build_openai_responses_params(
             model_id="gpt-5-pro",
             current_messages=[
                 {"role": "system", "content": "System"},
@@ -3352,7 +3352,7 @@ class TestClaudeStructuredOutputsParams:
     def test_openai_responses_json_loose_does_not_force_empty_schema(self, ai_service_instance):
         """JSON_LOOSE over Responses relies on prompt/local parsing, not a strict empty schema."""
 
-        params = ai_service_instance._build_openai_responses_tool_params(
+        params = ai_service_instance._build_openai_responses_params(
             model_id="gpt-5-pro",
             current_messages=[{"role": "user", "content": "Return JSON"}],
             max_tokens=128,
@@ -3374,7 +3374,7 @@ class TestClaudeStructuredOutputsParams:
             "required": ["decision"],
             "properties": {"decision": {"type": "string"}},
         }
-        params = ai_service_instance._build_openai_responses_tool_params(
+        params = ai_service_instance._build_openai_responses_params(
             model_id="gpt-5-pro",
             current_messages=[{"role": "user", "content": "Return a decision"}],
             max_tokens=128,
@@ -4241,6 +4241,8 @@ class TestGenerationToolLoop:
         Then: It raises ValueError so callers can fall back to standard generation
         """
 
+        ai_service_instance._is_openai_responses_api_model = Mock(return_value=False)  # Exercise the Chat tool-loop transport.
+
         async def passthrough(operation, **kwargs):
             return await operation()
 
@@ -4301,6 +4303,8 @@ class TestGenerationToolLoop:
         When: The runtime refuses additional tool calls
         Then: It requests one final no-tools answer and accepts it if valid
         """
+
+        ai_service_instance._is_openai_responses_api_model = Mock(return_value=False)  # Exercise the Chat tool-loop transport.
 
         async def passthrough(operation, **kwargs):
             return await operation()
@@ -4375,6 +4379,8 @@ class TestGenerationToolLoop:
         When: The runtime validates the overflow argument
         Then: It validates the validate_draft text, not the audit_accent text
         """
+
+        ai_service_instance._is_openai_responses_api_model = Mock(return_value=False)  # Exercise the Chat tool-loop transport.
 
         async def passthrough(operation, **kwargs):
             return await operation()
@@ -4466,6 +4472,8 @@ class TestGenerationToolLoop:
         Then: A clear ValueError is raised instead of leaking the raw exception
         """
 
+        ai_service_instance._is_openai_responses_api_model = Mock(return_value=False)  # Exercise the Chat tool-loop transport.
+
         async def passthrough(operation, **kwargs):
             return await operation()
 
@@ -4525,6 +4533,8 @@ class TestGenerationToolLoop:
         When: The tool loop processes the turn
         Then: The envelope trace includes an early budget warning
         """
+
+        ai_service_instance._is_openai_responses_api_model = Mock(return_value=False)  # Exercise the Chat tool-loop transport.
 
         async def passthrough(operation, **kwargs):
             return await operation()
@@ -5548,12 +5558,14 @@ class TestIsOpenAIResponsesApiModel:
         assert AIService._is_openai_responses_api_model("O3-Pro") is True
         assert AIService._is_openai_responses_api_model("GPT-5-PRO") is True
 
-    def test_non_responses_api_openai_model_returns_false(self):
-        assert AIService._is_openai_responses_api_model("gpt-4o") is False
-        assert AIService._is_openai_responses_api_model("gpt-5") is False
+    def test_chat_completions_only_openai_models_return_false(self):
+        assert AIService._is_openai_responses_api_model("o1-mini") is False
+        assert AIService._is_openai_responses_api_model("gpt-4o-audio-preview") is False
 
-    def test_unknown_model_returns_false(self):
-        assert AIService._is_openai_responses_api_model("nonexistent-model-xyz") is False
+    def test_other_native_models_default_to_responses(self):
+        assert AIService._is_openai_responses_api_model("gpt-4o") is True
+        assert AIService._is_openai_responses_api_model("gpt-5") is True
+        assert AIService._is_openai_responses_api_model("nonexistent-model-xyz") is True
 
     def test_empty_model_id_returns_false(self):
         assert AIService._is_openai_responses_api_model("") is False
@@ -5621,11 +5633,8 @@ class TestProviderResourceLifecycle:
             "provider": "openai", "model_id": model_id,
             "provider_capabilities": {"logprobs": True},
         }
-        create = AsyncMock(return_value=SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"), logprobs=None)],
-            usage=None,
-        ))
-        ai_service_instance.openai_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        create = AsyncMock(return_value=SimpleNamespace(output_text="ok", output=[], usage=None))
+        ai_service_instance.openai_client = SimpleNamespace(responses=SimpleNamespace(create=create))
 
         with patch.object(ai_service_instance, "_admit_chat_call", new=AsyncMock()), \
              patch.object(ai_service_instance, "_record_provider_health_success", new=AsyncMock()):
@@ -5635,7 +5644,7 @@ class TestProviderResourceLifecycle:
 
         assert content == "ok"
         params = create.await_args.kwargs
-        assert params["logprobs"] is True
+        assert params["include"] == ["message.output_text.logprobs"]
         assert params.get("temperature") == (0.4 if allowed else None)
 
     @pytest.mark.asyncio
