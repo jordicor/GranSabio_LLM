@@ -86,6 +86,15 @@
                                         <select id="generatorModel" name="generatorModel" class="form-select">
                                             <option value="">Loading models...</option>
                                         </select>
+                                        <div id="personalSubscriptionOptions" hidden>
+                                            <label class="checkbox-label">
+                                                <input type="checkbox" id="personalSubscriptionOnly" name="personalSubscriptionOnly" checked>
+                                                Use this personal model for every step
+                                            </label>
+                                            <p class="form-help">Includes request checks, AutoQA and reviews with this model.
+                                                Feedback memory is disabled because it requires embeddings.
+                                                Uncheck to use the other model selections and their API billing.</p>
+                                        </div>
                                     </div>
                                 </div>
 

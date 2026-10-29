@@ -166,3 +166,8 @@ tools/sync_github/output/
 
 # Runtime attachment blobs (user-uploaded content)
 data/attachment_blobs/
+
+# Personal OAuth credentials (normally stored outside the repository)
+chatgpt-accounts.dat
+chatgpt-accounts.lock
+chatgpt-accounts-*

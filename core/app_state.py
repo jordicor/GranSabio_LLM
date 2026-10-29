@@ -163,9 +163,11 @@ app.include_router(smart_edit_router, prefix="/smart-edit")
 # Monitor routes
 from .local_resource_routes import router as local_resource_router
 from .monitor_routes import router as monitor_router
+from .personal_subscription_routes import router as personal_subscription_router
 
 app.include_router(monitor_router)
 app.include_router(local_resource_router)
+app.include_router(personal_subscription_router)
 
 # Templates
 templates = enable_template_response_compat(Jinja2Templates(directory="templates"))
@@ -653,6 +655,10 @@ async def shutdown_event():
     from local_resources import close_local_resource_manager
 
     await close_local_resource_manager()
+
+    from personal_subscription import close_personal_subscription
+
+    close_personal_subscription()
 
     # Shutdown feedback memory system
     try:

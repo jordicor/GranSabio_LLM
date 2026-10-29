@@ -83,6 +83,26 @@ def _context_admission_observe_default(monkeypatch):
 # ============================================================================
 
 @pytest.fixture
+def personal_keychain(monkeypatch):
+    """Keep ordinary subscription tests out of the real user's Keychain."""
+    import personal_subscription as ps
+
+    class MemoryKeychain:
+        def __init__(self):
+            self.entries = {}
+
+        def get_password(self, service, account):
+            return self.entries.get((service, account))
+
+        def set_password(self, service, account, password):
+            self.entries[service, account] = password
+
+    backend = MemoryKeychain()
+    monkeypatch.setattr(ps, "_macos_keyring", lambda: backend)
+    return backend
+
+
+@pytest.fixture
 def mock_env_vars():
     """Provide test environment variables."""
     env = {

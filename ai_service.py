@@ -668,6 +668,7 @@ class AIService:
     """Unified AI service for multiple providers"""
 
     require_global_api_key = True
+    allow_personal_subscriptions = True
 
     def __init__(self, *, require_global_api_key: bool = True):
         """Initialize AI service with API clients"""
@@ -2269,6 +2270,11 @@ class AIService:
     ) -> None:
         """Log and schedule catalog suspect-marking after a provider overflow."""
 
+        if provider == "chatgpt":
+            # Account catalogs are ephemeral; the same wire ID in model_specs
+            # belongs to the paid API and must not be modified by this failure.
+            logger.warning("Personal ChatGPT reported a context overflow for %s; reduce the request size.", model_id)
+            return
         logger.warning(
             "Provider %s reported a context overflow for model '%s' despite the "
             "local admission guard (status=%s code=%s): %s; marking catalog entry "
@@ -3138,6 +3144,11 @@ class AIService:
         operation: str,
     ):
         """Register a provider call against a session before dispatch."""
+        if provider == "chatgpt":
+            from personal_subscription import SubscriptionError, require_personal_usage
+            require_personal_usage(config)
+            if not self.allow_personal_subscriptions:
+                raise SubscriptionError("This service cannot use personal subscriptions.")
         raise_if_dispatch_closed()
         provider_budget = getattr(self, "provider_budget", None)
         if provider_budget is not None:
@@ -3559,14 +3570,14 @@ class AIService:
             # revalidates the logical payload against the receptor's budget.
             await self._admit_chat_call(
                 provider=provider,
-                model_id=model_id,
+                model_id=catalog_model if provider == "chatgpt" else model_id,
                 call_id="ai_service.generate_content",
                 system_prompt=system_prompt,
                 prompt=prompt,
                 reserved_output_tokens=adjusted_max_tokens,
                 thinking_budget_tokens=thinking_budget_tokens,
                 images=images,
-                json_schema=effective_json_schema,
+                json_schema=json_schema if provider == "chatgpt" else effective_json_schema,
                 json_output=json_output,
                 local_execution=local_execution,
                 **({"shared_context": shared_context} if shared_context else {}),
@@ -3576,7 +3587,17 @@ class AIService:
             if images:
                 self._log_vision_request(images, provider, model_id)
 
-            if provider == "openai":
+            if provider == "chatgpt":
+                chunks = []
+                async for chunk in self._stream_chatgpt(
+                    prompt, model_id, system_prompt or "",
+                    json_output=json_output, json_schema=json_schema,
+                    shared_context=shared_context, request_timeout=request_timeout,
+                    usage_callback=usage_callback, usage_extra=extra_payload,
+                ):
+                    chunks.append(str(chunk))
+                return "".join(chunks)
+            elif provider == "openai":
                 content, usage_meta = await self._generate_openai(
                     prompt,
                     model_id,
@@ -3957,7 +3978,7 @@ class AIService:
                     attempted_feature=attempted_feature,
                     cancellation_token=cancellation_token,
                     request_timeout=request_timeout,
-                    strict_single_generation_attempt=strict_single_generation_attempt,
+                    strict_single_generation_attempt=strict_single_generation_attempt or provider == "chatgpt",
                     endpoint_id=self._effective_health_endpoint_id(
                         endpoint_id, local_execution, dispatch_call_id, dispatch_route_ordinal
                     ),
@@ -3969,7 +3990,7 @@ class AIService:
                     model_id=last_usage_model_id,
                     max_tokens=adjusted_max_tokens,
                 )
-                if json_output and json_schema and effective_json_schema is None:
+                if json_output and json_schema and effective_json_schema is None and provider != "chatgpt":
                     try:
                         from tools.ai_json_cleanroom import validate_ai_json
                     except Exception as exc:
@@ -12099,7 +12120,14 @@ class AIService:
             if images:
                 self._log_vision_request(images, provider, model_id)
 
-            if provider == "openai":
+            if provider == "chatgpt":
+                async for chunk in self._stream_chatgpt(
+                    prompt, model_id, system_prompt or "",
+                    json_output=json_output, json_schema=json_schema, shared_context=shared_context,
+                    request_timeout=request_timeout, usage_callback=usage_callback, usage_extra=extra_payload,
+                ):
+                    yield chunk
+            elif provider == "openai":
                 async for chunk in self._stream_openai(
                     prompt,
                     model_id,
@@ -12303,7 +12331,7 @@ class AIService:
             else:
                 raise ValueError(f"Unsupported provider: {provider}")
 
-        max_attempts = 1 if strict_single_generation_attempt else self._max_retry_attempts()
+        max_attempts = 1 if strict_single_generation_attempt or provider == "chatgpt" else self._max_retry_attempts()
         last_exception: Optional[Exception] = None
         attempt = 1
         stream_deadline = (
@@ -12329,14 +12357,14 @@ class AIService:
             # verdict is never reclassified as a provider failure.
             await self._admit_chat_call(
                 provider=provider,
-                model_id=model_id,
+                model_id=catalog_model if provider == "chatgpt" else model_id,
                 call_id="ai_service.generate_content_stream",
                 system_prompt=system_prompt,
                 prompt=prompt,
                 reserved_output_tokens=adjusted_max_tokens,
                 thinking_budget_tokens=thinking_budget_tokens,
                 images=images,
-                json_schema=effective_json_schema,
+                json_schema=json_schema if provider == "chatgpt" else effective_json_schema,
                 json_output=json_output,
                 local_execution=local_execution,
                 **({"shared_context": shared_context} if shared_context else {}),
@@ -13692,6 +13720,54 @@ class AIService:
         # task cannot inherit a stale probe admission report (AIS-09).
         _last_admission_report.set(None)
         return health_status
+
+    async def _stream_chatgpt(
+        self, prompt: str, model_id: str, system_prompt: str, *,
+        json_output: bool = False, json_schema: Optional[Dict[str, Any]] = None,
+        shared_context: Optional[str] = None, request_timeout: Optional[float] = None,
+        usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        usage_extra: Optional[Dict[str, Any]] = None,
+    ):
+        """Use the personal grant with ordinary usage and JSON validation contracts."""
+        from personal_subscription import MODEL_PREFIX, SubscriptionError
+        from personal_subscription_transport import stream_personal_response
+
+        content_parts = []
+        final_response = None
+        async for event in stream_personal_response(
+            config, model_id=model_id, prompt=prompt, instructions=system_prompt,
+            shared_context=shared_context, json_output=json_output, json_schema=json_schema,
+            request_timeout=request_timeout,
+        ):
+            if event.type == "response.output_text.delta":
+                delta = str(event.delta or "")
+                content_parts.append(delta)
+                if not json_output:
+                    yield delta
+            elif event.type == "response.completed":
+                final_response = event.response
+        content = "".join(content_parts)
+        if not content.strip():
+            raise SubscriptionError("ChatGPT completed without text content.")
+        usage = self._usage_with_finish_metadata(
+            getattr(final_response, "usage", None), final_response, provider="openai",
+        )
+        # This is a subscription request, not the identically named API model.
+        # Report tokens and billing mode; OpenAI owns plan/credit consumption.
+        self._emit_usage(usage_callback, MODEL_PREFIX + model_id, "chatgpt", usage,
+                         {**(usage_extra or {}), "billing_mode": "subscription"})
+        if json_output:
+            from tools.ai_json_cleanroom import validate_ai_json
+
+            validation = validate_ai_json(content, schema=json_schema)
+            if not validation.json_valid:
+                raise JsonContractError("ChatGPT output failed local JSON contract validation.")
+            if validation.data is not None and _should_normalize_json_contract_content(content, validation):
+                content = json.dumps(validation.data, ensure_ascii=False)
+            # Prompt-based JSON is emitted only after validation and completion.
+            yield content
+        metadata = _build_finish_metadata(provider="openai", finish_reason="completed")
+        yield StreamChunk("", metadata={**metadata, "provider": "chatgpt"})
 
     async def _stream_openai_responses(
         self,

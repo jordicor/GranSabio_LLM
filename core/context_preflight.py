@@ -534,10 +534,10 @@ class RuntimeRouting:
     request: ContentRequest
     generator: RuntimeRoute
     qa_models: Tuple[QAModelConfig, ...]
-    gran_sabio_review: RuntimeRoute
-    gran_sabio_regeneration: RuntimeRoute
-    gran_sabio_escalation: RuntimeRoute
-    arbiter: RuntimeRoute
+    gran_sabio_review: Optional[RuntimeRoute]
+    gran_sabio_regeneration: Optional[RuntimeRoute]
+    gran_sabio_escalation: Optional[RuntimeRoute]
+    arbiter: Optional[RuntimeRoute]
     preflight: RuntimeRoute
 
 
@@ -674,14 +674,15 @@ def _resolve_runtime_routing(payload: Dict[str, Any]) -> RuntimeRouting:
             "generation.main",
         )
 
-        if "qa_models" in fields_set:
-            qa_models: List[QAModelConfig] = []
+        qa_active = _semantic_qa_is_explicit(request)
+        qa_models: List[QAModelConfig] = []
+        if qa_active and "qa_models" in fields_set:
             for entry in request.qa_models or []:
                 if isinstance(entry, str):
                     qa_models.append(QAModelConfig(model=entry))
                 else:
                     qa_models.append(entry)
-        else:
+        elif qa_active:
             qa_resolution = llm_routing.resolve_call_models(
                 "qa.evaluate_layer",
                 request=request,
@@ -691,35 +692,40 @@ def _resolve_runtime_routing(payload: Dict[str, Any]) -> RuntimeRouting:
                 for entry in qa_resolution.models
             ]
 
-        gran_sabio_review = _runtime_route(
-            llm_routing.resolve_call("gransabio.review", request=request),
-            "gransabio.review",
-        )
-        gran_sabio_regeneration = _runtime_route(
-            llm_routing.resolve_call("gransabio.regenerate", request=request),
-            "gransabio.regenerate",
-        )
-        try:
-            escalation_resolution = llm_routing.resolve_call(
-                "gransabio.escalation",
-                request=request,
-            )
-        except llm_routing.LLMRoutingError:
-            # Older/default routing documents may not declare the newer,
-            # conditional call explicitly. Runtime falls back to the same
-            # Gran Sabio compatibility model used by the request.
-            escalation_resolution = llm_routing.resolve_call(
+        gran_sabio_review = None
+        gran_sabio_regeneration = None
+        gran_sabio_escalation = None
+        arbiter = None
+        if qa_active or request.gran_sabio_fallback:
+            gran_sabio_review = _runtime_route(
+                llm_routing.resolve_call("gransabio.review", request=request),
                 "gransabio.review",
-                request=request,
             )
-        gran_sabio_escalation = _runtime_route(
-            escalation_resolution,
-            "gransabio.escalation",
-        )
-        arbiter = _runtime_route(
-            llm_routing.resolve_call("arbiter.resolve", request=request),
-            "arbiter.resolve",
-        )
+        if request.gran_sabio_fallback:
+            gran_sabio_regeneration = _runtime_route(
+                llm_routing.resolve_call("gransabio.regenerate", request=request),
+                "gransabio.regenerate",
+            )
+        if qa_active:
+            try:
+                escalation_resolution = llm_routing.resolve_call(
+                    "gransabio.escalation",
+                    request=request,
+                )
+            except llm_routing.LLMRoutingError:
+                # Older routing documents use the review model for escalation.
+                escalation_resolution = llm_routing.resolve_call(
+                    "gransabio.review",
+                    request=request,
+                )
+            gran_sabio_escalation = _runtime_route(
+                escalation_resolution,
+                "gransabio.escalation",
+            )
+            arbiter = _runtime_route(
+                llm_routing.resolve_call("arbiter.resolve", request=request),
+                "arbiter.resolve",
+            )
         preflight = _runtime_route(
             llm_routing.resolve_call("preflight.validate", request=request),
             "preflight.validate",

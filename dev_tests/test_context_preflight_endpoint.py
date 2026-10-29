@@ -655,6 +655,21 @@ def test_real_reasoning_resolution_is_provider_free_and_unknown_is_structured(
         )
 
 
+def test_inactive_internal_routes_do_not_require_catalog_models(monkeypatch):
+    calls = FAKE_ROUTING["calls"]
+    monkeypatch.setitem(calls, "qa.evaluate_layer", {"models": [{"model": "missing-qa"}]})
+    for call_id in ("gransabio.review", "gransabio.regenerate", "gransabio.escalation", "arbiter.resolve"):
+        monkeypatch.setitem(calls, call_id, {"model": "missing-inactive-model"})
+
+    payload = _payload(qa_layers=[], gran_sabio_fallback=False)
+    response = context_preflight.build_context_preflight_response(payload)
+
+    assert response["accepted"] is True
+    assert response["participants_complete"] is True
+    assert [p["participant_kind"] for p in response["participants"]] == ["generator", "prompt_preflight"]
+    _assert_client_contract(response, payload)
+
+
 def test_implicit_internal_models_match_generate_default_routing():
     payload = _payload(qa_layers=[_qa_layer()])
 

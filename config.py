@@ -163,7 +163,12 @@ def resolve_model_catalog_entry(model_name: str, model_specs: Optional[Dict[str,
                 if not isinstance(model_data, dict):
                     continue
                 catalog_model_id = str(model_data.get("model_id", model_key) or model_key)
-                if candidate == model_key or candidate == catalog_model_id:
+                # Personal subscriptions require their catalog key or an explicit
+                # provider qualifier. Their wire IDs must not shadow API models.
+                if candidate == model_key or (
+                    candidate == catalog_model_id
+                    and (provider != "chatgpt" or qualified_provider == "chatgpt")
+                ):
                     candidate_matches.append((str(provider), model_key, model_data))
 
         if not candidate_matches:
@@ -687,6 +692,12 @@ class ImageSettings(BaseModel):
 class Config(BaseModel):
     """Configuration settings for the Gran Sabio LLM Engine (no fallbacks)."""
 
+    PERSONAL_SUBSCRIPTIONS_ENABLED: bool = Field(
+        default=False, description="Opt in to the local owner's personal ChatGPT plan",
+    )
+    PERSONAL_SUBSCRIPTION_DIR: str = Field(
+        default="", description="Private credential directory outside the repository; defaults to the user's home",
+    )
     model_config = {"populate_by_name": True}
 
     # API Keys (loaded from environment variables)
@@ -773,7 +784,16 @@ class Config(BaseModel):
     @property
     def model_specs(self) -> Dict[str, Any]:
         """Compatibility accessor for legacy model_specs attribute."""
-        return self.spec_catalog
+        from personal_subscription import get_personal_subscription, subscriptions_allowed
+
+        providers = self.spec_catalog.get("model_specifications", {})
+        personal = get_personal_subscription(self).catalog() if subscriptions_allowed(self) else {}
+        if not personal and "chatgpt" not in providers:
+            return self.spec_catalog
+        providers = {key: value for key, value in providers.items() if key != "chatgpt"}
+        if personal:
+            providers["chatgpt"] = personal
+        return {**self.spec_catalog, "model_specifications": providers}
 
     @model_specs.setter
     def model_specs(self, value: Dict[str, Any]) -> None:
@@ -2116,6 +2136,11 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
 
         self._validate_long_text_configuration()
 
+        self.PERSONAL_SUBSCRIPTIONS_ENABLED = os.getenv(
+            "PERSONAL_SUBSCRIPTIONS_ENABLED", str(self.PERSONAL_SUBSCRIPTIONS_ENABLED)
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.PERSONAL_SUBSCRIPTION_DIR = os.getenv("PERSONAL_SUBSCRIPTION_DIR", self.PERSONAL_SUBSCRIPTION_DIR)
+
     def _validate_long_text_configuration(self) -> None:
         """Validate Long Text single-key and cross-key policy bounds."""
 
@@ -2232,7 +2257,9 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
 
     def setup_legacy_models(self):
         """Setup legacy model dictionaries for backward compatibility (strictly from specs)."""
-        specs = self.model_specs.get("model_specifications", {})
+        # These legacy dictionaries contain only API providers. Account access
+        # stays lazy, allowing a hosted entrypoint to disable it before use.
+        specs = self.spec_catalog.get("model_specifications", {})
 
         # OpenAI models
         openai_models = specs.get("openai", {})
@@ -2249,7 +2276,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             self.CLAUDE_MODELS[model_name] = model_data.get("model_id", model_name)
 
         # Add aliases for Claude models
-        aliases = self.model_specs.get("aliases", {})
+        aliases = self.spec_catalog.get("aliases", {})
         for alias, target in aliases.items():
             if "claude" in target:
                 if target in self.CLAUDE_MODELS.values():
@@ -2325,6 +2352,10 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             # Credentials for registered local OpenAI-compatible services live
             # in that endpoint's api_key_env, never in OPENAI_API_KEY.
             api_key = "local-endpoint"
+        elif provider == "chatgpt":
+            from personal_subscription import require_personal_usage
+            require_personal_usage(self)
+            api_key = "personal-subscription"  # The real OAuth token never enters this API.
         elif provider == "fake" or resolved["is_test_model"]:
             api_key = "fake"
         if require_api_key and not api_key and provider not in ("ollama", "openai_compatible", "fake"):
@@ -2356,7 +2387,8 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "sync_metadata": model_data.get("sync_metadata", {}),
             "reasoning_effort": model_data.get("reasoning_effort", {}),
             "thinking_budget": model_data.get("thinking_budget", {}),
-            "pricing": model_data.get("pricing", {})
+            "pricing": model_data.get("pricing", {}),
+            "billing_mode": model_data.get("billing_mode", "api"),
         }
 
     def get_model_token_limits(self, model_name: str) -> Optional[Dict[str, Any]]:
@@ -3929,7 +3961,8 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                     "input_tokens": model_data.get("input_tokens", 0),
                     "output_tokens": model_data.get("output_tokens", 0),
                     "capabilities": model_data.get("capabilities", []),
-                    "pricing": model_data.get("pricing", {})
+                    "pricing": model_data.get("pricing", {}),
+                    "billing_mode": model_data.get("billing_mode", "api"),
                 }
 
                 timeout_hint = self._calculate_reasoning_timeout(

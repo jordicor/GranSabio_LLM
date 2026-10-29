@@ -828,7 +828,129 @@ MOONSHOT_API_KEY=...
 PEPPER=any-random-string-here
 ```
 
-> **Note:** You only need keys for the providers you want to use. At minimum, configure one provider.
+> **Note:** You only need keys for the API providers you want to use. A personal ChatGPT connection below can run text generation and QA without an OpenAI API key.
+
+#### Personal ChatGPT subscription
+
+For your own local installation, you can connect your personal ChatGPT plan using
+OpenAI's [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source/sign-in)
+preview. This is a separate `chatgpt` provider; it does not use or replace your OpenAI API key.
+
+1. Set `PERSONAL_SUBSCRIPTIONS_ENABLED=true` in your local `.env` and restart
+   **one engine process**. Keep network access to OpenAI available.
+2. On the computer running the engine, open
+   `http://127.0.0.1:8000/admin/subscription` (adjust the port) and choose
+   **Sign in with ChatGPT**. Complete OpenAI's account and plan-use consent.
+3. Reload the main app, choose a generator labelled **ChatGPT subscription**, and
+   keep **Use this personal model for every step** checked. This uses that model
+   for generation, preflight, QA, AutoQA and final reviews. It disables feedback
+   memory because this connection does not support embeddings.
+
+Available models are discovered automatically at sign-in; no manual entries in
+`model_specs.json` are needed. Personal model identities use `chatgpt/<slug>` and
+remain separate from identically named API models. The account page supports saved
+registrations, explicit account switching, model refresh and disconnecting.
+Switching refreshes the target account's models before activating it; a failed
+refresh leaves the previous account selected. Reload the main app after changing
+accounts. An active request must finish before switching or disconnecting.
+
+Disconnect discovers OpenAI's revocation endpoint, revokes the selected account's
+renewable session, and clears its local tokens only after OpenAI confirms success.
+The saved account registration remains available for signing in again. If
+revocation cannot be confirmed, the operation fails with an explicit message and
+retains the credentials for another Disconnect attempt. It does not silently
+complete a local-only sign-out. You can also revoke the app in ChatGPT settings.
+
+An unavailable configured default does not block the model picker. The interface
+reports it and leaves that choice empty until you select an available model;
+execution still validates the models used by each request.
+If you mix providers by unchecking the per-request option, each other selected
+provider still needs its own credentials and retains its normal billing.
+
+For API clients, the same routing uses existing request fields:
+
+```json
+{
+  "prompt": "Write a short explanation of how rain forms.",
+  "generator_model": "chatgpt/<slug-from-your-account>",
+  "llm_routing": {"global": {"model": "chatgpt/<slug-from-your-account>"}},
+  "qa_models": ["chatgpt/<slug-from-your-account>"],
+  "gran_sabio_model": "chatgpt/<slug-from-your-account>",
+  "auto_qa": {"enabled": true, "rigor": "light"},
+  "feedback_memory_enabled": false
+}
+```
+
+Use your account's actual model slug in every placeholder. Explicit per-role
+model fields override global routing, so avoid retaining API models from a copied
+request when you want all steps to use your subscription.
+
+The preview currently supports streaming text and prompt-based JSON, emitted
+after local contract validation. Its Responses endpoint requires `store=false` and streaming;
+temperature and output-token caps are not accepted. GranSabio still applies
+context admission and output reservations, but `max_tokens` is not a provider-side
+generation cap for this connection. Tools, images, embeddings and log-probability
+analysis are not offered by this adapter. An interrupted or quota-limited response
+fails without substituting a paid API call. See OpenAI's
+[preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations).
+
+Tokens are reported under `chatgpt/<slug>` with `billing_mode=subscription`.
+The reported $0 is **API spend**, not the price of your plan or a claim of unlimited
+use. Plan limits and any applicable credits remain controlled by OpenAI; check
+[ChatGPT usage settings](https://chatgpt.com/settings/usage).
+
+OAuth credentials stay outside the repository, by default in
+`~/.config/gransabio/personal`; `PERSONAL_SUBSCRIPTION_DIR` may select another
+private directory outside the checkout. Platform handling is automatic: Windows
+encrypts the file with the current user's DPAPI. On macOS, the file uses
+[Fernet authenticated encryption](https://cryptography.io/en/latest/fernet/),
+with a separate random key for each credential directory stored in the user's
+native Keychain through [keyring's macOS backend](https://github.com/jaraco/keyring).
+Only that backend is used; backend autodetection and plaintext fallback are
+disabled. `keyring` is installed only on macOS by `requirements.txt`. Linux keeps
+its existing unencrypted, owner-only file. Both Unix platforms retain `0600`
+files inside a `0700` directory, atomic writes and a single-process owner lock.
+
+If macOS reports a missing or inaccessible Keychain key, unlock/allow Keychain
+access or restore the original key and directory. An existing encrypted file
+never causes a missing key to be regenerated. The key is associated with the
+resolved credential-file path: moving or copying the directory is not a supported
+way to migrate accounts. Do not share it; sign in separately on each installation.
+This protects stored credentials, not a compromised user session or credentials
+already in the running engine's memory. Keep the Keychain key together with any
+private backup of the encrypted file; the file alone is insufficient to restore it.
+
+**Existing macOS JSON stores require an explicit one-time migration.** Stop the
+engine normally, install the updated requirements in its Python environment,
+then run the following from the repository with that same Python interpreter:
+
+```bash
+python personal_subscription.py migrate-keychain --directory "$HOME/.config/gransabio/personal"
+```
+
+Pass the actual configured directory if using `PERSONAL_SUBSCRIPTION_DIR`; this
+command does not load `.env`. It preserves the host ID, all accounts, tokens,
+selection and catalog. It verifies the Keychain key and encryption before
+atomically replacing the JSON file, and refuses to run while another process
+owns the store. A failure leaves the source available for retry. No plaintext
+backup is created; pre-existing backups or filesystem snapshots are not erased.
+Normal operation refuses legacy JSON instead of continuing in plaintext. After
+successful migration, start the engine normally. New stores need no migration.
+
+Native verification on macOS ARM64 (2026-10-29): five opt-in tests passed for
+persistence across processes, account/store isolation, a deleted key, a simulated
+Security API denial, and the migration command. Only temporary entries and fake
+accounts were used; cleanup verified every test key was removed. The user's
+Keychain was not locked. Another 73 offline subscription/storage/SaaS tests passed;
+Windows DPAPI and Linux dispatch were checked with test doubles, not native OS runs.
+To repeat the native checks: `GRANSABIO_TEST_MACOS_KEYCHAIN=1 python -m pytest -q
+dev_tests/test_personal_subscription_keychain_native.py`.
+
+Account management and the OAuth callback accept only the literal
+`http://127.0.0.1` origin on the engine computer. Model use can also be allowed
+over your private LAN or VPN through `INTERNAL_ALLOWED_CIDRS`. This connection is
+intended for the owner's personal use; hosted integrations disable it at both
+the catalog and execution boundary.
 
 #### Optional accumulated provider budget
 

@@ -5,7 +5,20 @@ const path = require('node:path');
 const { test } = require('node:test');
 const vm = require('node:vm');
 
-function createInterface(responseBody) {
+function modelElement() {
+    return {
+        value: '', textContent: '', style: {}, dataset: {}, children: [],
+        addEventListener() {},
+        set innerHTML(value) { this.children = []; this.value = ''; },
+        appendChild(child) { this.children.push(child); },
+        querySelectorAll() {
+            return this.children.flatMap(child => child.children.length ? child.querySelectorAll() : [child]);
+        },
+        querySelector() { return this.querySelectorAll()[0] || null; }
+    };
+}
+
+function createInterface(responseBody, catalogResponse) {
     const elements = new Map();
     for (const id of [
         'configurationScreen', 'processingScreen', 'backToConfigBtn',
@@ -18,6 +31,9 @@ function createInterface(responseBody) {
             querySelector() { return null; }
         });
     }
+    for (const id of ['generatorModel', 'granSabioModel', 'qaModelSelect', 'addQaModelBtn']) {
+        elements.set(id, modelElement());
+    }
     const requests = [];
     const streams = [];
     const timers = [];
@@ -26,12 +42,14 @@ function createInterface(responseBody) {
         console,
         document: {
             getElementById: id => elements.get(id) || null,
+            createElement: () => modelElement(),
             querySelectorAll: () => [],
             addEventListener() {}
         },
         alert: message => alerts.push(message),
-        fetch: async (url, options) => {
-            requests.push({ url, method: options.method });
+        fetch: async (url, options = {}) => {
+            requests.push({ url, method: options.method || 'GET' });
+            if (url === '/models/qa/available') return catalogResponse;
             assert.equal(url, '/generate');
             return { ok: true, json: async () => responseBody };
         },
@@ -52,6 +70,7 @@ function createInterface(responseBody) {
         collectFormData() {
             return {
                 prompt: 'Generate a draft', qa_models: ['test-model'],
+                generator_model: 'test-model', gran_sabio_model: 'test-model',
                 qa_layers: [{ name: 'Quality', description: 'Review', criteria: 'Clear prose' }]
             };
         }
@@ -67,6 +86,25 @@ async function clickStart(ui) {
     await new Promise(setImmediate);
     assert.equal(prevented, true);
 }
+
+test('personal model routes all text steps through the subscription without API defaults', () => {
+    const { app } = createInterface({});
+    const data = {
+        generator_model: 'chatgpt/gpt-test', qa_models: ['paid-reviewer'],
+        gran_sabio_model: 'paid-reviewer', auto_qa: { enabled: true },
+        feedback_memory_enabled: true
+    };
+    app.usePersonalSubscriptionForRequest(data);
+    assert.equal(data.llm_routing.global.model, 'chatgpt/gpt-test');
+    assert.equal(data.qa_models.join(','), 'chatgpt/gpt-test');
+    assert.equal(data.gran_sabio_model, 'chatgpt/gpt-test');
+    assert.equal(data.arbiter_model, 'chatgpt/gpt-test');
+    assert.equal(data.feedback_memory_enabled, false);
+    assert.equal(data.auto_qa.enabled, true);
+    const ordinary = { generator_model: 'api-model', qa_models: ['paid-reviewer'] };
+    app.usePersonalSubscriptionForRequest(ordinary);
+    assert.deepEqual(ordinary, { generator_model: 'api-model', qa_models: ['paid-reviewer'] });
+});
 
 const refusals = [
     {
@@ -131,4 +169,47 @@ test('connected startGeneration tracks an initialized session', async () => {
     assert.deepEqual(ui.requests, [{ url: '/generate', method: 'POST' }]);
     assert.deepEqual(ui.streams, ['/stream/project/new-session']);
     assert.ok(ui.timers.includes('interval'));
+});
+
+
+for (const preferred of [null, 'chatgpt/gpt-test', 'gpt-test']) {
+    test('model selectors preserve explicit defaults without substituting a missing model: ' + preferred, async () => {
+        const responseBody = {
+            qa_models: [
+                { key: 'gpt-test', name: 'API model', provider: 'openai', qa_priority: 'fast', output_tokens: 2000 },
+                { key: 'chatgpt/gpt-test', name: 'Personal model', provider: 'chatgpt', qa_priority: 'standard', output_tokens: 0 }
+            ],
+            defaults: { generator: preferred, gran_sabio: preferred, qa: [] },
+            recommendations: {},
+            default_errors: preferred ? [] : ['The configured model is unavailable. Select an available model.']
+        };
+        const ui = createInterface({}, { ok: true, json: async () => responseBody });
+        ui.app.updateReasoningControls = () => {};
+        await ui.app.loadQAModels();
+
+        for (const id of ['generatorModel', 'granSabioModel']) {
+            const select = ui.elements.get(id);
+            assert.equal(select.value, preferred || '');
+            const options = select.querySelectorAll('option');
+            assert.deepEqual(options.map(option => option.value), ['gpt-test', 'chatgpt/gpt-test']);
+            assert.equal(options[0].textContent, 'API model (2000 tokens)');
+            assert.equal(options[1].textContent, 'Personal model');
+        }
+        assert.equal(ui.alerts.length, preferred ? 0 : 1);
+        if (!preferred) {
+            assert.match(ui.alerts[0], /configured model is unavailable/);
+            const request = { prompt: 'Write', generator_model: '', gran_sabio_model: '',
+                qa_models: ['gpt-test'], qa_layers: [{ name: 'Quality', description: 'Check', criteria: 'Clear' }] };
+            assert.equal(ui.app.validateFormData(request), false);
+        }
+    });
+}
+
+test('model catalog HTTP errors are visible without trying to parse an error page', async () => {
+    const ui = createInterface({}, {
+        ok: false, status: 500,
+        json: async () => { throw new Error('Error page must not be parsed as catalog JSON'); }
+    });
+    await ui.app.loadQAModels();
+    assert.deepEqual(ui.alerts, ['Error: Failed to load models: Model catalog request failed (HTTP 500).']);
 });

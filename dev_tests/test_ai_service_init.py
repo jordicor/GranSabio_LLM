@@ -50,7 +50,7 @@ def mock_all_api_clients():
 @pytest.fixture
 def mock_config_with_keys():
     """Mock config with all API keys set."""
-    mock_cfg = MagicMock()
+    mock_cfg = MagicMock(LOCAL_RESOURCES_CONFIG_PATH="")
     mock_cfg.OPENAI_API_KEY = "sk-test-openai-key"
     mock_cfg.ANTHROPIC_API_KEY = "sk-ant-test-key"
     mock_cfg.GOOGLE_API_KEY = "test-google-key"
@@ -80,7 +80,7 @@ def mock_config_with_keys():
 @pytest.fixture
 def mock_config_no_keys():
     """Mock config with no API keys set."""
-    mock_cfg = MagicMock()
+    mock_cfg = MagicMock(LOCAL_RESOURCES_CONFIG_PATH="")
     mock_cfg.OPENAI_API_KEY = None
     mock_cfg.ANTHROPIC_API_KEY = None
     mock_cfg.GOOGLE_API_KEY = None
@@ -572,7 +572,7 @@ class TestOllamaClientInit:
         When: AIService is initialized
         Then: Ollama client is created with correct base_url
         """
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(LOCAL_RESOURCES_CONFIG_PATH="")
         mock_cfg.PROVIDER_BUDGET_LEDGER_PATH = ""
         mock_cfg.OPENAI_API_KEY = "sk-test"
         mock_cfg.ANTHROPIC_API_KEY = "sk-ant-test"
@@ -601,7 +601,7 @@ class TestOllamaClientInit:
         When: AIService is initialized
         Then: http:// is added automatically
         """
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(LOCAL_RESOURCES_CONFIG_PATH="")
         mock_cfg.PROVIDER_BUDGET_LEDGER_PATH = ""
         mock_cfg.OPENAI_API_KEY = "sk-test"
         mock_cfg.ANTHROPIC_API_KEY = "sk-ant-test"
@@ -629,7 +629,7 @@ class TestOllamaClientInit:
         When: AIService is initialized
         Then: the outbound client connects to localhost instead
         """
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(LOCAL_RESOURCES_CONFIG_PATH="")
         mock_cfg.PROVIDER_BUDGET_LEDGER_PATH = ""
         mock_cfg.OPENAI_API_KEY = "sk-test"
         mock_cfg.ANTHROPIC_API_KEY = "sk-ant-test"
@@ -657,7 +657,7 @@ class TestOllamaClientInit:
         When: AIService is initialized
         Then: that host is preserved as the outbound target
         """
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(LOCAL_RESOURCES_CONFIG_PATH="")
         mock_cfg.PROVIDER_BUDGET_LEDGER_PATH = ""
         mock_cfg.OPENAI_API_KEY = "sk-test"
         mock_cfg.ANTHROPIC_API_KEY = "sk-ant-test"
@@ -754,7 +754,7 @@ class TestLlamaCppClientInit:
     """Tests for the separately queued llama.cpp OpenAI-compatible client."""
 
     def test_llamacpp_client_uses_configured_v1_base_url(self, mock_all_api_clients, reset_singleton):
-        mock_cfg = MagicMock()
+        mock_cfg = MagicMock(LOCAL_RESOURCES_CONFIG_PATH="")
         mock_cfg.PROVIDER_BUDGET_LEDGER_PATH = ""
         mock_cfg.OPENAI_API_KEY = None
         mock_cfg.ANTHROPIC_API_KEY = None

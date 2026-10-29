@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Personal ChatGPT subscription — GranSabio LLM</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    .personal-shell { max-width: 860px; margin: 32px auto; padding: 24px; }
+    .personal-shell h1 { margin: 24px 0 16px; }
+    .personal-shell p { margin: 16px 0; line-height: 1.6; }
+    .account { padding: 16px; margin: 16px 0; border: 1px solid var(--border-light); border-radius: 8px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
+    .actions button { padding: 8px 14px; cursor: pointer; }
+    .notice { padding: 12px; background: var(--bg-secondary); border-left: 4px solid var(--accent-blue); }
+    .error { border-left-color: #b91c1c; }
+    .personal-shell ul { padding-left: 24px; }
+    .personal-shell li { margin: 8px 0; }
+  </style>
+</head>
+<body>
+<main class="personal-shell">
+  <a href="/admin/models">Model settings</a> · <a href="/">Back to app</a>
+  <h1>Personal ChatGPT subscription</h1>
+  <p>Connect your own ChatGPT plan for your personal texts, QA evaluations and AutoQA planning.
+    OpenAI decides which models and usage limits your account has. This connection uses your plan;
+    it never switches to a paid API key when a request fails.</p>
+  {% if error %}<p class="notice error" role="alert">{{ error }}</p>{% endif %}
+  {% if not enabled %}
+    <p class="notice">Personal subscriptions are disabled. In your local <code>.env</code>, set
+      <code>PERSONAL_SUBSCRIPTIONS_ENABLED=true</code>, restart the engine, and reopen this page
+      using <code>http://127.0.0.1:&lt;engine-port&gt;</code>.</p>
+  {% else %}
+    {% for account in summary.accounts %}
+    <section class="account" aria-label="Saved account">
+      <strong>{{ account.label }}</strong>
+      <p>{% if account.id == summary.active %}Selected account{% elif account.connected %}Connected{% else %}Disconnected{% endif %}</p>
+      <div class="actions">
+        {% if account.connected and account.id != summary.active %}
+        <form method="post" action="/admin/subscription/select">
+          <input type="hidden" name="account_id" value="{{ account.id }}">
+          <button type="submit">Use this account</button>
+        </form>
+        {% endif %}
+        <form method="post" action="/admin/subscription/login">
+          <input type="hidden" name="account_id" value="{{ account.id }}">
+          <button type="submit">Sign in again</button>
+        </form>
+        {% if account.id == summary.active %}
+        <form method="post" action="/admin/subscription/logout"><button type="submit">Disconnect</button></form>
+        {% endif %}
+      </div>
+    </section>
+    {% endfor %}
+    <div class="actions">
+      <form method="post" action="/admin/subscription/login"><button type="submit">Sign in with ChatGPT</button></form>
+      {% if summary.active %}
+      <form method="post" action="/admin/subscription/refresh"><button type="submit">Refresh models</button></form>
+      {% endif %}
+    </div>
+    <p>Disconnect ends the selected account's saved session with OpenAI and clears its credentials here.
+      The account registration remains available for signing in again. If OpenAI cannot confirm
+      the disconnection, an error appears and the saved credentials are kept so you can retry.</p>
+    {% if models %}
+    <h2>Models for the selected account</h2>
+    <p>Reload the main app after switching accounts. Choose a generator labelled <strong>ChatGPT subscription</strong>
+      and keep <strong>Use this personal model for every step</strong> checked to use it for request checks,
+      AutoQA and reviews too. Uncheck it to mix providers; other selected providers keep their own API billing.</p>
+    <ul>{% for key, model in models.items() %}<li>{{ model.name }} — <code>{{ key }}</code></li>{% endfor %}</ul>
+    {% elif summary.active %}
+    <p>No models are available yet. Refresh the model list or check the connected account's plan access.</p>
+    {% endif %}
+  {% endif %}
+  <p>Check plan usage, limits and any account credits in
+    <a href="https://chatgpt.com/settings/usage" target="_blank" rel="noopener noreferrer">ChatGPT usage settings</a>.
+    An API cost of $0 for this provider does not mean unlimited or free use.</p>
+  <p>This integration currently supports text and JSON through the public Sign in with ChatGPT preview.
+    Temperature and the output-token cap are not accepted by that preview; the engine still checks context
+    capacity and reserves output space. Tools, images and log-probability analysis are unavailable.</p>
+</main>
+</body>
+</html>

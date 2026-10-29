@@ -8,7 +8,6 @@ path rebuilds provider dictionaries from disk.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -70,7 +69,12 @@ def minimal_model_specs():
 def test_reload_model_specifications_rebuilds_legacy_maps(tmp_path, minimal_model_specs):
     specs_path = tmp_path / "model_specs.json"
     specs_path.write_text(json.dumps(minimal_model_specs, indent=2), encoding="utf-8")
-    repo_root = Path(__file__).resolve().parents[1]
+    original_join = os.path.join
+
+    def catalog_path(*parts):
+        if parts[-1] == "model_specs.json":
+            return str(specs_path)
+        return original_join(*parts)
 
     env_patch = {
         "OPENAI_KEY": "sk-test",
@@ -80,19 +84,12 @@ def test_reload_model_specifications_rebuilds_legacy_maps(tmp_path, minimal_mode
         "OPENROUTER_API_KEY": "sk-or-test",
         "MINIMAX_API_KEY": "sk-minimax-test",
         "MOONSHOT_API_KEY": "sk-moonshot-test",
-        # This test replaces os.path.join to redirect only model_specs.json.
-        # Capacity-policy paths must therefore be absolute so pathlib does not
-        # inherit that broad mock and accidentally read model_specs as policy.
-        "MODEL_LIMITS_CURATED_DEFAULT_PATH": str(repo_root / "model_limits.curated.json"),
-        "MODEL_LIMITS_CURATED_PATH": str(tmp_path / "missing-model-limits.local.json"),
-        "MODEL_FAMILY_FLOORS_DEFAULT_PATH": str(repo_root / "model_family_floors.json"),
-        "MODEL_FAMILY_FLOORS_PATH": str(tmp_path / "missing-family-floors.local.json"),
     }
 
     with patch.dict(os.environ, env_patch, clear=False):
         import config as config_module
 
-        with patch("config.os.path.join", return_value=str(specs_path)):
+        with patch("config.os.path.join", side_effect=catalog_path):
             cfg = config_module.Config()
 
     cfg.OPENAI_MODELS = {"stale": "value"}
@@ -143,7 +140,7 @@ def test_reload_model_specifications_rebuilds_legacy_maps(tmp_path, minimal_mode
     }
     specs_path.write_text(json.dumps(new_specs, indent=2), encoding="utf-8")
 
-    with patch("config.os.path.join", return_value=str(specs_path)):
+    with patch("config.os.path.join", side_effect=catalog_path):
         cfg.reload_model_specifications()
 
     assert cfg.model_specs["model_specifications"]["openai"] == new_specs["model_specifications"]["openai"]

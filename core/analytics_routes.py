@@ -12,7 +12,7 @@ from fastapi import Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from deal_breaker_tracker import get_tracker
-from llm_routing import legacy_default_models_view
+from llm_routing import LLMRoutingError, get_default_routing, resolve_call, resolve_call_models
 from provider_health import get_all_provider_health, refresh_official_provider_health
 from version import BUILD_VERSION_INFO
 
@@ -129,12 +129,51 @@ async def get_model_analytics(model_name: str):
         )
 
 
+def _model_selection_defaults(specs: dict) -> tuple[dict, list[str]]:
+    """Read selectable defaults without admitting every configured runtime path."""
+    from config import resolve_model_catalog_entry
+
+    routing = get_default_routing()
+    errors = []
+
+    def model_key(name: str, role: str) -> str | None:
+        resolved = resolve_model_catalog_entry(name, specs)
+        if resolved["matched"] and resolved["enabled"]:
+            return resolved["model_key"]
+        errors.append(f"The configured {role} model '{name}' is unavailable. Select an available model.")
+        return None
+
+    defaults = {}
+    for role, call_id in (
+        ("generator", "generation.main"),
+        ("gran_sabio", "gransabio.review"),
+        ("gran_sabio_fallback", "gransabio.regenerate"),
+        ("arbiter", "arbiter.resolve"),
+    ):
+        try:
+            route = resolve_call(call_id, routing=routing, validate_model=False)
+            defaults[role] = model_key(route.model, role)
+        except LLMRoutingError as exc:
+            defaults[role] = None
+            errors.append(str(exc))
+    defaults["qa"] = []
+    try:
+        route = resolve_call_models("qa.evaluate_layer", routing=routing, validate_model=False)
+        for entry in route.models:
+            key = model_key(entry["model"], "QA")
+            if key is not None:
+                defaults["qa"].append(key)
+    except LLMRoutingError as exc:
+        errors.append(str(exc))
+    return defaults, errors
+
+
 @app.get("/models/qa/available")
 async def get_qa_models():
     """Get list of models suitable for QA evaluation"""
     from config import config
     all_models = config.get_available_models()
-    defaults = legacy_default_models_view()
+    defaults, default_errors = _model_selection_defaults(config.model_specs)
 
     qa_suitable_models = []
 
@@ -157,7 +196,8 @@ async def get_qa_models():
                 "description": model["description"],
                 "qa_priority": qa_priority,
                 "output_tokens": model["output_tokens"],
-                "pricing": model["pricing"]
+                "pricing": model["pricing"],
+                "billing_mode": model.get("billing_mode", "api"),
             })
 
     # Sort by QA priority (fast first, then standard, then premium)
@@ -171,6 +211,7 @@ async def get_qa_models():
             "premium": [m["key"] for m in qa_suitable_models if m["qa_priority"] == "premium"][:2],
         },
         "defaults": defaults,
+        "default_errors": default_errors,
     }
 
 

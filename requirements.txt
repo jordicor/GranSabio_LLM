@@ -20,4 +20,6 @@ httpx>=0.28.0
 Pillow>=10.0.0
 jmespath>=1.0.0
 cryptography>=48.0.1
+keyring>=25.6; sys_platform == "darwin"  # Native Keychain only; no backend autodetection
+PyJWT[crypto]>=2.10.1,<3
 tiktoken>=0.9.0

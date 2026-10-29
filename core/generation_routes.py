@@ -264,6 +264,15 @@ def _routing_warnings_as_advisories(request: ContentRequest) -> List[PreflightIs
     ]
 
 
+def _request_requires_qa(request: ContentRequest) -> bool:
+    """Include declared, synthetic and planned QA when resolving active models."""
+    return (
+        bool(compute_base_effective_layers(request))
+        or request.llm_accent_guard.mode in {"post", "inline_post"}
+        or request.auto_qa.enabled
+    )
+
+
 def _apply_request_model_routing(request: ContentRequest, request_fields_set: set) -> None:
     """Resolve default/request LLM routing into legacy runtime fields."""
 
@@ -273,20 +282,22 @@ def _apply_request_model_routing(request: ContentRequest, request_fields_set: se
     request.generator_model = generator_route.model
     _apply_resolution_params(request, request_fields_set, generator_route)
 
+    qa_required = _request_requires_qa(request)
     if "qa_models" not in request_fields_set:
-        qa_route = resolve_call_models("qa.evaluate_layer", request=request)
-        request.qa_models = [_qa_model_config_from_route(entry) for entry in qa_route.models]
+        request.qa_models = []
+        if qa_required:
+            qa_route = resolve_call_models("qa.evaluate_layer", request=request)
+            request.qa_models = [_qa_model_config_from_route(entry) for entry in qa_route.models]
 
-    if "gran_sabio_model" not in request_fields_set:
+    if "gran_sabio_model" not in request_fields_set and (qa_required or request.gran_sabio_fallback):
         request.gran_sabio_model = resolve_call("gransabio.review", request=request).model
 
-    if "arbiter_model" not in request_fields_set:
+    if "arbiter_model" not in request_fields_set and qa_required:
         request.arbiter_model = resolve_call("arbiter.resolve", request=request).model
 
     preflight_route = resolve_call("preflight.validate", request=request)
     request._preflight_route = preflight_route
     request._preflight_model = preflight_route.model
-    request._long_text_controller_eval_model = resolve_call("long_text.semantic_eval", request=request).model
 
 
 def _local_only_requested(request: ContentRequest) -> bool:
@@ -803,6 +814,11 @@ async def _generate_content_once_with_cache_policy(request: ContentRequest):
         raise _local_policy_http_error(error) from error
 
     resolved_long_text_mode, long_text_advisories = _resolve_long_text_mode(request, request_fields_set)
+    if resolved_long_text_mode.get("enabled"):
+        try:
+            request._long_text_controller_eval_model = resolve_call("long_text.semantic_eval", request=request).model
+        except LLMRoutingError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     long_text_advisories.extend(_routing_warnings_as_advisories(request))
     request._resolved_long_text_mode = resolved_long_text_mode
     explicit_arbiter_model = "arbiter_model" in request_fields_set
@@ -910,11 +926,7 @@ async def _generate_content_once_with_cache_policy(request: ContentRequest):
         )
 
     # Require QA models when the effective QA pipeline is non-empty, accent post mode can run, or Auto-QA can create layers.
-    qa_required = (
-        bool(compute_base_effective_layers(request))
-        or request.llm_accent_guard.mode in {"post", "inline_post"}
-        or auto_qa_requested
-    )
+    qa_required = _request_requires_qa(request)
     if qa_required:
         if not request.qa_models:
             raise HTTPException(

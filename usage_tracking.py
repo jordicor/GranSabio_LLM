@@ -174,6 +174,7 @@ class UsageRecord:
 
         safe_metadata = {}
         for key in (
+            "billing_mode",
             "requested_model",
             "qa_model",
             "qa_layer",
@@ -311,7 +312,8 @@ class UsageTracker:
                     iteration=iteration,
                     layer=layer,
                     operation=operation or usage_payload.get("operation"),
-                    metadata=meta,
+                    metadata={**meta, **({"billing_mode": "subscription"}
+                              if usage_payload.get("billing_mode") == "subscription" else {})},
                     cost_override=usage_payload.get("cost"),
                     status=usage_payload.get("status", "success"),
                     duration_ms=duration_ms,

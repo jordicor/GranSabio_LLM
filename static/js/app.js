@@ -519,6 +519,7 @@ class GranSabioInterface {
         // Generator model change - show/hide reasoning controls
         document.getElementById('generatorModel')?.addEventListener('change', (e) => {
             this.updateReasoningControls(e.target.value);
+            this.updatePersonalSubscriptionOptions(e.target.value);
         });
 
         // Add QA Layer
@@ -1024,11 +1025,31 @@ class GranSabioInterface {
             }
         }
         
+        if (formData.has('personalSubscriptionOnly')) {
+            this.usePersonalSubscriptionForRequest(requestData);
+        }
         return requestData;
+    }
+
+    updatePersonalSubscriptionOptions(model) {
+        const options = document.getElementById('personalSubscriptionOptions');
+        if (options) options.hidden = !model?.startsWith('chatgpt/');
+    }
+
+    usePersonalSubscriptionForRequest(data) {
+        const model = data.generator_model;
+        if (!model?.startsWith('chatgpt/')) return;
+        // Reuse the engine's global routing override, including hidden checks.
+        data.llm_routing = { global: { model } };
+        data.qa_models = [model];
+        data.gran_sabio_model = model;
+        data.arbiter_model = model;
+        data.feedback_memory_enabled = false;
     }
 
     validateFormData(data) {
         if (!data.prompt || data.prompt.trim() === '') return false;
+        if (!data.generator_model || !data.gran_sabio_model) return false;
         if (data.qa_models.length === 0) return false;
         if (!data.auto_qa?.enabled && data.qa_layers.length === 0) return false;
         
@@ -1468,6 +1489,7 @@ class GranSabioInterface {
         if (form) {
             form.reset();
         }
+        this.updatePersonalSubscriptionOptions(document.getElementById('generatorModel')?.value);
         this.stopProgressTracking();
         this.currentSession = null;
         this.setLoadingState(false);
@@ -1514,6 +1536,9 @@ class GranSabioInterface {
     async loadQAModels() {
         try {
             const response = await fetch('/models/qa/available');
+            if (!response.ok) {
+                throw new Error(`Model catalog request failed (HTTP ${response.status}).`);
+            }
             const data = await response.json();
             
             this.qaModels = data.qa_models;
@@ -1525,8 +1550,12 @@ class GranSabioInterface {
             this.populateGranSabioModelSelect();
             this.bindQAModelEvents();
             this.loadDefaultQAModels();
+            if (data.default_errors?.length) {
+                this.showError(data.default_errors.join('\n'));
+            }
         } catch (error) {
             console.error('Failed to load models:', error);
+            this.showError(`Failed to load models: ${error.message}`);
         }
     }
 
@@ -1546,7 +1575,7 @@ class GranSabioInterface {
 
     populateGeneratorModelSelect() {
         const select = document.getElementById('generatorModel');
-        select.innerHTML = '';
+        select.innerHTML = '<option value="">Select a generator model...</option>';
         
         // Group models by priority for better organization
         const groupedModels = {
@@ -1581,7 +1610,7 @@ class GranSabioInterface {
             groupedModels.recommended.forEach(model => {
                 const option = document.createElement('option');
                 option.value = model.key;
-                option.textContent = `${model.name} (${model.tokens}k tokens)`;
+                option.textContent = model.tokens > 0 ? `${model.name} (${model.tokens} tokens)` : model.name;
                 recommendedGroup.appendChild(option);
             });
             select.appendChild(recommendedGroup);
@@ -1594,7 +1623,7 @@ class GranSabioInterface {
             groupedModels.advanced.forEach(model => {
                 const option = document.createElement('option');
                 option.value = model.key;
-                option.textContent = `${model.name} (${model.tokens}k tokens)`;
+                option.textContent = model.tokens > 0 ? `${model.name} (${model.tokens} tokens)` : model.name;
                 advancedGroup.appendChild(option);
             });
             select.appendChild(advancedGroup);
@@ -1607,7 +1636,7 @@ class GranSabioInterface {
             groupedModels.experimental.forEach(model => {
                 const option = document.createElement('option');
                 option.value = model.key;
-                option.textContent = `${model.name} (${model.tokens}k tokens)`;
+                option.textContent = model.tokens > 0 ? `${model.name} (${model.tokens} tokens)` : model.name;
                 experimentalGroup.appendChild(option);
             });
             select.appendChild(experimentalGroup);
@@ -1616,17 +1645,18 @@ class GranSabioInterface {
         const preferredGenerator = this.modelDefaults.generator;
         if (preferredGenerator && Array.from(select.querySelectorAll('option')).some(option => option.value === preferredGenerator)) {
             select.value = preferredGenerator;
-        } else if (select.querySelector('option')) {
-            select.value = select.querySelector('option').value;
+        } else {
+            select.value = '';
         }
         
         // Initialize reasoning controls for the default model
         this.updateReasoningControls(select.value);
+        this.updatePersonalSubscriptionOptions(select.value);
     }
 
     populateGranSabioModelSelect() {
         const select = document.getElementById('granSabioModel');
-        select.innerHTML = '';
+        select.innerHTML = '<option value="">Select a review model...</option>';
         
         // Filter and prioritize premium models for Gran Sabio
         const premiumModels = this.qaModels.filter(model => 
@@ -1635,10 +1665,7 @@ class GranSabioInterface {
             model.key.includes('gpt-4o')
         );
         
-        const standardModels = this.qaModels.filter(model => 
-            model.qa_priority === 'standard' && 
-            !premiumModels.includes(model)
-        );
+        const standardModels = this.qaModels.filter(model => !premiumModels.includes(model));
         
         // Add premium models first
         if (premiumModels.length > 0) {
@@ -1647,7 +1674,7 @@ class GranSabioInterface {
             premiumModels.forEach(model => {
                 const option = document.createElement('option');
                 option.value = model.key;
-                option.textContent = `${model.name} (${model.output_tokens} tokens)`;
+                option.textContent = model.output_tokens > 0 ? `${model.name} (${model.output_tokens} tokens)` : model.name;
                 premiumGroup.appendChild(option);
             });
             select.appendChild(premiumGroup);
@@ -1656,11 +1683,11 @@ class GranSabioInterface {
         // Add standard models
         if (standardModels.length > 0) {
             const standardGroup = document.createElement('optgroup');
-            standardGroup.label = 'Standard Models';
+            standardGroup.label = 'Other Models';
             standardModels.forEach(model => {
                 const option = document.createElement('option');
                 option.value = model.key;
-                option.textContent = `${model.name} (${model.output_tokens} tokens)`;
+                option.textContent = model.output_tokens > 0 ? `${model.name} (${model.output_tokens} tokens)` : model.name;
                 standardGroup.appendChild(option);
             });
             select.appendChild(standardGroup);
@@ -1669,8 +1696,8 @@ class GranSabioInterface {
         const preferredGranSabio = this.modelDefaults.gran_sabio;
         if (preferredGranSabio && Array.from(select.querySelectorAll('option')).some(option => option.value === preferredGranSabio)) {
             select.value = preferredGranSabio;
-        } else if (select.querySelector('option')) {
-            select.value = select.querySelector('option').value;
+        } else {
+            select.value = '';
         }
     }
 
