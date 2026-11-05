@@ -77,7 +77,9 @@ async def test_prompt_block_reaches_server_and_sdk_without_retry(service, stream
         assert models.generate_content.await_count + models.generate_content_stream.await_count == 1
         service._record_provider_health_failure.assert_not_awaited()
         assert usage[-1]["input_tokens"] == 17
-        assert usage[-1]["output_tokens"] == 0
+        # The provider supplied no output count; missing usage remains unknown.
+        assert usage[-1].get("output_tokens") is None
+        assert usage[-1]["total_tokens"] == 17
         assert usage[-1]["prompt_block_reason"] == "PROHIBITED_CONTENT"
         assert usage[-1]["finish_reason_category"] == "content_filter"
 

@@ -9,6 +9,8 @@ from typing import Any, Mapping, Optional
 
 import aiohttp
 
+from tool_loop_models import JsonContractError, ToolLoopSchemaViolationError
+
 
 class ProviderErrorKind(str, Enum):
     TRANSIENT_NETWORK = "transient_network"
@@ -26,6 +28,7 @@ class ProviderErrorKind(str, Enum):
     SCHEMA_INVALID = "schema_invalid"
     CONTEXT_OVERFLOW = "context_overflow"
     CONTENT_POLICY = "content_policy"
+    STREAM_INCOMPLETE = "stream_incomplete"
     MALFORMED_RESPONSE = "malformed_response"
     PARSE_FAILED = "parse_failed"
     NO_CONTENT = "no_content"
@@ -55,6 +58,7 @@ class ProviderFailure(Exception):
     raw_exception_class: Optional[str] = None
     raw_metadata: Mapping[str, Any] = field(default_factory=dict)
     endpoint_id: Optional[str] = None
+    json_validation: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
         Exception.__init__(self, self.message)
@@ -420,6 +424,11 @@ def classify_provider_exception(
             if error_type is None and isinstance(metadata.get("reasons"), list):
                 content_policy = bool(metadata["reasons"])
     request_id = _get_request_id(exc)
+    json_validation = (
+        exc.json_validation
+        if isinstance(exc, (JsonContractError, ToolLoopSchemaViolationError))
+        else None
+    )
     message_lower = str(exc).lower()
     quota_or_billing_kind = _quota_or_billing_kind(
         status=status,
@@ -429,10 +438,28 @@ def classify_provider_exception(
         message=message_lower,
     )
 
-    if isinstance(exc, asyncio.CancelledError):
+    if json_validation is not None:
+        # Preserve the existing classification and retry policy. A local JSON
+        # contract failure is not evidence of provider/network unavailability.
+        kind = ProviderErrorKind.UNKNOWN
+    elif isinstance(exc, asyncio.CancelledError):
         kind = ProviderErrorKind.CANCELLED
+    elif provider == "chatgpt" and getattr(exc, "subscription_completion_missing", False) is True:
+        # Only the transport's observed EOF carries this marker. Do not infer
+        # it from prose or relabel explicit provider errors/refusals.
+        kind = ProviderErrorKind.STREAM_INCOMPLETE
     elif content_policy:
         kind = ProviderErrorKind.CONTENT_POLICY
+    elif (
+        provider == "chatgpt"
+        and err_code in {"server_is_overloaded", "subscription_sharing_user_unavailable"}
+        and status in {None, 500, 502, 503, 529}
+    ):
+        kind = (
+            ProviderErrorKind.PROVIDER_OVERLOADED
+            if err_code == "server_is_overloaded"
+            else ProviderErrorKind.PROVIDER_DOWN
+        )
     elif isinstance(exc, asyncio.TimeoutError):
         kind = ProviderErrorKind.TIMEOUT
     elif status is None and "timeout" in message_lower:
@@ -556,4 +583,5 @@ def classify_provider_exception(
         max_attempts=max_attempts,
         raw_exception_class=exc.__class__.__name__,
         raw_metadata={"provider_error_payload": dict(payload) if isinstance(payload, Mapping) else {}},
+        json_validation=json_validation,
     )

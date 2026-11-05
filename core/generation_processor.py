@@ -64,7 +64,7 @@ from long_text_adapter import (
     coerce_resolved_long_text_mode,
     generate_long_text_candidate,
 )
-from model_aliasing import ModelAliasRegistry, PromptPart, get_evaluator_alias, to_prompt_safe_data
+from model_aliasing import ModelAliasRegistry, PromptPart, get_evaluator_alias
 from model_capability_registry import resolve_model_capability_context
 from models import (
     ContentRequest,
@@ -109,14 +109,14 @@ from smart_edit import (
     locate_by_word_indices,
     normalize_source_text,
 )
-from tool_loop_models import OutputContract
+from tool_loop_models import JsonContractError, OutputContract, ToolLoopSchemaViolationError
 from tools.ai_json_cleanroom import (
     ValidationResult,
     make_loose_json_validate_options,
     validate_ai_json,
     validate_loose_json,
 )
-from usage_tracking import UsageTracker, inject_costs_into_json_payload, merge_costs_into_json_string
+from usage_tracking import UsageTracker
 from word_count_utils import build_word_count_instructions, count_words, prepare_qa_layers_with_word_count
 
 from . import app_state
@@ -153,6 +153,7 @@ from .feedback_formatter import (
 )
 from .generation import results as generation_results
 from .generation import tool_events as generation_tool_events
+from .generation.results import attach_usage_metadata as _attach_usage_metadata
 from .prompt_templates import build_deal_breaker_awareness_prompt, build_json_validation_error_prompt
 from .qa_decision_engine import (
     _check_50_50_tie_deal_breakers,
@@ -218,6 +219,9 @@ def _attach_qa_provider_failure(session: Dict[str, Any], final_result: Dict[str,
     cause = exc.__cause__
     failure = _extract_provider_failure(cause) if isinstance(cause, Exception) else None
     if failure is None:
+        if isinstance(cause, (JsonContractError, ToolLoopSchemaViolationError)) and cause.json_validation is not None:
+            for target in (session, final_result):
+                target["json_validation"] = cause.json_validation
         return
     provider_error = _provider_failure_public_payload(failure)
     for target in (session, final_result):
@@ -230,6 +234,13 @@ def _provider_failure_public_message(failure: ProviderFailure) -> str:
     """Build an actionable message for user-facing API payloads."""
 
     target = f"{failure.provider}/{failure.model_id}"
+    if failure.json_validation is not None:
+        return f"JSON output failed validation for {target}. {failure.json_validation['message']}"
+    if failure.kind == ProviderErrorKind.STREAM_INCOMPLETE:
+        return (
+            f"The response stream for {target} ended without confirmation of completion. "
+            "Any partial output is unconfirmed. The cause of the interruption is unknown."
+        )
     if failure.kind == ProviderErrorKind.CONTENT_POLICY:
         return f"Provider content policy stopped generation for {target}."
     if failure.kind == ProviderErrorKind.QUOTA_EXHAUSTED:
@@ -283,6 +294,7 @@ def _provider_failure_public_payload(failure: ProviderFailure) -> Dict[str, Any]
         "attempt": failure.attempt,
         "max_attempts": failure.max_attempts,
         "raw_exception_class": failure.raw_exception_class,
+        "json_validation": failure.json_validation,
     }
     health_payload = provider_health_for_failure_payload(failure)
     if health_payload:
@@ -584,6 +596,14 @@ def _build_generation_error_result(
             "generated_at": datetime.now().isoformat(),
         }
 
+    if (
+        isinstance(exc, (JsonContractError, ToolLoopSchemaViolationError))
+        and exc.json_validation is not None
+    ):
+        # Local post-validation may run outside the provider wrapper. Keep its
+        # existing error type/code, but expose the same safe diagnostic to clients.
+        session["json_validation"] = final_result["json_validation"] = exc.json_validation
+        final_result["failure_reason"] = f"JSON output failed validation. {exc.json_validation['message']}"
     _attach_json_guard_metadata(session, final_result, request)
     return final_result
 
@@ -906,8 +926,19 @@ async def _finalize_generation_interruption(
 
     def _commit_cancelled(session: Dict[str, Any]) -> Dict[str, Any]:
         if is_terminal_session(session):
+            usage_changed = False
+            final_result = session.get("final_result")
+            if (
+                session.get("status") == GenerationStatus.CANCELLED
+                and session.get("request")
+                and isinstance(final_result, dict)
+            ):
+                previous_result = dict(final_result)
+                _attach_usage_metadata(session, final_result, session["request"])
+                usage_changed = final_result != previous_result
             return {
                 "already_terminal": True,
+                "usage_changed": usage_changed,
                 "status": session.get("status"),
                 "final_result": session.get("final_result"),
                 "project_id": session.get("project_id"),
@@ -937,6 +968,14 @@ async def _finalize_generation_interruption(
     finalized.update(outcome)
 
     if finalized.get("already_terminal"):
+        if finalized.get("usage_changed"):
+            await _await_bounded_terminal_write(
+                "debug cancellation usage",
+                _debug_update_status(
+                    session_id, status=GenerationStatus.CANCELLED.value,
+                    final_payload=finalized.get("final_result"),
+                ),
+            )
         return
 
     final_result = finalized.get("final_result")
@@ -1294,6 +1333,9 @@ def _build_final_result(session: Dict[str, Any]):
         if request_name:
             result.setdefault("request_name", request_name)
         result.setdefault("status", normalized_status)
+        if normalized_status == GenerationStatus.CANCELLED.value and session.get("request"):
+            # Provider cleanup can report usage after cancellation was committed.
+            _attach_usage_metadata(session, result, session["request"])
         return ("ok", result)
 
     last_iteration = session.get("current_iteration", 0)
@@ -1319,6 +1361,8 @@ def _build_final_result(session: Dict[str, Any]):
         payload["provider_error"] = provider_error
         payload["error_type"] = session.get("error_type", "provider_error")
         payload["error_code"] = session.get("error_code") or provider_error.get("kind")
+    if session.get("json_validation") is not None:
+        payload["json_validation"] = session["json_validation"]
     context_admission = session.get("context_admission")
     if isinstance(context_admission, dict):
         payload["context_admission"] = context_admission
@@ -1334,61 +1378,6 @@ def _build_final_result(session: Dict[str, Any]):
 
     return ("ok", payload)
 
-def _attach_usage_metadata(session: Dict[str, Any], final_result: Dict[str, Any], request: ContentRequest) -> None:
-    """Attach usage and cost metadata to the final payload.
-
-    The ``costs``/``query_stats`` blocks are part of the default result
-    contract (C15): ``show_query_costs``/``show_query_stats`` default to 1, and
-    a client that does not want them sends 0. Embedding the cost block INSIDE
-    the returned content stays opt-in, because that mutates canonical content:
-    it only happens when the request set the field explicitly.
-    """
-    local_execution = session.get("local_execution")
-    if local_execution is not None:
-        from local_execution_policy import build_local_execution_attestation
-
-        final_result["local_only_attestation"] = build_local_execution_attestation(
-            local_execution.manifest,
-            local_execution.ledger,
-        ).to_payload()
-
-    tracker: Optional[UsageTracker] = session.get("usage_tracker")
-    level = getattr(request, "show_query_costs", 0)
-    stats_level = getattr(request, "show_query_stats", 0)
-    embed_costs_in_content = "show_query_costs" in (
-        getattr(request, "model_fields_set", None) or set()
-    )
-
-    if not tracker or level <= 0:
-        final_result.pop("costs", None)
-    else:
-        summary = tracker.build_summary(level)
-        if not summary:
-            final_result.pop("costs", None)
-        else:
-            alias_registry = getattr(request, "_model_alias_registry", None) or session.get("model_alias_registry")
-            prompt_safe_summary = to_prompt_safe_data(summary, alias_registry)
-            final_result["costs"] = prompt_safe_summary
-            if embed_costs_in_content:
-                content_value = final_result.get("content")
-                if not is_json_output_requested(request):
-                    if isinstance(content_value, str):
-                        final_result["content"] = tracker.embed_text_summary(content_value, 1)
-                elif isinstance(content_value, str):
-                    final_result["content"] = merge_costs_into_json_string(content_value, prompt_safe_summary)
-                elif content_value is not None:
-                    final_result["content"] = inject_costs_into_json_payload(content_value, prompt_safe_summary)
-
-    if not tracker or stats_level <= 0:
-        final_result.pop("query_stats", None)
-        return
-
-    query_stats = tracker.build_query_stats(stats_level)
-    if not query_stats:
-        final_result.pop("query_stats", None)
-        return
-
-    final_result["query_stats"] = query_stats
 
 def _attach_json_guard_metadata(session: Dict[str, Any], final_result: Dict[str, Any], request: ContentRequest) -> None:
     """Attach JSON guard metadata to the final result when applicable."""
@@ -2619,6 +2608,10 @@ def _is_retryable_streaming_error(exc: Exception) -> bool:
     if isinstance(exc, AIRequestError):
         failure = getattr(exc, "provider_failure", None)
         if failure is not None:
+            if failure.provider == "chatgpt":
+                # AIService owns the subscription's complete overload budget
+                # and partial-stream guard; an outer retry would bypass both.
+                return False
             return bool(failure.retryable)
         return True
 
@@ -3504,6 +3497,9 @@ async def _generate_full_content(
                     request, "strict_single_generation_attempt", False
                 ),
                 request_timeout=remaining_stream_timeout,
+                allow_chatgpt_overload_retries=getattr(
+                    request, "allow_chatgpt_overload_retries", False
+                ),
                 cancellation_token=cancellation_token,
                 cancel_callback=_generation_cancelled,
                 local_execution=session.get("local_execution"),
@@ -7827,6 +7823,10 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                         "final_result": final_result,
                     },
                 )
+                if usage_tracker and usage_tracker.enabled:
+                    usage_summary = usage_tracker.build_summary(usage_tracker.detail_level)
+                    if usage_summary:
+                        await _debug_record_usage(session_id, usage_summary)
                 await _debug_update_status(
                     session_id,
                     status=GenerationStatus.COMPLETED.value,
@@ -10044,6 +10044,12 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
         # (approved, failed, rejected, cancelled), exactly once per session.
         # Previously only the approved path called complete_session, leaking
         # memory_cache entries for all other outcomes.
+        if session.get("status") == GenerationStatus.CANCELLED:
+            # Cooperative cancellation can return normally after a late receipt.
+            # Persist changed accounting once provider cleanup has finished.
+            await _finalize_generation_interruption_shielded(
+                session_id, reason="Cancellation accounting finalized",
+            )
         feedback_manager = session.get("feedback_manager")
         if feedback_manager is not None:
             terminal_status = session.get("status")

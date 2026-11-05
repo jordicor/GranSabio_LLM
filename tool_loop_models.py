@@ -8,9 +8,12 @@ so it can be depended on by both without creating circular imports.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from tools.ai_json_cleanroom import ValidationResult
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -136,6 +139,12 @@ class ToolLoopSchemaViolationError(Exception):
     a deterministic logic failure and must surface to the caller.
     """
 
+    def __init__(self, message: str, *, validation: Optional[ValidationResult] = None) -> None:
+        self.json_validation = validation.public_diagnostics() if validation is not None else None
+        if self.json_validation is not None:
+            message = f"{message} {self.json_validation['message']}"
+        super().__init__(message)
+
 
 class ValidationToolInputTooLarge(Exception):
     """Raised when the LLM invokes ``validate_draft`` with a ``text`` argument
@@ -235,6 +244,12 @@ class JsonContractError(Exception):
     schema-violation semantics.
     """
 
+    def __init__(self, message: str, *, validation: Optional[ValidationResult] = None) -> None:
+        self.json_validation = validation.public_diagnostics() if validation is not None else None
+        if self.json_validation is not None:
+            message = f"{message} {self.json_validation['message']}"
+        super().__init__(message)
+
 
 class ToolLoopContractError(Exception):
     """Raised when a caller violates the ``OutputContract`` contract.
@@ -248,15 +263,6 @@ class ToolLoopContractError(Exception):
 # ---------------------------------------------------------------------------
 # LLM JSON parsing utility
 # ---------------------------------------------------------------------------
-
-
-def _format_cleanroom_issues(errors: List[Any]) -> str:
-    """Return a compact error summary from ai_json_cleanroom issues."""
-
-    return "; ".join(
-        f"{getattr(issue, 'path', '$')}: {getattr(issue, 'message', str(issue))}"
-        for issue in (errors or [])
-    ) or "unknown JSON validation error"
 
 
 def parse_json_with_markdown_fences(
@@ -287,8 +293,7 @@ def parse_json_with_markdown_fences(
 
     validation_result = validate_ai_json(response or "", schema=schema)
     if not validation_result.json_valid:
-        details = _format_cleanroom_issues(validation_result.errors)
-        raise JsonContractError(f"{context} failed JSON validation: {details}")
+        raise JsonContractError(f"{context} failed JSON validation.", validation=validation_result)
 
     parsed = validation_result.data
     if not isinstance(parsed, dict):

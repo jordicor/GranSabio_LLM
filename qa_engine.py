@@ -2025,7 +2025,13 @@ Source QA layers:
                     else True
                 )
                 threshold_reached = failure_count >= self._qa_failure_threshold()
-                retryable = provider_retryable and not threshold_reached
+                retryable = (
+                    provider_retryable
+                    and not threshold_reached
+                    # AIService already exhausted or declined the subscription
+                    # retry budget. Do not multiply it in the QA scheduler.
+                    and getattr(provider_failure, "provider", None) != "chatgpt"
+                )
                 will_retry_provider = (
                     retryable
                     and attempt <= max(0, scheduler_policy.provider_failure_retries)

@@ -57,6 +57,13 @@ _REASONING_EFFORT_ORDER = (
 
 DEFAULT_OUTPUT_TOKEN_FALLBACK = 8192
 
+# Explicit comparison tariffs, not routing or billing fallbacks. Slugs absent
+# from this versioned mapping have no known API-equivalent cost.
+SUBSCRIPTION_API_EQUIVALENT_MODELS = {
+    "gpt-6-luna": "openrouter::openai/gpt-6-luna",
+    "gpt-6.1-sol": "openrouter::openai/gpt-6.1-sol",
+}
+
 SYSTEM_ONE_NOUL_YES_THRESHOLD = 0.5
 SYSTEM_ONE_QA_SCORE_LEVELS = (
     "Does not satisfy the criterion; the content is unusable for this requirement.",
@@ -2312,6 +2319,8 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         model_data = resolved["model_data"] or {}
         provider = str(resolved["catalog_provider"] or "")
         provider_name = str(resolved["provider"] or provider)
+        if provider == "chatgpt":
+            model_data = {**model_data, **self.get_subscription_capacity_metadata(model_name)}
 
         if not resolved["enabled"]:
             msg = f"[CONFIG ERROR] Model '{model_name}' is disabled."
@@ -2355,6 +2364,7 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         elif provider == "chatgpt":
             from personal_subscription import require_personal_usage
             require_personal_usage(self)
+            self.get_subscription_api_equivalent_model(resolved["model_id"])
             api_key = "personal-subscription"  # The real OAuth token never enters this API.
         elif provider == "fake" or resolved["is_test_model"]:
             api_key = "fake"
@@ -2391,6 +2401,30 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             "billing_mode": model_data.get("billing_mode", "api"),
         }
 
+    def get_subscription_api_equivalent_model(self, slug: str) -> Optional[str]:
+        """Resolve an explicit comparison tariff, rejecting broken catalog links."""
+        target = SUBSCRIPTION_API_EQUIVALENT_MODELS.get(slug)
+        if target is None:
+            return None
+        provider, separator, model_key = target.partition("::")
+        models = self.spec_catalog.get("model_specifications", {}).get(provider, {})
+        if not separator or not isinstance(models.get(model_key), dict):
+            raise RuntimeError(
+                f"[CONFIG ERROR] Subscription API-equivalent mapping for '{slug}' "
+                f"references missing catalog model '{target}'."
+            )
+        return target
+
+    def get_subscription_capacity_metadata(self, model_name: str) -> Dict[str, Any]:
+        """Use one subscription capacity view for catalog, detail and dispatch."""
+        limits = self.get_model_token_limits(model_name) or {}
+        return {
+            "input_tokens": limits.get("max_input_tokens"),
+            "output_tokens": limits.get("max_output_tokens"),
+            "context_window": limits.get("max_total_context_tokens"),
+            "token_limits": limits,
+        }
+
     def get_model_token_limits(self, model_name: str) -> Optional[Dict[str, Any]]:
         """
         Resolve the semantic token-limit view for one model, with provenance.
@@ -2421,6 +2455,10 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             resolved.get("model_id"),
             resolved.get("base_model"),
         ]
+        if provider == "chatgpt":
+            # Subscription capacity is account-specific. Bare slugs belong to
+            # API catalog entries, including their curated limits and tariffs.
+            candidate_keys = [f"chatgpt/{resolved.get('model_id')}", f"chatgpt::{resolved.get('model_id')}"]
         seen: set = set()
         for key in candidate_keys:
             if not key or key in seen:
@@ -2450,6 +2488,12 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
             return None
 
         token_limits = model_data.get("token_limits")
+        if provider == "chatgpt":
+            return {
+                "model": resolved.get("model_id") or model_name,
+                "provider": provider,
+                **(token_limits or {}),
+            }
         token_limit_output: Optional[int] = None
         if isinstance(token_limits, dict) and token_limits:
             token_limit_input = self._parse_positive_int_config_value(
@@ -3377,6 +3421,11 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         else:
             effective_output_limit = max_output_tokens
         safe_max_tokens = int(effective_output_limit * safety_margin)
+        if provider == "chatgpt" and max_output_tokens is None and max_tokens_percentage is None:
+            # This is a caller's reservation, not a provider output maximum.
+            # Keep it intact for joint-context admission; SIWC does not send an
+            # output cap on the wire. Other providers retain their fallback.
+            safe_max_tokens = max_tokens
 
         # Calculate tokens based on percentage if specified
         percentage_used = False
@@ -3964,6 +4013,9 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                     "pricing": model_data.get("pricing", {}),
                     "billing_mode": model_data.get("billing_mode", "api"),
                 }
+                if provider == "chatgpt":
+                    model_entry.update(self.get_subscription_capacity_metadata(model_name))
+                    model_entry["max_context_window"] = model_data.get("max_context_window")
 
                 timeout_hint = self._calculate_reasoning_timeout(
                     {

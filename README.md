@@ -707,7 +707,7 @@ Process images alongside text for multimodal content generation:
 
 ### JSON Schema Structured Outputs
 
-**100% format guarantee** across all major providers:
+Request structured JSON across supported providers:
 
 ```json
 {
@@ -733,6 +733,51 @@ Process images alongside text for multimodal content generation:
 - **OpenRouter:** All compatible models (Mistral, DeepSeek, LLaMA, Qwen, and 200+ more)
 
 ---
+
+### JSON validation diagnostics
+
+Local JSON contract failures include an optional `json_validation` diagnostic.
+Wrapped failures expose it at `provider_error.json_validation`; local failures
+outside the provider wrapper expose it at the result's top level. It survives
+`/status`, `/result`, project/session SSE status snapshots and the Python SDK's
+exception `details` at the same location.
+
+For example, a rejected value outside the schema's allowed options produces:
+
+```json
+{
+  "message": "A value is not one of the allowed options at $.*[*].*.",
+  "likely_truncated": false,
+  "issues": [{
+    "code": "enum_mismatch",
+    "category": "schema",
+    "path": "$.*[*].*",
+    "path_redacted": true,
+    "message": "A value is not one of the allowed options at $.*[*].*."
+  }],
+  "error_count": 1,
+  "issues_omitted": 0
+}
+```
+
+Codes distinguish syntax errors, duplicate keys, missing required properties,
+wrong types, enum/constant mismatches and other Cleanroom constraints. Categories
+group those codes as `syntax`, `schema`, `expectation` or `validation`.
+`likely_truncated` is a heuristic, not proof of a provider token limit; it does
+not change `output_truncated`, retries or acceptance.
+
+Diagnostics include at most eight issues. Paths show only a coarse shape:
+`.*` masks every property, `[*]` masks every index, and unusual or excessive
+paths fall back to `$` (root). They are not exact JSON paths; property names
+containing separators can also make their shape ambiguous. No prompt, response,
+JSON values, schema values, raw Cleanroom messages or issue details are included.
+
+Success, safe repairs, schema enforcement, exception classes and retry/downgrade
+policy remain unchanged. In particular, a wrapped `JsonContractError` still has
+`type="provider_error"`, `kind="unknown"`, `raw_exception_class="JsonContractError"`,
+`retryable=false` and `downgradable=false`. The diagnostic describes a local
+content rejection, not a provider outage. Older servers may omit it; clients
+should treat it as optional and use codes rather than parsing the human message.
 
 ### Reasoning Models Support
 
@@ -832,6 +877,44 @@ PEPPER=any-random-string-here
 
 #### Personal ChatGPT subscription
 
+Subscription capacity comes from the selected account's authenticated
+`GET https://api.openai.com/v1/models` catalog. The engine refreshes that catalog
+once at startup, including accounts saved by older versions, and on the existing
+Refresh/Select/sign-in paths. No new sign-in is needed for a connected account.
+If decoding a compressed catalog response fails, the same metadata GET is
+retried once with `Accept-Encoding: identity`; inference requests are unaffected.
+A failed refresh preserves credentials and the previous dated catalog; it does
+not substitute API capacity or activate the separately advertised
+`max_context_window`.
+
+`GET /models`, `GET /models/{model}` and `POST /context/preflight` expose the same
+subscription capacity. `context_window` is the provider's ordinary joint window.
+`input_tokens` and `output_tokens` remain `null` when independent maxima are not
+published. The `token_limits` object preserves `max_total_context_tokens`,
+`max_input_tokens`, `max_output_tokens`, `output_accounting`,
+`reasoning_accounting`, `provenance`, `source` and `verified_at`. API-equivalent
+prices are for accounting only; bare API-model curated limits cannot become
+subscription limits. Any explicit curated subscription override must use its
+`chatgpt/` or `chatgpt::` namespace.
+
+The `gransabio_context_preflight.v2` participant fields `max_input_tokens` and
+`max_output_tokens` can therefore be `null` for a known joint window. Consumers
+must preserve those unknown maxima. With `output_accounting="unknown"`, the
+preflight conservatively reserves output inside the working window; with
+`reasoning_accounting="unknown"`, it also reserves declared reasoning separately.
+`usable_input_tokens` is the working window minus those reservations, bounded
+by an independent input maximum only when one exists. `evidence_tokens` then
+subtracts fixed input, generated input and the safety margin. A reservation
+that consumes the window is rejected even when no independent output maximum
+is known. Missing joint/input capacity remains an explicit preflight rejection.
+Known API-model behavior is unchanged.
+
+For SIWC, an explicit output-token allowance is a context reservation, not a
+provider-enforced output cap: the transport omits unsupported `max_output_tokens`.
+The engine preserves that reservation instead of replacing it with the local
+default output budget. Small successful generations do not certify maximum
+context capacity or remaining subscription quota.
+
 For your own local installation, you can connect your personal ChatGPT plan using
 OpenAI's [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source/sign-in)
 preview. This is a separate `chatgpt` provider; it does not use or replace your OpenAI API key.
@@ -894,10 +977,79 @@ analysis are not offered by this adapter. An interrupted or quota-limited respon
 fails without substituting a paid API call. See OpenAI's
 [preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations).
 
+For the structured ChatGPT errors `server_is_overloaded` and
+`subscription_sharing_user_unavailable`, and HTTP 503 without a structured error
+code received before the Responses stream opens, GranSabio permits an
+initial attempt and at most two retries, after 5 and 15 seconds. A later
+`Retry-After` extends the wait only if the original process deadline allows it.
+Cancellation stops the wait. SDK retries remain disabled, and generation,
+Gran Sabio and QA do not restart an exhausted subscription retry budget.
+Other errors, including authentication, quota and invalid JSON, do not qualify.
+There is no model switch or paid-API fallback.
+The HTTP 503 branch uses the transport boundary and status, never message text.
+Structured error types other than `service_unavailable_error`, or an error
+parameter, do not qualify for that branch. Once a stream opens, an uncoded 503
+stays terminal even if no text has been emitted. The existing structured-code
+rules and the published-content guard still apply.
+With `allow_chatgpt_overload_retries=true`, HTTP 504 also qualifies when the
+transport confirms the Responses stream has not opened, there is no structured
+error code or parameter, and the type is absent or an absolute HTTP(S) URI.
+Such a URI is an opaque identifier: no gateway domain, path or language is
+hardcoded. Other structured type labels do not qualify. This uses the same
+two retries and original deadline; local timeouts and errors after the stream
+opens remain terminal. Without the opt-in, HTTP 504 remains terminal even when
+`strict_single_generation_attempt=false`. The existing 503 policy is unchanged.
+OpenAI documents `subscription_sharing_user_unavailable` as temporary
+user/workspace information unavailability, with bounded retries while preserving
+credentials ([recovery guidance](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery#structured-responses-errors)).
+
+`strict_single_generation_attempt=true` still disables these retries unless the
+request also explicitly sets `allow_chatgpt_overload_retries=true`. That opt-in
+only allows the bounded ChatGPT overload policy; all other strict-mode
+restrictions remain in force. Both fields are accepted in `/generate` requests
+and by the ordinary Python client payload. No retry occurs after streaming text
+has been published. Buffered JSON and non-streaming text from a failed attempt
+are discarded before starting the next attempt; JSON validation is unchanged.
+
+Usage records retain each physical attempt, its status and any reported tokens,
+with `attempt`, subscription `request_id` when available, and `usage_reported`.
+Missing token usage and its API-equivalent cost remain unknown, never inferred
+as zero. The logical request/session identity remains the same across retries.
+
+If the subscription stream ends without `response.completed`, the existing
+provider-error contract reports `kind=stream_incomplete` (and
+`error_code=stream_incomplete` in status/result), with `retryable=false` and
+`downgradable=false`. Any partial output remains unconfirmed. This local
+observation does not identify a network or quota cause and does not trigger a
+retry, including with overload retries enabled. Request identity, attempt and
+reported usage are preserved; unreported usage stays unknown. Explicit provider
+failures, refusals and historical error records retain their existing handling.
+
 Tokens are reported under `chatgpt/<slug>` with `billing_mode=subscription`.
 The reported $0 is **API spend**, not the price of your plan or a claim of unlimited
 use. Plan limits and any applicable credits remain controlled by OpenAI; check
 [ChatGPT usage settings](https://chatgpt.com/settings/usage).
+
+Usage reports also expose `api_equivalent_cost_usd`: what the reported tokens
+would cost at an explicitly mapped API tariff, **not money spent**. The versioned
+`SUBSCRIPTION_API_EQUIVALENT_MODELS` mapping in `config.py` currently maps
+`gpt-6-luna` to `openrouter::openai/gpt-6-luna` and `gpt-6.1-sol` to
+`openrouter::openai/gpt-6.1-sol`. Each call identifies that tariff in
+`api_equivalent_model`. There is no name-based inference or API fallback.
+An unmapped slug has a `null` equivalent; a mapped target missing from the
+catalog is a configuration error when that subscription model is resolved.
+No OpenRouter API key or API call is needed to calculate the comparison.
+
+When the subscription omits cache counts, all reported input is priced as
+ordinary input. This is an upper bound relative to cache-read discounts at the
+same tariff, not a guarantee against cache-write surcharges or other fees.
+Reported cache categories and long-context tariffs are applied when available.
+The adapter uses the Responses usage contract: `output_tokens` includes
+reasoning, and `output_tokens_details.reasoning_tokens` is a breakdown, not an
+additional charge ([OpenAI guidance](https://developers.openai.com/cookbook/articles/per_run_spending_controller_responses_api#limits-and-other-costs)).
+The breakdown is preserved when reported. The SIWC preview does not separately
+guarantee its completeness; if omitted, GranSabio prices the reported output
+total without reconstructing hidden reasoning or counting visible text.
 
 OAuth credentials stay outside the repository, by default in
 `~/.config/gransabio/personal`; `PERSONAL_SUBSCRIPTION_DIR` may select another
@@ -1686,7 +1838,55 @@ For execution timing and per-call visibility, use `show_query_stats`:
 
 `show_query_stats=1` returns phase/model/provider aggregates, `2` adds iteration and layer detail, and `3` adds prompt-free per-call rows with duration, tokens, provider, model, finish reason, and cost. A per-call `cost_basis` says whether `estimated_cost_usd` is the amount the provider reported as billed (`provider_billed`, OpenRouter's `usage.cost`, plus the upstream charge for BYOK requests) or a `catalog_estimate` from the model's `pricing` block; a call with neither leaves the cost `null`, and any such call keeps the aggregate cost `null` as well. The OpenRouter sync writes each catalog rate (`input_per_million`, `output_per_million`, `cached_input_per_million`, `cache_write_per_million`, and the `long_context` override above its `threshold_tokens`) only when OpenRouter lists it; a router model priced per routed request (OpenRouter lists `-1`) therefore has no catalog rate and stays `null` unless the call reported its billed cost. Local spans such as consensus and smart-edit timing are included without increasing the LLM call count.
 
+`api_equivalent_cost_usd` adds a separate comparison to each call and to all
+cost aggregates in `query_stats`, `costs`, and the debugger's `usage` summary.
+For paid API calls it equals their own `estimated_cost_usd`, including a
+provider-billed amount; `api_equivalent_model` is their own model. For personal
+subscriptions it uses the explicit mapping above, with the same input, output,
+cache and long-context pricing rules. For local models (Ollama, llama.cpp and
+registered local endpoints), or an unmapped subscription, both fields are
+`null`. Missing token counts or a required tariff also leave the cost `null`,
+while retaining a known mapped model. A known zero remains zero.
+
+Any unknown contributing call makes the equivalent aggregate `null`;
+`known_totals.api_equivalent_cost_usd` retains the sum of known comparison costs
+or `null` if none are known. These fields also survive cancellation and late
+usage receipts. They do not affect provider budgets, balance charges, or the
+existing `cost` / `estimated_cost_usd` fields: subscription API spend stays $0
+with `cost_basis=catalog_estimate` and `billing_mode=subscription`.
+
 Unreported token counts and costs are `null` (`unknown` in the text cost block), rather than zero. An aggregate is unavailable when a contributing call lacks the corresponding measurement; measured zero remains zero. A provider-reported total can still be available when its input/output breakdown is not.
+
+Both reports also include `known_totals`: the sum of available token measurements
+and costs, even when another call has missing data. Its `total_tokens` uses each
+reported total, or the available input/output counts when that total is missing.
+These are partial subtotals, not a replacement for a complete bill. A field with
+no measurements remains `null`; `known_totals.cost` is in USD and retains the
+same provider-billed/catalog-estimate basis as the underlying calls.
+
+Cancelling a session or project preserves the usage already received from
+providers, including earlier iterations and QA. `GET /result/{session_id}`
+returns that cancelled result; session `/stop` and `/pause` responses also
+include it as `final_result`. Cancellation reports carry `partial: true` in
+`costs` and `query_stats`, because the interrupted call may never supply its
+final token counts. Later result reads pick up any receipts recorded during
+cleanup. The debugger stores the cancelled result and its available cost
+summary. No tokens are estimated from partial text, and no extra generation
+is run to recover usage. If no usage receipt was recorded, there is no token
+summary to return. Explicit `show_query_costs=0` / `show_query_stats=0` still
+opt out; cancelled content is kept separate from these accounting snapshots.
+
+The synchronous and asynchronous SDKs keep raising
+`GranSabioGenerationCancelled`, which now retains the result in `result`
+(also available through `details`):
+
+```python
+try:
+    result = client.wait_for_result(session_id)
+except GranSabioGenerationCancelled as exc:
+    costs = (exc.result or {}).get("costs", {})
+    known_tokens = costs.get("known_totals", {}).get("total_tokens")
+```
 
 ---
 

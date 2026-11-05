@@ -1692,6 +1692,10 @@ async def get_status(
             (session.get("final_result") or {}).get("provider_error")
             or session.get("provider_error")
         ),
+        **(
+            {"json_validation": session["json_validation"]}
+            if session.get("json_validation") is not None else {}
+        ),
         "context_admission": (
             (session.get("final_result") or {}).get("context_admission")
             or session.get("context_admission")
@@ -1769,6 +1773,7 @@ async def _hard_stop_session_runtime(session_id: str) -> Dict[str, Any]:
                 "final_result": session.get("final_result"),
                 "response": {
                     "session_id": session_id,
+                    "final_result": _build_final_result(session)[1],
                     "message": f"Session already finished with status: {status_value}",
                     "stopped": False,
                     "status": status_value,
@@ -1794,6 +1799,7 @@ async def _hard_stop_session_runtime(session_id: str) -> Dict[str, Any]:
             "final_result": final_result,
             "response": {
                 "session_id": session_id,
+                "final_result": final_result,
                 "message": "Session hard-stopped successfully",
                 "stopped": True,
                 "status": GenerationStatus.CANCELLED.value,
@@ -1865,7 +1871,7 @@ async def pause_session(session_id: str):
                 "paused": False,
                 "status": status_value,
                 "cancel_mode": session.get("cancel_mode"),
-                "final_result": session.get("final_result"),
+                "final_result": _build_final_result(session)[1],
             }
         if session.get("cancelled") and session.get("cancel_mode") == CancelMode.HARD.value:
             return {
@@ -1895,6 +1901,10 @@ async def pause_session(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
     if result.get("paused"):
         await add_verbose_log(session_id, "Session paused by user request")
+        await _debug_update_status(
+            session_id, status=GenerationStatus.CANCELLED.value,
+            final_payload=result["final_result"],
+        )
     return result
 
 

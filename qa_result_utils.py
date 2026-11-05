@@ -263,7 +263,11 @@ def normalize_qa_technical_failure_metadata(
     upstream_request_id = extract_provider_request_id(original_exception)
     original_class = type(original_exception).__name__ if original_exception is not None else None
 
-    if provider_kind in RETRYABLE_PROVIDER_FAILURE_KINDS:
+    if provider == "chatgpt" and provider_failure is not None:
+        # The adapter has already applied the complete subscription retry
+        # policy; do not re-enable scheduler retries from the error taxonomy.
+        retryable = False
+    elif provider_kind in RETRYABLE_PROVIDER_FAILURE_KINDS:
         retryable = True
     elif provider_kind in NON_RETRYABLE_PROVIDER_FAILURE_KINDS:
         retryable = False
@@ -288,6 +292,10 @@ def normalize_qa_technical_failure_metadata(
         "provider_error_type": _read_mapping_or_attr(provider_failure, "provider_error_type"),
         "provider_error_code": _read_mapping_or_attr(provider_failure, "provider_error_code"),
         "provider_error_param": _read_mapping_or_attr(provider_failure, "provider_error_param"),
+        "json_validation": (
+            _read_mapping_or_attr(provider_failure, "json_validation")
+            or getattr(original_exception, "json_validation", None)
+        ),
         "original_exception_class": original_class,
         "correlation_id": derive_qa_correlation_id(
             session_id=session_id,

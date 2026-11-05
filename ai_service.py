@@ -1558,6 +1558,59 @@ class AIService:
         except Exception:
             return 10.0
 
+    def _generation_max_attempts(
+        self, provider: str, strict: bool, allow_chatgpt_overload_retries: bool = False,
+    ) -> int:
+        if provider == "chatgpt" and allow_chatgpt_overload_retries:
+            return 3
+        if strict:
+            return 1
+        return 3 if provider == "chatgpt" else self._max_retry_attempts()
+
+    def _provider_retry_delay(
+        self, failure: ProviderFailure, exc: Exception, attempt: int,
+        *, allow_chatgpt_overload_retries: bool = False,
+    ) -> Optional[float]:
+        if not failure.retryable:
+            return None
+        if failure.provider == "chatgpt":
+            explicit_transient = failure.provider_error_code in {
+                "server_is_overloaded", "subscription_sharing_user_unavailable",
+            }
+            unstructured_admission_503 = (
+                getattr(exc, "subscription_stream_not_opened", False) is True
+                and failure.status_code == 503
+                and failure.provider_error_code is None
+                and failure.provider_error_type in {None, "service_unavailable_error"}
+                and failure.provider_error_param is None
+                and failure.kind in {ProviderErrorKind.PROVIDER_DOWN, ProviderErrorKind.PROVIDER_OVERLOADED}
+            )
+            unstructured_admission_504 = False
+            if (
+                allow_chatgpt_overload_retries
+                and getattr(exc, "subscription_stream_not_opened", False) is True
+                and failure.status_code == 504
+                and failure.provider_error_code is None
+                and failure.provider_error_param is None
+                and failure.kind is ProviderErrorKind.TIMEOUT
+            ):
+                # HTTP problem-type URIs are opaque identifiers, not provider
+                # error labels. Do not depend on a gateway's domain or URL path.
+                error_type = failure.provider_error_type
+                try:
+                    problem_uri = urlsplit(error_type or "")
+                    unstructured_admission_504 = error_type is None or (
+                        problem_uri.scheme in {"http", "https"} and bool(problem_uri.netloc)
+                    )
+                except ValueError:
+                    pass
+            if not (explicit_transient or unstructured_admission_503 or unstructured_admission_504):
+                return None
+            from personal_subscription_transport import overload_retry_delay
+
+            return overload_retry_delay(exc, attempt)
+        return self._calculate_retry_delay(attempt)
+
     def _calculate_retry_delay(self, attempt: int) -> float:
         """
         Calculate retry delay with exponential backoff and optional jitter.
@@ -2537,8 +2590,11 @@ class AIService:
         request_timeout: Optional[float] = None,
         strict_single_generation_attempt: bool = False,
         endpoint_id: Optional[str] = None,
+        allow_chatgpt_overload_retries: bool = False,
     ) -> T:
-        max_attempts = 1 if strict_single_generation_attempt else self._max_retry_attempts()
+        max_attempts = self._generation_max_attempts(
+            provider, strict_single_generation_attempt, allow_chatgpt_overload_retries,
+        )
         last_exception: Optional[Exception] = None
         process_timeout = coerce_timeout_seconds(request_timeout)
         process_deadline = (
@@ -2646,7 +2702,10 @@ class AIService:
                         call_id=action,
                         public_label=action,
                     ) from exc
-                delay_seconds = self._calculate_retry_delay(attempt)
+                retry_delay = self._provider_retry_delay(
+                    failure, exc, attempt, allow_chatgpt_overload_retries=allow_chatgpt_overload_retries,
+                )
+                delay_seconds = retry_delay if retry_delay is not None else 0.0
                 deadline_allows_retry = (
                     not process_deadline_expired
                     and (
@@ -2657,7 +2716,7 @@ class AIService:
                 )
                 should_retry = (
                     attempt < max_attempts
-                    and failure.retryable
+                    and retry_delay is not None
                     and deadline_allows_retry
                 )
 
@@ -3341,6 +3400,7 @@ class AIService:
         endpoint_id: Optional[str] = None,
         include_default_system_context: bool = True,
         shared_context: Optional[str] = None,
+        allow_chatgpt_overload_retries: bool = False,
     ) -> str:
         """
         Generate content using specified AI model
@@ -3552,7 +3612,11 @@ class AIService:
             system_prompt, include_default_system_context
         )
 
+        generation_attempt = 0
+
         async def _single_attempt() -> str:
+            nonlocal generation_attempt
+            generation_attempt += 1
             authorized_route = self._authorize_local_execution(
                 local_execution,
                 dispatch_call_id=dispatch_call_id,
@@ -3594,6 +3658,7 @@ class AIService:
                     json_output=json_output, json_schema=json_schema,
                     shared_context=shared_context, request_timeout=request_timeout,
                     usage_callback=usage_callback, usage_extra=extra_payload,
+                    attempt=generation_attempt,
                 ):
                     chunks.append(str(chunk))
                 return "".join(chunks)
@@ -3978,7 +4043,8 @@ class AIService:
                     attempted_feature=attempted_feature,
                     cancellation_token=cancellation_token,
                     request_timeout=request_timeout,
-                    strict_single_generation_attempt=strict_single_generation_attempt or provider == "chatgpt",
+                    strict_single_generation_attempt=strict_single_generation_attempt,
+                    allow_chatgpt_overload_retries=allow_chatgpt_overload_retries,
                     endpoint_id=self._effective_health_endpoint_id(
                         endpoint_id, local_execution, dispatch_call_id, dispatch_route_ordinal
                     ),
@@ -4002,12 +4068,9 @@ class AIService:
                         schema=json_schema,
                     )
                     if not validation_result.json_valid:
-                        details = "; ".join(
-                            f"{issue.path}: {issue.message}"
-                            for issue in (validation_result.errors or [])
-                        ) or "unknown schema violation"
                         raise JsonContractError(
-                            f"JSON output failed local schema validation for {model_id}: {details}"
+                            f"JSON output failed local schema validation for {model_id}.",
+                            validation=validation_result,
                         )
                     if validation_result.data is not None and _should_normalize_json_contract_content(
                         generated_content,
@@ -11282,12 +11345,9 @@ class AIService:
             )
             if not validation_result.json_valid:
                 output_schema_valid = False
-                error_details = "; ".join(
-                    f"{issue.path}: {issue.message}"
-                    for issue in (validation_result.errors or [])
-                ) or "unknown JSON violation"
                 raise JsonContractError(
-                    f"JSON_LOOSE output failed validation for {model}: {error_details}"
+                    f"JSON_LOOSE output failed validation for {model}.",
+                    validation=validation_result,
                 )
             if validation_result.data is not None and _should_normalize_json_contract_content(content, validation_result):
                 content = json.dumps(validation_result.data, ensure_ascii=False)
@@ -11315,13 +11375,9 @@ class AIService:
             )
             if not validation_result.json_valid:
                 output_schema_valid = False
-                error_details = "; ".join(
-                    f"{issue.path}: {issue.message}"
-                    for issue in (validation_result.errors or [])
-                ) or "unknown schema violation"
                 raise ToolLoopSchemaViolationError(
                     f"JSON_STRUCTURED output failed schema validation for "
-                    f"{model}: {error_details}"
+                    f"{model}.", validation=validation_result,
                 )
             if not isinstance(validation_result.data, dict):
                 output_schema_valid = False
@@ -11904,6 +11960,7 @@ class AIService:
         endpoint_id: Optional[str] = None,
         include_default_system_context: bool = True,
         shared_context: Optional[str] = None,
+        allow_chatgpt_overload_retries: bool = False,
     ):
         """
         Generate content with streaming support
@@ -12125,6 +12182,7 @@ class AIService:
                     prompt, model_id, system_prompt or "",
                     json_output=json_output, json_schema=json_schema, shared_context=shared_context,
                     request_timeout=request_timeout, usage_callback=usage_callback, usage_extra=extra_payload,
+                    attempt=attempt,
                 ):
                     yield chunk
             elif provider == "openai":
@@ -12331,7 +12389,9 @@ class AIService:
             else:
                 raise ValueError(f"Unsupported provider: {provider}")
 
-        max_attempts = 1 if strict_single_generation_attempt or provider == "chatgpt" else self._max_retry_attempts()
+        max_attempts = self._generation_max_attempts(
+            provider, strict_single_generation_attempt, allow_chatgpt_overload_retries,
+        )
         last_exception: Optional[Exception] = None
         attempt = 1
         stream_deadline = (
@@ -12475,7 +12535,10 @@ class AIService:
                         call_id="streaming",
                         public_label="streaming",
                     ) from exc
-                delay_seconds = self._calculate_retry_delay(attempt)
+                retry_delay = self._provider_retry_delay(
+                    failure, exc, attempt, allow_chatgpt_overload_retries=allow_chatgpt_overload_retries,
+                )
+                delay_seconds = retry_delay if retry_delay is not None else 0.0
                 attempt_deadline_expired = (
                     attempt_timeout_scope is not None
                     and attempt_timeout_scope.expired()
@@ -12491,7 +12554,7 @@ class AIService:
                 should_retry = (
                     attempt < max_attempts
                     and chunks_emitted == 0
-                    and failure.retryable
+                    and retry_delay is not None
                     and deadline_allows_retry
                 )
 
@@ -12520,7 +12583,12 @@ class AIService:
                 )
                 if await _stream_cancel_requested():
                     return
-                await asyncio.sleep(delay_seconds)
+                wait_scope = self._provider_call_scope(
+                    cancellation_token, provider=provider, model_id=model_id,
+                    operation="stream_retry_wait",
+                ) if provider == "chatgpt" else nullcontext()
+                async with wait_scope:
+                    await asyncio.sleep(delay_seconds)
                 attempt += 1
 
         assert last_exception is not None
@@ -13727,6 +13795,7 @@ class AIService:
         shared_context: Optional[str] = None, request_timeout: Optional[float] = None,
         usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         usage_extra: Optional[Dict[str, Any]] = None,
+        attempt: int = 1,
     ):
         """Use the personal grant with ordinary usage and JSON validation contracts."""
         from personal_subscription import MODEL_PREFIX, SubscriptionError
@@ -13734,34 +13803,53 @@ class AIService:
 
         content_parts = []
         final_response = None
-        async for event in stream_personal_response(
-            config, model_id=model_id, prompt=prompt, instructions=system_prompt,
-            shared_context=shared_context, json_output=json_output, json_schema=json_schema,
-            request_timeout=request_timeout,
-        ):
-            if event.type == "response.output_text.delta":
-                delta = str(event.delta or "")
-                content_parts.append(delta)
-                if not json_output:
-                    yield delta
-            elif event.type == "response.completed":
-                final_response = event.response
-        content = "".join(content_parts)
-        if not content.strip():
-            raise SubscriptionError("ChatGPT completed without text content.")
-        usage = self._usage_with_finish_metadata(
-            getattr(final_response, "usage", None), final_response, provider="openai",
-        )
-        # This is a subscription request, not the identically named API model.
-        # Report tokens and billing mode; OpenAI owns plan/credit consumption.
-        self._emit_usage(usage_callback, MODEL_PREFIX + model_id, "chatgpt", usage,
-                         {**(usage_extra or {}), "billing_mode": "subscription"})
+        request_id = None
+        status = "failed"
+        try:
+            async for event in stream_personal_response(
+                config, model_id=model_id, prompt=prompt, instructions=system_prompt,
+                shared_context=shared_context, json_output=json_output, json_schema=json_schema,
+                request_timeout=request_timeout,
+            ):
+                if event.type == "response.output_text.delta":
+                    delta = str(event.delta or "")
+                    content_parts.append(delta)
+                    if not json_output:
+                        yield delta
+                elif event.type == "response.completed":
+                    final_response = event.response
+            content = "".join(content_parts)
+            if not content.strip():
+                raise SubscriptionError("ChatGPT completed without text content.")
+            status = "success"
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
+        except Exception as exc:
+            final_response = getattr(exc, "subscription_response", None) or final_response
+            request_id = self._extract_request_id(exc)
+            raise
+        finally:
+            usage = self._usage_with_finish_metadata(
+                getattr(final_response, "usage", None), final_response, provider="openai",
+            )
+            # One record per physical attempt, including failures with unknown
+            # token consumption. Never infer zero usage from a failed response.
+            self._emit_usage(usage_callback, MODEL_PREFIX + model_id, "chatgpt", usage, {
+                **(usage_extra or {}), "billing_mode": "subscription",
+                "attempt": attempt, "status": status,
+                "request_id": request_id or getattr(final_response, "id", None),
+                "usage_reported": getattr(final_response, "usage", None) is not None,
+            })
         if json_output:
             from tools.ai_json_cleanroom import validate_ai_json
 
             validation = validate_ai_json(content, schema=json_schema)
             if not validation.json_valid:
-                raise JsonContractError("ChatGPT output failed local JSON contract validation.")
+                raise JsonContractError(
+                    "ChatGPT output failed local JSON contract validation.",
+                    validation=validation,
+                )
             if validation.data is not None and _should_normalize_json_contract_content(content, validation):
                 content = json.dumps(validation.data, ensure_ascii=False)
             # Prompt-based JSON is emitted only after validation and completion.

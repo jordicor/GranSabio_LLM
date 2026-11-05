@@ -59,9 +59,13 @@ class TransientGranSabioError(GranSabioClientError):
 class GranSabioGenerationCancelled(GranSabioClientError):
     """Raised when a GranSabio generation session was cancelled by user request."""
 
-    def __init__(self, message: str, *, session_id: Optional[str] = None) -> None:
-        super().__init__(message)
+    def __init__(
+        self, message: str, *, session_id: Optional[str] = None,
+        result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message, details=result)
         self.session_id = session_id
+        self.result = result
 
 
 class GranSabioGenerationRejected(GranSabioClientError):

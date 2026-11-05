@@ -391,6 +391,61 @@ class ValidationResult:
     data: Optional[Union[Dict[str, Any], List[Any]]] = None
     info: Dict[str, Any] = field(default_factory=dict)
 
+    def public_diagnostics(self) -> Dict[str, Any]:
+        """Return bounded diagnostics without input, schema values or property names.
+
+        Paths are coarse shapes: every property and index is masked. Cleanroom
+        paths are not escaped; unusual paths fall back to the root. Never copy
+        issue messages, details, warnings, data or info into this public payload.
+        """
+        issues = []
+        for issue in self.errors[:8]:
+            code = issue.code if isinstance(issue.code, ErrorCode) else ErrorCode.UNKNOWN
+            path = "$"
+            raw_path = issue.path
+            if isinstance(raw_path, str) and len(raw_path) <= 1024 and re.fullmatch(
+                r"\$(?:\.[^.\[\]]+|\[[0-9*]+\])*", raw_path
+            ):
+                parts = re.findall(r"\.[^.\[\]]+|\[[0-9*]+\]", raw_path)
+                if len(parts) <= 12:
+                    path += "".join(".*" if part.startswith(".") else "[*]" for part in parts)
+            if code in {ErrorCode.PARSE_ERROR, ErrorCode.DUPLICATE_KEY, ErrorCode.TRUNCATED}:
+                category = "syntax"
+            elif code in {ErrorCode.PATH_NOT_FOUND, ErrorCode.EXPECTATION_FAILED, ErrorCode.ITEM_VALIDATION_FAILED}:
+                category = "expectation"
+            elif code in {ErrorCode.UNKNOWN, ErrorCode.RECURSION_LIMIT, ErrorCode.REPAIRED, ErrorCode.STRIPPED_ADDITIONAL}:
+                category = "validation"
+            else:
+                category = "schema"
+            explanation = {
+                ErrorCode.PARSE_ERROR: "The output could not be parsed as a JSON object or array",
+                ErrorCode.DUPLICATE_KEY: "A JSON object contains a duplicate property",
+                ErrorCode.MISSING_REQUIRED: "A required property is missing",
+                ErrorCode.TYPE_MISMATCH: "A value has the wrong type",
+                ErrorCode.ENUM_MISMATCH: "A value is not one of the allowed options",
+                ErrorCode.CONST_MISMATCH: "A value does not match the required constant",
+                ErrorCode.EXPECTATION_FAILED: "A value does not meet an expected constraint",
+            }.get(code, f"JSON validation failed ({code.value.replace('_', ' ')})")
+            issues.append({
+                "code": code.value,
+                "category": category,
+                "path": path,
+                "path_redacted": raw_path != "$",
+                "message": f"{explanation} at {path}.",
+            })
+        message = issues[0]["message"] if issues else (
+            "No JSON validation errors." if self.json_valid else "JSON validation failed."
+        )
+        if self.likely_truncated:
+            message += " The output may be truncated."
+        return {
+            "message": message,
+            "likely_truncated": bool(self.likely_truncated),
+            "issues": issues,
+            "error_count": len(self.errors),
+            "issues_omitted": max(0, len(self.errors) - len(issues)),
+        }
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "json_valid": self.json_valid,

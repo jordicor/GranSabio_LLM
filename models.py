@@ -1133,6 +1133,16 @@ class ContentRequest(BaseModel):
             "SDK retry budget to zero for the primary generation path."
         ),
     )
+    allow_chatgpt_overload_retries: bool = Field(
+        default=False,
+        description=(
+            "Allow up to two ChatGPT server_is_overloaded or "
+            "subscription_sharing_user_unavailable retries, or HTTP 503/504 without "
+            "a structured code before the stream opens (5s, 15s), even "
+            "with strict_single_generation_attempt. No retries after published "
+            "stream content, and no other strict-mode guarantees are relaxed."
+        ),
+    )
     timeout_seconds: Optional[float] = Field(
         default=None,
         gt=0,

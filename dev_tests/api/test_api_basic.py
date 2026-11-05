@@ -962,7 +962,9 @@ class TestResultEndpoint:
         When: GET /result/{session_id} is called
         Then: Returns 202 Accepted with Retry-After header
         """
-        gen_response = client.post("/generate", json=valid_generate_request)
+        # Keep admission in progress without starting unrelated provider work.
+        with patch('core.generation_routes.process_content_generation', new_callable=AsyncMock):
+            gen_response = client.post("/generate", json=valid_generate_request)
         session_id = gen_response.json()["session_id"]
 
         # Immediately check result (should be in progress)
@@ -992,7 +994,8 @@ class TestStopEndpoint:
         When: POST /stop/{session_id} is called
         Then: Returns stopped confirmation
         """
-        gen_response = client.post("/generate", json=valid_generate_request)
+        with patch('core.generation_routes.process_content_generation', new_callable=AsyncMock):
+            gen_response = client.post("/generate", json=valid_generate_request)
         session_id = gen_response.json()["session_id"]
 
         response = client.post(f"/stop/{session_id}")

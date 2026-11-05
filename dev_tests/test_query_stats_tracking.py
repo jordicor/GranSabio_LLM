@@ -99,6 +99,20 @@ def test_query_stats_levels_progressively_add_detail():
     assert calls["calls"][1]["duration_ms"] == 2500
     assert calls["providers"]["anthropic"]["calls"] == 1
 
+    def check_equivalent(value):
+        if isinstance(value, dict):
+            if "estimated_cost_usd" in value:
+                assert value["api_equivalent_cost_usd"] == value["estimated_cost_usd"]
+            for child in value.values():
+                check_equivalent(child)
+        elif isinstance(value, list):
+            for child in value:
+                check_equivalent(child)
+
+    for stats in (summary, detailed, calls):
+        check_equivalent(stats)
+        assert stats["known_totals"]["api_equivalent_cost_usd"] == pytest.approx(0.046)
+
 
 def test_show_query_stats_attaches_query_stats_without_legacy_costs():
     tracker = UsageTracker(detail_level=3)
@@ -334,6 +348,8 @@ def test_synced_cache_write_pricing_prices_the_live_defect_call(monkeypatch):
     assert call["estimated_cost_usd"] == pytest.approx(expected, abs=1e-6)
     assert call["cost_basis"] == "catalog_estimate"
     assert tracker.build_summary(1)["grand_totals"]["cost"] == pytest.approx(expected, abs=1e-6)
+    assert call["api_equivalent_cost_usd"] == call["estimated_cost_usd"]
+    assert call["api_equivalent_model"] == call["model"]
 
 
 def test_pricing_without_cache_write_rate_keeps_cost_unknown(monkeypatch):
@@ -519,3 +535,108 @@ def test_billed_cost_overrides_the_catalog_estimate(monkeypatch):
     call = tracker.build_query_stats(3)["calls"][0]
     assert call["estimated_cost_usd"] == pytest.approx(0.0009)
     assert call["cost_basis"] == "provider_billed"
+    assert call["api_equivalent_cost_usd"] == pytest.approx(0.0009)
+    assert call["api_equivalent_model"] == call["model"]
+
+
+@pytest.fixture
+def comparison_pricing(monkeypatch):
+    """A complete comparison tariff; subscription receipts retain their $0 tariff."""
+    from config import Config, config
+
+    pricing = {
+        "input_per_million": 2, "output_per_million": 10,
+        "cached_input_per_million": 0.1, "cache_write_per_million": 2.5,
+        "long_context": {"threshold_tokens": 272000, "input_per_million": 4,
+                         "output_per_million": 15, "cached_input_per_million": 0.2,
+                         "cache_write_per_million": 5},
+    }
+    monkeypatch.setattr(config, "spec_catalog", {"model_specifications": {
+        "openrouter": {"openai/gpt-6.1-sol": {"pricing": pricing}},
+    }})
+    monkeypatch.setattr(Config, "get_model_info", lambda self, model, **kwargs: {"pricing": (
+        {"input_per_million": 0, "output_per_million": 0,
+         "cached_input_per_million": 0, "cache_write_per_million": 0}
+        if model.startswith("chatgpt/") else pricing
+    )})
+    return pricing
+
+
+def _record_subscription(tracker, **overrides):
+    payload = {"model": "chatgpt/gpt-6.1-sol", "provider": "chatgpt",
+               "input_tokens": 3267, "output_tokens": 562, "iteration": 1,
+               "phase": "generation", "role": "generator",
+               "metadata": {"billing_mode": "subscription"}}
+    tracker.record(**{**payload, **overrides})
+    return tracker.build_query_stats(3)["calls"][-1]
+
+
+@pytest.mark.parametrize("input_tokens,expected", [(3267, 0.012154), (272000, 0.54962), (272001, 1.096434)])
+def test_subscription_comparison_prices_same_tokens_and_long_context(comparison_pricing, input_tokens, expected):
+    tracker = UsageTracker(detail_level=3)
+    call = _record_subscription(tracker, input_tokens=input_tokens)
+    assert call["estimated_cost_usd"] == 0
+    assert call["cost_basis"] == "catalog_estimate"
+    assert call["metadata"]["billing_mode"] == "subscription"
+    assert call["api_equivalent_model"] == "openrouter::openai/gpt-6.1-sol"
+    assert call["api_equivalent_cost_usd"] == pytest.approx(expected)
+    assert tracker._records[0].as_dict()["api_equivalent_cost_usd"] == pytest.approx(expected)
+    for stats in (tracker.build_query_stats(1), tracker.build_query_stats(2), tracker.build_query_stats(3)):
+        for group in (stats["totals"], stats["phases"]["generation"], stats["providers"]["chatgpt"],
+                      stats["models"][call["model"]], stats["known_totals"]):
+            assert group["api_equivalent_cost_usd"] == pytest.approx(expected)
+        if "iterations" in stats:
+            assert stats["iterations"][0]["api_equivalent_cost_usd"] == pytest.approx(expected)
+    summary = tracker.build_summary(2)
+    for group in (summary["grand_totals"], summary["phases"]["generation"], summary["known_totals"],
+                  summary["iterations"][0]["generation_totals"]):
+        assert group["api_equivalent_cost_usd"] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("input_tokens,rates", [(10000, (2, 0.1, 2.5, 10)), (300000, (4, 0.2, 5, 15))])
+def test_subscription_comparison_respects_reported_cache_categories(comparison_pricing, input_tokens, rates):
+    tracker = UsageTracker(detail_level=3)
+    call = _record_subscription(tracker, input_tokens=input_tokens, cached_input_tokens=4000,
+                                cache_write_input_tokens=2000)
+    ordinary, cached, write, output = rates
+    expected = ((input_tokens - 6000) * ordinary + 4000 * cached + 2000 * write + 562 * output) / 1e6
+    assert call["api_equivalent_cost_usd"] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("missing_rate", ["input_per_million", "output_per_million",
+                                          "cached_input_per_million", "cache_write_per_million"])
+def test_subscription_missing_required_comparison_price_is_unknown(comparison_pricing, missing_rate):
+    del comparison_pricing[missing_rate]
+    tracker = UsageTracker(detail_level=3)
+    call = _record_subscription(tracker, cached_input_tokens=100, cache_write_input_tokens=100)
+    assert call["estimated_cost_usd"] == 0
+    assert call["api_equivalent_cost_usd"] is None
+    assert call["api_equivalent_model"] == "openrouter::openai/gpt-6.1-sol"
+
+
+def test_mixed_comparison_unknown_is_strict_with_known_subtotal(comparison_pricing):
+    tracker = UsageTracker(detail_level=3)
+    _record_subscription(tracker)
+    tracker.record(phase="generation", role="generator", model="paid-model", provider="openai",
+                   input_tokens=10, output_tokens=5, iteration=1, cost_override=0.01)
+    call = _record_subscription(tracker, model="chatgpt/unmapped")
+    assert call["api_equivalent_cost_usd"] is None
+    assert call["api_equivalent_model"] is None
+    stats = tracker.build_query_stats(3)
+    for group in (stats["totals"], stats["phases"]["generation"], stats["providers"]["chatgpt"],
+                  stats["iterations"][0]):
+        assert group["api_equivalent_cost_usd"] is None
+    for report in (stats, tracker.build_summary(2)):
+        assert report["known_totals"]["api_equivalent_cost_usd"] == pytest.approx(0.022154)
+    assert tracker.build_summary(2)["grand_totals"]["api_equivalent_cost_usd"] is None
+
+
+@pytest.mark.parametrize("provider", ["ollama", "llamacpp", "openai_compatible"])
+def test_local_calls_have_no_api_equivalent(provider):
+    tracker = UsageTracker(detail_level=3)
+    tracker.record(phase="generation", role="generator", model="local-model", provider=provider,
+                   input_tokens=10, output_tokens=5, cost_override=0)
+    call = tracker.build_query_stats(3)["calls"][0]
+    assert call["api_equivalent_cost_usd"] is None
+    assert call["api_equivalent_model"] is None
+    assert tracker.build_summary(1)["known_totals"]["api_equivalent_cost_usd"] is None

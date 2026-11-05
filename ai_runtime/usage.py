@@ -434,6 +434,9 @@ def normalize_usage(usage_obj: Any) -> Optional[dict[str, Any]]:
         )
     total_tokens = _pluck(usage_obj, "total_tokens", "total_token_count")
     reasoning_tokens = _pluck(usage_obj, "reasoning_tokens", "thinking_tokens", "thoughts_token_count")
+    if reasoning_tokens is None:
+        output_details = _pluck(usage_obj, "output_tokens_details", "completion_tokens_details")
+        reasoning_tokens = _pluck(output_details, "reasoning_tokens")
     finish_reason = None
     for name in ("finish_reason", "stop_reason", "provider_stop_reason"):
         if isinstance(usage_obj, dict) and usage_obj.get(name) is not None:

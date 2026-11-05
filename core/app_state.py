@@ -46,6 +46,7 @@ from debug_logger import (
 )
 from services.runtime_console import activate_runtime_console_capture, set_console_phase
 
+from .generation.results import attach_usage_metadata
 from .state import session_store
 
 # Setup logging
@@ -440,6 +441,9 @@ async def _debug_update_status(
             final_payload=_serialize_for_debug(final_payload) if final_payload is not None else None,
             phase=phase,
         )
+        if status == GenerationStatus.CANCELLED.value and isinstance(final_payload, dict):
+            if final_payload.get("costs") is not None:
+                await _debug_record_usage(session_id, final_payload["costs"])
     except Exception:
         logger.exception("Failed to update debugger status for %s", session_id)
 
@@ -569,6 +573,17 @@ async def startup_event():
     project_phase_streams_lock = asyncio.Lock()
     project_status_streams_lock = asyncio.Lock()
     _session_cleanup_wake_event = asyncio.Event()
+
+    # Upgrade old three-field subscription catalogs before admitting clients.
+    # A failed refresh preserves the account and the previous dated metadata.
+    from personal_subscription import refresh_personal_catalog
+
+    try:
+        if await refresh_personal_catalog(config):
+            logger.info("Selected ChatGPT subscription catalog refreshed")
+    except Exception as exc:
+        logger.warning("ChatGPT catalog refresh unavailable (%s); saved account and catalog preserved",
+                       type(exc).__name__)
 
     # Initialize services early to catch any configuration issues
     try:
@@ -976,7 +991,10 @@ def apply_session_cancelled_state(
         session["hard_cancelled"] = True
         session["hard_cancel_reason"] = reason
     final_result = _build_cancelled_final_result(session, reason=reason)
+    final_result["session_id"] = session_id
     final_result["cancel_mode"] = cancel_mode
+    if session.get("request"):
+        attach_usage_metadata(session, final_result, session["request"])
     _store_final_result(
         session,
         final_result,
@@ -2756,6 +2774,7 @@ async def get_project_status(
                 "finish_reason",
                 "prompt_block_reason",
                 "native_finish_reason",
+                "json_validation",
             ):
                 value = (
                     final_result.get(key)

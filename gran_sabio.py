@@ -553,6 +553,10 @@ def _is_retryable_streaming_error(exc: Exception) -> bool:
     if isinstance(exc, AIRequestError):
         failure = getattr(exc, "provider_failure", None)
         if failure is not None:
+            if failure.provider == "chatgpt":
+                # The subscription retry budget and partial-stream guard were
+                # already enforced by AIService.
+                return False
             return bool(failure.retryable)
         # Without failure metadata do NOT assume retryable: fall through to
         # the explicit transience signals (status/message) below so a

@@ -5,6 +5,28 @@ import pytest
 from client._common import compute_token_budgets
 
 
+def test_cancelled_exception_preserves_result_and_consumption():
+    from client import GranSabioGenerationCancelled
+    from client._common import validate_result
+
+    result = {
+        "status": "cancelled", "session_id": "session-with-usage",
+        "content": "Earlier iteration",
+        "costs": {"partial": True, "grand_totals": {"total_tokens": 370}},
+        "query_stats": {"partial": True, "totals": {"total_tokens": 370}},
+    }
+    with pytest.raises(GranSabioGenerationCancelled) as caught:
+        validate_result(result)
+    assert caught.value.session_id == "session-with-usage"
+    assert caught.value.result == result
+    assert caught.value.details["costs"] == result["costs"]
+    assert caught.value.result["query_stats"] == result["query_stats"]
+
+    legacy = GranSabioGenerationCancelled("Cancelled", session_id="old-session")
+    assert legacy.session_id == "old-session"
+    assert legacy.result is None
+
+
 @pytest.mark.parametrize(
     ("model_limit", "desired_max_tokens", "expected_max_tokens"),
     [

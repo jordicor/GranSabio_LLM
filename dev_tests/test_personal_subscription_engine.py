@@ -48,11 +48,11 @@ class Stream:
         self.closed = True
 
 
-def sdk(monkeypatch, *, text="An original short text.", terminal="response.completed", status="completed"):
+def sdk(monkeypatch, *, text="An original short text.", terminal="response.completed", status="completed", usage=None):
     events = [SimpleNamespace(type="response.output_text.delta", delta=text)]
     if terminal:
         events.append(SimpleNamespace(type=terminal, response=SimpleNamespace(
-            status=status, usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15))))
+            status=status, usage=usage or SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15))))
     stream = Stream(events)
     captured = []
     create = AsyncMock(return_value=stream)
@@ -102,6 +102,39 @@ async def test_subscription_generation_uses_own_credentials_and_supported_wire_f
     assert tracker._records[0].metadata["billing_mode"] == "subscription"
     assert tracker._records[0].cost_usd == 0
     assert tracker._records[0].cost_basis == "catalog_estimate"
+    assert tracker._records[0].api_equivalent_cost_usd is None  # Unmapped subscription slug.
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_subscription_comparison_uses_inclusive_output_and_keeps_billing_zero(personal, engine, monkeypatch, streaming):
+    activate(personal, model="gpt-6.1-sol")
+    config.spec_catalog["model_specifications"]["openrouter"] = {"openai/gpt-6.1-sol": {
+        "model_id": "openai/gpt-6.1-sol", "pricing": {"input_per_million": 2, "output_per_million": 10},
+    }}
+    sdk(monkeypatch, usage=SimpleNamespace(input_tokens=3267, output_tokens=562, total_tokens=3829,
+        output_tokens_details=SimpleNamespace(reasoning_tokens=500)))
+    tracker = UsageTracker(detail_level=3)
+    kwargs = {"model": "chatgpt/gpt-6.1-sol", "max_tokens": 1000,
+              "usage_callback": tracker.create_callback(phase="generation", role="generator")}
+    if streaming:
+        async for _ in engine.generate_content_stream("Write a text", **kwargs):
+            pass
+    else:
+        await engine.generate_content("Write a text", **kwargs)
+    call = tracker.build_query_stats(3)["calls"][0]
+    assert call["estimated_cost_usd"] == 0
+    assert call["cost_basis"] == "catalog_estimate"
+    assert call["metadata"]["billing_mode"] == "subscription"
+    assert call["output_tokens"] == 562
+    assert call["reasoning_tokens"] == 500
+    assert call["api_equivalent_cost_usd"] == pytest.approx(0.012154)
+    assert call["api_equivalent_model"] == "openrouter::openai/gpt-6.1-sol"
+
+
+def test_missing_comparison_model_is_explicit_configuration_error(personal):
+    activate(personal, model="gpt-6.1-sol")
+    with pytest.raises(RuntimeError, match="API-equivalent mapping.*missing catalog model"):
+        config.get_model_info("chatgpt/gpt-6.1-sol")
 
 
 async def test_stream_json_uses_engine_validator_and_terminal_metadata(personal, engine, monkeypatch):
@@ -119,6 +152,43 @@ async def test_stream_json_uses_engine_validator_and_terminal_metadata(personal,
                                       json_output=True, json_schema=schema)
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("content,code,truncated", [
+    ('{"score": "PRIVATE_VALUE"}', "type_mismatch", False),
+    ('{"score": @}', "parse_error", False),
+    ('{"score": "PRIVATE_UNFINISHED', "parse_error", True),
+])
+async def test_subscription_json_failure_keeps_usage_and_safe_diagnostics(
+    personal, engine, monkeypatch, caplog, streaming, content, code, truncated,
+):
+    schema = {"type": "object", "properties": {"score": {"type": "integer"}}, "required": ["score"]}
+    create, _, stream = sdk(monkeypatch, text=content)
+    usage, chunks = [], []
+    kwargs = dict(model="chatgpt/gpt-test", max_tokens=100, json_output=True,
+                  json_schema=schema, usage_callback=usage.append)
+    with pytest.raises(ai.AIRequestError if streaming else ai.JsonContractError) as raised:
+        if streaming:
+            async for chunk in engine.generate_content_stream("PRIVATE_PROMPT", **kwargs):
+                chunks.append(chunk)
+        else:
+            await engine.generate_content("PRIVATE_PROMPT", **kwargs)
+    if streaming:
+        failure = raised.value.provider_failure
+        assert failure.kind.value == "unknown"
+        assert failure.raw_exception_class == "JsonContractError"
+        assert failure.retryable is False and failure.downgradable is False
+        diagnostics = failure.json_validation
+    else:
+        diagnostics = raised.value.json_validation
+    assert diagnostics["issues"][0]["code"] == code
+    assert diagnostics["likely_truncated"] is truncated
+    assert create.await_count == 1 and chunks == []
+    assert stream.closed and personal.active_calls == 0
+    assert len(usage) == 1 and usage[0]["total_tokens"] == 15
+    assert usage[0]["billing_mode"] == "subscription" and "cost" not in usage[0]
+    assert "PRIVATE_" not in str(raised.value) + json.dumps(diagnostics) + caplog.text
+
+
 @pytest.mark.parametrize("terminal,status", [
     ("response.failed", "failed"), ("response.incomplete", "incomplete"),
     (None, None), ("response.completed", "failed"),
@@ -131,7 +201,9 @@ async def test_partial_stream_never_succeeds_or_falls_back(personal, engine, mon
         await engine.generate_content("Write", model="chatgpt/gpt-test", max_tokens=100, usage_callback=usage.append)
     assert create.await_count == 1
     assert not engine._generate_openai.called
-    assert not usage and stream.closed and personal.active_calls == 0
+    assert len(usage) == 1 and usage[0]["status"] == "failed"
+    assert usage[0]["usage_reported"] is (terminal is not None)
+    assert stream.closed and personal.active_calls == 0
 
 
 async def test_cancellation_closes_stream_and_releases_selected_account(personal, engine, monkeypatch):

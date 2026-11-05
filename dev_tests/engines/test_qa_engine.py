@@ -123,6 +123,8 @@ async def test_ollama_qa_evaluators_wait_for_local_slot_before_timeout(
         "max_concurrent_requests": 1,
     }]}), encoding="utf-8")
     monkeypatch.setattr(cfg, "LOCAL_ENDPOINTS_CONFIG_PATH", "" if legacy else str(endpoint_config))
+    # This exercises endpoint queue limits, not the host's GPU coordinator.
+    monkeypatch.setattr(cfg, "LOCAL_RESOURCES_CONFIG_PATH", "")
     monkeypatch.setattr(
         type(cfg), "get_model_info",
         lambda self, model, **kwargs: {
@@ -317,6 +319,7 @@ def sample_content_request():
     request.content_type = "article"
     request.smart_editing_mode = "auto"
     request.extra_verbose = False
+    request.shared_context = None
     request.gran_sabio_call_limit_per_iteration = -1
     return request
 

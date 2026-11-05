@@ -40,6 +40,36 @@ def _sum_measured_tokens(values: Iterable[Optional[int]]) -> Optional[int]:
     return total
 
 
+def _known_usage_totals(records: List["UsageRecord"]) -> Dict[str, Any]:
+    """Sum available measurements without treating missing usage as zero."""
+    totals = {}
+    for name, attr in (
+        ("input_tokens", "input_tokens"),
+        ("output_tokens", "output_tokens"),
+        ("total_tokens", "resolved_total_tokens"),
+        ("cost", "cost_usd"),
+        ("api_equivalent_cost_usd", "api_equivalent_cost_usd"),
+    ):
+        values = []
+        for record in records:
+            value = getattr(record, attr)
+            if name == "total_tokens" and value is None:
+                # A partial input/output breakdown still supplies known tokens.
+                parts = [count for count in (record.input_tokens, record.output_tokens) if count is not None]
+                value = sum(parts) if parts else None
+            if value is not None:
+                values.append(value)
+        totals[name] = sum(values) if values else None
+    return totals
+
+
+def _api_equivalent_total(records: List["UsageRecord"]) -> Optional[float]:
+    """Sum comparison costs only when every LLM call has a known value."""
+    values = [record.api_equivalent_cost_usd for record in records
+              if record.api_equivalent_cost_usd is not None]
+    return sum(values) if values and len(values) == len(records) else None
+
+
 @dataclass
 class UsageRecord:
     """Single usage event emitted by an AI provider call."""
@@ -65,6 +95,8 @@ class UsageRecord:
     # PROVIDER_BILLED_COST_BASIS when the provider reported the billed amount,
     # CATALOG_ESTIMATE_COST_BASIS when cost_usd comes from model pricing.
     cost_basis: Optional[str] = None
+    api_equivalent_cost_usd: Optional[float] = None
+    api_equivalent_model: Optional[str] = None
     status: str = "success"
     duration_ms: Optional[int] = None
     started_at: Optional[str] = None
@@ -120,6 +152,9 @@ class UsageRecord:
             "total_tokens": self.resolved_total_tokens,
             "reasoning_tokens": self.reasoning_tokens,
             "cost": round(self.cost_usd, 6) if isinstance(self.cost_usd, (int, float)) else None,
+            "api_equivalent_cost_usd": round(self.api_equivalent_cost_usd, 6)
+            if self.api_equivalent_cost_usd is not None else None,
+            "api_equivalent_model": self.api_equivalent_model,
             "status": self.status,
             "duration_ms": self.duration_ms,
             "started_at": self.started_at,
@@ -159,6 +194,9 @@ class UsageRecord:
             "estimated_cost_usd": round(self.cost_usd, 6)
             if isinstance(self.cost_usd, (int, float))
             else None,
+            "api_equivalent_cost_usd": round(self.api_equivalent_cost_usd, 6)
+            if self.api_equivalent_cost_usd is not None else None,
+            "api_equivalent_model": self.api_equivalent_model,
             "finish_reason": self.finish_reason,
             "output_truncated": self.output_truncated,
             "started_at": self.started_at,
@@ -312,8 +350,11 @@ class UsageTracker:
                     iteration=iteration,
                     layer=layer,
                     operation=operation or usage_payload.get("operation"),
-                    metadata={**meta, **({"billing_mode": "subscription"}
-                              if usage_payload.get("billing_mode") == "subscription" else {})},
+                    metadata={**meta, **({
+                        key: usage_payload[key]
+                        for key in ("billing_mode", "request_id", "usage_reported")
+                        if key in usage_payload
+                    } if usage_payload.get("billing_mode") == "subscription" else {})},
                     cost_override=usage_payload.get("cost"),
                     status=usage_payload.get("status", "success"),
                     duration_ms=duration_ms,
@@ -414,6 +455,24 @@ class UsageTracker:
                 cost_basis = CATALOG_ESTIMATE_COST_BASIS
 
         kind_name = str(kind or "llm_call")
+        equivalent_model = None
+        equivalent_cost = None
+        if kind_name == "llm_call":
+            if (metadata or {}).get("billing_mode") == "subscription":
+                slug = model_name.removeprefix("chatgpt::").removeprefix("chatgpt/")
+                equivalent_model = config.get_subscription_api_equivalent_model(slug)
+                if equivalent_model is not None:
+                    equivalent_cost = self._estimate_cost(
+                        equivalent_model, input_tokens, output_tokens,
+                        cached_input_tokens=cached_input_tokens or 0,
+                        cache_write_input_tokens=cache_write_input_tokens or 0,
+                    )
+            elif provider_name not in {
+                "chatgpt", "ollama", "llamacpp", "llama.cpp", "openai_compatible",
+                "local", "fake", "unknown",
+            }:
+                equivalent_model = model_name
+                equivalent_cost = cost
         if kind_name == "llm_call":
             self._call_counter += 1
             record_id = f"call_{self._call_counter:06d}"
@@ -444,6 +503,8 @@ class UsageTracker:
             cache_write_input_tokens=cache_write_input_tokens,
             cost_usd=float(cost) if cost is not None else None,
             cost_basis=cost_basis,
+            api_equivalent_cost_usd=equivalent_cost,
+            api_equivalent_model=equivalent_model,
             status=str(status or "success"),
             duration_ms=int(duration_ms) if duration_ms is not None else None,
             started_at=str(started_at) if started_at else None,
@@ -517,6 +578,7 @@ class UsageTracker:
             "mode": "detailed" if level >= 2 else "summary",
             "currency": "USD",
             "grand_totals": self._cached_summary["grand_totals"],
+            "known_totals": self._cached_summary["known_totals"],
             "phases": self._cached_summary["phases"],
         }
 
@@ -547,6 +609,7 @@ class UsageTracker:
             "currency": "USD",
             "session": base["session"],
             "totals": base["totals"],
+            "known_totals": base["known_totals"],
             "phases": base["phases"],
             "providers": base["providers"],
             "models": base["models"],
@@ -661,6 +724,8 @@ class UsageTracker:
         ordinary_tokens = input_tokens - cached_input_tokens - cache_write_input_tokens
         if min(ordinary_tokens, cached_input_tokens, cache_write_input_tokens) < 0:
             return None
+        if (ordinary_tokens and input_rate is None) or (output_tokens and output_rate is None):
+            return None
         input_cost = (
             (ordinary_tokens / MILLION) * float(input_rate)
             if input_rate is not None
@@ -691,6 +756,7 @@ class UsageTracker:
                 "total_tokens": _sum_measured_tokens(rec.resolved_total_tokens for rec in records),
                 "reasoning_tokens": 0,
                 "cost": 0.0,
+                "api_equivalent_cost_usd": _api_equivalent_total(records),
             }
             cost_available = bool(records)
             reasoning_available = False
@@ -794,6 +860,7 @@ class UsageTracker:
 
         return {
             "grand_totals": grand_totals,
+            "known_totals": _known_usage_totals(records),
             "phases": phase_totals,
             "preflight": preflight_events,
             "iterations": iteration_details,
@@ -825,6 +892,7 @@ class UsageTracker:
             llm_records = [record for record in records if record.kind == "llm_call"]
             span_records = [record for record in records if record.kind != "llm_call"]
             costs = [record.cost_usd for record in llm_records if record.cost_usd is not None]
+            equivalent_cost = _api_equivalent_total(llm_records)
             reasoning_values = [
                 record.reasoning_tokens
                 for record in llm_records
@@ -850,6 +918,8 @@ class UsageTracker:
                 "estimated_cost_usd": round(sum(costs), 6)
                 if costs and len(costs) == len(llm_records)
                 else None,
+                "api_equivalent_cost_usd": round(equivalent_cost, 6)
+                if equivalent_cost is not None else None,
                 "duration_ms": _span_ms(records),
                 "call_duration_sum_ms": sum(call_duration_values) if call_duration_values else None,
                 "span_duration_sum_ms": sum(span_duration_values) if span_duration_values else None,
@@ -954,6 +1024,7 @@ class UsageTracker:
                 "duration_ms": _span_ms(records),
             },
             "totals": _combine(records),
+            "known_totals": _known_usage_totals(llm_records),
             "phases": _group(records, "phase"),
             "providers": _group(llm_records, "provider"),
             "models": _group(llm_records, "model"),

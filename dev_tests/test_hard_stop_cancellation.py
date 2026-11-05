@@ -1,7 +1,7 @@
 import asyncio
 import sys
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
@@ -39,6 +39,7 @@ from feedback_memory import FeedbackConfig, FeedbackProcessor
 from models import ContentRequest, GenerationStatus, PreflightResult
 from services.project_stream import ProjectStreamManager
 from smart_edit import OperationType, SeverityLevel, TextEditRange
+from usage_tracking import UsageTracker
 
 
 class _Request:
@@ -1619,3 +1620,167 @@ async def test_generation_interruption_finalizer_is_idempotent_for_terminal_sess
         assert debug_status_calls == []
     finally:
         await pop_session(session_id)
+
+
+@pytest.fixture
+def cancellation_usage_session(monkeypatch):
+    """Use provider receipts already obtained, with no provider/network calls."""
+    tracker = UsageTracker(detail_level=3)
+    for phase, input_tokens, output_tokens in (("preflight", 100, 20), ("generation", 200, 50)):
+        callback = tracker.create_callback(phase=phase, role=phase)
+        callback({
+            "model": "receipt-only-generator", "provider": "openai",
+            "input_tokens": input_tokens, "output_tokens": output_tokens, "cost": 0.01,
+        })
+    session = {
+        "status": GenerationStatus.GENERATING,
+        "request": ContentRequest(
+            prompt="Write a concise implementation note for cancellation testing.",
+            show_query_costs=2, show_query_stats=3,
+            qa_layers=[], qa_models=[],
+        ),
+        "current_phase": "generation", "current_iteration": 1,
+        "verbose_log": [], "usage_tracker": tracker,
+        "last_generated_content": "Accepted earlier iteration",
+        "generation_content": "Unfinished draft must stay out of the result",
+    }
+    debugger = AsyncMock()
+    monkeypatch.setattr(app_state_module, "debug_logger", debugger)
+    return session, tracker, debugger
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["stop", "pause", "stop_project", "pause_project", "interrupted"])
+async def test_cancellation_returns_and_records_consumption(mode, cancellation_usage_session):
+    session, tracker, debugger = cancellation_usage_session
+    session_id = f"usage-session-{uuid4()}"
+    project_id = f"usage-project-{uuid4()}"
+    epoch = await cancellation_registry.begin_project_admission(project_id)
+    session.update(session_id=session_id, project_id=project_id, project_epoch=epoch)
+    await cancellation_registry.register_session(session_id, project_id, epoch)
+    await register_session(session_id, session)
+    try:
+        if mode == "stop":
+            response = await stop_session(session_id, _Request())
+        elif mode == "pause":
+            response = await pause_session(session_id)
+        elif mode == "stop_project":
+            await hard_stop_project_runtime(project_id)
+        elif mode == "pause_project":
+            await pause_project_runtime(project_id)
+        else:
+            await _finalize_generation_interruption(session_id, reason="Interrupted test task")
+
+        result = await generation_routes_module.get_result(session_id)
+        assert result["session_id"] == session_id
+        assert result["status"] == "cancelled"
+        assert result["content"] == "Accepted earlier iteration"
+        assert result["costs"]["grand_totals"]["total_tokens"] == 370
+        assert result["costs"]["grand_totals"]["cost"] == pytest.approx(0.02)
+        assert result["costs"]["grand_totals"]["api_equivalent_cost_usd"] == pytest.approx(0.02)
+        assert result["query_stats"]["totals"]["api_equivalent_cost_usd"] == pytest.approx(0.02)
+        assert all(call["api_equivalent_cost_usd"] == 0.01 for call in result["query_stats"]["calls"])
+        assert result["costs"]["partial"] is True
+        assert result["query_stats"]["partial"] is True
+        assert len(result["query_stats"]["calls"]) == 2
+        if mode in {"stop", "pause"}:
+            assert response["final_result"]["costs"] == result["costs"]
+        debugger.record_usage_summary.assert_awaited()
+        assert debugger.record_usage_summary.await_args.args[1]["grand_totals"]["total_tokens"] == 370
+        assert debugger.record_usage_summary.await_args.args[1]["grand_totals"]["api_equivalent_cost_usd"] == pytest.approx(0.02)
+        # Re-reading never duplicates receipts or appends a stale cost block to content.
+        assert await generation_routes_module.get_result(session_id) == result
+    finally:
+        await pop_session(session_id)
+        await cancellation_registry.unregister_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_result_refreshes_late_usage_without_losing_known_totals(cancellation_usage_session):
+    session, tracker, debugger = cancellation_usage_session
+    session_id = f"usage-session-{uuid4()}"
+    await register_session(session_id, session)
+    try:
+        await pause_session(session_id)
+        # A provider can finish its cleanup after the cancelled state is stored.
+        callback = tracker.create_callback(phase="qa", role="qa")
+        callback({"model": "fake-qa", "provider": "fake", "input_tokens": 40, "cost": 0.003})
+        result = await generation_routes_module.get_result(session_id)
+        assert result["costs"]["grand_totals"]["total_tokens"] is None
+        for report in (result["costs"], result["query_stats"]):
+            assert report["known_totals"]["total_tokens"] == 410
+            assert report["known_totals"]["input_tokens"] == 340
+            assert report["known_totals"]["output_tokens"] == 70
+            assert report["known_totals"]["cost"] == pytest.approx(0.023)
+            assert report["known_totals"]["api_equivalent_cost_usd"] == pytest.approx(0.02)
+        assert result["query_stats"]["totals"]["api_equivalent_cost_usd"] is None
+        assert len(result["query_stats"]["calls"]) == 3
+        await _finalize_generation_interruption(session_id, reason="Provider cleanup completed")
+        assert session["final_result"]["costs"] == result["costs"]
+        assert debugger.record_usage_summary.await_args.args[1] == result["costs"]
+        # Repeated cancellation also returns the latest accounting snapshot.
+        assert (await pause_session(session_id))["final_result"]["costs"] == result["costs"]
+        assert (await stop_session(session_id, _Request()))["final_result"]["costs"] == result["costs"]
+    finally:
+        await pop_session(session_id)
+        await cancellation_registry.unregister_session(session_id)
+
+
+@pytest.mark.parametrize("cost_level,stats_level", [(0, 0), (0, 3), (2, 0)])
+def test_cancelled_usage_honors_explicit_opt_out(cost_level, stats_level, cancellation_usage_session):
+    session, _tracker, _debugger = cancellation_usage_session
+    session["request"].show_query_costs = cost_level
+    session["request"].show_query_stats = stats_level
+    result = apply_session_cancelled_state(
+        session, "usage-opt-out", cancel_mode="hard", reason="Cancelled", hard=True, queue_events=False,
+    )
+    assert ("costs" in result) == bool(cost_level)
+    assert ("query_stats" in result) == bool(stats_level)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_usage_http_result_survives_in_debugger_database(
+    cancellation_usage_session, monkeypatch, tmp_path,
+):
+    import sqlite3
+
+    import httpx
+
+    import json_utils as json
+    from debug_logger import DebugLogger
+
+    session, _tracker, _debugger = cancellation_usage_session
+    session_id = f"http-usage-{uuid4()}"
+    database = tmp_path / "cancelled-usage.db"
+    debugger = DebugLogger(enabled=True, db_path=str(database))
+    await debugger.initialize()
+    monkeypatch.setattr(app_state_module, "debug_logger", debugger)
+    await debugger.record_session_start(session_id, request_payload={}, status="generating")
+    await register_session(session_id, session)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app_state_module.app), base_url="http://testserver",
+        ) as client:
+            stopped = await client.post(f"/stop/{session_id}")
+            result = await client.get(f"/result/{session_id}")
+            debug_result = await client.get(f"/debugger/sessions/{session_id}")
+        assert stopped.status_code == 200
+        assert result.status_code == 200
+        assert debug_result.status_code == 200
+        payload = result.json()
+        assert stopped.json()["final_result"]["costs"] == payload["costs"]
+        assert debug_result.json()["usage"] == payload["costs"]
+        assert payload["costs"]["grand_totals"]["total_tokens"] == 370
+        assert payload["costs"]["grand_totals"]["api_equivalent_cost_usd"] == pytest.approx(0.02)
+    finally:
+        await pop_session(session_id)
+        await cancellation_registry.unregister_session(session_id)
+        await debugger.close()
+
+    with sqlite3.connect(database) as connection:
+        status, final_json, usage_json = connection.execute(
+            "SELECT status, final_json, usage_json FROM sessions WHERE session_id = ?", (session_id,),
+        ).fetchone()
+    assert status == "cancelled"
+    assert json.loads(final_json)["costs"] == payload["costs"]
+    assert json.loads(usage_json) == payload["costs"]

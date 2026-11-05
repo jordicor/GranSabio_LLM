@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import context_budget
@@ -235,10 +235,11 @@ class ModelCapacity:
     effective_model: str
     provider: str
     context_window_tokens: int
-    max_input_tokens: int
-    max_output_tokens: int
+    max_input_tokens: Optional[int]
+    max_output_tokens: Optional[int]
     output_accounting: str
     reasoning_accounting: str
+    token_limits: Dict[str, Any] = field(default_factory=dict)
 
 
 def _resolve_capacity(model_name: str) -> ModelCapacity:
@@ -272,7 +273,7 @@ def _resolve_capacity(model_name: str) -> ModelCapacity:
     max_output = _positive(limits.get("max_output_tokens"))
     total_context = _positive(limits.get("max_total_context_tokens"))
     context_window = total_context or max_input
-    if context_window is None or max_output is None:
+    if context_window is None or (max_output is None and total_context is None):
         return ModelCapacity(
             known=False,
             effective_model=effective,
@@ -282,8 +283,9 @@ def _resolve_capacity(model_name: str) -> ModelCapacity:
             max_output_tokens=0,
             output_accounting="unknown",
             reasoning_accounting="unknown",
+            token_limits=limits,
         )
-    if max_input is None:
+    if max_input is None and max_output is not None:
         # Curated convention: a null input split means "no explicit split;
         # the physical window is the ceiling" (effective input is window
         # minus output, which the within_total reservation already subtracts).
@@ -301,10 +303,11 @@ def _resolve_capacity(model_name: str) -> ModelCapacity:
         effective_model=effective,
         provider=provider,
         context_window_tokens=context_window,
-        max_input_tokens=min(max_input, context_window),
+        max_input_tokens=min(max_input, context_window) if max_input is not None else None,
         max_output_tokens=max_output,
         output_accounting=output_accounting,
         reasoning_accounting=reasoning_accounting,
+        token_limits=limits,
     )
 
 
@@ -419,7 +422,7 @@ def _build_participant(
             reserved += spec.output_tokens
         if capacity.reasoning_accounting != "within_output":
             reserved += effective_reasoning_tokens
-        usable = min(max_input, max(0, working - reserved))
+        usable = min(max_input if max_input is not None else working, max(0, working - reserved))
         evidence = usable - fixed_input - spec.generated_input_tokens - margin
     else:
         fixed_input = _count_components(
@@ -461,6 +464,7 @@ def _build_participant(
         "usable_input_tokens": usable,
         "evidence_tokens": evidence,
         "count_method": count_method,
+        "token_limits": capacity.token_limits,
     }
 
     rejection: Optional[Dict[str, Any]] = None
@@ -469,18 +473,30 @@ def _build_participant(
             "code": CODE_UNKNOWN_MODEL,
             "message": (
                 f"Model {spec.requested_model!r} has no known physical token "
-                "limits in the catalog or curated overlay; add it to "
+                "limits in the catalog or curated overlay; refresh the provider "
+                "catalog or add a verified provider-qualified entry to "
                 "model_limits.curated.json to admit it."
             ),
             "participant": spec.participant,
             "model": spec.requested_model,
         }
-    elif spec.output_tokens > max_output:
+    elif max_output is not None and spec.output_tokens > max_output:
         rejection = {
             "code": CODE_OUTPUT_OVERFLOW,
             "message": (
                 f"Reserved output {spec.output_tokens} tokens exceeds the model "
                 f"output limit {max_output} for {spec.requested_model!r}."
+            ),
+            "participant": spec.participant,
+            "model": spec.requested_model,
+        }
+    elif max_output is None and reserved + margin >= working:
+        rejection = {
+            "code": CODE_OUTPUT_OVERFLOW,
+            "message": (
+                f"Reserved generation {reserved} tokens plus safety margin {margin} "
+                f"leaves no input room in the joint working context {working} "
+                f"for {spec.requested_model!r}. No independent output maximum is known."
             ),
             "participant": spec.participant,
             "model": spec.requested_model,

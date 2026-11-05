@@ -1082,6 +1082,7 @@ class TestGroundingContext:
 
         original_request = MagicMock()
         original_request.prompt = "Prompt from request"
+        original_request.shared_context = None
 
         await qa_engine.evaluate_all_layers_with_progress(
             content="Test content",

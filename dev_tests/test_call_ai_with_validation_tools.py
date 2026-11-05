@@ -1381,7 +1381,7 @@ async def test_call_ai_rejects_empty_content_under_json_loose():
 
 @pytest.mark.asyncio
 async def test_call_ai_forwards_expectations_for_json_loose():
-    with pytest.raises(JsonContractError):
+    with pytest.raises(JsonContractError) as raised:
         await _invoke_call_ai_with_fake_loop(
             fake_content='{"decision": "APPLY"}',
             fake_metadata=_accepted_metadata(),
@@ -1389,17 +1389,21 @@ async def test_call_ai_forwards_expectations_for_json_loose():
             response_format=None,
             json_expectations=[{"path": "decision", "equals": "DISCARD"}],
         )
+    assert raised.value.json_validation["issues"][0]["code"] == "expectation_failed"
+    assert "APPLY" not in str(raised.value) and "DISCARD" not in str(raised.value)
 
 
 @pytest.mark.asyncio
 async def test_call_ai_forwards_expectations_for_json_structured():
-    with pytest.raises(ToolLoopSchemaViolationError):
+    with pytest.raises(ToolLoopSchemaViolationError) as raised:
         await _invoke_call_ai_with_fake_loop(
             fake_content='{"decision": "APPLY"}',
             fake_metadata=_accepted_metadata(),
             response_format=_SIMPLE_SCHEMA,
             json_expectations=[{"path": "decision", "equals": "DISCARD"}],
         )
+    assert raised.value.json_validation["issues"][0]["code"] == "expectation_failed"
+    assert "APPLY" not in str(raised.value) and "DISCARD" not in str(raised.value)
 
 
 @pytest.mark.asyncio

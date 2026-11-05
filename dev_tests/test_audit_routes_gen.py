@@ -31,7 +31,6 @@ from core.generation.idempotency import (
 )
 from core.generation.prestart_flow import PrestartFlowResult
 from core.generation_routes import GenerationAdmissionGate
-from local_execution_policy import LocalExecutionPolicyError
 from llm_routing import (
     LLMRoutingError,
     get_default_routing,
@@ -39,6 +38,7 @@ from llm_routing import (
     resolve_call,
     resolve_call_models,
 )
+from local_execution_policy import LocalExecutionPolicyError
 from models import (
     ContentRequest,
     GenerationInitResponse,
@@ -55,7 +55,9 @@ from models import (
 def stub_model_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
     """Accept any model id as a known catalog model (offline route tests)."""
 
-    def fake_model_info(_self: object, model_name: str) -> dict[str, object]:
+    def fake_model_info(
+        _self: object, model_name: str, *, require_api_key: bool = True,
+    ) -> dict[str, object]:
         model_lower = model_name.lower()
         if model_lower.startswith("claude-"):
             provider = "anthropic"
@@ -803,6 +805,7 @@ def test_routing_rejects_non_mapping_call_level_params_for_multi_model() -> None
 async def test_generate_with_typed_llm_routing_error_returns_400() -> None:
     request = ContentRequest(
         prompt="Write a useful test article about routing.",
+        qa_layers=[{"name": "Quality", "description": "Check quality", "criteria": "Verify accuracy"}],
         llm_routing={
             "calls": {
                 "qa.evaluate_layer": {"models": [{"model": "gpt-4o", "params": 42}]}

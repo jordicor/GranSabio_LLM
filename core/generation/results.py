@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 import json_utils as json
+from model_aliasing import to_prompt_safe_data
+from models import ContentRequest, GenerationStatus, is_json_output_requested
+from usage_tracking import UsageTracker, inject_costs_into_json_payload, merge_costs_into_json_string
 
 
 def run_json_post_guard(
@@ -100,3 +103,67 @@ def get_final_content(
         except (ValueError, TypeError):
             pass
     return raw_content
+
+
+def attach_usage_metadata(session: Dict[str, Any], final_result: Dict[str, Any], request: ContentRequest) -> None:
+    """Attach usage and cost metadata to the final payload.
+
+    The ``costs``/``query_stats`` blocks are part of the default result
+    contract (C15): ``show_query_costs``/``show_query_stats`` default to 1, and
+    a client that does not want them sends 0. Embedding the cost block INSIDE
+    the returned content stays opt-in, because that mutates canonical content:
+    it only happens when the request set the field explicitly.
+    Cancellation reports remain separate from accepted content and are marked
+    partial: the interrupted provider call may not have delivered its receipt.
+    """
+    local_execution = session.get("local_execution")
+    if local_execution is not None:
+        from local_execution_policy import build_local_execution_attestation
+
+        final_result["local_only_attestation"] = build_local_execution_attestation(
+            local_execution.manifest,
+            local_execution.ledger,
+        ).to_payload()
+
+    tracker: Optional[UsageTracker] = session.get("usage_tracker")
+    level = getattr(request, "show_query_costs", 0)
+    stats_level = getattr(request, "show_query_stats", 0)
+    cancelled = final_result.get("status") == GenerationStatus.CANCELLED.value
+    embed_costs_in_content = not cancelled and "show_query_costs" in (
+        getattr(request, "model_fields_set", None) or set()
+    )
+
+    if not tracker or level <= 0:
+        final_result.pop("costs", None)
+    else:
+        summary = tracker.build_summary(level)
+        if not summary:
+            final_result.pop("costs", None)
+        else:
+            alias_registry = getattr(request, "_model_alias_registry", None) or session.get("model_alias_registry")
+            prompt_safe_summary = to_prompt_safe_data(summary, alias_registry)
+            if cancelled:
+                prompt_safe_summary["partial"] = True
+            final_result["costs"] = prompt_safe_summary
+            if embed_costs_in_content:
+                content_value = final_result.get("content")
+                if not is_json_output_requested(request):
+                    if isinstance(content_value, str):
+                        final_result["content"] = tracker.embed_text_summary(content_value, 1)
+                elif isinstance(content_value, str):
+                    final_result["content"] = merge_costs_into_json_string(content_value, prompt_safe_summary)
+                elif content_value is not None:
+                    final_result["content"] = inject_costs_into_json_payload(content_value, prompt_safe_summary)
+
+    if not tracker or stats_level <= 0:
+        final_result.pop("query_stats", None)
+        return
+
+    query_stats = tracker.build_query_stats(stats_level)
+    if not query_stats:
+        final_result.pop("query_stats", None)
+        return
+
+    if cancelled:
+        query_stats["partial"] = True
+    final_result["query_stats"] = query_stats

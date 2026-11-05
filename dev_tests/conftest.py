@@ -12,6 +12,8 @@ import pytest
 # pytest suite.
 collect_ignore = [
     "manual",
+    # Manual example: needs its own fake server and mutates FAKE_AI_HOST on import.
+    "test_fake_ai_example.py",
     "test_providers_quick.py",
     "test_vision_basic.py",
     "test_vision_multiimage.py",

@@ -960,7 +960,7 @@ class TestHistoryInjection:
 class TestArbiterConfig:
     """Tests for Arbiter configuration."""
 
-    SHIPPED_ARBITER_MODEL = "gpt-6-sol"
+    SHIPPED_ARBITER_MODEL = "gpt-6.1-sol"
 
     @pytest.fixture
     def shipped_routing(self, monkeypatch):

@@ -456,7 +456,8 @@ def _terminal_failure_details(result: Dict[str, Any], raw_status: Any) -> Dict[s
     """Build the details allowlist for a non-success generation result.
 
     The terminal fields ``finish_reason_category``, ``retryable``, and
-    ``prompt_block_reason`` / ``native_finish_reason`` are included only when the
+    ``prompt_block_reason`` / ``native_finish_reason`` and ``json_validation``
+    are included only when the
     server actually sent them, so results from older
     servers do not acquire new ``None``-valued keys.
     """
@@ -470,7 +471,10 @@ def _terminal_failure_details(result: Dict[str, Any], raw_status: Any) -> Dict[s
         "provider_error": result.get("provider_error"),
         "session_id": result.get("session_id"),
     }
-    for terminal_key in ("finish_reason_category", "retryable", "prompt_block_reason", "native_finish_reason"):
+    for terminal_key in (
+        "finish_reason_category", "retryable", "prompt_block_reason",
+        "native_finish_reason", "json_validation",
+    ):
         if terminal_key in result:
             details[terminal_key] = result[terminal_key]
     return details
@@ -502,6 +506,7 @@ def validate_result(result: Dict[str, Any]) -> None:
         raise GranSabioGenerationCancelled(
             "Generation was cancelled by user request.",
             session_id=result.get("session_id"),
+            result=result,
         )
 
     if status == "rejected":

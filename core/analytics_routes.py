@@ -229,6 +229,8 @@ async def get_model_info(model_name: str):
 
     model_data = resolved["model_data"] or {}
     catalog_provider = str(resolved["catalog_provider"] or "")
+    if catalog_provider == "chatgpt":
+        model_data = {**model_data, **config.get_subscription_capacity_metadata(model_name)}
     provider_has_key = {
         "openai": bool(config.OPENAI_API_KEY),
         "anthropic": bool(config.ANTHROPIC_API_KEY),
@@ -263,6 +265,9 @@ async def get_model_info(model_name: str):
         "thinking_budget": model_data.get("thinking_budget", {}),
         "pricing": model_data.get("pricing", {}),
         "has_api_key": has_api_key,
+        "billing_mode": model_data.get("billing_mode", "api"),
+        "token_limits": model_data.get("token_limits", {}),
+        "max_context_window": model_data.get("max_context_window"),
     }
 
 

@@ -43,6 +43,7 @@ from model_aliasing import ModelAliasRegistry
 from models import ContentRequest, GenerationStatus, QALayer
 from qa_engine import QAEngine
 from services.attachment_manager import AttachmentError
+from usage_tracking import UsageTracker
 
 
 def _fake_model_specs() -> dict:
@@ -170,6 +171,51 @@ class _RecordingFeedbackManager:
 
     async def complete_session(self, session_id, success=True):
         self.complete_calls.append((session_id, success))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cost_level", [0, 2])
+async def test_generation_without_qa_persists_debugger_usage(monkeypatch, cost_level):
+    """The normal no-QA completion stores receipts even with costs hidden from the response."""
+    manager = _RecordingFeedbackManager()
+    _patch_process_common(monkeypatch, manager)
+    monkeypatch.setattr(app_state, "ai_service", object())
+    request = _make_request(
+        max_iterations=1, feedback_memory_enabled=False,
+        show_query_costs=cost_level, show_query_stats=3,
+    )
+
+    async def generate(**kwargs):
+        kwargs["usage_tracker"].record(
+            phase="generation", role="generator", model="receipt-only-model", provider="openai",
+            input_tokens=151, output_tokens=11, iteration=1, cost_override=0.000412,
+        )
+        return SimpleNamespace(
+            content="A short generated note.", mode="standard", long_text_state=None,
+            controller_summary=None, diagnostics_summary=None, used_tool_loop=False,
+        )
+
+    monkeypatch.setattr(generation_processor_module, "generate_iteration_candidate", generate)
+    session_id = f"no-qa-usage-{uuid4()}"
+    session = _base_session(session_id, request)
+    session["usage_tracker"] = UsageTracker(detail_level=3)
+    await register_session(session_id, session)
+    try:
+        await process_content_generation(session_id, request)
+        assert session["status"] == GenerationStatus.COMPLETED
+        result = session["final_result"]
+        assert result["qa_summary"]["qa_bypassed"] is True
+        assert ("costs" in result) == bool(cost_level)
+        persisted = generation_processor_module._debug_record_usage
+        persisted.assert_awaited_once()
+        assert persisted.await_args.args[0] == session_id
+        totals = persisted.await_args.args[1]["grand_totals"]
+        assert totals["total_tokens"] == 162
+        assert totals["api_equivalent_cost_usd"] == pytest.approx(0.000412)
+        assert result["query_stats"]["totals"]["api_equivalent_cost_usd"] == pytest.approx(0.000412)
+    finally:
+        await pop_session(session_id)
+        await cancellation_registry.unregister_session(session_id)
 
 
 @pytest.mark.asyncio
@@ -2145,3 +2191,68 @@ async def test_empty_candidate_terminal_has_stable_code_and_remains_failed(
         validate_result(serialized_result)
     assert error.value.details["status"] == "failed"
     assert error.value.details["error_code"] == expected_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrapped", [True, False])
+async def test_json_diagnostics_reach_result_status_sse_and_sdk(monkeypatch, wrapped):
+    from ai_service import AIRequestError
+    from client import GranSabioClientError
+    from client._common import validate_result
+    from client._sse import SSEParser, decode_event_json
+    from services.project_stream import SessionStreamManager
+    from tool_loop_models import JsonContractError
+    from tools.ai_json_cleanroom import validate_ai_json
+
+    manager = _RecordingFeedbackManager()
+    _patch_process_common(monkeypatch, manager)
+    request = _make_request(max_iterations=1, max_tokens=256, gran_sabio_fallback=False)
+    session_id = f"audit-json-diagnostic-{uuid4()}"
+    session = _base_session(session_id, request)
+    session["project_id"] = session_id
+    validation = validate_ai_json('{"PRIVATE_KEY": "PRIVATE_VALUE"}', schema={
+        "properties": {"PRIVATE_KEY": {"enum": ["PRIVATE_OPTION"]}},
+    })
+    cause = JsonContractError("JSON contract failed.", validation=validation)
+    cause.request_id = "synthetic-provider-request"
+    error = AIRequestError("chatgpt", "test", 1, 1, cause) if wrapped else cause
+    candidate = AsyncMock(side_effect=error)
+    monkeypatch.setattr(generation_processor_module, "generate_iteration_candidate", candidate)
+    monkeypatch.setattr(app_state, "ai_service", SimpleNamespace())
+    await register_session(session_id, session)
+    try:
+        await process_content_generation(session_id, request)
+        result = await generation_routes_module.get_result(session_id)
+        status = await generation_routes_module.get_status(session_id)
+        # Use the actual session SSE serializer and SDK parser on a late join.
+        stream = SessionStreamManager(session_id, session_id, {"status"}).stream()
+        parser = SSEParser()
+        try:
+            await stream.__anext__()  # connected
+            events = parser.feed(await stream.__anext__())
+            snapshot = decode_event_json(events[0])
+        finally:
+            await stream.aclose()
+    finally:
+        await pop_session(session_id)
+    candidate.assert_awaited_once()
+    assert result["status"] == "failed" and result["approved"] is False
+    assert result["content"] in ("", "No content generated")
+    assert manager.complete_calls == [(session_id, False)]
+    for public in (result, status, snapshot["session"]):
+        payload = public["provider_error"] if wrapped else public
+        assert payload["json_validation"] == cause.json_validation
+        assert "PRIVATE_" not in json.dumps(public)
+        if wrapped:
+            assert payload["type"] == "provider_error" and payload["kind"] == "unknown"
+            assert payload["raw_exception_class"] == "JsonContractError"
+            assert payload["retryable"] is False and payload["downgradable"] is False
+            assert payload["request_id"] == "synthetic-provider-request"
+    assert snapshot["session_id"] == session_id
+    native = generation_processor_module._debug_update_status.await_args_list[-1].kwargs["final_payload"]
+    assert (native["provider_error"] if wrapped else native)["json_validation"] == cause.json_validation
+    with pytest.raises(GranSabioClientError) as raised:
+        validate_result(json.loads(json.dumps({**result, "session_id": session_id})))
+    details = raised.value.details
+    assert details["session_id"] == session_id
+    assert (details["provider_error"] if wrapped else details)["json_validation"] == cause.json_validation

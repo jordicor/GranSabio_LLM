@@ -18,6 +18,7 @@ import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from ctypes import wintypes
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlsplit
@@ -257,6 +258,17 @@ class PersonalSubscription:
             if not isinstance(model, str) or not model or item.get("visibility") != "list":
                 continue
             key = MODEL_PREFIX + model
+            window = item.get("context_window")
+            window = window if type(window) is int and window > 0 else None
+            token_limits = {
+                "max_input_tokens": None, "max_output_tokens": None,
+                "max_total_context_tokens": window,
+                # Reserve output and reasoning conservatively within the joint
+                # window; the catalog does not publish independent maxima.
+                "output_accounting": "unknown", "reasoning_accounting": "unknown",
+                "provenance": "provider_api" if item.get("catalog_fetched_at") else "unknown",
+                "source": API_URL + "/models", "verified_at": item.get("catalog_fetched_at"),
+            }
             result[key] = {
                 "model_id": model, "name": f"{item.get('display_name') or model} (ChatGPT subscription)",
                 "description": "Personal ChatGPT plan; account usage limits apply.", "enabled": True,
@@ -269,6 +281,10 @@ class PersonalSubscription:
                     "cached_input_per_million": 0, "cache_write_per_million": 0,
                 },
                 "billing_mode": "subscription",
+                "input_tokens": None, "output_tokens": None, "context_window": window,
+                "token_limits": token_limits,
+                # Retain the separate advertised maximum without activating it.
+                "max_context_window": item.get("max_context_window"),
             }
         return result
 
@@ -389,14 +405,30 @@ class PersonalSubscription:
 
     async def _models(self, token: str) -> list[dict]:
         async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
-            response = await client.get(API_URL + "/models", headers={"Authorization": "Bearer " + token})
+            headers = {"Authorization": "Bearer " + token}
+            try:
+                response = await client.get(API_URL + "/models", headers=headers)
+            except httpx.DecodingError:
+                # Recover a broken compressed catalog response once, without
+                # repeating login, token refresh or any inference request.
+                response = await client.get(API_URL + "/models", headers={**headers, "Accept-Encoding": "identity"})
         if response.status_code != 200:
             raise SubscriptionError("The ChatGPT account's model list is unavailable. Reconnect or refresh it.")
         models = response.json().get("models")
         if not isinstance(models, list) or any(not isinstance(item, dict) for item in models):
             raise SubscriptionError("ChatGPT returned an invalid model list.")
-        return [{key: item.get(key) for key in ("slug", "display_name", "visibility")}
-                for item in models if item.get("visibility") == "list" and isinstance(item.get("slug"), str)]
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        result = []
+        for item in models:
+            if item.get("visibility") != "list" or not isinstance(item.get("slug"), str):
+                continue
+            entry = {key: item.get(key) for key in ("slug", "display_name", "visibility")}
+            for key in ("context_window", "max_context_window"):
+                value = item.get(key)
+                entry[key] = value if type(value) is int and value > 0 else None
+            entry["catalog_fetched_at"] = fetched_at
+            result.append(entry)
+        return result
 
     async def _access_token(self, account: dict) -> str:
         if not account.get("access_token") or PLAN_SCOPE not in account.get("scopes", []):
@@ -524,6 +556,18 @@ def close_personal_subscription() -> None:
         _service.store.close()
         _service = None
         _directory = None
+
+
+async def refresh_personal_catalog(settings: Any) -> bool:
+    """Refresh a connected selected account at startup, including old catalogs."""
+    if not subscriptions_allowed(settings):
+        return False
+    service = get_personal_subscription(settings)
+    account = service.state["accounts"].get(service.state.get("active"), {})
+    if not account.get("access_token") or PLAN_SCOPE not in account.get("scopes", []):
+        return False
+    await service.refresh_models()
+    return True
 
 
 if __name__ == "__main__":
