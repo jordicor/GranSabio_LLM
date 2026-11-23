@@ -211,6 +211,12 @@ result = client.upload_attachment_base64(
 upload_id = result["upload_id"]
 ```
 
+Audio uses the same upload methods. Supply an audio MIME type, then pass
+`audios=[{"username": username, "upload_id": upload_id}]` to `generate()` or the
+async equivalent. Optional `source_offset_seconds` is receipt metadata; it does
+not trim the recording. Check model `audio_input.available` and `formats` before
+dispatch. See the [complete audio example and contract](../AUDIO_INPUT.md).
+
 ## Configuration
 
 ### Environment Variables

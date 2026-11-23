@@ -124,7 +124,7 @@ async def test_callback_requires_browser_state_before_token_exchange(subscriptio
         await subscription.finish_login({"state": state, "code": "test-code", "client_id": "oaiapp_test"}, "other")
 
 
-async def test_interrupted_exchange_retains_registration_for_new_authorization(subscription, monkeypatch):
+async def test_interrupted_exchange_does_not_persist_an_unverified_account(subscription, monkeypatch):
     state, _ = subscription.begin_login("http://127.0.0.1:8000/auth/chatgpt/callback")
     async def interrupted(data):
         raise ps.SubscriptionError("The single-use code expired")
@@ -132,10 +132,7 @@ async def test_interrupted_exchange_retains_registration_for_new_authorization(s
     with pytest.raises(ps.SubscriptionError):
         await subscription.finish_login({"state": state, "code": "used-code", "client_id": "oaiapp_issued"}, state)
     assert subscription.state["active"] is None
-    key, record = next(iter(subscription.state["accounts"].items()))
-    assert record == {"client_id": "oaiapp_issued", "subject": None}
-    _, url = subscription.begin_login("http://127.0.0.1:8000/auth/chatgpt/callback", key)
-    assert parse_qs(urlparse(url).query)["client_id"] == ["oaiapp_issued"]
+    assert not subscription.state["accounts"]
 
 
 async def test_reconnect_keeps_registration_and_rejects_different_account(subscription, signing_key, monkeypatch):

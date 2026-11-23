@@ -7,16 +7,18 @@ process. The output allowance includes reasoning; unused allowance is released. 
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import os
 import sqlite3
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, replace
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from functools import partial
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, AsyncIterator, Callable, Iterator, Mapping
 
 import json_utils as json
 from ai_runtime.openrouter_provider_options import (
@@ -124,7 +126,7 @@ class BudgetPolicy:
                 "max_input_tokens": self.typesafe_max_input_tokens,
                 "output_usd_per_million": "0",
             }
-        return json.dumps(signature, sort_keys=True)
+        return json.dumps(signature, sort_keys=True, ensure_ascii=False)
 
 
 @dataclass(frozen=True)
@@ -299,9 +301,9 @@ class ProviderBudget:
                 or ("ai_service." + operation not in SUPPORTED_CALLS and operation != "tool_loop_generation")):
             raise ProviderBudgetError("This provider operation has no configured spend bound.")
 
-    @contextmanager
-    def tool_dispatch(self, *, provider: str, model: str, params: Mapping[str, Any],
-                      request_kwargs: Mapping[str, Any]) -> Iterator[tuple[dict[str, Any], Reservation]]:
+    @asynccontextmanager
+    async def tool_dispatch(self, *, provider: str, model: str, params: Mapping[str, Any],
+                            request_kwargs: Mapping[str, Any]) -> AsyncIterator[tuple[dict[str, Any], Reservation]]:
         """Bound one rendered text/validate_draft HTTP request, including retries.
 
         Tool loops already perform their normal context admission. Here the
@@ -368,8 +370,8 @@ class ProviderBudget:
             raise ProviderBudgetError("The tool request has unsupported provider routing.") from exc
         bounded["extra_body"] = self.constrain_routing({**extra, "provider": routing})
         rendered = {key: bounded[key] for key in ("messages", "tools", "response_format") if key in bounded}
-        input_bound = min(self.policy.max_input_tokens, 512 + len(json.dumps(rendered).encode("utf-8")))
-        with self._reservation_scope(bounded.get("max_tokens"), input_tokens=input_bound) as reservation:
+        input_bound = min(self.policy.max_input_tokens, 512 + len(json.dumps(rendered, ensure_ascii=False).encode("utf-8")))
+        async with self._reservation_scope(bounded.get("max_tokens"), input_tokens=input_bound) as reservation:
             yield bounded, reservation
 
     def constrain_routing(self, extra_body: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -421,25 +423,24 @@ class ProviderBudget:
                 raise
         return reservation
 
-    @contextmanager
-    def dispatch(self, *, model: str, max_tokens: int, call_id: str, images: Any = None) -> Iterator[Reservation]:
+    @asynccontextmanager
+    async def dispatch(self, *, model: str, max_tokens: int, call_id: str, images: Any = None) -> AsyncIterator[Reservation]:
         admitted = self._admitted.get()
         self._admitted.set(None)
         if (admitted is None or admitted[:3] != ("openrouter", model, call_id)
                 or model != self.policy.model or images
                 or type(max_tokens) is not int or not 0 < max_tokens <= admitted[3]):
             raise ProviderBudgetError("The provider dispatch lacks a matching bounded admission.")
-        with self._reservation_scope(max_tokens, input_tokens=admitted[4]) as reservation:
+        async with self._reservation_scope(max_tokens, input_tokens=admitted[4]) as reservation:
             yield reservation
 
-    @contextmanager
-    def _reservation_scope(self, max_tokens: int, *, input_tokens: int | None = None) -> Iterator[Reservation]:
-        reservation = self.reserve(max_tokens, input_tokens=input_tokens)
-        with self._attempt_scope(reservation):
+    @asynccontextmanager
+    async def _reservation_scope(self, max_tokens: int, *, input_tokens: int | None = None) -> AsyncIterator[Reservation]:
+        async with self._attempt_scope(partial(self.reserve, max_tokens, input_tokens=input_tokens)) as reservation:
             yield reservation
 
-    @contextmanager
-    def system_one_dispatch(self, *, model: str, call_id: str) -> Iterator[Reservation]:
+    @asynccontextmanager
+    async def system_one_dispatch(self, *, model: str, call_id: str) -> AsyncIterator[Reservation]:
         """Charge one typed request to the existing shared ceiling, without text output."""
         admitted = self._admitted.get()
         self._admitted.set(None)
@@ -448,20 +449,35 @@ class ProviderBudget:
             raise ProviderBudgetError("The provider dispatch lacks a matching bounded admission.")
         upper = _micro(Decimal(2) * Decimal(self.policy.typesafe_max_input_tokens)
                        * self.policy.typesafe_input_usd_per_million / MICRO_USD)
-        reservation = self._reserve(model, 0, upper, provider="typesafe")
-        with self._attempt_scope(reservation):
+        async with self._attempt_scope(partial(self._reserve, model, 0, upper, provider="typesafe")) as reservation:
             yield reservation
 
-    @contextmanager
-    def _attempt_scope(self, reservation: Reservation) -> Iterator[Reservation]:
+    @asynccontextmanager
+    async def _attempt_scope(self, reserve: Callable[[], Reservation]) -> AsyncIterator[Reservation]:
+        pending = asyncio.create_task(asyncio.to_thread(reserve))
+        try:
+            reservation = await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            # The worker still owns its transaction. Wait for its outcome before
+            # marking the abandoned reservation; cancellation cannot dispatch.
+            reservation = await pending
+            await asyncio.shield(asyncio.to_thread(self._mark_uncertain, reservation))
+            raise
         try:
             yield reservation
         finally:
-            with self._connection() as db:
-                db.execute("UPDATE provider_attempts SET state='uncertain',updated_at=? WHERE id=? AND state='reserved'",
-                           (int(time.time()), reservation.id))
+            await asyncio.shield(asyncio.to_thread(self._mark_uncertain, reservation))
 
-    def settle(self, reservation: Reservation, usage: Any, *, response: Any = None) -> None:
+    def _mark_uncertain(self, reservation: Reservation) -> None:
+        with self._connection() as db:
+            db.execute("UPDATE provider_attempts SET state='uncertain',updated_at=? WHERE id=? AND state='reserved'",
+                       (int(time.time()), reservation.id))
+
+    async def settle(self, reservation: Reservation, usage: Any, *, response: Any = None) -> None:
+        """Complete accounting on a worker thread before the next dispatch."""
+        await asyncio.to_thread(self._settle, reservation, usage, response=response)
+
+    def _settle(self, reservation: Reservation, usage: Any, *, response: Any = None) -> None:
         """Use complete raw provider metadata; missing fields never mean zero."""
         byok = _field(usage, "is_byok")
         if type(byok) is not bool:

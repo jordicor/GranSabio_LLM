@@ -87,6 +87,7 @@ def _plan(*, include_input_images: bool = False, criteria: str = "Check factual 
                 "concise_on_pass": True,
                 "order": 1,
                 "include_input_images": include_input_images,
+                "include_input_audio": False,
             }
         ],
         "request_overrides": _request_overrides(

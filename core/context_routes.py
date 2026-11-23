@@ -26,6 +26,6 @@ async def context_preflight_endpoint(request: Request) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="request body must be a JSON object")
     try:
-        return context_preflight.build_context_preflight_response(payload)
+        return await context_preflight.build_context_preflight_response(payload)
     except context_preflight.MalformedRequest as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

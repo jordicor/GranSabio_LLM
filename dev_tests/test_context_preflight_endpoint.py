@@ -197,7 +197,7 @@ _REAL_VALIDATE_TOKEN_LIMITS = type(context_preflight.config).validate_token_limi
 _REAL_GET_MODEL_INFO = type(context_preflight.config).get_model_info
 
 
-def test_system_one_qa_admits_typed_payload_without_chat_output_reservation():
+async def test_system_one_qa_admits_typed_payload_without_chat_output_reservation():
     payload = _payload(
         qa_models=["jev-latest", "qa-model-a"],
         qa_global_config={"max_tokens": 2048},
@@ -208,7 +208,7 @@ def test_system_one_qa_admits_typed_payload_without_chat_output_reservation():
         source_text="A complete source retained for the typed factual review.",
     )
 
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
 
     assert response["accepted"] is True
     _assert_client_contract(response, payload)
@@ -230,14 +230,14 @@ def test_system_one_qa_admits_typed_payload_without_chat_output_reservation():
 
 
 @pytest.mark.parametrize("oversized", ["source", "question"])
-def test_system_one_qa_rejects_oversized_evidence_or_question(oversized):
+async def test_system_one_qa_rejects_oversized_evidence_or_question(oversized):
     layer = _qa_layer()
     source = "Short source."
     if oversized == "source":
         source = "Complete evidence must not be truncated. " * 10_000
     else:
         layer["criteria"] = "Evaluate every required criterion. " * 10_000
-    response = context_preflight.build_context_preflight_response(_payload(
+    response = await context_preflight.build_context_preflight_response(_payload(
         qa_models=["jev-latest"], qa_layers=[layer], source_text=source,
     ))
 
@@ -507,14 +507,14 @@ def _assert_client_contract(response: dict, payload: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_readiness_like_payload_accepted():
+async def test_readiness_like_payload_accepted():
     payload = _payload(
         prompt="Validate this small stateless readiness request.",
         max_tokens=256,
         content_type="other",
         json_output=False,
     )
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is True
     assert response["status"] == "accepted"
     assert {p["participant_kind"] for p in response["participants"]} == {
@@ -527,20 +527,20 @@ def test_readiness_like_payload_accepted():
 
 
 @pytest.mark.parametrize("request_name", [None, "", "   ", "  generic request  "])
-def test_optional_request_name_matches_generate_contract(request_name):
+async def test_optional_request_name_matches_generate_contract(request_name):
     payload = _payload(request_name=request_name)
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
 
     assert response["accepted"] is True
     assert response["request_name"] == request_name
     _assert_client_contract(response, payload)
 
 
-def test_missing_request_name_is_accepted_and_echoed_as_null():
+async def test_missing_request_name_is_accepted_and_echoed_as_null():
     payload = _payload()
     del payload["request_name"]
 
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
 
     assert response["accepted"] is True
     assert response["request_name"] is None
@@ -548,27 +548,27 @@ def test_missing_request_name_is_accepted_and_echoed_as_null():
 
 
 @pytest.mark.parametrize("request_name", ["x" * 129, 42])
-def test_invalid_optional_request_name_is_rejected(request_name):
+async def test_invalid_optional_request_name_is_rejected(request_name):
     with pytest.raises(context_preflight.MalformedRequest):
-        context_preflight.build_context_preflight_response(
+        await context_preflight.build_context_preflight_response(
             _payload(request_name=request_name)
         )
 
 
-def test_request_name_accepts_exactly_128_characters():
+async def test_request_name_accepts_exactly_128_characters():
     payload = _payload(request_name="x" * 128)
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
 
     assert response["accepted"] is True
     assert response["request_name"] == payload["request_name"]
     _assert_client_contract(response, payload)
 
 
-def test_legacy_policy_schema_alias_is_accepted_and_echoed_exactly():
+async def test_legacy_policy_schema_alias_is_accepted_and_echoed_exactly():
     legacy_policy = _policy(schema_version="bmc_context_budget_policy.v1")
     payload = _payload(context_budget_policy=legacy_policy)
 
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
 
     assert response["accepted"] is True
     assert response["context_budget_policy"] == legacy_policy
@@ -579,7 +579,7 @@ def test_legacy_policy_schema_alias_is_accepted_and_echoed_exactly():
     _assert_client_contract(response, payload)
 
 
-def test_effective_reasoning_default_is_reported_within_output(monkeypatch):
+async def test_effective_reasoning_default_is_reported_within_output(monkeypatch):
     def fake_validate_token_limits(self, *args, **kwargs):
         return {
             "adjusted_reasoning_effort": "high",
@@ -592,7 +592,7 @@ def test_effective_reasoning_default_is_reported_within_output(monkeypatch):
         fake_validate_token_limits,
     )
     payload = _payload(model="gen-model", max_tokens=16_384)
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     generator = next(
         item
         for item in response["participants"]
@@ -608,7 +608,7 @@ def test_effective_reasoning_default_is_reported_within_output(monkeypatch):
     _assert_client_contract(response, payload)
 
 
-def test_real_reasoning_resolution_is_provider_free_and_unknown_is_structured(
+async def test_real_reasoning_resolution_is_provider_free_and_unknown_is_structured(
     monkeypatch,
 ):
     """Exercise the real catalog validator, not the suite's permissive fake."""
@@ -635,7 +635,7 @@ def test_real_reasoning_resolution_is_provider_free_and_unknown_is_structured(
             }
         },
     )
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     generator = next(
         item
         for item in response["participants"]
@@ -650,19 +650,19 @@ def test_real_reasoning_resolution_is_provider_free_and_unknown_is_structured(
         context_preflight.MalformedRequest,
         match="could not resolve runtime LLM routing",
     ):
-        context_preflight.build_context_preflight_response(
+        await context_preflight.build_context_preflight_response(
             _payload(model="not-in-catalog")
         )
 
 
-def test_inactive_internal_routes_do_not_require_catalog_models(monkeypatch):
+async def test_inactive_internal_routes_do_not_require_catalog_models(monkeypatch):
     calls = FAKE_ROUTING["calls"]
     monkeypatch.setitem(calls, "qa.evaluate_layer", {"models": [{"model": "missing-qa"}]})
     for call_id in ("gransabio.review", "gransabio.regenerate", "gransabio.escalation", "arbiter.resolve"):
         monkeypatch.setitem(calls, call_id, {"model": "missing-inactive-model"})
 
     payload = _payload(qa_layers=[], gran_sabio_fallback=False)
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
 
     assert response["accepted"] is True
     assert response["participants_complete"] is True
@@ -670,10 +670,10 @@ def test_inactive_internal_routes_do_not_require_catalog_models(monkeypatch):
     _assert_client_contract(response, payload)
 
 
-def test_implicit_internal_models_match_generate_default_routing():
+async def test_implicit_internal_models_match_generate_default_routing():
     payload = _payload(qa_layers=[_qa_layer()])
 
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
 
     assert response["accepted"] is True
     assert response["participants_complete"] is True
@@ -692,7 +692,7 @@ def test_implicit_internal_models_match_generate_default_routing():
     _assert_client_contract(response, payload)
 
 
-def test_request_llm_routing_overlay_controls_every_internal_participant(
+async def test_request_llm_routing_overlay_controls_every_internal_participant(
     monkeypatch,
 ):
     monkeypatch.setitem(
@@ -746,7 +746,7 @@ def test_request_llm_routing_overlay_controls_every_internal_participant(
         },
     )
 
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
 
     assert response["accepted"] is True
     assert response["participants_complete"] is True
@@ -801,7 +801,7 @@ def test_request_llm_routing_overlay_controls_every_internal_participant(
     _assert_client_contract(response, payload)
 
 
-def test_unresolvable_internal_routing_fails_instead_of_claiming_complete():
+async def test_unresolvable_internal_routing_fails_instead_of_claiming_complete():
     payload = _payload(
         qa_layers=[_qa_layer()],
         llm_routing={
@@ -815,10 +815,10 @@ def test_unresolvable_internal_routing_fails_instead_of_claiming_complete():
         context_preflight.MalformedRequest,
         match="could not resolve runtime LLM routing",
     ):
-        context_preflight.build_context_preflight_response(payload)
+        await context_preflight.build_context_preflight_response(payload)
 
 
-def test_full_generation_payload_participants_complete():
+async def test_full_generation_payload_participants_complete():
     payload = _payload(
         source_text="x" * 50_000,
         qa_models=[
@@ -831,7 +831,7 @@ def test_full_generation_payload_participants_complete():
         thinking_budget_tokens=8192,
         json_schema={"type": "object"},
     )
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is True
     kinds = [p["participant_kind"] for p in response["participants"]]
     assert kinds == [
@@ -864,7 +864,7 @@ def test_full_generation_payload_participants_complete():
     _assert_client_contract(response, payload)
 
 
-def test_qa_default_output_uses_runtime_resolver_not_fixed_floor(monkeypatch):
+async def test_qa_default_output_uses_runtime_resolver_not_fixed_floor(monkeypatch):
     def fake_resolve_qa_max_tokens(
         self,
         model_name,
@@ -883,7 +883,7 @@ def test_qa_default_output_uses_runtime_resolver_not_fixed_floor(monkeypatch):
         qa_layers=[_qa_layer()],
     )
 
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     evaluator = next(
         item
         for item in response["participants"]
@@ -895,7 +895,7 @@ def test_qa_default_output_uses_runtime_resolver_not_fixed_floor(monkeypatch):
     _assert_client_contract(response, payload)
 
 
-def test_qa_overlays_match_runtime_normalization_precedence():
+async def test_qa_overlays_match_runtime_normalization_precedence():
     payload = _payload(
         qa_models=[
             {"model": "qa-model-a"},
@@ -926,7 +926,7 @@ def test_qa_overlays_match_runtime_normalization_precedence():
         qa_layers=[_qa_layer()],
     )
 
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     evaluators = [
         item
         for item in response["participants"]
@@ -950,7 +950,7 @@ def test_qa_overlays_match_runtime_normalization_precedence():
     _assert_client_contract(response, payload)
 
 
-def test_all_role_reasoning_requests_are_preserved_without_underreservation(
+async def test_all_role_reasoning_requests_are_preserved_without_underreservation(
     monkeypatch,
 ):
     def fake_validate_token_limits(
@@ -1000,7 +1000,7 @@ def test_all_role_reasoning_requests_are_preserved_without_underreservation(
         context_participant_contracts=contracts,
     )
 
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     participants = {
         item["participant_kind"]: item
         for item in response["participants"]
@@ -1022,17 +1022,17 @@ def test_all_role_reasoning_requests_are_preserved_without_underreservation(
     _assert_client_contract(response, payload)
 
 
-def test_openai_model_count_method_exact_or_degraded():
+async def test_openai_model_count_method_exact_or_degraded():
     payload = _payload(model="openai-model")
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     generator = response["participants"][0]
     assert generator["count_method"] in {"exact_local", "conservative_estimate"}
     _assert_client_contract(response, payload)
 
 
-def test_separate_output_accounting_has_no_output_reservation():
+async def test_separate_output_accounting_has_no_output_reservation():
     payload = _payload(model="separate-model")
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     generator = response["participants"][0]
     assert generator["output_accounting"] == "separate"
     assert generator["reserved_context_tokens"] == 0
@@ -1042,13 +1042,13 @@ def test_separate_output_accounting_has_no_output_reservation():
     _assert_client_contract(response, payload)
 
 
-def test_separate_reasoning_is_reserved_on_top_of_output():
+async def test_separate_reasoning_is_reserved_on_top_of_output():
     FAKE_LIMITS["reasoning-model"] = _limits(
         output_accounting="within_total", reasoning_accounting="separate"
     )
     try:
         payload = _payload(model="reasoning-model", thinking_budget_tokens=4096)
-        response = context_preflight.build_context_preflight_response(payload)
+        response = await context_preflight.build_context_preflight_response(payload)
         generator = response["participants"][0]
         assert generator["reserved_context_tokens"] == (
             generator["output_tokens"] + generator["reasoning_tokens"]
@@ -1058,7 +1058,7 @@ def test_separate_reasoning_is_reserved_on_top_of_output():
         del FAKE_LIMITS["reasoning-model"]
 
 
-def test_effective_reasoning_budget_is_reported_and_reserved(monkeypatch):
+async def test_effective_reasoning_budget_is_reported_and_reserved(monkeypatch):
     FAKE_LIMITS["effective-reasoning-model"] = _limits(
         output_accounting="separate",
         reasoning_accounting="separate",
@@ -1085,7 +1085,7 @@ def test_effective_reasoning_budget_is_reported_and_reserved(monkeypatch):
             preflight_model="gen-model",
             context_participant_contracts=contracts,
         )
-        response = context_preflight.build_context_preflight_response(payload)
+        response = await context_preflight.build_context_preflight_response(payload)
         generator = response["participants"][0]
 
         assert generator["effective_thinking_budget_tokens"] == 6144
@@ -1096,9 +1096,9 @@ def test_effective_reasoning_budget_is_reported_and_reserved(monkeypatch):
         del FAKE_LIMITS["effective-reasoning-model"]
 
 
-def test_evidence_budget_drives_packing_decision():
+async def test_evidence_budget_drives_packing_decision():
     payload = _payload(source_text="y" * 30_000)
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     generator = response["participants"][0]
     # usable - fixed - generated - margin, with the 1M-window cap at 64K working.
     assert generator["usable_input_tokens"] == 65_536 - 4_096
@@ -1106,14 +1106,14 @@ def test_evidence_budget_drives_packing_decision():
     assert generator["evidence_tokens"] == response["evidence_budget_tokens"]
 
 
-def test_null_input_split_uses_window_as_ceiling():
+async def test_null_input_split_uses_window_as_ceiling():
     """Curated entries may leave max_input_tokens null (no explicit split)."""
     nullsplit = _limits(context_window=200_000, max_input=200_000, max_output=64_000)
     nullsplit["max_input_tokens"] = None
     FAKE_LIMITS["nullsplit-model"] = nullsplit
     try:
         payload = _payload(model="nullsplit-model")
-        response = context_preflight.build_context_preflight_response(payload)
+        response = await context_preflight.build_context_preflight_response(payload)
         assert response["accepted"] is True
         generator = response["participants"][0]
         assert generator["context_window_tokens"] == 200_000
@@ -1128,22 +1128,22 @@ def test_null_input_split_uses_window_as_ceiling():
 # ---------------------------------------------------------------------------
 
 
-def test_unknown_routed_model_is_malformed_like_generate():
+async def test_unknown_routed_model_is_malformed_like_generate():
     payload = _payload(model="not-in-catalog")
     with pytest.raises(
         context_preflight.MalformedRequest,
         match="could not resolve runtime LLM routing",
     ):
-        context_preflight.build_context_preflight_response(payload)
+        await context_preflight.build_context_preflight_response(payload)
 
 
 @pytest.mark.parametrize("maximum", [65536, None])
-def test_output_overflow_rejected(maximum):
+async def test_output_overflow_rejected(maximum):
     payload = _payload(
         model="tiny-model", max_tokens=8192,  # tiny allows only 4096 out
         context_budget_policy=_policy(maximum_working_context_tokens=maximum),
     )
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is False
     assert response["rejection"]["code"] == "output_budget_exceeds_model_limit"
     assert response["rejection"]["participant"] == "generator"
@@ -1151,14 +1151,14 @@ def test_output_overflow_rejected(maximum):
 
 
 @pytest.mark.parametrize("maximum", [65536, None])
-def test_tiny_window_prompt_too_large(maximum):
+async def test_tiny_window_prompt_too_large(maximum):
     payload = _payload(
         model="tiny-model",
         max_tokens=4096,
         source_text="z" * 200_000,
         context_budget_policy=_policy(maximum_working_context_tokens=maximum),
     )
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is False
     assert response["status"] == "prompt_too_large"
     assert response["rejection"]["code"] == "prompt_too_large"
@@ -1166,19 +1166,19 @@ def test_tiny_window_prompt_too_large(maximum):
 
 
 @pytest.mark.parametrize("configured,requested", [(0.05, 0.04), (0.08, 0.05)])
-def test_minimum_safety_margin_enforced_without_service_ceiling(monkeypatch, configured, requested):
+async def test_minimum_safety_margin_enforced_without_service_ceiling(monkeypatch, configured, requested):
     monkeypatch.setenv("GRANSABIO_CONTEXT_POLICY_SAFETY_MARGIN", str(configured))
     payload = _payload(context_budget_policy=_policy(
         maximum_working_context_tokens=None, safety_margin_fraction=requested,
     ))
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is False
     assert response["rejection"]["code"] == "context_budget_policy_mismatch"
     _assert_client_contract(response, payload)
 
 
 @pytest.mark.parametrize("context_window", [262144, 1050000, 2000000])
-def test_model_capacity_replaces_retired_service_ceiling(monkeypatch, context_window):
+async def test_model_capacity_replaces_retired_service_ceiling(monkeypatch, context_window):
     monkeypatch.setenv("GRANSABIO_CONTEXT_POLICY_MAX_TOKENS", "262144")
     monkeypatch.setitem(FAKE_LIMITS, "gen-model", _limits(
         context_window=context_window, max_input=context_window - 128000,
@@ -1188,7 +1188,7 @@ def test_model_capacity_replaces_retired_service_ceiling(monkeypatch, context_wi
         context_fraction=1, minimum_working_context_tokens=1,
         maximum_working_context_tokens=None,
     ))
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is True
     assert response["working_context_tokens"] == context_window
     generator = response["participants"][0]
@@ -1198,43 +1198,43 @@ def test_model_capacity_replaces_retired_service_ceiling(monkeypatch, context_wi
     _assert_client_contract(response, payload)
 
 
-def test_omitted_maximum_uses_each_participants_native_window():
+async def test_omitted_maximum_uses_each_participants_native_window():
     policy = _policy(context_fraction=1, minimum_working_context_tokens=1)
     del policy["maximum_working_context_tokens"]
     payload = _payload(
         context_budget_policy=policy,
         qa_models=["qa-model-a", "qa-model-b"], qa_layers=[_qa_layer()],
     )
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is True
     assert response["working_context_tokens"] == 200000
     assert {p["working_context_tokens"] for p in response["participants"]} == {200000, 1000000}
     _assert_client_contract(response, payload)
 
 
-def test_explicit_ceiling_above_model_capacity_is_clamped_to_model(monkeypatch):
+async def test_explicit_ceiling_above_model_capacity_is_clamped_to_model(monkeypatch):
     monkeypatch.setenv("GRANSABIO_CONTEXT_POLICY_MAX_TOKENS", "262144")
     payload = _payload(context_budget_policy=_policy(
         context_fraction=1, maximum_working_context_tokens=2000000,
     ))
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is True
     assert response["working_context_tokens"] == 1000000
     _assert_client_contract(response, payload)
 
 
-def test_run_ceiling_caps_each_participant_independently_of_model_window():
+async def test_run_ceiling_caps_each_participant_independently_of_model_window():
     payload = _payload(context_budget_policy=_policy(
         context_fraction=1, minimum_working_context_tokens=1,
         maximum_working_context_tokens=32000,
     ))
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is True
     assert all(item["working_context_tokens"] == 32000 for item in response["participants"])
     _assert_client_contract(response, payload)
 
 
-def test_native_system_one_preflight_counts_typed_payload_and_enforces_run_ceiling():
+async def test_native_system_one_preflight_counts_typed_payload_and_enforces_run_ceiling():
     payload = {
         "operation": "system_one", "model": "jev-latest", "state": "State " * 100,
         "questions": {"q": {
@@ -1250,29 +1250,30 @@ def test_native_system_one_preflight_counts_typed_payload_and_enforces_run_ceili
             "receives_generated_candidate": False,
         }},
     }
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is True
     participant, = response["participants"]
     assert participant["call_kind"] == "system_one"
     assert participant["fixed_input_tokens"] > 0
     assert participant["output_tokens"] == participant["generated_input_tokens"] == 0
     payload["context_budget_policy"]["maximum_working_context_tokens"] = 32
-    rejected = context_preflight.build_context_preflight_response(payload)
+    rejected = await context_preflight.build_context_preflight_response(payload)
     assert rejected["accepted"] is False
     assert rejected["rejection"]["code"] == "prompt_too_large"
 
 
-def test_auto_qa_rejected_as_non_deterministic():
+async def test_auto_qa_rejected_as_non_deterministic():
     payload = _payload(auto_qa={"enabled": True})
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is False
     assert response["rejection"]["code"] == "non_deterministic_request"
     _assert_client_contract(response, payload)
 
 
-def test_attachments_rejected_as_unsupported():
-    payload = _payload(attachments=[{"name": "file.pdf"}])
-    response = context_preflight.build_context_preflight_response(payload)
+@pytest.mark.parametrize("field", ["attachments", "images", "audios", "context_documents"])
+async def test_attachments_rejected_as_unsupported(field):
+    payload = _payload(**{field: [{"username": "test", "upload_id": "test-file"}]})
+    response = await context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is False
     assert response["rejection"]["code"] == "unsupported_payload_component"
     _assert_client_contract(response, payload)
@@ -1283,44 +1284,44 @@ def test_attachments_rejected_as_unsupported():
 # ---------------------------------------------------------------------------
 
 
-def test_missing_policy_is_malformed():
+async def test_missing_policy_is_malformed():
     payload = _payload()
     del payload["context_budget_policy"]
     with pytest.raises(context_preflight.MalformedRequest):
-        context_preflight.build_context_preflight_response(payload)
+        await context_preflight.build_context_preflight_response(payload)
 
 
-def test_unknown_policy_schema_is_malformed():
+async def test_unknown_policy_schema_is_malformed():
     payload = _payload(
         context_budget_policy=_policy(schema_version="consumer_policy.v99")
     )
     with pytest.raises(context_preflight.MalformedRequest):
-        context_preflight.build_context_preflight_response(payload)
+        await context_preflight.build_context_preflight_response(payload)
 
 
 @pytest.mark.parametrize("maximum", [0, -1, "not-a-number", float("inf")])
-def test_invalid_explicit_maximum_is_malformed(maximum):
+async def test_invalid_explicit_maximum_is_malformed(maximum):
     payload = _payload(context_budget_policy=_policy(maximum_working_context_tokens=maximum))
     with pytest.raises(context_preflight.MalformedRequest):
-        context_preflight.build_context_preflight_response(payload)
+        await context_preflight.build_context_preflight_response(payload)
 
 
-def test_missing_contracts_is_malformed():
+async def test_missing_contracts_is_malformed():
     payload = _payload()
     del payload["context_participant_contracts"]
     with pytest.raises(context_preflight.MalformedRequest):
-        context_preflight.build_context_preflight_response(payload)
+        await context_preflight.build_context_preflight_response(payload)
 
 
-def test_generator_contract_mismatch_is_malformed():
+async def test_generator_contract_mismatch_is_malformed():
     contracts = _contracts(4096)
     contracts["generator"]["max_output_tokens"] = 9999
     payload = _payload(context_participant_contracts=contracts)
     with pytest.raises(context_preflight.MalformedRequest):
-        context_preflight.build_context_preflight_response(payload)
+        await context_preflight.build_context_preflight_response(payload)
 
 
-def test_missing_qa_contract_kind_is_malformed():
+async def test_missing_qa_contract_kind_is_malformed():
     contracts = _contracts(4096)
     del contracts["qa_evaluator"]
     payload = _payload(
@@ -1329,36 +1330,36 @@ def test_missing_qa_contract_kind_is_malformed():
         qa_layers=[_qa_layer()],
     )
     with pytest.raises(context_preflight.MalformedRequest):
-        context_preflight.build_context_preflight_response(payload)
+        await context_preflight.build_context_preflight_response(payload)
 
 
-def test_invalid_qa_overlay_is_malformed():
+async def test_invalid_qa_overlay_is_malformed():
     payload = _payload(
         qa_models=["qa-model-a"],
         qa_global_config={"max_tokens": "not-an-integer"},
         qa_layers=[_qa_layer()],
     )
     with pytest.raises(context_preflight.MalformedRequest):
-        context_preflight.build_context_preflight_response(payload)
+        await context_preflight.build_context_preflight_response(payload)
 
 
-def test_secondary_thinking_request_cannot_exceed_declared_maximum():
+async def test_secondary_thinking_request_cannot_exceed_declared_maximum():
     contracts = _contracts(4_096)
     contracts["prompt_preflight"]["thinking_budget_tokens"] = 2_048
     with pytest.raises(context_preflight.MalformedRequest):
-        context_preflight.build_context_preflight_response(
+        await context_preflight.build_context_preflight_response(
             _payload(context_participant_contracts=contracts)
         )
 
 
-def test_builder_is_pure_and_deterministic():
+async def test_builder_is_pure_and_deterministic():
     payload = _payload(
         source_text="w" * 10_000,
         qa_models=[{"model": "qa-model-a"}],
         qa_layers=[_qa_layer()],
     )
-    first = context_preflight.build_context_preflight_response(payload)
-    second = context_preflight.build_context_preflight_response(payload)
+    first = await context_preflight.build_context_preflight_response(payload)
+    second = await context_preflight.build_context_preflight_response(payload)
     assert first == second
 
 
@@ -1432,7 +1433,7 @@ def test_context_preflight_preserves_exact_generator_system_prompt(
 @pytest.mark.parametrize("qa_active,fallback", [
     (False, False), (False, True), (True, False), (True, True),
 ])
-def test_shared_context_is_counted_once_for_each_chat_participant(
+async def test_shared_context_is_counted_once_for_each_chat_participant(
     qa_active: bool, fallback: bool,
 ) -> None:
     source = 'Complete shared evidence.\nQuoted observation: "verified".\n' * 20
@@ -1441,9 +1442,9 @@ def test_shared_context_is_counted_once_for_each_chat_participant(
         source_text="A separate legacy source remains present.",
         qa_layers=[_qa_layer()] if qa_active else [],
     )
-    baseline = context_preflight.build_context_preflight_response(payload)
+    baseline = await context_preflight.build_context_preflight_response(payload)
     sourced = {**payload, "shared_context": source}
-    response = context_preflight.build_context_preflight_response(sourced)
+    response = await context_preflight.build_context_preflight_response(sourced)
     specs = context_preflight._build_participant_specs(sourced)
     expected_kinds = {"generator", "prompt_preflight"}
     if qa_active:
@@ -1475,7 +1476,7 @@ def test_shared_context_is_counted_once_for_each_chat_participant(
     _assert_client_contract(response, sourced)
 
 
-def test_shared_context_stays_inside_the_single_system_one_qa_payload() -> None:
+async def test_shared_context_stays_inside_the_single_system_one_qa_payload() -> None:
     source = 'Full shared evidence.\nQuoted observation: "verified".\n' * 20
     payload = _payload(
         shared_context=source,
@@ -1498,7 +1499,7 @@ def test_shared_context_stays_inside_the_single_system_one_qa_payload() -> None:
     assert state["shared_context"] == source
     assert state["source_text"] == payload["source_text"]
     assert state["original_prompt"] == payload["prompt"]
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is True
     reported = next(item for item in response["participants"]
                     if item["participant"] == typed.participant)
@@ -1530,11 +1531,11 @@ def test_empty_shared_context_preserves_legacy_component_accounting(shared_conte
     )
 
 
-def test_oversized_shared_context_rejects_the_generator_budget() -> None:
+async def test_oversized_shared_context_rejects_the_generator_budget() -> None:
     payload = _payload(model="tiny-model", max_tokens=1024)
-    assert context_preflight.build_context_preflight_response(payload)["accepted"] is True
+    assert (await context_preflight.build_context_preflight_response(payload))["accepted"] is True
     payload["shared_context"] = "Complete reference data retained without truncation.\n" * 2000
-    response = context_preflight.build_context_preflight_response(payload)
+    response = await context_preflight.build_context_preflight_response(payload)
     assert response["accepted"] is False
     assert response["rejection"]["code"] == "prompt_too_large"
     assert response["rejection"]["participant"] == "generator"

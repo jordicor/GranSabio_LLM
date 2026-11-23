@@ -17,8 +17,9 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Deque, Dict, Iterable, Optional, TextIO
+from typing import Any, Deque, Dict, Optional, TextIO
 
+from logging_policy import OutputPolicyFilter, get_logging_policy
 
 _session_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "runtime_console_session_id",
@@ -44,6 +45,8 @@ _next_seq = 1
 _subscribers: list["ConsoleSubscription"] = []
 _lock = threading.RLock()
 _capture_active = False
+_logging_write: contextvars.ContextVar[bool] = contextvars.ContextVar("runtime_logging_write", default=False)
+_persistence_sink = None
 
 
 @dataclass(frozen=True)
@@ -72,17 +75,29 @@ class ConsoleCaptureOutput:
         self.stream_name = stream_name
 
     def write(self, message: str) -> int:
-        written = self.stream.write(message)
-        if message:
+        if not _logging_write.get() and self.stream_name == "stdout" and get_logging_policy().quiet:
+            return len(message)
+        if message and not _logging_write.get():
             publish_console_output(
                 self.stream_name,
                 message,
                 source="stream",
             )
-        return written
+        try:
+            return self.stream.write(message)
+        except (OSError, ValueError):
+            if _persistence_sink is not None:
+                # Capture above owns delivery/failure status. A closed mirror
+                # is not a loss of the already captured operational record.
+                return len(message)
+            raise
 
     def flush(self) -> None:
-        self.stream.flush()
+        try:
+            self.stream.flush()
+        except (OSError, ValueError):
+            if _persistence_sink is None:
+                raise
 
     def close(self) -> None:
         close = getattr(self.stream, "close", None)
@@ -112,10 +127,11 @@ class ConsoleCaptureOutput:
 
 
 class RuntimeConsoleLoggingHandler(logging.Handler):
-    """Logging handler that publishes formatted records without writing them."""
+    """Write and capture each structured record once, preserving its context."""
 
     def __init__(self) -> None:
         super().__init__(level=logging.NOTSET)
+        self.addFilter(OutputPolicyFilter())
         self.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
@@ -124,15 +140,24 @@ class RuntimeConsoleLoggingHandler(logging.Handler):
         try:
             message = self.format(record) + "\n"
             publish_console_output(
-                "stderr",
-                message,
-                source="logging",
-                level=record.levelname,
+                "stderr", message, source="logging", level=record.levelname,
                 logger_name=record.name,
+                operational_notice=getattr(record, "operational_notice", False),
             )
         except Exception:
-            # Never let observability break application logging.
+            if _persistence_sink is not None:
+                _persistence_sink.capture_failure("A log record could not be formatted or captured")
             return
+        marker = _logging_write.set(True)
+        try:
+            sys.stderr.write(message)
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            # The persistent sink already has the record. Losing only the
+            # terminal mirror must not mark its evidence incomplete or gate work.
+            pass
+        finally:
+            _logging_write.reset(marker)
 
 
 def bind_console_context(
@@ -187,10 +212,30 @@ def activate_runtime_console_capture() -> None:
         sys.stderr = ConsoleCaptureOutput(sys.stderr, "stderr")  # type: ignore[assignment]
 
     root_logger = logging.getLogger()
+    # This is the engine's console handler. Keep custom embedding/test handlers,
+    # but do not mirror every record through a second plain console handler.
+    for handler in root_logger.handlers[:]:
+        if type(handler) is logging.StreamHandler:
+            root_logger.removeHandler(handler)
     if not any(isinstance(handler, RuntimeConsoleLoggingHandler) for handler in root_logger.handlers):
         root_logger.addHandler(RuntimeConsoleLoggingHandler())
 
+    # The ASGI servers otherwise bypass structured capture with private handlers.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "gunicorn.error", "gunicorn.access"):
+        server_logger = logging.getLogger(name)
+        server_logger.handlers.clear()
+        server_logger.propagate = True
+        server_logger.setLevel(get_logging_policy().level)
+    logging.getLogger("uvicorn.access").disabled = get_logging_policy().quiet
+    logging.getLogger("gunicorn.access").disabled = get_logging_policy().quiet
+
     _capture_active = True
+
+
+def set_console_persistence_sink(sink) -> None:
+    """Attach the process-owned sink before producers start, independently of SSE."""
+    global _persistence_sink
+    _persistence_sink = sink
 
 
 def _event_size(event: Dict[str, Any]) -> int:
@@ -250,10 +295,17 @@ def publish_console_output(
     source: str = "stream",
     level: Optional[str] = None,
     logger_name: Optional[str] = None,
-) -> Dict[str, Any]:
+    operational_notice: bool = False,
+    persist: bool = True,
+) -> Optional[Dict[str, Any]]:
     """Publish a stdout/stderr/logging fragment to the in-memory console tail."""
 
     global _events_bytes, _next_seq
+    policy = get_logging_policy()
+    if level and not policy.allows(logging.getLevelName(level), operational_notice=operational_notice):
+        return None
+    if not level and stream == "stdout" and policy.quiet:
+        return None
     timestamp_ms = int(time.time() * 1000)
     event = {
         "type": "console_output",
@@ -270,6 +322,10 @@ def publish_console_output(
     if logger_name:
         event["logger"] = logger_name
 
+    if persist and _persistence_sink is not None:
+        # The sink has its own ordered queue. Do not hold the UI lock while
+        # applying exceptional producer backpressure to a very large record.
+        _persistence_sink.capture(event)
     with _lock:
         event["seq"] = _next_seq
         _next_seq += 1
@@ -283,6 +339,18 @@ def publish_console_output(
             _enqueue_subscription_event(subscriber, event)
 
     return event
+
+
+def report_persistence_notice(message: str) -> None:
+    """Report a writer transition without feeding the failing writer itself."""
+    text = "Operational log storage: " + message + "\n"
+    try:
+        sys.__stderr__.write(text)
+        sys.__stderr__.flush()
+    except (OSError, AttributeError):
+        pass
+    publish_console_output("stderr", text, source="logging", level="WARNING",
+                           logger_name="log_persistence", operational_notice=True, persist=False)
 
 
 def get_recent_console_events(
@@ -353,6 +421,8 @@ def console_stats() -> Dict[str, Any]:
             "subscribers": len(_subscribers),
             "next_seq": _next_seq,
             "capture_active": _capture_active,
+            "output_mode": get_logging_policy().mode,
+            "persistence": _persistence_sink.status() if _persistence_sink is not None else {"backend": "local"},
         }
 
 

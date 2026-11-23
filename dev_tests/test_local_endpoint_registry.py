@@ -115,6 +115,47 @@ def test_registry_rejects_inline_secret_and_unknown_endpoint_fields(tmp_path):
         load_local_endpoint_registry(registry_path)
 
 
+def test_app_client_url_preserves_explicit_registry_and_daemon_environment(monkeypatch, tmp_path):
+    import os
+
+    from config import Config
+
+    registry_path = tmp_path / "endpoints.json"
+    registry_path.write_text('{"local_endpoints":{"local":{"adapter":"ollama","base_url":"http://127.0.0.1:11434"},'
+                             '"remote":{"adapter":"llamacpp","base_url":"http://gpu.example:11435/v1"}}}')
+    monkeypatch.setenv("LOCAL_ENDPOINTS_CONFIG_PATH", str(registry_path))
+    monkeypatch.setenv("OLLAMA_HOST", "0.0.0.0:11434")
+    monkeypatch.setenv("GRANSABIO_OLLAMA_BASE_URL", "http://localhost:11434")
+    monkeypatch.setenv("LLAMACPP_BASE_URL", "")
+    settings = Config()
+    registry = build_local_endpoint_registry(settings)
+    assert settings.OLLAMA_HOST == "http://localhost:11434"
+    assert registry.get("local").base_url == "http://127.0.0.1:11434"
+    assert registry.get("remote").base_url == "http://gpu.example:11435/v1"
+    assert os.environ["OLLAMA_HOST"] == "0.0.0.0:11434"
+
+
+def test_legacy_client_url_remains_compatible_without_app_override(monkeypatch):
+    from config import Config
+
+    monkeypatch.delenv("GRANSABIO_OLLAMA_BASE_URL", raising=False)
+    monkeypatch.setenv("LOCAL_ENDPOINTS_CONFIG_PATH", "")
+    monkeypatch.setenv("OLLAMA_HOST", "http://legacy.example:11434")
+    settings = Config()
+    assert build_local_endpoint_registry(settings).get("ollama").base_url == "http://legacy.example:11434"
+
+
+def test_conflicting_explicit_app_url_is_still_refused(monkeypatch, tmp_path):
+    from config import Config
+
+    registry_path = tmp_path / "endpoints.json"
+    registry_path.write_text('{"local_endpoints":{"local":{"adapter":"ollama","base_url":"http://127.0.0.1:11434"}}}')
+    monkeypatch.setenv("LOCAL_ENDPOINTS_CONFIG_PATH", str(registry_path))
+    monkeypatch.setenv("GRANSABIO_OLLAMA_BASE_URL", "http://another.example:11434")
+    with pytest.raises(LocalEndpointConfigurationError, match="OLLAMA_HOST"):
+        build_local_endpoint_registry(Config())
+
+
 def test_legacy_llamacpp_api_key_is_used_without_leaking_from_repr() -> None:
     secret = "legacy-llamacpp-secret"
     registry = build_local_endpoint_registry(

@@ -261,7 +261,7 @@ class TestOpenAIClientInit:
             assert openai_call is not None
             assert openai_call[1]["api_key"] == "sk-test-openai-key"
             assert openai_call[1]["timeout"] == 12000.0
-            assert openai_call[1]["max_retries"] == 3
+            assert openai_call[1]["max_retries"] == 0
 
     def test_sdk_http_clients_use_extended_keepalive(self, mock_all_api_clients, mock_config_with_keys, reset_singleton):
         """
@@ -321,7 +321,7 @@ class TestAnthropicClientInit:
             call_kwargs = mock_all_api_clients["anthropic"].AsyncAnthropic.call_args[1]
             assert call_kwargs["api_key"] == "sk-ant-test-key"
             assert call_kwargs["timeout"] == 12000.0
-            assert call_kwargs["max_retries"] == 3
+            assert call_kwargs["max_retries"] == 0
 
     def test_anthropic_client_has_beta_headers(self, mock_all_api_clients, mock_config_with_keys, reset_singleton):
         """
@@ -381,7 +381,8 @@ class TestGoogleClientInit:
             service = AIService()
 
             assert service.google_new_client is not None
-            mock_google_genai.Client.assert_called_once_with(api_key="test-google-key")
+            mock_google_genai.Client.assert_called_once_with(
+                api_key="test-google-key", http_options={"retry_options": {"attempts": 1}})
 
     def test_google_client_none_without_key(self, mock_all_api_clients, mock_config_no_keys, reset_singleton, caplog):
         """
@@ -1004,28 +1005,3 @@ class TestProviderRouting:
         except RuntimeError:
             # If API key is missing in test environment, that's expected
             pass
-
-
-# ============================================================================
-# HTTP Connector Tests (Additional tests for completeness)
-# ============================================================================
-
-class TestHTTPConnector:
-    """Tests for HTTP connector configuration."""
-
-    def test_http_connector_created(self, mock_all_api_clients, mock_config_with_keys, reset_singleton):
-        """
-        Given: AIService initialization
-        When: __init__ completes
-        Then: HTTP connector is created with optimized settings
-        """
-        with patch("ai_service.config", mock_config_with_keys):
-            from ai_service import AIService
-
-            service = AIService()
-
-            mock_all_api_clients["connector"].assert_called_once()
-            call_kwargs = mock_all_api_clients["connector"].call_args[1]
-            assert call_kwargs["limit"] == 200
-            assert call_kwargs["limit_per_host"] == 50
-            assert call_kwargs["keepalive_timeout"] == 60

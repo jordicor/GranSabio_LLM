@@ -6,10 +6,11 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import Depends, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from deal_breaker_tracker import get_tracker
 from llm_routing import LLMRoutingError, get_default_routing, resolve_call, resolve_call_models
@@ -41,12 +42,14 @@ async def api_info():
 async def health_check():
     """Health check endpoint"""
     _ensure_services()
+    from services.runtime_console import console_stats
     return {
         "status": "healthy",
         "active_sessions": len(active_sessions),
         "timestamp": datetime.now().isoformat(),
         "version": BUILD_VERSION_INFO,
         "capabilities": {"include_default_system_context": True},
+        "logging": console_stats()["persistence"],
     }
 
 
@@ -228,6 +231,7 @@ async def get_model_info(model_name: str):
         )
 
     model_data = resolved["model_data"] or {}
+    from ai_runtime.audio import audio_support_info
     catalog_provider = str(resolved["catalog_provider"] or "")
     if catalog_provider == "chatgpt":
         model_data = {**model_data, **config.get_subscription_capacity_metadata(model_name)}
@@ -254,6 +258,7 @@ async def get_model_info(model_name: str):
         "name": model_data.get("name", resolved["model_key"]),
         "description": model_data.get("description", ""),
         "capabilities": model_data.get("capabilities", []),
+        "audio_input": audio_support_info(specs=config.model_specs, provider=resolved["provider"], model_id=resolved["model_id"]),
         "special_features": model_data.get("special_features", []),
         "provider_capabilities": model_data.get("provider_capabilities", {}),
         "prompt_cache_capabilities": asdict(config.get_prompt_cache_capabilities(
@@ -278,6 +283,12 @@ async def api_documentation(
 ):
     """Serve the API documentation page (internal access only)"""
     return templates.TemplateResponse("api_docs.html", {"request": request})
+
+
+@app.get("/api-docs/storage-and-logs", response_class=FileResponse)
+async def storage_logging_documentation(_client_ip: str = Depends(require_internal_ip)):
+    """Serve the same storage guide shipped in the source distribution."""
+    return FileResponse(Path(__file__).resolve().parents[1] / "STORAGE_AND_LOGS.md", media_type="text/plain")
 
 
 @app.get("/api-usage", response_class=HTMLResponse)

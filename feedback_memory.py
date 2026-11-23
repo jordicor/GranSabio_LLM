@@ -18,10 +18,10 @@ import asyncio
 import hashlib
 import logging
 import os
-import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiosqlite
@@ -29,11 +29,10 @@ import aiosqlite
 import json_utils as json
 from ai_service import get_ai_service, is_content_filter_stop
 from config import config as app_config
-from context_budget import ContextAdmissionError, admit_embedding_texts
+from context_budget import ContextAdmissionError
 from core.cancellation import ProviderCallHandle
-from llm_routing import endpoint_id_call_kwargs, resolve_call, resolve_temperature
+from llm_routing import LLMRoutingError, endpoint_id_call_kwargs, resolve_call, resolve_embedding_model, resolve_temperature
 from model_aliasing import ModelAliasRegistry, PromptPart
-from model_capability_registry import resolve_model_capability_context
 from models import shared_context_call_kwargs
 
 logger = logging.getLogger(__name__)
@@ -149,12 +148,31 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
 
 # ---------- Database Manager ----------
 
+def _serialized_database(method):
+    """Keep each database operation and its transaction on the owning task."""
+    @wraps(method)
+    async def serialized(self, *args, **kwargs):
+        async with self._lock:
+            try:
+                result = await method(self, *args, **kwargs)
+                if self._pool.in_transaction:
+                    await self._pool.commit()
+                return result
+            except BaseException:
+                if self._pool.in_transaction:
+                    await self._pool.rollback()
+                raise
+    return serialized
+
+
 class FeedbackDatabase:
     """Manages SQLite database for feedback persistence"""
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()
+        self._cleanup_task: asyncio.Task | None = None
+        self._closing = False
         self._pool = None
         self._last_cleanup_ts: float = 0.0
         self._cleanup_running: bool = False
@@ -248,11 +266,17 @@ class FeedbackDatabase:
 
     async def close(self):
         """Close database connection"""
-        if self._pool:
-            await self._pool.close()
+        self._closing = True
+        if self._cleanup_task is not None:
+            await self._cleanup_task
+        async with self._lock:
+            if self._pool:
+                await self._pool.close()
+                self._pool = None
 
     # Session Management
 
+    @_serialized_database
     async def create_session(self, session_id: str, request_hash: str, metadata: Dict = None,
                              user_id: Optional[str] = None):
         """Create new session entry"""
@@ -262,8 +286,9 @@ class FeedbackDatabase:
             VALUES (?, ?, ?, 'active', ?)
         """, (session_id, request_hash, json.dumps(metadata or {}), user_id))
         await self._pool.commit()
-        asyncio.create_task(self._maybe_piggyback_cleanup())
+        self.schedule_cleanup()
 
+    @_serialized_database
     async def get_session(self, session_id: str) -> Optional[Dict]:
         """Get session metadata"""
         async with self._pool.execute("""
@@ -285,6 +310,7 @@ class FeedbackDatabase:
                 }
         return None
 
+    @_serialized_database
     async def update_session_status(self, session_id: str, status: str, success: bool = None):
         """Update session status"""
         if success is not None:
@@ -300,8 +326,9 @@ class FeedbackDatabase:
                 WHERE session_id = ?
             """, (status, session_id))
         await self._pool.commit()
-        asyncio.create_task(self._maybe_piggyback_cleanup())
+        self.schedule_cleanup()
 
+    @_serialized_database
     async def find_similar_sessions(self, request_hash: str, limit: int = 5,
                                     user_id: Optional[str] = None) -> List[str]:
         """Find sessions with similar request hash.
@@ -324,6 +351,7 @@ class FeedbackDatabase:
 
     # Iteration Management
 
+    @_serialized_database
     async def add_iteration(self, session_id: str, iteration_num: int,
                            feedback_text: str, content_snapshot: str,
                            summaries: Dict, issues: List, analysis: Dict):
@@ -350,8 +378,9 @@ class FeedbackDatabase:
         """, (iteration_num + 1, session_id))
 
         await self._pool.commit()
-        asyncio.create_task(self._maybe_piggyback_cleanup())
+        self.schedule_cleanup()
 
+    @_serialized_database
     async def get_recent_iterations(self, session_id: str, limit: int = 10) -> List[Dict]:
         """Get recent iterations for a session"""
         async with self._pool.execute("""
@@ -377,6 +406,7 @@ class FeedbackDatabase:
 
     # Category Management
 
+    @_serialized_database
     async def upsert_category(self, session_id: str, concept_id: str,
                              canonical_label: str, category_type: str,
                              severity: str, evidence: List[str],
@@ -433,6 +463,7 @@ class FeedbackDatabase:
                   severity, json.dumps(evidence), json.dumps(actions),
                   json.dumps(embedding), current_iteration, current_iteration))
 
+    @_serialized_database
     async def get_categories(self, session_id: str, min_occurrences: int = 1) -> List[Dict]:
         """Get feedback categories for session"""
         async with self._pool.execute("""
@@ -469,6 +500,7 @@ class FeedbackDatabase:
 
     # Rules Management
 
+    @_serialized_database
     async def save_normative_rules(self, session_id: str, rules: List[str],
                                   source_patterns: List[str]):
         """Save normative rules derived from patterns"""
@@ -478,8 +510,9 @@ class FeedbackDatabase:
             VALUES (?, ?, ?)
         """, (session_id, '\n'.join(rules), json.dumps(source_patterns)))
         await self._pool.commit()
-        asyncio.create_task(self._maybe_piggyback_cleanup())
+        self.schedule_cleanup()
 
+    @_serialized_database
     async def get_active_rules(self, session_id: str) -> List[str]:
         """Get active normative rules for session"""
         async with self._pool.execute("""
@@ -495,6 +528,13 @@ class FeedbackDatabase:
             return []
 
     # Cleanup
+
+    def schedule_cleanup(self) -> None:
+        """Own at most one maintenance task and drain it before closing SQLite."""
+        if self._closing or time.monotonic() - self._last_cleanup_ts < FB_CLEANUP_INTERVAL_SECONDS:
+            return
+        if self._cleanup_task is None or self._cleanup_task.done():
+            self._cleanup_task = asyncio.create_task(self._maybe_piggyback_cleanup())
 
     async def _maybe_piggyback_cleanup(self):
         """Run cleanup opportunistically if enough time has passed."""
@@ -514,10 +554,11 @@ class FeedbackDatabase:
         finally:
             self._cleanup_running = False
 
+    @_serialized_database
     async def cleanup_old_sessions(self, retention_days: int, archive_days: int):
         """Clean up old sessions based on retention policy"""
-        cutoff_archive = datetime.now() - timedelta(days=archive_days)
-        cutoff_delete = datetime.now() - timedelta(days=retention_days)
+        cutoff_archive = datetime.utcnow() - timedelta(days=archive_days)
+        cutoff_delete = datetime.utcnow() - timedelta(days=retention_days)
 
         # Archive old sessions
         await self._pool.execute("""
@@ -685,24 +726,12 @@ Provide a JSON response with:
         }
 
     def _resolve_embedding_route(self, request: Optional[Any] = None) -> Tuple[Optional[str], str]:
-        """Resolve the 'feedback.embed' route to (model, provider).
-
-        The provider comes from the model catalog via
-        ``resolve_model_capability_context`` (the same resolution other
-        engines use), with the name-based fallback llm_routing itself
-        applies to embedding models absent from the catalog. The endpoint is
-        never hardcoded to OpenAI (audit ORQ-01).
-        """
-        route = resolve_call("feedback.embed", request=request)
-        embedding_model = self.config.embedding_model or route.model
-        specs = getattr(app_config, "model_specs", {}) or {}
-        context = resolve_model_capability_context(embedding_model or "", specs)
-        provider = context.provider
-        if not provider:
-            model_lower = (embedding_model or "").lower()
-            if "embedding" in model_lower:
-                provider = "gemini" if model_lower.startswith("models/") else "openai"
-        return embedding_model, provider
+        """Resolve the configured embedding identity through the shared catalog."""
+        model = self.config.embedding_model or resolve_call("feedback.embed", request=request).model
+        try:
+            return resolve_embedding_model(model, app_config)
+        except LLMRoutingError as exc:
+            raise FeedbackEmbeddingSupportError(str(exc)) from exc
 
     def validate_embedding_support(self, request: Optional[Any] = None) -> None:
         """Fail fast when 'feedback.embed' cannot be served by this deployment.
@@ -722,21 +751,6 @@ Provide a JSON response with:
                 f"but {credential_attr} is not set; set the key or route "
                 "'feedback.embed' to an embedding model of a provider with credentials."
             )
-
-    async def _request_gemini_embeddings(self, model: str, texts: List[str]) -> Any:
-        """Dispatch a batch request to the Gemini embeddings endpoint."""
-        resource = model if model.startswith("models/") else f"models/{model}"
-        return await self.ai_service._make_request(
-            'POST',
-            f'https://generativelanguage.googleapis.com/v1beta/{resource}:batchEmbedContents',
-            headers={'x-goog-api-key': app_config.GOOGLE_API_KEY},
-            json={
-                'requests': [
-                    {'model': resource, 'content': {'parts': [{'text': text}]}}
-                    for text in texts
-                ]
-            },
-        )
 
     async def get_embeddings(
         self,
@@ -760,67 +774,23 @@ Provide a JSON response with:
             # session initialization; never degrade silently here either.
             raise _embedding_support_error(embedding_model, provider)
 
-        async def request_embeddings() -> Any:
-            if provider == "gemini":
-                return await self._request_gemini_embeddings(embedding_model, texts)
-            return await self.ai_service._make_request(
-                'POST',
-                'https://api.openai.com/v1/embeddings',
-                json={
-                    'model': embedding_model,
-                    'input': texts
-                }
-            )
+        async def request_embeddings() -> List[List[float]]:
+            return await self.ai_service.get_embeddings(
+                texts, model=embedding_model, dispatch_call_id="feedback.embed")
 
-        # Context admission guard BEFORE dispatch. This is an independent
-        # provider call (_make_request bypasses ai_service.get_embeddings), so
-        # it does not inherit that frontier guard on its own. The shared
-        # per-input loop lives in context_budget so this module never depends
-        # on private AIService internals (test doubles only need
-        # _make_request). A verdict is fatal and must never be swallowed into
-        # empty vectors (plan 12.1); it is raised outside the resilience try
-        # below. The guard is evaluated with the real routed provider.
-        await admit_embedding_texts(
-            texts, provider=provider, model=embedding_model, call_id="feedback.embed"
-        )
-
-        try:
-            if cancellation_token and await cancellation_token.any_cancelled():
-                raise asyncio.CancelledError()
-
-            if cancellation_token:
-                handle = ProviderCallHandle(
-                    call_id="",
-                    provider=provider,
-                    model_id=embedding_model,
-                    session_id=cancellation_token.session_id,
-                    phase=cancellation_token.phase,
-                    operation="feedback_embeddings",
-                    close=close_provider_task,
-                )
-                async with cancellation_token.registry.begin_provider_call(handle):
-                    response = await request_embeddings()
-                    if await cancellation_token.any_cancelled():
-                        raise asyncio.CancelledError()
-            else:
-                response = await request_embeddings()
-
-            if response:
-                if provider == "gemini":
-                    gemini_embeddings = response.get('embeddings') or []
-                    if gemini_embeddings:
-                        return [list(item['values']) for item in gemini_embeddings]
-                elif 'data' in response:
-                    return [item['embedding'] for item in response['data']]
-
-        except ContextAdmissionError:
-            # Defensive: a context-admission verdict is fatal and never an
-            # empty-vector fallback (the guard above already raises pre-dispatch).
-            raise
-        except Exception as e:
-            logger.error(f"Failed to get embeddings: {e}")
-
-        return [[] for _ in texts]  # Return empty embeddings on failure
+        if cancellation_token and await cancellation_token.any_cancelled():
+            raise asyncio.CancelledError()
+        if cancellation_token:
+            handle = ProviderCallHandle(
+                call_id="", provider=provider, model_id=embedding_model,
+                session_id=cancellation_token.session_id, phase=cancellation_token.phase,
+                operation="feedback_embeddings", close=close_provider_task)
+            async with cancellation_token.registry.begin_provider_call(handle):
+                vectors = await request_embeddings()
+                if await cancellation_token.any_cancelled():
+                    raise asyncio.CancelledError()
+                return vectors
+        return await request_embeddings()
 
     async def synthesize_normative_rules(
         self,
@@ -1161,8 +1131,7 @@ class FeedbackMemoryManager:
             )
 
         # Single commit after all issues have been processed
-        await self.db._pool.commit()
-        asyncio.create_task(self.db._maybe_piggyback_cleanup())
+        self.db.schedule_cleanup()
 
     async def build_iteration_prompt(
         self,

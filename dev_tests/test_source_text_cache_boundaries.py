@@ -52,7 +52,7 @@ def test_qa_cache_prefix_excludes_round_task_criteria_and_candidate():
 
 
 @pytest.mark.parametrize("pipeline", ["preflight", "auto_qa"])
-def test_source_json_prefix_preserves_escaping_payload_and_provenance(pipeline):
+async def test_source_json_prefix_preserves_escaping_payload_and_provenance(pipeline):
     request = ContentRequest(prompt="Write a concise biography.", source_text=SOURCE, shared_context=SHARED)
     registry = ModelAliasRegistry.from_request(request)
     if pipeline == "preflight":
@@ -93,7 +93,7 @@ def test_source_json_prefix_preserves_escaping_payload_and_provenance(pipeline):
     frontier._assert_model_blind_prompt(prompt=prompt, system_prompt="Validate the request.",
                                         model_alias_registry=registry, prompt_safety_parts=parts,
                                         boundary=pipeline, shared_context=SHARED)
-    budget = frontier._build_chat_call_budget(provider="fake", model_id="offline", call_id=pipeline,
+    budget = await frontier._build_chat_call_budget(provider="fake", model_id="offline", call_id=pipeline,
                                              prompt=prompt, system_prompt=None, shared_context=SHARED, reserved_output_tokens=32)
     assert [part.name for part in budget.components] == ["shared_context", "prompt"]
     assert budget.components[0].text == SHARED

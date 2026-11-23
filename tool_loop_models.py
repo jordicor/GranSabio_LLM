@@ -12,6 +12,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+
+class ToolLoopExhausted(RuntimeError):
+    """A paid validation loop ended without an acceptable draft."""
+
 if TYPE_CHECKING:
     from tools.ai_json_cleanroom import ValidationResult
 

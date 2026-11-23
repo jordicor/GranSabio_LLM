@@ -1072,3 +1072,19 @@ class TestProjectEndpoints:
         long_id = "x" * 129
         response = client.get(f"/status/project/{long_id}")
         assert response.status_code == 400
+
+
+def test_generate_validation_error_with_nan_input_is_json_safe(client):
+    """
+    Given: A JSON body whose temperature is NaN (accepted by Python's parser, invalid for JSON output)
+    When: POST /generate is called
+    Then: Returns 422 with the rejected field, never a 500 from the error serializer
+    """
+    response = client.post(
+        "/generate",
+        content=b'{"prompt": "Write a comprehensive article about testing", "temperature": NaN}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "temperature"]
+    assert response.json()["detail"][0]["input"] == "nan"

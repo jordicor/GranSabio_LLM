@@ -399,25 +399,25 @@ class AsyncGranSabioClient:
 
     async def start_project(self, project_id: str) -> Dict[str, Any]:
         """Activate/reactivate a project."""
-        async with await self._request("POST", f"/project/start/{project_id}") as response:
+        async with await self._request("POST", f"/project/start/{quote(project_id, safe='')}") as response:
             if response.status not in (200, 201):
-                text = await self._read_error_text(response, f"/project/start/{project_id}")
+                text = await self._read_error_text(response, f"/project/start/{quote(project_id, safe='')}")
                 raise GranSabioClientError(
                     f"Failed to start project: {text}",
                     status_code=response.status
                 )
-            return await self._read_json_no_retry(response, f"/project/start/{project_id}")
+            return await self._read_json_no_retry(response, f"/project/start/{quote(project_id, safe='')}")
 
     async def stop_project(self, project_id: str) -> Dict[str, Any]:
         """Cancel a project and all its active sessions."""
-        async with await self._request("POST", f"/project/stop/{project_id}") as response:
+        async with await self._request("POST", f"/project/stop/{quote(project_id, safe='')}") as response:
             if response.status not in (200, 202):
-                text = await self._read_error_text(response, f"/project/stop/{project_id}")
+                text = await self._read_error_text(response, f"/project/stop/{quote(project_id, safe='')}")
                 raise GranSabioClientError(
                     f"Failed to stop project: {text}",
                     status_code=response.status
                 )
-            return await self._read_json_no_retry(response, f"/project/stop/{project_id}")
+            return await self._read_json_no_retry(response, f"/project/stop/{quote(project_id, safe='')}")
 
     # =========================================================================
     # Content Generation
@@ -662,7 +662,7 @@ class AsyncGranSabioClient:
 
     async def get_status(self, session_id: str) -> Dict[str, Any]:
         """Get current status of a generation session."""
-        endpoint = f"/status/{session_id}"
+        endpoint = f"/status/{quote(session_id, safe='')}"
         async with await self._request("GET", endpoint) as response:
             if response.status in _RETRYABLE_POLL_STATUS_CODES:
                 raise TransientGranSabioError(
@@ -679,7 +679,7 @@ class AsyncGranSabioClient:
 
     async def get_result(self, session_id: str) -> Dict[str, Any]:
         """Get the result of a completed generation session."""
-        endpoint = f"/result/{session_id}"
+        endpoint = f"/result/{quote(session_id, safe='')}"
         async with await self._request("GET", endpoint) as response:
             if response.status == 202:
                 return {"status": "in_progress", "session_id": session_id}
@@ -801,7 +801,7 @@ class AsyncGranSabioClient:
 
     async def stop_session(self, session_id: str) -> Dict[str, Any]:
         """Cancel an active generation session."""
-        endpoint = f"/stop/{session_id}"
+        endpoint = f"/stop/{quote(session_id, safe='')}"
         async with await self._request("POST", endpoint) as response:
             if response.status not in (200, 202):
                 text = await self._read_error_text(response, endpoint)
@@ -1593,7 +1593,7 @@ class AsyncGranSabioClient:
         ``last_stream_errors``, ``error_callback``) and never abort the run:
         the result is still fetched by polling.
         """
-        url = f"{self.base_url}/stream/{session_id}"
+        url = f"{self.base_url}/stream/{quote(session_id, safe='')}"
         router = SessionEventRouter(callbacks, activity=activity_monitor)
         parser = SSEParser()
         try:

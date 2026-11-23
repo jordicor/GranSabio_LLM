@@ -22,6 +22,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 import httpx
 from fastapi import UploadFile
 
+from ai_runtime.audio import AUDIO_MIME_FORMATS, AudioInputError, inspect_audio
 from config import AttachmentSettings
 from services import attachment_validation
 from services.attachment_store import (
@@ -50,10 +51,6 @@ except ImportError:  # pragma: no cover - optional dependency
 
 logger = logging.getLogger(__name__)
 
-# Environment knobs with safe defaults. They live here (instead of config.py)
-# so the hardening applies to every deployment without requiring config edits;
-# each one can be overridden explicitly when needed.
-_FACTORY_RETENTION_DAYS = 32850
 _CLEANUP_STARTUP_DELAY_SECONDS = 30
 
 
@@ -99,7 +96,6 @@ class AttachmentManager:
 
         self.settings = settings
         self.store = AttachmentStore(settings=settings)
-        self.store.ensure_schema()
         self.pepper = pepper
         self._recent_url_cache: Dict[Tuple[str, str], Tuple[str, str, float]] = {}
         self._url_cache_lock = asyncio.Lock()
@@ -114,13 +110,6 @@ class AttachmentManager:
         self._metadata_signing_key = hashlib.sha256(
             f"attachment-metadata-signing:{pepper}".encode("utf-8")
         ).digest()
-        self._signature_accept_legacy = _env_bool(
-            "GRANSABIO_ATTACHMENTS_SIGNATURE_ACCEPT_LEGACY", True
-        )
-        self._gc_enabled_default = _env_bool("GRANSABIO_ATTACHMENTS_GC_ENABLED", True)
-        self._default_retention_days = max(
-            _env_int("GRANSABIO_ATTACHMENTS_RETENTION_DAYS", 30), 1
-        )
         self.max_total_storage_bytes = max(
             _env_int("GRANSABIO_ATTACHMENTS_MAX_TOTAL_BYTES", 10 * 1024**3), 0
         )
@@ -288,7 +277,8 @@ class AttachmentManager:
                 if (
                     not resolved_mime
                     or resolved_mime == "application/octet-stream"
-                    or resolved_mime not in attachment_validation.SAFE_MIME_WHEN_MAGIC_MISSING
+                    or (resolved_mime not in attachment_validation.SAFE_MIME_WHEN_MAGIC_MISSING
+                        and resolved_mime not in AUDIO_MIME_FORMATS)
                 ):
                     raise AttachmentValidationError("MIME type is not permitted without python-magic")
 
@@ -610,7 +600,7 @@ class AttachmentManager:
             target_hash = normalized
 
         report = CleanupReport(dry_run=dry_run)
-        effective_retention_days = retention_days if retention_days is not None else self._effective_retention_days()
+        effective_retention_days = retention_days if retention_days is not None else self.settings.retention_days
         if effective_retention_days and effective_retention_days > 0:
             cutoff = datetime.utcnow() - timedelta(days=effective_retention_days)
             cutoff_text = cutoff.replace(microsecond=0).isoformat() + "Z"
@@ -633,10 +623,10 @@ class AttachmentManager:
                     )
                 )
 
-        gc_dry_run = dry_run or not self._blob_gc_enabled()
+        gc_dry_run = dry_run or not self.settings.blob_gc_enabled
         gc_result = self.store.gc_unreferenced_blobs(dry_run=gc_dry_run)
         if gc_result["scanned"]:
-            if not dry_run and not self._blob_gc_enabled():
+            if not dry_run and not self.settings.blob_gc_enabled:
                 report.issues.append("Blob garbage collection is disabled; unreferenced blobs were left in place")
             action = "Would remove" if gc_dry_run else "Removed"
             detail = (
@@ -660,21 +650,6 @@ class AttachmentManager:
             )
 
         return report
-
-    def _blob_gc_enabled(self) -> bool:
-        """Effective blob GC flag: enabled by default unless explicitly disabled."""
-
-        if self.settings.blob_gc_enabled:
-            return True
-        return self._gc_enabled_default
-
-    def _effective_retention_days(self) -> int:
-        """Effective retention: explicit config wins; the factory default is capped."""
-
-        configured = self.settings.retention_days
-        if configured != _FACTORY_RETENTION_DAYS:
-            return configured
-        return self._default_retention_days
 
     def _sweep_temp_files(self, *, dry_run: bool) -> int:
         """Remove stale temporary upload files left by interrupted ingestions."""
@@ -823,7 +798,17 @@ class AttachmentManager:
             self._enforce_storage_quota(incoming_bytes=total_bytes)
             self._validate_declared_size(actual=total_bytes, declared=declared_size)
 
-            detected_mime = self._detect_mime(bytes(sample), temp_path)
+            audio_validated = resolved_mime.lower() in AUDIO_MIME_FORMATS
+            if audio_validated:
+                try:
+                    audio_bytes = await asyncio.to_thread(temp_path.read_bytes)
+                    detected_mime, _, _ = await asyncio.to_thread(
+                        inspect_audio, audio_bytes, resolved_mime,
+                    )
+                except AudioInputError as exc:
+                    raise AttachmentValidationError(str(exc)) from exc
+            else:
+                detected_mime = self._detect_mime(bytes(sample), temp_path)
             final_mime = resolved_mime
             if detected_mime:
                 self._validate_mime(detected_mime, source="detected")
@@ -839,7 +824,7 @@ class AttachmentManager:
             else:
                 self._validate_mime(resolved_mime, source="declared")
 
-            if magic is None:
+            if magic is None and not audio_validated:
                 safe_mime = (final_mime or "").lower()
                 if safe_mime not in attachment_validation.SAFE_MIME_WHEN_MAGIC_MISSING:
                     raise AttachmentValidationError("MIME type is not permitted without python-magic")
@@ -969,13 +954,6 @@ class AttachmentManager:
             self._metadata_signing_key, canonical.encode("utf-8"), hashlib.sha256
         ).hexdigest()
 
-    def _compute_legacy_metadata_signature(self, payload: Dict[str, Any]) -> str:
-        """Legacy unsalted SHA-256 signature, kept only for migration reads."""
-
-        data = {k: v for k, v in payload.items() if k != "metadata_signature"}
-        canonical = std_json.dumps(data, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
     def _metadata_signature_payload(self, row: AttachmentUploadRow) -> Dict[str, Any]:
         """Rebuild the canonical payload signed when the upload was persisted."""
 
@@ -1007,10 +985,6 @@ class AttachmentManager:
         expected = self._compute_metadata_signature(payload)
         if secrets.compare_digest(expected, row.metadata_signature):
             return
-        if self._signature_accept_legacy:
-            legacy = self._compute_legacy_metadata_signature(payload)
-            if secrets.compare_digest(legacy, row.metadata_signature):
-                return
         logger.warning(
             "Attachment metadata signature mismatch for upload %s; refusing to serve it",
             row.upload_id,
@@ -1136,6 +1110,10 @@ class AttachmentManager:
         key = (username, url)
         expires_at = time.time() + self.settings.url_cache_ttl_seconds
         async with self._url_cache_lock:
+            now = time.time()
+            self._recent_url_cache = {key: entry for key, entry in self._recent_url_cache.items() if entry[2] > now}
+            if key not in self._recent_url_cache and len(self._recent_url_cache) >= 1024:
+                self._recent_url_cache.pop(next(iter(self._recent_url_cache)))
             self._recent_url_cache[key] = (record.upload_id, record.sha256, expires_at)
 
     async def _prune_cache_entry(self, key: Tuple[str, str]) -> None:

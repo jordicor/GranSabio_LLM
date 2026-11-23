@@ -2964,7 +2964,7 @@ function contentStatusOf(data) {
  * Anything labelled other than `draft` closes the attempt and publishes the
  * whole text (C0.7): the accepted commits (`accepted_stream`, `accepted_json`,
  * `tool_loop_final`) and the candidate a later guard republished as rejected
- * (`rejected_json`). A consumer that appends must REPLACE what it accumulated
+ * (`rejected_json` or `rejected_candidate`). A consumer that appends must REPLACE what it accumulated
  * for that (session, phase), or it shows the dead draft glued to the text that
  * supersedes it.
  * @param {Object} data - Parsed chunk event

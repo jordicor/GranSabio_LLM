@@ -14,14 +14,15 @@ import os
 import sys
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from dotenv import load_dotenv
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, SecretStr
 
 # context_budget owns the single source of truth for admission knobs/defaults.
 # It does NOT import config at module load time, so this import is cycle-safe.
 import context_budget
+import counting_executor
 
 # Use optimized JSON (3.6x faster than standard json)
 import json_utils as json
@@ -421,6 +422,9 @@ def _match_model_family_floor(
     return None
 
 
+AUDIO_ADMISSION_TOKENS_PER_SECOND = 50  # Conservative across supported audio routes.
+
+
 class AttachmentSettings(BaseModel):
     """Attachment ingestion configuration and limits."""
 
@@ -439,6 +443,11 @@ class AttachmentSettings(BaseModel):
             "image/png",
             "image/gif",
             "image/webp",
+            "audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave",
+            "audio/mpeg", "audio/mp3", "audio/flac", "audio/x-flac",
+            "audio/ogg", "audio/opus", "application/ogg",
+            "audio/mp4", "audio/m4a", "audio/x-m4a",
+            "audio/aac", "audio/x-aac", "audio/aiff", "audio/x-aiff",
         ],
         description="MIME types permitted for attachments",
     )
@@ -447,6 +456,7 @@ class AttachmentSettings(BaseModel):
             ".txt", ".md", ".json", ".pdf",
             # Image extensions for vision support
             ".jpg", ".jpeg", ".png", ".gif", ".webp",
+            ".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".aiff", ".aif",
         ],
         description="File extensions permitted for attachments",
     )
@@ -637,6 +647,15 @@ class DebuggerSettings(BaseModel):
         default="debugger_history.db",
         description="SQLite database file for debugger storage"
     )
+    backend: Literal["sqlite", "postgresql"] = Field(default="sqlite", description="Debugger storage backend")
+    database_url: SecretStr = Field(default=SecretStr(""), description="PostgreSQL URI, including the required TLS policy")
+    instance_id: str = Field(default="", description="Stable installation identity; required for PostgreSQL schema isolation")
+    pg_spill: bool = Field(default=True, description="Allow a private local journal during PostgreSQL outages")
+    pg_strict: bool = Field(default=False, description="Require PostgreSQL before admitting new provider work")
+    pg_ram_bytes: int = Field(default=64 * 1024 * 1024, ge=4096, description="Capture RAM budget, including coalescer and in-flight copies")
+    pg_ram_seconds: float = Field(default=30, gt=0, description="Maximum volatile backlog age before spill or admission backpressure")
+    pg_spool_bytes: int = Field(default=1024 * 1024 * 1024, ge=4096, description="Contingency journal byte quota; never an expiry policy")
+    pg_spool_path: str = Field(default="", description="Private local contingency journal; empty uses the debugger state directory")
     retention_days: Optional[int] = Field(
         default=None,
         ge=0,
@@ -650,6 +669,13 @@ class DebuggerSettings(BaseModel):
         ge=1,
         description="Maximum number of sessions returned per debugger list page"
     )
+
+    def persistence_policy(self):
+        """Build the PostgreSQL capture policy without changing the SQLite backend."""
+        from debugger_transport import PersistencePolicy
+        return PersistencePolicy(spill=self.pg_spill, strict=self.pg_strict,
+                                 ram_bytes=self.pg_ram_bytes, ram_seconds=self.pg_ram_seconds,
+                                 spool_bytes=self.pg_spool_bytes, spool_path=self.pg_spool_path)
 
 
 class ImageSettings(BaseModel):
@@ -972,6 +998,18 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         default=context_budget.DEFAULT_ADMISSION_MODE,
         description="Context admission mode: 'enforce' (default) or 'observe'",
     )
+    CPU_COUNT_WORKERS: int = Field(
+        default=counting_executor.DEFAULT_COUNT_WORKERS,
+        description="Shared threads for large token-counting batches; services stay in the coordinator",
+    )
+    CPU_COUNT_MAX_JOBS: int = Field(
+        default=counting_executor.DEFAULT_COUNT_MAX_JOBS,
+        description="Maximum submitted counting batches, including running jobs after caller cancellation",
+    )
+    CPU_COUNT_MAX_BYTES: int = Field(
+        default=counting_executor.DEFAULT_COUNT_MAX_BYTES,
+        description="Maximum estimated retained input bytes across submitted counting batches",
+    )
     CONTEXT_NEAR_LIMIT_THRESHOLD: float = Field(
         default=context_budget.DEFAULT_NEAR_LIMIT_THRESHOLD,
         description="Utilization fraction that flags a call as near_limit (never blocks)",
@@ -1249,6 +1287,8 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
     # Verbose logging
     VERBOSE_MAX_ENTRIES: int = Field(default=100, description="Maximum verbose log entries per session")
     LOG_LEVEL: str = Field(default="INFO", description="Logging level")
+    LOG_MODE: str = Field(default="normal", description="Process output: normal, quiet or verbose; independent of request progress")
+    LOG_BACKEND: str = Field(default="local", description="Operational logs: local or postgresql; see STORAGE_AND_LOGS.md")
 
     # Gran Sabio escalation limits (defaults)
     DEFAULT_GRAN_SABIO_LIMIT_PER_ITERATION: int = Field(
@@ -1505,7 +1545,9 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         typesafe_base_url = os.getenv("TYPESAFE_BASE_URL", "").strip()
         if typesafe_base_url:
             self.TYPESAFE_BASE_URL = typesafe_base_url.rstrip("/")
-        self.OLLAMA_HOST = os.getenv("OLLAMA_HOST", self.OLLAMA_HOST)
+        # OLLAMA_HOST may be the daemon's machine-wide listening address.
+        # This app-owned client URL takes precedence without changing that env.
+        self.OLLAMA_HOST = os.getenv("GRANSABIO_OLLAMA_BASE_URL", "").strip() or os.getenv("OLLAMA_HOST", self.OLLAMA_HOST)
         self.LOCAL_ENDPOINTS_CONFIG_PATH = os.getenv(
             "LOCAL_ENDPOINTS_CONFIG_PATH", self.LOCAL_ENDPOINTS_CONFIG_PATH
         )
@@ -1557,6 +1599,10 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         # Context Admission Policy knobs (resolved by context_budget so the
         # numeric defaults are never duplicated here).
         self.CONTEXT_ADMISSION_MODE = context_budget.resolve_admission_mode()
+        counting_settings = counting_executor.resolve_counting_settings()
+        self.CPU_COUNT_WORKERS = counting_settings["workers"]
+        self.CPU_COUNT_MAX_JOBS = counting_settings["max_jobs"]
+        self.CPU_COUNT_MAX_BYTES = counting_settings["max_bytes"]
         self.CONTEXT_NEAR_LIMIT_THRESHOLD = context_budget.resolve_near_limit_threshold()
         self.CONTEXT_MARGIN_EXACT_PROVIDER = context_budget.resolve_margin(
             context_budget.CountMethod.EXACT_PROVIDER
@@ -1614,13 +1660,9 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                 pass
 
         retention_override = os.getenv("ATTACHMENTS_RETENTION_DAYS")
-        if retention_override:
-            try:
-                parsed = int(retention_override)
-                if parsed > 0:
-                    self.ATTACHMENTS.retention_days = parsed
-            except ValueError:
-                pass
+        attachment_overrides = {}
+        if retention_override is not None:
+            attachment_overrides["retention_days"] = retention_override
 
         dedupe_db_path_override = os.getenv("ATTACHMENTS_DEDUPE_DB_PATH")
         if dedupe_db_path_override:
@@ -1632,12 +1674,11 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
 
         blob_gc_override = os.getenv("ATTACHMENTS_BLOB_GC_ENABLED")
         if blob_gc_override is not None:
-            self.ATTACHMENTS.blob_gc_enabled = blob_gc_override.strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }
+            attachment_overrides["blob_gc_enabled"] = blob_gc_override
+        if attachment_overrides:
+            self.ATTACHMENTS = AttachmentSettings.model_validate(
+                {**self.ATTACHMENTS.model_dump(), **attachment_overrides}
+            )
 
         feedback_enabled_override = os.getenv("FEEDBACK_MEMORY_ENABLED")
         if feedback_enabled_override is not None:
@@ -1652,6 +1693,24 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
         debugger_path_override = os.getenv("DEBUGGER_DB_PATH")
         if debugger_path_override:
             self.DEBUGGER.db_path = debugger_path_override
+
+        debugger_backend = os.getenv("DEBUGGER_BACKEND", "sqlite").strip().lower()
+        if debugger_backend not in {"sqlite", "postgresql"}:
+            raise ValueError("DEBUGGER_BACKEND must be sqlite or postgresql")
+        self.DEBUGGER.backend = debugger_backend
+        self.DEBUGGER.database_url = SecretStr(os.getenv("DEBUGGER_DATABASE_URL", ""))
+        self.DEBUGGER.instance_id = os.getenv("DEBUGGER_INSTANCE_ID", "").strip()
+        if self.DEBUGGER.backend == "postgresql" or self.DEBUGGER.instance_id:
+            from debugger_postgres import debugger_schema
+
+            debugger_schema(self.DEBUGGER.instance_id)
+        self.DEBUGGER.pg_spill = os.getenv("DEBUGGER_PG_SPILL", "true").lower() in {"1", "true", "yes", "on"}
+        self.DEBUGGER.pg_strict = os.getenv("DEBUGGER_PG_STRICT", "false").lower() in {"1", "true", "yes", "on"}
+        self.DEBUGGER.pg_ram_bytes = int(os.getenv("DEBUGGER_PG_RAM_BYTES", str(self.DEBUGGER.pg_ram_bytes)))
+        self.DEBUGGER.pg_ram_seconds = float(os.getenv("DEBUGGER_PG_RAM_SECONDS", str(self.DEBUGGER.pg_ram_seconds)))
+        self.DEBUGGER.pg_spool_bytes = int(os.getenv("DEBUGGER_PG_SPOOL_BYTES", str(self.DEBUGGER.pg_spool_bytes)))
+        self.DEBUGGER.pg_spool_path = os.getenv("DEBUGGER_PG_SPOOL_PATH", "")
+        self.DEBUGGER.persistence_policy()  # Reject invalid bounds at configuration time.
 
         # Single retention setting for the debugger (C13.1). Unset or 0 means
         # keep every session forever; a positive value restores time-based
@@ -1804,6 +1863,8 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
 
         # Logging
         self.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+        self.LOG_MODE = os.getenv("LOG_MODE", "normal")
+        self.LOG_BACKEND = os.getenv("LOG_BACKEND", "local")
         self.VERBOSE_MAX_ENTRIES = self._parse_env_int(
             "VERBOSE_MAX_ENTRIES", os.getenv("VERBOSE_MAX_ENTRIES"), 100,
             field_name="VERBOSE_MAX_ENTRIES", minimum=1,
@@ -3988,9 +4049,11 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
 
     def get_available_models(self) -> Dict[str, List[Dict[str, Any]]]:
         """Get list of all available models organized by provider."""
+        from ai_runtime.audio import audio_support_info
         available_models = {}
 
-        specs = self.model_specs.get("model_specifications", {})
+        catalog = self.model_specs
+        specs = catalog.get("model_specifications", {})
 
         # Initialize available_models with all providers found in specs
         for provider in specs.keys():
@@ -4016,6 +4079,9 @@ Act to the highest editorial standards and deliver a concise, well-reasoned deci
                 if provider == "chatgpt":
                     model_entry.update(self.get_subscription_capacity_metadata(model_name))
                     model_entry["max_context_window"] = model_data.get("max_context_window")
+                model_entry["audio_input"] = audio_support_info(
+                    specs=catalog, provider=provider, model_id=model_entry["model_id"],
+                )
 
                 timeout_hint = self._calculate_reasoning_timeout(
                     {

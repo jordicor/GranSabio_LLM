@@ -54,6 +54,20 @@ def _new_session(sessions, session_id: str) -> dict:
     return session
 
 
+@pytest.mark.asyncio
+async def test_quiet_preserves_client_progress_without_classifying_message_words(isolated_sessions, monkeypatch, caplog):
+    import logging
+
+    import logging_policy
+
+    monkeypatch.setattr(logging_policy, "_policy", logging_policy.LoggingPolicy(mode="quiet", level=logging.WARNING))
+    session = _new_session(isolated_sessions, "quiet-cursor-fixture")
+    await add_verbose_log("quiet-cursor-fixture", "Explain the rejection criterion before generation")
+    assert session["verbose_log_next_offset"] == 1
+    assert "rejection criterion" in session["verbose_log"][0]
+    assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
+
+
 # ---------------------------------------------------------------------------
 # The pure cursor window
 # ---------------------------------------------------------------------------

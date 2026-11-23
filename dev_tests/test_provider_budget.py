@@ -74,9 +74,9 @@ def system_one_budget(**changes):
                        reserved_output_tokens=0, **changes)
 
 
-def test_typesafe_opt_in_requires_transition_and_shares_existing_spend(tmp_path):
+async def test_typesafe_opt_in_requires_transition_and_shares_existing_spend(tmp_path):
     old = ProviderBudget(policy(tmp_path, limit_usd=Decimal("0.003")))
-    old.settle(old.reserve(100), raw_usage())
+    await old.settle(old.reserve(100), raw_usage())
     old_rows = rows(old)
     assert "typesafe" not in json.loads(old.policy.signature())
     selected = system_one_policy(tmp_path, limit_usd=Decimal("0.003"))
@@ -87,12 +87,12 @@ def test_typesafe_opt_in_requires_transition_and_shares_existing_spend(tmp_path)
     old.transition_policy(selected, expected_signature=old.policy.signature(), reason="Enable typed QA.")
     ledger = ProviderBudget(selected)
     ledger.admit(system_one_budget())
-    with ledger.system_one_dispatch(model="jev-latest", call_id="qa.evaluate_layer") as reservation:
+    async with ledger.system_one_dispatch(model="jev-latest", call_id="qa.evaluate_layer") as reservation:
         assert reservation.output_tokens_limit == 0
         assert reservation.upper_micro_usd == 2753
         with pytest.raises(ProviderBudgetError, match="accumulated"):
             ledger.reserve(100)
-        ledger.settle(reservation, {"input_tokens": 120, "output_tokens": 33})
+        await ledger.settle(reservation, {"input_tokens": 120, "output_tokens": 33})
     assert rows(ledger)[:-1] == old_rows
     settled = rows(ledger)[-1]
     assert settled["model"] == "jev-latest"
@@ -104,7 +104,7 @@ def test_typesafe_opt_in_requires_transition_and_shares_existing_spend(tmp_path)
     assert ProviderBudget(selected).summary()["accounted_micro_usd"] == 12
 
 
-def test_system_one_dispatch_requires_exact_model_and_consumes_admission(tmp_path):
+async def test_system_one_dispatch_requires_exact_model_and_consumes_admission(tmp_path):
     ledger = ProviderBudget(system_one_policy(tmp_path))
     with pytest.raises(ProviderBudgetError):
         ledger.require_operation("typesafe", "another-model", "systemone.evaluate")
@@ -112,25 +112,25 @@ def test_system_one_dispatch_requires_exact_model_and_consumes_admission(tmp_pat
         ledger.require_operation("typesafe", "jev-latest", "generate_content")
     ledger.admit(system_one_budget())
     with pytest.raises(asyncio.CancelledError):
-        with ledger.system_one_dispatch(model="jev-latest", call_id="qa.evaluate_layer"):
+        async with ledger.system_one_dispatch(model="jev-latest", call_id="qa.evaluate_layer"):
             raise asyncio.CancelledError()
     assert rows(ledger)[0]["state"] == "uncertain"
     assert rows(ledger)[0]["accounted_micro_usd"] == 2753
     with pytest.raises(ProviderBudgetError, match="matching"):
-        with ledger.system_one_dispatch(model="jev-latest", call_id="qa.evaluate_layer"):
+        async with ledger.system_one_dispatch(model="jev-latest", call_id="qa.evaluate_layer"):
             pytest.fail("Admission cannot be reused.")
 
 
 @pytest.mark.parametrize("input_tokens", [None, True, 1.5, "120", 32769])
-def test_system_one_usage_keeps_uncertain_reserve_and_halts_on_overflow(tmp_path, input_tokens):
+async def test_system_one_usage_keeps_uncertain_reserve_and_halts_on_overflow(tmp_path, input_tokens):
     ledger = ProviderBudget(system_one_policy(tmp_path))
     ledger.admit(system_one_budget())
-    with ledger.system_one_dispatch(model="jev-latest", call_id="qa.evaluate_layer") as reservation:
+    async with ledger.system_one_dispatch(model="jev-latest", call_id="qa.evaluate_layer") as reservation:
         if input_tokens == 32769:
             with pytest.raises(ProviderBudgetError, match="exceeded"):
-                ledger.settle(reservation, {"input_tokens": input_tokens, "output_tokens": 33})
+                await ledger.settle(reservation, {"input_tokens": input_tokens, "output_tokens": 33})
         else:
-            ledger.settle(reservation, {"input_tokens": input_tokens, "output_tokens": 33})
+            await ledger.settle(reservation, {"input_tokens": input_tokens, "output_tokens": 33})
     assert rows(ledger)[0]["state"] == "uncertain"
     assert rows(ledger)[0]["accounted_micro_usd"] == 2753
     assert ledger.summary()["halted"] is (input_tokens == 32769)
@@ -157,11 +157,11 @@ def test_reservation_is_atomic_across_concurrent_clients_and_restarts(tmp_path):
         ProviderBudget(replace(selected, limit_usd=Decimal("60")))
 
 
-def test_explicit_policy_transition_preserves_attempts_and_shares_the_spend_ceiling(tmp_path):
+async def test_explicit_policy_transition_preserves_attempts_and_shares_the_spend_ceiling(tmp_path):
     old_policy = policy(tmp_path, limit_usd=Decimal("0.004"))
     old_client = ProviderBudget(old_policy)
-    old_client.settle(old_client.reserve(100), raw_usage())
-    with old_client._reservation_scope(100):
+    await old_client.settle(old_client.reserve(100), raw_usage())
+    async with old_client._reservation_scope(100):
         pass
     before = rows(old_client)
     assert [row["state"] for row in before] == ["settled", "uncertain"]
@@ -196,11 +196,11 @@ def test_explicit_policy_transition_preserves_attempts_and_shares_the_spend_ceil
 @pytest.mark.parametrize("initial_limit,new_limit", [
     ("0.001", "0.002"), ("0.004", "0.001606"), ("0.004", "0.000806"),
 ])
-def test_limit_transition_preserves_attempts_and_reopens_with_new_admission(tmp_path, initial_limit, new_limit):
+async def test_limit_transition_preserves_attempts_and_reopens_with_new_admission(tmp_path, initial_limit, new_limit):
     selected = system_one_policy(tmp_path, limit_usd=Decimal(initial_limit))
     old_client = ProviderBudget(selected)
-    old_client.settle(old_client.reserve(100), raw_usage())
-    with old_client._reservation_scope(100):
+    await old_client.settle(old_client.reserve(100), raw_usage())
+    async with old_client._reservation_scope(100):
         pass
     before = rows(old_client)
     assert [row["state"] for row in before] == ["settled", "uncertain"]
@@ -254,7 +254,7 @@ def test_limit_transition_preserves_attempts_and_reopens_with_new_admission(tmp_
     ("reason", ValueError, "non-empty"),
     ("unchanged", ValueError, "must differ"),
 ])
-def test_limit_transition_rejection_does_not_mutate_the_ledger(tmp_path, rejection, exception, message):
+async def test_limit_transition_rejection_does_not_mutate_the_ledger(tmp_path, rejection, exception, message):
     selected = policy(tmp_path)
     ledger = ProviderBudget(selected)
     expected, reason, new_limit = selected.signature(), "Explicit ceiling maintenance.", Decimal("2")
@@ -266,10 +266,10 @@ def test_limit_transition_rejection_does_not_mutate_the_ledger(tmp_path, rejecti
         ledger.reserve(100)
     elif rejection == "halted":
         with pytest.raises(ProviderBudgetError, match="exceeded"):
-            ledger.settle(ledger.reserve(100), raw_usage(cost=0.002))
+            await ledger.settle(ledger.reserve(100), raw_usage(cost=0.002))
     elif rejection in {"below_accounted", "below_accounted_fraction"}:
-        ledger.settle(ledger.reserve(100), raw_usage())
-        with ledger._reservation_scope(100):
+        await ledger.settle(ledger.reserve(100), raw_usage())
+        async with ledger._reservation_scope(100):
             pass
         assert ledger.summary()["accounted_micro_usd"] == 806
         new_limit = Decimal("0.000805999" if rejection == "below_accounted_fraction" else "0.000805")
@@ -290,7 +290,7 @@ def test_limit_transition_rejection_does_not_mutate_the_ledger(tmp_path, rejecti
     ("reserved", ProviderBudgetError), ("halted", ProviderBudgetError),
     ("reason", ValueError), ("unchanged", ValueError),
 ])
-def test_policy_transition_rejection_does_not_mutate_the_ledger(tmp_path, rejection, exception):
+async def test_policy_transition_rejection_does_not_mutate_the_ledger(tmp_path, rejection, exception):
     selected = policy(tmp_path)
     ledger = ProviderBudget(selected)
     replacement = replace(selected, model="openai/gpt-5.4-mini")
@@ -305,7 +305,7 @@ def test_policy_transition_rejection_does_not_mutate_the_ledger(tmp_path, reject
         ledger.reserve(100)
     elif rejection == "halted":
         with pytest.raises(ProviderBudgetError, match="exceeded"):
-            ledger.settle(ledger.reserve(100), raw_usage(cost=0.002))
+            await ledger.settle(ledger.reserve(100), raw_usage(cost=0.002))
     elif rejection == "reason":
         reason = " "
     elif rejection == "unchanged":
@@ -364,11 +364,11 @@ def test_policy_transition_and_old_client_reservation_are_serialized(tmp_path, m
     (raw_usage(is_byok=None, cost_details={"upstream_inference_cost": 0.000010}), 16, "conservative"),
     (raw_usage(cost="0.0000001"), 1, "actual"),
 ])
-def test_complete_usage_settles_and_reports_actual_or_conservative_cost(tmp_path, usage, expected, basis):
+async def test_complete_usage_settles_and_reports_actual_or_conservative_cost(tmp_path, usage, expected, basis):
     ledger = ProviderBudget(policy(tmp_path))
     reservation = ledger.reserve(100)
-    ledger.settle(reservation, usage)
-    ledger.settle(reservation, usage)
+    await ledger.settle(reservation, usage)
+    await ledger.settle(reservation, usage)
     record = rows(ledger)[0]
     assert record["state"] == "settled" and record["accounted_micro_usd"] == expected
     assert record["cost_basis"] == basis
@@ -378,10 +378,10 @@ def test_complete_usage_settles_and_reports_actual_or_conservative_cost(tmp_path
 @pytest.mark.parametrize("usage", [None, {}, raw_usage(cost=None), raw_usage(total_tokens=None),
     raw_usage(total_tokens=13), raw_usage(is_byok=True), raw_usage(is_byok=None),
     raw_usage(cost=float("nan")), raw_usage(cost=-1), raw_usage(prompt_tokens=True)])
-def test_missing_or_invalid_usage_retains_uncertainty(tmp_path, usage):
+async def test_missing_or_invalid_usage_retains_uncertainty(tmp_path, usage):
     ledger = ProviderBudget(policy(tmp_path))
     reservation = ledger.reserve(100)
-    ledger.settle(reservation, usage)
+    await ledger.settle(reservation, usage)
     assert rows(ledger)[0]["state"] == "uncertain"
     assert ledger.summary()["accounted_micro_usd"] == reservation.upper_micro_usd
 
@@ -397,7 +397,7 @@ def test_missing_or_invalid_usage_retains_uncertainty(tmp_path, usage):
     (raw_usage(cost=float("nan")), None),
     (raw_usage(cost=-1), None),
 ])
-def test_session_usage_bills_exactly_what_the_ledger_settles(tmp_path, usage, expected_micro_usd):
+async def test_session_usage_bills_exactly_what_the_ledger_settles(tmp_path, usage, expected_micro_usd):
     """The OpenRouter billed ``cost`` follows settle's BYOK rule, so session
     telemetry and the spend ledger never disagree on what the account paid."""
     from ai_runtime.usage import provider_billed_cost, usage_with_finish_metadata
@@ -405,7 +405,7 @@ def test_session_usage_bills_exactly_what_the_ledger_settles(tmp_path, usage, ex
 
     ledger = ProviderBudget(policy(tmp_path))
     reservation = ledger.reserve(100)
-    ledger.settle(reservation, usage)
+    await ledger.settle(reservation, usage)
     record = rows(ledger)[0]
     billed = provider_billed_cost(usage)
     normalized = usage_with_finish_metadata(usage, None, provider="openrouter")
@@ -422,11 +422,11 @@ def test_session_usage_bills_exactly_what_the_ledger_settles(tmp_path, usage, ex
     assert normalized["cost_basis"] == "provider_billed"
 
 
-def test_known_usage_exceeding_bounds_halts_new_requests_and_preserves_observed_cost(tmp_path):
+async def test_known_usage_exceeding_bounds_halts_new_requests_and_preserves_observed_cost(tmp_path):
     ledger = ProviderBudget(policy(tmp_path))
     reservation = ledger.reserve(100)
     with pytest.raises(ProviderBudgetError, match="exceeded"):
-        ledger.settle(reservation, raw_usage(cost=0.002))
+        await ledger.settle(reservation, raw_usage(cost=0.002))
     assert ledger.summary()["halted"] is True
     assert rows(ledger)[0]["accounted_micro_usd"] == 2000
     with pytest.raises(ProviderBudgetError, match="halted"):
@@ -444,16 +444,39 @@ def test_unsupported_capabilities_fail_before_any_reservation(tmp_path, changes)
     assert not rows(ledger)
 
 
-def test_dispatch_consumes_its_admission_and_failure_retains_reservation(tmp_path):
+async def test_dispatch_consumes_its_admission_and_failure_retains_reservation(tmp_path):
     ledger = ProviderBudget(policy(tmp_path))
     ledger.admit(call_budget())
     with pytest.raises(asyncio.CancelledError):
-        with ledger.dispatch(model=MODEL, max_tokens=100, call_id="ai_service.generate_content"):
+        async with ledger.dispatch(model=MODEL, max_tokens=100, call_id="ai_service.generate_content"):
             raise asyncio.CancelledError()
     assert rows(ledger)[0]["state"] == "uncertain"
     with pytest.raises(ProviderBudgetError, match="matching"):
-        with ledger.dispatch(model=MODEL, max_tokens=100, call_id="ai_service.generate_content"):
+        async with ledger.dispatch(model=MODEL, max_tokens=100, call_id="ai_service.generate_content"):
             pytest.fail("No second HTTP dispatch can reuse an admission.")
+
+
+async def test_locked_ledger_keeps_event_loop_responsive_and_canceled_reserve_accounted(tmp_path):
+    ledger = ProviderBudget(policy(tmp_path))
+    ledger.admit(call_budget())
+    entered = False
+
+    async def dispatch():
+        nonlocal entered
+        async with ledger.dispatch(model=MODEL, max_tokens=100, call_id="ai_service.generate_content"):
+            entered = True
+
+    with ledger._connection() as locked:
+        locked.execute("BEGIN IMMEDIATE")
+        task = asyncio.create_task(dispatch())
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        task.cancel()
+        locked.execute("ROLLBACK")
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not entered
+    assert rows(ledger)[0]["state"] == "uncertain"
 
 
 def test_routing_ceiling_preserves_stricter_user_caps(tmp_path):
@@ -725,7 +748,7 @@ async def test_tool_outer_retry_is_accounted_and_sdk_retries_stay_disabled(servi
 
 
 @pytest.mark.asyncio
-async def test_tool_reasoning_retry_has_its_own_reservation(service):
+async def test_tool_reasoning_rejection_does_not_change_policy_or_repeat_request(service):
     sent = []
     def wire(request):
         sent.append(json.loads(request.content))
@@ -735,11 +758,12 @@ async def test_tool_reasoning_retry_has_its_own_reservation(service):
         return tool_wire()
     service.openrouter_client = sdk_client(wire)
     try:
-        await consume_tool_turn(service, tool_params(service, reasoning_effort="minimal"))
+        with pytest.raises(openai.BadRequestError):
+            await consume_tool_turn(service, tool_params(service, reasoning_effort="minimal"))
     finally:
         await service.openrouter_client.close()
-    assert [request["reasoning_effort"] for request in sent] == ["minimal", "medium"]
-    assert [record["state"] for record in rows(service.provider_budget)] == ["uncertain", "settled"]
+    assert [request["reasoning_effort"] for request in sent] == ["minimal"]
+    assert [record["state"] for record in rows(service.provider_budget)] == ["uncertain"]
 
 
 @pytest.mark.asyncio
@@ -795,7 +819,7 @@ async def test_normal_validation_loop_reaches_the_bounded_http_edge(service, mon
 
 
 @pytest.mark.parametrize("declared_parameter", ["reasoning", "reasoning_effort"])
-def test_catalog_reasoning_survives_routing_token_validation_and_budget(service, monkeypatch, declared_parameter):
+async def test_catalog_reasoning_survives_routing_token_validation_and_budget(service, monkeypatch, declared_parameter):
     """Exercise the real routing/validation chain with declarative catalog metadata."""
     from config import config
     from llm_routing import LLMRoutingError, resolve_call
@@ -818,11 +842,11 @@ def test_catalog_reasoning_survives_routing_token_validation_and_budget(service,
         json_output=True, json_schema=None, tools_enabled=True,
     )
     params.update(stream=True, stream_options={"include_usage": True})
-    with service.provider_budget.tool_dispatch(provider="openrouter", model=MODEL, params=params,
+    async with service.provider_budget.tool_dispatch(provider="openrouter", model=MODEL, params=params,
                                                request_kwargs={}) as (bounded, reservation):
         assert bounded["extra_body"]["reasoning"] == {"effort": "low"}
         assert bounded["max_tokens"] == 100 and 300 <= reservation.upper_micro_usd <= 800
-        service.provider_budget.settle(reservation, raw_usage())
+        await service.provider_budget.settle(reservation, raw_usage())
 
     for unsupported in ({"supported_parameters": []}, {"provider_capabilities": {"reasoning_effort": False}}):
         previous = dict(model_data)
@@ -855,7 +879,7 @@ async def test_tool_missing_usage_exhausts_cap_before_another_http_attempt(servi
 
 
 @pytest.mark.parametrize("mode", ["off", "explicit"])
-def test_cache_policy_keeps_tool_spend_bound_and_transcript(service, mode):
+async def test_cache_policy_keeps_tool_spend_bound_and_transcript(service, mode):
     from shared_context import CacheablePrompt, PromptCachePolicy, prepend_user_context, prompt_cache_scope
 
     model = "openai/gpt-6-luna"
@@ -874,14 +898,14 @@ def test_cache_policy_keeps_tool_spend_bound_and_transcript(service, mode):
             json_output=False, json_schema=None, tools_enabled=True,
         )
         params.update(stream=True, stream_options={"include_usage": True})
-        with service.provider_budget.tool_dispatch(
+        async with service.provider_budget.tool_dispatch(
             provider="openrouter", model=model, params=params, request_kwargs={},
         ) as (bounded, reservation):
             assert bounded["messages"] == messages
             assert bounded["extra_body"]["prompt_cache_options"] == {"mode": "explicit", "ttl": "30m"}
             assert bounded["extra_body"]["provider"]["allow_fallbacks"] is False
             assert reservation.upper_micro_usd < 1000
-            service.provider_budget.settle(reservation, raw_usage())
+            await service.provider_budget.settle(reservation, raw_usage())
     assert rows(service.provider_budget)[0]["state"] == "settled"
 
 
@@ -939,20 +963,20 @@ async def test_unbounded_tool_capabilities_never_dispatch(service, changes):
     assert not rows(service.provider_budget)
 
 
-def test_rendered_admission_keeps_generous_output_without_reserving_full_window(tmp_path):
+async def test_rendered_admission_keeps_generous_output_without_reserving_full_window(tmp_path):
     ledger = ProviderBudget(policy(tmp_path, limit_usd=Decimal("2"),
         input_usd_per_million=Decimal("4"), output_usd_per_million=Decimal("15"),
         max_input_tokens=1050000, max_output_tokens=32768))
     admitted = call_budget(reserved_output_tokens=32768)
     ledger.admit(admitted)
-    with ledger.dispatch(model=MODEL, max_tokens=32768, call_id=admitted.call_id) as first:
+    async with ledger.dispatch(model=MODEL, max_tokens=32768, call_id=admitted.call_id) as first:
         assert first.output_tokens_limit == 32768
         assert first.upper_micro_usd < 1000000
         ledger.admit(admitted)
-        with ledger.dispatch(model=MODEL, max_tokens=32768, call_id=admitted.call_id) as second:
+        async with ledger.dispatch(model=MODEL, max_tokens=32768, call_id=admitted.call_id) as second:
             assert second.upper_micro_usd == first.upper_micro_usd
-            ledger.settle(second, raw_usage())
-        ledger.settle(first, raw_usage())
+            await ledger.settle(second, raw_usage())
+        await ledger.settle(first, raw_usage())
     assert all(row["state"] == "settled" for row in rows(ledger))
 
 

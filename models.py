@@ -105,6 +105,11 @@ class QALayer(BaseModel):
     order: int = Field(default=1, description="Evaluation order for this layer")
 
     # Vision support for QA evaluation
+    include_input_audio: bool = Field(
+        default=False,
+        description="Require the original audio in this QA layer. Unsupported evaluators are rejected, never run without the audio.",
+    )
+
     include_input_images: bool = Field(
         default=False,
         description="When true and images are available, include input images in QA evaluation context. Useful for layers that validate image descriptions or visual accuracy."
@@ -230,7 +235,8 @@ class SegmentBudgetsContract(BaseModel):
     per-section word budget). The target text is then validated
     deterministically against that declaration before acceptance: headings
     must match the declared titles/levels in order and every segment length
-    (heading included) must fit its budget.
+    (heading included) must fit its budget. Active contracts require explicit
+    structure_field and base_heading_level; violations always block acceptance.
     """
 
     enabled: bool = Field(default=True, description="Enable segment budget validation")
@@ -238,30 +244,41 @@ class SegmentBudgetsContract(BaseModel):
         default="segment-budgets/v1",
         description="Version of the self-declared structure schema",
     )
-    structure_field: str = Field(
-        default="composition",
+    structure_field: Optional[str] = Field(
+        default=None,
         min_length=1,
-        description="JSON field that carries the self-declared structure",
+        description="JSON field that carries the self-declared structure; required when enabled",
     )
-    base_heading_level: int = Field(
-        default=3,
+    base_heading_level: Optional[int] = Field(
+        default=None,
         ge=1,
         le=5,
-        description="Markdown heading level of top-level sections (subsections use base+1)",
-    )
-    severity: Literal["deal_breaker"] = Field(
-        default="deal_breaker",
-        description="Severity when the declared budgets are violated",
+        description="Markdown heading level of top-level sections; required when enabled (subsections use base+1)",
     )
 
+    @model_validator(mode="after")
+    def _require_enabled_fields(self) -> "SegmentBudgetsContract":
+        """An active contract must describe the caller's output explicitly."""
+        if self.enabled and (self.structure_field is None or self.base_heading_level is None):
+            raise ValueError("Enabled segment_budgets requires structure_field and base_heading_level")
+        return self
+
     class Config:
+        extra = "forbid"
         json_schema_extra = {
+            "if": {"properties": {"enabled": {"const": False}}, "required": ["enabled"]},
+            "else": {
+                "required": ["structure_field", "base_heading_level"],
+                "properties": {
+                    "structure_field": {"type": "string"},
+                    "base_heading_level": {"type": "integer"},
+                },
+            },
             "example": {
                 "enabled": True,
                 "schema_version": "segment-budgets/v1",
-                "structure_field": "composition",
-                "base_heading_level": 3,
-                "severity": "deal_breaker"
+                "structure_field": "structure",
+                "base_heading_level": 2,
             }
         }
 
@@ -303,7 +320,7 @@ class PhraseFrequencyConfig(BaseModel):
     min_n: Optional[int] = Field(default=None, ge=1, description="Override minimum n-gram length")
     max_n: Optional[int] = Field(default=None, ge=1, description="Override maximum n-gram length")
     min_count: int = Field(default=2, ge=1, description="Minimum occurrences to include in analysis")
-    mp_threshold_tokens: int = Field(default=50000, ge=1, description="Token threshold for switching to multiprocess counting")
+    mp_threshold_tokens: int = Field(default=50000, ge=50000, description="Token threshold for switching to multiprocess counting")
     workers: int = Field(default=0, ge=0, description="Explicit worker count for multiprocess mode (0 = auto)")
     summary_top_k: int = Field(default=25, ge=1, description="Top phrases per n to include in summaries")
     diagnostics_mode: Literal["off", "basic", "full"] = Field(default="off", description="Diagnostics mode for repetition analyzer")
@@ -849,7 +866,7 @@ class ContextDocumentRef(BaseModel):
     """Reference to a previously uploaded attachment for context injection."""
 
     upload_id: str = Field(..., min_length=8, description="Identifier returned by the attachment router")
-    username: str = Field(..., min_length=1, description="User identifier that owns the attachment")
+    username: str = Field(..., min_length=1, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$", description="User identifier that owns the attachment")
     intended_usage: Optional[str] = Field(default="context", description="Usage hint stored alongside the attachment")
 
 
@@ -857,8 +874,8 @@ class ImageRef(BaseModel):
     """Reference to an image attachment for vision-enabled generation."""
 
     upload_id: str = Field(..., min_length=8, description="Attachment upload_id containing the image")
-    username: str = Field(..., min_length=1, description="Owner of the attachment")
-    detail: Optional[str] = Field(
+    username: str = Field(..., min_length=1, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$", description="Owner of the attachment")
+    detail: Optional[Literal["low", "high", "auto"]] = Field(
         default=None,
         description="Detail level for OpenAI: 'low', 'high', 'auto'. None = provider default"
     )
@@ -873,6 +890,29 @@ class ImageRef(BaseModel):
         }
 
 
+class AudioRef(ContextDocumentRef):
+    """Reference to an uploaded audio file; no server paths or provider URLs."""
+
+    source_offset_seconds: Optional[float] = Field(
+        default=None, ge=0, allow_inf_nan=False,
+        description="Consumer-supplied offset in the source recording; metadata only, does not trim audio.",
+    )
+
+
+class AudioData(BaseModel):
+    """Validated audio resolved once for generation and acoustic QA."""
+
+    base64_data: str = Field(..., repr=False)
+    mime_type: str
+    format: Literal["wav", "mp3", "flac", "ogg", "m4a", "aac", "aiff"]
+    original_filename: str
+    size_bytes: int = Field(..., gt=0)
+    duration_seconds: float = Field(..., gt=0, allow_inf_nan=False)
+    sha256: str
+    upload_id: Optional[str] = None
+    source_offset_seconds: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+
+
 class ImageData(BaseModel):
     """Resolved image data ready for API calls."""
 
@@ -883,7 +923,7 @@ class ImageData(BaseModel):
     width: Optional[int] = Field(default=None, ge=1, description="Image width in pixels")
     height: Optional[int] = Field(default=None, ge=1, description="Image height in pixels")
     estimated_tokens: Optional[int] = Field(default=None, ge=0, description="Estimated token cost for this image")
-    detail: Optional[str] = Field(default=None, description="Detail level applied for OpenAI")
+    detail: Optional[Literal["low", "high", "auto"]] = Field(default=None, description="Detail level applied for OpenAI")
 
 
 class LlmAccentGuard(BaseModel):
@@ -1014,7 +1054,7 @@ class ProjectInitRequest(BaseModel):
     """Optional payload used when allocating or reserving a project identifier."""
 
     project_id: Optional[str] = Field(
-        default=None,
+        default=None, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$",
         description="Client-supplied project identifier to validate and reserve; leave empty to let the API generate one.",
     )
 
@@ -1094,9 +1134,9 @@ class ContentRequest(BaseModel):
             "only the selected field can be edited."
         )
     )
-    username: Optional[str] = Field(default=None, description="User identifier required when referencing attachments")
+    username: Optional[str] = Field(default=None, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$", description="User identifier required when referencing attachments")
     project_id: Optional[str] = Field(
-        default=None,
+        default=None, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$",
         description="Existing project identifier that should group this request with related sessions",
     )
     request_project_id: bool = Field(
@@ -1164,12 +1204,18 @@ class ContentRequest(BaseModel):
     )
 
     # Image inputs for vision-enabled generation
+    audios: Optional[List[AudioRef]] = Field(
+        default=None,
+        max_length=5,
+        description="Uploaded audio references for audio-capable models. Returned output remains text/JSON.",
+    )
+
     images: Optional[List[ImageRef]] = Field(
         default=None,
         max_length=MAX_IMAGE_REFS,
         description="List of image references for vision-enabled models (GPT-4o, Claude, Gemini)"
     )
-    image_detail: Optional[str] = Field(
+    image_detail: Optional[Literal["low", "high", "auto"]] = Field(
         default=None,
         description="Default detail level for all images: 'low', 'high', 'auto' (OpenAI-specific)"
     )
@@ -2044,7 +2090,7 @@ class ProgressUpdate(BaseModel):
     """Progress update for streaming"""
     session_id: str = Field(..., description="Session identifier")
     project_id: Optional[str] = Field(
-        default=None,
+        default=None, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$",
         description="Associated project identifier when available",
     )
     request_name: Optional[str] = Field(
@@ -2096,7 +2142,7 @@ class GenerationInitResponse(BaseModel):
     status: str = Field(..., description="Initialization status (e.g., 'initialized', 'preflight_rejected')")
     session_id: Optional[str] = Field(default=None, description="Session identifier when generation starts")
     project_id: Optional[str] = Field(
-        default=None,
+        default=None, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$",
         description="Project identifier associated with this session when provided or generated",
     )
     request_name: Optional[str] = Field(

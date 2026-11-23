@@ -47,6 +47,7 @@ from services.typesafe_client import (
     is_typesafe_provider,
     validate_questions,
 )
+from token_counting import TextComponent, TokenCounter
 
 SCHEMA_VERSION = "gransabio_context_preflight.v2"
 POLICY_SCHEMA_VERSION = "gransabio_context_budget_policy.v1"
@@ -318,22 +319,21 @@ def _count_method(provider: str, model: str) -> str:
     return str(method.value)
 
 
-def _count_components(
+async def _count_components(
     components: List[Tuple[str, str, str]],
     *,
     provider: str,
     model: str,
+    counter: TokenCounter,
 ) -> int:
     """Sum tokens for (name, text, hint) fixed components via context_budget."""
 
-    total = 0
-    for name, text, hint in components:
-        if not text:
-            continue
-        total += context_budget.make_payload_component(
-            name, text, "message", provider, model, hint, keep_text=False
-        ).tokens_estimate
-    return total
+    measured = await counter.components(
+        [TextComponent(name, text, hint=hint, keep_text=False)
+         for name, text, hint in components if text],
+        provider, model,
+    )
+    return sum(component.tokens_estimate for component in measured)
 
 
 @dataclass(frozen=True)
@@ -387,10 +387,11 @@ def _effective_reasoning_settings(
     return effort, thinking_budget
 
 
-def _build_participant(
+async def _build_participant(
     spec: ParticipantSpec,
     *,
     policy: OperationalPolicy,
+    counter: TokenCounter,
 ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
     """Return (participant payload, candidate rejection) applying the v2 math."""
 
@@ -406,10 +407,11 @@ def _build_participant(
         effective_thinking_budget = None
         effective_reasoning_tokens = spec.reasoning_tokens
     if capacity.known:
-        fixed_input = _count_components(
+        fixed_input = await _count_components(
             list(spec.fixed_components),
             provider=capacity.provider,
             model=capacity.effective_model,
+            counter=counter,
         )
         count_method = _count_method(capacity.provider, capacity.effective_model)
         context_window = capacity.context_window_tokens
@@ -425,8 +427,9 @@ def _build_participant(
         usable = min(max_input if max_input is not None else working, max(0, working - reserved))
         evidence = usable - fixed_input - spec.generated_input_tokens - margin
     else:
-        fixed_input = _count_components(
-            list(spec.fixed_components), provider="", model=spec.requested_model
+        fixed_input = await _count_components(
+            list(spec.fixed_components), provider="", model=spec.requested_model,
+            counter=counter,
         )
         count_method = "unknown"
         context_window = 0
@@ -1329,7 +1332,7 @@ def _early_rejection(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "preflight. Declare explicit qa_models and qa_layers instead."
             ),
         }
-    for field_name in ("attachments", "images", "context_documents"):
+    for field_name in ("attachments", "images", "audios", "context_documents"):
         value = payload.get(field_name)
         if value:
             return {
@@ -1342,7 +1345,7 @@ def _early_rejection(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
-def build_context_preflight_response(payload: Dict[str, Any]) -> Dict[str, Any]:
+async def build_context_preflight_response(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Build the ``gransabio_context_preflight.v2`` response for one candidate.
 
     Never raises for budget outcomes: rejections are structured payload
@@ -1365,8 +1368,9 @@ def build_context_preflight_response(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     participants: List[Dict[str, Any]] = []
     capacity_rejections: List[Dict[str, Any]] = []
+    counter = TokenCounter()
     for spec in specs:
-        participant, rejection = _build_participant(spec, policy=policy)
+        participant, rejection = await _build_participant(spec, policy=policy, counter=counter)
         participants.append(participant)
         if rejection is not None:
             capacity_rejections.append(rejection)

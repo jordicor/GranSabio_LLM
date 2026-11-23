@@ -175,6 +175,8 @@ class PhaseLogger:
 
     def _print_phase_header(self, phase_name: str, sub_label: Optional[str] = None):
         """Print phase header with color and formatting"""
+        if not self.logger.isEnabledFor(logging.INFO):
+            return
         color = PHASE_COLORS.get(phase_name, Fore.WHITE)
         icon = PHASE_ICONS.get(phase_name, "[???]")
 
@@ -194,6 +196,8 @@ class PhaseLogger:
 
     def _print_phase_footer(self, phase_name: str, elapsed: float):
         """Print phase footer with timing"""
+        if not self.logger.isEnabledFor(logging.INFO):
+            return
         color = PHASE_COLORS.get(phase_name, Fore.WHITE)
         icon = PHASE_ICONS.get(phase_name, "[???]")
 
@@ -208,6 +212,8 @@ class PhaseLogger:
 
     def info(self, message: str):
         """Log info message with current phase context"""
+        if not self.logger.isEnabledFor(logging.INFO):
+            return
         if self._current_phase:
             color = PHASE_COLORS.get(self._current_phase, Fore.WHITE)
             icon = PHASE_ICONS.get(self._current_phase, "[???]")
@@ -217,7 +223,7 @@ class PhaseLogger:
 
     def debug(self, message: str):
         """Log debug message (only if verbose)"""
-        if self.verbose:
+        if self.verbose and self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug(f"{Fore.WHITE}{Style.DIM}{message}{Style.RESET_ALL}")
 
     def warning(self, message: str):
@@ -244,7 +250,7 @@ class PhaseLogger:
             user_prompt: User prompt
             **kwargs: Additional parameters (temperature, max_tokens, etc.)
         """
-        if not self.extra_verbose:
+        if not self.extra_verbose or not self.logger.isEnabledFor(logging.INFO):
             return
 
         color = PHASE_COLORS.get(self._current_phase, Fore.WHITE)
@@ -290,7 +296,7 @@ class PhaseLogger:
             response: Full response content
             metadata: Optional metadata (tokens, timing, etc.)
         """
-        if not self.extra_verbose:
+        if not self.extra_verbose or not self.logger.isEnabledFor(logging.INFO):
             return
 
         color = PHASE_COLORS.get(self._current_phase, Fore.WHITE)
@@ -319,7 +325,7 @@ class PhaseLogger:
 
     def log_content_preview(self, content: str, max_chars: int = 500):
         """Log content preview (only if extra_verbose)"""
-        if not self.extra_verbose:
+        if not self.extra_verbose or not self.logger.isEnabledFor(logging.INFO):
             return
 
         preview = content[:max_chars]
@@ -344,6 +350,8 @@ class PhaseLogger:
             score: Optional score
             reason: Optional reason
         """
+        if not self.logger.isEnabledFor(logging.INFO):
+            return
         if decision.upper() in ["APPROVED", "PROCEED", "PASS"]:
             color = Fore.GREEN + Style.BRIGHT
             icon = "[OK]"
@@ -365,6 +373,8 @@ class PhaseLogger:
         feedback: Optional[str] = None
     ):
         """Log QA evaluation result"""
+        if not self.logger.isEnabledFor(logging.INFO):
+            return
         if is_deal_breaker:
             icon = "[X]"
             color = Fore.RED + Style.BRIGHT
@@ -393,7 +403,7 @@ class PhaseLogger:
 
     def log_timing_summary(self):
         """Log timing summary for all phases (only if extra_verbose)"""
-        if not self.extra_verbose:
+        if not self.extra_verbose or not self.logger.isEnabledFor(logging.INFO):
             return
 
         timings = self.timing_tracker.get_all()

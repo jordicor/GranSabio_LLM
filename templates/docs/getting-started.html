@@ -55,6 +55,20 @@
             </section>
 
             <!-- Base URL Section -->
+            <section id="server-output" class="docs-section">
+                <h2 class="docs-subheading">Server output and storage</h2>
+                <p>Configure the process in <code>.env</code>: <code>LOG_MODE=normal|quiet|verbose</code>
+                    controls operational output. Quiet retains warnings, errors and storage recovery notices,
+                    while suppressing routine output and HTTP access logs.</p>
+                <p><code>LOG_BACKEND=local|postgresql</code> independently chooses operational log storage.
+                    PostgreSQL requires explicit <code>LOG_DATABASE_URL</code> and <code>LOG_INSTANCE_ID</code>.
+                    Debugger history has separate <code>DEBUGGER_*</code> settings; switching backend preserves existing SQLite history.</p>
+                <p>These are server settings, not <code>/generate</code> request fields. Quiet does not reduce
+                    request progress, debugger capture or model work. See the
+                    <a href="/api-docs/storage-and-logs">storage and recovery guide</a> for profiles,
+                    limits, retention, status and shutdown guarantees.</p>
+            </section>
+
             <section id="base-url" class="docs-section">
                 <h2 class="docs-subheading">Base URL</h2>
                 <div class="code-block">

@@ -153,6 +153,8 @@ cache/
 *.pdf
 !**/README.md
 !examples/gpu_reservations/COMFYUI-LICENSE.txt
+!STORAGE_AND_LOGS.md
+!AUDIO_INPUT.md
 !requirements.txt
 !requirements-dev.txt
 !core/trusted_proxies.txt

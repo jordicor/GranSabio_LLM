@@ -30,7 +30,7 @@ from ai_service import (
 )
 from deterministic_validation import DraftValidationResult
 from provider_errors import ProviderErrorKind
-from tool_loop_models import LoopScope, OutputContract, ToolLoopEnvelope, ToolLoopOutputTruncated
+from tool_loop_models import LoopScope, OutputContract, ToolLoopEnvelope, ToolLoopExhausted, ToolLoopOutputTruncated
 
 # ============================================================================
 # Fixtures
@@ -64,7 +64,7 @@ def mock_config():
         mock_cfg.RETRY_DELAY = 10.0
         mock_cfg.GENERATOR_SYSTEM_PROMPT = "You are a helpful assistant."
         mock_cfg.GENERATOR_SYSTEM_PROMPT_RAW = "Raw system prompt."
-        mock_cfg.get_model_specs = Mock(return_value={"model_specifications": {}})
+        mock_cfg.model_specs = {"model_specifications": {}}
         # Tool-loop constants used by call_ai_with_validation_tools defensive gates.
         mock_cfg.TOOL_LOOP_MAX_PROMPT_CHARS = 200_000
         mock_cfg.VALIDATE_DRAFT_MAX_LENGTH = 200_000
@@ -1699,165 +1699,27 @@ class TestNonStreamingFinishReasonHandling:
         assert exc_info.value.finish_reason_category == "content_filter"
 
 
-class TestReasoningEffortProviderRetry:
-    """Tests provider-error correction for stale reasoning effort metadata."""
+class TestReasoningEffortRejection:
+    """Provider text never changes an explicitly requested reasoning policy."""
 
     @pytest.mark.asyncio
-    async def test_chat_completion_retry_coerces_to_provider_supported_level(self, ai_service_instance):
-        response = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
-            usage=None,
-        )
-        create = AsyncMock(
-            side_effect=[
-                Exception("Unsupported value: 'minimal'. Supported values are: 'medium'."),
-                response,
-            ]
-        )
-        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-
-        result = await ai_service_instance._call_chat_completions_create_with_reasoning_retry(
-            client,
-            {
-                "model": "gpt-5.1-chat-latest",
-                "messages": [{"role": "user", "content": "hi"}],
-                "reasoning_effort": "minimal",
-            },
-            provider_key="openai",
-            model_id="gpt-5.1-chat-latest",
-        )
-
-        assert result is response
-        assert create.await_args_list[1].kwargs["reasoning_effort"] == "medium"
-
-    @pytest.mark.asyncio
-    async def test_responses_retry_coerces_max_to_xhigh(self, ai_service_instance):
-        response = SimpleNamespace(output_text="ok", usage=None)
-        create = AsyncMock(
-            side_effect=[
-                Exception("reasoning.effort: Input should be 'low', 'medium', 'high' or 'xhigh'"),
-                response,
-            ]
-        )
-        ai_service_instance.openai_client = SimpleNamespace(
-            responses=SimpleNamespace(create=create)
-        )
-
-        result = await ai_service_instance._call_responses_create_with_reasoning_retry(
-            {
-                "model": "some-responses-model",
-                "input": "hi",
-                "reasoning": {"effort": "max"},
-            },
-            model_id="some-responses-model",
-        )
-
-        assert result is response
-        assert create.await_args_list[1].kwargs["reasoning"]["effort"] == "xhigh"
-
-    @pytest.mark.asyncio
-    async def test_responses_retry_fails_closed_instead_of_xhigh_to_none(
-        self,
-        ai_service_instance,
-    ):
-        create = AsyncMock(
-            side_effect=Exception(
-                "Unsupported reasoning.effort 'xhigh'. Supported values are: 'none'."
-            )
-        )
-        ai_service_instance.openai_client = SimpleNamespace(
-            responses=SimpleNamespace(create=create)
-        )
-
-        with pytest.raises(Exception, match="Supported values are: 'none'"):
-            await ai_service_instance._call_responses_create_with_reasoning_retry(
-                {
-                    "model": "gpt-5.6-sol",
-                    "input": "hi",
-                    "reasoning": {"effort": "xhigh"},
-                },
-                model_id="gpt-5.6-sol",
-            )
-
-        assert create.await_count == 1
-
-    @pytest.mark.asyncio
-    async def test_chat_completion_retry_fails_closed_for_nonzero_effort_without_supported_values(
-        self,
-        ai_service_instance,
-    ):
-        create = AsyncMock(
-            side_effect=Exception("reasoning_effort is not supported by this model")
-        )
-        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-
-        with pytest.raises(Exception, match="reasoning_effort is not supported"):
-            await ai_service_instance._call_chat_completions_create_with_reasoning_retry(
-                client,
-                {
-                    "model": "legacy",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "reasoning_effort": "low",
-                },
-                provider_key="openai",
-                model_id="legacy",
-            )
-
-        assert create.await_count == 1
-
-    @pytest.mark.asyncio
-    async def test_chat_completion_retry_fails_closed_instead_of_xhigh_to_none(
-        self,
-        ai_service_instance,
-    ):
-        create = AsyncMock(
-            side_effect=Exception(
-                "Unsupported value: 'xhigh'. Supported values are: 'none'."
-            )
-        )
-        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-
-        with pytest.raises(Exception, match="Supported values are: 'none'"):
-            await ai_service_instance._call_chat_completions_create_with_reasoning_retry(
-                client,
-                {
-                    "model": "gpt-5.6-sol",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "reasoning_effort": "xhigh",
-                },
-                provider_key="openai",
-                model_id="gpt-5.6-sol",
-            )
-
-        assert create.await_count == 1
-
-    @pytest.mark.asyncio
-    async def test_chat_completion_retry_can_remove_explicit_none(self, ai_service_instance):
-        response = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
-            usage=None,
-        )
-        create = AsyncMock(
-            side_effect=[
-                Exception("reasoning_effort is not supported by this model"),
-                response,
-            ]
-        )
-        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-
-        result = await ai_service_instance._call_chat_completions_create_with_reasoning_retry(
-            client,
-            {
-                "model": "legacy",
-                "messages": [{"role": "user", "content": "hi"}],
-                "reasoning_effort": "none",
-            },
-            provider_key="openai",
-            model_id="legacy",
-        )
-
-        assert result is response
-        assert "reasoning_effort" not in create.await_args_list[1].kwargs
+    @pytest.mark.parametrize("surface", ["chat", "responses", "claude"])
+    @pytest.mark.parametrize("effort", ["none", "minimal", "max"])
+    async def test_rejection_propagates_without_another_request(self, ai_service_instance, surface, effort):
+        create = AsyncMock(side_effect=ValueError("Unsupported effort. Supported values are: medium."))
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+                                 responses=SimpleNamespace(create=create))
+        service = ai_service_instance
+        service.openai_client = client
+        with pytest.raises(ValueError, match="Unsupported effort"):
+            if surface == "chat":
+                await service._create_chat_completion(client, {"reasoning_effort": effort},
+                    provider_key="openai", model_id="test-model")
+            elif surface == "responses":
+                await service._create_response({"reasoning": {"effort": effort}}, model_id="test-model")
+            else:
+                await service._create_claude_message(create, {"output_config": {"effort": effort}}, model_id="test-model")
+        create.assert_awaited_once()
 
 
 class TestClaudeStructuredOutputsParams:
@@ -4009,7 +3871,7 @@ class TestExecuteWithRetries:
             exc.status = 400  # Bad request - not retriable
             raise exc
 
-        with pytest.raises(Exception, match="Invalid request"):
+        with pytest.raises(AIRequestError, match="invalid_request"):
             await ai_service_instance._execute_with_retries(
                 failing_operation,
                 provider="openai",
@@ -4142,7 +4004,7 @@ class TestExecuteWithoutRetries:
         """Retry-disabled paths still surface provider/SDK failures as typed API errors."""
 
         async def failing_operation():
-            raise AttributeError("module aiohttp has no attribute ClientConnectorDNSError")
+            raise ConnectionResetError("connection lost")
 
         with pytest.raises(AIRequestError) as exc_info:
             await ai_service_instance._execute_without_retries(
@@ -4156,7 +4018,7 @@ class TestExecuteWithoutRetries:
         assert exc_info.value.model == "gemini-3.1-pro-preview"
         assert exc_info.value.attempts == 1
         assert exc_info.value.max_attempts == 1
-        assert isinstance(exc_info.value.cause, AttributeError)
+        assert isinstance(exc_info.value.cause, ConnectionResetError)
 
     @pytest.mark.asyncio
     async def test_preserves_non_retryable_errors(self, ai_service_instance):
@@ -4238,7 +4100,7 @@ class TestGenerationToolLoop:
         """
         Given: The tool loop keeps asking for validation but never produces an approved draft
         When: call_ai_with_validation_tools() exhausts its rounds and the forced final turn also fails
-        Then: It raises ValueError so callers can fall back to standard generation
+        Then: It rejects the candidate with a typed exhaustion error
         """
 
         ai_service_instance._is_openai_responses_api_model = Mock(return_value=False)  # Exercise the Chat tool-loop transport.
@@ -4286,7 +4148,7 @@ class TestGenerationToolLoop:
             }
         )
 
-        with pytest.raises(ValueError, match="Tool loop exhausted without producing a validated draft"):
+        with pytest.raises(ToolLoopExhausted, match="Tool loop exhausted without producing a validated draft"):
             await ai_service_instance.call_ai_with_validation_tools(
                 prompt="Write something long.",
                 model="gpt-4o",
@@ -5575,9 +5437,11 @@ class TestProviderResourceLifecycle:
     """Regression coverage for provider streaming and shutdown resources."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_partial", [False, True])
     async def test_gemini_partial_stream_failure_is_not_reported_as_success(
         self,
         ai_service_instance,
+        with_partial,
     ):
         """A transport error after content started must terminate the stream."""
 
@@ -5591,16 +5455,18 @@ class TestProviderResourceLifecycle:
 
             async def __anext__(self):
                 self._step += 1
-                if self._step == 1:
+                if self._step == 1 and with_partial:
                     return SimpleNamespace(text="partial")
                 raise ConnectionResetError("connection lost")
 
         stream = InterruptingStream()
         generate_content_stream = AsyncMock(return_value=stream)
+        generate_content = AsyncMock()
         ai_service_instance.google_new_client = SimpleNamespace(
             aio=SimpleNamespace(
                 models=SimpleNamespace(
                     generate_content_stream=generate_content_stream,
+                    generate_content=generate_content,
                 )
             )
         )
@@ -5621,7 +5487,8 @@ class TestProviderResourceLifecycle:
                 ):
                     received.append(chunk)
 
-        assert received == ["partial"]
+        assert received == (["partial"] if with_partial else [])
+        generate_content.assert_not_awaited()
         stream.aclose.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -5695,11 +5562,6 @@ class TestProviderResourceLifecycle:
             close=google_sync_close,
         )
 
-        session_close = AsyncMock()
-        connector_close = AsyncMock()
-        service.http_session = SimpleNamespace(close=session_close)
-        service.http_connector = SimpleNamespace(close=connector_close)
-
         await service.close()
 
         failing_close.assert_awaited_once()
@@ -5707,6 +5569,28 @@ class TestProviderResourceLifecycle:
             close.assert_awaited_once()
         google_async_close.assert_awaited_once()
         google_sync_close.assert_called_once()
-        session_close.assert_awaited_once()
-        connector_close.assert_awaited_once()
         assert "close failed" in caplog.text
+
+
+def test_thinking_controls_use_the_matching_provider_catalog(ai_service_instance, mock_config):
+    mock_config.model_specs = {"model_specifications": {
+        "anthropic": {"shared-id": {"model_id": "shared-id", "thinking_budget": {
+            "supported": True, "default_tokens": 2048}}},
+        "google": {"shared-id": {"model_id": "shared-id", "thinking_budget": {
+            "supported": True, "default_tokens": 1024, "min_tokens": 0, "max_tokens": 8192}}},
+    }}
+    assert ai_service_instance._get_thinking_budget_details("claude", "shared-id")["default_tokens"] == 2048
+    assert ai_service_instance._build_gemini_thinking_config_kwargs(
+        "shared-id", reasoning_effort=None, thinking_budget_tokens=4096,
+    ) == {"thinking_budget": 4096}
+
+
+def test_empty_claude_completion_is_rejected_with_usage():
+    from ai_service import GenerationStoppedUnexpectedly
+
+    usage = {"finish_reason": "end_turn", "finish_reason_category": "stop", "input_tokens": 100}
+    with pytest.raises(GenerationStoppedUnexpectedly) as caught:
+        AIService._raise_if_generation_stopped_unusably(
+            "", usage, provider="claude", model_id="claude-test", max_tokens=512,
+        )
+    assert caught.value.usage["input_tokens"] == 100

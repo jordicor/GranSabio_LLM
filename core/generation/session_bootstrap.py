@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from content_events import SessionPhase
+from debugger_spool import DebuggerPersistenceError
 from models import ContentRequest, GenerationInitResponse, GenerationStatus
 
 from ..cancellation import CancelMode
@@ -60,8 +61,8 @@ def build_session_payload(
         "session_id": session_id,
         "request": request,
         "request_name": getattr(request, "request_name", None),
-        "created_at": datetime.now(),
-        "last_activity_at": datetime.now(),
+        "created_at": datetime.utcnow(),
+        "last_activity_at": datetime.utcnow(),
         "iterations": [],
         "current_iteration": 0,
         "max_iterations": request.max_iterations,
@@ -150,6 +151,7 @@ async def finalize_generation_session(
     auto_qa_plan_payload: Optional[dict[str, Any]],
     local_execution: Any = None,
     deps: SessionBootstrapDeps,
+    resolved_audios: Optional[list[Any]] = None,
 ) -> GenerationInitResponse:
     """Register the final session and start background generation."""
 
@@ -237,6 +239,8 @@ async def finalize_generation_session(
                 for entry in preflight_context
             ],
         )
+    except DebuggerPersistenceError:
+        raise
     except Exception as exc:
         deps.logger.error(
             "GRANSABIO_MAIN: _debug_session_start failed for %s..., continuing anyway: %s",
@@ -251,6 +255,7 @@ async def finalize_generation_session(
             resolved_attachments,
             attachment_manager,
             resolved_images,
+            **({"resolved_audios": resolved_audios} if resolved_audios else {}),
         )
 
     acceptance = GenerationInitResponse(

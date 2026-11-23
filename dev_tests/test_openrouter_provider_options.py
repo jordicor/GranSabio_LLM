@@ -596,7 +596,7 @@ async def test_tool_system_context_flag_preserves_explicit_scaffolding(
     _configure_public_dispatch(monkeypatch, service, provider="openrouter")
     monkeypatch.setattr(service, "_supports_generation_validation_tool_loop", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(service, "_serialize_tool_loop_tool_defs", lambda *_args, **_kwargs: "")
-    monkeypatch.setattr(service, "_build_chat_call_budget", lambda **_kwargs: object())
+    monkeypatch.setattr(service, "_build_chat_call_budget", AsyncMock(return_value=object()))
     monkeypatch.setattr(
         ai_service_module.context_budget,
         "evaluate_call_admission",

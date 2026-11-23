@@ -1,5 +1,44 @@
 const defaultProjectId = (document.body.dataset.projectId || "").trim();
 
+async function refreshPersistenceStatus() {
+    const banner = document.getElementById("persistence-status");
+    if (!banner) return;
+    try {
+        const response = await fetch("/debugger/storage");
+        if (!response.ok) throw new Error("Storage status unavailable");
+        const storage = await response.json();
+        if (storage.backend === "sqlite") {
+            banner.dataset.level = storage.available ? "ok" : "error";
+            banner.textContent = storage.available ? "SQLite history available." : "SQLite history unavailable.";
+            if (storage.disabled_reason) banner.textContent += ` ${storage.disabled_reason}`;
+            return;
+        }
+        const capture = storage.persistence || {};
+        const pending = Number(capture.pending_operations || 0);
+        const labels = {
+            available: pending || capture.complete === false ? "Captured in memory; waiting for PostgreSQL confirmation." : "PostgreSQL history is up to date.",
+            buffering: "Captured in memory. Pending history can be lost if this process stops.",
+            local: "A pending prefix is saved on this computer. Newer history may still be in memory.",
+            recovering: "Synchronizing saved history with PostgreSQL. Displayed history may be older.",
+            blocked: "Capture needs attention. New provider work is paused; displayed history may be incomplete."
+        };
+        banner.dataset.level = capture.state === "blocked" ? "error" : (capture.state === "available" ? "ok" : "warning");
+        banner.textContent = `${labels[capture.state] || (storage.available ? "History available." : "History unavailable.")} Pending: ${pending}; oldest: ${Number(capture.oldest_pending_seconds || 0).toFixed(1)} s.`;
+        if (capture.reason) banner.textContent += ` ${capture.reason}`;
+        if (capture.loss_unknown) {
+            banner.dataset.level = capture.state === "blocked" ? "error" : "warning";
+            banner.textContent += " A previous process stopped without a complete shutdown receipt; some in-memory history may be missing.";
+        }
+    } catch (_error) {
+        banner.dataset.level = "error";
+        banner.textContent = "Cannot verify capture status. The displayed history may be out of date.";
+    } finally {
+        window.setTimeout(refreshPersistenceStatus, 5000);
+    }
+}
+
+document.addEventListener("DOMContentLoaded", refreshPersistenceStatus);
+
 // escapeHtml / escapeHtmlAttr come from /static/js/escape_utils.js (loaded first by the template).
 
 const state = {

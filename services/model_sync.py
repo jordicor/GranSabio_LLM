@@ -91,16 +91,18 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _apply_image_support(entry: dict[str, Any], supported: bool | None, *, source: str, source_url: str) -> None:
+def _apply_image_support(entry: dict[str, Any], supported: bool | None, *, source: str, source_url: str, modality: str = "image") -> None:
     """Keep legacy capability tags and the capability registry in agreement."""
     if supported is None:
         return
-    capabilities = [cap for cap in entry.get("capabilities", []) if str(cap).lower() != "vision"]
+    tag = "vision" if modality == "image" else "audio"
+    capability = "vision_input" if modality == "image" else "audio_input"
+    capabilities = [cap for cap in entry.get("capabilities", []) if str(cap).lower() != tag]
     if supported:
-        capabilities.append("vision")
+        capabilities.append(tag)
     entry["capabilities"] = _dedupe_strings(capabilities)
     provider_caps = dict(entry.get("provider_capabilities") or {})
-    provider_caps["vision_input"] = {
+    provider_caps[capability] = {
         "support": "supported" if supported else "unsupported",
         "source": source,
         "source_url": source_url,
@@ -173,7 +175,7 @@ OPENROUTER_PRICING_FIELDS = (
     ("input_cache_read", "cached_input_per_million"),
     ("input_cache_write", "cache_write_per_million"),
 )
-PRICING_RATE_KEYS = tuple(local_key for _remote_key, local_key in OPENROUTER_PRICING_FIELDS)
+PRICING_RATE_KEYS = tuple(local_key for _remote_key, local_key in OPENROUTER_PRICING_FIELDS) + ("audio_input_per_million",)
 
 
 def openrouter_pricing_from_remote(pricing: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -384,7 +386,6 @@ def _is_openai_text_candidate(model_id: str) -> bool:
             "image",
             "realtime",
             "search",
-            "audio",
         )
     ):
         return False
@@ -762,6 +763,9 @@ class ModelSyncService:
                     "pricing": openrouter_pricing_from_remote(pricing),
                     "capabilities": _dedupe_strings(capabilities),
                     "supported_parameters": supported_parameters,
+                    "provider_capabilities": {
+                        "audio_input": {"support": "supported" if "audio" in input_modalities else "unsupported", "source": "provider_api"},
+                    } if input_modalities else {},
                     "parameter_constraints": _parameter_constraints_for_model(
                         "openrouter",
                         model_id,
@@ -868,8 +872,9 @@ class ModelSyncService:
             # resolve exact IDs through the provider's official model sheets.
             docs_vision = await fetch_openai_vision_metadata(
                 session,
-                {model["id"] for model in models if api_image_support(model) is None},
+                {model["id"] for model in models if api_image_support(model) is None or api_image_support(model, "audio") is None},
                 self.logger,
+                include_audio=True,
             )
 
         current_specs = self._get_provider_specs(self.load_specs(), "openai")
@@ -887,12 +892,13 @@ class ModelSyncService:
             )
             # OpenAI's model-list API does not publish token limits.
             entry["token_limits_provenance"] = TOKEN_PROVENANCE_INFERRED
-            image_support = api_image_support(model)
-            if image_support is not None:
-                _apply_image_support(entry, image_support, source="provider_api", source_url=OPENAI_MODEL_LIST_URL)
-            elif model_id in docs_vision:
-                supported, source_url = docs_vision[model_id]
-                _apply_image_support(entry, supported, source="official_docs", source_url=source_url)
+            for modality in ("image", "audio"):
+                supported = api_image_support(model, modality)
+                if supported is not None:
+                    _apply_image_support(entry, supported, source="provider_api", source_url=OPENAI_MODEL_LIST_URL, modality=modality)
+                elif model_id in docs_vision:
+                    declaration, source_url = docs_vision[model_id]
+                    _apply_image_support(entry, declaration.get(modality), source="official_docs", source_url=source_url, modality=modality)
             remote_models.append(entry)
 
         remote_models.sort(key=lambda item: (item.get("remote_created_at") or "", item["model_id"]), reverse=True)
@@ -1374,12 +1380,14 @@ class ModelSyncService:
             # through the provider's official per-model documentation tables.
             docs_vision = await fetch_gemini_vision_metadata(
                 session, {entry["model_id"] for entry in all_models}, self.logger,
+                include_audio=True,
             )
 
         for entry in all_models:
             if entry["model_id"] in docs_vision:
-                supported, source_url = docs_vision[entry["model_id"]]
-                _apply_image_support(entry, supported, source="official_docs", source_url=source_url)
+                declaration, source_url = docs_vision[entry["model_id"]]
+                for modality in ("image", "audio"):
+                    _apply_image_support(entry, declaration.get(modality), source="official_docs", source_url=source_url, modality=modality)
 
         self.logger.info("Fetched %d text-generation models from Google API", len(all_models))
         return all_models
@@ -1941,7 +1949,10 @@ class ModelSyncService:
         if output_tokens <= 0:
             output_tokens = max(context_window // 4, 8192) if context_window else 8192
 
-        pricing = model.get("pricing") or {}
+        pricing = dict(model.get("pricing") or {})
+        current_pricing = current_spec.get("pricing") or {}
+        if "audio_input_per_million" not in pricing and "audio_input_per_million" in current_pricing:
+            pricing["audio_input_per_million"] = current_pricing["audio_input_per_million"]
         capabilities = model.get("capabilities")
         if capabilities is None or (not capabilities and provider != "ollama"):
             capabilities = current_spec.get("capabilities") or ["text"]
@@ -1994,13 +2005,24 @@ class ModelSyncService:
         remote_provider_caps = _nested_lookup(model, "provider_capabilities")
         if isinstance(remote_provider_caps, Mapping):
             for capability, value in remote_provider_caps.items():
-                if capability == "vision_input":
+                if capability in {"vision_input", "audio_input"}:
                     support = value.get("support") if isinstance(value, Mapping) else value
                     if support not in ("supported", "unsupported") and not isinstance(support, bool):
                         continue
+                if capability == "audio_input":
+                    previous = provider_caps.get(capability)
+                    if isinstance(previous, Mapping) and "formats" in previous:
+                        value = dict(value) if isinstance(value, Mapping) else {"support": value}
+                        value.setdefault("formats", previous["formats"])
                 provider_caps[capability] = value
         if provider_caps:
             new_spec["provider_capabilities"] = provider_caps
+        audio = provider_caps.get("audio_input")
+        audio_support = audio.get("support") if isinstance(audio, Mapping) else audio
+        if audio_support in ("supported", "unsupported") or isinstance(audio_support, bool):
+            capabilities = [cap for cap in capabilities if str(cap).lower() != "audio"]
+            if audio_support is True or audio_support == "supported":
+                capabilities.append("audio")
         vision = provider_caps.get("vision_input")
         support = vision.get("support") if isinstance(vision, Mapping) else vision
         if provider in {"anthropic", "openai", "google"} and (support in ("supported", "unsupported") or isinstance(support, bool)):

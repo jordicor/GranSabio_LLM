@@ -48,6 +48,8 @@ _dispatch_gates: ContextVar[Tuple[_DispatchGate, ...]] = ContextVar(
 def raise_if_dispatch_closed() -> None:
     """Refuse to start a provider call while an enclosing fan-out drains."""
 
+    from runtime_logging import require_log_capacity
+    require_log_capacity()
     if any(gate.closed for gate in _dispatch_gates.get()):
         raise ProviderDispatchClosed(
             "Provider call not started: a sibling branch failed and the "

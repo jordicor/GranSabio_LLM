@@ -680,7 +680,7 @@ async def test_generate_full_content_routes_json_with_schema_as_json_structured(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("shared_context", [None, "Stable source data for retry testing."])
-async def test_generate_full_content_standard_streaming_keeps_retry_without_tool_loop(shared_context):
+async def test_generate_full_content_does_not_restart_exhausted_provider_retries(shared_context):
     request = _tool_request(
         shared_context=shared_context,
         content_type="json",
@@ -697,9 +697,9 @@ async def test_generate_full_content_standard_streaming_keeps_retry_without_tool
                 raise AIRequestError(
                     provider="openai",
                     model="gpt-4o",
-                    attempts=1,
+                    attempts=3,
                     max_attempts=3,
-                    cause=RuntimeError("timeout"),
+                    cause=TimeoutError("timeout"),
                 )
             yield '{"ok": true}'
 
@@ -722,23 +722,23 @@ async def test_generate_full_content_standard_streaming_keeps_retry_without_tool
         session = {"session_id": session_id, "cancelled": False, "verbose_log": []}
         await app_state.register_session(session_id, session)
         try:
-            content = await _generate_full_content(
-                final_prompt="Write JSON.",
-                request=request,
-                ai_service=ai_service,
-                usage_tracker=None,
-                session_id=session_id,
-                session=session,
-                iteration=0,
-                json_output_requested=is_json_output_requested(request),
-            )
+            with pytest.raises(AIRequestError):
+                await _generate_full_content(
+                    final_prompt="Write JSON.",
+                    request=request,
+                    ai_service=ai_service,
+                    usage_tracker=None,
+                    session_id=session_id,
+                    session=session,
+                    iteration=0,
+                    json_output_requested=is_json_output_requested(request),
+                )
         finally:
             await app_state.pop_session(session_id)
 
-    assert content == '{"ok": true}'
     assert all(call.get("shared_context") == shared_context for call in attempts)
     assert all(("shared_context" in call) == (shared_context is not None) for call in attempts)
-    assert len(attempts) == 2
+    assert len(attempts) == 1
     assert all(call["json_output"] is True for call in attempts)
     ai_service.call_ai_with_validation_tools.assert_not_called()
 

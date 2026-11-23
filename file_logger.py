@@ -53,7 +53,7 @@ class TeeOutput:
     Automatically rotates log files every hour.
     """
 
-    def __init__(self, stream: TextIO, base_log_dir: str = "logs"):
+    def __init__(self, stream: TextIO, base_log_dir: str = "logs", *, stream_name: str = "stderr"):
         """
         Initialize the TeeOutput.
 
@@ -62,6 +62,7 @@ class TeeOutput:
             base_log_dir: Base directory for log files (default: "logs")
         """
         self.stream = stream
+        self.stream_name = stream_name
         self.base_log_dir = base_log_dir
         self.current_file: Optional[TextIO] = None
         self.current_hour: Optional[str] = None
@@ -163,6 +164,9 @@ class TeeOutput:
         Args:
             message: String to write
         """
+        from logging_policy import get_logging_policy
+        if self.stream_name == "stdout" and get_logging_policy().quiet:
+            return len(message)
         with self.lock:
             # Write to original stream (console)
             self.stream.write(message)
@@ -213,62 +217,6 @@ class TeeOutput:
         return self.stream.isatty()
 
 
-class TeeLoggingHandler(logging.StreamHandler):
-    """
-    Custom logging handler that writes to both console and file using TeeOutput.
-    This captures all Python logging module output (logger.info, logger.debug, etc.)
-    """
-
-    def __init__(self, tee_output: TeeOutput):
-        """
-        Initialize the handler with a TeeOutput instance.
-
-        Args:
-            tee_output: TeeOutput instance that handles file writing
-        """
-        super().__init__(stream=tee_output)
-        self.tee_output = tee_output
-
-    def emit(self, record):
-        """
-        Emit a log record through the TeeOutput.
-        This ensures all logging goes to both console and file.
-        """
-        try:
-            msg = self.format(record)
-            stream = self.stream
-            # Write the message + newline
-            stream.write(msg + self.terminator)
-            self.flush()
-        except Exception:
-            self.handleError(record)
-
-
-def _silence_noisy_loggers():
-    """
-    Configure third-party loggers to reduce noise in extra verbose mode.
-
-    This prevents low-level HTTP connection logs from httpcore, httpx, urllib3, etc.
-    from cluttering the output when extra verbose is enabled.
-    """
-    noisy_loggers = [
-        'httpcore',
-        'httpcore.connection',
-        'httpcore.http11',
-        'httpcore.http2',
-        'httpx',
-        'urllib3',
-        'urllib3.connectionpool',
-        'openai._base_client',
-        'anthropic._base_client',
-        'google.auth',
-        'google.auth.transport',
-        'googleapiclient',
-    ]
-
-    for logger_name in noisy_loggers:
-        logging.getLogger(logger_name).setLevel(logging.WARNING)
-
 
 def activate_file_logging(base_log_dir: str = "logs") -> tuple[TeeOutput, TeeOutput]:
     """
@@ -277,7 +225,7 @@ def activate_file_logging(base_log_dir: str = "logs") -> tuple[TeeOutput, TeeOut
     This function:
     1. Creates TeeOutput instances for stdout/stderr
     2. Replaces sys.stdout and sys.stderr
-    3. Configures Python logging to use the TeeOutput via a custom handler
+    Existing structured logging handlers and their levels stay intact.
 
     Args:
         base_log_dir: Base directory for log files (default: "logs")
@@ -285,36 +233,15 @@ def activate_file_logging(base_log_dir: str = "logs") -> tuple[TeeOutput, TeeOut
     Returns:
         Tuple of (stdout_tee, stderr_tee) for cleanup purposes
     """
-    stdout_tee = TeeOutput(sys.stdout, base_log_dir)
-    stderr_tee = TeeOutput(sys.stderr, base_log_dir)
+    stdout_tee = TeeOutput(sys.stdout, base_log_dir, stream_name="stdout")
+    stderr_tee = TeeOutput(sys.stderr, base_log_dir, stream_name="stderr")
 
     sys.stdout = stdout_tee
     sys.stderr = stderr_tee
 
-    # Configure Python logging to also use the TeeOutput
-    root_logger = logging.getLogger()
-
-    # Remove existing handlers to avoid duplicates
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-
-    # Add our custom TeeLoggingHandler that writes to stderr (which is now TeeOutput)
-    tee_handler = TeeLoggingHandler(stderr_tee)
-    tee_handler.setLevel(logging.DEBUG)
-
-    # Use the same format as the original handlers
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    tee_handler.setFormatter(formatter)
-
-    root_logger.addHandler(tee_handler)
-    root_logger.setLevel(logging.DEBUG)
-
-    # Silence noisy third-party loggers to avoid cluttering the output
-    _silence_noisy_loggers()
-
-    # Print confirmation to both console and file
-    print(f"[FILE LOGGING ACTIVATED] Logs will be saved to: {base_log_dir}/YYYY-MM-DD/HH_00_00.log")
-    logging.info("File logging activated - capturing all Python logging output")
+    # RuntimeConsoleLoggingHandler writes through the current stderr and
+    # publishes the structured event exactly once. Storage never changes detail.
+    logging.info("File logging activated: %s/YYYY-MM-DD/HH_00_00.log", base_log_dir)
 
     return stdout_tee, stderr_tee
 
@@ -330,19 +257,6 @@ def deactivate_file_logging(stdout_tee: TeeOutput, stderr_tee: TeeOutput):
     # Restore original streams
     sys.stdout = stdout_tee.stream
     sys.stderr = stderr_tee.stream
-
-    # Restore original logging configuration
-    root_logger = logging.getLogger()
-    for handler in root_logger.handlers[:]:
-        if isinstance(handler, TeeLoggingHandler):
-            root_logger.removeHandler(handler)
-
-    # Re-add a basic StreamHandler to stderr
-    basic_handler = logging.StreamHandler()
-    basic_handler.setFormatter(
-        logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    )
-    root_logger.addHandler(basic_handler)
 
     # Close log files
     stdout_tee.close()

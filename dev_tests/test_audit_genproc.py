@@ -4,7 +4,7 @@ Covers the GENPROC package: GEN-03 (feedback memory released on every terminal
 state), GEN-05 (streaming session-field sampling instead of per-chunk O(n^2)
 joins), GEN-07 (no raw exception text in client-facing failure_reason),
 GEN-08 (dead comprehensive QA timeout removed), GEN-09 (unexpected smart-edit
-errors fall back to regeneration), GEN-10 (per-iteration content retention
+errors stop generation), GEN-10 (per-iteration content retention
 pruned) and QA-04 (no Gran Sabio engine passed to the grounding-only call).
 """
 
@@ -144,6 +144,7 @@ def _patch_process_common(monkeypatch, manager) -> None:
         app_state,
         "debug_logger",
         SimpleNamespace(
+            _transport=None,
             storage_available=True,
             record_event=AsyncMock(),
             update_session_status=AsyncMock(),
@@ -314,6 +315,7 @@ async def test_json_target_field_preserves_other_values_after_smart_edit(
         ])
     if repair_method == "smart_edit_noop":
         responses.insert(3, ("fake-generator", original_paragraph))
+        responses.pop()
     provider_calls = []
 
     def provider_response(kwargs):
@@ -420,6 +422,9 @@ async def test_json_target_field_preserves_other_values_after_smart_edit(
     assert request.target_field_only is bool(target_field_only)
     qa_calls = [call for call in provider_calls if call["model"] == "fake-qa"]
     expected_texts = [original_text, edited_text, edited_text]
+    if repair_method == "smart_edit_noop":
+        # An unchanged edit skips the duplicate layer review; final QA remains.
+        expected_texts = [original_text, original_text]
     if uses_gran_sabio:
         expected_texts = [text for text in expected_texts for _ in range(2)]
     if regenerate_after_edit:
@@ -449,8 +454,7 @@ async def test_json_target_field_preserves_other_values_after_smart_edit(
         assert ("Keep the caption" in gran_sabio_call["prompt"]) is not bool(target_field_only)
     assert "QA MODE: FINAL VERIFICATION" in qa_calls[-1]["prompt"]
     assert "This pass is read-only" in qa_calls[-1]["prompt"]
-    assert len(provider_calls) == (8 if uses_gran_sabio or regenerate_after_edit
-                                   else 6 if repair_method == "smart_edit_noop" else 5)
+    assert len(provider_calls) == (8 if uses_gran_sabio or regenerate_after_edit else 5)
     assert responses == []
 
 
@@ -1138,7 +1142,9 @@ async def test_add_to_session_field_buffers_chunks_between_flushes(monkeypatch):
         assert session["gransabio_content"] == "a"  # buffered, not lost
 
         # Force the next flush window: buffered chunks land in order.
-        session["_gransabio_content_stream_last_flush"] = 0.0
+        session["_gransabio_content_stream_last_flush"] = (
+            generation_processor_module.time.monotonic() - 3601.0
+        )
         await add_to_session_field(session_id, "gransabio_content", "c")
         assert session["gransabio_content"] == "abc"
     finally:
@@ -2029,13 +2035,13 @@ def test_fallback_qa_call_wires_visibility_and_labels():
 
 
 # ---------------------------------------------------------------------------
-# GEN-09: unexpected smart-edit errors force regeneration fallback
+# GEN-09: unexpected smart-edit errors stop generation
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_unexpected_smart_edit_error_forces_regeneration_fallback(monkeypatch):
-    """GEN-09: an unexpected edit error preserves the original and clears its payload."""
+async def test_unexpected_smart_edit_error_propagates(monkeypatch):
+    """GEN-09: an editor crash must not trigger another paid generation."""
     session_id = f"audit-gen09-{uuid4()}"
     request = _make_request()
     session = {
@@ -2060,20 +2066,17 @@ async def test_unexpected_smart_edit_error_forces_regeneration_fallback(monkeypa
 
     await register_session(session_id, session)
     try:
-        result = await _generate_smart_edits(
-            session=session,
-            request=request,
-            ai_service=None,
-            usage_tracker=None,
-            session_id=session_id,
-            iteration=1,
-        )
+        with pytest.raises(RuntimeError, match="unexpected editor crash"):
+            await _generate_smart_edits(
+                session=session,
+                request=request,
+                ai_service=None,
+                usage_tracker=None,
+                session_id=session_id,
+                iteration=1,
+            )
     finally:
         await pop_session(session_id)
-
-    assert result == "BASE CONTENT"
-    assert session["smart_edit_data"] is None
-
 
 # ---------------------------------------------------------------------------
 # GEN-10: per-iteration full content is pruned in the session

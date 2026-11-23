@@ -82,8 +82,8 @@ def test_claude_stable_block_has_cache_boundary(provider, model):
     assert result[1]["content"] == TASK
 
 
-def test_budget_counts_source_and_can_block_before_dispatch(service):
-    budget = service._build_chat_call_budget(
+async def test_budget_counts_source_and_can_block_before_dispatch(service):
+    budget = await service._build_chat_call_budget(
         provider="openai", model_id="test", call_id="test", system_prompt="s",
         prompt=TASK, shared_context=SOURCE * 100, reserved_output_tokens=32,
     )

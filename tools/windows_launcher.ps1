@@ -65,23 +65,25 @@ function Start-GranSabio {
     try {
         $env:APP_PORT = [string]$Port
         $env:APP_RELOAD = 'false'
-        $arguments = '-u "{0}" --file-logging --force-extra-verbose' -f (Join-Path $script:GranSabioRoot 'main.py')
+        # The child loads .env: quantity and storage are independent.
+        $arguments = '-u "{0}"' -f (Join-Path $script:GranSabioRoot 'main.py')
         $child = Start-Process -FilePath $script:GranSabioPython -ArgumentList $arguments `
-            -WorkingDirectory $script:GranSabioRoot -PassThru
+            -WorkingDirectory $script:GranSabioRoot -WindowStyle Hidden -PassThru
     } finally {
         $env:APP_PORT = $previousPort
         $env:APP_RELOAD = $previousReload
     }
 
-    Write-Host "Starting GranSabio on port $Port in a separate console..."
+    Write-Host "Starting GranSabio on port $Port independently of this launcher..."
     $deadline = (Get-Date).AddSeconds(90)
     do {
-        if ($child.HasExited) { throw "Server exited during startup. Check the logs in $script:GranSabioRoot\logs." }
+        $child.Refresh()
+        if ($child.HasExited) { throw 'Server exited during startup. Run python main.py in the dedicated venv to see startup diagnostics.' }
         $state = Get-GranSabioState -Port $Port
         if ($state.Status -eq 'running' -and $state.Healthy) { return $state }
         Start-Sleep -Milliseconds 500
     } while ((Get-Date) -lt $deadline)
-    throw 'Startup was not confirmed within 90 seconds. Check the server console; the process has not been stopped.'
+    throw 'Startup was not confirmed within 90 seconds. Inspect /health and /monitor/console/recent; the process has not been stopped.'
 }
 
 function Stop-GranSabio {

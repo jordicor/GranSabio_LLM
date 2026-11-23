@@ -415,6 +415,7 @@ class QAEngine:
         request_timeout: Optional[float] = None,
         local_execution: Optional[Any] = None,
         dispatch_route_ordinal: int = 0,
+        input_audios: Optional[List[Any]] = None,
     ) -> QAEvaluation:
         """
         Evaluate content using a specific QA layer and AI model
@@ -435,6 +436,15 @@ class QAEngine:
             model_config = QAModelConfig(model=model)
         else:
             model_config = model
+
+        audios_for_eval = input_audios if layer.include_input_audio else None
+        if layer.include_input_audio:
+            from ai_runtime.audio import AudioInputError, validate_audio_model
+
+            if not audios_for_eval:
+                raise AudioInputError("audio_required", "This QA layer requires audio evidence.")
+            info = config.get_model_info(model_config.model)
+            validate_audio_model(audios_for_eval, specs=config.model_specs, provider=info["provider"], model_id=info["model_id"])
 
         # Determine if we should pass images to this evaluation
         # Images are only passed if:
@@ -495,6 +505,7 @@ class QAEngine:
                 word_map_formatted=word_map_formatted,
                 draft_map_formatted=draft_map_formatted,
                 input_images=images_for_eval,
+                input_audios=audios_for_eval,
                 edit_history=edit_history,
                 model_alias_registry=model_alias_registry,
                 layer=layer,
@@ -524,6 +535,7 @@ class QAEngine:
         layers: List[QALayer],
         qa_models: List[str],
         input_images: Optional[List["ImageData"]] = None,
+        input_audios: Optional[List[Any]] = None,
     ) -> Dict[str, Dict[str, QAEvaluation]]:
         """
         Evaluate content through all QA layers with all specified models.
@@ -538,6 +550,7 @@ class QAEngine:
             layers=layers,
             qa_models=qa_models,
             input_images=input_images,
+            input_audios=input_audios,
         )
         if isinstance(qa_results, dict) and "qa_results" in qa_results:
             return qa_results["qa_results"]
@@ -720,6 +733,7 @@ class QAEngine:
         model_alias_registry: Optional[ModelAliasRegistry] = None,
         project_id: Optional[str] = None,
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        input_audios: Optional[List[Any]] = None,
     ) -> Dict[str, Dict[str, QAEvaluation]]:
         """
         Evaluate content through all QA layers with detailed progress tracking.
@@ -874,6 +888,7 @@ class QAEngine:
                 word_map_formatted=word_map_formatted,
                 draft_map_formatted=draft_map_formatted,
                 input_images=input_images,
+                input_audios=input_audios,
                 content_for_bypass=content_for_bypass,
                 model_alias_registry=model_alias_registry,
                 project_id=project_id,
@@ -1161,6 +1176,7 @@ class QAEngine:
         model_alias_registry: Optional[ModelAliasRegistry] = None,
         project_id: Optional[str] = None,
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        input_audios: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """
         Comprehensive content evaluation with progress tracking
@@ -1203,6 +1219,7 @@ class QAEngine:
             word_map_formatted=word_map_formatted,
             draft_map_formatted=draft_map_formatted,
             input_images=input_images,
+            input_audios=input_audios,
             evidence_grounding_config=evidence_grounding_config,
             context_for_grounding=context_for_grounding,
             content_for_bypass=content_for_bypass,
@@ -1323,6 +1340,7 @@ Source QA layers:
             concise_on_pass=True,
             order=max((getattr(layer, "order", 0) for layer in ordered_layers), default=0) + 1,
             include_input_images=any(getattr(layer, "include_input_images", False) for layer in ordered_layers),
+            include_input_audio=any(layer.include_input_audio for layer in ordered_layers),
         )
         estimated_tokens = self._estimate_fast_global_tokens(
             "\n".join(
@@ -1392,6 +1410,7 @@ Source QA layers:
         context_for_grounding: Optional[str] = None,
         content_for_bypass: Optional[str] = None,
         model_alias_registry: Optional[ModelAliasRegistry] = None,
+        input_audios: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run a read-only final QA verification pass.
@@ -1466,6 +1485,7 @@ Source QA layers:
                 word_map_formatted=word_map_formatted,
                 draft_map_formatted=draft_map_formatted,
                 input_images=input_images,
+                input_audios=input_audios,
                 content_for_bypass=content_for_bypass,
                 model_alias_registry=model_alias_registry,
             )
@@ -1821,6 +1841,7 @@ Source QA layers:
         model_alias_registry: Optional[ModelAliasRegistry] = None,
         project_id: Optional[str] = None,
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        input_audios: Optional[List[Any]] = None,
     ) -> QASchedulerResult:
         """Evaluate a semantic QA layer through the shared scheduler primitive."""
 
@@ -1967,6 +1988,7 @@ Source QA layers:
                             word_map_formatted=word_map_formatted,
                             draft_map_formatted=draft_map_formatted,
                             input_images=input_images,
+                            input_audios=input_audios,
                             edit_history=edit_history,
                             model_alias_registry=model_alias_registry,
                             session_id=session_id,
@@ -2220,6 +2242,7 @@ Source QA layers:
             word_map_formatted=word_map_formatted,
             draft_map_formatted=draft_map_formatted,
             input_images=input_images,
+            input_audios=input_audios,
             edit_history=edit_history,
             model_alias_registry=model_alias_registry,
         )
@@ -2291,6 +2314,7 @@ Source QA layers:
         input_images: Optional[List["ImageData"]],
         edit_history: Optional[str],
         model_alias_registry: Optional[ModelAliasRegistry],
+        input_audios: Optional[List[Any]] = None,
     ) -> None:
         """Atomic strict_all context admission for one QA layer's evaluators.
 
@@ -2309,6 +2333,7 @@ Source QA layers:
         from models import QAModelConfig
 
         # Images that a vision-capable evaluator would actually receive.
+        layer_audios = input_audios if layer.include_input_audio else None
         layer_images = (
             input_images
             if (input_images and getattr(layer, "include_input_images", False))
@@ -2364,6 +2389,13 @@ Source QA layers:
                 else QAModelConfig(model=model_name)
             )
             provider = _provider_for(model_name)
+            if layer.include_input_audio:
+                from ai_runtime.audio import AudioInputError, estimate_audio_tokens, validate_audio_model
+
+                if not layer_audios:
+                    raise AudioInputError("audio_required", "This QA layer requires audio evidence.")
+                info = config.get_model_info(model_name)
+                validate_audio_model(layer_audios, specs=config.model_specs, provider=info["provider"], model_id=info["model_id"])
             if client_named:
                 labels.append(model_name)
             elif model_alias_registry is not None:
@@ -2401,6 +2433,7 @@ Source QA layers:
                     word_map_formatted=word_map_formatted,
                     draft_map_formatted=draft_map_formatted,
                     input_images=layer_images,
+                    input_audios=layer_audios,
                     edit_history=edit_history,
                 )
             reserved_output = config.resolve_qa_max_tokens(
@@ -2421,6 +2454,10 @@ Source QA layers:
                 ),
             ]
             shared_context = getattr(original_request, "shared_context", None)
+            if layer.include_input_audio:
+                components.append(context_budget.PayloadComponent(
+                    name="qa_input_audios", chars=0, tokens_estimate=estimate_audio_tokens(layer_audios), kind="audio",
+                ))
             if shared_context:
                 components.append(context_budget.make_payload_component(
                     "shared_context", shared_context, "message", provider, model_name,
@@ -2543,6 +2580,7 @@ Source QA layers:
         model_alias_registry: Optional[ModelAliasRegistry] = None,
         project_id: Optional[str] = None,
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        input_audios: Optional[List[Any]] = None,
     ) -> Tuple[Dict[str, QAEvaluation], Optional[Dict[str, Any]]]:
         """
         Evaluate a single semantic QA layer.
@@ -2709,6 +2747,7 @@ Source QA layers:
                 word_map_formatted=word_map_formatted,
                 draft_map_formatted=draft_map_formatted,
                 input_images=input_images,
+                input_audios=input_audios,
                 edit_history=edit_history,
                 model_alias_registry=model_alias_registry,
                 project_id=project_id,

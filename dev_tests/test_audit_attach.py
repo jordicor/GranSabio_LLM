@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json as standard_json
 import os
 import sqlite3
 import sys
@@ -260,8 +261,8 @@ async def test_url_ingestion_still_enforces_size_match_without_encoding(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_blob_gc_collects_unreferenced_blobs_by_default(tmp_path):
-    """ADJ-03: blob GC runs by default even though the config flag ships off."""
+async def test_blob_gc_requires_explicit_configuration(tmp_path):
+    """Disabled GC must preserve unreferenced blobs."""
 
     manager = _make_manager(tmp_path)
     record = await manager.store_bytes(
@@ -271,28 +272,20 @@ async def test_blob_gc_collects_unreferenced_blobs_by_default(tmp_path):
 
     report = manager.run_cleanup(dry_run=False)
 
-    assert manager.store.count_ready_blobs() == 0
-    assert not any("garbage collection is disabled" in issue for issue in report.issues)
+    assert manager.store.count_ready_blobs() == 1
+    assert any("garbage collection is disabled" in issue for issue in report.issues)
 
 
-def test_effective_retention_caps_factory_default_but_respects_explicit_config(tmp_path, monkeypatch):
-    """ADJ-03: the absurd ~90-year factory default is capped by the env knob,
-    while an explicitly configured retention is respected."""
-
+def test_retention_uses_explicit_settings_without_hidden_override(tmp_path, monkeypatch):
     monkeypatch.setenv("GRANSABIO_ATTACHMENTS_RETENTION_DAYS", "30")
-    default_manager = _make_manager(tmp_path / "a")
-    assert default_manager._effective_retention_days() == 30
-    explicit_manager = _make_manager(tmp_path / "b", retention_days=90)
-    assert explicit_manager._effective_retention_days() == 90
+    assert _make_manager(tmp_path / "a").settings.retention_days == 32850
+    assert _make_manager(tmp_path / "b", retention_days=90).settings.retention_days == 90
 
 
 @pytest.mark.asyncio
-async def test_run_cleanup_applies_effective_retention_by_default(tmp_path, monkeypatch):
-    """ADJ-03: run_cleanup with no explicit retention expires rows older than
-    the effective (env-capped) retention instead of the 90-year default."""
-
-    monkeypatch.setenv("GRANSABIO_ATTACHMENTS_RETENTION_DAYS", "30")
-    manager = _make_manager(tmp_path)
+async def test_run_cleanup_applies_explicit_retention(tmp_path):
+    """Cleanup honors a deliberately configured short retention."""
+    manager = _make_manager(tmp_path, retention_days=30)
     prefix1, prefix2, user_hash = manager.generate_user_hash("alice")
     temp_path = manager.store.blob_base_path / "_seed" / "old.tmp"
     temp_path.parent.mkdir(parents=True, exist_ok=True)
@@ -583,7 +576,7 @@ async def test_new_rows_use_hmac_signature(tmp_path):
     )
     payload = manager._metadata_signature_payload(row)
     assert row.metadata_signature == manager._compute_metadata_signature(payload)
-    assert row.metadata_signature != manager._compute_legacy_metadata_signature(payload)
+    assert row.metadata_signature != hashlib.sha256(standard_json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 @pytest.mark.asyncio
@@ -608,9 +601,8 @@ async def test_tampered_metadata_fails_integrity_verification(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_legacy_signature_accepted_for_preexisting_rows(tmp_path):
-    """DOC-01 (migration): rows signed with the old unsalted SHA-256 remain
-    readable while the acceptance flag is enabled."""
+async def test_unkeyed_signature_is_always_rejected(tmp_path):
+    """A writable store cannot forge metadata without the signing key."""
 
     manager = _make_manager(tmp_path)
     record = await manager.store_bytes(
@@ -619,12 +611,12 @@ async def test_legacy_signature_accepted_for_preexisting_rows(tmp_path):
     row = manager.store.get_upload(
         user_hash=manager.generate_user_hash("alice")[2], upload_id=record.upload_id
     )
-    legacy = manager._compute_legacy_metadata_signature(manager._metadata_signature_payload(row))
+    legacy = hashlib.sha256(standard_json.dumps(manager._metadata_signature_payload(row), ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     with sqlite3.connect(manager.store.db_path) as conn:
         conn.execute(
             "UPDATE attachment_uploads SET metadata_signature = ? WHERE upload_id = ?",
             (legacy, record.upload_id),
         )
 
-    fetched = manager.get_metadata(username="alice", upload_id=record.upload_id)
-    assert fetched.upload_id == record.upload_id
+    with pytest.raises(AttachmentNotFoundError, match="integrity"):
+        manager.get_metadata(username="alice", upload_id=record.upload_id)

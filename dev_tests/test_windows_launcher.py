@@ -1,9 +1,11 @@
 """Windows process-control regressions; local HTTP fixtures, no engine/provider calls."""
 
 import os
+import socket
 import subprocess
 import sys
 import textwrap
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -118,3 +120,36 @@ def test_stop_only_affects_verified_instance_and_duplicate_start_is_refused(http
     ''')
     target.wait(timeout=5)
     assert other.poll() is None
+
+
+def test_started_server_survives_launcher_exit_and_no_verbosity_flags_are_forced(tmp_path):
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    marker = tmp_path / "arguments.txt"
+    (tmp_path / "main.py").write_text(textwrap.dedent('''\
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from pathlib import Path
+        import json, os, sys
+        Path("arguments.txt").write_text(json.dumps(sys.argv[1:]))
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b'{"service":"Gran Sabio LLM Engine","status":"healthy"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *args):
+                pass
+        HTTPServer(("127.0.0.1", int(os.environ["APP_PORT"])), Handler).serve_forever()
+    '''), encoding="utf-8")
+    quoted_root = str(tmp_path).replace("'", "''")
+    try:
+        run_script(f"$script:GranSabioRoot = '{quoted_root}'; $null = Start-GranSabio -Port {port}; 'PASS'")
+        # The PowerShell launcher above has exited; the child is still serving.
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as response:
+            assert response.status == 200
+        assert marker.read_text() == "[]"
+    finally:
+        run_script(f"$state = Get-GranSabioState -Port {port}; if ($state.Status -eq 'running') {{ Stop-GranSabio -ExpectedState $state }}; 'PASS'")

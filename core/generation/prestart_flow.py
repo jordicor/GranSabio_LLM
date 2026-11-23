@@ -8,7 +8,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+from fastapi import HTTPException
+
 from auto_qa_planner import AutoQAPlanningError
+from config import config
 from content_events import (
     ContentEvent,
     ContentPhase,
@@ -20,6 +23,7 @@ from content_events import (
 from content_stream import flush_content_events, publish_content_event
 from logging_utils import Phase
 from models import ContentRequest, GenerationInitResponse, GenerationStatus
+from services.audio_inputs import validate_request_audio_models
 
 from ..cancellation import CancellationToken, CancelMode
 
@@ -74,12 +78,13 @@ async def run_prestart_flow(
     preflight_context: list[dict[str, Any]],
     preflight_image_info: Optional[dict[str, Any]],
     model_alias_registry: Any,
+    resolved_audios: Optional[list] = None,
     local_execution: Optional[Any] = None,
     deps: PrestartFlowDeps,
 ) -> PrestartFlowResult:
     """Run pre-background Auto-QA and preflight without owning route imports."""
 
-    now = datetime.now()
+    now = datetime.utcnow()
     temp_session: Dict[str, Any] = {
         "status": GenerationStatus.INITIALIZING,
         "session_id": session_id,
@@ -249,6 +254,11 @@ async def run_prestart_flow(
                 auto_qa_plan,
                 request_fields_set=request_fields_set,
             )
+            try:
+                validate_request_audio_models(request, resolved_audios or [], config)
+            except HTTPException as exc:
+                details = exc.detail
+                raise AutoQAPlanningError(details["code"], details["message"], details=details) from exc
             auto_qa_plan_payload = auto_qa_plan.public_dict()
             await deps.debug_record_event(
                 session_id,

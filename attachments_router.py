@@ -9,7 +9,7 @@ from time import monotonic
 from typing import Deque, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from config import config
 from core.security import get_client_ip
@@ -212,27 +212,27 @@ class AttachmentUploadResponse(BaseModel):
 class Base64AttachmentRequest(BaseModel):
     """Payload for base64 attachment ingestion."""
 
-    username: str
-    filename: str
+    username: str = Field(min_length=1, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$")
+    filename: str = Field(min_length=1, max_length=255)
     content_base64: str
-    intended_usage: Optional[str] = "context"
+    intended_usage: Optional[str] = Field(default="context", max_length=128)
     mime_type: Optional[str] = None
 
 
 class URLAttachmentRequest(BaseModel):
     """Payload for URL-based attachment ingestion."""
 
-    username: str
-    url: str
-    intended_usage: Optional[str] = "context"
+    username: str = Field(min_length=1, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$")
+    url: str = Field(min_length=1, max_length=8192)
+    intended_usage: Optional[str] = Field(default="context", max_length=128)
 
 
 @router.post("", response_model=AttachmentUploadResponse)
 async def upload_attachment(
     request: Request,
-    username: str = Form(..., description="User identifier used to scope storage"),
+    username: str = Form(..., min_length=1, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$", description="User identifier used to scope storage"),
     file: UploadFile = File(..., description="Attachment to store"),
-    intended_usage: str = Form("context", description="High-level hint about how this attachment will be used"),
+    intended_usage: str = Form("context", max_length=128, description="High-level hint about how this attachment will be used"),
     manager: AttachmentManager = Depends(get_attachment_manager),
     rate_limiter: SimpleRateLimiter = Depends(get_rate_limiter),
 ) -> AttachmentUploadResponse:
@@ -323,7 +323,7 @@ async def upload_attachment_url(
 @router.get("/{upload_id}", response_model=AttachmentRecord)
 async def get_attachment_metadata(
     upload_id: str,
-    username: str = Query(..., description="User identifier used when the attachment was uploaded"),
+    username: str = Query(..., min_length=1, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$", description="User identifier used when the attachment was uploaded"),
     manager: AttachmentManager = Depends(get_attachment_manager),
 ) -> AttachmentRecord:
     """Return previously stored metadata for an attachment."""

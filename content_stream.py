@@ -53,6 +53,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from content_events import ContentEvent, ContentEventType, ContentStatus
+from debugger_transport import TraceAcceptance
 
 logger = logging.getLogger(__name__)
 
@@ -77,10 +78,9 @@ _TraceKey = Tuple[str, str, int, str, str]
 TRACE_MAX_PENDING_CHARS = 2_000_000
 
 ChunkPublisher = Callable[..., Awaitable[None]]
-# The trace writer reports the persisted row length after applying the delta so
-# the coalescer can resynchronize its offsets instead of adding lengths blindly;
-# ``None`` means "no row to stay aligned with" (persistence unavailable).
-TraceWriter = Callable[..., Awaitable[Optional[int]]]
+# SQLite reports a persisted row length. PostgreSQL reports TraceAcceptance:
+# logical ownership by the bounded queue, which is still volatile until flushed.
+TraceWriter = Callable[..., Awaitable[Optional[int | TraceAcceptance]]]
 
 _NO_ITERATION = -1
 _NO_ATTEMPT = 0
@@ -123,6 +123,9 @@ class _PendingTrace:
     # that write owns instead of dropping the row from under it.
     write_settled: Optional[asyncio.Event] = None
     timer: Optional[asyncio.Task] = None
+    capture_bytes: int = 0
+    metadata_bytes: int = 0
+    capture_owner: Any = None
 
 
 def _trace_key(event: ContentEvent) -> _TraceKey:
@@ -136,6 +139,14 @@ def _trace_key(event: ContentEvent) -> _TraceKey:
     )
 
 
+def _continues_segment(entry: Optional[_PendingTrace], event: ContentEvent) -> bool:
+    if entry is None or not entry.segments:
+        return False
+    last = entry.segments[-1]
+    return (last["subphase"] == event.subphase and last["iteration"] == event.iteration
+            and last["content_status"] == event.content_status and last["is_thinking"] == event.is_thinking)
+
+
 async def _default_publish_chunk(**kwargs: Any) -> None:
     """Publish one event on the project bus (lazy import breaks the cycle)."""
     from core.app_state import publish_project_phase_chunk
@@ -143,8 +154,8 @@ async def _default_publish_chunk(**kwargs: Any) -> None:
     await publish_project_phase_chunk(**kwargs)
 
 
-async def _default_write_trace(**kwargs: Any) -> Optional[int]:
-    """Append one batched trace row update to the debugger database."""
+async def _default_write_trace(**kwargs: Any) -> Optional[int | TraceAcceptance]:
+    """Transfer one batched trace delta to the configured debugger writer."""
     from core import app_state
 
     debug_logger = app_state.debug_logger
@@ -185,6 +196,17 @@ class ContentStreamCoalescer:
 
     # -- public API ---------------------------------------------------------
 
+    def _postgres_capture(self):
+        if self._trace_writer is not _default_write_trace:
+            return None
+        from core import app_state
+        instance = app_state.debug_logger
+        return instance._transport if instance is not None else None
+
+    async def _flush_capture(self) -> None:
+        for session_id in {key[0] for key in self._traces}:
+            await self.flush(session_id)
+
     async def publish(self, event: ContentEvent) -> None:
         """Publish one content event through the coalescing handler.
 
@@ -193,7 +215,33 @@ class ContentStreamCoalescer:
         markers) flushes the pending drafts of the same session+phase first and
         is then published immediately.
         """
+        capture = self._postgres_capture()
+        borrowed_large = False
+        charge = 0
+        metadata_charge = 0
+        if capture is not None and event.content and event.session_id:
+            capture.flush_external = self._flush_capture
+            charge = len(event.content) * 8 + 512
+            if not _continues_segment(self._traces.get(_trace_key(event)), event):
+                metadata_charge = 2048 + sum(len(str(item or ""))*8 for item in (event.subphase, event.model, event.layer))
+            borrowed_large = charge > capture.policy.ram_bytes // 4
+            if borrowed_large or capture.external_bytes + charge > capture.policy.ram_bytes // 4:
+                await self._flush_capture()
+            await capture.reserve_external(metadata_charge + (0 if borrowed_large else charge),
+                                           pending_bytes=0 if borrowed_large else charge)
         self._buffer_trace(event)
+        if capture is not None and event.content and event.session_id:
+            entry = self._traces[_trace_key(event)]
+            entry.capture_owner = capture
+            entry.metadata_bytes += metadata_charge
+            if not borrowed_large:
+                entry.capture_bytes += charge
+            else:
+                # Keep the producer awaiting its own large immutable chunk;
+                # encode/commit it in bounded pieces, rather than retaining it.
+                await self._write_trace(_trace_key(event), force=True)
+                await self._publish_now(event, event.content)
+                return
 
         if event.is_draft_chunk:
             if event.content:
@@ -266,7 +314,7 @@ class ContentStreamCoalescer:
             # delta it may still restore into ``parts``, and dropping the entry
             # now would leave the restore writing into an object nobody can
             # reach again. The drain waits for it instead.
-            if entry.parts or entry.write_in_flight:
+            if entry.parts or entry.write_in_flight or entry.metadata_bytes:
                 pending_trace_keys.append(key)
             else:
                 self._traces.pop(key, None)
@@ -412,13 +460,7 @@ class ContentStreamCoalescer:
         # short by that delta, cumulatively, because the writer always suspends.
         offset = entry.chars_written + entry.in_flight_chars + entry.pending_chars
         last_segment = entry.segments[-1] if entry.segments else None
-        if (
-            last_segment is not None
-            and last_segment["subphase"] == event.subphase
-            and last_segment["iteration"] == event.iteration
-            and last_segment["content_status"] == event.content_status
-            and last_segment["is_thinking"] == event.is_thinking
-        ):
+        if _continues_segment(entry, event):
             last_segment["end"] = offset + len(event.content)
         else:
             entry.segments.append(
@@ -465,11 +507,14 @@ class ContentStreamCoalescer:
             return
         _cancel_timer(entry.timer)
         entry.timer = None
-        if not entry.parts:
-            return
         if entry.write_in_flight:
             # A write is already in flight for this row; the buffered tail is
             # written by the follow-up scheduled when that write completes.
+            if force and entry.write_settled is not None:
+                await entry.write_settled.wait()
+                await self._write_trace(key, force=force)
+            return
+        if not entry.parts:
             return
         if not force and (self._clock() - entry.last_write_at) < self._trace_interval:
             return
@@ -482,8 +527,9 @@ class ContentStreamCoalescer:
         entry.write_in_flight = True
         entry.write_settled = asyncio.Event()
         segments = [dict(segment) for segment in entry.segments]
-        persisted = False
-        applied_chars: Optional[int] = None
+        capture_bytes, entry.capture_bytes = entry.capture_bytes, 0
+        accepted = False
+        applied_chars: Optional[int | TraceAcceptance] = None
         try:
             applied_chars = await self._trace_writer(
                 session_id=entry.session_id,
@@ -499,7 +545,7 @@ class ContentStreamCoalescer:
                 expected_offset=expected_offset,
                 segments=segments,
             )
-            persisted = True
+            accepted = True
         except asyncio.CancelledError:
             # External cancellation (shutdown, hard stop) while the writer was
             # suspended: this call cannot know whether the delta reached the row,
@@ -512,6 +558,7 @@ class ContentStreamCoalescer:
             # arming a timer here would mean spawning a task on a loop that is
             # being torn down.
             _restore_unwritten_delta(entry, content)
+            entry.capture_bytes += capture_bytes
             raise
         except Exception:
             logger.exception(
@@ -527,24 +574,29 @@ class ContentStreamCoalescer:
             if settled is not None:
                 settled.set()
 
-        if persisted:
-            # ``applied_chars`` is the authoritative length of the row after an
-            # append positioned at ``expected_offset``: text that a cancelled
-            # attempt already got in is skipped instead of appended twice, so
-            # trusting the writer's number is what keeps the offsets truthful.
+        if accepted:
+            # PG advances the logical offset on ownership, not durability.
+            # A read barrier separately confirms the captured prefix in PG.
+            # SQLite returns its persisted offset after overlap reconciliation.
             # ``None`` means there is no row at all (persistence unavailable) and
             # the in-memory accounting only has to stay monotonic.
             entry.chars_written = (
                 entry.chars_written + len(content)
                 if applied_chars is None
-                else applied_chars
+                else applied_chars.chars if isinstance(applied_chars, TraceAcceptance) else applied_chars
             )
             entry.in_flight_chars = 0
+            if entry.capture_owner and capture_bytes:
+                await entry.capture_owner.release_external(capture_bytes)
         else:
             # The row did not grow: keep the delta at the head of the buffer so
             # segment offsets stay aligned with the persisted text, unless the
             # backlog is already unreasonable.
             _restore_unwritten_delta(entry, content)
+            entry.capture_bytes += capture_bytes
+            if entry.capture_owner:
+                from debugger_spool import DebuggerPersistenceError
+                raise DebuggerPersistenceError("Trace capture is blocked; original buffered content retained")
             if entry.pending_chars > TRACE_MAX_PENDING_CHARS:
                 logger.error(
                     "Dropping %d buffered trace chars for session %s phase %s "
@@ -595,6 +647,9 @@ class ContentStreamCoalescer:
             # being lost instead of leaving a silent gap in the trace.
             _cancel_timer(entry.timer)
             entry.timer = None
+            if entry.capture_owner and entry.metadata_bytes:
+                await entry.capture_owner.release_external(entry.metadata_bytes, pending_bytes=0)
+                entry.metadata_bytes = 0
             if entry.parts:
                 logger.error(
                     "Dropping %d unwritten trace chars for session %s phase %s "

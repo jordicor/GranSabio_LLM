@@ -16,11 +16,13 @@ import importlib.util
 import json
 from pathlib import Path
 from types import SimpleNamespace
+
 import pytest
 
 from deterministic_validation import (
     SEGMENT_BUDGET_CHECK_NAME,
     build_segment_budget_gate_evaluations,
+    build_segment_budget_instructions,
     evaluate_segment_budget_gate,
     has_active_generation_validators,
     validate_generation_candidate,
@@ -46,7 +48,6 @@ def _contract_dict(**overrides):
         "schema_version": "segment-budgets/v1",
         "structure_field": "composition",
         "base_heading_level": 3,
-        "severity": "deal_breaker",
     }
     base.update(overrides)
     return base
@@ -158,7 +159,7 @@ def test_invalid_json_candidate_is_skipped():
 
 
 def test_segment_budgets_model_instance_is_supported():
-    request = _request(segment_budgets=SegmentBudgetsContract())
+    request = _request(segment_budgets=SegmentBudgetsContract(**_contract_dict()))
     text = _words(25)
 
     report = validate_generation_candidate(
@@ -739,7 +740,7 @@ def test_gate_rechecks_the_current_text_after_an_edit():
         "prompt": "Generate a short report about the supplied facts.",
         "json_output": True,
         "target_field": "text",
-        "segment_budgets": {},
+        "segment_budgets": _contract_dict(),
     })
     declared = _budget(5, 12, 120)
     sections = [_section("Overview", 5, 12, 30)]
@@ -754,7 +755,7 @@ def test_gate_rejects_unparseable_current_json():
         "prompt": "Generate a short report about the supplied facts.",
         "json_output": True,
         "target_field": "text",
-        "segment_budgets": {},
+        "segment_budgets": _contract_dict(),
     })
     gate = evaluate_segment_budget_gate('{"text":', request)
     assert gate is not None and not gate.passed and gate.deal_breaker
@@ -789,25 +790,77 @@ def test_gate_synthetic_evaluations_feed_iteration_feedback_prompt():
 
 
 # ---------------------------------------------------------------------------
-# ContentRequest integration / mixed-version behavior
+# ContentRequest integration
 # ---------------------------------------------------------------------------
 
 
-def test_content_request_accepts_segment_budgets_with_defaults():
+def test_content_request_accepts_explicit_segment_budgets():
     request = ContentRequest.model_validate({
         "prompt": "Genera un texto de prueba.",
         "json_output": True,
         "target_field": "text",
-        "segment_budgets": {"enabled": True},
+        "segment_budgets": _contract_dict(),
     })
 
     assert isinstance(request.segment_budgets, SegmentBudgetsContract)
     assert request.segment_budgets.schema_version == "segment-budgets/v1"
     assert request.segment_budgets.structure_field == "composition"
     assert request.segment_budgets.base_heading_level == 3
-    assert request.segment_budgets.severity == "deal_breaker"
     assert has_active_generation_validators(request)
     assert not validate_generation_candidate(_violating_content(), request).approved
+
+
+@pytest.mark.parametrize("contract", [
+    {},
+    {"enabled": True},
+    {"structure_field": "structure"},
+    {"base_heading_level": 2},
+    {"structure_field": None, "base_heading_level": 2},
+    {"structure_field": "structure", "base_heading_level": None},
+    _contract_dict(structure_field=""),
+    _contract_dict(base_heading_level=0),
+    _contract_dict(base_heading_level=6),
+    _contract_dict(severity="deal_breaker"),
+    _contract_dict(structure_filed="typo"),
+    _contract_dict(schema_version="segment-budgets/v2"),
+])
+def test_active_contract_rejects_incomplete_or_unsupported_fields(contract):
+    with pytest.raises(ValueError):
+        ContentRequest(
+            prompt="Write a short structured report about software testing.",
+            json_output=True,
+            target_field="text",
+            segment_budgets=contract,
+        )
+
+
+@pytest.mark.parametrize("contract,status", [
+    ({}, 422),
+    ({"enabled": False}, 200),
+    ({"structure_field": "structure", "base_heading_level": 2}, 200),
+])
+def test_http_contract_validation_precedes_request_handler(contract, status):
+    """Exercise FastAPI's body validation without starting the engine or providers."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+    handled = []
+
+    @app.post("/contract-check")
+    def accept(request: ContentRequest):
+        handled.append(request)
+        return {"accepted": True}
+
+    with TestClient(app) as client:
+        response = client.post("/contract-check", json={
+            "prompt": "Write a short structured report about software testing.",
+            "json_output": True,
+            "target_field": "text",
+            "segment_budgets": contract,
+        })
+    assert response.status_code == status
+    assert len(handled) == (1 if status == 200 else 0)
 
 
 def test_real_qa_model_configs_are_valid_gate_keys():
@@ -815,7 +868,7 @@ def test_real_qa_model_configs_are_valid_gate_keys():
         "prompt": "Genera un texto de prueba.",
         "json_output": True,
         "target_field": "text",
-        "segment_budgets": {},
+        "segment_budgets": _contract_dict(),
         "qa_models": [{"model": "qa-a"}, {"model": "qa-b"}],
     })
     gate = evaluate_segment_budget_gate(_violating_content(), request)
@@ -829,13 +882,13 @@ def test_real_qa_model_configs_are_valid_gate_keys():
     {"json_output": True},
     {"json_output": True, "target_field": "composition"},
     {"json_output": True, "target_field": ["text", "notes"]},
-    {"json_output": True, "target_field": "text", "segment_budgets": {"base_heading_level": 6}},
+    {"json_output": True, "target_field": "text", "segment_budgets": _contract_dict(base_heading_level=6)},
 ])
 def test_active_contract_rejects_invalid_request_configuration(extra):
     with pytest.raises(ValueError):
         ContentRequest.model_validate({
             "prompt": "Genera un texto de prueba.",
-            "segment_budgets": {},
+            "segment_budgets": _contract_dict(),
             **extra,
         })
 
@@ -844,6 +897,52 @@ def test_content_request_defaults_segment_budgets_to_none():
     request = ContentRequest.model_validate({"prompt": "Genera un texto de prueba."})
 
     assert request.segment_budgets is None
+
+
+@pytest.mark.parametrize("contract", [None, {"enabled": False}])
+def test_inactive_segment_budgets_add_no_prompt_instructions(contract):
+    request = ContentRequest(
+        prompt="Write a short report about software testing.",
+        segment_budgets=contract,
+    )
+
+    assert build_segment_budget_instructions(request) == ""
+    assert evaluate_segment_budget_gate("Plain text needs no structure", request) is None
+
+
+def test_segment_budget_instructions_preserve_explicit_api_fields():
+    request = ContentRequest(
+        prompt="Write a short report about software testing.",
+        json_output=True,
+        target_field="text",
+        segment_budgets=_contract_dict(),
+    )
+
+    instructions = build_segment_budget_instructions(request)
+
+    assert 'its structure is declared in "composition"' in instructions
+    assert '"### <title>" for top-level sections' in instructions
+    assert "requested length" not in instructions
+
+
+def test_segment_budget_instructions_follow_explicit_fields_and_bounds():
+    request = ContentRequest(
+        prompt="Write a short report about software testing.",
+        json_output=True,
+        target_field="body",
+        segment_budgets={"structure_field": "plan", "base_heading_level": 2},
+        min_words=100,
+        max_words=400,
+    )
+
+    instructions = build_segment_budget_instructions(request)
+
+    assert 'its text goes in "body"' in instructions
+    assert 'its structure is declared in "plan"' in instructions
+    assert '"## <title>" for top-level sections' in instructions
+    assert '"### <title>" for children' in instructions
+    assert "its min_words must be at least 100" in instructions
+    assert "its max_words must be at most 400" in instructions
 
 
 def test_unknown_fields_are_ignored_like_an_old_server():

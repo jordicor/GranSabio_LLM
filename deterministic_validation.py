@@ -1203,6 +1203,47 @@ def evaluate_segment_budget_gate(
     return evaluate_segment_budget_check(context, request)
 
 
+def build_segment_budget_instructions(request: Any) -> str:
+    """Build the writing instructions for an active segment budgets contract.
+
+    States, in neutral terms, every rule that ``evaluate_segment_budget_check``
+    enforces before acceptance, so whoever writes the candidate (generator,
+    JSON retry, Gran Sabio regeneration, and the Gran Sabio reviews when they
+    rewrite the final content) works against the same contract it is judged
+    by. Returns an empty string when the contract is not active.
+    """
+
+    contract = _segment_budget_contract_dict(request)
+    if contract is None:
+        return ""
+
+    base_heading_level = contract["base_heading_level"]
+    top_heading = "#" * base_heading_level
+    child_heading = "#" * (base_heading_level + 1)
+    request_bounds: List[str] = []
+    request_min_words = getattr(request, "min_words", None)
+    request_max_words = getattr(request, "max_words", None)
+    if request_min_words is not None:
+        request_bounds.append(f"its min_words must be at least {request_min_words}")
+    if request_max_words is not None:
+        request_bounds.append(f"its max_words must be at most {request_max_words}")
+    request_bounds_rule = (
+        "\n- The document word_budget must stay inside the requested length: "
+        + " and ".join(request_bounds)
+        + "."
+        if request_bounds
+        else ""
+    )
+
+    return f"""SEGMENT BUDGETS CONTRACT ({_SEGMENT_BUDGET_SCHEMA_VERSION}): checked deterministically before the result can be accepted.
+- The result is one JSON object: its text goes in "{request.target_field}" and its structure is declared in "{contract['structure_field']}" as an object with "word_budget" (for the whole text) and "sections" (the ordered sections; [] for a continuous text without headings).
+- Every word_budget is an object with integer "min_words", "target_words" and "max_words", where 0 <= min_words <= target_words <= max_words and target_words >= 1.{request_bounds_rule}
+- Each section declares "title" (a non-empty single line with no leading or trailing whitespace) and "word_budget". To nest sections, give the parent a "subsection_id" (a unique non-empty string without ':' or whitespace) and give each child that id in "parent_subsection_id". Only two levels are allowed, and children must directly follow their parent or a sibling.
+- When sections are declared, the "target_words" of the top-level sections must add up exactly to the document "target_words" and their "max_words" must not add up to more than the document "max_words". Likewise, the "target_words" of the children of a section must add up exactly to that section's "target_words" and their "max_words" must not add up to more than that section's "max_words".
+- In the text, open every declared section with a Markdown heading that repeats its title exactly, in the declared order: "{top_heading} <title>" for top-level sections and "{child_heading} <title>" for children. Add no other headings: every line that starts with up to 3 spaces and then 1 to 6 "#" characters followed by a space, a tab or the end of the line is read as a heading, and its text after the "#" characters (trailing whitespace ignored) must be the next declared title at the declared level.
+- Words are counted as runs of letters, digits and underscores, so punctuation, apostrophes and hyphens split words. A section is counted from its heading line (heading words included) up to the next heading of the same or a higher level, so a parent section includes its children. Every section, and the whole text, must stay within its declared min_words and max_words."""
+
+
 def build_segment_budget_gate_evaluations(
     check_result: DeterministicCheckResult,
     qa_models: Optional[List[Any]],

@@ -13,7 +13,9 @@ from personal_subscription import API_URL, SubscriptionError, get_personal_subsc
 
 
 def overload_retry_delay(exc: Exception, attempt: int) -> float:
-    """Use the bounded overload schedule, respecting a later Retry-After."""
+    """Respect Retry-After within the request's bounded overload schedule."""
+    if attempt < 1:
+        raise ValueError("Retry attempt must be positive")
     delay = (5.0, 15.0)[min(attempt - 1, 1)]
     headers = getattr(getattr(exc, "response", None), "headers", None) or {}
     retry_after = headers.get("retry-after")
@@ -29,7 +31,7 @@ def overload_retry_delay(exc: Exception, attempt: int) -> float:
             ).total_seconds()
         except (ValueError, TypeError, OverflowError):
             return delay
-    return max(delay, provider_delay) if math.isfinite(provider_delay) else delay
+    return min(60.0, max(delay, provider_delay)) if math.isfinite(provider_delay) else delay
 
 
 async def stream_personal_response(

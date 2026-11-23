@@ -89,7 +89,7 @@ def _openai_tool_call(draft_text: str) -> SimpleNamespace:
 async def test_openai_embedding_failure_counts_degraded_batch(
     service, clean_provider_health, monkeypatch
 ):
-    """AIS-07: provider outage keeps the empty-vector fallback but records it."""
+    """A provider outage records health and propagates without another paid call."""
     monkeypatch.setattr("ai_service.config.OPENAI_API_KEY", "test-key", raising=False)
     monkeypatch.setattr(
         "ai_service.resolve_call", lambda *a, **k: SimpleNamespace(model=None)
@@ -101,9 +101,9 @@ async def test_openai_embedding_failure_counts_degraded_batch(
     )
     service._admit_embedding_batch = AsyncMock(return_value=None)
 
-    result = await service.get_embeddings(["alpha", "beta"], model="text-embedding-3-small")
-
-    assert result == [[], []]  # documented fallback preserved
+    with pytest.raises(Exception, match="upstream 500"):
+        await service.get_embeddings(["alpha", "beta"], model="text-embedding-3-small")
+    service.openai_client.embeddings.create.assert_awaited_once()
     snapshot = provider_health.get_provider_health("openai")
     assert snapshot["recent_event_count"] == 1
     assert snapshot["local_errors"]["recent_event_count"] == 1
@@ -112,7 +112,7 @@ async def test_openai_embedding_failure_counts_degraded_batch(
 async def test_google_embedding_failure_counts_degraded_batch(
     service, clean_provider_health, monkeypatch
 ):
-    """AIS-07: the Gemini embeddings fallback is counted as well."""
+    """An explicitly selected Gemini embedding model never switches provider."""
     monkeypatch.setattr("ai_service.config.GOOGLE_API_KEY", "test-key", raising=False)
     service.google_new_client = SimpleNamespace(
         aio=SimpleNamespace(
@@ -123,9 +123,12 @@ async def test_google_embedding_failure_counts_degraded_batch(
     )
     service._admit_embedding_batch = AsyncMock(return_value=None)
 
-    result = await service.get_embeddings(["alpha"], model="text-embedding-004")
-
-    assert result == [[]]
+    from config import config
+    monkeypatch.setitem(config.MODEL_TOKEN_LIMITS, "synthetic-gemini-embed", {
+        "provider": "google", "enabled": True, "capabilities": ["embeddings"]})
+    with pytest.raises(Exception, match="upstream 503"):
+        await service.get_embeddings(["alpha"], model="synthetic-gemini-embed")
+    service.google_new_client.aio.models.embed_content.assert_awaited_once()
     snapshot = provider_health.get_provider_health("gemini")
     assert snapshot["recent_event_count"] == 1
 
@@ -415,7 +418,7 @@ async def test_gpt5_responses_reraises_original_exception(service):
     service.openai_client = SimpleNamespace()
     original = Exception("rate limit exceeded")
     original.status_code = 429
-    service._call_responses_create_with_reasoning_retry = AsyncMock(side_effect=original)
+    service._create_response = AsyncMock(side_effect=original)
 
     with pytest.raises(Exception) as exc_info:
         await service._generate_openai("p", "gpt-5", 0.7, 100, "sys")
@@ -429,7 +432,7 @@ async def test_gpt5_streaming_reraises_original_exception(service):
     service.openai_client = SimpleNamespace()
     original = Exception("upstream exploded")
     original.status_code = 500
-    service._call_responses_create_with_reasoning_retry = AsyncMock(side_effect=original)
+    service._create_response = AsyncMock(side_effect=original)
 
     with pytest.raises(Exception) as exc_info:
         async for _ in service._stream_openai("p", "gpt-5", 0.7, 100, "sys", False):

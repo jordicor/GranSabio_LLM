@@ -1239,7 +1239,8 @@ async def test_call_ai_emits_tool_loop_error_event_on_provider_failure():
     assert event_type == "tool_loop_error"
     assert payload["exception_class"] == "AIRequestError"
     assert payload["cause_class"] == "AttributeError"
-    assert "ClientConnectorDNSError" in payload["cause_message"]
+    assert payload["cause_message"] == provider_error.provider_failure.message
+    assert str(cause) not in str(payload)
 
 
 @pytest.mark.asyncio

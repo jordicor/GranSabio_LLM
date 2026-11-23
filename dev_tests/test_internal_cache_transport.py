@@ -174,7 +174,7 @@ async def test_openrouter_adapter_preserves_internal_markers(service, streaming)
     assert ["cache_control" in part for part in parts] == [True, True, False]
 
 
-def test_tools_responses_conversion_and_admission_keep_complete_prompt(service):
+async def test_tools_responses_conversion_and_admission_keep_complete_prompt(service):
     prompt = CacheablePrompt(TEXT, BOUNDARIES)
     messages = prepend_user_context([{"role": "system", "content": "system"},
                                     {"role": "user", "content": prompt}],
@@ -186,6 +186,6 @@ def test_tools_responses_conversion_and_admission_keep_complete_prompt(service):
                for part in message["content"]) == 3
     counted = service._collect_tool_loop_message_text(converted)
     assert all(part["text"] in counted for part in converted[-1]["content"])
-    budget = service._build_chat_call_budget(provider="openai", model_id="test", call_id="test",
+    budget = await service._build_chat_call_budget(provider="openai", model_id="test", call_id="test",
         system_prompt="system", prompt=prompt, shared_context="source", reserved_output_tokens=32)
     assert next(part.text for part in budget.components if part.name == "prompt") == TEXT

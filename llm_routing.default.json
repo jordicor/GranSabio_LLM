@@ -155,30 +155,6 @@
         "embeddings"
       ]
     },
-    "feedback.embed_fallback": {
-      "model": "text-embedding-3-small",
-      "requires": [
-        "embeddings"
-      ]
-    },
-    "embedding.openai": {
-      "model": "text-embedding-3-large",
-      "requires": [
-        "embeddings"
-      ]
-    },
-    "embedding.openai_fallback": {
-      "model": "text-embedding-3-small",
-      "requires": [
-        "embeddings"
-      ]
-    },
-    "embedding.google": {
-      "model": "models/text-embedding-004",
-      "requires": [
-        "embeddings"
-      ]
-    },
     "accent.audit": {
       "model": "gpt-6-luna",
       "params": {
@@ -236,6 +212,12 @@
       "params": {
         "max_tokens": 5
       }
+    },
+    "embedding.default": {
+      "model": "text-embedding-3-large",
+      "requires": [
+        "embeddings"
+      ]
     }
   }
 }

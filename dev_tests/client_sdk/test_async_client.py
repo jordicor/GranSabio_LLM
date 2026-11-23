@@ -551,6 +551,17 @@ class TestAsyncGenerate:
     """Tests for async generate() and related methods."""
 
     @pytest.mark.asyncio
+    async def test_generate_forwards_segment_budgets(self, client, mock_response):
+        contract = {"structure_field": "structure", "base_heading_level": 2}
+        mock_response.json.return_value = {"session_id": "sess-1", "status": "started"}
+        client._session.request = AsyncMock(return_value=mock_response)
+        await client.generate(
+            prompt="Test", json_output=True, target_field="text",
+            segment_budgets=contract, qa_layers=[], wait_for_completion=False,
+        )
+        assert client._session.request.call_args[1]["json"]["segment_budgets"] == contract
+
+    @pytest.mark.asyncio
     async def test_generate_returns_immediately_when_not_waiting(self, client, mock_response):
         """Given: wait_for_completion=False, Then: Returns init response."""
         mock_response.json.return_value = {"session_id": "sess-123", "status": "started"}

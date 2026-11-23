@@ -1,12 +1,13 @@
 """
 Debug logger for Gran Sabio LLM Engine.
 
-Persists a verbatim request/response timeline to SQLite so developers can
+Persists a verbatim request/response timeline to SQLite or PostgreSQL so developers can
 inspect each session in chronological order via the /debugger interface.
 
 Persistence notes (what is stored, where, and for how long):
-- Storage is an unencrypted SQLite database. The default path lives under
-  per-user local app storage; DEBUGGER_DB_PATH overrides it.
+- Storage defaults to an unencrypted SQLite database under per-user local app
+  storage (DEBUGGER_DB_PATH overrides it). PostgreSQL is opt-in through
+  DEBUGGER_BACKEND / DEBUGGER_DATABASE_URL / DEBUGGER_INSTANCE_ID.
 - Capture is VERBATIM (C13.2): prompts, source material, generated content, QA
   payloads and usage are stored exactly as the engine saw them. Absolute
   traceability is the point of this database; unbounded growth is an accepted
@@ -42,6 +43,9 @@ from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Optional, S
 import aiosqlite
 
 import json_utils as json
+from debugger_payload import SerializedJSON
+from debugger_spool import DebuggerConflict, DebuggerPersistenceError
+from debugger_transport import PersistencePolicy, PostgresCapture, TraceAcceptance, applying_operation
 
 logger = logging.getLogger(__name__)
 
@@ -767,14 +771,23 @@ class DebugLogger:
         enabled: bool,
         db_path: str,
         retention_days: Optional[int] = None,
+        backend: str = "sqlite",
+        database_url: str = "",
+        instance_id: str = "",
+        persistence_policy: Optional[PersistencePolicy] = None,
     ):
+        if backend not in {"sqlite", "postgresql"}:
+            raise ValueError("DEBUGGER_BACKEND must be sqlite or postgresql")
         self.enabled = enabled
+        self.backend = backend
+        self.database_url = database_url
+        self.instance_id = instance_id
         self.configured_db_path = db_path
         self.db_path = resolve_debugger_db_path(db_path)
         # Single retention setting, read once (C13.1). None means "keep
         # forever"; no cleanup task is created at all in that case.
         self.retention_days = _normalize_retention_days(retention_days)
-        self._pool: Optional[aiosqlite.Connection] = None
+        self._pool = None  # aiosqlite or the debugger's PostgreSQL connection
         self._init_lock = asyncio.Lock()
         self._event_lock = asyncio.Lock()
         self._event_counters: Dict[str, int] = {}
@@ -782,20 +795,57 @@ class DebugLogger:
         self._cleanup_running: bool = False
         self._storage_disabled_reason: Optional[str] = None
         self._bg_tasks: Set[asyncio.Task] = set()
+        self._transport: Optional[PostgresCapture] = None
+        self.persistence_policy = persistence_policy or PersistencePolicy()
 
     @property
     def storage_disabled_reason(self) -> Optional[str]:
         """Explain why debugger persistence was disabled, if it was."""
-        return self._storage_disabled_reason
+        return self._transport.reason if self._transport else self._storage_disabled_reason
 
     @property
     def storage_available(self) -> bool:
         """Return whether debugger persistence can still be used."""
+        if self._transport:
+            return self.enabled and not self._transport.fatal and self._pool is not None
         return self.enabled and self._storage_disabled_reason is None
+
+    @property
+    def persistence_status(self) -> dict:
+        """Report capture separately from complete remote evidence."""
+        return self._transport.status() if self._transport else {"state": "available" if self.storage_available else "blocked", "complete": self.storage_available}
+
+    def require_capture_capacity(self) -> None:
+        """Guard new work without aborting provider calls already in flight."""
+        if self._transport:
+            self._transport.require_admission()
+        elif self.enabled and self.backend == "postgresql":
+            raise DebuggerPersistenceError("PostgreSQL debugger has not initialized safely")
+
+    async def flush(self, timeout: Optional[float] = None) -> None:
+        """Confirm the currently accepted prefix before exposing complete evidence."""
+        if self._transport:
+            await self._transport.flush(timeout)
 
     async def _disable_storage(self, exc: BaseException) -> None:
         """Disable debugger persistence after a terminal storage error."""
-        await self._disable_storage_with_reason(f"{type(exc).__name__}: {exc}")
+        if self.backend == "postgresql":
+            from debugger_postgres import postgres_failure_reason
+            reason = postgres_failure_reason(exc)
+        else:
+            reason = f"{type(exc).__name__}: {exc}"
+        await self._disable_storage_with_reason(reason)
+
+    @property
+    def storage_identity(self) -> dict:
+        """Public backend identity without paths, addresses or credentials."""
+        return {"backend": self.backend, "instance_id": self.instance_id or None}
+
+    def _terminal_storage_error(self, exc: BaseException) -> bool:
+        if self.backend == "postgresql":
+            from debugger_postgres import is_postgres_storage_error
+            return is_postgres_storage_error(exc)
+        return is_terminal_debugger_storage_error(exc)
 
     async def _disable_storage_with_reason(self, reason: str) -> None:
         """Disable debugger persistence and record why, logging once."""
@@ -805,25 +855,54 @@ class DebugLogger:
         if first_disable:
             logger.warning(
                 "Debugger persistence disabled for database %s: %s",
-                self.db_path,
+                self.instance_id if self.backend == "postgresql" else self.db_path,
                 reason,
             )
 
     async def _run_guarded(self, operation: Callable[[], Awaitable[T]], *, default: T) -> T:
         """Run a storage operation and disable persistence on terminal I/O failures."""
+        if self._transport:
+            if applying_operation.get():
+                return await operation()
+            await self.flush()
+            pool = self._pool
+            try:
+                async with pool.operation():
+                    return await operation()
+            except DebuggerPersistenceError:
+                raise
+            except Exception as exc:
+                self._transport._failed(exc)
+                await self._transport._disconnect()
+                self._transport._wake.set()
+                raise DebuggerPersistenceError("Debugger read failed; complete evidence unavailable") from exc
         if not self.storage_available or self._pool is None:
             return default
 
         try:
+            if self.backend == "postgresql":
+                pool = self._pool
+                async with pool.operation():
+                    if not self.storage_available or self._pool is not pool:
+                        return default
+                    return await operation()
             return await operation()
         except Exception as exc:
-            if is_terminal_debugger_storage_error(exc):
+            if self._terminal_storage_error(exc):
                 await self._disable_storage(exc)
                 return default
             raise
 
     async def initialize(self) -> None:
-        """Open SQLite connection and create schema if needed."""
+        """Open the selected debugger store without copying another backend."""
+        if self.backend == "postgresql":
+            if not self.enabled:
+                return
+            async with self._init_lock:
+                if self._transport is None:
+                    self._transport = PostgresCapture(self, self.persistence_policy)
+                    await self._transport.start()
+            return
         if not self.storage_available:
             return
 
@@ -878,11 +957,24 @@ class DebugLogger:
                     )
                 logger.info("Debug logger initialized with database at %s", self.db_path)
             except Exception as exc:
-                if is_terminal_debugger_storage_error(exc):
+                if self._terminal_storage_error(exc) or self.backend == "postgresql":
                     await self._disable_storage(exc)
                     return
                 await self.close()
                 raise
+
+    async def _connect_postgres(self) -> None:
+        from debugger_postgres import PostgresDebuggerConnection
+
+        self._pool = await PostgresDebuggerConnection.connect(self.database_url, self.instance_id)
+        await self._pool.initialize(
+            self._SESSION_SCHEMA_SQL + self._CONTENT_TRACES_TABLE_DDL.format(table="content_traces")
+            + ";\n" + self._CONTENT_TRACES_INDEX_DDL
+            + "\nCREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id);",
+            self.instance_id,
+        )
+        if self.storage_available:
+            logger.info("PostgreSQL debugger initialized for instance %s", self.instance_id)
 
     async def _set_journal_mode_wal(self) -> None:
         """Switch the debugger connection to WAL and report the result.
@@ -914,18 +1006,15 @@ class DebugLogger:
             )
 
     async def close(self) -> None:
-        """Close SQLite connection."""
-        if self._pool is not None:
-            await self._pool.close()
-            self._pool = None
-
-    async def _create_schema(self) -> None:
-        """Create tables for session storage."""
-        if self._pool is None:
+        """Close the selected connection, including after concurrent I/O failures."""
+        if self._transport:
+            await self._transport.close()
             return
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            await pool.close()
 
-        await self._pool.executescript(
-            """
+    _SESSION_SCHEMA_SQL = """
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 created_at TEXT DEFAULT (datetime('now')),
@@ -961,7 +1050,13 @@ class DebugLogger:
             CREATE INDEX IF NOT EXISTS idx_sessions_created
                 ON sessions(created_at);
             """
-        )
+
+    async def _create_schema(self) -> None:
+        """Create tables for session storage."""
+        if self._pool is None:
+            return
+
+        await self._pool.executescript(self._SESSION_SCHEMA_SQL)
         await self._ensure_sessions_columns()
         await self._ensure_content_traces_table()
 
@@ -1137,9 +1232,13 @@ class DebugLogger:
 
     def _serialize(self, payload: Any) -> str:
         """Serialize a telemetry payload to JSON verbatim (C13.2)."""
+        if isinstance(payload, SerializedJSON):
+            return payload.text.decode("utf-8") if isinstance(payload.text, bytes) else payload.text
         try:
             return json.dumps(payload, ensure_ascii=True)
         except Exception:
+            if self.backend == "postgresql":
+                raise DebuggerPersistenceError("Debugger payload cannot be encoded without loss")
             logger.exception("Failed to serialize payload for debug logger")
             return "{}"
 
@@ -1168,7 +1267,13 @@ class DebugLogger:
         """
         if self.retention_days is None:
             return
-        task = asyncio.create_task(self._maybe_piggyback_cleanup())
+        # A task created by the PG applier must not inherit its transaction-only
+        # bypass: maintenance has to wait for a complete capture cut itself.
+        marker = applying_operation.set(False)
+        try:
+            task = asyncio.create_task(self._maybe_piggyback_cleanup())
+        finally:
+            applying_operation.reset(marker)
         self._bg_tasks.add(task)
         task.add_done_callback(self._on_cleanup_task_done)
 
@@ -1193,6 +1298,11 @@ class DebugLogger:
         phase: Optional[str] = None,
     ) -> None:
         """Persist initial session data verbatim, prompts and sources included."""
+        if self._transport and not applying_operation.get():
+            await self._transport.submit("record_session_start", dict(session_id=session_id,
+                request_payload=request_payload, preflight_payload=preflight_payload,
+                status=status, project_id=project_id, phase=phase))
+            return
         async def _operation() -> None:
             logger.debug(
                 "Recording session %s... with project_id: %s",
@@ -1215,8 +1325,8 @@ class DebugLogger:
                 (?, datetime('now'), datetime('now'), ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     updated_at = datetime('now'),
-                    status = excluded.status,
-                    phase = COALESCE(excluded.phase, sessions.phase),
+                    status = CASE WHEN sessions.status IN ('completed','rejected','failed','cancelled','interrupted') THEN sessions.status ELSE excluded.status END,
+                    phase = CASE WHEN sessions.status IN ('completed','rejected','failed','cancelled','interrupted') THEN sessions.phase ELSE COALESCE(excluded.phase, sessions.phase) END,
                     request_json = excluded.request_json,
                     request_name = excluded.request_name,
                     preflight_json = excluded.preflight_json,
@@ -1246,7 +1356,13 @@ class DebugLogger:
         phase: Optional[str] = None,
     ) -> None:
         """Update stored session status, phase and optional final payload."""
+        if self._transport and not applying_operation.get():
+            await self._transport.submit("update_session_status", dict(session_id=session_id,
+                status=status, final_payload=final_payload, phase=phase))
+            return
         async def _operation() -> None:
+            if self.backend == "postgresql":
+                await self._require_session(session_id)
             where_clause = "WHERE session_id = ?"
             params: List[Any] = [
                 status,
@@ -1282,7 +1398,12 @@ class DebugLogger:
 
     async def record_usage_summary(self, session_id: str, usage_payload: Any) -> None:
         """Store aggregated usage metrics for a session."""
+        if self._transport and not applying_operation.get():
+            await self._transport.submit("record_usage_summary", dict(session_id=session_id, usage_payload=usage_payload))
+            return
         async def _operation() -> None:
+            if self.backend == "postgresql":
+                await self._require_session(session_id)
             await self._pool.execute(
                 """
                 UPDATE sessions
@@ -1303,12 +1424,16 @@ class DebugLogger:
         payload: Any,
     ) -> None:
         """Insert chronological event for the session."""
+        if self._transport and not applying_operation.get():
+            await self._transport.submit("record_event", dict(session_id=session_id, event_type=event_type, payload=payload))
+            return
         async def _operation() -> None:
-            event_order = await self._next_event_order(session_id)
+            event_order = (await self._lookup_existing_event_order(session_id) + 1
+                           if self.backend == "postgresql" else await self._next_event_order(session_id))
             await self._pool.execute(
                 """
-                INSERT INTO session_events (session_id, event_order, event_type, payload_json)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO session_events (session_id, event_order, event_type, payload_json, created_at)
+                VALUES (?, ?, ?, ?, datetime('now'))
                 """,
                 (
                     session_id,
@@ -1345,7 +1470,7 @@ class DebugLogger:
         iteration: Optional[int] = None,
         content_status: Optional[str] = None,
         segments: Optional[List[Dict[str, Any]]] = None,
-    ) -> Optional[int]:
+    ) -> Optional[int | TraceAcceptance]:
         """Append a batch of verbatim content to the trace of one attempt.
 
         Called only by ``content_stream.ContentStreamCoalescer`` (single
@@ -1368,18 +1493,51 @@ class DebugLogger:
         BATCHED with newer text, which is why the overlap is skipped by length
         instead of the whole append being refused.
 
-        Returns the row's ``content_chars`` AFTER the operation, so the caller
-        can resynchronize its own accounting instead of adding lengths blindly,
-        or ``None`` when persistence is unavailable.
+        SQLite returns the row's ``content_chars`` after the operation, or None
+        when unavailable. PostgreSQL returns volatile ``TraceAcceptance``;
+        ``flush`` separately confirms the captured prefix before any read.
         """
         if not content_delta:
             return None
 
+        if self._transport and not applying_operation.get():
+            sequence = await self._transport.submit("record_content_trace", dict(
+                session_id=session_id, phase=phase, attempt=attempt, content_delta=content_delta,
+                expected_offset=expected_offset, model=model, layer=layer, project_id=project_id,
+                subphase=subphase, iteration=iteration, content_status=content_status, segments=segments))
+            return TraceAcceptance(expected_offset + len(content_delta), sequence)
+
         expected_total = expected_offset + len(content_delta)
 
         async def _operation() -> Optional[int]:
+            append_expression = "substr(excluded.content, content_traces.content_chars - :expected_offset + 1)"
+            stored_offset = expected_offset
+            if self.backend == "postgresql":
+                async with self._pool.execute(
+                    "SELECT content_chars FROM content_traces WHERE session_id = ? AND phase = ? AND attempt = ? AND model = ? AND layer = ?",
+                    (session_id, phase, attempt, model, layer),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                if existing:
+                    stored_offset = int(existing[0])
+                    if stored_offset < expected_offset:
+                        raise DebuggerConflict("Trace prefix is missing; pending content preserved")
+                    if stored_offset > expected_offset:
+                        from debugger_payload import TraceReader
+                        reader = TraceReader(self._pool.connection, (session_id, phase, attempt, model, layer))
+                        await reader.skip(expected_offset)
+                        overlap = min(stored_offset-expected_offset, len(content_delta))
+                        for offset in range(0, overlap, 32768):
+                            part = content_delta[offset:min(offset+32768, overlap)]
+                            if await reader.read(len(part)) != part:
+                                raise DebuggerConflict("Trace overlap differs from captured content")
+                else:
+                    if expected_offset:
+                        raise DebuggerConflict("Trace prefix is missing; refusing a fabricated prefix")
+                    await self._require_session(session_id)
+                append_expression = ":content_suffix"
             await self._pool.execute(
-                """
+                f"""
                 INSERT INTO content_traces (
                     session_id, phase, attempt, model, layer, project_id,
                     subphase, iteration, content_status, content, content_chars,
@@ -1391,10 +1549,7 @@ class DebugLogger:
                     :content_chars, :segments, datetime('now'), datetime('now')
                 )
                 ON CONFLICT(session_id, phase, attempt, model, layer) DO UPDATE SET
-                    content = content_traces.content || substr(
-                        excluded.content,
-                        content_traces.content_chars - :expected_offset + 1
-                    ),
+                    content = content_traces.content || {append_expression},
                     content_chars = :expected_offset + excluded.content_chars,
                     project_id = COALESCE(excluded.project_id, content_traces.project_id),
                     subphase = excluded.subphase,
@@ -1416,10 +1571,12 @@ class DebugLogger:
                     "subphase": subphase,
                     "iteration": iteration,
                     "content_status": content_status,
-                    "content": content_delta,
+                    "content": content_delta.encode("utf-8") if self.backend == "postgresql" else content_delta,
+                    **({"content_suffix": content_delta[max(0, stored_offset - expected_offset):].encode("utf-8")}
+                       if self.backend == "postgresql" else {}),
                     "content_chars": len(content_delta),
                     "segments": (
-                        json.dumps(segments, ensure_ascii=True) if segments else None
+                        self._serialize(segments) if segments else None
                     ),
                     "expected_offset": expected_offset,
                 },
@@ -1462,6 +1619,12 @@ class DebugLogger:
 
         return await self._run_guarded(_operation, default=None)
 
+    async def _require_session(self, session_id: str) -> None:
+        """A missing parent is a replay conflict, never a successful zero-row write."""
+        async with self._pool.execute("SELECT 1 FROM sessions WHERE session_id=?", (session_id,)) as cursor:
+            if await cursor.fetchone() is None:
+                raise DebuggerConflict("Debugger session header is missing")
+
     async def get_content_traces(
         self,
         session_id: str,
@@ -1488,7 +1651,7 @@ class DebugLogger:
             page_clause = ""
             if limit is not None or offset:
                 page_clause = "LIMIT ? OFFSET ?"
-                params.extend([-1 if limit is None else limit, offset])
+                params.extend([(-1 if self.backend == "sqlite" else None) if limit is None else limit, offset])
 
             async with self._pool.execute(
                 f"""
@@ -1517,7 +1680,7 @@ class DebugLogger:
                         "subphase": row[6],
                         "iteration": row[7],
                         "content_status": row[8],
-                        "content": row[9],
+                        "content": row[9].decode("utf-8") if self.backend == "postgresql" else row[9],
                         "content_chars": row[10],
                         "segments": _decode_trace_segments(row[11]),
                         "created_at": row[12],
@@ -1672,7 +1835,10 @@ class DebugLogger:
             async with self._event_lock:
                 self._event_counters.pop(session_id, None)
 
-        await self._run_guarded(_operation, default=None)
+        if self._transport:
+            await self._transport.maintenance(_operation)
+        else:
+            await self._run_guarded(_operation, default=None)
 
     async def cleanup_old_sessions(
         self,
@@ -1708,7 +1874,7 @@ class DebugLogger:
             }
         retention_days = window
 
-        try:
+        async def _operation():
             # Compute cutoff once in Python (ISO-8601 sorts correctly as text)
             cutoff_str = (datetime.utcnow() - timedelta(days=retention_days)).strftime('%Y-%m-%d %H:%M:%S')
             cleanup_params = (cutoff_str,)
@@ -1777,7 +1943,8 @@ class DebugLogger:
             await self._pool.commit()
 
             # VACUUM to reclaim disk space
-            await self._pool.execute("VACUUM")
+            if self.backend == "sqlite":
+                await self._pool.execute("VACUUM")
 
             # Clear event counters for deleted sessions
             async with self._event_lock:
@@ -1795,8 +1962,17 @@ class DebugLogger:
                 "retention_days": retention_days
             }
 
+        try:
+            if self._transport:
+                return await self._transport.maintenance(_operation)
+            return await self._run_guarded(
+                _operation,
+                default={"status": "disabled", "deleted_sessions": 0, "deleted_events": 0},
+            )
+        except DebuggerPersistenceError:
+            raise
         except Exception as e:
-            if is_terminal_debugger_storage_error(e):
+            if self._terminal_storage_error(e):
                 await self._disable_storage(e)
                 return {
                     "status": "disabled",
@@ -1804,10 +1980,11 @@ class DebugLogger:
                     "deleted_sessions": 0,
                     "deleted_events": 0
                 }
-            logger.error("Failed to cleanup old sessions: %s", e)
+            error = str(e) if self.backend == "sqlite" else type(e).__name__
+            logger.error("Failed to cleanup old sessions: %s", error)
             return {
                 "status": "error",
-                "error": str(e),
+                "error": error,
                 "deleted_sessions": 0,
                 "deleted_events": 0
             }
@@ -1817,16 +1994,34 @@ _shared_debug_logger: Optional[DebugLogger] = None
 _debug_logger_lock = asyncio.Lock()
 
 
+async def require_debugger_dispatch() -> None:
+    """Use the engine's existing dispatch gate for capture backpressure."""
+    if _shared_debug_logger is not None and _shared_debug_logger.enabled:
+        if _shared_debug_logger._transport:
+            await _shared_debug_logger._transport.wait_admission()
+            return
+        _shared_debug_logger.require_capture_capacity()
+
+
 async def initialize_debug_logger(
     enabled: bool,
     db_path: str,
     retention_days: Optional[int] = None,
+    *,
+    backend: str = "sqlite",
+    database_url: str = "",
+    instance_id: str = "",
+    persistence_policy: Optional[PersistencePolicy] = None,
 ) -> None:
     """Initialize shared debug logger instance."""
     logger_instance = await get_debug_logger(
         enabled=enabled,
         db_path=db_path,
         retention_days=retention_days,
+        backend=backend,
+        database_url=database_url,
+        instance_id=instance_id,
+        persistence_policy=persistence_policy,
     )
     await logger_instance.initialize()
 
@@ -1844,6 +2039,10 @@ async def get_debug_logger(
     enabled: bool,
     db_path: str,
     retention_days: Optional[int] = None,
+    backend: str = "sqlite",
+    database_url: str = "",
+    instance_id: str = "",
+    persistence_policy: Optional[PersistencePolicy] = None,
 ) -> DebugLogger:
     """Return shared debug logger (creating if needed)."""
     global _shared_debug_logger
@@ -1857,5 +2056,9 @@ async def get_debug_logger(
                 enabled=enabled,
                 db_path=db_path,
                 retention_days=retention_days,
+                backend=backend,
+                database_url=database_url,
+                instance_id=instance_id,
+                persistence_policy=persistence_policy,
             )
     return _shared_debug_logger

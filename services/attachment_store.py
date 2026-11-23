@@ -76,7 +76,7 @@ class AttachmentUploadRow:
 class AttachmentStore:
     """Small SQLite facade for content-addressed attachment blobs."""
 
-    VALID_KINDS = frozenset({"text", "json", "pdf", "image"})
+    VALID_KINDS = frozenset({"text", "json", "pdf", "image", "audio"})
     ACTIVE_BLOB_STATUSES = ("pending", "ready", "gc_pending")
     CHUNK_SIZE = 1024 * 1024
 
@@ -84,6 +84,7 @@ class AttachmentStore:
         self.settings = settings
         self.db_path = Path(settings.dedupe_db_path)
         self.blob_base_path = Path(settings.blob_base_path)
+        self.ensure_schema()
 
     def ensure_schema(self) -> None:
         """Create the database schema if it does not exist."""
@@ -96,7 +97,7 @@ class AttachmentStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     sha256 TEXT NOT NULL,
                     size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
-                    kind TEXT NOT NULL CHECK (kind IN ('text', 'json', 'pdf', 'image')),
+                    kind TEXT NOT NULL CHECK (kind IN ('text', 'json', 'pdf', 'image', 'audio')),
                     mime_type TEXT NOT NULL,
                     storage_key TEXT NOT NULL UNIQUE,
                     status TEXT NOT NULL CHECK (status IN ('pending', 'ready', 'gc_pending', 'quarantined')),
@@ -144,11 +145,47 @@ class AttachmentStore:
                 );
                 """
             )
-            conn.execute("PRAGMA user_version = 1")
+            self._migrate_audio_kind(conn)
+
+    @staticmethod
+    def _migrate_audio_kind(conn: sqlite3.Connection) -> None:
+        """Extend the v1 CHECK constraint atomically, preserving rows and references."""
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            schema = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='attachment_blobs'"
+            ).fetchone()[0]
+            if "'audio'" not in schema:
+                indexes = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='attachment_blobs' AND sql IS NOT NULL"
+                ).fetchall()
+                sequence = conn.execute("SELECT seq FROM sqlite_sequence WHERE name='attachment_blobs'").fetchone()
+                new_schema = schema.replace("attachment_blobs", "attachment_blobs_v2", 1).replace(
+                    "'pdf', 'image'", "'pdf', 'image', 'audio'"
+                )
+                if "'audio'" not in new_schema:
+                    raise AttachmentStoreError("Unrecognized attachment schema; audio migration aborted")
+                conn.execute(new_schema)
+                conn.execute("INSERT INTO attachment_blobs_v2 SELECT * FROM attachment_blobs")
+                conn.execute("DROP TABLE attachment_blobs")
+                conn.execute("ALTER TABLE attachment_blobs_v2 RENAME TO attachment_blobs")
+                for index in indexes:
+                    conn.execute(index[0])
+                if sequence:
+                    conn.execute("UPDATE sqlite_sequence SET seq=? WHERE name='attachment_blobs'", (sequence[0],))
+                if conn.execute("PRAGMA foreign_key_check").fetchone():
+                    raise AttachmentStoreIntegrityError("Attachment migration failed foreign key validation")
+            conn.execute("PRAGMA user_version = 2")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
 
     def backup_to(self, output_path: Path) -> None:
         """Create a consistent SQLite backup."""
-        self.ensure_schema()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         source = sqlite3.connect(self.db_path)
         try:
@@ -213,7 +250,6 @@ class AttachmentStore:
         created_at: str,
     ) -> AttachmentUploadRow:
         """Persist or reuse a blob and create an upload row for it."""
-        self.ensure_schema()
         normalized_kind = self._normalize_kind(kind)
         digest = self._validate_sha256(sha256)
         if not temp_path.exists():
@@ -370,7 +406,6 @@ class AttachmentStore:
 
     def get_upload(self, *, user_hash: str, upload_id: str) -> Optional[AttachmentUploadRow]:
         """Fetch one upload row with its blob, regardless of status."""
-        self.ensure_schema()
         with self._connection() as conn:
             return self._get_upload(user_hash=user_hash, upload_id=upload_id, conn=conn)
 
@@ -383,7 +418,6 @@ class AttachmentStore:
     ) -> bool:
         """Return true when a tombstone exists for the upload."""
         if conn is None:
-            self.ensure_schema()
             with self._connection() as owned_conn:
                 return self.deletion_exists(user_hash=user_hash, upload_id=upload_id, conn=owned_conn)
         row = conn.execute(
@@ -398,7 +432,6 @@ class AttachmentStore:
 
     def delete_upload(self, *, user_hash: str, upload_id: str, reason: str) -> bool:
         """Delete an upload row and insert a tombstone."""
-        self.ensure_schema()
         with self._connection(immediate=True) as conn:
             upload = self._get_upload(user_hash=user_hash, upload_id=upload_id, conn=conn)
             if upload is None:
@@ -424,7 +457,6 @@ class AttachmentStore:
         user_hash: Optional[str] = None,
     ) -> int:
         """Delete active upload rows older than a cutoff and preserve tombstones."""
-        self.ensure_schema()
         where = "status = 'active' AND created_at < ?"
         params: list[object] = [cutoff_created_at]
         if user_hash is not None:
@@ -455,7 +487,6 @@ class AttachmentStore:
 
     def record_deletion_tombstone(self, *, user_hash: str, upload_id: str, reason: str) -> None:
         """Insert a deletion tombstone without requiring an active upload row."""
-        self.ensure_schema()
         with self._connection(immediate=True) as conn:
             self._record_deletion_tombstone(
                 conn=conn,
@@ -466,7 +497,6 @@ class AttachmentStore:
 
     def iter_uploads(self) -> Iterator[AttachmentUploadRow]:
         """Yield all upload rows with blob metadata."""
-        self.ensure_schema()
         with self._connection() as conn:
             rows = conn.execute(
                 """
@@ -497,7 +527,6 @@ class AttachmentStore:
         limit: Optional[int] = None,
     ) -> Iterator[AttachmentUploadRow]:
         """Yield active ready uploads for one user without scanning unrelated rows."""
-        self.ensure_schema()
         if not user_hash:
             return
         if limit is not None and limit <= 0:
@@ -535,7 +564,6 @@ class AttachmentStore:
 
     def iter_deletions(self) -> Iterator[Dict[str, Optional[str]]]:
         """Yield deletion tombstones."""
-        self.ensure_schema()
         with self._connection() as conn:
             rows = conn.execute(
                 """
@@ -554,7 +582,6 @@ class AttachmentStore:
 
     def count_ready_blobs(self) -> int:
         """Return number of ready blobs. Used by tests and diagnostics."""
-        self.ensure_schema()
         with self._connection() as conn:
             row = conn.execute(
                 "SELECT COUNT(*) AS count FROM attachment_blobs WHERE status = 'ready'"
@@ -563,7 +590,6 @@ class AttachmentStore:
 
     def total_blob_bytes(self) -> int:
         """Return the total size in bytes accounted for every tracked blob."""
-        self.ensure_schema()
         with self._connection() as conn:
             row = conn.execute(
                 "SELECT COALESCE(SUM(size_bytes), 0) AS total FROM attachment_blobs"
@@ -572,7 +598,6 @@ class AttachmentStore:
 
     def gc_unreferenced_blobs(self, *, dry_run: bool = True, limit: int = 100) -> Dict[str, int]:
         """Remove ready blobs that have no uploads, using gc_pending claims."""
-        self.ensure_schema()
         scanned = 0
         removed = 0
         quarantined = 0

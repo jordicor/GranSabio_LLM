@@ -164,7 +164,7 @@ async def test_gpt5_empty_content_filter_reaches_typed_finish_guard() -> None:
     service.openai_client = object()
     service._is_openai_responses_api_model = Mock(return_value=False)
     service._should_inject_json_prompt = Mock(return_value=False)
-    service._call_chat_completions_create_with_reasoning_retry = AsyncMock(
+    service._create_chat_completion = AsyncMock(
         return_value=SimpleNamespace(
             choices=[
                 SimpleNamespace(
@@ -196,7 +196,7 @@ async def test_gpt5_empty_content_filter_reaches_typed_finish_guard() -> None:
             max_tokens=64,
         )
     assert is_content_filter_stop(raised.value)
-    service._call_chat_completions_create_with_reasoning_retry.assert_awaited_once()
+    service._create_chat_completion.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -231,7 +231,7 @@ async def test_openai_zero_output_stream_emits_filter_metadata_not_runtime_error
             except StopIteration as exc:
                 raise StopAsyncIteration from exc
 
-    service._call_chat_completions_create_with_reasoning_retry = AsyncMock(
+    service._create_chat_completion = AsyncMock(
         return_value=FilteredStream()
     )
 
@@ -252,7 +252,7 @@ async def test_openai_zero_output_stream_emits_filter_metadata_not_runtime_error
     assert chunks[0].text == ""
     assert chunks[0].metadata["finish_reason_category"] == "content_filter"
     assert chunks[0].metadata["finish_unusable"] is True
-    service._call_chat_completions_create_with_reasoning_retry.assert_awaited_once()
+    service._create_chat_completion.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -287,7 +287,7 @@ async def test_openai_unexplained_zero_output_keeps_runtime_error_path() -> None
             except StopIteration as exc:
                 raise StopAsyncIteration from exc
 
-    service._call_chat_completions_create_with_reasoning_retry = AsyncMock(
+    service._create_chat_completion = AsyncMock(
         return_value=EmptyStopStream()
     )
 
@@ -304,7 +304,7 @@ async def test_openai_unexplained_zero_output_keeps_runtime_error_path() -> None
             chunks.append(chunk)
 
     assert chunks == []
-    service._call_chat_completions_create_with_reasoning_retry.assert_awaited_once()
+    service._create_chat_completion.assert_awaited_once()
 
 
 @pytest.mark.asyncio

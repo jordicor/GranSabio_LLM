@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <title>Gran Sabio LLM Debugger</title>
-    <link rel="stylesheet" href="/static/debugger.css">
+    <link rel="stylesheet" href="/static/debugger.css?v=20261109">
 </head>
 <body data-project-id="{{ project_id or '' }}">
     <div id="app">
@@ -15,6 +15,7 @@
                 <input type="text" id="session-filter" placeholder="Filter by session id or request name...">
             </div>
         </header>
+        <div id="persistence-status" class="persistence-status" role="status" aria-live="polite"></div>
         <main>
             <section id="session-panel">
                 <h2>Sessions</h2>
@@ -57,6 +58,6 @@
         </main>
     </div>
     <script src="/static/js/escape_utils.js"></script>
-    <script src="/static/debugger.js"></script>
+    <script src="/static/debugger.js?v=20261109"></script>
 </body>
 </html>

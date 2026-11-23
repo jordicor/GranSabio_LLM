@@ -347,6 +347,52 @@ Every generation is logged in detail. Access `/debugger` to inspect:
 ![Session Debugger](screenshots/debugger.png)
 *Inspect every detail of your generation sessions*
 
+The debugger uses SQLite in the user's local state directory by default.
+`DEBUGGER_DB_PATH` selects a different SQLite file. To keep new debugger history
+on PostgreSQL instead, configure:
+
+```dotenv
+DEBUGGER_BACKEND=postgresql
+DEBUGGER_DATABASE_URL=postgresql://debugger:YOUR_PASSWORD@db.example:5432/debugger?sslmode=verify-full&sslrootcert=/path/ca.crt
+DEBUGGER_INSTANCE_ID=workstation_one
+DEBUGGER_RETENTION_DAYS=0
+```
+
+Use a dedicated database/role with permission to create its debugger schema.
+Keep the URI private and configure the server's TLS certificate and access rules.
+Each installation needs a stable, distinct instance ID: 1–40 lowercase letters,
+digits or underscores, starting with a letter. Its tables live in
+`gransabio_debugger_<instance_id>`; reads, deletion and retention stay inside that
+schema. A second writer using the same ID is refused. `/debugger/storage` reports
+the backend, instance ID and availability without revealing credentials.
+
+The existing session, event and content-trace APIs work with either backend.
+PostgreSQL capture normally uses a bounded RAM queue and one ordered writer;
+acceptance by RAM is **not** a persistence receipt. If PostgreSQL is unavailable,
+the default policy can spill pending operations to a private local SQLite
+transport journal and replay them after reconnection. This journal is separate
+from SQLite history. Immutable sequence identities and a receipt in the same
+PostgreSQL transaction prevent duplicated events or trace text after a lost
+commit response. Reads flush the captured prefix, including stream buffers, or
+return 503 instead of a partial successful response.
+
+`DEBUGGER_PG_SPILL=false` disables new contingency payload writes to disk;
+existing pending journals still recover. `DEBUGGER_PG_STRICT=true` additionally
+requires a PostgreSQL connection before new provider work. RAM defaults to
+64 MiB and 30 seconds before spill/backpressure; the journal defaults to 1 GiB
+of pending encoded content with a free-space reserve. Healthy bursts wait for
+capacity. Exhausted capacity pauses new dispatch while preserving accepted work.
+A process crash can lose volatile RAM in either mode; confirmed journal content
+survives normal filesystem recovery. Neither mode resumes a generation or
+repeats a provider call.
+
+Retention defaults to unlimited; a positive number removes inactive, confirmed
+telemetry. Pending journal entries never expire by age. Switching history
+backends does **not** migrate or delete history. The debugger remains diagnostic
+storage, separate from live execution and billing. Other engine logs and stores
+can still use local disk. See [storage, output profiles and recovery commands](STORAGE_AND_LOGS.md)
+for status, retry, verified manual recovery, and process-loss limits.
+
 ---
 
 ## Key Features
@@ -544,6 +590,30 @@ Detect and prevent repetitive vocabulary:
 
 ---
 
+### Per-section word budgets
+
+For JSON output with one `target_field`, `segment_budgets` checks the declared
+document and section word budgets, heading order, and nesting before accepting
+the result. The generator, JSON retries, and Gran Sabio regeneration/review
+prompts receive the same contract. JSON validation and normalization run before
+the final budget check, and a rejected regeneration does not replace the
+previous candidate. Rejections retain their cause in the result and stream.
+
+An enabled contract requires explicit `structure_field` and `base_heading_level`
+(1–5), for example `"segment_budgets": {"structure_field": "structure",
+"base_heading_level": 2}`. Omit the contract, use `null`, or send
+`{"enabled": false}` to disable this validation without supplying those fields.
+Violations always prevent acceptance; there is no configurable `severity`.
+Unknown contract fields are rejected. When supplying a strict JSON schema,
+declare the structure field and its `word_budget`/`sections` properties so
+normalization preserves them.
+
+**API change (2026-11-07):** clients that previously sent `{}` or relied on the
+implicit `composition` / heading level `3` must now send those values explicitly
+and remove `severity`. Incomplete active contracts return HTTP 422 before any
+generation. The synchronous and asynchronous SDKs forward this object through
+their existing keyword arguments; no SDK upgrade is required.
+
 ### Phrase Frequency Guard
 
 Block specific phrases or patterns:
@@ -704,6 +774,18 @@ Process images alongside text for multimodal content generation:
 - Preflight validation rejects requests when model lacks vision capability
 
 ---
+
+### Audio input
+
+Upload recordings through the existing attachments API and pass their references
+in `audios`. Audio-capable OpenRouter, native Gemini and OpenAI Chat Completions
+models can return text or structured JSON. `GET /models` and model details expose
+`audio_input.support`, `transport_available`, `available` and `formats` so callers
+can select a compatible route before generation. Unknown support is rejected.
+
+QA layers opt in with `include_input_audio: true`; those evaluators must support
+the recording. Generation retries and regeneration keep the original audio.
+See [Audio input: API, client example, errors and limits](AUDIO_INPUT.md).
 
 ### JSON Schema Structured Outputs
 
@@ -1227,6 +1309,14 @@ registry is intentionally rejected if it conflicts with non-default legacy
 `OLLAMA_HOST` or `LLAMACPP_BASE_URL` settings; it is never silently merged.
 The JSON accepts only `api_key_env`, never an inline `api_key`.
 
+If the machine uses `OLLAMA_HOST` for the Ollama daemon's listening address,
+set `GRANSABIO_OLLAMA_BASE_URL` in GranSabio's environment to select its client
+URL independently. It takes precedence over legacy `OLLAMA_HOST` without
+modifying the global variable. With an explicit registry, use the neutral
+legacy default `GRANSABIO_OLLAMA_BASE_URL=http://localhost:11434`: the actual
+service URLs still come exclusively from the registry. A conflicting non-default
+client URL remains a configuration error; there is no inference fallback.
+
 An endpoint is one API service, not one machine: two services on the same host
 but different ports are two endpoints, while one Ollama endpoint can announce
 many models and the route selects the desired `model` under the same URL. Give
@@ -1306,13 +1396,23 @@ powershell -NoProfile -File .\tools\windows_launcher.ps1 -PythonPath .\venv\Scri
 
 Use `-Port 8001` or the menu to select another port; `.env` is never rewritten.
 
-The server opens in a separate console with file logging and extra verbosity.
-Exiting the menu leaves it running. Reopening the menu also detects servers
+The server starts as an independent, hidden Windows process. It reads the output
+profile and storage destination from `.env`; the launcher does not force file
+logging or extra verbosity. Exiting the menu or Codex leaves it running. For a
+visible foreground console, run `python main.py` directly. Reopening the menu also detects servers
 started manually in Windows once they are listening. Status comes from the OS
 listener, process identity, `/api`, and `/health`; no lock/PID file is needed.
 An unidentified occupied port cannot be started over or stopped. Stopping a
 verified instance is immediate and interrupts its running analyses. Instances
-whose `/api` does not respond must be stopped from their own console.
+whose `/api` does not respond need their process identity checked manually before stopping.
+
+Use `LOG_MODE=quiet` for warnings/errors and operational incident notices, with
+HTTP access logs disabled. `normal` is the default; `verbose` enables DEBUG.
+`GRANSABIO_FORCE_EXTRA_VERBOSE=true` additionally includes full prompts and
+responses and conflicts with quiet. `LOG_BACKEND=postgresql` independently
+stores operational output in its own PostgreSQL schema; debugger capture is
+configured separately. See [STORAGE_AND_LOGS.md](STORAGE_AND_LOGS.md) for complete
+examples, retention, bounded buffering and recovery limits.
 
 ### 4. Generate Your First Content
 
@@ -1442,6 +1542,40 @@ Both Python clients expose
 accept 2–10 ordered levels; the standalone response retains TypeSafe's raw
 0-based level scale. See the [TypeSafe API](https://docs.typesafe.ai/api) and
 [Score contract](https://docs.typesafe.ai/primitives/score).
+
+### CPU preparation
+
+Large token-counting batches run in a shared, bounded thread pool. Native
+OpenAI tokenization can use multiple CPU cores while sharing its vocabulary;
+other providers retain their existing conservative counting method. Small
+batches run directly to avoid scheduling overhead. Counts are reused only
+within one preparation phase, with the complete text, provider, model and hint
+as their identity. Component boundaries, admission margins and debugger records
+are preserved. Sessions, credentials, budgets and provider dispatch stay in the
+coordinator process.
+
+`CPU_COUNT_WORKERS` defaults to at most eight, capped by the CPUs available to
+the process (including affinity). Workers start lazily as work arrives; this
+does not imply continuous use of eight cores. Lower this limit when sharing a
+host with other CPU-heavy services.
+Only one Python/conservative batch enters that same pool at a time. Other
+conservative callers await capacity before submission, leaving workers available
+for native counts and reducing GIL contention. Its slot remains occupied until
+the real work finishes, even after cancellation. No additional pool or server
+is created.
+`CPU_COUNT_MAX_JOBS=32` bounds submitted batches, including running work whose
+caller was cancelled. `CPU_COUNT_MAX_BYTES=67108864` bounds the estimated Python
+input storage retained by those batches, not total server RAM. Callers await
+capacity without copying their request into an unbounded executor queue. A
+single component above that byte limit fails explicitly; text is never split,
+truncated or counted as zero. Configure these positive integer limits before
+starting the process. Graceful shutdown drains the workers.
+
+This optimization applies to deterministic preflight, early generation
+admission and final chat/tool-call admission across API, personal subscription
+and local routes. It does not change provider concurrency limits or make
+Python-only estimation execute on several cores. Adding full server processes
+still requires a separate design for shared execution state.
 
 ### Fail-closed local execution
 
@@ -1748,6 +1882,7 @@ Gran Sabio LLM is currently a **self-hosted solution**. You deploy it on your in
 - ~500MB disk space for dependencies
 - Recommended: 4GB RAM minimum
 - Pillow library (auto-installed, required for vision/image processing)
+- Mutagen library (auto-installed, required for local audio container/duration validation)
 
 **Quality assurance:** Automated tests cover API endpoints, engines, the client
 SDK, and integrations. Live provider tests are opt-in; a passing offline suite

@@ -237,6 +237,7 @@ class QAEvaluationService:
         draft_map_formatted: Optional[str] = None,
         input_images: Optional[List["ImageData"]] = None,
         edit_history: Optional[str] = None,
+        input_audios: Optional[List[Any]] = None,
     ) -> "RenderedQAPrompt":
         """Render the QA (system_prompt, evaluation_prompt) pair.
 
@@ -343,6 +344,12 @@ When evaluating, consider whether the generated content accurately describes, re
 """
             if extra_verbose:
                 logger.info(f"[QA VISION] Including {image_count} images in QA evaluation for layer {layer_name}")
+
+        if input_audios:
+            image_context_section += (
+                f"\nINPUT AUDIO EVIDENCE: {len(input_audios)} audio file(s) are attached. "
+                "Evaluate acoustic criteria against these recordings; preserve uncertainty when inaudible.\n"
+            )
 
         # Robust validation for concise_on_pass (default to True if not bool)
         if not isinstance(concise_on_pass, bool):
@@ -634,6 +641,7 @@ IMPORTANT:
         endpoint_id: Optional[str] = None,
         local_execution: Optional[Any] = None,
         dispatch_route_ordinal: int = 0,
+        input_audios: Optional[List[Any]] = None,
     ) -> QAEvaluation:
         """
         Evaluate content quality using specified AI model
@@ -726,6 +734,7 @@ IMPORTANT:
             word_map_formatted=word_map_formatted,
             draft_map_formatted=draft_map_formatted,
             input_images=input_images,
+            input_audios=input_audios,
             edit_history=edit_history,
         )
         qa_system_prompt = rendered_prompt.system_prompt
@@ -795,6 +804,7 @@ IMPORTANT:
                     usage_callback=usage_callback,
                     phase_logger=phase_logger,
                     images=input_images,
+                    audios=input_audios,
                     json_output=True,
                     json_schema=json_schema,
                     model_alias_registry=model_alias_registry,
@@ -905,6 +915,7 @@ IMPORTANT:
                 usage_callback=usage_callback,
                 phase_logger=phase_logger,
                 images=input_images,
+                audios=input_audios,
                 json_output=True,
                 json_schema=json_schema,
                 model_alias_registry=model_alias_registry,
@@ -1030,6 +1041,7 @@ IMPORTANT:
                     usage_callback=usage_callback,
                     phase_logger=phase_logger,
                     images=input_images,
+                    audios=input_audios,
                     model_alias_registry=model_alias_registry,
                     prompt_safety_parts=[
                         PromptPart(

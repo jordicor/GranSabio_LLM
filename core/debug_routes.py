@@ -10,12 +10,20 @@ import os
 from typing import Optional
 
 from fastapi import Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 
 from debug_logger import DebugLogger, get_debug_logger
+from debugger_spool import DebuggerPersistenceError
 
 from . import app_state
 from .app_state import _parse_debug_json, app, config
 from .security import require_internal_ip
+
+
+@app.exception_handler(DebuggerPersistenceError)
+async def debugger_persistence_unavailable(_request, exc):
+    """Existing SDK consumers already treat 503 as unavailable evidence."""
+    return JSONResponse(status_code=503, content={"detail": str(exc)}, headers={"Retry-After": "5"})
 
 
 def require_debugger_exposed() -> None:
@@ -39,6 +47,10 @@ async def _get_active_debug_logger() -> DebugLogger:
             enabled=config.DEBUGGER.enabled,
             db_path=config.DEBUGGER.db_path,
             retention_days=config.DEBUGGER.retention_days,
+            backend=config.DEBUGGER.backend,
+            database_url=config.DEBUGGER.database_url.get_secret_value(),
+            instance_id=config.DEBUGGER.instance_id,
+            persistence_policy=config.DEBUGGER.persistence_policy(),
         )
         if config.DEBUGGER.enabled:
             await app_state.debug_logger.initialize()
@@ -47,11 +59,37 @@ async def _get_active_debug_logger() -> DebugLogger:
 
 def _ensure_debugger_storage_available(logger_instance: DebugLogger) -> None:
     """Fail fast when debugger storage has been disabled after a terminal I/O error."""
-    if logger_instance.storage_disabled_reason:
+    if not logger_instance.storage_available:
         raise HTTPException(
             status_code=503,
             detail=f"Debugger storage unavailable: {logger_instance.storage_disabled_reason}",
         )
+
+
+@app.get("/debugger/storage")
+async def debugger_storage(
+    _client_ip: str = Depends(require_internal_ip),
+    _exposed: None = Depends(require_debugger_exposed),
+):
+    """Identify this installation's store without disclosing connection secrets."""
+    if not config.DEBUGGER.enabled:
+        raise HTTPException(status_code=404, detail="Debugger interface is disabled")
+    instance = await _get_active_debug_logger()
+    return {**instance.storage_identity, "available": instance.storage_available,
+            "disabled_reason": instance.storage_disabled_reason,
+            "retention_days": instance.retention_days, "persistence": instance.persistence_status}
+
+
+@app.post("/debugger/storage/retry")
+async def retry_debugger_storage(
+    _client_ip: str = Depends(require_internal_ip),
+    _exposed: None = Depends(require_debugger_exposed),
+):
+    """Wake the existing reconnect task, without another writer or data deletion."""
+    instance = await _get_active_debug_logger()
+    if instance._transport:
+        instance._transport.retry()
+    return instance.persistence_status
 
 
 @app.get("/debugger/sessions")
@@ -77,6 +115,7 @@ async def list_debugger_sessions(
         offset=offset,
         project_id=normalized_project_id,
     )
+    _ensure_debugger_storage_available(logger_instance)
     # request_name is now denormalized in the sessions table
     enriched_sessions = []
     for session in sessions:
@@ -104,6 +143,7 @@ async def debugger_session_details(
     logger_instance = await _get_active_debug_logger()
     _ensure_debugger_storage_available(logger_instance)
     details = await logger_instance.get_session_details(session_id)
+    _ensure_debugger_storage_available(logger_instance)
     if not details:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -145,6 +185,7 @@ async def debugger_session_events(
     max_limit = max(1, config.DEBUGGER.max_session_list * 5)
     limit = min(limit, max_limit)
     events = await logger_instance.get_session_events(session_id, offset=offset, limit=limit)
+    _ensure_debugger_storage_available(logger_instance)
     parsed_events = [
         {
             "event_order": item["event_order"],
@@ -184,4 +225,5 @@ async def debugger_session_content_traces(
         limit=limit,
         offset=offset,
     )
+    _ensure_debugger_storage_available(logger_instance)
     return {"traces": traces}

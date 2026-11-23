@@ -44,7 +44,7 @@ async def test_discovered_gpt61_terra_tool_loop_dispatches_through_responses(mon
     service._execute_without_retries = execute
     service._openai_responses_streaming_supported = Mock(return_value=False)
     service._run_openai_responses_tool_turn = AsyncMock(side_effect=StopBeforeDispatch)
-    service._call_chat_completions_create_with_reasoning_retry = AsyncMock(
+    service._create_chat_completion = AsyncMock(
         side_effect=AssertionError("GPT-6.x tool turns must not use Chat Completions")
     )
 

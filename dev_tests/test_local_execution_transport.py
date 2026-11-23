@@ -629,7 +629,7 @@ async def test_normal_local_tool_loop_discovers_once_for_multiple_turns(
     monkeypatch.setattr(service, "_normalize_tool_loop_provider", lambda _provider: "ollama")
     monkeypatch.setattr(service, "_supports_generation_validation_tool_loop", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(service, "_serialize_tool_loop_tool_defs", lambda *_args, **_kwargs: "")
-    monkeypatch.setattr(service, "_build_chat_call_budget", lambda **_kwargs: object())
+    monkeypatch.setattr(service, "_build_chat_call_budget", AsyncMock(return_value=object()))
     monkeypatch.setattr(service, "_run_openai_compatible_validation_tool_loop", loop)
     monkeypatch.setattr(
         context_budget,

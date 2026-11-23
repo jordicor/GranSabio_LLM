@@ -354,3 +354,7 @@ textarea {
     font-style: italic;
     padding: 12px;
 }
+/* Persistent capture status is independent of an old history snapshot. */
+.persistence-status { padding: 12px 18px; background: #173525; color: #d7f8df; }
+.persistence-status[data-level="warning"] { background: #59420b; color: #fff0b3; }
+.persistence-status[data-level="error"] { background: #602323; color: #ffe0e0; }

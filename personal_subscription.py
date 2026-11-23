@@ -376,18 +376,9 @@ class PersonalSubscription:
             raise SubscriptionError("The returned registration does not match the selected account.")
         async with self.lock:
             self._idle()
-            try:
-                tokens = await self._post_token({"grant_type": "authorization_code", "client_id": client_id,
-                    "code": params["code"], "code_verifier": pending["verifier"],
-                    "redirect_uri": pending["redirect_uri"], "resource": API_URL})
-            except (SubscriptionError, httpx.HTTPError):
-                if not pending["account_id"]:
-                    # A code is single-use even if its exchange is interrupted.
-                    # Keep the issued registration for a fresh authorization,
-                    # without activating or trusting an unverified identity.
-                    self.state["accounts"][uuid4().hex] = {"client_id": client_id, "subject": None}
-                    self.store.write(self.state)
-                raise
+            tokens = await self._post_token({"grant_type": "authorization_code", "client_id": client_id,
+                "code": params["code"], "code_verifier": pending["verifier"],
+                "redirect_uri": pending["redirect_uri"], "resource": API_URL})
             identity = await self._identity(tokens.get("id_token", ""), client_id, pending["nonce"])
             previous = self.state["accounts"].get(pending["account_id"])
             if previous and previous.get("subject") and identity["sub"] != previous["subject"]:

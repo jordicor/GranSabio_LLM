@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
+from ai_runtime.audio import AUDIO_MIME_FORMATS
 from models import ContentRequest, ImageData
 from services.attachment_manager import (
     AttachmentError,
@@ -15,6 +16,7 @@ from services.attachment_manager import (
     AttachmentValidationError,
     ResolvedAttachment,
 )
+from services.audio_inputs import resolve_audio_inputs, validate_request_audio_models
 
 
 @dataclass
@@ -24,6 +26,7 @@ class GenerationInputResolution:
     resolved_images: List[ImageData]
     preflight_context: List[Dict[str, Any]]
     preflight_image_info: Optional[Dict[str, Any]]
+    resolved_audios: List[Any] = field(default_factory=list)
 
 
 async def resolve_generation_inputs(
@@ -34,7 +37,7 @@ async def resolve_generation_inputs(
     resolve_images_for_generation_fn: Any,
     logger: Any,
 ) -> GenerationInputResolution:
-    """Resolve context documents and image references for a generation request."""
+    """Resolve document, image and audio references for a generation request."""
 
     attachment_manager: Optional[AttachmentManager] = None
     resolved_attachments: List[ResolvedAttachment] = []
@@ -67,6 +70,9 @@ async def resolve_generation_inputs(
                 logger.exception("Unexpected attachment resolution error", exc_info=exc)
                 raise HTTPException(status_code=500, detail="Unable to access attachment content") from exc
 
+            if resolved.record.mime_type in AUDIO_MIME_FORMATS:
+                raise HTTPException(400, {"code": "audio_reference_requires_audios",
+                                          "message": "Use audios for audio attachments, not context_documents."})
             resolved_attachments.append(resolved)
             preflight_context.append(attachment_manager.build_preflight_summary(resolved))
 
@@ -134,7 +140,8 @@ async def resolve_generation_inputs(
                 request.username,
             )
         except (AttachmentError, AttachmentNotFoundError, AttachmentValidationError) as exc:
-            raise HTTPException(status_code=400, detail=f"Image processing failed: {exc}") from exc
+            logger.exception("Image processing failed")
+            raise HTTPException(status_code=400, detail="Image processing failed") from exc
 
     preflight_image_info: Optional[Dict[str, Any]] = None
     if resolved_images:
@@ -173,10 +180,19 @@ async def resolve_generation_inputs(
             )) or ["auto"],
         }
 
+    resolved_audios = []
+    if request.audios:
+        if attachment_manager is None:
+            attachment_manager = attachment_manager_factory()
+        resolved_audios = await resolve_audio_inputs(request, attachment_manager, config_obj)
+    else:
+        validate_request_audio_models(request, [], config_obj)
+
     return GenerationInputResolution(
         attachment_manager=attachment_manager,
         resolved_attachments=resolved_attachments,
         resolved_images=resolved_images,
         preflight_context=preflight_context,
         preflight_image_info=preflight_image_info,
+        resolved_audios=resolved_audios,
     )

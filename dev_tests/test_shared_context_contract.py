@@ -74,10 +74,10 @@ def test_preflight_planner_and_system_one_receive_source_as_user_evidence():
     assert _build_grounding_context(request()) == value.prompt
 
 
-def test_early_admission_counts_the_complete_source_for_all_receptors():
+async def test_early_admission_counts_the_complete_source_for_all_receptors():
     value = request(shared_context=SOURCE, min_words=40, max_words=60, qa_models=["qa-test"])
     with patch.object(type(config), "resolve_qa_max_tokens", return_value=100):
-        receptors = _build_receptors(
+        receptors = await _build_receptors(
             value, request_fields_set=value.model_fields_set, preflight_model="preflight-test",
             preflight_will_run=True, preflight_max_tokens=100, auto_qa_requested=True,
             auto_qa_model="planner-test", auto_qa_max_tokens=100, qa_mandatory=True,

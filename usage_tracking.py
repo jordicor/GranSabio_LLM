@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 # Use optimized JSON helper
@@ -90,6 +90,7 @@ class UsageRecord:
     total_tokens: Optional[int] = None
     reasoning_tokens: Optional[int] = None
     cached_input_tokens: Optional[int] = None
+    audio_input_tokens: Optional[int] = None
     cache_write_input_tokens: Optional[int] = None
     cost_usd: Optional[float] = None
     # PROVIDER_BILLED_COST_BASIS when the provider reported the billed amount,
@@ -107,7 +108,7 @@ class UsageRecord:
     context_utilization: Optional[float] = None
     context_admission_decision: Optional[str] = None
     context_count_method: Optional[str] = None
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     @property
     def resolved_total_tokens(self) -> Optional[int]:
@@ -166,7 +167,7 @@ class UsageRecord:
         }
         if self.endpoint_id is not None:
             payload["endpoint_id"] = self.endpoint_id
-        for field_name in ("cached_input_tokens", "cache_write_input_tokens", "cost_basis"):
+        for field_name in ("cached_input_tokens", "cache_write_input_tokens", "audio_input_tokens", "cost_basis"):
             if getattr(self, field_name) is not None:
                 payload[field_name] = getattr(self, field_name)
         payload.update(self._context_admission_fields())
@@ -205,7 +206,7 @@ class UsageRecord:
         if self.endpoint_id is not None:
             payload["endpoint_id"] = self.endpoint_id
 
-        for field_name in ("cached_input_tokens", "cache_write_input_tokens", "cost_basis"):
+        for field_name in ("cached_input_tokens", "cache_write_input_tokens", "audio_input_tokens", "cost_basis"):
             if getattr(self, field_name) is not None:
                 payload[field_name] = getattr(self, field_name)
         payload.update(self._context_admission_fields())
@@ -252,14 +253,14 @@ class _UsageSpan:
         self._started_perf: Optional[float] = None
 
     def __enter__(self) -> "_UsageSpan":
-        self._started_at = datetime.utcnow()
+        self._started_at = datetime.now(timezone.utc)
         self._started_perf = time.perf_counter()
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         if not self.tracker.enabled or self._started_at is None or self._started_perf is None:
             return False
-        ended_at = datetime.utcnow()
+        ended_at = datetime.now(timezone.utc)
         duration_ms = int(max(0.0, time.perf_counter() - self._started_perf) * 1000)
         self.tracker.record_span(
             phase=self.phase,
@@ -322,12 +323,12 @@ class UsageTracker:
             return None
 
         meta = metadata.copy() if metadata else {}
-        last_started_at = datetime.utcnow()
+        last_started_at = datetime.now(timezone.utc)
         last_perf = time.perf_counter()
 
         def _callback(usage_payload: Dict[str, Any]) -> None:
             nonlocal last_started_at, last_perf
-            ended_at_dt = datetime.utcnow()
+            ended_at_dt = datetime.now(timezone.utc)
             ended_perf = time.perf_counter()
             duration_ms = usage_payload.get("duration_ms")
             if duration_ms is None:
@@ -346,11 +347,12 @@ class UsageTracker:
                     total_tokens=usage_payload.get("total_tokens"),
                     reasoning_tokens=usage_payload.get("reasoning_tokens"),
                     cached_input_tokens=usage_payload.get("cached_input_tokens"),
+                    audio_input_tokens=usage_payload.get("audio_input_tokens"),
                     cache_write_input_tokens=usage_payload.get("cache_write_input_tokens"),
                     iteration=iteration,
                     layer=layer,
                     operation=operation or usage_payload.get("operation"),
-                    metadata={**meta, **({
+                    metadata={**meta, **{key: usage_payload[key] for key in ("audio_input", "audio_inputs") if key in usage_payload}, **({
                         key: usage_payload[key]
                         for key in ("billing_mode", "request_id", "usage_reported")
                         if key in usage_payload
@@ -414,6 +416,7 @@ class UsageTracker:
         total_tokens: Optional[int] = None,
         reasoning_tokens: Optional[int] = None,
         cached_input_tokens: Optional[int] = None,
+        audio_input_tokens: Optional[int] = None,
         cache_write_input_tokens: Optional[int] = None,
         iteration: Optional[int] = None,
         layer: Optional[str] = None,
@@ -450,6 +453,8 @@ class UsageTracker:
                 model_name, input_tokens, output_tokens,
                 cached_input_tokens=cached_input_tokens or 0,
                 cache_write_input_tokens=cache_write_input_tokens or 0,
+                audio_input_tokens=audio_input_tokens,
+                audio_input=bool((metadata or {}).get("audio_input")),
             )
             if cost is not None:
                 cost_basis = CATALOG_ESTIMATE_COST_BASIS
@@ -500,6 +505,7 @@ class UsageTracker:
             if reasoning_tokens is not None
             else None,
             cached_input_tokens=cached_input_tokens,
+            audio_input_tokens=audio_input_tokens,
             cache_write_input_tokens=cache_write_input_tokens,
             cost_usd=float(cost) if cost is not None else None,
             cost_basis=cost_basis,
@@ -702,9 +708,12 @@ class UsageTracker:
     def _estimate_cost(
         self, model: str, input_tokens: Optional[int], output_tokens: Optional[int], *,
         cached_input_tokens: int = 0, cache_write_input_tokens: int = 0,
+        audio_input_tokens: Optional[int] = None, audio_input: bool = False,
     ) -> Optional[float]:
         """Calculate approximate USD cost using model specifications."""
         if input_tokens is None or output_tokens is None:
+            return None
+        if audio_input and audio_input_tokens is None:
             return None
         try:
             model_info = config.get_model_info(model, require_api_key=False)
@@ -721,7 +730,11 @@ class UsageTracker:
         if input_rate is None and output_rate is None:
             return None
 
-        ordinary_tokens = input_tokens - cached_input_tokens - cache_write_input_tokens
+        audio_tokens = audio_input_tokens or 0
+        audio_rate = pricing.get("audio_input_per_million")
+        if audio_tokens and (audio_rate is None or cached_input_tokens or cache_write_input_tokens):
+            return None  # No trustworthy split/rate for cached audio in this catalog.
+        ordinary_tokens = input_tokens - cached_input_tokens - cache_write_input_tokens - audio_tokens
         if min(ordinary_tokens, cached_input_tokens, cache_write_input_tokens) < 0:
             return None
         if (ordinary_tokens and input_rate is None) or (output_tokens and output_rate is None):
@@ -731,6 +744,8 @@ class UsageTracker:
             if input_rate is not None
             else 0.0
         )
+        if audio_tokens:
+            input_cost += (audio_tokens / MILLION) * float(audio_rate)
         for count, rate_key in (
             (cached_input_tokens, "cached_input_per_million"),
             (cache_write_input_tokens, "cache_write_per_million"),
@@ -1052,6 +1067,8 @@ def _parse_iso_ms(value: Optional[str]) -> Optional[int]:
     try:
         normalized = value.replace("Z", "+00:00")
         parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
         return int(parsed.timestamp() * 1000)
     except Exception:
         return None

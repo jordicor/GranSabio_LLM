@@ -8,6 +8,9 @@ from enum import Enum
 from typing import Any, Mapping, Optional
 
 import aiohttp
+import anthropic
+import httpx
+import openai
 
 from tool_loop_models import JsonContractError, ToolLoopSchemaViolationError
 
@@ -64,17 +67,10 @@ class ProviderFailure(Exception):
         Exception.__init__(self, self.message)
 
 
-def _safe_text(value: Any, *, limit: int = 500) -> str:
-    text = "" if value is None else str(value)
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}..."
-
-
 def _get_status(exc: BaseException) -> Optional[int]:
-    for attr in ("status", "status_code", "http_status"):
+    for attr in ("status", "status_code", "http_status", "code"):
         value = getattr(exc, attr, None)
-        if isinstance(value, int):
+        if isinstance(value, int) and 100 <= value <= 599:
             return value
     response = getattr(exc, "response", None)
     if response is not None:
@@ -109,6 +105,9 @@ def _get_request_id(exc: BaseException) -> Optional[str]:
 
 
 def _provider_error_payload(exc: BaseException) -> Mapping[str, Any]:
+    response_json = getattr(exc, "response_json", None)
+    if isinstance(response_json, Mapping):
+        return response_json
     body = getattr(exc, "body", None)
     if isinstance(body, Mapping):
         return body
@@ -187,18 +186,9 @@ def _quota_or_billing_kind(
         "credit_balance_exhausted",
         "payment_required",
     }
-    message_text = (message or "").strip().lower()
-    has_billing_marker = markers.intersection(billing_markers) or any(
-        marker in message_text or marker.replace("_", " ") in message_text
-        for marker in billing_markers
-    )
-    has_quota_marker = markers.intersection(quota_markers) or any(
-        marker in message_text or marker.replace("_", " ") in message_text
-        for marker in quota_markers
-    )
-    if has_billing_marker:
+    if markers.intersection(billing_markers):
         return ProviderErrorKind.BILLING_REQUIRED
-    if has_quota_marker:
+    if markers.intersection(quota_markers):
         return ProviderErrorKind.QUOTA_EXHAUSTED
     return None
 
@@ -372,15 +362,7 @@ def _is_overload_signal(
     if markers.intersection(overload_markers):
         return True
 
-    return any(
-        marker in message
-        for marker in (
-            "overloaded",
-            "over capacity",
-            "capacity exceeded",
-            "server is busy",
-        )
-    )
+    return False
 
 
 def classify_provider_exception(
@@ -460,30 +442,16 @@ def classify_provider_exception(
             if err_code == "server_is_overloaded"
             else ProviderErrorKind.PROVIDER_DOWN
         )
-    elif isinstance(exc, asyncio.TimeoutError):
+    elif isinstance(exc, (
+        asyncio.TimeoutError, openai.APITimeoutError,
+        anthropic.APITimeoutError, httpx.TimeoutException,
+    )):
         kind = ProviderErrorKind.TIMEOUT
-    elif status is None and "timeout" in message_lower:
-        kind = ProviderErrorKind.TIMEOUT
-    elif status is None and any(
-        marker in message_lower
-        for marker in ("rate limit", "too many requests")
-    ):
-        kind = ProviderErrorKind.RATE_LIMITED
-    elif status is None and any(
-        marker in message_lower
-        for marker in (
-            "temporarily unavailable",
-            "internal server error",
-            "gateway",
-            "overloaded",
-            "unavailable",
-            "service unavailable",
-            "connection reset",
-            "connection refused",
-            "dns",
-            "network",
-        )
-    ):
+    elif isinstance(exc, (
+        openai.APIConnectionError, anthropic.APIConnectionError,
+        httpx.TransportError, aiohttp.ClientConnectionError,
+        aiohttp.ClientPayloadError, ConnectionError,
+    )):
         kind = ProviderErrorKind.TRANSIENT_NETWORK
     elif _is_context_overflow_signal(
         provider=provider,
@@ -550,8 +518,6 @@ def classify_provider_exception(
             )
             else ProviderErrorKind.PROVIDER_DOWN
         )
-    elif status is None and isinstance(exc, (aiohttp.ClientError, ConnectionError, OSError)):
-        kind = ProviderErrorKind.TRANSIENT_NETWORK
     else:
         kind = ProviderErrorKind.UNKNOWN
 
@@ -561,7 +527,6 @@ def classify_provider_exception(
         ProviderErrorKind.RATE_LIMITED,
         ProviderErrorKind.PROVIDER_OVERLOADED,
         ProviderErrorKind.PROVIDER_DOWN,
-        ProviderErrorKind.NO_CONTENT,
     }
     downgradable = kind == ProviderErrorKind.UNSUPPORTED_PARAMETER and bool(attempted_feature)
 
@@ -570,7 +535,7 @@ def classify_provider_exception(
         model_id=model_id,
         operation=operation,
         kind=kind,
-        message=_safe_text(exc),
+        message=f"Provider request failed ({kind.value}).",
         retryable=retryable,
         downgradable=downgradable,
         status_code=status,

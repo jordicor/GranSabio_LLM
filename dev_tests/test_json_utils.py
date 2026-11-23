@@ -158,27 +158,11 @@ class TestDumps:
         result = json.dumps(data, default=str)
         assert "custom_string" in result
 
-    def test_fallback_when_options_fail(self):
-        """
-        Given: orjson.dumps fails with options but succeeds without
-        When: dumps() is called
-        Then: Falls back to basic orjson and returns result
-        """
-        original_dumps = orjson.dumps
-        call_count = [0]
-
-        def mock_dumps(obj, default=None, option=None):
-            call_count[0] += 1
-            if call_count[0] == 1 and option is not None:
-                # First call with options - simulate failure
-                raise TypeError("Simulated option error")
-            # Fallback call without options
-            return original_dumps(obj, default=default)
-
-        with patch.object(orjson, 'dumps', side_effect=mock_dumps):
-            result = json.dumps({"key": "value"})
-            assert result == '{"key":"value"}'
-            assert call_count[0] == 2  # First failed, second succeeded
+    def test_serialization_error_does_not_silently_drop_options(self):
+        with patch.object(orjson, 'dumps', side_effect=TypeError("Simulated option error")) as serialize:
+            with pytest.raises(TypeError, match="Simulated option error"):
+                json.dumps({"key": "value"}, sort_keys=True)
+            assert serialize.call_count == 1
 
 
 class TestLoads:

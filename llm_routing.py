@@ -100,29 +100,11 @@ LLM_CALL_REGISTRY: Dict[str, LLMCallSpec] = {
         required_capabilities=("embeddings",),
         description="Feedback memory embeddings",
     ),
-    "feedback.embed_fallback": LLMCallSpec(
-        "feedback.embed_fallback",
+    "embedding.default": LLMCallSpec(
+        "embedding.default",
         kind="embedding",
         required_capabilities=("embeddings",),
-        description="Feedback embedding fallback",
-    ),
-    "embedding.openai": LLMCallSpec(
-        "embedding.openai",
-        kind="embedding",
-        required_capabilities=("embeddings",),
-        description="OpenAI embedding call",
-    ),
-    "embedding.openai_fallback": LLMCallSpec(
-        "embedding.openai_fallback",
-        kind="embedding",
-        required_capabilities=("embeddings",),
-        description="OpenAI embedding fallback",
-    ),
-    "embedding.google": LLMCallSpec(
-        "embedding.google",
-        kind="embedding",
-        required_capabilities=("embeddings",),
-        description="Google embedding call",
+        description="Default embedding model",
     ),
     "accent.audit": LLMCallSpec("accent.audit", description="LLM accent audit"),
     "smart_edit.analyze": LLMCallSpec("smart_edit.analyze", description="Smart edit analysis"),
@@ -464,13 +446,14 @@ def _provider_key(model_info: Mapping[str, Any]) -> str:
 
 
 def _validate_known_model(model: str, call_id: str, config_obj: Any) -> Dict[str, Any]:
+    curated = getattr(config_obj, "MODEL_TOKEN_LIMITS", {}).get(model, {})
+    if isinstance(curated, dict) and "embeddings" in curated.get("capabilities", []):
+        if curated.get("enabled") is not True or curated.get("provider") not in {"openai", "google"}:
+            raise LLMRoutingError(f"Embedding model '{model}' is disabled or has no supported provider.")
+        return {"model_id": model, **curated}
     try:
         return config_obj.get_model_info(model, require_api_key=False)
     except Exception as exc:
-        model_lower = model.lower()
-        if "embedding" in model_lower:
-            provider = "google" if model_lower.startswith("models/") else "openai"
-            return {"model_id": model, "provider": provider, "capabilities": ["embeddings"]}
         raise LLMRoutingError(
             f"LLM routing for '{call_id}' references unknown model '{model}': {exc}"
         ) from exc
@@ -557,8 +540,15 @@ def _supports_logprobs(model: str, model_info: Mapping[str, Any]) -> bool:
 
 def _supports_embeddings(model: str, model_info: Mapping[str, Any]) -> bool:
     provider = _provider_key(model_info)
-    model_id = str(model_info.get("model_id") or model).lower()
-    return provider in {"openai", "gemini", "google"} and "embedding" in model_id
+    return provider in {"openai", "gemini"} and "embeddings" in model_info.get("capabilities", [])
+
+
+def resolve_embedding_model(model: str, config_obj: Any) -> tuple[str, str]:
+    """Resolve an exact enabled catalog identity, never a name-based guess."""
+    info = _validate_known_model(model, "embeddings", config_obj)
+    if not _supports_embeddings(model, info):
+        raise LLMRoutingError(f"Model '{model}' does not support embeddings.")
+    return str(info["model_id"]), _provider_key(info)
 
 
 def _validate_required_capabilities(

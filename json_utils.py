@@ -8,6 +8,8 @@ compatibility with standard json library interface.
 orjson is 3.6x faster than standard json based on our benchmarks.
 """
 
+import json as standard_json
+import re
 from typing import Any, Optional
 
 import orjson
@@ -36,7 +38,18 @@ def dumps(
     Note:
         orjson.dumps returns bytes, this function returns str for compatibility
     """
-    option = orjson.OPT_SERIALIZE_UUID | orjson.OPT_SERIALIZE_NUMPY
+    return dumps_bytes(obj, ensure_ascii=ensure_ascii, indent=indent, default=default, sort_keys=sort_keys).decode('utf-8')
+
+
+def dumps_bytes(
+    obj: Any,
+    ensure_ascii: bool = True,
+    indent: Optional[int] = None,
+    default: callable = None,
+    sort_keys: bool = False,
+) -> bytes:
+    """Serialize once when a consumer retains or hashes the UTF-8 representation."""
+    option = orjson.OPT_SERIALIZE_UUID | orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS
 
     if indent is not None:
         option |= orjson.OPT_INDENT_2
@@ -44,15 +57,12 @@ def dumps(
     if sort_keys:
         option |= orjson.OPT_SORT_KEYS
 
-    if not ensure_ascii:
-        option |= orjson.OPT_NON_STR_KEYS
-
-    try:
-        # orjson.dumps returns bytes, decode to string
-        return orjson.dumps(obj, default=default, option=option).decode('utf-8')
-    except Exception as e:
-        # Fallback to basic orjson if options cause issues
-        return orjson.dumps(obj, default=default).decode('utf-8')
+    result = orjson.dumps(obj, default=default, option=option)
+    if ensure_ascii and not result.isascii():
+        # Escape only non-ASCII runs; preserve orjson's types, ordering and layout.
+        result = re.sub(r"[^\x00-\x7f]+", lambda match: standard_json.dumps(
+            match.group(), ensure_ascii=True)[1:-1], result.decode("utf-8")).encode("ascii")
+    return result
 
 
 def loads(s: str) -> Any:

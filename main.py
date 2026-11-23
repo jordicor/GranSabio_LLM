@@ -62,131 +62,81 @@ def _install_force_exit_signal_handlers() -> None:
 # Register before importing core so Ctrl+C also works during import/startup.
 _install_force_exit_signal_handlers()
 
-import core  # noqa: E402,F401  # Ensure route modules are imported for side effects
-from core.app_state import app  # noqa: E402,F401  # Re-export for uvicorn "main:app"
+if __name__ == "__main__":
+    from pathlib import Path
 
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+    parser = argparse.ArgumentParser(description="Gran Sabio LLM Engine")
+    parser.add_argument("--file-logging", action="store_true", help="Store output in local rotating files; does not change verbosity")
+    parser.add_argument("--force-verbose", action="store_true", help="Enable detailed progress for all requests")
+    parser.add_argument("--force-extra-verbose", action="store_true", help="Include complete prompts/responses for all requests")
+    parser.add_argument("--quiet", action="store_true", help="Warnings/errors only; disable HTTP access logs")
+    parser.add_argument("--log-mode", choices=("normal", "quiet", "verbose"), help="Process output profile, independent of storage")
+    args = parser.parse_args()
+    if args.quiet and args.log_mode not in (None, "quiet"):
+        parser.error("--quiet conflicts with the selected --log-mode")
+    if args.log_mode or args.quiet:
+        os.environ["LOG_MODE"] = "quiet" if args.quiet else args.log_mode
+    if args.file_logging:
+        os.environ["GRANSABIO_FILE_LOGGING"] = "true"
+    if args.force_extra_verbose:
+        os.environ["GRANSABIO_FORCE_EXTRA_VERBOSE"] = "true"
+        os.environ["GRANSABIO_FORCE_VERBOSE"] = "true"
+        os.environ["EXTRA_VERBOSE"] = "true"
+    elif args.force_verbose:
+        os.environ["GRANSABIO_FORCE_VERBOSE"] = "true"
+
+
+    # Supervisors must not import the engine or own a PostgreSQL log writer.
+    # Only the serving worker captures application startup and runtime output.
+    from logging_policy import LoggingPolicy
+    policy = LoggingPolicy.from_env()
+    reload_enabled = os.getenv("APP_RELOAD", "false").lower() == "true"
+    if platform.system() == "Linux" or reload_enabled:
+        host = os.getenv("APP_HOST", "0.0.0.0")
+        port = int(os.getenv("APP_PORT", "8000"))
+        if not 1 <= port <= 65535:
+            parser.error("APP_PORT must be between 1 and 65535")
+        if platform.system() == "Linux":
+            import subprocess
+            workers = int(os.getenv("APP_WORKERS", "1"))
+            if policy.backend == "postgresql" and workers != 1:
+                parser.error("PostgreSQL logs require one writer per LOG_INSTANCE_ID (APP_WORKERS=1)")
+            cmd = [sys.executable, "-m", "gunicorn", "main:app", "--workers", str(workers),
+                   "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", f"{host}:{port}",
+                   "--log-level", {10: "debug", 20: "info", 30: "warning", 40: "error", 50: "critical"}[policy.level]]
+            if reload_enabled:
+                cmd.append("--reload")
+            raise SystemExit(subprocess.run(cmd, check=False).returncode)
+        import uvicorn
+        uvicorn.run("main:app", host=host, port=port, http="httptools", reload=True,
+                    log_level=policy.level, access_log=not policy.quiet)
+        raise SystemExit(0)
+
+from runtime_logging import bootstrap_logging, server_log_options  # noqa: E402
+
+bootstrap_logging()
+
+import core  # noqa: E402,F401  # Ensure route modules are imported for side effects
 from core.app_state import (
-    FILE_LOGGING_ENV_VAR,
-    FORCE_EXTRA_VERBOSE_ENV_VAR,
-    FORCE_VERBOSE_ENV_VAR,
+    app,  # noqa: E402,F401  # Re-export for uvicorn "main:app"
     config,
     logger,
 )
 
 if __name__ == "__main__":
-    from file_logger import activate_file_logging
+    import uvicorn
 
-    parser = argparse.ArgumentParser(description="Gran Sabio LLM Engine")
-    parser.add_argument(
-        "--file-logging",
-        action="store_true",
-        help="Enable file logging (logs all output to logs/yyyy-mm-dd/HH_00_00.log)",
-    )
-    parser.add_argument(
-        "--force-verbose",
-        action="store_true",
-        help="Force verbose progress logs for all requests regardless of payload settings",
-    )
-    parser.add_argument(
-        "--force-extra-verbose",
-        action="store_true",
-        help="Force verbose and extra verbose logs for all requests (includes --force-verbose)",
-    )
-    args = parser.parse_args()
+    class ImmediateExitServer(uvicorn.Server):
+        """Retain the local console's immediate Ctrl+C/SIGBREAK behavior."""
 
-    if args.file_logging:
-        os.environ[FILE_LOGGING_ENV_VAR] = "true"
-        activate_file_logging()
+        def handle_exit(self, sig, frame):
+            if _should_force_exit_for_signal(sig):
+                _force_exit(sig, frame)
+            super().handle_exit(sig, frame)
 
-    if args.force_extra_verbose:
-        os.environ[FORCE_EXTRA_VERBOSE_ENV_VAR] = "true"
-        os.environ[FORCE_VERBOSE_ENV_VAR] = "true"
-        os.environ["EXTRA_VERBOSE"] = "true"
-    elif args.force_verbose:
-        os.environ[FORCE_VERBOSE_ENV_VAR] = "true"
-
-    def is_wsl_or_linux() -> bool:
-        """Detect if running in WSL or native Linux environment."""
-        if platform.system() != "Linux":
-            return False
-
-        try:
-            with open("/proc/version", "r", encoding="utf-8") as version_file:
-                version_info = version_file.read().lower()
-                if "microsoft" in version_info or "wsl" in version_info:
-                    logger.info("Detected WSL environment")
-                    return True
-        except Exception:
-            pass
-
-        if os.environ.get("WSL_DISTRO_NAME"):
-            logger.info("Detected WSL via WSL_DISTRO_NAME env var")
-            return True
-
-        logger.info("Detected native Linux environment")
-        return True
-
-    if is_wsl_or_linux():
-        import subprocess
-
-        # Default to 1 worker to avoid session state inconsistencies across processes.
-        # Multi-worker mode requires shared state backend (Redis) - not yet implemented.
-        # Override with APP_WORKERS env var if needed (at your own risk).
-        workers = int(os.environ.get("APP_WORKERS", "1"))
-        cmd = [
-            sys.executable,
-            "-m",
-            "gunicorn",
-            "main:app",
-            "--workers",
-            str(workers),
-            "--worker-class",
-            "uvicorn.workers.UvicornWorker",
-            "--bind",
-            f"{config.APP_HOST}:{config.APP_PORT}",
-        ]
-
-        if config.APP_RELOAD:
-            cmd.append("--reload")
-
-        logger.info("Starting with gunicorn - %d workers", workers)
-        logger.info("Command: %s", " ".join(cmd))
-        subprocess.run(cmd, check=False)
-    else:
-        import uvicorn
-
-        logger.info("Starting with uvicorn (detected Windows)")
-
-        if config.APP_RELOAD:
-            # Reload mode runs under a subprocess supervisor that owns signal
-            # handling, so the standard entrypoint is kept for that path.
-            uvicorn.run(
-                "main:app",
-                host=config.APP_HOST,
-                port=config.APP_PORT,
-                http="httptools",
-                reload=True,
-            )
-        else:
-            class ImmediateExitServer(uvicorn.Server):
-                """uvicorn Server that kills the process on the first Ctrl+C.
-
-                uvicorn installs its own SIGINT/SIGTERM/SIGBREAK handlers while
-                serving, so a module-level signal handler cannot take effect.
-                Overriding handle_exit is the supported hook: it runs for every
-                captured signal. Forcing exit here avoids hanging on long-lived
-                SSE streams (e.g. /stream/console) during graceful shutdown.
-                """
-
-                def handle_exit(self, sig, frame):
-                    if _should_force_exit_for_signal(sig):
-                        _force_exit(sig, frame)
-                    super().handle_exit(sig, frame)
-
-            uvicorn_config = uvicorn.Config(
-                "main:app",
-                host=config.APP_HOST,
-                port=config.APP_PORT,
-                http="httptools",
-            )
-            ImmediateExitServer(uvicorn_config).run()
+    logger.info("Starting with uvicorn (detected Windows)")
+    uvicorn_config = uvicorn.Config("main:app", host=config.APP_HOST, port=config.APP_PORT,
+                                    http="httptools", **server_log_options())
+    ImmediateExitServer(uvicorn_config).run()

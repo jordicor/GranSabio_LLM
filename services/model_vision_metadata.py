@@ -1,4 +1,4 @@
-"""Read explicit image-input declarations during catalog sync, never generation."""
+"""Read explicit image/audio input declarations during sync, never generation."""
 
 from __future__ import annotations
 
@@ -13,16 +13,17 @@ OPENAI_DOCS_BASE = "https://developers.openai.com/api/docs/models"
 GEMINI_DOCS_BASE = "https://ai.google.dev/gemini-api/docs/models"
 
 _DOCS_HEADERS = {"Accept": "text/markdown", "Accept-Encoding": "gzip, deflate"}
+ModalityDeclaration = bool | dict[str, bool | None]
 _GEMINI_INPUT_TERMS = {
     "text": "text", "image": "image", "images": "image", "video": "video",
     "videos": "video", "audio": "audio", "pdf": "pdf",
 }
 
 
-def api_image_support(model: Mapping[str, Any]) -> bool | None:
+def api_image_support(model: Mapping[str, Any], modality: str = "image") -> bool | None:
     """Distinguish an explicit yes/no from missing or malformed API metadata."""
     capabilities = model.get("capabilities")
-    image = capabilities.get("image_input") if isinstance(capabilities, Mapping) else None
+    image = capabilities.get(f"{modality}_input") if isinstance(capabilities, Mapping) else None
     supported = image.get("supported") if isinstance(image, Mapping) else None
     if isinstance(supported, bool):
         return supported
@@ -30,11 +31,11 @@ def api_image_support(model: Mapping[str, Any]) -> bool | None:
     if isinstance(modalities, list) and modalities and all(isinstance(m, str) for m in modalities):
         normalized = {m.strip().lower() for m in modalities}
         if normalized <= {"text", "image", "audio", "video"}:
-            return "image" in normalized
+            return modality in normalized
     return None
 
 
-def parse_openai_model_vision(markdown: str) -> tuple[set[str], bool | None]:
+def parse_openai_model_vision(markdown: str, modality: str = "image") -> tuple[set[str], bool | None]:
     """Parse published Markdown fields, not prose or model-name heuristics.
 
     Only the canonical ID and explicitly listed snapshots/aliases share the
@@ -44,7 +45,7 @@ def parse_openai_model_vision(markdown: str) -> tuple[set[str], bool | None]:
     modalities = re.findall(r"^- Input modalities: ([a-z, ]+)\s*$", markdown, re.MULTILINE)
     if len(model_ids) != 1 or len(modalities) != 1:
         return set(), None
-    supported = api_image_support({"input_modalities": modalities[0].split(",")})
+    supported = api_image_support({"input_modalities": modalities[0].split(",")}, modality)
     if supported is None:
         return set(), None
     ids = set(model_ids)
@@ -54,7 +55,7 @@ def parse_openai_model_vision(markdown: str) -> tuple[set[str], bool | None]:
     return ids, supported
 
 
-def _gemini_inputs_include_image(cell: str) -> bool | None:
+def _gemini_inputs_include_image(cell: str, modality: str = "image") -> bool | None:
     """Read the bold Inputs list of a data-types cell; unknown terms are no evidence."""
     match = re.fullmatch(r"\*\*Inputs?\*\*\s+(.+?)\s+\*\*Outputs?\*\*.*", cell)
     if not match:
@@ -65,10 +66,10 @@ def _gemini_inputs_include_image(cell: str) -> bool | None:
     terms = [term for term in terms if term]
     if not terms or any(term not in _GEMINI_INPUT_TERMS for term in terms):
         return None
-    return "image" in {_GEMINI_INPUT_TERMS[term] for term in terms}
+    return modality in {_GEMINI_INPUT_TERMS[term] for term in terms}
 
 
-def parse_gemini_model_vision(markdown: str) -> dict[str, bool]:
+def parse_gemini_model_vision(markdown: str, modality: str = "image") -> dict[str, bool]:
     """Parse each model property table, not prose or model-name heuristics.
 
     A table declares image input only through exactly one "Model code" row and
@@ -88,7 +89,7 @@ def parse_gemini_model_vision(markdown: str) -> dict[str, bool]:
         if len(codes) != 1 or len(data_types) != 1:
             continue
         model_ids = re.findall(r"`([a-zA-Z0-9._-]+)`", codes[0])
-        supported = _gemini_inputs_include_image(data_types[0])
+        supported = _gemini_inputs_include_image(data_types[0], modality)
         if not model_ids or supported is None:
             continue
         for model_id in model_ids:
@@ -115,13 +116,13 @@ async def _read_markdown(session: aiohttp.ClientSession, url: str) -> str:
 async def _collect_docs_declarations(
     session: aiohttp.ClientSession,
     urls: Iterable[str],
-    parse_page: Callable[[str], Mapping[str, bool]],
+    parse_page: Callable[[str], Mapping[str, ModalityDeclaration]],
     model_ids: set[str],
     logger: logging.Logger,
     provider_label: str,
-) -> dict[str, tuple[bool, str]]:
+) -> dict[str, tuple[ModalityDeclaration, str]]:
     """Read pages with bounded parallelism; conflicting declarations cancel out."""
-    declarations: dict[str, tuple[bool, str]] = {}
+    declarations: dict[str, tuple[ModalityDeclaration, str]] = {}
     conflicts: set[str] = set()
     semaphore = asyncio.Semaphore(6)
 
@@ -140,11 +141,11 @@ async def _collect_docs_declarations(
     try:
         await asyncio.wait_for(asyncio.gather(*(read_page(url) for url in urls)), timeout=30)
     except asyncio.TimeoutError:
-        logger.warning("%s vision documentation refresh timed out; preserving unrefreshed capabilities.", provider_label)
+        logger.warning("%s modality documentation refresh timed out; preserving unrefreshed capabilities.", provider_label)
     missing = model_ids - declarations.keys()
     if missing:
         logger.warning(
-            "%s has no fresh image-input declaration for %s; preserving local values.",
+            "%s has no fresh input-modality declaration for %s; preserving local values.",
             provider_label, ", ".join(sorted(missing)),
         )
     return declarations
@@ -157,7 +158,8 @@ def _openai_page_declarations(markdown: str) -> dict[str, bool]:
 
 async def fetch_openai_vision_metadata(
     session: aiohttp.ClientSession, model_ids: set[str], logger: logging.Logger,
-) -> dict[str, tuple[bool, str]]:
+    *, include_audio: bool = False,
+) -> dict[str, tuple[ModalityDeclaration, str]]:
     """Supplement /models with official modality fields and exact snapshot IDs.
 
     The model-list API currently has no modalities. Read its public docs only
@@ -175,14 +177,20 @@ async def fetch_openai_vision_metadata(
     }
     slugs = {slug for slug in slugs if any(mid == slug or mid.startswith(slug + "-") for mid in model_ids)}
     urls = [f"{OPENAI_DOCS_BASE}/{slug}.md" for slug in sorted(slugs)]
-    return await _collect_docs_declarations(
-        session, urls, _openai_page_declarations, model_ids, logger, "OpenAI",
-    )
+    def parse_page(markdown: str) -> dict:
+        vision = _openai_page_declarations(markdown)
+        if not include_audio:
+            return vision
+        ids, audio = parse_openai_model_vision(markdown, "audio")
+        return {mid: {"image": vision.get(mid), "audio": audio} for mid in ids}
+
+    return await _collect_docs_declarations(session, urls, parse_page, model_ids, logger, "OpenAI")
 
 
 async def fetch_gemini_vision_metadata(
     session: aiohttp.ClientSession, model_ids: set[str], logger: logging.Logger,
-) -> dict[str, tuple[bool, str]]:
+    *, include_audio: bool = False,
+) -> dict[str, tuple[ModalityDeclaration, str]]:
     """Supplement the Gemini Models API, which publishes no input modalities.
 
     Read each model's official Markdown page only on an explicit catalog
@@ -198,6 +206,11 @@ async def fetch_gemini_vision_metadata(
         for mid in sorted(model_ids)
         if re.fullmatch(r"[a-zA-Z0-9._-]+", mid)
     ]
-    return await _collect_docs_declarations(
-        session, urls, parse_gemini_model_vision, model_ids, logger, "Gemini",
-    )
+    def parse_page(markdown: str) -> dict:
+        vision = parse_gemini_model_vision(markdown)
+        if not include_audio:
+            return vision
+        audio = parse_gemini_model_vision(markdown, "audio")
+        return {mid: {"image": vision.get(mid), "audio": audio.get(mid)} for mid in vision.keys() | audio.keys()}
+
+    return await _collect_docs_declarations(session, urls, parse_page, model_ids, logger, "Gemini")

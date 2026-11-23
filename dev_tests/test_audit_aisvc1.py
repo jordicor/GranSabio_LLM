@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from ai_service import AIService, GenerationStoppedUnexpectedly
+from ai_service import AIRequestError, AIService, GenerationStoppedUnexpectedly
 from deterministic_validation import DraftValidationResult
 from model_aliasing import (
     ModelAliasRegistry,
@@ -64,7 +64,7 @@ def _validation_callback_feeding(approvals):
 
 
 # ---------------------------------------------------------------------------
-# AIS-01: tool-loop retries must start from the pristine transcript
+# AIS-01: a completed paid turn must never be replayed
 # ---------------------------------------------------------------------------
 
 
@@ -79,8 +79,8 @@ def _openai_tool_call(draft_text: str) -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
-async def test_openai_tool_loop_retry_starts_with_clean_transcript(service):
-    """AIS-01 (OpenAI loop): a retry must not inherit the failed attempt's messages."""
+async def test_openai_tool_loop_does_not_replay_completed_turns(service):
+    """AIS-01 (OpenAI loop): a later timeout stops without replaying the completed first turn."""
     service._is_openai_responses_api_model = Mock(return_value=False)  # Exercise the Chat tool-loop transport.
     captured = []
     calls = {"n": 0}
@@ -109,34 +109,32 @@ async def test_openai_tool_loop_retry_starts_with_clean_transcript(service):
     service.openai_client = SimpleNamespace()
     service._stream_openai_compatible_tool_turn = fake_turn
 
-    text, _envelope = await service._run_openai_compatible_validation_tool_loop(
-        "openai",
-        "gpt-4o",
-        "Write the intro",
-        _validation_callback_feeding([False, True]),
-        0.5,
-        256,
-        "System rules",
-        None,   # request_timeout
-        None,   # reasoning_effort
-        False,  # json_output
-        None,   # json_schema
-        None,   # usage_callback
-        None,   # usage_extra
-        None,   # images
-        4,      # max_rounds
-    )
+    with pytest.raises(AIRequestError):
+        await service._run_openai_compatible_validation_tool_loop(
+            "openai",
+            "gpt-4o",
+            "Write the intro",
+            _validation_callback_feeding([False, True]),
+            0.5,
+            256,
+            "System rules",
+            None,   # request_timeout
+            None,   # reasoning_effort
+            False,  # json_output
+            None,   # json_schema
+            None,   # usage_callback
+            None,   # usage_extra
+            None,   # images
+            4,      # max_rounds
+        )
 
-    assert text == "final draft"
-    assert len(captured) == 3
+    assert len(captured) == 2
     assert captured[0] == [
         {"role": "system", "content": "System rules"},
         {"role": "user", "content": "Write the intro"},
     ]
     # The failed first attempt did append assistant/tool turns before dying...
     assert len(captured[1]) > len(captured[0])
-    # ...but the second attempt must start from the pristine transcript.
-    assert captured[2] == captured[0]
 
 
 def _claude_tool_use_response(draft_text: str) -> SimpleNamespace:
@@ -154,8 +152,8 @@ def _claude_tool_use_response(draft_text: str) -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
-async def test_claude_tool_loop_retry_starts_with_clean_transcript(service):
-    """AIS-01 (Claude loop): a retry must not inherit the failed attempt's messages."""
+async def test_claude_tool_loop_does_not_replay_completed_turns(service):
+    """AIS-01 (Claude loop): a later timeout stops without replaying the completed first turn."""
     captured = []
     calls = {"n": 0}
 
@@ -171,31 +169,29 @@ async def test_claude_tool_loop_retry_starts_with_clean_transcript(service):
     service.anthropic_client = SimpleNamespace()
     service._stream_claude_tool_turn = fake_stream_turn
 
-    text, _envelope = await service._run_claude_validation_tool_loop(
-        "claude",
-        "claude-sonnet-4",
-        "Write the intro",
-        _validation_callback_feeding([False, True]),
-        0.5,
-        256,
-        "System rules",
-        None,   # request_timeout
-        None,   # thinking_budget_tokens
-        False,  # json_output
-        None,   # json_schema
-        None,   # usage_callback
-        None,   # usage_extra
-        None,   # images
-        4,      # max_rounds
-    )
+    with pytest.raises(AIRequestError):
+        await service._run_claude_validation_tool_loop(
+            "claude",
+            "claude-sonnet-4",
+            "Write the intro",
+            _validation_callback_feeding([False, True]),
+            0.5,
+            256,
+            "System rules",
+            None,   # request_timeout
+            None,   # thinking_budget_tokens
+            False,  # json_output
+            None,   # json_schema
+            None,   # usage_callback
+            None,   # usage_extra
+            None,   # images
+            4,      # max_rounds
+        )
 
-    assert text == "final draft"
-    assert len(captured) == 3
+    assert len(captured) == 2
     assert captured[0] == [{"role": "user", "content": "Write the intro"}]
     # The failed first attempt did append assistant/tool turns before dying...
     assert len(captured[1]) > len(captured[0])
-    # ...but the second attempt must start from the pristine transcript.
-    assert captured[2] == captured[0]
 
 
 def _gemini_function_call_response(draft_text: str) -> SimpleNamespace:
@@ -224,8 +220,8 @@ def _gemini_function_call_response(draft_text: str) -> SimpleNamespace:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_id", ["gemini-2.5-flash", "gemini-3.8-flash"])
-async def test_gemini_tool_loop_retry_starts_with_clean_transcript(service, model_id):
-    """AIS-01 (Gemini loop): a retry must not inherit the failed attempt's contents."""
+async def test_gemini_tool_loop_does_not_replay_completed_turns(service, model_id):
+    """AIS-01 (Gemini loop): a later timeout stops without replaying the completed first turn."""
     captured = []
     calls = {"n": 0}
 
@@ -244,31 +240,29 @@ async def test_gemini_tool_loop_retry_starts_with_clean_transcript(service, mode
         aio=SimpleNamespace(models=SimpleNamespace(generate_content=fake_generate_content))
     )
 
-    text, _envelope = await service._run_gemini_new_sdk_validation_tool_loop(
-        model_id,
-        "Write the intro",
-        _validation_callback_feeding([False, True]),
-        0.5,
-        256,
-        "System rules",
-        None,   # reasoning_effort
-        None,   # thinking_budget_tokens
-        False,  # json_output
-        None,   # json_schema
-        None,   # usage_callback
-        None,   # usage_extra
-        None,   # images
-        4,      # max_rounds
-    )
+    with pytest.raises(AIRequestError):
+        await service._run_gemini_new_sdk_validation_tool_loop(
+            model_id,
+            "Write the intro",
+            _validation_callback_feeding([False, True]),
+            0.5,
+            256,
+            "System rules",
+            None,   # reasoning_effort
+            None,   # thinking_budget_tokens
+            False,  # json_output
+            None,   # json_schema
+            None,   # usage_callback
+            None,   # usage_extra
+            None,   # images
+            4,      # max_rounds
+        )
 
-    assert text == "final draft"
-    assert len(captured) == 3
+    assert len(captured) == 2
     assert captured[0] == [{"role": "user", "parts": [{"text": "Write the intro"}]}]
     # The failed first attempt did append model/tool turns before dying...
     assert len(captured[1]) > len(captured[0])
     assert captured[1][-1].parts[0].function_response.id == "validation-call-1"
-    # ...but the second attempt must start from the pristine transcript.
-    assert captured[2] == captured[0]
 
 
 # ---------------------------------------------------------------------------
@@ -370,13 +364,13 @@ def test_gemini_text_extractor_skips_thought_parts(service):
 
 
 # ---------------------------------------------------------------------------
-# AIS-03: Gemini stream fallback must forward the request images
+# AIS-03: Gemini stream failure must not dispatch a fallback
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_gemini_stream_fallback_forwards_images(service):
-    """AIS-03: the non-streaming fallback keeps the vision payload."""
+async def test_gemini_stream_failure_does_not_generate_a_second_response(service):
+    """A stream error propagates even when the request includes images."""
 
     class _ExplodingStream:
         def __aiter__(self):
@@ -407,21 +401,20 @@ async def test_gemini_stream_fallback_forwards_images(service):
     )
     service._generate_gemini_new_sdk = fake_fallback
 
-    chunks = [
-        chunk
-        async for chunk in service._stream_gemini_new_sdk(
-            "Describe this image",
-            "gemini-2.5-flash",
-            0.5,
-            128,
-            "",
-            images=[image],
-        )
-    ]
+    with pytest.raises(RuntimeError, match="stream exploded"):
+        _chunks = [
+            chunk
+            async for chunk in service._stream_gemini_new_sdk(
+                "Describe this image",
+                "gemini-2.5-flash",
+                0.5,
+                128,
+                "",
+                images=[image],
+            )
+        ]
+    assert not fallback_calls
 
-    assert fallback_calls, "the non-streaming fallback was not invoked"
-    assert fallback_calls[0].get("images") == [image]
-    assert "fallback description" in chunks
 
 
 @pytest.mark.asyncio
@@ -624,7 +617,7 @@ async def test_openrouter_none_content_fails_fast(service):
 
 def test_claude_thinking_disabled_when_max_tokens_cannot_fit_minimum(service):
     """AIS-05: a budget clamped below 1024 disables thinking for that call."""
-    service._get_thinking_budget_details = lambda model_id: None
+    service._get_thinking_budget_details = lambda provider, model_id: None
     params = {"model": "claude-sonnet-4", "max_tokens": 800}
 
     service._inject_claude_thinking_params(params, "claude-sonnet-4", 2048)
@@ -634,7 +627,7 @@ def test_claude_thinking_disabled_when_max_tokens_cannot_fit_minimum(service):
 
 def test_claude_thinking_kept_when_budget_fits(service):
     """AIS-05: budgets that fit keep working unchanged."""
-    service._get_thinking_budget_details = lambda model_id: None
+    service._get_thinking_budget_details = lambda provider, model_id: None
     params = {"model": "claude-sonnet-4", "max_tokens": 8000}
 
     service._inject_claude_thinking_params(params, "claude-sonnet-4", 2048)
@@ -644,7 +637,7 @@ def test_claude_thinking_kept_when_budget_fits(service):
 
 def test_claude_thinking_boundary_budget_at_minimum(service):
     """AIS-05: a clamp landing exactly on the minimum stays enabled."""
-    service._get_thinking_budget_details = lambda model_id: None
+    service._get_thinking_budget_details = lambda provider, model_id: None
     params = {"model": "claude-sonnet-4", "max_tokens": 1124}
 
     service._inject_claude_thinking_params(params, "claude-sonnet-4", 2048)
@@ -654,7 +647,7 @@ def test_claude_thinking_boundary_budget_at_minimum(service):
 
 def test_claude_thinking_respects_catalog_minimum(service):
     """AIS-05: the catalog min_tokens raises the floor used for the disable check."""
-    service._get_thinking_budget_details = lambda model_id: {
+    service._get_thinking_budget_details = lambda provider, model_id: {
         "supported": True,
         "min_tokens": 2048,
         "max_tokens": 8192,
@@ -682,7 +675,7 @@ async def test_gpt5_stream_init_error_logs_metadata_not_prompts(service, caplog)
         raise RuntimeError("400 boom from provider")
 
     service.openai_client = SimpleNamespace()
-    service._call_responses_create_with_reasoning_retry = failing_create
+    service._create_response = failing_create
 
     with caplog.at_level(logging.ERROR):
         with pytest.raises(RuntimeError, match="400 boom from provider"):
@@ -705,15 +698,15 @@ async def test_gpt5_stream_init_error_logs_metadata_not_prompts(service, caplog)
 
 
 @pytest.mark.asyncio
-async def test_gpt5_stream_init_error_full_payload_only_with_extra_verbose(service, caplog):
-    """AIS-06: the full payload is still available through the opt-in channel."""
+async def test_gpt5_stream_init_error_never_logs_payload_even_with_extra_verbose(service, caplog):
+    """Verbose operational logs retain metadata without exposing request text."""
     secret_prompt = "TOP-SECRET user payload 4f9d2c"
 
     async def failing_create(*args, **kwargs):
         raise RuntimeError("400 boom from provider")
 
     service.openai_client = SimpleNamespace()
-    service._call_responses_create_with_reasoning_retry = failing_create
+    service._create_response = failing_create
 
     with caplog.at_level(logging.INFO):
         with pytest.raises(RuntimeError, match="400 boom from provider"):
@@ -730,9 +723,10 @@ async def test_gpt5_stream_init_error_full_payload_only_with_extra_verbose(servi
     verbose_lines = [
         record.getMessage()
         for record in caplog.records
-        if "[EXTRA_VERBOSE] OpenAI Responses streaming parameters" in record.getMessage()
+        if "[EXTRA_VERBOSE] OpenAI Responses streaming parameter names" in record.getMessage()
     ]
-    assert verbose_lines and secret_prompt in verbose_lines[0]
+    assert verbose_lines
+    assert all(secret_prompt not in record.getMessage() for record in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -808,3 +802,30 @@ def test_blind_guard_catches_system_leak_in_declared_parts(service):
             ],
             boundary="unit",
         )
+
+
+@pytest.mark.parametrize("responses", [False, True])
+async def test_closing_generation_stream_closes_the_provider_stream(service, responses):
+    closed = []
+
+    class ProviderStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if responses:
+                return SimpleNamespace(type="response.output_text.delta", delta="first")
+            return SimpleNamespace(choices=[SimpleNamespace(
+                delta=SimpleNamespace(content="first"), finish_reason=None)], usage=None)
+
+        async def close(self):
+            closed.append(True)
+
+    service.openai_client = SimpleNamespace()
+    service._create_response = AsyncMock(return_value=ProviderStream())
+    service._create_chat_completion = AsyncMock(return_value=ProviderStream())
+    service._is_openai_responses_api_model = Mock(return_value=responses)
+    stream = service._stream_openai("fixture", "gpt-5.1" if responses else "gpt-4o", 0.5, 128, "", False)
+    assert await anext(stream) == "first"
+    await stream.aclose()
+    assert closed == [True]

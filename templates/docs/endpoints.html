@@ -50,6 +50,11 @@
                         <div class="param-desc">Path to one primary text field in JSON output using jmespath notation. Examples: <code>"generated_text"</code>, <code>"data.content"</code>. The alias <code>text_field_path</code> accepts the same single path; lists are rejected with HTTP 422 before generation. Required only when downstream text validators or QA must operate on a specific string field; pure JSON validation can accept object/array JSON without extractable text. See <a href="#smart-editing">Smart Editing</a> for details.</div>
                     </div>
                     <div class="param-row">
+                        <div class="param-name">segment_budgets</div>
+                        <div class="param-type">object</div>
+                        <div class="param-desc">Optional deterministic document/section word budgets for JSON output with one <code>target_field</code>. When enabled (default true), requires explicit <code>structure_field</code> and <code>base_heading_level</code> (1–5), for example <code>{"structure_field":"structure","base_heading_level":2}</code>. Omit, pass <code>null</code>, or use <code>{"enabled":false}</code> to disable. Violations always prevent acceptance. Since 2026-11-07, there are no implicit field/heading defaults and <code>severity</code> is no longer accepted; incomplete or unknown contract fields return HTTP 422 before generation.</div>
+                    </div>
+                    <div class="param-row">
                         <div class="param-name">text_field_only</div>
                         <div class="param-type">boolean</div>
                         <div class="param-desc">Controls what QA/Consensus/GranSabio receives when processing JSON. If <code>true</code>: Send only extracted text field(s) for evaluation (saves tokens). If <code>false</code>: Send complete JSON with hint about primary fields. In both cases, the user always receives the complete JSON with all fields preserved. (default: false)</div>
@@ -937,7 +942,7 @@ eventSource.onmessage = function(event) {
                 </div>
 
                 <div class="alert warning">
-                    <strong>Commits replace, they do not append:</strong> a chunk labelled anything other than <code>draft</code> carries the FULL body of its attempt (<code>accepted_stream</code>, <code>accepted_json</code>, <code>tool_loop_final</code>, <code>rejected_json</code>), not a delta. A consumer that accumulates drafts must REPLACE what it has for that (session, phase) when one arrives, or it will show the dead draft glued to the text that supersedes it.
+                    <strong>Commits replace, they do not append:</strong> a chunk labelled anything other than <code>draft</code> carries the FULL body of its attempt (<code>accepted_stream</code>, <code>accepted_json</code>, <code>tool_loop_final</code>, <code>rejected_json</code>, <code>rejected_candidate</code>), not a delta. A consumer that accumulates drafts must REPLACE what it has for that (session, phase) when one arrives, or it will show the dead draft glued to the text that supersedes it.
                 </div>
 
                 <div class="alert info">

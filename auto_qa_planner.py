@@ -82,6 +82,7 @@ AUTO_QA_PLAN_SCHEMA: Dict[str, Any] = {
                     "concise_on_pass",
                     "order",
                     "include_input_images",
+                    "include_input_audio",
                 ],
                 "properties": {
                     "name": {"type": "string"},
@@ -93,6 +94,7 @@ AUTO_QA_PLAN_SCHEMA: Dict[str, Any] = {
                     "concise_on_pass": {"type": "boolean"},
                     "order": {"type": "integer", "minimum": 0, "maximum": 998999},
                     "include_input_images": {"type": "boolean"},
+                    "include_input_audio": {"type": "boolean"},
                 },
             },
         },
@@ -239,6 +241,7 @@ def build_auto_qa_planning_payload(
         },
         "context_documents": context_documents or [],
         "images": image_info or {"count": 0},
+        "audios": {"count": len(request.audios or [])},
         "qa_evaluators": _qa_evaluator_snapshot(model_alias_registry),
         "auto_qa": {
             "rigor": auto_qa.rigor,
@@ -262,6 +265,7 @@ def _build_planner_prompt(payload: Dict[str, Any]) -> str:
         "request and rigor. Return at least auto_qa.qa_layer_count.min and at most auto_qa.qa_layer_count.max "
         "qa_layers; a plan outside that range is rejected. Do not create layers that merely duplicate active structured validators unless the layer "
         "checks a distinct semantic risk. Use include_input_images only when the QA layer truly needs visual evidence.\n"
+        "Use include_input_audio=true for acoustic fidelity criteria when audios are present; false for text-only criteria.\n"
         "Allowed request_overrides are: min_global_score, smart_editing_mode, qa_final_verification_mode, "
         "qa_final_verification_strategy, qa_execution_mode, max_edit_rounds_per_layer. Include every request_overrides "
         "field and set fields to null when no tuning is useful."

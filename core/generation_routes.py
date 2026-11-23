@@ -23,6 +23,7 @@ from auto_qa_planner import (
 )
 from config import EDITABLE_CONTENT_TYPES
 from deal_breaker_tracker import get_tracker
+from debug_logger import require_debugger_dispatch
 from llm_routing import (
     LLMRouteResolution,
     LLMRoutingError,
@@ -657,16 +658,14 @@ def _client_safe_failure_reason(
     or context-admission errors); anything else degrades to a fixed message
     while the raw detail stays in server-side state and logs.
     """
-    if final_result and final_result.get("failure_reason"):
-        return final_result["failure_reason"]
-    raw_error = session.get("error")
+    raw_error = (final_result or {}).get("failure_reason") or session.get("error")
     if raw_error is None:
         return None
     status = session.get("status")
     status_value = status.value if isinstance(status, GenerationStatus) else str(status)
     if (
         status_value == GenerationStatus.FAILED.value
-        and session.get("error_type") in (None, "internal_error")
+        and ((final_result or {}).get("error_type") or session.get("error_type")) in (None, "internal_error")
     ):
         if raw_error != INTERNAL_FAILURE_REASON:
             logger.warning(
@@ -765,7 +764,15 @@ async def _discard_admission_session(
 
 async def _generate_content_once(request: ContentRequest):
     """Keep request policy isolated while admission and background tasks inherit it."""
+    from provider_drain import ProviderDispatchClosed
+    from runtime_logging import require_log_capacity
     from shared_context import PromptCachePolicyError, prompt_cache_scope
+
+    try:
+        require_log_capacity()
+        await require_debugger_dispatch()
+    except ProviderDispatchClosed as exc:
+        raise TransientAdmissionRefusal(status_code=503, detail=str(exc), headers={"Retry-After": "5"}) from exc
 
     with prompt_cache_scope(request.prompt_cache):
         try:
@@ -1005,434 +1012,460 @@ async def _generate_content_once_with_cache_policy(request: ContentRequest):
             detail=f"Project '{project_id}' is stopped or paused. Call POST /project/start/{project_id} to reactivate it.",
         ) from exc
 
-    # Validate word count enforcement configuration early
-    if is_word_count_enforcement_enabled(request.word_count_enforcement):
-        is_valid, error_msg = validate_word_count_config(request.word_count_enforcement)
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=f"Invalid word count enforcement configuration: {error_msg}")
+    try:
+        # Validate word count enforcement configuration early
+        if is_word_count_enforcement_enabled(request.word_count_enforcement):
+            is_valid, error_msg = validate_word_count_config(request.word_count_enforcement)
+            if not is_valid:
+                raise HTTPException(status_code=400, detail=f"Invalid word count enforcement configuration: {error_msg}")
 
-        # Check that word limits are provided when enforcement is enabled
-        if not request.min_words and not request.max_words:
-            raise HTTPException(status_code=400, detail="Word count enforcement is enabled but no min_words or max_words specified")
+            # Check that word limits are provided when enforcement is enabled
+            if not request.min_words and not request.max_words:
+                raise HTTPException(status_code=400, detail="Word count enforcement is enabled but no min_words or max_words specified")
 
-    # When word targets are present and the caller did not set an explicit token budget,
-    # auto-raise the default generation budget so long-form requests are not silently capped.
-    if (
-        (request.min_words or request.max_words)
-        and request.max_tokens_percentage is None
-        and "max_tokens" not in request_fields_set
-    ):
-        estimated_budget = _estimate_tokens_for_word_target(request)
-        token_resolution = (
-            config.resolve_output_max_tokens(
-                request.generator_model,
-                requested_max_tokens=estimated_budget,
-                call_id="generation.word_target",
-            )
-            if estimated_budget is not None
-            else {}
-        )
-        resolved_estimated_budget = token_resolution.get("max_tokens") if token_resolution else None
-        if resolved_estimated_budget is not None and resolved_estimated_budget > (request.max_tokens or 0):
-            logger.info(
-                "Auto-adjusting generation max_tokens for word-targeted request: %s -> %s "
-                "(estimated=%s, min_words=%s, max_words=%s, safe_limit=%s)",
-                request.max_tokens,
-                resolved_estimated_budget,
-                estimated_budget,
-                request.min_words,
-                request.max_words,
-                token_resolution.get("safe_limit"),
-            )
-            request.max_tokens = int(resolved_estimated_budget)
-
-    if request.max_tokens_percentage is None:
-        token_floor_adjustment = _apply_external_generation_min_tokens(request)
-        if token_floor_adjustment:
-            long_text_advisories.append(
-                _build_advisory(
-                    code="external_generation_min_tokens_applied",
-                    message=(
-                        f"max_tokens was raised from {token_floor_adjustment.get('original_tokens')} "
-                        f"to {token_floor_adjustment.get('adjusted_tokens')} for "
-                        f"{request.generator_model} because the configured external generation "
-                        "minimum is higher than the requested budget."
-                    ),
-                    severity="info",
+        # When word targets are present and the caller did not set an explicit token budget,
+        # auto-raise the default generation budget so long-form requests are not silently capped.
+        if (
+            (request.min_words or request.max_words)
+            and request.max_tokens_percentage is None
+            and "max_tokens" not in request_fields_set
+        ):
+            estimated_budget = _estimate_tokens_for_word_target(request)
+            token_resolution = (
+                config.resolve_output_max_tokens(
+                    request.generator_model,
+                    requested_max_tokens=estimated_budget,
+                    call_id="generation.word_target",
                 )
+                if estimated_budget is not None
+                else {}
             )
-
-    json_output_requested = is_json_output_requested(request)
-
-    usage_tracker = UsageTracker(
-        detail_level=max(
-            getattr(request, "show_query_costs", 0),
-            getattr(request, "show_query_stats", 0),
-        )
-    )
-
-    if json_output_requested:
-        fields_set = getattr(request, "model_fields_set", None)
-        if fields_set is None:
-            fields_set = getattr(request, "__fields_set__", set())
-        if "max_iterations" not in fields_set:
-            adjusted_iterations = 10
-            if request.max_iterations != adjusted_iterations:
+            resolved_estimated_budget = token_resolution.get("max_tokens") if token_resolution else None
+            if resolved_estimated_budget is not None and resolved_estimated_budget > (request.max_tokens or 0):
                 logger.info(
-                    "Adjusting max_iterations for JSON content type: requested=%s, applied=%s",
-                    request.max_iterations,
-                    adjusted_iterations,
+                    "Auto-adjusting generation max_tokens for word-targeted request: %s -> %s "
+                    "(estimated=%s, min_words=%s, max_words=%s, safe_limit=%s)",
+                    request.max_tokens,
+                    resolved_estimated_budget,
+                    estimated_budget,
+                    request.min_words,
+                    request.max_words,
+                    token_resolution.get("safe_limit"),
                 )
-            request.max_iterations = adjusted_iterations
+                request.max_tokens = int(resolved_estimated_budget)
 
-    long_text_enabled = bool(resolved_long_text_mode.get("enabled"))
-    long_text_tools_supported = _supports_long_text_generation_tools(request.generator_model)
-    long_text_controller_eval_model = getattr(request, "_long_text_controller_eval_model", None)
-    request._long_text_controller_eval_model = long_text_controller_eval_model
-    if long_text_enabled:
-        if not config.has_model_spec(long_text_controller_eval_model):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Long Text controller eval model '{long_text_controller_eval_model}' "
-                    "is not declared in model_specs.json."
-                ),
+        if request.max_tokens_percentage is None:
+            token_floor_adjustment = _apply_external_generation_min_tokens(request)
+            if token_floor_adjustment:
+                long_text_advisories.append(
+                    _build_advisory(
+                        code="external_generation_min_tokens_applied",
+                        message=(
+                            f"max_tokens was raised from {token_floor_adjustment.get('original_tokens')} "
+                            f"to {token_floor_adjustment.get('adjusted_tokens')} for "
+                            f"{request.generator_model} because the configured external generation "
+                            "minimum is higher than the requested budget."
+                        ),
+                        severity="info",
+                    )
+                )
+
+        json_output_requested = is_json_output_requested(request)
+
+        usage_tracker = UsageTracker(
+            detail_level=max(
+                getattr(request, "show_query_costs", 0),
+                getattr(request, "show_query_stats", 0),
             )
-        if not resolved_long_text_mode.get("user_set_max_iterations"):
-            request.max_iterations = 2
-        elif request.max_iterations > config.LONG_TEXT_MAX_OUTER_ITERATIONS:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Long Text Mode allows at most {config.LONG_TEXT_MAX_OUTER_ITERATIONS} outer iterations "
-                    f"when max_iterations is set explicitly; got {request.max_iterations}."
-                ),
-            )
+        )
 
         if json_output_requested:
-            raise HTTPException(
-                status_code=400,
-                detail="Long Text Mode only supports plain-text generation and cannot be combined with JSON output.",
-            )
-        if getattr(request, "target_field", None):
-            raise HTTPException(
-                status_code=400,
-                detail="Long Text Mode does not support target_field or text_field_path requests.",
-            )
-        if getattr(request, "images", None):
-            raise HTTPException(
-                status_code=400,
-                detail="Long Text Mode V1 does not support image inputs.",
-            )
-        if explicit_arbiter_model:
-            raise HTTPException(
-                status_code=400,
-                detail="Long Text Mode manages structural repairs internally and does not accept an explicit arbiter_model.",
-            )
-        if request.generation_tools_mode == "auto" and not long_text_tools_supported:
-            long_text_advisories.append(
-                _build_advisory(
-                    code="long_text_tools_auto_downgraded",
-                    message=(
-                        f"Generator '{request.generator_model}' does not support tool-assisted Long Text "
-                        "section drafting. The request was accepted with standard streaming drafts instead."
+            fields_set = getattr(request, "model_fields_set", None)
+            if fields_set is None:
+                fields_set = getattr(request, "__fields_set__", set())
+            if "max_iterations" not in fields_set:
+                adjusted_iterations = 10
+                if request.max_iterations != adjusted_iterations:
+                    logger.info(
+                        "Adjusting max_iterations for JSON content type: requested=%s, applied=%s",
+                        request.max_iterations,
+                        adjusted_iterations,
+                    )
+                request.max_iterations = adjusted_iterations
+
+        long_text_enabled = bool(resolved_long_text_mode.get("enabled"))
+        long_text_tools_supported = _supports_long_text_generation_tools(request.generator_model)
+        long_text_controller_eval_model = getattr(request, "_long_text_controller_eval_model", None)
+        request._long_text_controller_eval_model = long_text_controller_eval_model
+        if long_text_enabled:
+            if not config.has_model_spec(long_text_controller_eval_model):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Long Text controller eval model '{long_text_controller_eval_model}' "
+                        "is not declared in model_specs.json."
                     ),
-                    severity="info",
                 )
-            )
+            if not resolved_long_text_mode.get("user_set_max_iterations"):
+                request.max_iterations = 2
+            elif request.max_iterations > config.LONG_TEXT_MAX_OUTER_ITERATIONS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Long Text Mode allows at most {config.LONG_TEXT_MAX_OUTER_ITERATIONS} outer iterations "
+                        f"when max_iterations is set explicitly; got {request.max_iterations}."
+                    ),
+                )
 
-    input_resolution = await resolve_generation_inputs(
-        request,
-        attachment_manager_factory=get_attachment_manager,
-        config_obj=config,
-        resolve_images_for_generation_fn=resolve_images_for_generation,
-        logger=logger,
-    )
-    attachment_manager = input_resolution.attachment_manager
-    resolved_attachments = input_resolution.resolved_attachments
-    resolved_images = input_resolution.resolved_images
-    preflight_context = input_resolution.preflight_context
-    preflight_image_info = input_resolution.preflight_image_info
+            if json_output_requested:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Long Text Mode only supports plain-text generation and cannot be combined with JSON output.",
+                )
+            if getattr(request, "target_field", None):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Long Text Mode does not support target_field or text_field_path requests.",
+                )
+            if getattr(request, "images", None):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Long Text Mode V1 does not support image inputs.",
+                )
+            if explicit_arbiter_model:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Long Text Mode manages structural repairs internally and does not accept an explicit arbiter_model.",
+                )
+            if request.generation_tools_mode == "auto" and not long_text_tools_supported:
+                long_text_advisories.append(
+                    _build_advisory(
+                        code="long_text_tools_auto_downgraded",
+                        message=(
+                            f"Generator '{request.generator_model}' does not support tool-assisted Long Text "
+                            "section drafting. The request was accepted with standard streaming drafts instead."
+                        ),
+                        severity="info",
+                    )
+                )
 
-    reasoning_timeout_hint: Optional[int] = None
-    try:
-        validation_preview = config.validate_token_limits(
-            request.generator_model,
-            request.max_tokens,
-            getattr(request, "reasoning_effort", None),
-            getattr(request, "thinking_budget_tokens", None),
-            getattr(request, "max_tokens_percentage", None),
+        input_resolution = await resolve_generation_inputs(
+            request,
+            attachment_manager_factory=get_attachment_manager,
+            config_obj=config,
+            resolve_images_for_generation_fn=resolve_images_for_generation,
+            logger=logger,
         )
-        reasoning_timeout_hint = validation_preview.get("reasoning_timeout_seconds")
-    except Exception as exc:
-        logger.debug("Could not preview reasoning timeout for %s: %s", request.generator_model, exc)
-        reasoning_timeout_hint = None
+        attachment_manager = input_resolution.attachment_manager
+        resolved_attachments = input_resolution.resolved_attachments
+        resolved_images = input_resolution.resolved_images
+        resolved_audios = input_resolution.resolved_audios
+        from ai_runtime.audio import estimate_audio_tokens
+        if long_text_enabled and resolved_audios:
+            raise HTTPException(400, {"code": "audio_mode_unsupported", "message": "Long Text does not support audio inputs."})
+        preflight_context = input_resolution.preflight_context
+        preflight_image_info = input_resolution.preflight_image_info
 
-    selected_preflight_model = resolve_preflight_model(request)
-    model_alias_registry = ModelAliasRegistry.from_request(
-        request,
-        preflight_model=selected_preflight_model,
-    )
-    request._model_alias_registry = model_alias_registry
-
-    # Stash the client-named QA models flag (pre-routing ground truth) so the
-    # barrier-2 mirror rule can distinguish client-named from routing-chosen
-    # evaluators deep inside the QA engine.
-    request._client_named_qa_models = "qa_models" in request_fields_set
-
-    # --- Barrier 1: early technical context admission (pre-session, pre-LLM) ---
-    preflight_will_run = not _should_bypass_llm_preflight(
-        request,
-        context_documents=preflight_context,
-        image_info=preflight_image_info,
-    )
-    auto_qa_admission_model: Optional[str] = None
-    auto_qa_admission_max_tokens = 6000
-    if auto_qa_requested:
+        reasoning_timeout_hint: Optional[int] = None
         try:
-            auto_qa_route = resolve_call("auto_qa.plan", request=request)
-            auto_qa_admission_model = auto_qa_route.model
-            auto_qa_admission_max_tokens = (
-                config.resolve_output_max_tokens(
-                    auto_qa_route.model,
-                    routed_max_tokens=(getattr(auto_qa_route, "params", {}) or {}).get("max_tokens"),
-                    call_id="auto_qa.plan",
-                ).get("max_tokens")
-                or 6000
+            validation_preview = config.validate_token_limits(
+                request.generator_model,
+                request.max_tokens,
+                getattr(request, "reasoning_effort", None),
+                getattr(request, "thinking_budget_tokens", None),
+                getattr(request, "max_tokens_percentage", None),
             )
+            reasoning_timeout_hint = validation_preview.get("reasoning_timeout_seconds")
         except Exception as exc:
-            logger.debug("Could not resolve auto_qa.plan routing for admission: %s", exc)
-    preflight_admission_max_tokens = 800
-    _preflight_route = getattr(request, "_preflight_route", None)
-    if preflight_will_run and selected_preflight_model and _preflight_route is not None:
-        try:
-            preflight_admission_max_tokens = (
-                config.resolve_output_max_tokens(
-                    selected_preflight_model,
-                    routed_max_tokens=(getattr(_preflight_route, "params", {}) or {}).get("max_tokens"),
-                    call_id="preflight.validate",
-                ).get("max_tokens")
-                or 800
-            )
-        except Exception as exc:
-            logger.debug("Could not resolve preflight max_tokens for admission: %s", exc)
+            logger.debug("Could not preview reasoning timeout for %s: %s", request.generator_model, exc)
+            reasoning_timeout_hint = None
 
-    if request.prompt_cache and request.prompt_cache.mode != "auto":
-        if preflight_will_run and selected_preflight_model:
-            _ensure_model_known(selected_preflight_model, "preflight.validate")
-        if auto_qa_requested and auto_qa_admission_model:
-            _ensure_model_known(auto_qa_admission_model, "auto_qa.plan")
-
-    technical_admission = await admission_helpers.run_technical_context_admission(
-        request,
-        request_fields_set=request_fields_set,
-        preflight_model=selected_preflight_model,
-        preflight_will_run=preflight_will_run,
-        auto_qa_requested=auto_qa_requested,
-        auto_qa_model=auto_qa_admission_model,
-        qa_mandatory=qa_required,
-        preflight_image_info=preflight_image_info,
-        alias_registry=model_alias_registry,
-        native_counter=(
-            None
-            if _local_only_requested(request)
-            else getattr(ai_service, "_native_token_count", None)
-        ),
-        preflight_max_tokens=preflight_admission_max_tokens,
-        auto_qa_max_tokens=auto_qa_admission_max_tokens,
-        context_documents_total_bytes=sum(
-            int(item.get("size_bytes", 0) or 0) for item in (preflight_context or [])
-        ),
-    )
-    if technical_admission.diagnostics:
-        logger.info(
-            "Context admission plan (session %s): %s",
-            session_id,
-            technical_admission.diagnostics,
+        selected_preflight_model = resolve_preflight_model(request)
+        model_alias_registry = ModelAliasRegistry.from_request(
+            request,
+            preflight_model=selected_preflight_model,
         )
-    if technical_admission.advisories:
-        long_text_advisories.extend(technical_admission.advisories)
-    if technical_admission.rejected:
-        await publish_project_session_end(
-            project_id,
-            session_id,
-            "preflight_rejected",
-            request_name=getattr(request, "request_name", None),
-            project_epoch=project_epoch,
+        request._model_alias_registry = model_alias_registry
+
+        # Stash the client-named QA models flag (pre-routing ground truth) so the
+        # barrier-2 mirror rule can distinguish client-named from routing-chosen
+        # evaluators deep inside the QA engine.
+        request._client_named_qa_models = "qa_models" in request_fields_set
+
+        # --- Barrier 1: early technical context admission (pre-session, pre-LLM) ---
+        preflight_will_run = not _should_bypass_llm_preflight(
+            request,
+            context_documents=preflight_context,
+            image_info=preflight_image_info,
         )
-        return GenerationInitResponse(
-            status="preflight_rejected",
-            session_id=None,
-            project_id=project_id,
-            request_name=getattr(request, "request_name", None),
-            preflight_feedback=technical_admission.preflight_result,
-            advisories=long_text_advisories or None,
-        )
+        auto_qa_admission_model: Optional[str] = None
+        auto_qa_admission_max_tokens = 6000
+        if auto_qa_requested:
+            try:
+                auto_qa_route = resolve_call("auto_qa.plan", request=request)
+                auto_qa_admission_model = auto_qa_route.model
+                auto_qa_admission_max_tokens = (
+                    config.resolve_output_max_tokens(
+                        auto_qa_route.model,
+                        routed_max_tokens=(getattr(auto_qa_route, "params", {}) or {}).get("max_tokens"),
+                        call_id="auto_qa.plan",
+                    ).get("max_tokens")
+                    or 6000
+                )
+            except Exception as exc:
+                logger.debug("Could not resolve auto_qa.plan routing for admission: %s", exc)
+        preflight_admission_max_tokens = 800
+        _preflight_route = getattr(request, "_preflight_route", None)
+        if preflight_will_run and selected_preflight_model and _preflight_route is not None:
+            try:
+                preflight_admission_max_tokens = (
+                    config.resolve_output_max_tokens(
+                        selected_preflight_model,
+                        routed_max_tokens=(getattr(_preflight_route, "params", {}) or {}).get("max_tokens"),
+                        call_id="preflight.validate",
+                    ).get("max_tokens")
+                    or 800
+                )
+            except Exception as exc:
+                logger.debug("Could not resolve preflight max_tokens for admission: %s", exc)
 
-    local_execution: Optional[LocalExecutionRuntime] = None
-    if _local_only_requested(request):
-        try:
-            route_requirements = _build_local_route_requirements(
-                request,
-                auto_qa_requested=auto_qa_requested,
-                preflight_will_run=preflight_will_run,
-                qa_required=qa_required,
-                gran_sabio_needed=gran_sabio_needed,
-                json_output_requested=json_output_requested,
-                long_text_enabled=long_text_enabled,
-                long_text_tools_supported=long_text_tools_supported,
-            )
-            manifest = await admit_local_only(route_requirements, config_obj=config)
-            local_execution = LocalExecutionRuntime.create(
-                session_id=session_id,
-                manifest=manifest,
-            )
-        except LocalExecutionPolicyError as exc:
-            raise _local_policy_http_error(exc) from exc
+        if request.prompt_cache and request.prompt_cache.mode != "auto":
+            if preflight_will_run and selected_preflight_model:
+                _ensure_model_known(selected_preflight_model, "preflight.validate")
+            if auto_qa_requested and auto_qa_admission_model:
+                _ensure_model_known(auto_qa_admission_model, "auto_qa.plan")
 
-    if not _generation_admission_gate.try_acquire():
-        logger.warning(
-            "Rejecting /generate admission: active generation sessions at configured capacity (%s)",
-            getattr(config, "MAX_ACTIVE_SESSIONS", 100),
-        )
-        raise TransientAdmissionRefusal(
-            status_code=503,
-            detail="Generation capacity reached: too many active sessions. Retry later.",
-            headers={"Retry-After": "5"},
-        )
-
-    background_task_started = False
-
-    def _on_background_task_started(task: asyncio.Task) -> None:
-        nonlocal background_task_started
-        background_task_started = True
-        task.add_done_callback(lambda _finished: _generation_admission_gate.release())
-
-    try:
-        prestart_result = await run_prestart_flow(
-            request=request,
-            session_id=session_id,
-            project_id=project_id,
-            project_epoch=project_epoch,
-            auto_qa_requested=auto_qa_requested,
+        technical_admission = await admission_helpers.run_technical_context_admission(
+            request,
             request_fields_set=request_fields_set,
-            usage_tracker=usage_tracker,
-            preflight_context=preflight_context,
+            preflight_model=selected_preflight_model,
+            preflight_will_run=preflight_will_run,
+            auto_qa_requested=auto_qa_requested,
+            auto_qa_model=auto_qa_admission_model,
+            qa_mandatory=qa_required,
             preflight_image_info=preflight_image_info,
-            model_alias_registry=model_alias_registry,
-            local_execution=local_execution,
-            deps=PrestartFlowDeps(
-                ai_service=ai_service,
-                cancellation_registry=cancellation_registry,
-                register_session=register_session,
-                mutate_session=mutate_session,
-                pop_session=pop_session,
-                is_terminal_session=is_terminal_session,
-                apply_session_cancelled_state=apply_session_cancelled_state,
-                publish_project_session_end=publish_project_session_end,
-                debug_record_event=_debug_record_event,
-                create_phase_logger=create_phase_logger,
-                run_auto_qa_planning=run_auto_qa_planning,
-                run_preflight_validation=run_preflight_validation,
-                apply_auto_qa_plan=apply_auto_qa_plan,
-                validate_auto_qa_effective_contract=validate_auto_qa_effective_contract,
+            alias_registry=model_alias_registry,
+            native_counter=(
+                None
+                if _local_only_requested(request)
+                else getattr(ai_service, "_native_token_count", None)
             ),
-        )
-        if prestart_result.response is not None:
-            if local_execution is not None:
-                prestart_result.response.local_only_attestation = (
-                    build_local_execution_attestation(
-                        local_execution.manifest,
-                        local_execution.ledger,
-                    ).to_payload()
-                )
-            return prestart_result.response
-
-        temp_session = prestart_result.temp_session
-        preflight_result = prestart_result.preflight_result
-        auto_qa_plan_payload = prestart_result.auto_qa_plan_payload
-
-        grounding_config = getattr(request, "evidence_grounding", None)
-        grounding_enabled = bool(grounding_config and grounding_config.enabled)
-        if long_text_enabled and not request.qa_layers and not grounding_enabled:
-            long_text_advisories.append(
-                _build_advisory(
-                    code="long_text_qa_bypass",
-                    message=(
-                        "Long Text Mode was accepted with qa_layers=[]. Outer QA, consensus, and Gran Sabio "
-                        "safeguards are bypassed for this request."
-                    ),
-                )
-            )
-
-        recommended_timeout_seconds = _estimate_session_timeout(request, reasoning_timeout_hint)
-
-        return await finalize_generation_session(
-            request=request,
-            session_id=session_id,
-            project_id=project_id,
-            project_epoch=project_epoch,
-            request_payload_for_debug=request,
-            preflight_context=preflight_context,
-            resolved_attachments=resolved_attachments,
-            attachment_manager=attachment_manager,
-            resolved_images=resolved_images,
-            temp_session=temp_session,
-            preflight_result=preflight_result,
-            recommended_timeout_seconds=recommended_timeout_seconds,
-            usage_tracker=usage_tracker,
-            model_alias_registry=model_alias_registry,
-            resolved_long_text_mode=resolved_long_text_mode,
-            long_text_enabled=long_text_enabled,
-            long_text_advisories=long_text_advisories,
-            auto_qa_plan_payload=auto_qa_plan_payload,
-            local_execution=local_execution,
-            deps=SessionBootstrapDeps(
-                cancellation_registry=cancellation_registry,
-                register_session=register_session,
-                mutate_session=mutate_session,
-                is_terminal_session=is_terminal_session,
-                apply_session_cancelled_state=apply_session_cancelled_state,
-                debug_session_start=_debug_session_start,
-                process_content_generation=process_content_generation,
-                logger=logger,
-                background_task_hook=_on_background_task_started,
-                prepare_background_task=getattr(app.state, "prepare_generation_task", None),
+            preflight_max_tokens=preflight_admission_max_tokens,
+            auto_qa_max_tokens=auto_qa_admission_max_tokens,
+            context_documents_total_bytes=sum(
+                int(item.get("size_bytes", 0) or 0) for item in (preflight_context or [])
             ),
+            audio_tokens=estimate_audio_tokens(resolved_audios),
         )
-    except LocalExecutionPolicyError as exc:
-        # A normal-scope route to an explicit local endpoint is verified at its
-        # first SDK call, which preflight and Auto-QA reach after prestart
-        # registered the temp session.
-        http_error = _local_policy_http_error(exc)
-        if isinstance(http_error, TransientAdmissionRefusal):
-            await _discard_admission_session(
+        if technical_admission.diagnostics:
+            logger.info(
+                "Context admission plan (session %s): %s",
                 session_id,
-                project_id=project_id,
+                technical_admission.diagnostics,
+            )
+        if technical_admission.advisories:
+            long_text_advisories.extend(technical_admission.advisories)
+        if technical_admission.rejected:
+            await publish_project_session_end(
+                project_id,
+                session_id,
+                "preflight_rejected",
                 request_name=getattr(request, "request_name", None),
                 project_epoch=project_epoch,
             )
-        else:
+            return GenerationInitResponse(
+                status="preflight_rejected",
+                session_id=None,
+                project_id=project_id,
+                request_name=getattr(request, "request_name", None),
+                preflight_feedback=technical_admission.preflight_result,
+                advisories=long_text_advisories or None,
+            )
+
+        local_execution: Optional[LocalExecutionRuntime] = None
+        if _local_only_requested(request):
+            try:
+                route_requirements = _build_local_route_requirements(
+                    request,
+                    auto_qa_requested=auto_qa_requested,
+                    preflight_will_run=preflight_will_run,
+                    qa_required=qa_required,
+                    gran_sabio_needed=gran_sabio_needed,
+                    json_output_requested=json_output_requested,
+                    long_text_enabled=long_text_enabled,
+                    long_text_tools_supported=long_text_tools_supported,
+                )
+                manifest = await admit_local_only(route_requirements, config_obj=config)
+                local_execution = LocalExecutionRuntime.create(
+                    session_id=session_id,
+                    manifest=manifest,
+                )
+            except LocalExecutionPolicyError as exc:
+                raise _local_policy_http_error(exc) from exc
+
+        await require_debugger_dispatch()
+        if not _generation_admission_gate.try_acquire():
+            logger.warning(
+                "Rejecting /generate admission: active generation sessions at configured capacity (%s)",
+                getattr(config, "MAX_ACTIVE_SESSIONS", 100),
+            )
+            raise TransientAdmissionRefusal(
+                status_code=503,
+                detail="Generation capacity reached: too many active sessions. Retry later.",
+                headers={"Retry-After": "5"},
+            )
+
+        background_task_started = False
+
+        def _on_background_task_started(task: asyncio.Task) -> None:
+            nonlocal background_task_started
+            background_task_started = True
+            task.add_done_callback(lambda _finished: _generation_admission_gate.release())
+
+        try:
+            # Auto-QA/preflight emit events and traces before final session bootstrap.
+            # Establish the actual request header first; bootstrap enriches it later.
+            from . import app_state as capture_state
+            if capture_state.debug_logger is not None:
+                await capture_state.debug_logger.record_session_start(
+                    session_id, request_payload=capture_state._serialize_for_debug(request),
+                    project_id=project_id, status="initializing", phase="preflight",
+                )
+            prestart_result = await run_prestart_flow(
+                request=request,
+                session_id=session_id,
+                project_id=project_id,
+                project_epoch=project_epoch,
+                auto_qa_requested=auto_qa_requested,
+                request_fields_set=request_fields_set,
+                usage_tracker=usage_tracker,
+                preflight_context=preflight_context,
+                preflight_image_info=preflight_image_info,
+                model_alias_registry=model_alias_registry,
+                resolved_audios=resolved_audios,
+                local_execution=local_execution,
+                deps=PrestartFlowDeps(
+                    ai_service=ai_service,
+                    cancellation_registry=cancellation_registry,
+                    register_session=register_session,
+                    mutate_session=mutate_session,
+                    pop_session=pop_session,
+                    is_terminal_session=is_terminal_session,
+                    apply_session_cancelled_state=apply_session_cancelled_state,
+                    publish_project_session_end=publish_project_session_end,
+                    debug_record_event=_debug_record_event,
+                    create_phase_logger=create_phase_logger,
+                    run_auto_qa_planning=run_auto_qa_planning,
+                    run_preflight_validation=run_preflight_validation,
+                    apply_auto_qa_plan=apply_auto_qa_plan,
+                    validate_auto_qa_effective_contract=validate_auto_qa_effective_contract,
+                ),
+            )
+            if prestart_result.response is not None:
+                if capture_state.debug_logger is not None:
+                    await capture_state.debug_logger.update_session_status(
+                        session_id,
+                        status="cancelled" if prestart_result.response.status == "cancelled" else "rejected",
+                        phase="preflight",
+                        final_payload=capture_state._serialize_for_debug(prestart_result.response),
+                    )
+                if local_execution is not None:
+                    prestart_result.response.local_only_attestation = (
+                        build_local_execution_attestation(
+                            local_execution.manifest,
+                            local_execution.ledger,
+                        ).to_payload()
+                    )
+                return prestart_result.response
+
+            temp_session = prestart_result.temp_session
+            preflight_result = prestart_result.preflight_result
+            auto_qa_plan_payload = prestart_result.auto_qa_plan_payload
+
+            grounding_config = getattr(request, "evidence_grounding", None)
+            grounding_enabled = bool(grounding_config and grounding_config.enabled)
+            if long_text_enabled and not request.qa_layers and not grounding_enabled:
+                long_text_advisories.append(
+                    _build_advisory(
+                        code="long_text_qa_bypass",
+                        message=(
+                            "Long Text Mode was accepted with qa_layers=[]. Outer QA, consensus, and Gran Sabio "
+                            "safeguards are bypassed for this request."
+                        ),
+                    )
+                )
+
+            recommended_timeout_seconds = _estimate_session_timeout(request, reasoning_timeout_hint)
+
+            return await finalize_generation_session(
+                request=request,
+                session_id=session_id,
+                project_id=project_id,
+                project_epoch=project_epoch,
+                request_payload_for_debug=request,
+                preflight_context=preflight_context,
+                resolved_attachments=resolved_attachments,
+                attachment_manager=attachment_manager,
+                resolved_images=resolved_images,
+                resolved_audios=resolved_audios,
+                temp_session=temp_session,
+                preflight_result=preflight_result,
+                recommended_timeout_seconds=recommended_timeout_seconds,
+                usage_tracker=usage_tracker,
+                model_alias_registry=model_alias_registry,
+                resolved_long_text_mode=resolved_long_text_mode,
+                long_text_enabled=long_text_enabled,
+                long_text_advisories=long_text_advisories,
+                auto_qa_plan_payload=auto_qa_plan_payload,
+                local_execution=local_execution,
+                deps=SessionBootstrapDeps(
+                    cancellation_registry=cancellation_registry,
+                    register_session=register_session,
+                    mutate_session=mutate_session,
+                    is_terminal_session=is_terminal_session,
+                    apply_session_cancelled_state=apply_session_cancelled_state,
+                    debug_session_start=_debug_session_start,
+                    process_content_generation=process_content_generation,
+                    logger=logger,
+                    background_task_hook=_on_background_task_started,
+                    prepare_background_task=getattr(app.state, "prepare_generation_task", None),
+                ),
+            )
+        except LocalExecutionPolicyError as exc:
+            # A normal-scope route to an explicit local endpoint is verified at its
+            # first SDK call, which preflight and Auto-QA reach after prestart
+            # registered the temp session.
+            http_error = _local_policy_http_error(exc)
+            if isinstance(http_error, TransientAdmissionRefusal):
+                await _discard_admission_session(
+                    session_id,
+                    project_id=project_id,
+                    request_name=getattr(request, "request_name", None),
+                    project_epoch=project_epoch,
+                )
+            else:
+                await _abort_admission_session(
+                    session_id,
+                    exc,
+                    project_id=project_id,
+                    request_name=getattr(request, "request_name", None),
+                )
+            raise http_error from exc
+        except HTTPException:
+            raise
+        except BaseException as exc:
             await _abort_admission_session(
                 session_id,
                 exc,
                 project_id=project_id,
                 request_name=getattr(request, "request_name", None),
             )
-        raise http_error from exc
-    except HTTPException:
-        raise
-    except BaseException as exc:
-        await _abort_admission_session(
-            session_id,
-            exc,
-            project_id=project_id,
-            request_name=getattr(request, "request_name", None),
-        )
-        raise
+            raise
+        finally:
+            if not background_task_started:
+                _generation_admission_gate.release()
     finally:
-        if not background_task_started:
-            _generation_admission_gate.release()
+        await cancellation_registry.end_project_admission(project_id)
 
 
 def _normalize_saas_request_id(value: object) -> str | None:
@@ -1453,7 +1486,7 @@ def _generation_request_fingerprint(request: ContentRequest) -> str:
         payload.pop("shared_context", None)  # Preserve legacy request identities.
     if request.prompt_cache is None or request.prompt_cache.mode == "auto":
         payload.pop("prompt_cache", None)
-    serialized = json.dumps(payload, sort_keys=True)
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
@@ -1658,7 +1691,7 @@ async def get_status(
                 for esc in escalations
             ]
         },
-        "error": session.get("error"),
+        "error": _client_safe_failure_reason(session, session.get("final_result")) if session.get("error") else None,
         "error_type": (
             (session.get("final_result") or {}).get("error_type")
             or session.get("error_type")
@@ -1725,11 +1758,10 @@ async def get_result(session_id: str):
         if (
             built[0] == "ok"
             and isinstance(built[1], dict)
-            and "final_result" not in session
         ):
-            # Legacy fallback serves session["error"] verbatim; keep raw
-            # internal failure detail out of the client payload (audit GEN-07).
-            built[1]["failure_reason"] = _client_safe_failure_reason(session, None)
+            built[1]["failure_reason"] = _client_safe_failure_reason(session, session.get("final_result"))
+            if built[1].get("error"):
+                built[1]["error"] = built[1]["failure_reason"] or INTERNAL_FAILURE_REASON
             if session.get("error_code") and "error_code" not in built[1]:
                 built[1]["error_code"] = session["error_code"]
         return built

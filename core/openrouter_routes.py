@@ -204,6 +204,8 @@ async def sync_provider_models(
 
     try:
         payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
         models = payload.get("models")
         if models is None:
             models = payload.get("selected_models", [])
@@ -277,6 +279,8 @@ async def sync_all_providers(
     service = _get_model_sync_service()
     try:
         payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
         providers = payload.get("providers")
         if not isinstance(providers, dict):
             return JSONResponse(
@@ -335,6 +339,8 @@ async def sync_openrouter_models(
     service = _get_model_sync_service()
     try:
         payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
         models = payload.get("models")
         if models is None:
             models = payload.get("selected_models", [])

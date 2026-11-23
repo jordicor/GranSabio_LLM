@@ -247,3 +247,21 @@ def test_majority_deal_breaker_blocks_when_collection_did_not_early_stop():
 
     assert result["approved"] is False
     assert result["deal_breaker_type"] == "majority_consensus_retry"
+
+
+def test_passing_layers_cannot_approve_below_the_global_minimum():
+    layer = QALayer(name="Accuracy", description="accuracy", criteria="accuracy", min_score=7.0)
+    request = _make_request()
+    request.qa_layers = [layer]
+    request.qa_models = ["model_a", "model_b", "model_c"]
+    qa_results = {layer.name: {model: _qa_eval(model=model, layer=layer.name, score=7.2)
+                              for model in request.qa_models}}
+    consensus = SimpleNamespace(average_score=7.2, layer_averages={layer.name: 7.2})
+    for iteration, final in ((1, False), (request.max_iterations, True)):
+        result = _evaluate_layer_based_approval(
+            qa_results=qa_results, consensus_result=consensus, request=request,
+            session_id="global-minimum", iteration=iteration, evaluated_layers=[layer],
+            qa_summary={"summary": {"layers_summary": {layer.name: {"passed": True}}}},
+        )
+        assert result["approved"] is False
+        assert result["final_rejection"] is final

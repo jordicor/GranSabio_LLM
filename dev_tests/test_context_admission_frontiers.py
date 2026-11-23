@@ -13,6 +13,8 @@ enforce-mode tests set ``CONTEXT_ADMISSION_MODE`` explicitly via monkeypatch.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -191,6 +193,64 @@ async def test_generate_content_observe_proceeds(service, monkeypatch):
 
     assert result == "draft"
     service._generate_claude.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["soft", "hard"])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_cancellation_during_cpu_count_never_dispatches_late_result(
+    service, monkeypatch, mode, streaming,
+):
+    import token_counting
+    from core.cancellation import CancellationRegistry, CancellationToken
+    from counting_executor import CountingExecutor
+
+    executor = CountingExecutor(workers=1, max_jobs=1, max_bytes=2_000_000)
+    entered, release = threading.Event(), threading.Event()
+    original = token_counting._count_batch
+
+    def blocked(inputs):
+        entered.set()
+        assert release.wait(5)
+        return original(inputs)
+
+    monkeypatch.setattr(token_counting, "_count_batch", blocked)
+    monkeypatch.setattr(token_counting, "get_counting_executor", lambda: executor)
+    registry = CancellationRegistry()
+    await registry.register_session("cpu-cancel", None, None)
+    token = CancellationToken("cpu-cancel", None, "generation", "cpu-test", registry)
+    service._generate_claude = AsyncMock(return_value=("late", {"provider": "claude"}))
+    service._stream_claude = MagicMock()
+
+    async def generate():
+        kwargs = dict(prompt="Evidence retained in full. " * 6000, model="claude-x",
+                      max_tokens=1000, cancellation_token=token)
+        if streaming:
+            return [chunk async for chunk in service.generate_content_stream(**kwargs)]
+        return await service.generate_content(**kwargs)
+
+    task = None
+    try:
+        with _patch_generation_config("claude", "claude-x"), \
+             patch.object(AIService, "_assert_model_blind_prompt", return_value=None), \
+             patch.object(context_budget, "resolve_token_limits",
+                          return_value=_large_verified("claude", "claude-x")):
+            task = asyncio.create_task(generate())
+            assert await asyncio.to_thread(entered.wait, 2)
+            await getattr(registry, f"request_{mode}_cancel")("cpu-cancel")
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+            assert executor.snapshot()["jobs"] == 1
+            release.set()
+            await executor.close()
+            service._generate_claude.assert_not_awaited()
+            service._stream_claude.assert_not_called()
+            assert executor.snapshot() == {"jobs": 0, "bytes": 0, "waiters": 0}
+    finally:
+        release.set()
+        if task is not None and not task.done():
+            task.cancel()
+        await executor.close()
 
 
 @pytest.mark.asyncio

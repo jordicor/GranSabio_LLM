@@ -469,6 +469,18 @@ def normalize_usage(usage_obj: Any) -> Optional[dict[str, Any]]:
         "reasoning_tokens": _coerce_int(reasoning_tokens),
     }
     input_details = _pluck(usage_obj, "input_tokens_details", "prompt_tokens_details") or {}
+    audio_tokens = _pluck(usage_obj, "audio_input_tokens")
+    if audio_tokens is None:
+        audio_tokens = _pluck(input_details, "audio_tokens")
+    if audio_tokens is None:
+        modality_details = _pluck(usage_obj, "prompt_tokens_details")
+        if isinstance(modality_details, list):
+            counts = [_coerce_int(_pluck(item, "token_count")) for item in modality_details
+                      if str(_pluck(item, "modality")).upper() in {"AUDIO", "MEDIAMODALITY.AUDIO"}]
+            if counts and all(count is not None for count in counts):
+                audio_tokens = sum(counts)
+    if audio_tokens is not None:
+        normalized["audio_input_tokens"] = _coerce_int(audio_tokens)
     for field, native_name, anthropic_name in (
         ("cached_input_tokens", "cached_tokens", "cache_read_input_tokens"),
         ("cache_write_input_tokens", "cache_write_tokens", "cache_creation_input_tokens"),
@@ -478,6 +490,8 @@ def normalize_usage(usage_obj: Any) -> Optional[dict[str, Any]]:
             count = _pluck(input_details, native_name)
         if count is None:
             count = _pluck(usage_obj, anthropic_name)
+        if count is None and field == "cached_input_tokens":
+            count = _pluck(usage_obj, "cached_content_token_count")
         if count is not None:
             normalized[field] = _coerce_int(count)
     # Anthropic's native input_tokens excludes both cache categories. Canonical

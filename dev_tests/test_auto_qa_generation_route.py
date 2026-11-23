@@ -190,6 +190,29 @@ async def test_auto_qa_planner_rejection_publishes_session_end(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_auto_qa_acoustic_plan_without_audio_rejects_before_preflight(monkeypatch):
+    from core.app_state import pop_session
+
+    monkeypatch.setattr(config, "model_specs", _fake_specs())
+    plan = _plan_result()
+    plan.qa_layers[0].include_input_audio = True
+    with patch("core.generation_routes.resolve_preflight_model", return_value="fake-preflight"), patch(
+        "core.generation_routes.run_auto_qa_planning", new_callable=AsyncMock, return_value=plan,
+    ), patch("core.generation_routes.run_preflight_validation", new_callable=AsyncMock) as preflight, patch(
+        "core.generation_routes.publish_project_session_end", new_callable=AsyncMock,
+    ) as publish, patch("core.generation_routes.pop_session", wraps=pop_session) as pop, patch(
+        "core.generation_routes._debug_record_event", new_callable=AsyncMock,
+    ) as debug:
+        response = await generate_content(_auto_qa_request())
+    assert response.status == "auto_qa_rejected"
+    assert response.auto_qa_feedback["code"] == "audio_required"
+    preflight.assert_not_awaited()
+    publish.assert_awaited_once()
+    pop.assert_awaited_once()
+    assert "auto_qa_plan_applied" not in [call.args[1] for call in debug.await_args_list]
+
+
+@pytest.mark.asyncio
 async def test_auto_qa_post_preflight_rejection_publishes_session_end(monkeypatch):
     monkeypatch.setattr(config, "model_specs", _fake_specs())
     request = _auto_qa_request()

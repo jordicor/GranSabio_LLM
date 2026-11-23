@@ -106,7 +106,7 @@ def test_generation_streaming_retry_helper_respects_ai_request_provider_failure(
     )
 
     assert generation_processor_module._is_retryable_streaming_error(definitive_error) is False
-    assert generation_processor_module._is_retryable_streaming_error(transient_error) is True
+    assert generation_processor_module._is_retryable_streaming_error(transient_error) is False
 
 
 @pytest.mark.asyncio
@@ -821,7 +821,11 @@ async def test_project_hard_stop_finishes_registry_state_when_publish_fails(monk
 
 
 @pytest.mark.asyncio
-async def test_feedback_memory_analysis_provider_call_is_cancellable():
+async def test_feedback_memory_analysis_provider_call_is_cancellable(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr("feedback_memory.resolve_call", lambda *a, **k: SimpleNamespace(
+        model="fake-feedback", params={"max_tokens": 128, "temperature": 0.3}, endpoint_id=None, provider_options={}))
+    monkeypatch.setattr(type(config), "resolve_output_max_tokens", lambda *a, **k: {"max_tokens": 128})
     session_id = f"test-session-{uuid4()}"
     started = asyncio.Event()
     service = AIService.__new__(AIService)
@@ -857,7 +861,7 @@ async def test_feedback_memory_analysis_provider_call_is_cancellable():
             cancellation_token=token,
         )
     )
-    await started.wait()
+    await asyncio.wait_for(started.wait(), 2)
 
     result = await cancellation_registry.request_soft_cancel(session_id)
 
@@ -873,10 +877,10 @@ async def test_feedback_memory_embedding_provider_call_is_cancellable():
     started = asyncio.Event()
 
     class SlowEmbeddingAI:
-        async def _make_request(self, *args, **kwargs):
+        async def get_embeddings(self, *args, **kwargs):
             started.set()
             await asyncio.sleep(30)
-            return {"data": [{"embedding": [0.1, 0.2]}]}
+            return [[0.1, 0.2]]
 
     processor = FeedbackProcessor.__new__(FeedbackProcessor)
     processor.config = FeedbackConfig()

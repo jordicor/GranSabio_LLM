@@ -15,11 +15,12 @@ import copy
 import hashlib
 import inspect
 import logging
+import math
 import random
 import re
 import threading
 import warnings
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import aclosing, asynccontextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime
 from types import SimpleNamespace
@@ -60,6 +61,7 @@ except ImportError:
 # Use optimized JSON (3.6x faster than standard json)
 import context_budget
 import json_utils as json
+from ai_runtime import audio as runtime_audio
 from ai_runtime import capabilities as runtime_capabilities
 from ai_runtime import parameters as runtime_parameters
 from ai_runtime import schemas as runtime_schemas
@@ -77,12 +79,13 @@ from config import (
 )
 from content_events import ContentStatus
 from context_budget import ContextAdmissionError, ProviderContextOverflow
+from debug_logger import require_debugger_dispatch
 from deterministic_validation import DraftValidationResult
 from llm_accent_prompts import (
     build_accent_criteria_block,
     build_inline_accent_prompt,
 )
-from llm_routing import resolve_call, resolve_temperature
+from llm_routing import resolve_call, resolve_embedding_model, resolve_temperature
 from local_endpoint_registry import (
     LocalEndpointConfigurationError,
     LocalInferenceEndpoint,
@@ -139,6 +142,7 @@ from shared_context import (
     with_openai_cache_options,
     with_openrouter_cache_options,
 )
+from token_counting import TextComponent, TokenCounter
 from tool_loop_models import (
     JsonContractError,
     LoopScope,
@@ -147,6 +151,7 @@ from tool_loop_models import (
     ToolLoopContextOverflow,
     ToolLoopContractError,
     ToolLoopEnvelope,
+    ToolLoopExhausted,
     ToolLoopOutputTruncated,
     ToolLoopSchemaViolationError,
     ToolLoopTraceEntry,
@@ -664,6 +669,14 @@ async def call_ai_with_validation_tools(*args: Any, **kwargs: Any):
     return await get_ai_service().call_ai_with_validation_tools(*args, **kwargs)
 
 
+
+async def _close_provider_stream(stream: Any) -> None:
+    """Close SDK streams and async generators using their native close method."""
+    close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
+    if close is not None:
+        await close()
+
+
 class AIService:
     """Unified AI service for multiple providers"""
 
@@ -708,16 +721,6 @@ class AIService:
         )
         self._llamacpp_request_semaphore = asyncio.Semaphore(
             self._llamacpp_max_concurrent_requests
-        )
-
-        # Configure optimized HTTP connector for better performance
-        self.http_connector = aiohttp.TCPConnector(
-            limit=200,              # Total connection pool size
-            limit_per_host=50,      # Max connections per API host (OpenAI/Claude/Google)
-            keepalive_timeout=60,   # Keep connections alive for 60 seconds
-            enable_cleanup_closed=True,  # Clean up closed connections
-            ttl_dns_cache=3600,     # Cache DNS lookups for 1 hour
-            use_dns_cache=True
         )
 
         self._initialize_clients()
@@ -1062,7 +1065,7 @@ class AIService:
             self.openai_client = openai.AsyncOpenAI(
                 api_key=config.OPENAI_API_KEY,
                 timeout=float(config.SDK_OPENAI_TIMEOUT_SECONDS),
-                max_retries=3,  # Retry failed requests twice
+                max_retries=0,
                 http_client=_openai_async_http_client(),
             )
         else:
@@ -1078,7 +1081,7 @@ class AIService:
             self.anthropic_client = anthropic.AsyncAnthropic(
                 api_key=config.ANTHROPIC_API_KEY,
                 timeout=float(config.SDK_ANTHROPIC_TIMEOUT_SECONDS),
-                max_retries=3,   # Retry failed requests twice
+                max_retries=0,
                 default_headers=default_headers,
                 http_client=_anthropic_async_http_client(),
             )
@@ -1090,7 +1093,10 @@ class AIService:
         if config.GOOGLE_API_KEY:
             if google_genai:
                 try:
-                    self.google_new_client = google_genai.Client(api_key=config.GOOGLE_API_KEY)
+                    self.google_new_client = google_genai.Client(
+                        api_key=config.GOOGLE_API_KEY,
+                        http_options={"retry_options": {"attempts": 1}},
+                    )
                     logger.info("Using new Google GenAI SDK")
                 except Exception as e:
                     logger.error(f"Failed to initialize Google GenAI SDK: {e}")
@@ -1105,7 +1111,7 @@ class AIService:
                 api_key=config.XAI_API_KEY,
                 base_url="https://api.x.ai/v1",
                 timeout=float(config.SDK_XAI_TIMEOUT_SECONDS),
-                max_retries=3,
+                max_retries=0,
                 http_client=_openai_async_http_client(),
             )
         else:
@@ -1117,7 +1123,7 @@ class AIService:
                 api_key=config.OPENROUTER_API_KEY,
                 base_url="https://openrouter.ai/api/v1",
                 timeout=float(config.SDK_OPENROUTER_TIMEOUT_SECONDS),
-                max_retries=0 if self.provider_budget is not None else 3,
+                max_retries=0,
                 default_headers={
                     "HTTP-Referer": "https://github.com/jordicor/GranSabio_LLM",
                     "X-Title": "Gran Sabio LLM Engine"
@@ -1135,7 +1141,7 @@ class AIService:
                 api_key=minimax_api_key,
                 base_url="https://api.minimax.io/v1",
                 timeout=float(config.SDK_MINIMAX_TIMEOUT_SECONDS),
-                max_retries=3,
+                max_retries=0,
                 http_client=_openai_async_http_client(),
             )
             logger.info("MiniMax client initialized")
@@ -1149,7 +1155,7 @@ class AIService:
                 api_key=moonshot_api_key,
                 base_url="https://api.moonshot.ai/v1",
                 timeout=float(config.SDK_MOONSHOT_TIMEOUT_SECONDS),
-                max_retries=3,
+                max_retries=0,
                 http_client=_openai_async_http_client(),
             )
             logger.info("Moonshot/Kimi client initialized")
@@ -1169,7 +1175,7 @@ class AIService:
                 api_key="fake",  # Dummy key, Fake AI doesn't require authentication
                 base_url=fake_base_url,
                 timeout=float(config.SDK_FAKE_TIMEOUT_SECONDS),
-                max_retries=1,
+                max_retries=0,
                 http_client=_openai_async_http_client(),
             )
             logger.info(f"Fake AI client initialized at {fake_base_url}")
@@ -1319,13 +1325,14 @@ class AIService:
 
         client, semaphore, endpoint = self._local_endpoint_transport(provider, endpoint_id)
         async with self._local_endpoint_request_slot(semaphore):
-            async for chunk in self._stream_openai_compatible(
+            async with aclosing(self._stream_openai_compatible(
                 provider_key=provider,
                 client=client,
                 display_name=f"{endpoint.adapter} endpoint '{endpoint.endpoint_id}'",
                 **kwargs,
-            ):
-                yield chunk
+            )) as provider_stream:
+                async for chunk in provider_stream:
+                    yield chunk
 
     @staticmethod
     def _strip_additional_properties(schema: Dict[str, Any]) -> Dict[str, Any]:
@@ -1794,22 +1801,23 @@ class AIService:
         and keeps the local conservative estimate.
         """
 
-        prov = (provider or "").strip().lower()
-        if prov in ("claude", "anthropic") and self.anthropic_client is not None:
-            result = await self.anthropic_client.messages.count_tokens(
-                model=model,
-                messages=[{"role": "user", "content": text}],
-            )
-            return int(result.input_tokens)
-        if prov in ("gemini", "google") and self.google_new_client is not None:
-            result = await self.google_new_client.aio.models.count_tokens(
-                model=model,
-                contents=text,
-            )
-            return int(result.total_tokens)
-        return None
+        async with asyncio.timeout(10):
+            prov = (provider or "").strip().lower()
+            if prov in ("claude", "anthropic") and self.anthropic_client is not None:
+                result = await self.anthropic_client.messages.count_tokens(
+                    model=model,
+                    messages=[{"role": "user", "content": text}],
+                )
+                return int(result.input_tokens)
+            if prov in ("gemini", "google") and self.google_new_client is not None:
+                result = await self.google_new_client.aio.models.count_tokens(
+                    model=model,
+                    contents=text,
+                )
+                return int(result.total_tokens)
+            return None
 
-    def _build_chat_call_budget(
+    async def _build_chat_call_budget(
         self,
         *,
         provider: str,
@@ -1826,6 +1834,7 @@ class AIService:
         output_fallback_model: Optional[str] = None,
         local_execution: Optional["LocalExecutionRuntime"] = None,
         shared_context: Optional[str] = None,
+        audios: Optional[List[Any]] = None,
     ) -> "context_budget.RenderedCallBudget":
         """Build a ``RenderedCallBudget`` from the logical payload of a chat call.
 
@@ -1835,65 +1844,34 @@ class AIService:
         the request is allowed to generate.
         """
 
+        if audios:
+            runtime_audio.validate_audio_model(audios, specs=config.model_specs, provider=provider, model_id=model_id)
+        counter = TokenCounter()
         hint = "json" if json_output else "prose"
-        components: List[context_budget.PayloadComponent] = []
+        text_components: List[TextComponent] = []
         if system_prompt:
-            components.append(
-                context_budget.make_payload_component(
-                    name="system_prompt",
-                    text=system_prompt,
-                    kind="system",
-                    provider=provider,
-                    model=model_id,
-                    hint=hint,
-                )
+            text_components.append(
+                TextComponent(name="system_prompt", text=system_prompt, kind="system", hint=hint)
             )
         if shared_context:
-            components.append(
-                context_budget.make_payload_component(
-                    name="shared_context",
-                    text=shared_context,
-                    kind="message",
-                    provider=provider,
-                    model=model_id,
-                    hint=hint,
-                )
+            text_components.append(
+                TextComponent(name="shared_context", text=shared_context, kind="message", hint=hint)
             )
         if prompt:
-            components.append(
-                context_budget.make_payload_component(
-                    name="prompt",
-                    text=prompt,
-                    kind="message",
-                    provider=provider,
-                    model=model_id,
-                    hint=hint,
-                )
+            text_components.append(
+                TextComponent(name="prompt", text=prompt, kind="message", hint=hint)
             )
         if json_schema:
-            components.append(
-                context_budget.make_payload_component(
-                    name="json_schema",
-                    text=json.dumps(json_schema, ensure_ascii=True, sort_keys=True),
-                    kind="schema",
-                    provider=provider,
-                    model=model_id,
-                    hint="json",
-                )
+            text_components.append(
+                TextComponent(name="json_schema", text=json.dumps(json_schema, ensure_ascii=True, sort_keys=True), kind="schema", hint="json")
             )
         for name, text, kind in (extra_text_components or ()):
             if not text:
                 continue
-            components.append(
-                context_budget.make_payload_component(
-                    name=name,
-                    text=text,
-                    kind=kind,
-                    provider=provider,
-                    model=model_id,
-                    hint=hint,
-                )
+            text_components.append(
+                TextComponent(name=name, text=text, kind=kind, hint=hint)
             )
+        components = await counter.components(text_components, provider, model_id)
         if images:
             image_tokens = runtime_vision.estimate_vision_request_tokens(images, provider)
             if image_tokens > 0:
@@ -1905,6 +1883,11 @@ class AIService:
                         kind="image",
                     )
                 )
+
+        if audios:
+            components.append(context_budget.PayloadComponent(
+                name="audios", chars=0, tokens_estimate=runtime_audio.estimate_audio_tokens(audios), kind="audio",
+            ))
 
         reserved = reserved_output_tokens
         if reserved is None:
@@ -1938,6 +1921,7 @@ class AIService:
         output_fallback_model: Optional[str] = None,
         local_execution: Optional["LocalExecutionRuntime"] = None,
         shared_context: Optional[str] = None,
+        audios: Optional[List[Any]] = None,
     ) -> "context_budget.CallAdmissionReport":
         """Admit one provider call against the budget service.
 
@@ -1950,7 +1934,7 @@ class AIService:
         invariant).
         """
 
-        budget = self._build_chat_call_budget(
+        budget = await self._build_chat_call_budget(
             provider=provider,
             model_id=model_id,
             call_id=call_id,
@@ -1959,6 +1943,7 @@ class AIService:
             reserved_output_tokens=reserved_output_tokens,
             thinking_budget_tokens=thinking_budget_tokens,
             images=images,
+            audios=audios,
             json_schema=json_schema,
             json_output=json_output,
             extra_text_components=extra_text_components,
@@ -2052,7 +2037,7 @@ class AIService:
         """
 
         collected: List[str] = []
-        image_fields = {"image_url", "inline_data", "file_data"}
+        image_fields = {"image_url", "inline_data", "file_data", "input_audio"}
 
         def _visit(value: Any, *, field: Optional[str] = None) -> None:
             if field in image_fields:
@@ -2107,6 +2092,7 @@ class AIService:
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
         extra_texts: Optional[Sequence[Tuple[str, str, str]]] = None,
         image_tokens: int = 0,
+        audio_tokens: int = 0,
         local_execution: Optional["LocalExecutionRuntime"] = None,
     ) -> bool:
         """Re-check accumulated tool-loop size before a subsequent turn's SDK call.
@@ -2163,6 +2149,10 @@ class AIService:
                     kind="image",
                 )
             )
+        if audio_tokens:
+            components.append(context_budget.PayloadComponent(
+                name="audios", chars=0, tokens_estimate=audio_tokens, kind="audio",
+            ))
         budget = context_budget.RenderedCallBudget(
             provider=provider,
             model=model_id,
@@ -2591,6 +2581,7 @@ class AIService:
         strict_single_generation_attempt: bool = False,
         endpoint_id: Optional[str] = None,
         allow_chatgpt_overload_retries: bool = False,
+        can_retry: Optional[Callable[[], bool]] = None,
     ) -> T:
         max_attempts = self._generation_max_attempts(
             provider, strict_single_generation_attempt, allow_chatgpt_overload_retries,
@@ -2622,6 +2613,7 @@ class AIService:
                 # Every attempt is a new provider request: none starts while a
                 # sibling failure drains the enclosing fan-out.
                 raise_if_dispatch_closed()
+                await require_debugger_dispatch()
                 await self._raise_if_cancelled(cancellation_token)
                 if process_deadline is not None:
                     remaining_timeout = process_deadline - asyncio.get_running_loop().time()
@@ -2655,7 +2647,7 @@ class AIService:
                 raise
             except StructuredOutputSchemaError:
                 raise
-            except ToolLoopContextOverflow:
+            except (ToolLoopContextOverflow, ToolLoopExhausted):
                 # Authoritative provider signal — do not retry, surface to caller.
                 raise
             except ContextAdmissionError:
@@ -2718,6 +2710,7 @@ class AIService:
                     attempt < max_attempts
                     and retry_delay is not None
                     and deadline_allows_retry
+                    and (can_retry is None or can_retry())
                 )
 
                 if not should_retry:
@@ -2805,7 +2798,7 @@ class AIService:
             raise
         except StructuredOutputSchemaError:
             raise
-        except ToolLoopContextOverflow:
+        except (ToolLoopContextOverflow, ToolLoopExhausted):
             raise
         except ContextAdmissionError:
             # Local admission guard verdict — non-retryable, never wrapped.
@@ -3111,9 +3104,7 @@ class AIService:
     ) -> None:
         """Fail fast when a non-streaming response is known to be unusable."""
 
-        if not usage_meta:
-            return
-
+        usage_meta = usage_meta or {}
         finish_reason = (
             usage_meta.get("provider_stop_reason")
             or usage_meta.get("finish_reason")
@@ -3142,6 +3133,7 @@ class AIService:
             and not usage_meta.get("finish_unusable")
             and not unknown_empty_finish
             and not content_filter_stop
+            and bool(partial_content.strip())
         ):
             return
 
@@ -3209,6 +3201,7 @@ class AIService:
             if not self.allow_personal_subscriptions:
                 raise SubscriptionError("This service cannot use personal subscriptions.")
         raise_if_dispatch_closed()
+        await require_debugger_dispatch()
         provider_budget = getattr(self, "provider_budget", None)
         if provider_budget is not None:
             provider_budget.require_operation(provider, model_id, operation)
@@ -3344,7 +3337,7 @@ class AIService:
                 ),
                 local_execution=local_execution,
             )
-            with (provider_budget.system_one_dispatch(model=model_id, call_id=system_one_call_id)
+            async with (provider_budget.system_one_dispatch(model=model_id, call_id=system_one_call_id)
                   if provider_budget is not None else nullcontext()) as reservation:
                 result = await typesafe_evaluate(
                     state,
@@ -3355,7 +3348,7 @@ class AIService:
                     client=client,
                 )
                 if provider_budget is not None:
-                    provider_budget.settle(reservation, result.usage)
+                    await provider_budget.settle(reservation, result.usage)
         _last_admission_report.set(report)
         extra_payload = {"requested_model": catalog_model}
         if usage_extra:
@@ -3401,6 +3394,7 @@ class AIService:
         include_default_system_context: bool = True,
         shared_context: Optional[str] = None,
         allow_chatgpt_overload_retries: bool = False,
+        audios: Optional[List[Any]] = None,
     ) -> str:
         """
         Generate content using specified AI model
@@ -3498,9 +3492,11 @@ class AIService:
             local_execution=local_execution,
         )
         self._assert_images_supported(model_info, model_id, images)
+        if audios:
+            runtime_audio.validate_audio_model(audios, specs=config.model_specs, provider=provider, model_id=model_id)
         if provider_options and provider != "openrouter":
             raise ValueError("provider_options are supported only for OpenRouter models.")
-        extra_payload = {"requested_model": model}
+        extra_payload = {"requested_model": model, **runtime_audio.audio_usage_metadata(audios or [])}
         if usage_extra:
             extra_payload.update(usage_extra)
         last_usage_meta: Optional[Mapping[str, Any]] = None
@@ -3575,11 +3571,11 @@ class AIService:
                 user_prompt=prompt,
                 **params
             )
-        elif extra_verbose:
+        elif extra_verbose and logger.isEnabledFor(logging.INFO):
             # Fallback to standard logging if phase_logger not available
             logger.info(f"[EXTRA_VERBOSE] AI GENERATION PROMPT for {model}:")
-            logger.info(f"[EXTRA_VERBOSE] System: {system_prompt if system_prompt else 'None'}")
-            logger.info(f"[EXTRA_VERBOSE] User: {prompt}")
+            logger.info(f"[EXTRA_VERBOSE] System prompt: {len(system_prompt or '')} characters")
+            logger.info(f"[EXTRA_VERBOSE] User prompt: {len(prompt)} characters")
             logger.info(f"[EXTRA_VERBOSE] Temperature: {temperature}, Max Tokens: {adjusted_max_tokens}")
             logger.info(f"[EXTRA_VERBOSE] --- END PROMPT ---")
 
@@ -3641,6 +3637,7 @@ class AIService:
                 reserved_output_tokens=adjusted_max_tokens,
                 thinking_budget_tokens=thinking_budget_tokens,
                 images=images,
+                audios=audios,
                 json_schema=json_schema if provider == "chatgpt" else effective_json_schema,
                 json_output=json_output,
                 local_execution=local_execution,
@@ -3653,14 +3650,15 @@ class AIService:
 
             if provider == "chatgpt":
                 chunks = []
-                async for chunk in self._stream_chatgpt(
+                async with aclosing(self._stream_chatgpt(
                     prompt, model_id, system_prompt or "",
                     json_output=json_output, json_schema=json_schema,
                     shared_context=shared_context, request_timeout=request_timeout,
                     usage_callback=usage_callback, usage_extra=extra_payload,
                     attempt=generation_attempt,
-                ):
-                    chunks.append(str(chunk))
+                )) as provider_stream:
+                    async for chunk in provider_stream:
+                        chunks.append(str(chunk))
                 return "".join(chunks)
             elif provider == "openai":
                 content, usage_meta = await self._generate_openai(
@@ -3675,6 +3673,7 @@ class AIService:
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     images=images,
+                    audios=audios,
                     **({"shared_context": shared_context} if shared_context else {}),
                 )
 
@@ -3690,12 +3689,12 @@ class AIService:
                             "provider": provider,
                         }
                     )
-                elif extra_verbose:
+                elif extra_verbose and logger.isEnabledFor(logging.INFO):
                     separator = "=" * 80
                     logger.info(f"\n{separator}")
                     logger.info(f"[EXTRA_VERBOSE] AI GENERATION RESPONSE from {model_id}")
                     logger.info(f"{separator}")
-                    logger.info(content)
+                    logger.info("Generated response: %d characters", len(content))
                     logger.info(f"{separator}\n")
 
                 _emit_generation_usage(usage_meta)
@@ -3727,12 +3726,12 @@ class AIService:
                             "provider": provider,
                         }
                     )
-                elif extra_verbose:
+                elif extra_verbose and logger.isEnabledFor(logging.INFO):
                     separator = "=" * 80
                     logger.info(f"\n{separator}")
                     logger.info(f"[EXTRA_VERBOSE] AI GENERATION RESPONSE from {model_id}")
                     logger.info(f"{separator}")
-                    logger.info(content)
+                    logger.info("Generated response: %d characters", len(content))
                     logger.info(f"{separator}\n")
 
                 _emit_generation_usage(usage_meta)
@@ -3750,6 +3749,7 @@ class AIService:
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     images=images,
+                    audios=audios,
                     **({"shared_context": shared_context} if shared_context else {}),
                 )
 
@@ -3764,12 +3764,12 @@ class AIService:
                             "provider": provider,
                         }
                     )
-                elif extra_verbose:
+                elif extra_verbose and logger.isEnabledFor(logging.INFO):
                     separator = "=" * 80
                     logger.info(f"\n{separator}")
                     logger.info(f"[EXTRA_VERBOSE] AI GENERATION RESPONSE from {model_id}")
                     logger.info(f"{separator}")
-                    logger.info(content)
+                    logger.info("Generated response: %d characters", len(content))
                     logger.info(f"{separator}\n")
 
                 _emit_generation_usage(usage_meta)
@@ -3800,12 +3800,12 @@ class AIService:
                             "provider": provider,
                         }
                     )
-                elif extra_verbose:
+                elif extra_verbose and logger.isEnabledFor(logging.INFO):
                     separator = "=" * 80
                     logger.info(f"\n{separator}")
                     logger.info(f"[EXTRA_VERBOSE] AI GENERATION RESPONSE from {model_id}")
                     logger.info(f"{separator}")
-                    logger.info(content)
+                    logger.info("Generated response: %d characters", len(content))
                     logger.info(f"{separator}\n")
 
                 _emit_generation_usage(usage_meta)
@@ -3821,6 +3821,7 @@ class AIService:
                     json_output=json_output,
                     json_schema=effective_json_schema,
                     images=images,
+                    audios=audios,
                     provider_options=provider_options,
                     strict_single_generation_attempt=strict_single_generation_attempt,
                     reasoning_effort=reasoning_effort,
@@ -3838,12 +3839,12 @@ class AIService:
                             "provider": provider,
                         }
                     )
-                elif extra_verbose:
+                elif extra_verbose and logger.isEnabledFor(logging.INFO):
                     separator = "=" * 80
                     logger.info(f"\n{separator}")
                     logger.info(f"[EXTRA_VERBOSE] AI GENERATION RESPONSE from {model_id}")
                     logger.info(f"{separator}")
-                    logger.info(content)
+                    logger.info("Generated response: %d characters", len(content))
                     logger.info(f"{separator}\n")
 
                 _emit_generation_usage(usage_meta)
@@ -3872,12 +3873,12 @@ class AIService:
                             "provider": provider,
                         }
                     )
-                elif extra_verbose:
+                elif extra_verbose and logger.isEnabledFor(logging.INFO):
                     separator = "=" * 80
                     logger.info(f"\n{separator}")
                     logger.info(f"[EXTRA_VERBOSE] AI GENERATION RESPONSE from {model_id}")
                     logger.info(f"{separator}")
-                    logger.info(content)
+                    logger.info("Generated response: %d characters", len(content))
                     logger.info(f"{separator}\n")
 
                 _emit_generation_usage(usage_meta)
@@ -3906,12 +3907,12 @@ class AIService:
                             "provider": provider,
                         }
                     )
-                elif extra_verbose:
+                elif extra_verbose and logger.isEnabledFor(logging.INFO):
                     separator = "=" * 80
                     logger.info(f"\n{separator}")
                     logger.info(f"[EXTRA_VERBOSE] AI GENERATION RESPONSE from {model_id}")
                     logger.info(f"{separator}")
-                    logger.info(content)
+                    logger.info("Generated response: %d characters", len(content))
                     logger.info(f"{separator}\n")
 
                 _emit_generation_usage(usage_meta)
@@ -3943,12 +3944,12 @@ class AIService:
                             "provider": provider,
                         },
                     )
-                elif extra_verbose:
+                elif extra_verbose and logger.isEnabledFor(logging.INFO):
                     separator = "=" * 80
                     logger.info(f"\n{separator}")
                     logger.info(f"[EXTRA_VERBOSE] AI GENERATION RESPONSE from {model_id}")
                     logger.info(f"{separator}")
-                    logger.info(content)
+                    logger.info("Generated response: %d characters", len(content))
                     logger.info(f"{separator}\n")
 
                 _emit_generation_usage(usage_meta)
@@ -3981,12 +3982,12 @@ class AIService:
                             "provider": provider,
                         }
                     )
-                elif extra_verbose:
+                elif extra_verbose and logger.isEnabledFor(logging.INFO):
                     separator = "=" * 80
                     logger.info(f"\n{separator}")
                     logger.info(f"[EXTRA_VERBOSE] AI GENERATION RESPONSE from {model_id}")
                     logger.info(f"{separator}")
-                    logger.info(content)
+                    logger.info("Generated response: %d characters", len(content))
                     logger.info(f"{separator}\n")
 
                 _emit_generation_usage(usage_meta)
@@ -4015,12 +4016,12 @@ class AIService:
                             "provider": provider,
                         }
                     )
-                elif extra_verbose:
+                elif extra_verbose and logger.isEnabledFor(logging.INFO):
                     separator = "=" * 80
                     logger.info(f"\n{separator}")
                     logger.info(f"[EXTRA_VERBOSE] FAKE AI RESPONSE from {model_id}")
                     logger.info(f"{separator}")
-                    logger.info(content)
+                    logger.info("Generated response: %d characters", len(content))
                     logger.info(f"{separator}\n")
 
                 _emit_generation_usage(usage_meta)
@@ -4088,8 +4089,9 @@ class AIService:
             logger.warning("Content generation stopped unusably for %s", model)
             raise
         except Exception as e:
-            logger.error(f"Content generation failed for {model}: {str(e)}")
+            logger.error("Content generation failed for %s (%s)", model, type(e).__name__)
             raise
+
 
     @staticmethod
     def _assert_images_supported(
@@ -4598,7 +4600,7 @@ class AIService:
             {
                 "turn": turn,
                 "accumulated_chars_estimate": accumulated_chars_estimate,
-                "provider_error": str(exc),
+                "provider_error": type(exc).__name__,
             },
         )
         raise ToolLoopContextOverflow(
@@ -4624,82 +4626,6 @@ class AIService:
         return is_context_overflow_exception(exc, provider=provider_key)
 
     @staticmethod
-    def _provider_error_text(exc: BaseException) -> str:
-        """Return provider error text plus structured body fields when available."""
-        parts = [str(exc or "")]
-        for attr in ("body", "response", "error"):
-            value = getattr(exc, attr, None)
-            if value is None:
-                continue
-            try:
-                if hasattr(value, "json"):
-                    value = value.json()
-                parts.append(json.dumps(value, ensure_ascii=True, sort_keys=True))
-            except Exception:
-                parts.append(str(value))
-        return "\n".join(part for part in parts if part)
-
-    @staticmethod
-    def _is_reasoning_effort_provider_error(exc: BaseException) -> bool:
-        """Return True when a provider error appears to reject a reasoning effort param."""
-        text = AIService._provider_error_text(exc).lower()
-        if not text:
-            return False
-        parameter_markers = (
-            "reasoning_effort",
-            "reasoning.effort",
-            "reasoning effort",
-            "output_config.effort",
-            "thinking_level",
-            "thinkinglevel",
-        )
-        error_markers = (
-            "unsupported",
-            "not supported",
-            "supported values",
-            "input should be",
-            "invalid_reasoning_effort",
-            "invalid value",
-        )
-        return any(marker in text for marker in parameter_markers) and any(
-            marker in text for marker in error_markers
-        )
-
-    @staticmethod
-    def _extract_supported_reasoning_efforts_from_error(exc: BaseException) -> List[str]:
-        """Extract supported reasoning levels from provider validation text."""
-        text = AIService._provider_error_text(exc).lower()
-        if not text:
-            return []
-
-        tail = text
-        for marker in (
-            "supported values are",
-            "supported values",
-            "supported:",
-            "input should be",
-            "must be one of",
-            "valid values are",
-        ):
-            marker_index = text.rfind(marker)
-            if marker_index >= 0:
-                tail = text[marker_index:]
-                break
-
-        matches = re.findall(
-            r"(?<![a-z0-9_-])(none|minimal|low|medium|high|xhigh|max)(?![a-z0-9_-])",
-            tail,
-        )
-        supported: List[str] = []
-        seen: Set[str] = set()
-        for match in matches:
-            normalized = config.normalize_reasoning_effort_label(match)
-            if normalized and normalized not in seen:
-                supported.append(normalized)
-                seen.add(normalized)
-        return supported
-
-    @staticmethod
     def _model_reasoning_effort_config(model_id: str) -> Dict[str, Any]:
         """Return catalog reasoning-effort metadata without requiring API keys."""
         try:
@@ -4713,105 +4639,7 @@ class AIService:
         reasoning_config = cls._model_reasoning_effort_config(model_id)
         return bool(reasoning_config.get("supported"))
 
-    @staticmethod
-    def _coerce_retry_reasoning_effort(
-        current_effort: Optional[str],
-        supported_levels: List[str],
-    ) -> Optional[str]:
-        """Choose a retry-safe effort level from provider-reported supported values."""
-        if not current_effort or not supported_levels:
-            return None
-        adjusted, _validation = config._coerce_reasoning_effort_to_supported_level(
-            current_effort,
-            {"supported": True, "levels": supported_levels},
-        )
-        return adjusted
-
-    def _adjust_reasoning_params_for_provider_retry(
-        self,
-        params: Dict[str, Any],
-        exc: BaseException,
-        *,
-        surface: Literal["chat_completions", "responses", "claude_messages"],
-    ) -> Optional[Tuple[Dict[str, Any], str]]:
-        """Return adjusted params for one provider retry, or None if not applicable."""
-        supported_levels = self._extract_supported_reasoning_efforts_from_error(exc)
-        retry_params = copy.deepcopy(params)
-        current_effort: Optional[str] = None
-
-        if surface == "chat_completions":
-            current_effort = retry_params.get("reasoning_effort")
-            parameter_path = "reasoning_effort"
-        elif surface == "responses":
-            reasoning_payload = retry_params.get("reasoning")
-            if isinstance(reasoning_payload, dict):
-                current_effort = reasoning_payload.get("effort")
-            parameter_path = "reasoning.effort"
-        else:
-            output_config = retry_params.get("output_config")
-            if isinstance(output_config, dict):
-                current_effort = output_config.get("effort")
-            parameter_path = "output_config.effort"
-
-        if not current_effort:
-            return None
-
-        if not self._is_reasoning_effort_provider_error(exc):
-            text = self._provider_error_text(exc).lower()
-            generic_value_rejection = any(
-                marker in text
-                for marker in (
-                    "unsupported",
-                    "not supported",
-                    "supported values",
-                    "input should be",
-                    "invalid value",
-                )
-            )
-            if not generic_value_rejection:
-                return None
-
-        adjusted_effort = self._coerce_retry_reasoning_effort(current_effort, supported_levels)
-        if adjusted_effort and adjusted_effort != current_effort:
-            current_level = config.normalize_reasoning_effort_label(current_effort)
-            adjusted_level = config.normalize_reasoning_effort_label(adjusted_effort)
-            if (current_level == "none") != (adjusted_level == "none"):
-                # ``none`` is a qualitative boundary, not merely an adjacent
-                # compatibility label. Crossing it would silently discard an
-                # explicit reasoning policy (or unexpectedly enable reasoning),
-                # so preserve the provider rejection and fail closed instead.
-                return None
-            if surface == "chat_completions":
-                retry_params["reasoning_effort"] = adjusted_effort
-            elif surface == "responses":
-                retry_params.setdefault("reasoning", {})["effort"] = adjusted_effort
-            else:
-                retry_params.setdefault("output_config", {})["effort"] = adjusted_effort
-            return retry_params, f"{parameter_path}: {current_effort} -> {adjusted_effort}"
-
-        if config.normalize_reasoning_effort_label(current_effort) != "none":
-            # Removing a non-zero effort is equivalent to an unbounded quality
-            # downgrade. A caller that requested reasoning must see the original
-            # capability error rather than receive a lower-policy completion.
-            return None
-
-        if surface == "chat_completions":
-            retry_params.pop("reasoning_effort", None)
-        elif surface == "responses":
-            reasoning_payload = retry_params.get("reasoning")
-            if isinstance(reasoning_payload, dict):
-                reasoning_payload.pop("effort", None)
-                if not reasoning_payload:
-                    retry_params.pop("reasoning", None)
-        else:
-            output_config = retry_params.get("output_config")
-            if isinstance(output_config, dict):
-                output_config.pop("effort", None)
-                if not output_config:
-                    retry_params.pop("output_config", None)
-        return retry_params, f"removed unsupported {parameter_path}={current_effort}"
-
-    async def _call_chat_completions_create_with_reasoning_retry(
+    async def _create_chat_completion(
         self,
         client: Any,
         params: Dict[str, Any],
@@ -4820,7 +4648,7 @@ class AIService:
         provider_key: str,
         model_id: str,
     ) -> Any:
-        """Call Chat Completions and retry once if provider rejects effort level."""
+        """Dispatch Chat Completions with cache policy and optional spend accounting."""
         request_kwargs = request_kwargs or {}
         if provider_key == "openai":
             params = with_openai_cache_options(params)
@@ -4829,24 +4657,7 @@ class AIService:
             return self._stream_bounded_openrouter_tool_request(
                 client, params, request_kwargs, model_id=model_id,
             )
-        try:
-            return await client.chat.completions.create(**params, **request_kwargs)
-        except Exception as exc:
-            retry = self._adjust_reasoning_params_for_provider_retry(
-                params,
-                exc,
-                surface="chat_completions",
-            )
-            if retry is None:
-                raise
-            retry_params, reason = retry
-            logger.warning(
-                "Retrying %s Chat Completions for %s after reasoning effort rejection (%s)",
-                provider_key,
-                model_id,
-                reason,
-            )
-            return await client.chat.completions.create(**retry_params, **request_kwargs)
+        return await client.chat.completions.create(**params, **request_kwargs)
 
     async def _stream_bounded_openrouter_tool_request(
         self, client: Any, params: Dict[str, Any], request_kwargs: Dict[str, Any], *, model_id: str,
@@ -4854,65 +4665,34 @@ class AIService:
         """Account each tool-turn HTTP attempt before any bytes reach the SDK."""
         provider_budget = self.provider_budget
         client = client.with_options(max_retries=0)
-        for attempt in range(2):
-            with provider_budget.tool_dispatch(
-                provider="openrouter", model=model_id, params=params, request_kwargs=request_kwargs,
-            ) as (bounded, reservation):
-                try:
-                    stream = await client.chat.completions.create(**bounded, **request_kwargs)
-                except Exception as exc:
-                    retry = None if attempt else self._adjust_reasoning_params_for_provider_retry(
-                        params, exc, surface="chat_completions",
-                    )
-                    if retry is None:
-                        raise
-                    params, reason = retry
-                    logger.warning(
-                        "Retrying bounded OpenRouter tool request after reasoning effort rejection (%s)", reason,
-                    )
-                    continue
-                try:
-                    async for chunk in stream:
-                        usage = getattr(chunk, "usage", None)
-                        if usage is not None:
-                            # Settlement precedes consumers, parsing and optional callbacks.
-                            provider_budget.settle(reservation, usage, response=chunk)
-                        yield chunk
-                finally:
-                    await stream.close()
-            return
+        async with provider_budget.tool_dispatch(
+            provider="openrouter", model=model_id, params=params, request_kwargs=request_kwargs,
+        ) as (bounded, reservation):
+            stream = await client.chat.completions.create(**bounded, **request_kwargs)
+            try:
+                async for chunk in stream:
+                    usage = getattr(chunk, "usage", None)
+                    if usage is not None:
+                        await provider_budget.settle(reservation, usage, response=chunk)
+                    yield chunk
+            finally:
+                await _close_provider_stream(stream)
 
-    async def _call_responses_create_with_reasoning_retry(
+    async def _create_response(
         self,
         params: Dict[str, Any],
         request_kwargs: Optional[Dict[str, Any]] = None,
         *,
         model_id: str,
     ) -> Any:
-        """Call OpenAI Responses and retry once if provider rejects effort level."""
+        """Dispatch OpenAI Responses with the configured cache policy."""
         if not self.openai_client:
             raise ValueError("OpenAI client not initialized")
         request_kwargs = request_kwargs or {}
         params = with_openai_cache_options(params)
-        try:
-            return await self.openai_client.responses.create(**params, **request_kwargs)
-        except Exception as exc:
-            retry = self._adjust_reasoning_params_for_provider_retry(
-                params,
-                exc,
-                surface="responses",
-            )
-            if retry is None:
-                raise
-            retry_params, reason = retry
-            logger.warning(
-                "Retrying OpenAI Responses for %s after reasoning effort rejection (%s)",
-                model_id,
-                reason,
-            )
-            return await self.openai_client.responses.create(**retry_params, **request_kwargs)
+        return await self.openai_client.responses.create(**params, **request_kwargs)
 
-    async def _call_claude_messages_create_with_reasoning_retry(
+    async def _create_claude_message(
         self,
         create: Callable[..., Awaitable[Any]],
         params: Dict[str, Any],
@@ -4920,25 +4700,9 @@ class AIService:
         *,
         model_id: str,
     ) -> Any:
-        """Call Claude Messages and retry once if provider rejects effort level."""
+        """Dispatch Claude Messages without changing the requested reasoning policy."""
         request_kwargs = request_kwargs or {}
-        try:
-            return await create(**params, **request_kwargs)
-        except Exception as exc:
-            retry = self._adjust_reasoning_params_for_provider_retry(
-                params,
-                exc,
-                surface="claude_messages",
-            )
-            if retry is None:
-                raise
-            retry_params, reason = retry
-            logger.warning(
-                "Retrying Claude Messages for %s after effort rejection (%s)",
-                model_id,
-                reason,
-            )
-            return await create(**retry_params, **request_kwargs)
+        return await create(**params, **request_kwargs)
 
     async def audit_accent(
         self,
@@ -5301,23 +5065,19 @@ class AIService:
         """Extract visible text from Claude content blocks, skipping thinking/tool blocks."""
         text_content = []
 
-        try:
-            for content_block in content_blocks or []:
-                block_type = getattr(content_block, "type", None)
+        for content_block in content_blocks or []:
+            block_type = getattr(content_block, "type", None)
 
-                if block_type in {"thinking", "tool_use", "server_tool_use"}:
-                    continue
-                if block_type == "text" and hasattr(content_block, "text"):
-                    text_content.append(content_block.text)
-                elif hasattr(content_block, "text"):
-                    text_content.append(content_block.text)
-                elif hasattr(content_block, "content") and isinstance(content_block.content, str):
-                    text_content.append(content_block.content)
+            if block_type in {"thinking", "tool_use", "server_tool_use"}:
+                continue
+            if block_type == "text" and hasattr(content_block, "text"):
+                text_content.append(content_block.text)
+            elif hasattr(content_block, "text"):
+                text_content.append(content_block.text)
+            elif hasattr(content_block, "content") and isinstance(content_block.content, str):
+                text_content.append(content_block.content)
 
-            return "".join(text_content).strip()
-        except Exception as e:
-            logger.error(f"Error extracting text from Claude content blocks: {e}")
-            return ""
+        return "".join(text_content).strip()
 
     def _serialize_claude_message_content(self, content_blocks: Any) -> List[Dict[str, Any]]:
         """Serialize Claude assistant content so it can be sent back on subsequent turns."""
@@ -5826,7 +5586,7 @@ class AIService:
             },
         )
 
-        stream = await self._call_chat_completions_create_with_reasoning_retry(
+        stream = await self._create_chat_completion(
             client,
             params,
             request_kwargs,
@@ -6165,7 +5925,7 @@ class AIService:
         )
 
         await self._raise_if_cancelled(cancellation_token)
-        response = await self._call_responses_create_with_reasoning_retry(
+        response = await self._create_response(
             params,
             request_kwargs,
             model_id=model_id,
@@ -6353,7 +6113,7 @@ class AIService:
             },
         )
 
-        stream = await self._call_responses_create_with_reasoning_retry(
+        stream = await self._create_response(
             params,
             request_kwargs,
             model_id=model_id,
@@ -6376,240 +6136,45 @@ class AIService:
         terminal_replay_items: List[Dict[str, Any]] = []
         replay_items_by_index: Dict[int, Dict[str, Any]] = {}
 
-        async for event in stream:
-            await self._raise_if_cancelled(cancellation_token)
-            event_type = getattr(event, "type", "")
-            stream_event_count += 1
-            last_event_type = str(event_type or "unknown")
+        try:
+            async for event in stream:
+                await self._raise_if_cancelled(cancellation_token)
+                event_type = getattr(event, "type", "")
+                stream_event_count += 1
+                last_event_type = str(event_type or "unknown")
 
-            response_obj = getattr(event, "response", None)
-            if response_obj is not None:
-                response_id_value = self._obj_get(response_obj, "id", None)
-                if response_id_value:
-                    stream_response_id = str(response_id_value)
-                usage_value = getattr(response_obj, "usage", None)
-                if usage_value is not None:
-                    usage_meta = usage_value
-                status_value = getattr(response_obj, "status", None)
-                if status_value:
-                    finish_reason = _stringify_finish_reason(status_value)
-                response_replay_items = self._openai_responses_replay_items(response_obj)
-                if response_replay_items:
-                    terminal_replay_items = response_replay_items
-                response_refusal = self._extract_openai_responses_refusal(
-                    response_obj
-                )
-                if response_refusal:
-                    terminal_refusal_text = response_refusal
-
-            if event_type in {"error", "response.error"}:
-                # The OpenAI SDK models an SSE-level provider failure as
-                # ``ResponseErrorEvent(type="error")``. It has no ``response``
-                # object, so ignoring it makes the stream look like a clean EOF
-                # without ``response.completed`` and destroys the real cause.
-                terminal_error_status = "error"
-                (
-                    terminal_error_code,
-                    terminal_error_detail,
-                    terminal_error_param,
-                ) = self._openai_responses_error_fields(event)
-                terminal_error_reason = terminal_error_code or "error"
-                await self._emit_tool_event_safe(
-                    tool_event_callback,
-                    "tool_loop_provider_terminal",
-                    {
-                        "provider": "openai",
-                        "model": model_id,
-                        "turn": turn,
-                        "loop_scope": loop_scope.value,
-                        "api_surface": "responses",
-                        "status": "error",
-                        "error_code": terminal_error_code,
-                        "message": terminal_error_detail,
-                        "param": terminal_error_param,
-                        "response_id": stream_response_id,
-                        "last_event_type": last_event_type,
-                        "event_count": stream_event_count,
-                    },
-                )
-                continue
-
-            if event_type == "response.refusal.delta":
-                refusal_delta = str(getattr(event, "delta", "") or "")
-                if refusal_delta:
-                    refusal_parts.append(refusal_delta)
-                continue
-
-            if event_type == "response.refusal.done":
-                refusal_done = str(getattr(event, "refusal", "") or "")
-                if refusal_done:
-                    terminal_refusal_text = refusal_done
-                continue
-
-            if event_type == "response.output_text.delta":
-                text_delta = str(getattr(event, "delta", "") or "")
-                if text_delta:
-                    assistant_parts.append(text_delta)
-                    await self._emit_tool_event_safe(
-                        tool_event_callback,
-                        "assistant_delta",
-                        {
-                            "provider": "openai",
-                            "model": model_id,
-                            "turn": turn,
-                            "loop_scope": loop_scope.value,
-                            "api_surface": "responses",
-                            "content": text_delta,
-                        },
+                response_obj = getattr(event, "response", None)
+                if response_obj is not None:
+                    response_id_value = self._obj_get(response_obj, "id", None)
+                    if response_id_value:
+                        stream_response_id = str(response_id_value)
+                    usage_value = getattr(response_obj, "usage", None)
+                    if usage_value is not None:
+                        usage_meta = usage_value
+                    status_value = getattr(response_obj, "status", None)
+                    if status_value:
+                        finish_reason = _stringify_finish_reason(status_value)
+                    response_replay_items = self._openai_responses_replay_items(response_obj)
+                    if response_replay_items:
+                        terminal_replay_items = response_replay_items
+                    response_refusal = self._extract_openai_responses_refusal(
+                        response_obj
                     )
-                continue
+                    if response_refusal:
+                        terminal_refusal_text = response_refusal
 
-            if event_type == "response.output_text.done":
-                done_text = getattr(event, "text", None)
-                if done_text and not assistant_parts:
-                    assistant_parts.append(str(done_text))
-                continue
-
-            if event_type == "response.output_item.added":
-                item = getattr(event, "item", None)
-                item_type = getattr(item, "type", None)
-                output_index = int(
-                    getattr(event, "output_index", len(replay_items_by_index)) or 0
-                )
-                serialized_item = self._serialize_openai_responses_replay_item(item)
-                if serialized_item:
-                    replay_items_by_index[output_index] = serialized_item
-                if item_type == "function_call":
-                    tool_accumulators[output_index] = {
-                        "id": str(getattr(item, "id", "") or ""),
-                        "call_id": str(getattr(item, "call_id", "") or ""),
-                        "type": "function",
-                        "function": {
-                            "name": str(getattr(item, "name", "") or ""),
-                            "arguments": str(getattr(item, "arguments", "") or ""),
-                        },
-                    }
-                continue
-
-            if event_type == "response.function_call_arguments.delta":
-                output_index = int(getattr(event, "output_index", 0) or 0)
-                acc = tool_accumulators.setdefault(
-                    output_index,
-                    {
-                        "id": str(getattr(event, "item_id", "") or ""),
-                        "call_id": "",
-                        "type": "function",
-                        "function": {"name": "", "arguments": ""},
-                    },
-                )
-                item_id = getattr(event, "item_id", None)
-                if item_id:
-                    acc["id"] = str(item_id)
-                delta_text = str(getattr(event, "delta", "") or "")
-                acc["function"]["arguments"] += delta_text
-                await self._emit_tool_event_safe(
-                    tool_event_callback,
-                    "tool_call_delta",
-                    {
-                        "provider": "openai",
-                        "model": model_id,
-                        "turn": turn,
-                        "loop_scope": loop_scope.value,
-                        "api_surface": "responses",
-                        "index": output_index,
-                        "tool_call_id": acc.get("call_id") or acc.get("id") or None,
-                        "tool_name": acc["function"].get("name") or None,
-                        "delta": delta_text,
-                        "arguments_chars": len(acc["function"].get("arguments") or ""),
-                    },
-                )
-                continue
-
-            if event_type == "response.function_call_arguments.done":
-                output_index = int(getattr(event, "output_index", 0) or 0)
-                acc = tool_accumulators.setdefault(
-                    output_index,
-                    {
-                        "id": str(getattr(event, "item_id", "") or ""),
-                        "call_id": str(getattr(event, "call_id", "") or ""),
-                        "type": "function",
-                        "function": {"name": "", "arguments": ""},
-                    },
-                )
-                item_id = getattr(event, "item_id", None)
-                call_id = getattr(event, "call_id", None)
-                name = getattr(event, "name", None)
-                arguments = getattr(event, "arguments", None)
-                if item_id:
-                    acc["id"] = str(item_id)
-                if call_id:
-                    acc["call_id"] = str(call_id)
-                if name:
-                    acc["function"]["name"] = str(name)
-                if arguments is not None:
-                    acc["function"]["arguments"] = str(arguments)
-                continue
-
-            if event_type == "response.output_item.done":
-                item = getattr(event, "item", None)
-                item_type = getattr(item, "type", None)
-                output_index = int(
-                    getattr(event, "output_index", len(replay_items_by_index)) or 0
-                )
-                serialized_item = self._serialize_openai_responses_replay_item(item)
-                if serialized_item:
-                    replay_items_by_index[output_index] = serialized_item
-                if item_type == "function_call":
-                    acc = tool_accumulators.setdefault(
-                        output_index,
-                        {
-                            "id": "",
-                            "call_id": "",
-                            "type": "function",
-                            "function": {"name": "", "arguments": ""},
-                        },
-                    )
-                    acc["id"] = str(getattr(item, "id", "") or acc.get("id") or "")
-                    acc["call_id"] = str(getattr(item, "call_id", "") or acc.get("call_id") or "")
-                    acc["function"]["name"] = str(
-                        getattr(item, "name", "") or acc["function"].get("name") or ""
-                    )
-                    acc["function"]["arguments"] = str(
-                        getattr(item, "arguments", None)
-                        if getattr(item, "arguments", None) is not None
-                        else acc["function"].get("arguments") or ""
-                    )
-                continue
-
-            if event_type in {"response.completed", "response.failed", "response.incomplete"}:
-                finish_reason = event_type.replace("response.", "")
-                if event_type == "response.completed":
-                    response_completed = True
-                else:
-                    terminal_error_status = finish_reason
-                    error_obj = getattr(event, "error", None)
-                    response_error = getattr(response_obj, "error", None) if response_obj is not None else None
-                    structured_error = error_obj or response_error
+                if event_type in {"error", "response.error"}:
+                    # The OpenAI SDK models an SSE-level provider failure as
+                    # ``ResponseErrorEvent(type="error")``. It has no ``response``
+                    # object, so ignoring it makes the stream look like a clean EOF
+                    # without ``response.completed`` and destroys the real cause.
+                    terminal_error_status = "error"
                     (
                         terminal_error_code,
-                        structured_error_message,
+                        terminal_error_detail,
                         terminal_error_param,
-                    ) = self._openai_responses_error_fields(structured_error)
-                    incomplete_details = (
-                        getattr(response_obj, "incomplete_details", None)
-                        if response_obj is not None
-                        else getattr(event, "incomplete_details", None)
-                    )
-                    if incomplete_details is not None:
-                        reason_value = getattr(incomplete_details, "reason", None)
-                        if reason_value is None and isinstance(incomplete_details, dict):
-                            reason_value = incomplete_details.get("reason")
-                        terminal_error_reason = _stringify_finish_reason(reason_value)
-                    terminal_error_reason = terminal_error_reason or terminal_error_code
-                    terminal_error_detail = (
-                        structured_error_message
-                        or str(structured_error or incomplete_details or "")[:500]
-                    )
+                    ) = self._openai_responses_error_fields(event)
+                    terminal_error_reason = terminal_error_code or "error"
                     await self._emit_tool_event_safe(
                         tool_event_callback,
                         "tool_loop_provider_terminal",
@@ -6619,15 +6184,213 @@ class AIService:
                             "turn": turn,
                             "loop_scope": loop_scope.value,
                             "api_surface": "responses",
-                            "status": finish_reason,
-                            "detail": terminal_error_detail,
+                            "status": "error",
                             "error_code": terminal_error_code,
+                            "message": terminal_error_detail,
                             "param": terminal_error_param,
                             "response_id": stream_response_id,
                             "last_event_type": last_event_type,
                             "event_count": stream_event_count,
                         },
                     )
+                    continue
+
+                if event_type == "response.refusal.delta":
+                    refusal_delta = str(getattr(event, "delta", "") or "")
+                    if refusal_delta:
+                        refusal_parts.append(refusal_delta)
+                    continue
+
+                if event_type == "response.refusal.done":
+                    refusal_done = str(getattr(event, "refusal", "") or "")
+                    if refusal_done:
+                        terminal_refusal_text = refusal_done
+                    continue
+
+                if event_type == "response.output_text.delta":
+                    text_delta = str(getattr(event, "delta", "") or "")
+                    if text_delta:
+                        assistant_parts.append(text_delta)
+                        await self._emit_tool_event_safe(
+                            tool_event_callback,
+                            "assistant_delta",
+                            {
+                                "provider": "openai",
+                                "model": model_id,
+                                "turn": turn,
+                                "loop_scope": loop_scope.value,
+                                "api_surface": "responses",
+                                "content": text_delta,
+                            },
+                        )
+                    continue
+
+                if event_type == "response.output_text.done":
+                    done_text = getattr(event, "text", None)
+                    if done_text and not assistant_parts:
+                        assistant_parts.append(str(done_text))
+                    continue
+
+                if event_type == "response.output_item.added":
+                    item = getattr(event, "item", None)
+                    item_type = getattr(item, "type", None)
+                    output_index = int(
+                        getattr(event, "output_index", len(replay_items_by_index)) or 0
+                    )
+                    serialized_item = self._serialize_openai_responses_replay_item(item)
+                    if serialized_item:
+                        replay_items_by_index[output_index] = serialized_item
+                    if item_type == "function_call":
+                        tool_accumulators[output_index] = {
+                            "id": str(getattr(item, "id", "") or ""),
+                            "call_id": str(getattr(item, "call_id", "") or ""),
+                            "type": "function",
+                            "function": {
+                                "name": str(getattr(item, "name", "") or ""),
+                                "arguments": str(getattr(item, "arguments", "") or ""),
+                            },
+                        }
+                    continue
+
+                if event_type == "response.function_call_arguments.delta":
+                    output_index = int(getattr(event, "output_index", 0) or 0)
+                    acc = tool_accumulators.setdefault(
+                        output_index,
+                        {
+                            "id": str(getattr(event, "item_id", "") or ""),
+                            "call_id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        },
+                    )
+                    item_id = getattr(event, "item_id", None)
+                    if item_id:
+                        acc["id"] = str(item_id)
+                    delta_text = str(getattr(event, "delta", "") or "")
+                    acc["function"]["arguments"] += delta_text
+                    await self._emit_tool_event_safe(
+                        tool_event_callback,
+                        "tool_call_delta",
+                        {
+                            "provider": "openai",
+                            "model": model_id,
+                            "turn": turn,
+                            "loop_scope": loop_scope.value,
+                            "api_surface": "responses",
+                            "index": output_index,
+                            "tool_call_id": acc.get("call_id") or acc.get("id") or None,
+                            "tool_name": acc["function"].get("name") or None,
+                            "delta": delta_text,
+                            "arguments_chars": len(acc["function"].get("arguments") or ""),
+                        },
+                    )
+                    continue
+
+                if event_type == "response.function_call_arguments.done":
+                    output_index = int(getattr(event, "output_index", 0) or 0)
+                    acc = tool_accumulators.setdefault(
+                        output_index,
+                        {
+                            "id": str(getattr(event, "item_id", "") or ""),
+                            "call_id": str(getattr(event, "call_id", "") or ""),
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        },
+                    )
+                    item_id = getattr(event, "item_id", None)
+                    call_id = getattr(event, "call_id", None)
+                    name = getattr(event, "name", None)
+                    arguments = getattr(event, "arguments", None)
+                    if item_id:
+                        acc["id"] = str(item_id)
+                    if call_id:
+                        acc["call_id"] = str(call_id)
+                    if name:
+                        acc["function"]["name"] = str(name)
+                    if arguments is not None:
+                        acc["function"]["arguments"] = str(arguments)
+                    continue
+
+                if event_type == "response.output_item.done":
+                    item = getattr(event, "item", None)
+                    item_type = getattr(item, "type", None)
+                    output_index = int(
+                        getattr(event, "output_index", len(replay_items_by_index)) or 0
+                    )
+                    serialized_item = self._serialize_openai_responses_replay_item(item)
+                    if serialized_item:
+                        replay_items_by_index[output_index] = serialized_item
+                    if item_type == "function_call":
+                        acc = tool_accumulators.setdefault(
+                            output_index,
+                            {
+                                "id": "",
+                                "call_id": "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            },
+                        )
+                        acc["id"] = str(getattr(item, "id", "") or acc.get("id") or "")
+                        acc["call_id"] = str(getattr(item, "call_id", "") or acc.get("call_id") or "")
+                        acc["function"]["name"] = str(
+                            getattr(item, "name", "") or acc["function"].get("name") or ""
+                        )
+                        acc["function"]["arguments"] = str(
+                            getattr(item, "arguments", None)
+                            if getattr(item, "arguments", None) is not None
+                            else acc["function"].get("arguments") or ""
+                        )
+                    continue
+
+                if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+                    finish_reason = event_type.replace("response.", "")
+                    if event_type == "response.completed":
+                        response_completed = True
+                    else:
+                        terminal_error_status = finish_reason
+                        error_obj = getattr(event, "error", None)
+                        response_error = getattr(response_obj, "error", None) if response_obj is not None else None
+                        structured_error = error_obj or response_error
+                        (
+                            terminal_error_code,
+                            structured_error_message,
+                            terminal_error_param,
+                        ) = self._openai_responses_error_fields(structured_error)
+                        incomplete_details = (
+                            getattr(response_obj, "incomplete_details", None)
+                            if response_obj is not None
+                            else getattr(event, "incomplete_details", None)
+                        )
+                        if incomplete_details is not None:
+                            reason_value = getattr(incomplete_details, "reason", None)
+                            if reason_value is None and isinstance(incomplete_details, dict):
+                                reason_value = incomplete_details.get("reason")
+                            terminal_error_reason = _stringify_finish_reason(reason_value)
+                        terminal_error_reason = terminal_error_reason or terminal_error_code
+                        terminal_error_detail = (
+                            structured_error_message
+                            or str(structured_error or incomplete_details or "")[:500]
+                        )
+                        await self._emit_tool_event_safe(
+                            tool_event_callback,
+                            "tool_loop_provider_terminal",
+                            {
+                                "provider": "openai",
+                                "model": model_id,
+                                "turn": turn,
+                                "loop_scope": loop_scope.value,
+                                "api_surface": "responses",
+                                "status": finish_reason,
+                                "detail": terminal_error_detail,
+                                "error_code": terminal_error_code,
+                                "param": terminal_error_param,
+                                "response_id": stream_response_id,
+                                "last_event_type": last_event_type,
+                                "event_count": stream_event_count,
+                            },
+                        )
+        finally:
+            await _close_provider_stream(stream)
 
         refusal_text = (terminal_refusal_text or "".join(refusal_parts)).strip()
         if terminal_error_status is None and refusal_text:
@@ -7156,6 +6919,7 @@ class AIService:
         dispatch_route_ordinal: int = 0,
         endpoint_id: Optional[str] = None,
         shared_context: Optional[str] = None,
+        audios: Optional[List[Any]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on OpenAI-style chat APIs.
 
@@ -7252,8 +7016,9 @@ class AIService:
             or use_openrouter_chat_streaming
         ) and not use_responses_api
 
-        if images:
-            image_parts = self._build_openai_image_content(images, use_responses_api=False)
+        if images or audios:
+            image_parts = self._build_openai_image_content(images or [], use_responses_api=False)
+            image_parts.extend(runtime_audio.build_openai_audio_content(audios or []))
             image_parts.append({"type": "text", "text": prompt})
             initial_messages: List[Dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
@@ -7273,7 +7038,7 @@ class AIService:
         if request_timeout and request_timeout > 0:
             request_kwargs["timeout"] = request_timeout
 
-        extra_payload = {"requested_model": model_id}
+        extra_payload = {"requested_model": model_id, **runtime_audio.audio_usage_metadata(audios or [])}
         if usage_extra:
             extra_payload.update(usage_extra)
 
@@ -7298,8 +7063,11 @@ class AIService:
             else 0
         )
 
+        completed_turn = False
+
         async def _single_attempt() -> Tuple[str, Dict[str, Any]]:
-            # Every retry attempt must start from the pristine transcript:
+            nonlocal completed_turn
+            # Only failures before a completed turn may restart the transcript:
             # turn handling appends assistant/tool/user messages to this list.
             messages: List[Dict[str, Any]] = copy.deepcopy(initial_messages)
             trace: List[Dict[str, Any]] = []
@@ -7431,6 +7199,7 @@ class AIService:
                 feedback: str,
                 draft: str,
             ) -> Optional[Tuple[str, Dict[str, Any]]]:
+                nonlocal completed_turn
                 await self._emit_tool_event_safe(
                     tool_event_callback,
                     "force_finalize",
@@ -7461,6 +7230,7 @@ class AIService:
                     tool_event_callback=tool_event_callback,
                     extra_texts=revalidation_extra_texts,
                     image_tokens=revalidation_image_tokens,
+                    audio_tokens=runtime_audio.estimate_audio_tokens(audios or []),
                     local_execution=local_execution,
                 )
                 if use_responses_api:
@@ -7525,7 +7295,7 @@ class AIService:
                         )
                     else:
                         _authorize_tool_turn()
-                        response = await self._call_chat_completions_create_with_reasoning_retry(
+                        response = await self._create_chat_completion(
                             client,
                             create_params,
                             request_kwargs,
@@ -7535,6 +7305,7 @@ class AIService:
                         usage_meta = getattr(response, "usage", None)
                         usage_envelope = response
                         message = response.choices[0].message
+                    completed_turn = True
                 except Exception as provider_exc:
                     await self._maybe_raise_context_overflow_midloop(
                         provider_exc,
@@ -7652,6 +7423,7 @@ class AIService:
                         tool_event_callback=tool_event_callback,
                         extra_texts=revalidation_extra_texts,
                         image_tokens=revalidation_image_tokens,
+                    audio_tokens=runtime_audio.estimate_audio_tokens(audios or []),
                         local_execution=local_execution,
                     )
                 if use_responses_api:
@@ -7680,12 +7452,12 @@ class AIService:
                         tool_schemas=active_tools if active_tools else None,
                         provider_options=provider_options,
                     )
-                if extra_verbose:
+                if extra_verbose and logger.isEnabledFor(logging.INFO):
                     logger.info(
-                        "[EXTRA_VERBOSE] %s tool-loop parameters (turn %d): %s",
+                        "[EXTRA_VERBOSE] %s tool-loop parameter names (turn %d): %s",
                         provider_key,
                         turn,
-                        create_params,
+                        sorted(create_params),
                 )
 
                 try:
@@ -7726,7 +7498,7 @@ class AIService:
                         )
                     else:
                         _authorize_tool_turn()
-                        response = await self._call_chat_completions_create_with_reasoning_retry(
+                        response = await self._create_chat_completion(
                             client,
                             create_params,
                             request_kwargs,
@@ -7736,6 +7508,7 @@ class AIService:
                         usage_meta = getattr(response, "usage", None)
                         usage_envelope = response
                         message = response.choices[0].message
+                    completed_turn = True
                 except Exception as provider_exc:
                     await self._maybe_raise_context_overflow_midloop(
                         provider_exc,
@@ -7844,7 +7617,7 @@ class AIService:
                         )
                         if forced_result:
                             return forced_result
-                        raise ValueError("Tool loop exhausted without producing a validated draft")
+                        raise ToolLoopExhausted("Tool loop exhausted without producing a validated draft")
 
                     assistant_message = {
                         "role": "assistant",
@@ -8216,7 +7989,7 @@ class AIService:
                 envelope.update(_build_accent_envelope())
                 return latest_validated_text, envelope
 
-            raise ValueError("Tool loop exhausted without producing a validated draft")
+            raise ToolLoopExhausted("Tool loop exhausted without producing a validated draft")
 
         async with self._provider_call_scope(
             cancellation_token,
@@ -8227,6 +8000,7 @@ class AIService:
             if retries_enabled and not strict_single_generation_attempt:
                 return await self._execute_with_retries(
                     _single_attempt,
+                    can_retry=lambda: not completed_turn,
                     provider=provider_key,
                     model_id=model_id,
                     action="tool_loop_generation",
@@ -8245,6 +8019,7 @@ class AIService:
                 request_timeout=request_timeout,
                 endpoint_id=transport_endpoint_id,
             )
+
 
     async def _stream_claude_tool_turn(
         self,
@@ -8294,7 +8069,7 @@ class AIService:
                 if use_beta_structured_outputs
                 else self.anthropic_client.messages.create
             )
-            stream_context = await self._call_claude_messages_create_with_reasoning_retry(
+            stream_context = await self._create_claude_message(
                 create,
                 params,
                 request_kwargs,
@@ -8821,8 +8596,11 @@ class AIService:
             else 0
         )
 
+        completed_turn = False
+
         async def _single_attempt() -> Tuple[str, Dict[str, Any]]:
-            # Every retry attempt must start from the pristine transcript:
+            nonlocal completed_turn
+            # Only failures before a completed turn may restart the transcript:
             # turn handling appends assistant/tool/user messages to this list.
             messages: List[Dict[str, Any]] = copy.deepcopy(initial_messages)
             trace: List[Dict[str, Any]] = []
@@ -8949,6 +8727,7 @@ class AIService:
                 feedback: str,
                 draft: str,
             ) -> Optional[Tuple[str, Dict[str, Any]]]:
+                nonlocal completed_turn
                 await self._emit_tool_event_safe(
                     tool_event_callback,
                     "force_finalize",
@@ -8993,6 +8772,7 @@ class AIService:
                         tool_event_callback=tool_event_callback,
                     )
                     raise
+                completed_turn = True
                 usage_meta = getattr(response, "usage", None)
                 self._emit_usage(usage_callback, model_id, provider_key, usage_meta, extra_payload)
 
@@ -9097,6 +8877,7 @@ class AIService:
                         tool_event_callback=tool_event_callback,
                     )
                     raise
+                completed_turn = True
                 usage_meta = getattr(response, "usage", None)
                 self._emit_usage(usage_callback, model_id, provider_key, usage_meta, extra_payload)
 
@@ -9176,7 +8957,7 @@ class AIService:
                         )
                         if forced_result:
                             return forced_result
-                        raise ValueError("Tool loop exhausted without producing a validated draft")
+                        raise ToolLoopExhausted("Tool loop exhausted without producing a validated draft")
 
                     messages.append(
                         {
@@ -9532,7 +9313,7 @@ class AIService:
                 envelope.update(_build_accent_envelope())
                 return latest_validated_text, envelope
 
-            raise ValueError("Tool loop exhausted without producing a validated draft")
+            raise ToolLoopExhausted("Tool loop exhausted without producing a validated draft")
 
         async with self._provider_call_scope(
             cancellation_token,
@@ -9543,6 +9324,7 @@ class AIService:
             if retries_enabled:
                 return await self._execute_with_retries(
                     _single_attempt,
+                    can_retry=lambda: not completed_turn,
                     provider=provider_key,
                     model_id=model_id,
                     action="tool_loop_generation",
@@ -9599,6 +9381,7 @@ class AIService:
         dispatch_call_id: Optional[str] = None,
         dispatch_route_ordinal: int = 0,
         shared_context: Optional[str] = None,
+        audios: Optional[List[Any]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Run the deterministic validator tool-loop on the new Gemini SDK."""
         if not (enable_validate_draft or accent_context is not None):
@@ -9629,6 +9412,8 @@ class AIService:
         initial_parts: List[Any] = []
         if images:
             initial_parts.extend(self._build_gemini_image_parts(images))
+        if audios:
+            initial_parts.extend(runtime_audio.build_gemini_audio_parts(audios))
         initial_parts.append({"text": prompt})
         initial_contents: List[Any] = [{"role": "user", "parts": initial_parts}]
         initial_contents = prepend_gemini_context(initial_contents, shared_context, model_id=model_id)
@@ -9700,7 +9485,7 @@ class AIService:
                 config_params["thinking_config"] = types.ThinkingConfig(**thinking_config_kwargs)
             return types.GenerateContentConfig(**config_params)
 
-        extra_payload = {"requested_model": model_id}
+        extra_payload = {"requested_model": model_id, **runtime_audio.audio_usage_metadata(audios or [])}
         if usage_extra:
             extra_payload.update(usage_extra)
 
@@ -9727,8 +9512,11 @@ class AIService:
             else 0
         )
 
+        completed_turn = False
+
         async def _single_attempt() -> Tuple[str, Dict[str, Any]]:
-            # Every retry attempt must start from the pristine transcript:
+            nonlocal completed_turn
+            # Only failures before a completed turn may restart the transcript:
             # turn handling appends content entries to this list.
             contents: List[Any] = copy.deepcopy(initial_contents)
             trace: List[Dict[str, Any]] = []
@@ -9850,6 +9638,7 @@ class AIService:
                 feedback: str,
                 draft: str,
             ) -> Optional[Tuple[str, Dict[str, Any]]]:
+                nonlocal completed_turn
                 await self._emit_tool_event_safe(
                     tool_event_callback,
                     "force_finalize",
@@ -9885,6 +9674,7 @@ class AIService:
                     tool_event_callback=tool_event_callback,
                     extra_texts=revalidation_extra_texts,
                     image_tokens=revalidation_image_tokens,
+                    audio_tokens=runtime_audio.estimate_audio_tokens(audios or []),
                     local_execution=local_execution,
                 )
                 try:
@@ -9902,6 +9692,7 @@ class AIService:
                         tool_event_callback=tool_event_callback,
                     )
                     raise
+                completed_turn = True
                 usage_meta = getattr(response, "usage_metadata", None)
                 self._emit_usage(usage_callback, model_id, "gemini", usage_meta, extra_payload)
 
@@ -9972,7 +9763,7 @@ class AIService:
 
             ctx_overflow_warned = False
             for turn in range(1, max_rounds + 1):
-                if extra_verbose:
+                if extra_verbose and logger.isEnabledFor(logging.INFO):
                     logger.info("[EXTRA_VERBOSE] gemini tool-loop turn %d", turn)
 
                 if turn > 1:
@@ -9990,6 +9781,7 @@ class AIService:
                         tool_event_callback=tool_event_callback,
                         extra_texts=revalidation_extra_texts,
                         image_tokens=revalidation_image_tokens,
+                    audio_tokens=runtime_audio.estimate_audio_tokens(audios or []),
                         local_execution=local_execution,
                     )
 
@@ -10017,6 +9809,7 @@ class AIService:
                         tool_event_callback=tool_event_callback,
                     )
                     raise
+                completed_turn = True
                 usage_meta = getattr(response, "usage_metadata", None)
                 self._emit_usage(usage_callback, model_id, "gemini", usage_meta, extra_payload)
 
@@ -10090,7 +9883,7 @@ class AIService:
                         )
                         if forced_result:
                             return forced_result
-                        raise ValueError("Tool loop exhausted without producing a validated draft")
+                        raise ToolLoopExhausted("Tool loop exhausted without producing a validated draft")
 
                     candidate_content = getattr(response.candidates[0], "content", None)
                     if candidate_content is not None:
@@ -10451,7 +10244,7 @@ class AIService:
                 envelope.update(_build_accent_envelope())
                 return latest_validated_text, envelope
 
-            raise ValueError("Tool loop exhausted without producing a validated draft")
+            raise ToolLoopExhausted("Tool loop exhausted without producing a validated draft")
 
         async with self._provider_call_scope(
             cancellation_token,
@@ -10462,6 +10255,7 @@ class AIService:
             if retries_enabled:
                 return await self._execute_with_retries(
                     _single_attempt,
+                    can_retry=lambda: not completed_turn,
                     provider="gemini",
                     model_id=model_id,
                     action="tool_loop_generation",
@@ -10478,6 +10272,7 @@ class AIService:
                 cancellation_token=cancellation_token,
                 request_timeout=request_timeout,
             )
+
 
     async def call_ai_with_validation_tools(
         self,
@@ -10532,6 +10327,7 @@ class AIService:
         endpoint_id: Optional[str] = None,
         include_default_system_context: bool = True,
         shared_context: Optional[str] = None,
+        audios: Optional[List[Any]] = None,
     ) -> Tuple[str, ToolLoopEnvelope]:
         """Reusable entry point for the shared ``validate_draft`` tool loop.
 
@@ -10815,7 +10611,7 @@ class AIService:
         entry_extra_components = (
             [("tool_definitions", entry_tool_defs, "tool_defs")] if entry_tool_defs else None
         )
-        entry_budget = self._build_chat_call_budget(
+        entry_budget = await self._build_chat_call_budget(
             provider=provider,
             model_id=model_id,
             call_id="ai_service.call_ai_with_validation_tools",
@@ -10824,6 +10620,7 @@ class AIService:
             reserved_output_tokens=adjusted_max_tokens,
             thinking_budget_tokens=adjusted_thinking_budget or 0,
             images=images,
+            audios=audios,
             json_schema=json_schema_arg,
             json_output=json_output_flag,
             extra_text_components=entry_extra_components,
@@ -10969,12 +10766,12 @@ class AIService:
                 user_prompt=prompt,
                 **params,
             )
-        elif extra_verbose:
+        elif extra_verbose and logger.isEnabledFor(logging.INFO):
             logger.info(f"[EXTRA_VERBOSE] AI TOOL-LOOP PROMPT for {model}:")
-            logger.info(f"[EXTRA_VERBOSE] System: {effective_system_prompt}")
-            logger.info(f"[EXTRA_VERBOSE] User: {prompt}")
+            logger.info(f"[EXTRA_VERBOSE] System prompt: {len(effective_system_prompt or '')} characters")
+            logger.info(f"[EXTRA_VERBOSE] User prompt: {len(prompt)} characters")
 
-        extra_payload = {"requested_model": model}
+        extra_payload = {"requested_model": model, **runtime_audio.audio_usage_metadata(audios or [])}
         if usage_extra:
             extra_payload.update(usage_extra)
 
@@ -11019,6 +10816,7 @@ class AIService:
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                     images=images,
+                    audios=audios,
                     max_rounds=effective_max_rounds,
                     extra_verbose=extra_verbose,
                     accent_context=accent_context,
@@ -11072,6 +10870,7 @@ class AIService:
                         usage_callback=usage_callback,
                         usage_extra=extra_payload,
                         images=images,
+                        audios=audios,
                         max_rounds=effective_max_rounds,
                         extra_verbose=extra_verbose,
                         accent_context=accent_context,
@@ -11116,7 +10915,7 @@ class AIService:
                 overflow_exc.turn,
                 overflow_exc.accumulated_chars_estimate,
                 getattr(overflow_exc, "provider_reported", False),
-                overflow_exc.provider_error,
+                type(overflow_exc.provider_error).__name__,
             )
             provider_reported = bool(getattr(overflow_exc, "provider_reported", False))
             if provider_reported:
@@ -11245,8 +11044,7 @@ class AIService:
                     "Tool-loop generation failed for %s via %s: %s",
                     model,
                     provider_key,
-                    e,
-                    exc_info=True,
+                    type(e).__name__,
                 )
             await self._emit_tool_event_safe(
                 tool_event_callback,
@@ -11257,15 +11055,15 @@ class AIService:
                     "model_id": model_id,
                     "loop_scope": loop_scope.value,
                     "exception_class": type(e).__name__,
-                    "message": str(e)[:500],
+                    "message": provider_failure.message if isinstance(provider_failure, ProviderFailure) else f"Generation failed ({type(e).__name__}).",
                     "cause_class": (
                         type(getattr(e, "cause", None)).__name__
                         if getattr(e, "cause", None) is not None
                         else None
                     ),
                     "cause_message": (
-                        str(getattr(e, "cause", ""))[:500]
-                        if getattr(e, "cause", None) is not None
+                        provider_failure.message
+                        if isinstance(provider_failure, ProviderFailure)
                         else None
                     ),
                 },
@@ -11500,6 +11298,7 @@ class AIService:
 
         return content, envelope
 
+
     async def _generate_openai(
         self,
         prompt: str,
@@ -11514,6 +11313,7 @@ class AIService:
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
         shared_context: Optional[str] = None,
+        audios: Optional[List[Any]] = None,
     ) -> Tuple[str, Any]:
         """Generate content using OpenAI API with optional JSON Schema and vision support"""
         if not self.openai_client:
@@ -11533,9 +11333,10 @@ class AIService:
         effective_prompt = prompt
 
         # Build messages with optional vision support
-        if images:
+        if images or audios:
             # Vision-enabled request: use content array format
-            image_parts = self._build_openai_image_content(images, use_responses_api=False)
+            image_parts = self._build_openai_image_content(images or [], use_responses_api=False)
+            image_parts.extend(runtime_audio.build_openai_audio_content(audios or []))
             image_parts.append({"type": "text", "text": effective_prompt})
             messages = [
                 {"role": "system", "content": effective_system_prompt},
@@ -11564,10 +11365,10 @@ class AIService:
                 json_schema=json_schema,
                 tools_enabled=False,
             )
-            if extra_verbose:
-                logger.info(f"[EXTRA_VERBOSE] OpenAI Responses parameters: {create_params}")
+            if extra_verbose and logger.isEnabledFor(logging.INFO):
+                logger.info(f"[EXTRA_VERBOSE] OpenAI Responses parameter names: {sorted(create_params)}")
 
-            response = await self._call_responses_create_with_reasoning_retry(
+            response = await self._create_response(
                 create_params,
                 request_kwargs,
                 model_id=model_id,
@@ -11579,7 +11380,7 @@ class AIService:
             )
 
         # --- Chat Completions-only models ---
-        if extra_verbose:
+        if extra_verbose and logger.isEnabledFor(logging.INFO):
             logger.info(f"[EXTRA_VERBOSE] Standard OpenAI non-streaming with temperature: {temperature}")
         standard_params = _build_openai_params(model_id, messages, temperature, max_tokens, reasoning_effort)
 
@@ -11601,7 +11402,7 @@ class AIService:
                 standard_params["response_format"] = {"type": "json_object"}
                 logger.info(f"Using OpenAI JSON mode (flexible) for {model_id}")
 
-        response = await self._call_chat_completions_create_with_reasoning_retry(
+        response = await self._create_chat_completion(
             self.openai_client,
             standard_params,
             request_kwargs,
@@ -11614,6 +11415,7 @@ class AIService:
             model_id=model_id,
             max_tokens=max_tokens,
         )
+
 
     async def generate_with_logprobs(
         self,
@@ -11906,17 +11708,8 @@ class AIService:
 
         # Track usage
         if usage_callback and hasattr(response, "usage") and response.usage:
-            usage_info = {
-                "model": model_id,
-                "input_tokens": (
-                    response.usage.input_tokens if use_openai_responses else response.usage.prompt_tokens
-                ),
-                "output_tokens": (
-                    response.usage.output_tokens if use_openai_responses else response.usage.completion_tokens
-                ),
-                "total_tokens": response.usage.total_tokens,
-                "timestamp": datetime.now().isoformat(),
-            }
+            usage_info = {**(self._normalize_usage(response.usage) or {}),
+                          "model": model_id, "timestamp": datetime.utcnow().isoformat()}
             if usage_extra:
                 usage_info.update(usage_extra)
             if effective_endpoint_id:
@@ -11961,6 +11754,7 @@ class AIService:
         include_default_system_context: bool = True,
         shared_context: Optional[str] = None,
         allow_chatgpt_overload_retries: bool = False,
+        audios: Optional[List[Any]] = None,
     ):
         """
         Generate content with streaming support
@@ -12058,9 +11852,11 @@ class AIService:
             local_execution=local_execution,
         )
         self._assert_images_supported(model_info, model_id, images)
+        if audios:
+            runtime_audio.validate_audio_model(audios, specs=config.model_specs, provider=provider, model_id=model_id)
         if provider_options and provider != "openrouter":
             raise ValueError("provider_options are supported only for OpenRouter models.")
-        extra_payload = {"requested_model": model}
+        extra_payload = {"requested_model": model, **runtime_audio.audio_usage_metadata(audios or [])}
         if usage_extra:
             extra_payload.update(usage_extra)
 
@@ -12126,7 +11922,7 @@ class AIService:
                 user_prompt=prompt,
                 **params
             )
-        elif extra_verbose and forced_temperature:
+        elif extra_verbose and forced_temperature and logger.isEnabledFor(logging.INFO):
             logger.info(
                 f"[EXTRA_VERBOSE] Temperature overridden to {temperature} due to reasoning policy for {model}"
             )
@@ -12178,15 +11974,16 @@ class AIService:
                 self._log_vision_request(images, provider, model_id)
 
             if provider == "chatgpt":
-                async for chunk in self._stream_chatgpt(
+                async with aclosing(self._stream_chatgpt(
                     prompt, model_id, system_prompt or "",
                     json_output=json_output, json_schema=json_schema, shared_context=shared_context,
                     request_timeout=request_timeout, usage_callback=usage_callback, usage_extra=extra_payload,
                     attempt=attempt,
-                ):
-                    yield chunk
+                )) as provider_stream:
+                    async for chunk in provider_stream:
+                        yield chunk
             elif provider == "openai":
-                async for chunk in self._stream_openai(
+                async with aclosing(self._stream_openai(
                     prompt,
                     model_id,
                     temperature,
@@ -12203,11 +12000,13 @@ class AIService:
                     resolved_model_id=model_id,
                     usage_extra=extra_payload,
                     images=images,
+                    audios=audios,
                     **({"shared_context": shared_context} if shared_context else {}),
-                ):
-                    yield chunk
+                )) as provider_stream:
+                    async for chunk in provider_stream:
+                        yield chunk
             elif provider in {"anthropic", "claude"}:
-                async for chunk in self._stream_claude(
+                async with aclosing(self._stream_claude(
                     prompt,
                     model_id,
                     temperature,
@@ -12225,10 +12024,11 @@ class AIService:
                     usage_extra=extra_payload,
                     images=images,
                     **({"shared_context": shared_context} if shared_context else {}),
-                ):
-                    yield chunk
+                )) as provider_stream:
+                    async for chunk in provider_stream:
+                        yield chunk
             elif provider in {"google", "gemini"}:
-                async for chunk in self._stream_gemini(
+                async with aclosing(self._stream_gemini(
                     prompt,
                     model_id,
                     temperature,
@@ -12243,11 +12043,13 @@ class AIService:
                     provider=provider,
                     usage_extra=extra_payload,
                     images=images,
+                    audios=audios,
                     **({"shared_context": shared_context} if shared_context else {}),
-                ):
-                    yield chunk
+                )) as provider_stream:
+                    async for chunk in provider_stream:
+                        yield chunk
             elif provider in {"xai", "grok"}:
-                async for chunk in self._stream_xai(
+                async with aclosing(self._stream_xai(
                     prompt,
                     model_id,
                     temperature,
@@ -12261,10 +12063,11 @@ class AIService:
                     usage_extra=extra_payload,
                     images=images,
                     **({"shared_context": shared_context} if shared_context else {}),
-                ):
-                    yield chunk
+                )) as provider_stream:
+                    async for chunk in provider_stream:
+                        yield chunk
             elif provider == "openrouter":
-                async for chunk in self._stream_openrouter(
+                async with aclosing(self._stream_openrouter(
                     prompt,
                     model_id,
                     temperature,
@@ -12276,14 +12079,16 @@ class AIService:
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                     images=images,
+                    audios=audios,
                     provider_options=provider_options,
                     strict_single_generation_attempt=strict_single_generation_attempt,
                     reasoning_effort=reasoning_effort,
                     **({"shared_context": shared_context} if shared_context else {}),
-                ):
-                    yield chunk
+                )) as provider_stream:
+                    async for chunk in provider_stream:
+                        yield chunk
             elif provider == "minimax":
-                async for chunk in self._stream_minimax(
+                async with aclosing(self._stream_minimax(
                     prompt,
                     model_id,
                     temperature,
@@ -12296,10 +12101,11 @@ class AIService:
                     usage_extra=extra_payload,
                     images=images,
                     **({"shared_context": shared_context} if shared_context else {}),
-                ):
-                    yield chunk
+                )) as provider_stream:
+                    async for chunk in provider_stream:
+                        yield chunk
             elif provider == "moonshot":
-                async for chunk in self._stream_moonshot(
+                async with aclosing(self._stream_moonshot(
                     prompt,
                     model_id,
                     temperature,
@@ -12312,10 +12118,11 @@ class AIService:
                     usage_extra=extra_payload,
                     images=images,
                     **({"shared_context": shared_context} if shared_context else {}),
-                ):
-                    yield chunk
+                )) as provider_stream:
+                    async for chunk in provider_stream:
+                        yield chunk
             elif provider == "llamacpp":
-                async for chunk in self._stream_registered_local(
+                async with aclosing(self._stream_registered_local(
                     provider,
                     effective_endpoint_id,
                     prompt=prompt,
@@ -12331,10 +12138,11 @@ class AIService:
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                     **({"shared_context": shared_context} if shared_context else {}),
-                ):
-                    yield chunk
+                )) as provider_stream:
+                    async for chunk in provider_stream:
+                        yield chunk
             elif provider == "ollama":
-                async for chunk in self._stream_registered_local(
+                async with aclosing(self._stream_registered_local(
                     provider,
                     effective_endpoint_id,
                     prompt=prompt,
@@ -12350,10 +12158,11 @@ class AIService:
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                     **({"shared_context": shared_context} if shared_context else {}),
-                ):
-                    yield chunk
+                )) as provider_stream:
+                    async for chunk in provider_stream:
+                        yield chunk
             elif provider == "openai_compatible":
-                async for chunk in self._stream_registered_local(
+                async with aclosing(self._stream_registered_local(
                     provider,
                     effective_endpoint_id,
                     prompt=prompt,
@@ -12369,10 +12178,11 @@ class AIService:
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                     **({"shared_context": shared_context} if shared_context else {}),
-                ):
-                    yield chunk
+                )) as provider_stream:
+                    async for chunk in provider_stream:
+                        yield chunk
             elif provider == "fake":
-                async for chunk in self._stream_fake(
+                async with aclosing(self._stream_fake(
                     prompt,
                     model_id,
                     temperature,
@@ -12384,8 +12194,9 @@ class AIService:
                     usage_callback=usage_callback,
                     usage_extra=extra_payload,
                     **({"shared_context": shared_context} if shared_context else {}),
-                ):
-                    yield chunk
+                )) as provider_stream:
+                    async for chunk in provider_stream:
+                        yield chunk
             else:
                 raise ValueError(f"Unsupported provider: {provider}")
 
@@ -12415,20 +12226,29 @@ class AIService:
             # Universal context guard BEFORE provider dispatch — revalidated per
             # retry attempt. Placed outside the retry ``try`` so an admission
             # verdict is never reclassified as a provider failure.
-            await self._admit_chat_call(
-                provider=provider,
-                model_id=catalog_model if provider == "chatgpt" else model_id,
-                call_id="ai_service.generate_content_stream",
-                system_prompt=system_prompt,
-                prompt=prompt,
-                reserved_output_tokens=adjusted_max_tokens,
-                thinking_budget_tokens=thinking_budget_tokens,
-                images=images,
-                json_schema=json_schema if provider == "chatgpt" else effective_json_schema,
-                json_output=json_output,
-                local_execution=local_execution,
-                **({"shared_context": shared_context} if shared_context else {}),
-            )
+            # Counting can wait for worker capacity. Register preparation
+            # with the same cancellation machinery before the first await;
+            # admission errors stay outside the provider retry handler.
+            preparation_scope = self._provider_call_scope(
+                cancellation_token, provider=provider, model_id=model_id,
+                operation="generate_content_stream",
+            ) if cancellation_token is not None else nullcontext()
+            async with preparation_scope:
+                await self._admit_chat_call(
+                    provider=provider,
+                    model_id=catalog_model if provider == "chatgpt" else model_id,
+                    call_id="ai_service.generate_content_stream",
+                    system_prompt=system_prompt,
+                    prompt=prompt,
+                    reserved_output_tokens=adjusted_max_tokens,
+                    thinking_budget_tokens=thinking_budget_tokens,
+                    images=images,
+                    audios=audios,
+                    json_schema=json_schema if provider == "chatgpt" else effective_json_schema,
+                    json_output=json_output,
+                    local_execution=local_execution,
+                    **({"shared_context": shared_context} if shared_context else {}),
+                )
             remaining_stream_timeout = (
                 stream_deadline - asyncio.get_running_loop().time()
                 if stream_deadline is not None
@@ -12612,6 +12432,7 @@ class AIService:
             provider_failure=failure,
         ) from last_exception
 
+
     async def _generate_claude(
         self,
         prompt: str,
@@ -12716,14 +12537,14 @@ class AIService:
                 if use_beta_structured_outputs
                 else self.anthropic_client.messages.create
             )
-            response = await self._call_claude_messages_create_with_reasoning_retry(
+            response = await self._create_claude_message(
                 create,
                 create_params,
                 request_kwargs,
                 model_id=model_id,
             )
         else:
-            response = await self._call_claude_messages_create_with_reasoning_retry(
+            response = await self._create_claude_message(
                 self.anthropic_client.messages.create,
                 create_params,
                 request_kwargs,
@@ -12747,14 +12568,7 @@ class AIService:
         - ThinkingBlock objects (which we skip)
         - TextBlock objects (which contain the actual response text)
         """
-        try:
-            return self._extract_text_from_claude_content(
-                getattr(response, "content", []) or []
-            )
-
-        except Exception as e:
-            logger.error(f"Error extracting text from Claude response: {e}")
-            return ""
+        return self._extract_text_from_claude_content(response.content)
 
     async def _generate_gemini(
         self,
@@ -12770,6 +12584,7 @@ class AIService:
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
         shared_context: Optional[str] = None,
+        audios: Optional[List[Any]] = None,
     ) -> Tuple[str, Any]:
         """Generate content using Gemini API with optional JSON Schema and vision support"""
         if not self.google_new_client:
@@ -12786,6 +12601,7 @@ class AIService:
             json_output=json_output,
             json_schema=json_schema,
             images=images,
+            audios=audios,
             **({"shared_context": shared_context} if shared_context else {}),
         )
 
@@ -12803,6 +12619,7 @@ class AIService:
         json_schema: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
         shared_context: Optional[str] = None,
+        audios: Optional[List[Any]] = None,
     ) -> Tuple[str, Any]:
         """Generate content using new Google GenAI SDK with optional JSON Schema and vision support
 
@@ -12833,6 +12650,8 @@ class AIService:
             parts = []
             if images:
                 parts.extend(self._build_gemini_image_parts(images))
+            if audios:
+                parts.extend(runtime_audio.build_gemini_audio_parts(audios))
             parts.append({"text": prompt})
             contents.append({"role": "user", "parts": parts})
             contents = prepend_gemini_context(contents, shared_context, model_id=model_id)
@@ -12924,8 +12743,9 @@ class AIService:
             )
 
         except Exception as e:
-            logger.error(f"New Gemini SDK error: {e}")
+            logger.error("New Gemini SDK error (%s)", type(e).__name__)
             raise
+
 
     def _apply_temperature_policies(
         self,
@@ -13084,19 +12904,11 @@ class AIService:
             specs=getattr(config, "model_specs", {}) or {},
         )
 
-    def _get_thinking_budget_details(self, model_id: str) -> Optional[Dict[str, Any]]:
+    def _get_thinking_budget_details(self, provider: str, model_id: str) -> Optional[Dict[str, Any]]:
         """Fetch full thinking budget configuration for a model if available."""
-        try:
-            model_specs = config.get_model_specs()
-            for provider in model_specs.get("model_specifications", {}).values():
-                for spec in provider.values():
-                    if spec.get("model_id") == model_id:
-                        thinking_budget = spec.get("thinking_budget", {})
-                        if thinking_budget.get("supported", False):
-                            return thinking_budget
-            return None
-        except Exception:
-            return None
+        spec = find_model_spec(config.model_specs, provider, model_id)
+        budget = spec.get("thinking_budget", {})
+        return budget if budget.get("supported", False) else None
 
     def _inject_claude_thinking_params(
         self,
@@ -13133,7 +12945,7 @@ class AIService:
         min_budget = 1024
         budget = max(budget, min_budget)
 
-        details = self._get_thinking_budget_details(model_id)
+        details = self._get_thinking_budget_details("claude", model_id)
         if details:
             min_tokens = details.get("min_tokens")
             max_tokens = details.get("max_tokens")
@@ -13167,7 +12979,7 @@ class AIService:
 
     def _get_thinking_budget_for_model(self, model_id: str) -> int:
         """Return default thinking budget tokens for a model."""
-        details = self._get_thinking_budget_details(model_id)
+        details = self._get_thinking_budget_details("gemini", model_id)
         if not details:
             return 0
         return int(details.get("default_tokens", 0))
@@ -13180,7 +12992,7 @@ class AIService:
         thinking_budget_tokens: Optional[int],
     ) -> Optional[Dict[str, Any]]:
         """Return kwargs for google.genai.types.ThinkingConfig."""
-        details = self._get_thinking_budget_details(model_id)
+        details = self._get_thinking_budget_details("gemini", model_id)
         if not details:
             return None
 
@@ -13300,7 +13112,7 @@ class AIService:
                 request_params["response_format"] = {"type": "json_object"}
                 logger.info(f"Using Grok JSON mode (flexible) for {model_id}")
 
-        response = await self._call_chat_completions_create_with_reasoning_retry(
+        response = await self._create_chat_completion(
             self.xai_client,
             request_params,
             request_kwargs,
@@ -13330,6 +13142,7 @@ class AIService:
         strict_single_generation_attempt: bool = False,
         reasoning_effort: Optional[str] = None,
         shared_context: Optional[str] = None,
+        audios: Optional[List[Any]] = None,
     ) -> Tuple[str, Any]:
         """Generate content using OpenRouter unified API with optional JSON Schema and vision support"""
         if not self.openrouter_client:
@@ -13345,8 +13158,9 @@ class AIService:
                 effective_system = json_instructions
 
         # Build user content with optional images (OpenRouter uses OpenAI format) - keep user prompt clean
-        if images:
-            image_parts = self._build_openai_image_content(images, use_responses_api=False)
+        if images or audios:
+            image_parts = self._build_openai_image_content(images or [], use_responses_api=False)
+            image_parts.extend(runtime_audio.build_openai_audio_content(audios or []))
             image_parts.append({"type": "text", "text": prompt})
             messages = [{"role": "user", "content": image_parts}]
         else:
@@ -13407,7 +13221,7 @@ class AIService:
         provider_budget = getattr(self, "provider_budget", None)
         if provider_budget is not None:
             request_kwargs["extra_body"] = provider_budget.constrain_routing(request_kwargs["extra_body"])
-        with (provider_budget.dispatch(model=model_id, max_tokens=max_tokens, images=images,
+        async with (provider_budget.dispatch(model=model_id, max_tokens=max_tokens, images=images,
                 call_id="ai_service.generate_content") if provider_budget is not None else nullcontext()) as reservation:
             response = await client.chat.completions.create(
                 **request_params,
@@ -13417,7 +13231,7 @@ class AIService:
                 # Settle raw metadata first: content validation or an optional
                 # usage callback can still fail after this point. Normalization
                 # keeps only the billed ``cost`` (see provider_billed_cost).
-                provider_budget.settle(reservation, getattr(response, "usage", None), response=response)
+                await provider_budget.settle(reservation, getattr(response, "usage", None), response=response)
             self._raise_openrouter_response_error(response, max_tokens=max_tokens)
             return self._chat_completion_content_and_usage(
                 response,
@@ -13425,6 +13239,7 @@ class AIService:
                 model_id=model_id,
                 max_tokens=max_tokens,
             )
+
 
     async def _generate_openai_compatible(
         self,
@@ -13589,36 +13404,37 @@ class AIService:
         # Health probes intentionally use tiny responses; they are liveness checks.
         # Test OpenAI
         try:
-            if self.openai_client:
-                route = resolve_call("health.openai")
-                await self._admit_chat_call(
-                    provider="openai",
-                    model_id=route.model,
-                    call_id="health.openai",
-                    prompt="Hello",
-                    reserved_output_tokens=route.params.get("max_tokens", 5),
-                )
-                if self._is_openai_responses_api_model(route.model):
-                    await self.openai_client.responses.create(
-                        **self._build_openai_responses_params(
-                            model_id=route.model,
-                            current_messages=[{"role": "user", "content": "Hello"}],
-                            max_tokens=route.params.get("max_tokens", 5),
-                            reasoning_effort=route.params.get("reasoning_effort"),
-                            json_output=False,
-                            json_schema=None,
-                            tools_enabled=False,
+            async with asyncio.timeout(15):
+                if self.openai_client:
+                    route = resolve_call("health.openai")
+                    await self._admit_chat_call(
+                        provider="openai",
+                        model_id=route.model,
+                        call_id="health.openai",
+                        prompt="Hello",
+                        reserved_output_tokens=route.params.get("max_tokens", 5),
+                    )
+                    if self._is_openai_responses_api_model(route.model):
+                        await self.openai_client.responses.create(
+                            **self._build_openai_responses_params(
+                                model_id=route.model,
+                                current_messages=[{"role": "user", "content": "Hello"}],
+                                max_tokens=route.params.get("max_tokens", 5),
+                                reasoning_effort=route.params.get("reasoning_effort"),
+                                json_output=False,
+                                json_schema=None,
+                                tools_enabled=False,
+                            )
                         )
-                    )
+                    else:
+                        await self.openai_client.chat.completions.create(
+                            model=route.model,
+                            messages=[{"role": "user", "content": "Hello"}],
+                            max_tokens=route.params.get("max_tokens", 5)
+                        )
+                    health_status["openai"] = True
                 else:
-                    await self.openai_client.chat.completions.create(
-                        model=route.model,
-                        messages=[{"role": "user", "content": "Hello"}],
-                        max_tokens=route.params.get("max_tokens", 5)
-                    )
-                health_status["openai"] = True
-            else:
-                health_status["openai"] = False
+                    health_status["openai"] = False
         except ContextAdmissionError:
             logger.warning(
                 "health probe blocked by context admission (capacity metadata "
@@ -13632,23 +13448,24 @@ class AIService:
 
         # Test Claude
         try:
-            if self.anthropic_client:
-                route = resolve_call("health.claude")
-                await self._admit_chat_call(
-                    provider="claude",
-                    model_id=route.model,
-                    call_id="health.claude",
-                    prompt="Hello",
-                    reserved_output_tokens=route.params.get("max_tokens", 5),
-                )
-                await self.anthropic_client.messages.create(
-                    model=route.model,
-                    max_tokens=route.params.get("max_tokens", 5),
-                    messages=[{"role": "user", "content": "Hello"}]
-                )
-                health_status["claude"] = True
-            else:
-                health_status["claude"] = False
+            async with asyncio.timeout(15):
+                if self.anthropic_client:
+                    route = resolve_call("health.claude")
+                    await self._admit_chat_call(
+                        provider="claude",
+                        model_id=route.model,
+                        call_id="health.claude",
+                        prompt="Hello",
+                        reserved_output_tokens=route.params.get("max_tokens", 5),
+                    )
+                    await self.anthropic_client.messages.create(
+                        model=route.model,
+                        max_tokens=route.params.get("max_tokens", 5),
+                        messages=[{"role": "user", "content": "Hello"}]
+                    )
+                    health_status["claude"] = True
+                else:
+                    health_status["claude"] = False
         except ContextAdmissionError:
             logger.warning(
                 "health probe blocked by context admission (capacity metadata "
@@ -13662,22 +13479,24 @@ class AIService:
 
         # Test Gemini
         try:
-            if self.google_new_client:
-                route = resolve_call("health.gemini")
-                await self._admit_chat_call(
-                    provider="gemini",
-                    model_id=route.model,
-                    call_id="health.gemini",
-                    prompt="Hello",
-                    reserved_output_tokens=route.params.get("max_tokens", 5),
-                )
-                await self.google_new_client.aio.models.generate_content(
-                    model=route.model,
-                    contents="Hello",
-                )
-                health_status["gemini"] = True
-            else:
-                health_status["gemini"] = False
+            async with asyncio.timeout(15):
+                if self.google_new_client:
+                    route = resolve_call("health.gemini")
+                    await self._admit_chat_call(
+                        provider="gemini",
+                        model_id=route.model,
+                        call_id="health.gemini",
+                        prompt="Hello",
+                        reserved_output_tokens=route.params.get("max_tokens", 5),
+                    )
+                    await self.google_new_client.aio.models.generate_content(
+                        model=route.model,
+                        contents="Hello",
+                        config={"max_output_tokens": route.params.get("max_tokens", 5)},
+                    )
+                    health_status["gemini"] = True
+                else:
+                    health_status["gemini"] = False
         except ContextAdmissionError:
             logger.warning(
                 "health probe blocked by context admission (capacity metadata "
@@ -13691,23 +13510,24 @@ class AIService:
 
         # Test xAI
         try:
-            if self.xai_client:
-                route = resolve_call("health.xai")
-                await self._admit_chat_call(
-                    provider="xai",
-                    model_id=route.model,
-                    call_id="health.xai",
-                    prompt="Hello",
-                    reserved_output_tokens=route.params.get("max_tokens", 5),
-                )
-                await self.xai_client.chat.completions.create(
-                    model=route.model,
-                    messages=[{"role": "user", "content": "Hello"}],
-                    max_tokens=route.params.get("max_tokens", 5)
-                )
-                health_status["xai"] = True
-            else:
-                health_status["xai"] = False
+            async with asyncio.timeout(15):
+                if self.xai_client:
+                    route = resolve_call("health.xai")
+                    await self._admit_chat_call(
+                        provider="xai",
+                        model_id=route.model,
+                        call_id="health.xai",
+                        prompt="Hello",
+                        reserved_output_tokens=route.params.get("max_tokens", 5),
+                    )
+                    await self.xai_client.chat.completions.create(
+                        model=route.model,
+                        messages=[{"role": "user", "content": "Hello"}],
+                        max_tokens=route.params.get("max_tokens", 5)
+                    )
+                    health_status["xai"] = True
+                else:
+                    health_status["xai"] = False
         except ContextAdmissionError:
             logger.warning(
                 "health probe blocked by context admission (capacity metadata "
@@ -13721,23 +13541,24 @@ class AIService:
 
         # Test MiniMax
         try:
-            if self.minimax_client:
-                route = resolve_call("health.minimax")
-                await self._admit_chat_call(
-                    provider="minimax",
-                    model_id=route.model,
-                    call_id="health.minimax",
-                    prompt="Hello",
-                    reserved_output_tokens=route.params.get("max_tokens", 5),
-                )
-                await self.minimax_client.chat.completions.create(
-                    model=route.model,
-                    messages=[{"role": "user", "content": "Hello"}],
-                    max_tokens=route.params.get("max_tokens", 5)
-                )
-                health_status["minimax"] = True
-            else:
-                health_status["minimax"] = False
+            async with asyncio.timeout(15):
+                if self.minimax_client:
+                    route = resolve_call("health.minimax")
+                    await self._admit_chat_call(
+                        provider="minimax",
+                        model_id=route.model,
+                        call_id="health.minimax",
+                        prompt="Hello",
+                        reserved_output_tokens=route.params.get("max_tokens", 5),
+                    )
+                    await self.minimax_client.chat.completions.create(
+                        model=route.model,
+                        messages=[{"role": "user", "content": "Hello"}],
+                        max_tokens=route.params.get("max_tokens", 5)
+                    )
+                    health_status["minimax"] = True
+                else:
+                    health_status["minimax"] = False
         except ContextAdmissionError:
             logger.warning(
                 "health probe blocked by context admission (capacity metadata "
@@ -13751,27 +13572,28 @@ class AIService:
 
         # Test Moonshot/Kimi
         try:
-            if self.moonshot_client:
-                route = resolve_call("health.moonshot")
-                token_param = self._openai_compatible_token_parameter(
-                    "moonshot",
-                    route.model,
-                )
-                await self._admit_chat_call(
-                    provider="moonshot",
-                    model_id=route.model,
-                    call_id="health.moonshot",
-                    prompt="Hello",
-                    reserved_output_tokens=route.params.get("max_tokens", 5),
-                )
-                await self.moonshot_client.chat.completions.create(
-                    model=route.model,
-                    messages=[{"role": "user", "content": "Hello"}],
-                    **{token_param: route.params.get("max_tokens", 5)},
-                )
-                health_status["moonshot"] = True
-            else:
-                health_status["moonshot"] = False
+            async with asyncio.timeout(15):
+                if self.moonshot_client:
+                    route = resolve_call("health.moonshot")
+                    token_param = self._openai_compatible_token_parameter(
+                        "moonshot",
+                        route.model,
+                    )
+                    await self._admit_chat_call(
+                        provider="moonshot",
+                        model_id=route.model,
+                        call_id="health.moonshot",
+                        prompt="Hello",
+                        reserved_output_tokens=route.params.get("max_tokens", 5),
+                    )
+                    await self.moonshot_client.chat.completions.create(
+                        model=route.model,
+                        messages=[{"role": "user", "content": "Hello"}],
+                        **{token_param: route.params.get("max_tokens", 5)},
+                    )
+                    health_status["moonshot"] = True
+                else:
+                    health_status["moonshot"] = False
         except ContextAdmissionError:
             logger.warning(
                 "health probe blocked by context admission (capacity metadata "
@@ -13891,10 +13713,10 @@ class AIService:
             tools_enabled=False,
         )
         create_params["stream"] = True
-        if extra_verbose:
-            logger.info(f"[EXTRA_VERBOSE] OpenAI Responses streaming parameters: {create_params}")
+        if extra_verbose and logger.isEnabledFor(logging.INFO):
+            logger.info(f"[EXTRA_VERBOSE] OpenAI Responses streaming parameter names: {sorted(create_params)}")
 
-        stream = await self._call_responses_create_with_reasoning_retry(
+        stream = await self._create_response(
             create_params,
             request_kwargs,
             model_id=model_id,
@@ -13904,19 +13726,22 @@ class AIService:
         final_response = None
         error_code: Optional[str] = None
         error_message: Optional[str] = None
-        async for event in stream:
-            event_type = getattr(event, "type", "")
-            if event_type == "response.output_text.delta":
-                delta = str(getattr(event, "delta", "") or "")
-                if delta:
-                    text_parts.append(delta)
-                    yield delta
-            elif event_type == "response.refusal.delta":
-                refusal_parts.append(str(getattr(event, "delta", "") or ""))
-            elif event_type in {"response.completed", "response.incomplete", "response.failed"}:
-                final_response = getattr(event, "response", None)
-            elif event_type in {"error", "response.error"}:
-                error_code, error_message, _param = self._openai_responses_error_fields(event)
+        try:
+            async for event in stream:
+                event_type = getattr(event, "type", "")
+                if event_type == "response.output_text.delta":
+                    delta = str(getattr(event, "delta", "") or "")
+                    if delta:
+                        text_parts.append(delta)
+                        yield delta
+                elif event_type == "response.refusal.delta":
+                    refusal_parts.append(str(getattr(event, "delta", "") or ""))
+                elif event_type in {"response.completed", "response.incomplete", "response.failed"}:
+                    final_response = getattr(event, "response", None)
+                elif event_type in {"error", "response.error"}:
+                    error_code, error_message, _param = self._openai_responses_error_fields(event)
+        finally:
+            await _close_provider_stream(stream)
 
         content = "".join(text_parts)
         usage_with_finish = self._usage_with_finish_metadata(
@@ -14005,6 +13830,7 @@ class AIService:
         usage_extra: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
         shared_context: Optional[str] = None,
+        audios: Optional[List[Any]] = None,
     ):
         """Stream OpenAI content generation with optional JSON Schema and vision support"""
         if not self.openai_client:
@@ -14024,8 +13850,9 @@ class AIService:
             effective_system_prompt = f"{effective_system_prompt}\n\n{json_instructions}"
 
         # Build messages with optional vision support - user prompt stays clean
-        if images:
-            image_parts = self._build_openai_image_content(images, use_responses_api=False)
+        if images or audios:
+            image_parts = self._build_openai_image_content(images or [], use_responses_api=False)
+            image_parts.extend(runtime_audio.build_openai_audio_content(audios or []))
             image_parts.append({"type": "text", "text": prompt})
             messages = [
                 {"role": "system", "content": effective_system_prompt},
@@ -14042,7 +13869,7 @@ class AIService:
         )
 
         # Log streaming start if extra_verbose is enabled
-        if extra_verbose:
+        if extra_verbose and logger.isEnabledFor(logging.INFO):
             logger.info(f"[EXTRA_VERBOSE] Starting streaming generation for model {model_id}")
             logger.info(f"[EXTRA_VERBOSE] Reasoning effort: {reasoning_effort}")
             logger.info(f"[EXTRA_VERBOSE] Max tokens: {max_tokens}")
@@ -14050,7 +13877,7 @@ class AIService:
         try:
             if self._is_openai_responses_api_model(model_id):
                 if self._openai_responses_streaming_supported(model_id):
-                    async for piece in self._stream_openai_responses(
+                    async with aclosing(self._stream_openai_responses(
                         messages,
                         model_id=model_id,
                         temperature=temperature,
@@ -14064,8 +13891,9 @@ class AIService:
                         resolved_model_id=resolved_model_id,
                         extra_payload=extra_payload,
                         extra_verbose=extra_verbose,
-                    ):
-                        yield piece
+                    )) as provider_stream:
+                        async for piece in provider_stream:
+                            yield piece
                     return
 
                 logger.info(
@@ -14084,6 +13912,7 @@ class AIService:
                     json_output=json_output,
                     json_schema=json_schema,
                     images=images,
+                    audios=audios,
                     **({"shared_context": shared_context} if shared_context else {}),
                 )
                 yield content
@@ -14106,7 +13935,7 @@ class AIService:
                 return
 
             # Chat Completions-only models
-            if extra_verbose:
+            if extra_verbose and logger.isEnabledFor(logging.INFO):
                 logger.info(f"[EXTRA_VERBOSE] Standard OpenAI streaming with temperature: {temperature}")
 
             create_params = _build_openai_params(
@@ -14134,7 +13963,7 @@ class AIService:
                     create_params["response_format"] = {"type": "json_object"}
                     logger.info(f"Using OpenAI JSON mode (streaming, flexible) for {model_id}")
 
-            stream = await self._call_chat_completions_create_with_reasoning_retry(
+            stream = await self._create_chat_completion(
                 self.openai_client,
                 create_params,
                 request_kwargs,
@@ -14146,19 +13975,22 @@ class AIService:
             total_content = ""
             usage_obj = None
             finish_reason = None
-            async for chunk in stream:
-                # Verify that choices exists and has elements before accessing
-                if chunk.choices and len(chunk.choices) > 0:
-                    if getattr(chunk.choices[0], "finish_reason", None) is not None:
-                        finish_reason = getattr(chunk.choices[0], "finish_reason", None)
-                    if chunk.choices[0].delta.content is not None:
-                        chunk_count += 1
-                        content_piece = chunk.choices[0].delta.content
-                        total_content += content_piece
-                        yield content_piece
-                # Capture usage even if choices is empty
-                if hasattr(chunk, "usage") and chunk.usage:
-                    usage_obj = chunk.usage
+            try:
+                async for chunk in stream:
+                    # Verify that choices exists and has elements before accessing
+                    if chunk.choices and len(chunk.choices) > 0:
+                        if getattr(chunk.choices[0], "finish_reason", None) is not None:
+                            finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+                        if chunk.choices[0].delta.content is not None:
+                            chunk_count += 1
+                            content_piece = chunk.choices[0].delta.content
+                            total_content += content_piece
+                            yield content_piece
+                    # Capture usage even if choices is empty
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        usage_obj = chunk.usage
+            finally:
+                await _close_provider_stream(stream)
 
             if hasattr(stream, "response"):
                 usage_obj = getattr(stream.response, "usage", usage_obj)
@@ -14206,7 +14038,7 @@ class AIService:
                 ),
             )
 
-            if extra_verbose:
+            if extra_verbose and logger.isEnabledFor(logging.INFO):
                 logger.info(
                     "[EXTRA_VERBOSE] Streaming completed for %s - received "
                     "%d chunks, %d characters",
@@ -14216,8 +14048,9 @@ class AIService:
                 )
 
         except Exception as e:
-            logger.error(f"OpenAI streaming error: {e}")
+            logger.error("OpenAI streaming error (%s)", type(e).__name__)
             raise
+
 
 
     async def _stream_claude(
@@ -14321,7 +14154,7 @@ class AIService:
                     if use_beta_structured_outputs
                     else self.anthropic_client.messages.create
                 )
-                stream_context = await self._call_claude_messages_create_with_reasoning_retry(
+                stream_context = await self._create_claude_message(
                     create,
                     stream_params,
                     request_kwargs,
@@ -14431,12 +14264,13 @@ class AIService:
         usage_extra: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
         shared_context: Optional[str] = None,
+        audios: Optional[List[Any]] = None,
     ):
         """Stream Gemini content generation with optional JSON Schema and vision support"""
         extra_payload = usage_extra or {}
         if not self.google_new_client:
             raise ValueError("No Gemini client initialized")
-        async for chunk in self._stream_gemini_new_sdk(
+        async with aclosing(self._stream_gemini_new_sdk(
             prompt,
             model_id,
             temperature,
@@ -14451,9 +14285,11 @@ class AIService:
             provider=provider,
             usage_extra=extra_payload,
             images=images,
+            audios=audios,
             **({"shared_context": shared_context} if shared_context else {}),
-        ):
-            yield chunk
+        )) as provider_stream:
+            async for chunk in provider_stream:
+                yield chunk
 
     async def _stream_gemini_new_sdk(
         self,
@@ -14472,6 +14308,7 @@ class AIService:
         usage_extra: Optional[Dict[str, Any]] = None,
         images: Optional[List["ImageData"]] = None,
         shared_context: Optional[str] = None,
+        audios: Optional[List[Any]] = None,
     ):
         """Stream content using new Google GenAI SDK with optional JSON Schema and vision support"""
         extra_payload = usage_extra or {}
@@ -14492,6 +14329,8 @@ class AIService:
             parts = []
             if images:
                 parts.extend(self._build_gemini_image_parts(images))
+            if audios:
+                parts.extend(runtime_audio.build_gemini_audio_parts(audios))
             parts.append({"text": prompt})
             contents.append({"role": "user", "parts": parts})
             contents = prepend_gemini_context(contents, shared_context, model_id=model_id)
@@ -14546,8 +14385,6 @@ class AIService:
                 raise RuntimeError(error_msg)
 
             yielded_chunks = False
-            fallback_needed = False
-            fallback_reason: Optional[BaseException] = None
             finish_reason = None
             prompt_feedback_response = None
 
@@ -14570,59 +14407,12 @@ class AIService:
 
                     if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
                         usage_metadata = chunk.usage_metadata
-            except TypeError as e:
-                # Handle 'NoneType' object is not iterable and similar issues
-                fallback_needed = not yielded_chunks
-                fallback_reason = e
-                logger.error(f"New Gemini SDK streaming error: {e}")
-            except Exception as e:
-                refusal = find_terminal_refusal(e)
-                if refusal is not None:
-                    # A refusal is terminal; it never falls back to a new request.
-                    raise refusal
-                fallback_needed = not yielded_chunks
-                fallback_reason = e
-                logger.error(f"New Gemini SDK streaming error: {e}")
             finally:
                 if stream_response and hasattr(stream_response, "aclose"):
                     try:
                         await stream_response.aclose()
                     except Exception as close_error:
-                        logger.warning(f"Error closing Gemini stream response: {close_error}")
-
-            if fallback_reason is not None and yielded_chunks:
-                # Once content has reached the caller, a fresh fallback would
-                # concatenate two different generations. Surface the
-                # interruption so the outer streaming contract marks the call
-                # as failed instead of publishing a terminal success chunk.
-                raise fallback_reason
-
-            if fallback_needed:
-                try:
-                    fallback_text, fallback_usage = await self._generate_gemini_new_sdk(
-                        prompt,
-                        model_id,
-                        temperature,
-                        max_tokens,
-                        system_prompt,
-                        reasoning_effort=reasoning_effort,
-                        thinking_budget_tokens=thinking_budget_tokens,
-                        request_timeout=request_timeout,
-                        json_output=json_output,
-                        json_schema=json_schema,
-                        images=images,
-                        **({"shared_context": shared_context} if shared_context else {}),
-                    )
-                    if fallback_text:
-                        yielded_chunks = True
-                        yield fallback_text
-                    usage_metadata = fallback_usage
-                    if isinstance(fallback_usage, dict):
-                        finish_reason = fallback_usage.get("finish_reason") or fallback_usage.get("provider_stop_reason")
-                    logger.info("Gemini stream fallback succeeded after streaming error")
-                except Exception as fallback_error:
-                    logger.error(f"Gemini fallback generation failed after streaming error ({fallback_reason}): {fallback_error}")
-                    raise
+                        logger.warning("Error closing Gemini stream response (%s)", type(close_error).__name__)
 
             usage_with_finish = self._usage_with_finish_metadata(
                 usage_metadata,
@@ -14667,8 +14457,9 @@ class AIService:
             )
 
         except Exception as e:
-            logger.error(f"New Gemini SDK streaming error: {e}")
+            logger.error("New Gemini SDK streaming error (%s)", type(e).__name__)
             raise
+
 
     async def _stream_xai(
         self,
@@ -14765,7 +14556,7 @@ class AIService:
                     create_params["response_format"] = {"type": "json_object"}
                     logger.info(f"Using Grok JSON mode (streaming, flexible) for {model_id}")
 
-            stream = await self._call_chat_completions_create_with_reasoning_retry(
+            stream = await self._create_chat_completion(
                 self.xai_client,
                 create_params,
                 request_kwargs,
@@ -14775,16 +14566,19 @@ class AIService:
 
             usage_obj = None
             finish_reason = None
-            async for chunk in stream:
-                # Verify that choices exists and has elements before accessing
-                if chunk.choices and len(chunk.choices) > 0:
-                    if getattr(chunk.choices[0], "finish_reason", None) is not None:
-                        finish_reason = getattr(chunk.choices[0], "finish_reason", None)
-                    if chunk.choices[0].delta.content is not None:
-                        yield chunk.choices[0].delta.content
-                # Capture usage even if choices is empty
-                if hasattr(chunk, "usage") and chunk.usage:
-                    usage_obj = chunk.usage
+            try:
+                async for chunk in stream:
+                    # Verify that choices exists and has elements before accessing
+                    if chunk.choices and len(chunk.choices) > 0:
+                        if getattr(chunk.choices[0], "finish_reason", None) is not None:
+                            finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+                        if chunk.choices[0].delta.content is not None:
+                            yield chunk.choices[0].delta.content
+                    # Capture usage even if choices is empty
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        usage_obj = chunk.usage
+            finally:
+                await _close_provider_stream(stream)
 
             if hasattr(stream, "response"):
                 usage_obj = getattr(stream.response, "usage", usage_obj)
@@ -14835,6 +14629,7 @@ class AIService:
         strict_single_generation_attempt: bool = False,
         reasoning_effort: Optional[str] = None,
         shared_context: Optional[str] = None,
+        audios: Optional[List[Any]] = None,
     ):
         """Stream OpenRouter content generation with optional JSON Schema and vision support"""
         if not self.openrouter_client:
@@ -14852,8 +14647,9 @@ class AIService:
                 effective_system = json_instructions
 
         # Build user content with optional images (OpenRouter uses OpenAI format) - keep user prompt clean
-        if images:
-            image_parts = self._build_openai_image_content(images, use_responses_api=False)
+        if images or audios:
+            image_parts = self._build_openai_image_content(images or [], use_responses_api=False)
+            image_parts.extend(runtime_audio.build_openai_audio_content(audios or []))
             image_parts.append({"type": "text", "text": prompt})
             messages = [{"role": "user", "content": image_parts}]
         else:
@@ -14919,7 +14715,7 @@ class AIService:
             provider_budget = getattr(self, "provider_budget", None)
             if provider_budget is not None:
                 request_kwargs["extra_body"] = provider_budget.constrain_routing(request_kwargs["extra_body"])
-            with (provider_budget.dispatch(model=model_id, max_tokens=max_tokens, images=images,
+            async with (provider_budget.dispatch(model=model_id, max_tokens=max_tokens, images=images,
                     call_id="ai_service.generate_content_stream") if provider_budget is not None else nullcontext()) as reservation:
                 stream = await client.chat.completions.create(
                     **create_params,
@@ -14950,7 +14746,7 @@ class AIService:
                     elif hasattr(stream, "usage") and stream.usage:
                         usage_obj = stream.usage
                     if provider_budget is not None:
-                        provider_budget.settle(reservation, usage_obj, response=byok_metadata)
+                        await provider_budget.settle(reservation, usage_obj, response=byok_metadata)
                 finally:
                     # Close on policy exceptions as well as normal completion.
                     await stream.close()
@@ -14982,8 +14778,9 @@ class AIService:
                 },
             )
         except Exception as e:
-            logger.error(f"OpenRouter streaming error: {e}")
+            logger.error("OpenRouter streaming error (%s)", type(e).__name__)
             raise
+
 
     async def _stream_openai_compatible(
         self,
@@ -15087,14 +14884,17 @@ class AIService:
 
             usage_obj = None
             finish_reason = None
-            async for chunk in stream:
-                if chunk.choices and len(chunk.choices) > 0:
-                    if getattr(chunk.choices[0], "finish_reason", None) is not None:
-                        finish_reason = getattr(chunk.choices[0], "finish_reason", None)
-                    if chunk.choices[0].delta.content is not None:
-                        yield chunk.choices[0].delta.content
-                if getattr(chunk, "usage", None) is not None:
-                    usage_obj = chunk.usage
+            try:
+                async for chunk in stream:
+                    if chunk.choices and len(chunk.choices) > 0:
+                        if getattr(chunk.choices[0], "finish_reason", None) is not None:
+                            finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+                        if chunk.choices[0].delta.content is not None:
+                            yield chunk.choices[0].delta.content
+                    if getattr(chunk, "usage", None) is not None:
+                        usage_obj = chunk.usage
+            finally:
+                await _close_provider_stream(stream)
 
             final_usage = getattr(getattr(stream, "response", None), "usage", None)
             if final_usage is None:
@@ -15146,7 +14946,7 @@ class AIService:
     ):
         """Stream MiniMax content generation."""
 
-        async for chunk in self._stream_openai_compatible(
+        async with aclosing(self._stream_openai_compatible(
             provider_key="minimax",
             client=self.minimax_client,
             display_name="MiniMax",
@@ -15162,8 +14962,9 @@ class AIService:
             usage_extra=usage_extra,
             images=images,
             **({"shared_context": shared_context} if shared_context else {}),
-        ):
-            yield chunk
+        )) as provider_stream:
+            async for chunk in provider_stream:
+                yield chunk
 
     async def _stream_moonshot(
         self,
@@ -15182,7 +14983,7 @@ class AIService:
     ):
         """Stream Moonshot/Kimi content generation."""
 
-        async for chunk in self._stream_openai_compatible(
+        async with aclosing(self._stream_openai_compatible(
             provider_key="moonshot",
             client=self.moonshot_client,
             display_name="Moonshot/Kimi",
@@ -15198,8 +14999,9 @@ class AIService:
             usage_extra=usage_extra,
             images=images,
             **({"shared_context": shared_context} if shared_context else {}),
-        ):
-            yield chunk
+        )) as provider_stream:
+            async for chunk in provider_stream:
+                yield chunk
 
     async def _generate_fake(
         self,
@@ -15318,15 +15120,18 @@ class AIService:
 
             usage_obj = None
             finish_reason = None
-            async for chunk in stream:
-                if chunk.choices:
-                    if getattr(chunk.choices[0], "finish_reason", None) is not None:
-                        finish_reason = getattr(chunk.choices[0], "finish_reason", None)
-                    if chunk.choices[0].delta.content:
-                        yield chunk.choices[0].delta.content
-                # Capture usage from streaming response if available
-                if hasattr(chunk, "usage") and chunk.usage:
-                    usage_obj = chunk.usage
+            try:
+                async for chunk in stream:
+                    if chunk.choices:
+                        if getattr(chunk.choices[0], "finish_reason", None) is not None:
+                            finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+                        if chunk.choices[0].delta.content:
+                            yield chunk.choices[0].delta.content
+                    # Capture usage from streaming response if available
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        usage_obj = chunk.usage
+            finally:
+                await _close_provider_stream(stream)
 
             # Try to get usage from stream object
             if hasattr(stream, "response") and hasattr(stream.response, "usage"):
@@ -15389,153 +15194,41 @@ class AIService:
         if not texts:
             return []
 
-        # Default to OpenAI embeddings if available
-        if self.openai_client and config.OPENAI_API_KEY:
-            return await self._get_openai_embeddings(texts, model)
-
-        # Fallback to Google if available (Gemini supports embeddings)
-        if self.google_new_client and config.GOOGLE_API_KEY:
-            return await self._get_google_embeddings(texts, model)
-
-        logger.warning("No embedding provider available")
-        return [[] for _ in texts]  # Return empty embeddings
-
-    async def _get_openai_embeddings(
-        self,
-        texts: List[str],
-        model: str = None,
-        *,
-        local_execution: Optional["LocalExecutionRuntime"] = None,
-        dispatch_call_id: Optional[str] = None,
-        dispatch_route_ordinal: int = 0,
-    ) -> List[List[float]]:
-        """Get embeddings using OpenAI API"""
-        if local_execution is not None:
-            raise LocalExecutionPolicyError(
-                "local_embeddings_unsupported",
-                "Embeddings are not available in local_only execution.",
-            )
-        if not model:
-            model = resolve_call("embedding.openai").model
-
-        # Context guard BEFORE dispatch. An admission verdict is fatal (must never
-        # be swallowed into empty vectors); it is raised before the SDK call.
+        model, provider = resolve_embedding_model(model or resolve_call("embedding.default").model, config)
+        client = self.openai_client if provider == "openai" else self.google_new_client
+        if client is None:
+            raise RuntimeError(f"Embedding provider '{provider}' is not configured.")
         await self._admit_embedding_batch(
-            texts, provider="openai", model=model, call_id="embedding.openai"
+            texts, provider=provider, model=model, call_id=dispatch_call_id or "embedding.default"
         )
-
         try:
-            response = await self.openai_client.embeddings.create(
-                model=model,
-                input=texts
-            )
+            if provider == "openai":
+                response = await client.embeddings.create(model=model, input=texts)
+                ordered = sorted(response.data, key=lambda item: item.index)
+                if [item.index for item in ordered] != list(range(len(texts))):
+                    raise ValueError("Embedding response indices do not match the input batch.")
+                vectors = [list(item.embedding) for item in ordered]
+            else:
+                from google.genai import types
 
-            return [item.embedding for item in response.data]
-
-        except Exception as e:
-            refusal = find_terminal_refusal(e)
-            if refusal is not None:
-                # Never retried with the fallback model or swallowed into empty vectors.
-                raise refusal
-            logger.error(f"OpenAI embedding error: {e}")
-            last_error: Exception = e
-            try:
-                fallback_model = resolve_call("embedding.openai_fallback").model
-                if fallback_model and fallback_model != model:
-                    # Re-admit against the fallback model before retrying.
-                    await self._admit_embedding_batch(
-                        texts,
-                        provider="openai",
-                        model=fallback_model,
-                        call_id="embedding.openai_fallback",
-                    )
-                    response = await self.openai_client.embeddings.create(
-                        model=fallback_model,
-                        input=texts
-                    )
-                    return [item.embedding for item in response.data]
-            except ContextAdmissionError:
-                # A fallback-model admission verdict is fatal — never empty vectors.
-                raise
-            except Exception as e2:
-                refusal = find_terminal_refusal(e2)
-                if refusal is not None:
-                    raise refusal
-                logger.error(f"OpenAI embedding fallback failed: {e2}")
-                last_error = e2
-
-            # Degraded batch: keep the documented empty-vector fallback,
-            # but count it in provider health so an embeddings outage is
-            # visible instead of silently decaying every similarity score
-            # to 0.0 (AIS-07).
-            await self._record_provider_health_failure(
-                classify_provider_exception(
-                    last_error,
-                    provider="openai",
-                    model_id=model,
-                    operation="embeddings",
-                )
-            )
-            return [[] for _ in texts]
-
-    async def _get_google_embeddings(
-        self,
-        texts: List[str],
-        model: str = None,
-        *,
-        local_execution: Optional["LocalExecutionRuntime"] = None,
-        dispatch_call_id: Optional[str] = None,
-        dispatch_route_ordinal: int = 0,
-    ) -> List[List[float]]:
-        """Get embeddings using Google/Gemini API"""
-        if local_execution is not None:
-            raise LocalExecutionPolicyError(
-                "local_embeddings_unsupported",
-                "Embeddings are not available in local_only execution.",
-            )
-        if not model:
-            model = resolve_call("embedding.google").model
-
-        # Context guard BEFORE dispatch. An admission verdict is fatal (must never
-        # be swallowed into empty vectors); it is raised before the SDK call.
-        await self._admit_embedding_batch(
-            texts, provider="google", model=model, call_id="embedding.google"
-        )
-
-        try:
-            from google.genai import types
-
-            embeddings = []
-            embed_config = types.EmbedContentConfig(task_type="retrieval_document")
-
-            for text in texts:
-                # Google embeddings API requires individual requests
-                result = await self.google_new_client.aio.models.embed_content(
-                    model=model,
-                    contents=text,
-                    config=embed_config,
-                )
-                embeddings.append(list(result.embeddings[0].values))
-
-            return embeddings
-
-        except Exception as e:
-            refusal = find_terminal_refusal(e)
-            if refusal is not None:
-                # Never swallowed into empty vectors.
-                raise refusal
-            logger.error(f"Google embedding error: {e}")
-            # Degraded batch: keep the documented empty-vector fallback,
-            # but count it in provider health (AIS-07).
-            await self._record_provider_health_failure(
-                classify_provider_exception(
-                    e,
-                    provider="google",
-                    model_id=model,
-                    operation="embeddings",
-                )
-            )
-            return [[] for _ in texts]
+                vectors = []
+                for text in texts:
+                    result = await client.aio.models.embed_content(model=model, contents=text,
+                        config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT"))
+                    if len(result.embeddings or []) != 1:
+                        raise ValueError("Embedding response does not match the input.")
+                    vectors.append(list(result.embeddings[0].values))
+            dimensions = len(vectors[0]) if vectors else 0
+            if (len(vectors) != len(texts) or not dimensions or any(
+                    len(vector) != dimensions or not any(vector) or any(
+                        isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                        for value in vector) for vector in vectors)):
+                raise ValueError("Embedding response contains missing, nonfinite, or incompatible vectors.")
+            return vectors
+        except Exception as exc:
+            await self._record_provider_health_failure(classify_provider_exception(
+                exc, provider=provider, model_id=model, operation="embeddings"))
+            raise
 
     async def calculate_similarity(
         self,
@@ -15566,9 +15259,6 @@ class AIService:
             dispatch_route_ordinal=dispatch_route_ordinal,
         )
 
-        if len(embeddings) != 2 or not embeddings[0] or not embeddings[1]:
-            return 0.0
-
         vec1, vec2 = embeddings[0], embeddings[1]
 
         # Calculate cosine similarity
@@ -15576,60 +15266,7 @@ class AIService:
         norm1 = sum(x * x for x in vec1) ** 0.5
         norm2 = sum(x * x for x in vec2) ** 0.5
 
-        if norm1 == 0 or norm2 == 0:
-            return 0.0
-
         return dot_product / (norm1 * norm2)
-
-    async def _make_request(
-        self,
-        method: str,
-        url: str,
-        *,
-        local_execution: Optional["LocalExecutionRuntime"] = None,
-        dispatch_call_id: Optional[str] = None,
-        dispatch_route_ordinal: int = 0,
-        **kwargs: Any,
-    ) -> Optional[Dict]:
-        """
-        Make HTTP request to API endpoints (for custom operations)
-
-        Args:
-            method: HTTP method (GET, POST, etc.)
-            url: API endpoint URL
-            **kwargs: Additional request parameters
-
-        Returns:
-            JSON response or None on error
-        """
-        if local_execution is not None:
-            raise LocalExecutionPolicyError(
-                "local_http_request_unsupported",
-                "Direct HTTP requests are not available in local_only execution.",
-            )
-
-        try:
-            if not hasattr(self, 'http_session'):
-                import aiohttp
-                self.http_session = aiohttp.ClientSession(connector=self.http_connector)
-
-            # Add default headers for OpenAI-style APIs
-            if 'api.openai.com' in url and config.OPENAI_API_KEY:
-                if 'headers' not in kwargs:
-                    kwargs['headers'] = {}
-                kwargs['headers']['Authorization'] = f"Bearer {config.OPENAI_API_KEY}"
-
-            async with self.http_session.request(method, url, **kwargs) as response:
-                if response.status >= 400:
-                    error_text = await response.text()
-                    logger.error(f"API request failed: {response.status} - {error_text}")
-                    return None
-
-                return await response.json()
-
-        except Exception as e:
-            logger.error(f"HTTP request failed: {e}")
-            return None
 
     async def close(self):
         """Close provider clients, HTTP pools, and connector resources."""
@@ -15683,6 +15320,4 @@ class AIService:
             )
             await _close_resource("Google GenAI client", google_client)
 
-        await _close_resource("HTTP session", getattr(self, "http_session", None))
-        await _close_resource("HTTP connector", getattr(self, "http_connector", None))
         logger.info("All AI service resources cleaned up")

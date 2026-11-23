@@ -447,7 +447,7 @@ def test_529_capacity_signal_remains_provider_overloaded():
     assert failure.retryable is True
 
 
-def test_generic_timeout_message_is_retryable_timeout():
+def test_untyped_timeout_prose_does_not_authorize_another_request():
     failure = classify_provider_exception(
         Exception("timeout"),
         provider="openai",
@@ -455,8 +455,8 @@ def test_generic_timeout_message_is_retryable_timeout():
         operation="generation",
     )
 
-    assert failure.kind == ProviderErrorKind.TIMEOUT
-    assert failure.retryable is True
+    assert failure.kind == ProviderErrorKind.UNKNOWN
+    assert failure.retryable is False
 
 
 def test_provider_body_numeric_error_code_is_treated_as_status():
@@ -569,7 +569,7 @@ def test_aiohttp_quota_response_error_uses_quota_taxonomy():
     assert failure.retryable is False
 
 
-def test_aiohttp_429_quota_message_without_body_uses_quota_taxonomy():
+def test_aiohttp_429_without_structured_quota_code_is_rate_limited():
     exc = aiohttp.ClientResponseError(
         request_info=SimpleNamespace(real_url="https://api.example.test"),
         history=(),
@@ -585,5 +585,29 @@ def test_aiohttp_429_quota_message_without_body_uses_quota_taxonomy():
         operation="generation",
     )
 
-    assert failure.kind == ProviderErrorKind.QUOTA_EXHAUSTED
-    assert failure.retryable is False
+    assert failure.kind == ProviderErrorKind.RATE_LIMITED
+    assert failure.retryable is True
+
+
+def test_real_sdk_transport_errors_are_classified_without_prose():
+    import anthropic
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://provider.example/generate")
+    for sdk in (openai, anthropic):
+        for error, expected in (
+            (sdk.APITimeoutError(request=request), ProviderErrorKind.TIMEOUT),
+            (sdk.APIConnectionError(request=request), ProviderErrorKind.TRANSIENT_NETWORK),
+        ):
+            failure = classify_provider_exception(
+                error, provider="test", model_id="test", operation="generation",
+            )
+            assert failure.kind == expected
+            assert failure.retryable
+    failure = classify_provider_exception(
+        AttributeError("network timeout gateway unavailable"),
+        provider="test", model_id="test", operation="generation",
+    )
+    assert not failure.retryable
+    assert failure.kind == ProviderErrorKind.UNKNOWN

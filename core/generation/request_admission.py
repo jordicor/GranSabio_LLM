@@ -33,6 +33,7 @@ from models import (
     PreflightResult,
     is_json_output_requested,
 )
+from token_counting import TextComponent, TokenCounter
 
 logger = logging.getLogger(__name__)
 
@@ -458,7 +459,7 @@ def _qa_model_reserve(model_entry: Any) -> tuple[str, int, int]:
     return model_name, int(reserved), thinking
 
 
-def _build_receptors(
+async def _build_receptors(
     request: ContentRequest,
     *,
     request_fields_set: set,
@@ -471,9 +472,11 @@ def _build_receptors(
     qa_mandatory: bool,
     preflight_image_info: Optional[Dict[str, Any]],
     alias_registry: Any,
+    audio_tokens: int = 0,
 ) -> List[_ReceptorSpec]:
     """Build the guaranteed lower-bound receptors for all predictable calls."""
 
+    counter = TokenCounter()
     source_text = str(getattr(request, "source_text", "") or "")
     prompt = str(getattr(request, "prompt", "") or "")
     image_tokens = int((preflight_image_info or {}).get("total_estimated_tokens", 0) or 0)
@@ -500,23 +503,16 @@ def _build_receptors(
     gen_model = str(request.generator_model)
     gen_provider = _provider_for_model(gen_model)
     gen_components = [
-        context_budget.make_payload_component(
-            "generator_system_prompt",
-            config.GENERATOR_SYSTEM_PROMPT_RAW,
-            "system",
-            gen_provider,
-            gen_model,
-        ),
-        context_budget.make_payload_component(
-            "prompt", prompt, "message", gen_provider, gen_model, json_hint
-        ),
+        TextComponent(name="generator_system_prompt", text=config.GENERATOR_SYSTEM_PROMPT_RAW, kind="system"),
+        TextComponent(name="prompt", text=prompt, kind="message", hint=json_hint),
     ]
     if source_text:
         gen_components.append(
-            context_budget.make_payload_component(
-                "source_text", source_text, "message", gen_provider, gen_model, json_hint
-            )
+            TextComponent(name="source_text", text=source_text, kind="message", hint=json_hint)
         )
+    gen_components = await counter.components(gen_components, gen_provider, gen_model)
+    if audio_tokens:
+        gen_components.append(PayloadComponent(name="audios", chars=0, tokens_estimate=audio_tokens, kind="audio"))
     image_component = _image_component()
     if image_component is not None:
         gen_components.append(image_component)
@@ -542,26 +538,15 @@ def _build_receptors(
     if preflight_will_run and preflight_model:
         pf_provider = _provider_for_model(preflight_model)
         pf_components = [
-            context_budget.make_payload_component(
-                "preflight_system_prompt",
-                config.PREFLIGHT_SYSTEM_PROMPT,
-                "system",
-                pf_provider,
-                preflight_model,
-            ),
-            context_budget.make_payload_component(
-                "prompt", prompt, "message", pf_provider, preflight_model
-            ),
-            context_budget.make_payload_component(
-                "payload_skeleton", _PREFLIGHT_SKELETON, "message", pf_provider, preflight_model
-            ),
+            TextComponent(name="preflight_system_prompt", text=config.PREFLIGHT_SYSTEM_PROMPT, kind="system"),
+            TextComponent(name="prompt", text=prompt, kind="message"),
+            TextComponent(name="payload_skeleton", text=_PREFLIGHT_SKELETON, kind="message"),
         ]
         if source_text:
             pf_components.append(
-                context_budget.make_payload_component(
-                    "source_text", source_text, "message", pf_provider, preflight_model
-                )
+                TextComponent(name="source_text", text=source_text, kind="message")
             )
+        pf_components = await counter.components(pf_components, pf_provider, preflight_model)
         receptors.append(
             _ReceptorSpec(
                 call_id="preflight.validate",
@@ -584,19 +569,14 @@ def _build_receptors(
         aq_provider = _provider_for_model(auto_qa_model)
         aq_source = source_text[:30000] if source_text else ""
         aq_components = [
-            context_budget.make_payload_component(
-                "prompt", prompt, "message", aq_provider, auto_qa_model
-            ),
-            context_budget.make_payload_component(
-                "payload_skeleton", _AUTO_QA_SKELETON, "message", aq_provider, auto_qa_model
-            ),
+            TextComponent(name="prompt", text=prompt, kind="message"),
+            TextComponent(name="payload_skeleton", text=_AUTO_QA_SKELETON, kind="message"),
         ]
         if aq_source:
             aq_components.append(
-                context_budget.make_payload_component(
-                    "source_text", aq_source, "message", aq_provider, auto_qa_model
-                )
+                TextComponent(name="source_text", text=aq_source, kind="message")
             )
+        aq_components = await counter.components(aq_components, aq_provider, auto_qa_model)
         receptors.append(
             _ReceptorSpec(
                 call_id="auto_qa.plan",
@@ -623,23 +603,16 @@ def _build_receptors(
             model_name, reserved, thinking = _qa_model_reserve(model_entry)
             provider = _provider_for_model(model_name)
             guaranteed = [
-                context_budget.make_payload_component(
-                    "qa_system_prompt",
-                    config.QA_SYSTEM_PROMPT_RAW,
-                    "system",
-                    provider,
-                    model_name,
-                ),
-                context_budget.make_payload_component(
-                    "prompt", prompt, "message", provider, model_name
-                ),
+                TextComponent(name="qa_system_prompt", text=config.QA_SYSTEM_PROMPT_RAW, kind="system"),
+                TextComponent(name="prompt", text=prompt, kind="message"),
             ]
             if source_text:
                 guaranteed.append(
-                    context_budget.make_payload_component(
-                        "source_text", source_text, "message", provider, model_name
-                    )
+                    TextComponent(name="source_text", text=source_text, kind="message")
                 )
+            guaranteed = await counter.components(guaranteed, provider, model_name)
+            if audio_tokens and any(layer.include_input_audio for layer in request.qa_layers or []):
+                guaranteed.append(PayloadComponent(name="audios", chars=0, tokens_estimate=audio_tokens, kind="audio"))
             worst_case_budget: Optional[RenderedCallBudget] = None
             if est_gen_tokens > 0:
                 worst_case_components = list(guaranteed) + [
@@ -680,8 +653,8 @@ def _build_receptors(
 
     if request.shared_context:
         for spec in receptors:
-            component = context_budget.make_payload_component(
-                "shared_context", request.shared_context, "message",
+            component, = await counter.components(
+                [TextComponent(name="shared_context", text=request.shared_context)],
                 spec.budget.provider, spec.model,
             )
             spec.budget.components.append(component)
@@ -711,6 +684,7 @@ async def run_technical_context_admission(
     preflight_max_tokens: int = _PREFLIGHT_DEFAULT_MAX_TOKENS,
     auto_qa_max_tokens: int = _AUTO_QA_DEFAULT_MAX_TOKENS,
     context_documents_total_bytes: int = 0,
+    audio_tokens: int = 0,
 ) -> TechnicalAdmissionResult:
     """Early, pre-session, pre-LLM technical context admission (barrier 1).
 
@@ -726,7 +700,7 @@ async def run_technical_context_admission(
     nothing is rejected — only advisories and logs.
     """
 
-    receptors = _build_receptors(
+    receptors = await _build_receptors(
         request,
         request_fields_set=request_fields_set,
         preflight_model=preflight_model,
@@ -738,6 +712,7 @@ async def run_technical_context_admission(
         qa_mandatory=qa_mandatory,
         preflight_image_info=preflight_image_info,
         alias_registry=alias_registry,
+        audio_tokens=audio_tokens,
     )
 
     mode = context_budget.resolve_admission_mode()

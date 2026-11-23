@@ -351,27 +351,27 @@ class GranSabioClient:
 
     def start_project(self, project_id: str) -> Dict[str, Any]:
         """Activate/reactivate a project."""
-        response = self._request("POST", f"/project/start/{project_id}")
+        response = self._request("POST", f"/project/start/{quote(project_id, safe='')}")
         if response.status_code not in (200, 201):
-            endpoint = f"/project/start/{project_id}"
+            endpoint = f"/project/start/{quote(project_id, safe='')}"
             text = self._read_error_text(response, endpoint)
             raise GranSabioClientError(
                 f"Failed to start project: {text}",
                 status_code=response.status_code
             )
-        return self._read_json_no_retry(response, f"/project/start/{project_id}")
+        return self._read_json_no_retry(response, f"/project/start/{quote(project_id, safe='')}")
 
     def stop_project(self, project_id: str) -> Dict[str, Any]:
         """Cancel a project and all its active sessions."""
-        response = self._request("POST", f"/project/stop/{project_id}")
+        response = self._request("POST", f"/project/stop/{quote(project_id, safe='')}")
         if response.status_code not in (200, 202):
-            endpoint = f"/project/stop/{project_id}"
+            endpoint = f"/project/stop/{quote(project_id, safe='')}"
             text = self._read_error_text(response, endpoint)
             raise GranSabioClientError(
                 f"Failed to stop project: {text}",
                 status_code=response.status_code
             )
-        return self._read_json_no_retry(response, f"/project/stop/{project_id}")
+        return self._read_json_no_retry(response, f"/project/stop/{quote(project_id, safe='')}")
 
     # =========================================================================
     # Content Generation
@@ -615,24 +615,24 @@ class GranSabioClient:
 
     def get_status(self, session_id: str) -> Dict[str, Any]:
         """Get current status of a generation session."""
-        response = self._request("GET", f"/status/{session_id}")
+        response = self._request("GET", f"/status/{quote(session_id, safe='')}")
         if response.status_code in _RETRYABLE_POLL_STATUS_CODES:
             raise TransientGranSabioError(
                 f"Transient HTTP {response.status_code} getting status of session {session_id}",
                 status_code=response.status_code,
             )
         if response.status_code != 200:
-            endpoint = f"/status/{session_id}"
+            endpoint = f"/status/{quote(session_id, safe='')}"
             text = self._read_error_text(response, endpoint)
             raise GranSabioClientError(
                 f"Failed to get status: {text}",
                 status_code=response.status_code
             )
-        return self._read_json(response, f"/status/{session_id}")
+        return self._read_json(response, f"/status/{quote(session_id, safe='')}")
 
     def get_result(self, session_id: str) -> Dict[str, Any]:
         """Get the result of a completed generation session."""
-        response = self._request("GET", f"/result/{session_id}")
+        response = self._request("GET", f"/result/{quote(session_id, safe='')}")
 
         if response.status_code == 202:
             # Still in progress
@@ -645,14 +645,14 @@ class GranSabioClient:
             )
 
         if response.status_code != 200:
-            endpoint = f"/result/{session_id}"
+            endpoint = f"/result/{quote(session_id, safe='')}"
             text = self._read_error_text(response, endpoint)
             raise GranSabioClientError(
                 f"Failed to get result: {text}",
                 status_code=response.status_code
             )
 
-        return self._read_json(response, f"/result/{session_id}")
+        return self._read_json(response, f"/result/{quote(session_id, safe='')}")
 
     def get_session_details(self, session_id: str) -> Dict[str, Any]:
         """Read original request evidence without submitting or retrying generation.
@@ -754,15 +754,15 @@ class GranSabioClient:
 
     def stop_session(self, session_id: str) -> Dict[str, Any]:
         """Cancel an active generation session."""
-        response = self._request("POST", f"/stop/{session_id}")
+        response = self._request("POST", f"/stop/{quote(session_id, safe='')}")
         if response.status_code not in (200, 202):
-            endpoint = f"/stop/{session_id}"
+            endpoint = f"/stop/{quote(session_id, safe='')}"
             text = self._read_error_text(response, endpoint)
             raise GranSabioClientError(
                 f"Failed to stop session: {text}",
                 status_code=response.status_code
             )
-        return self._read_json_no_retry(response, f"/stop/{session_id}")
+        return self._read_json_no_retry(response, f"/stop/{quote(session_id, safe='')}")
 
     def _call_with_retry(
         self,
@@ -1191,7 +1191,7 @@ class GranSabioClient:
 
         def _run_session_stream() -> None:
             """Consume the unified session event stream."""
-            url = f"{self.base_url}/stream/{session_id}"
+            url = f"{self.base_url}/stream/{quote(session_id, safe='')}"
             try:
                 resp = requests.get(
                     url,

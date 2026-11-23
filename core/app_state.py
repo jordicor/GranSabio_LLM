@@ -19,13 +19,12 @@ Version: 1.0.0
 
 import asyncio
 import logging
-import os
-import sys
 import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -40,24 +39,20 @@ from content_events import (
     Visibility,
 )
 from debug_logger import (
+    DebuggerPersistenceError,
     DebugLogger,
     get_debug_logger,
     shutdown_debug_logger,
 )
-from services.runtime_console import activate_runtime_console_capture, set_console_phase
+from runtime_logging import bootstrap_logging, close_runtime_logging
+from services.runtime_console import set_console_phase
 
 from .generation.results import attach_usage_metadata
+from .request_errors import request_validation_error_response
 from .state import session_store
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-    ]
-)
-activate_runtime_console_capture()
+# Also covers embedded ASGI users that import core without main.py.
+bootstrap_logging()
 
 # Silence noisy third-party loggers to avoid cluttering output
 # This prevents low-level HTTP connection logs from httpcore, httpx, etc.
@@ -85,14 +80,6 @@ TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 FILE_LOGGING_ENV_VAR = "GRANSABIO_FILE_LOGGING"
 FORCE_VERBOSE_ENV_VAR = "GRANSABIO_FORCE_VERBOSE"
 FORCE_EXTRA_VERBOSE_ENV_VAR = "GRANSABIO_FORCE_EXTRA_VERBOSE"
-
-if os.getenv(FILE_LOGGING_ENV_VAR, "").lower() in TRUTHY_ENV_VALUES:
-    try:
-        from file_logger import TeeOutput, activate_file_logging
-        if not isinstance(sys.stdout, TeeOutput):
-            activate_file_logging()
-    except Exception as exc:
-        logger.error(f"Failed to activate file logging in worker process: {exc}")
 
 from ai_service import get_ai_service
 from analysis_router import router as analysis_router
@@ -123,6 +110,10 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
+# Validation errors echo the rejected input; NaN/Infinity would otherwise turn the
+# 422 into a 500 (security review 2026-11-07, S-12).
+app.add_exception_handler(RequestValidationError, request_validation_error_response)
+
 # Add GZip compression middleware (compresses responses > 1000 bytes)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
@@ -136,14 +127,14 @@ from .security import (
     SecurityHeadersMiddleware,
 )
 
-app.add_middleware(IPFilterMiddleware)
-# Reject cross-site browser mutations on state-changing endpoints (audit FE-01)
-app.add_middleware(CrossSiteRequestGuardMiddleware)
 # Reject oversized request bodies before parsing (audit API-02)
 app.add_middleware(
     RequestBodyLimitMiddleware,
     attachment_max_bytes=config.ATTACHMENTS.max_size_bytes,
 )
+# Starlette prepends middleware: reject prohibited clients before reading a body.
+app.add_middleware(CrossSiteRequestGuardMiddleware)
+app.add_middleware(IPFilterMiddleware)
 # Outermost: security headers on every response, including early rejections (audit FE-03)
 app.add_middleware(SecurityHeadersMiddleware)
 
@@ -381,16 +372,20 @@ async def _debug_session_start(
     if not debug_logger:
         return
     try:
+        # Both records describe the same initialization snapshot, even if the
+        # caller's model changes while the first persistence operation awaits.
+        serialized_request = _serialize_for_debug(request_payload)
+        serialized_preflight = _serialize_for_debug(preflight_payload)
         await debug_logger.record_session_start(
             session_id,
-            request_payload=_serialize_for_debug(request_payload),
-            preflight_payload=_serialize_for_debug(preflight_payload),
+            request_payload=serialized_request,
+            preflight_payload=serialized_preflight,
             status="initializing",
             project_id=project_id,
         )
         details = {
-            "request": _serialize_for_debug(request_payload),
-            "preflight": _serialize_for_debug(preflight_payload),
+            "request": serialized_request,
+            "preflight": serialized_preflight,
             "project_id": project_id,
             "attachments": [_serialize_for_debug(item) for item in (attachments or [])],
             "preflight_context": preflight_context or [],
@@ -403,6 +398,8 @@ async def _debug_session_start(
                 "details": details,
             },
         )
+    except DebuggerPersistenceError:
+        raise
     except Exception:
         logger.exception("Failed to record debugger session start for %s", session_id)
 
@@ -420,6 +417,8 @@ async def _debug_record_event(session_id: str, event_type: str, payload: Any) ->
                 "data": _serialize_for_debug(payload),
             },
         )
+    except DebuggerPersistenceError:
+        raise
     except Exception:
         logger.exception("Failed to record debugger event %s for %s", event_type, session_id)
 
@@ -444,6 +443,8 @@ async def _debug_update_status(
         if status == GenerationStatus.CANCELLED.value and isinstance(final_payload, dict):
             if final_payload.get("costs") is not None:
                 await _debug_record_usage(session_id, final_payload["costs"])
+    except DebuggerPersistenceError:
+        raise
     except Exception:
         logger.exception("Failed to update debugger status for %s", session_id)
 
@@ -454,6 +455,8 @@ async def _debug_record_usage(session_id: str, usage_payload: Any) -> None:
         return
     try:
         await debug_logger.record_usage_summary(session_id, _serialize_for_debug(usage_payload))
+    except DebuggerPersistenceError:
+        raise
     except Exception:
         logger.exception("Failed to record debugger usage summary for %s", session_id)
 
@@ -599,6 +602,10 @@ async def startup_event():
             enabled=config.DEBUGGER.enabled,
             db_path=config.DEBUGGER.db_path,
             retention_days=config.DEBUGGER.retention_days,
+            backend=config.DEBUGGER.backend,
+            database_url=config.DEBUGGER.database_url.get_secret_value(),
+            instance_id=config.DEBUGGER.instance_id,
+            persistence_policy=config.DEBUGGER.persistence_policy(),
         )
         # Retention is owned entirely by the debugger (C13.1): with
         # DEBUGGER_RETENTION_DAYS unset or 0 nothing is ever deleted, and
@@ -642,6 +649,10 @@ async def shutdown_event():
     """Clean up resources on shutdown"""
     global _session_cleanup_task
     logger.info("Shutting down Gran Sabio LLM Engine...")
+
+    from counting_executor import shutdown_counting_executor
+
+    await shutdown_counting_executor()
 
     cleanup_task = _session_cleanup_task
     if cleanup_task is not None:
@@ -706,6 +717,7 @@ async def shutdown_event():
         logger.error(f"Error shutting down debugger persistence: {e}")
 
     logger.info("Shutdown complete")
+    await close_runtime_logging()
 
 
 async def register_session(session_id: str, session_data: Dict[str, Any]) -> None:

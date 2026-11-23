@@ -69,51 +69,20 @@ def _make_manager() -> FeedbackMemoryManager:
 
 
 class TestEmbeddingsRouting:
-    async def test_openai_route_dispatches_openai_endpoint(self, monkeypatch):
-        monkeypatch.setattr("feedback_memory.app_config.OPENAI_API_KEY", "sk-test")
-        double = SimpleNamespace(
-            _make_request=AsyncMock(return_value={"data": [{"embedding": [0.1, 0.2]}]})
-        )
+    @pytest.mark.parametrize("model,provider", [("text-embedding-3-large", "openai"),
+                                               ("synthetic-gemini-embed", "google")])
+    async def test_feedback_passes_exact_model_to_shared_embedding_api(self, monkeypatch, model, provider):
+        from config import config
+        monkeypatch.setitem(config.MODEL_TOKEN_LIMITS, model, {
+            "provider": provider, "enabled": True, "capabilities": ["embeddings"]})
+        double = SimpleNamespace(get_embeddings=AsyncMock(return_value=[[0.1, 0.2]]))
         processor = _make_processor(double)
-        with patch("feedback_memory.resolve_call") as mock_resolve, patch(
-            "feedback_memory.admit_embedding_texts", AsyncMock()
-        ) as mock_admit:
-            mock_resolve.return_value = SimpleNamespace(model="text-embedding-3-large", params={})
-            result = await processor.get_embeddings(["tiny text"])
-
-        assert result == [[0.1, 0.2]]
-        args, kwargs = double._make_request.call_args
-        assert args[0] == "POST"
-        assert args[1] == "https://api.openai.com/v1/embeddings"
-        assert kwargs["json"]["model"] == "text-embedding-3-large"
-        admit_kwargs = mock_admit.call_args.kwargs
-        assert admit_kwargs["provider"] == "openai"
-        assert admit_kwargs["model"] == "text-embedding-3-large"
-
-    async def test_gemini_route_dispatches_gemini_endpoint(self, monkeypatch):
-        """Pre-fix the call went to api.openai.com with provider='openai'
-        regardless of the routed model (audit ORQ-01 scenario b)."""
-        monkeypatch.setattr("feedback_memory.app_config.GOOGLE_API_KEY", "g-test")
-        double = SimpleNamespace(
-            _make_request=AsyncMock(return_value={"embeddings": [{"values": [0.3, 0.4]}]})
-        )
-        processor = _make_processor(double)
-        with patch("feedback_memory.resolve_call") as mock_resolve, patch(
-            "feedback_memory.admit_embedding_texts", AsyncMock()
-        ) as mock_admit:
-            mock_resolve.return_value = SimpleNamespace(model="models/text-embedding-004", params={})
-            result = await processor.get_embeddings(["texto uno", "texto dos"])
-
-        assert result == [[0.3, 0.4]]
-        args, kwargs = double._make_request.call_args
-        assert "generativelanguage.googleapis.com" in args[1]
-        assert args[1].endswith(":batchEmbedContents")
-        assert kwargs["json"]["requests"][0]["content"]["parts"][0]["text"] == "texto uno"
-        assert kwargs["json"]["requests"][1]["content"]["parts"][0]["text"] == "texto dos"
-        assert mock_admit.call_args.kwargs["provider"] == "gemini"
+        with patch("feedback_memory.resolve_call", return_value=SimpleNamespace(model=model)):
+            assert await processor.get_embeddings(["tiny text"]) == [[0.1, 0.2]]
+        double.get_embeddings.assert_awaited_once_with(["tiny text"], model=model, dispatch_call_id="feedback.embed")
 
     def test_validate_embedding_support_rejects_unsupported_provider(self):
-        processor = _make_processor(SimpleNamespace(_make_request=AsyncMock()))
+        processor = _make_processor(SimpleNamespace(get_embeddings=AsyncMock()))
         with patch("feedback_memory.resolve_call") as mock_resolve:
             mock_resolve.return_value = SimpleNamespace(model="claude-opus-4-1", params={})
             with pytest.raises(FeedbackEmbeddingSupportError):
@@ -123,7 +92,7 @@ class TestEmbeddingsRouting:
         """Audit ORQ-01 scenario (a): no credentials for the routed provider
         must surface explicitly instead of degrading into empty vectors."""
         monkeypatch.setattr("feedback_memory.app_config.OPENAI_API_KEY", "")
-        processor = _make_processor(SimpleNamespace(_make_request=AsyncMock()))
+        processor = _make_processor(SimpleNamespace(get_embeddings=AsyncMock()))
         with patch("feedback_memory.resolve_call") as mock_resolve:
             mock_resolve.return_value = SimpleNamespace(model="text-embedding-3-large", params={})
             with pytest.raises(FeedbackEmbeddingSupportError, match="OPENAI_API_KEY"):
@@ -132,12 +101,13 @@ class TestEmbeddingsRouting:
     def test_validate_embedding_support_accepts_servable_routes(self, monkeypatch):
         monkeypatch.setattr("feedback_memory.app_config.OPENAI_API_KEY", "sk-test")
         monkeypatch.setattr("feedback_memory.app_config.GOOGLE_API_KEY", "g-test")
-        processor = _make_processor(SimpleNamespace(_make_request=AsyncMock()))
+        processor = _make_processor(SimpleNamespace(get_embeddings=AsyncMock()))
         with patch("feedback_memory.resolve_call") as mock_resolve:
             mock_resolve.return_value = SimpleNamespace(model="text-embedding-3-large", params={})
             processor.validate_embedding_support()
             mock_resolve.return_value = SimpleNamespace(model="models/text-embedding-004", params={})
-            processor.validate_embedding_support()
+            with pytest.raises(FeedbackEmbeddingSupportError):
+                processor.validate_embedding_support()
 
     async def test_initialize_session_fails_explicitly_without_embedding_support(self):
         """The failure must happen at session initialization, not per call."""

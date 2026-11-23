@@ -126,7 +126,10 @@ class QABypassEngine:
         Returns:
             True if this layer can be bypassed algorithmically
         """
-        # ALWAYS bypass word count enforcement layers algorithmically
+        if layer.include_input_audio:
+            return False
+
+        # Bypass word count enforcement layers algorithmically
         # The severity setting controls whether violations trigger deal_breaker
         if layer.name == "Word Count Enforcement":
             config = getattr(original_request, "word_count_enforcement", None)

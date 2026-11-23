@@ -12,6 +12,7 @@ from urllib.parse import urlparse, urlunparse
 
 from fastapi import UploadFile
 
+from ai_runtime.audio import AUDIO_MIME_FORMATS
 from services.attachment_types import (
     AttachmentRecord,
     AttachmentValidationError,
@@ -60,6 +61,8 @@ def attachment_kind(*, final_mime: str, stored_filename: str) -> str:
     extension = Path(stored_filename).suffix.lower()
     if normalized_mime.startswith("image/"):
         return "image"
+    if normalized_mime in AUDIO_MIME_FORMATS:
+        return "audio"
     if normalized_mime == "application/pdf":
         return "pdf"
     if normalized_mime == "application/json" or extension == ".json":
@@ -155,6 +158,8 @@ def mime_equivalent(detected: str, declared: str) -> bool:
     declared = declared.lower()
     if detected == declared:
         return True
+    if detected in AUDIO_MIME_FORMATS and declared in AUDIO_MIME_FORMATS:
+        return AUDIO_MIME_FORMATS[detected] == AUDIO_MIME_FORMATS[declared]
     text_equivalents = {"text/plain", "text/markdown"}
     if {detected, declared} <= text_equivalents:
         return True
@@ -162,6 +167,8 @@ def mime_equivalent(detected: str, declared: str) -> bool:
 
 
 def sanitize_filename(filename: str) -> str:
+    if len(filename or "") > 255:
+        raise AttachmentValidationError("Attachment filename must be 255 characters or fewer")
     normalized = unicodedata.normalize("NFC", filename or "")
     cleaned = "".join(ch for ch in normalized if unicodedata.category(ch)[0] != "C")
     candidate = Path(cleaned).name

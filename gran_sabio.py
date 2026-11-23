@@ -37,7 +37,11 @@ from content_events import (
     ContentSubphase,
 )
 from context_budget import ContextAdmissionError, context_budget_error_from_overflow
-from deterministic_validation import DraftValidationResult, validate_generation_candidate
+from deterministic_validation import (
+    DraftValidationResult,
+    build_segment_budget_instructions,
+    validate_generation_candidate,
+)
 from json_utils import dumps as json_dumps
 from llm_routing import endpoint_id_call_kwargs, resolve_call, resolve_temperature
 from local_execution_policy import LocalExecutionPolicyError
@@ -151,6 +155,28 @@ def _build_gran_sabio_measurement_request(request: Any) -> MeasurementRequest:
         setattr(measurement_request, "json_expectations", json_expectations)
 
     return measurement_request
+
+
+def _build_final_content_contract_block(request: Any) -> str:
+    """Return the segment budgets contract scoped to a review's final_content.
+
+    A review that rewrites the content returns it in ``final_content``, which
+    the final-decision gate then judges. The block carries its own leading
+    separator and is empty when the contract is not active, so a review
+    prompt without the contract stays exactly as it was.
+    """
+
+    instructions = build_segment_budget_instructions(request)
+    if not instructions:
+        return ""
+    return (
+        "\n\nFINAL CONTENT CONTRACT:\n"
+        "When you set modifications_made=true, final_content must be the full "
+        "result and must satisfy the contract below; it is checked "
+        "deterministically before your decision can be accepted. It does not "
+        "apply when final_content is null.\n"
+        f"{instructions}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -852,6 +878,7 @@ class GranSabioEngine:
         # Build enhanced context with QA configuration
         qa_cfg = minority_deal_breakers.get("qa_configuration", {})
         enhanced_db_context = self._build_enhanced_deal_breaker_context(minority_deal_breakers)
+        final_content_contract = _build_final_content_contract_block(original_request)
         alias_registry = getattr(original_request, "_model_alias_registry", None)
         prompt_safety_parts = [
             PromptPart(
@@ -860,6 +887,15 @@ class GranSabioEngine:
                 label="gran_sabio.minority_deal_breakers",
             )
         ] if alias_registry else None
+        if prompt_safety_parts is not None and final_content_contract:
+            # Interpolates the caller's field names, hence user_supplied.
+            prompt_safety_parts.append(
+                PromptPart(
+                    text=final_content_contract,
+                    source="user_supplied",
+                    label="gran_sabio.minority_deal_breakers.final_content_contract",
+                )
+            )
 
         prompt = f"""
 You are Gran Sabio, the senior arbiter. Review content flagged as deal-breaker by a MINORITY of QA evaluators.
@@ -893,7 +929,7 @@ INSTRUCTIONS:
    - score is the effective score for the QA layer under review after your arbitration.
    - If decision is APPROVED, score MUST be greater than or equal to the layer's minimum score.
    - If a minority deal-breaker is a false positive and no edit is needed, use at least the minimum passing score for that layer.
-   - If decision is REJECTED, score may be below the minimum.
+   - If decision is REJECTED, score may be below the minimum.{final_content_contract}
 
 OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
 {{
@@ -1090,7 +1126,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 )
                 raise
             logger.error("Gran Sabio review failed for session %s: %s", session_id, str(e))
-            failure_reason = f"Gran Sabio review failed: {str(e)}"
+            failure_reason = "Gran Sabio review failed."
             # Matrix row 8: exception path for review_minority_deal_breakers keeps `content` as defensive default.
             return GranSabioResult(
                 approved=False,
@@ -1098,7 +1134,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 final_score=0.0,
                 reason=failure_reason,
                 modifications_made=False,
-                error=str(e),
+                error="gran_sabio_review_failed",
             )
         finally:
             await review_tool_events.close(
@@ -1120,6 +1156,7 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
         tool_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
         fallback_reason: Optional[str] = None,
         cancellation_token: Optional[Any] = None,
+        audios: Optional[List[Any]] = None,
     ) -> GranSabioResult:
         """
         Final fallback: generate new content from scratch when iterations are exhausted.
@@ -1194,6 +1231,13 @@ OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
                 elif original_request.min_words:
                     word_instructions = f"\nCRITICAL WORD COUNT: MIN {original_request.min_words} words (MANDATORY)."
 
+            segment_budget_instructions = build_segment_budget_instructions(original_request)
+            # Carries its own separator, so a request without the contract
+            # gets exactly the prompt it had before the contract existed.
+            segment_budget_block = (
+                f"\n\n{segment_budget_instructions}" if segment_budget_instructions else ""
+            )
+
             json_output_effective = is_json_output_requested(original_request)
             if json_output_effective:
                 response_instruction = (
@@ -1215,7 +1259,7 @@ You are Gran Sabio. This is a single final chance to produce a draft that strict
 ORIGINAL REQUEST:
 - Content type: {original_request.content_type}
 - Prompt: {original_request.prompt}
-{word_instructions}
+{word_instructions}{segment_budget_block}
 
 {failure_context}
 
@@ -1249,6 +1293,15 @@ CRITICAL INSTRUCTIONS:
                     label="gran_sabio.regeneration.request_context",
                 ),
             ]
+            if segment_budget_instructions:
+                # Interpolates the caller's field names, hence user_supplied.
+                prompt_safety_parts.append(
+                    PromptPart(
+                        text=segment_budget_instructions,
+                        source="user_supplied",
+                        label="gran_sabio.regeneration.segment_budget_instructions",
+                    )
+                )
             model_alias_registry = getattr(original_request, "_model_alias_registry", None)
 
             model, reasoning_effort, thinking_tokens, temperature = self._get_default_content_generation_model(
@@ -1375,6 +1428,7 @@ CRITICAL INSTRUCTIONS:
                         content_type=original_request.content_type,
                         usage_callback=usage_callback,
                         images=images,
+                        audios=audios,
                         model_alias_registry=model_alias_registry,
                         prompt_safety_parts=prompt_safety_parts,
                         llm_routing=getattr(original_request, "_llm_routing", None),
@@ -1485,6 +1539,7 @@ CRITICAL INSTRUCTIONS:
                         json_schema=json_schema,
                         usage_callback=usage_callback,
                         images=images,
+                        audios=audios,
                         model_alias_registry=model_alias_registry,
                         prompt_safety_parts=prompt_safety_parts,
                         llm_routing=getattr(original_request, "_llm_routing", None),
@@ -1543,6 +1598,7 @@ CRITICAL INSTRUCTIONS:
                             json_schema=json_schema,
                             usage_callback=usage_callback,
                             images=images,
+                            audios=audios,
                             model_alias_registry=model_alias_registry,
                             prompt_safety_parts=prompt_safety_parts,
                             llm_routing=getattr(original_request, "_llm_routing", None),
@@ -1751,6 +1807,7 @@ CRITICAL INSTRUCTIONS:
                     json_schema=json_schema,
                     usage_callback=usage_callback,
                     images=images,
+                    audios=audios,
                     model_alias_registry=model_alias_registry,
                     prompt_safety_parts=prompt_safety_parts,
                     llm_routing=getattr(original_request, "_llm_routing", None),
@@ -1840,9 +1897,9 @@ CRITICAL INSTRUCTIONS:
                 approved=False,
                 final_content=fallback_content,
                 final_score=0.0,
-                reason=f"Gran Sabio regeneration failed: {str(e)}",
+                reason="Gran Sabio regeneration failed.",
                 modifications_made=False,
-                error=str(e),
+                error="gran_sabio_regeneration_failed",
             )
 
     # ==========================
@@ -1919,6 +1976,16 @@ CRITICAL INSTRUCTIONS:
                         label="gran_sabio.iteration_review",
                     )
                 ]
+                final_content_contract = _build_final_content_contract_block(original_request)
+                if final_content_contract:
+                    # Interpolates the caller's field names, hence user_supplied.
+                    prompt_safety_parts.append(
+                        PromptPart(
+                            text=final_content_contract,
+                            source="user_supplied",
+                            label="gran_sabio.iteration_review.final_content_contract",
+                        )
+                    )
 
             best_iteration = self._pick_best_iteration(iterations)
             best_content = best_iteration.get("content", "") if best_iteration else ""
@@ -2111,9 +2178,9 @@ CRITICAL INSTRUCTIONS:
                 approved=False,
                 final_content=fallback_content,
                 final_score=0.0,
-                reason=f"Gran Sabio review failed: {str(e)}",
+                reason="Gran Sabio review failed.",
                 modifications_made=False,
-                error=str(e),
+                error="gran_sabio_review_failed",
             )
         finally:
             await review_tool_events.close(
@@ -2243,6 +2310,7 @@ CRITICAL INSTRUCTIONS:
             if best_iteration else "No metadata"
         )
         best_content_text = best_iteration["content"] if best_iteration and "content" in best_iteration else "Not available"
+        final_content_contract = _build_final_content_contract_block(original_request)
 
         prompt = f"""
 You are Gran Sabio, the final arbiter. Review the full process after {len(iterations)} iterations without automatic approval.
@@ -2273,7 +2341,7 @@ INSTRUCTIONS:
    - APPROVE: The content is acceptable. Leave final_content=null and modifications_made=false.
    - APPROVE_WITH_MODIFICATIONS: Content needs MINOR fixes. Set modifications_made=true and place the FULL edited text in final_content (non-empty string).
    - REJECT: Content has unfixable issues. Leave final_content=null and modifications_made=false.
-5) Prefer APPROVE over APPROVE_WITH_MODIFICATIONS. Only modify if strictly necessary.
+5) Prefer APPROVE over APPROVE_WITH_MODIFICATIONS. Only modify if strictly necessary.{final_content_contract}
 
 OUTPUT CONTRACT (JSON object, no extra keys, no markdown):
 {{

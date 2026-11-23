@@ -305,10 +305,11 @@ def _evaluate_layer_based_approval(
                 "reason": friendly_reason,
             }
 
-    # Step 4: If all semantic QA layers passed, approve immediately.
+    # Step 4: Passed semantic layers must also meet the global minimum.
     # When qa_layers=[] there is no semantic score surface for min_global_score,
     # so warn-only evidence grounding remains advisory instead of blocking approval.
-    if not mandatory_failures and not non_mandatory_failures:
+    global_score_passed = not request.qa_layers or consensus_result.average_score >= request.min_global_score
+    if not mandatory_failures and not non_mandatory_failures and global_score_passed:
         return {
             "approved": True,
             "final_rejection": False,
@@ -316,8 +317,10 @@ def _evaluate_layer_based_approval(
         }
 
     # Step 5: If we have failures but not at max iterations, continue iterating
-    if iteration < request.max_iterations and (mandatory_failures or non_mandatory_failures):
+    if iteration < request.max_iterations:
         all_failures = mandatory_failures + non_mandatory_failures
+        if not global_score_passed:
+            all_failures.append("minimum global score")
         return {
             "approved": False,
             "final_rejection": False,

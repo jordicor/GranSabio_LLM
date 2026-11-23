@@ -536,6 +536,7 @@ async def test_synced_vision_controls_the_actual_fourteen_image_admission(servic
                           capability="vision_input").supported is supported
     request = SimpleNamespace(
         context_documents=[], username="vision-test", generator_model="claude-opus-5-5",
+        audios=[], qa_layers=[],
         images=[SimpleNamespace(username="vision-test", upload_id=str(i)) for i in range(14)],
     )
     images = [SimpleNamespace(estimated_tokens=10, original_filename="test.png", size_bytes=10, detail="auto")
@@ -591,9 +592,11 @@ async def test_openai_vision_refresh_roundtrip_preserves_evidence_on_docs_failur
         def get(self, url, **kwargs):
             if url == model_sync.OPENAI_MODEL_LIST_URL:
                 return _FakeResponse(payload={"data": [
-                    {"id": "gpt-future"}, {"id": "gpt-future-2026-10-25"},
+                    {"id": "gpt-future"}, {"id": "gpt-future-2026-10-25"}, {"id": "gpt-audio"},
                     {"id": "gpt-future-unlisted-variant"}, {"id": "gpt-text-only"},
-                    {"id": "gpt-api-vision", "capabilities": {"image_input": {"supported": True}}},
+                    {"id": "gpt-api-vision", "capabilities": {
+                        "image_input": {"supported": True}, "audio_input": {"supported": False},
+                    }},
                 ]})
             assert "Authorization" not in kwargs.get("headers", {})
             self.urls.append(url)
@@ -602,6 +605,7 @@ async def test_openai_vision_refresh_roundtrip_preserves_evidence_on_docs_failur
             documents = {
                 OPENAI_DOCS_BASE + ".md": (
                     '- [Future](/api/docs/models/gpt-future.md)\n'
+                    '- [Audio](/api/docs/models/gpt-audio.md)\n'
                     '- [Text](/api/docs/models/gpt-text-only.md)\n'
                     '- [API](/api/docs/models/gpt-api-vision.md)\n'
                 ),
@@ -611,6 +615,9 @@ async def test_openai_vision_refresh_roundtrip_preserves_evidence_on_docs_failur
                 ),
                 OPENAI_DOCS_BASE + "/gpt-text-only.md": (
                     'Model ID: `gpt-text-only`\n- Input modalities: text\n'
+                ),
+                OPENAI_DOCS_BASE + "/gpt-audio.md": (
+                    'Model ID: `gpt-audio`\n- Input modalities: text, audio\n'
                 ),
             }
             return _FakeResponse(text=documents[url])
@@ -624,7 +631,9 @@ async def test_openai_vision_refresh_roundtrip_preserves_evidence_on_docs_failur
     assert models["gpt-text-only"]["capabilities"] == ["text", "reasoning"]
     assert models["gpt-future-unlisted-variant"]["capabilities"] == ["text"]
     assert models["gpt-future-unlisted-variant"]["needs_review"] is True
-    assert len(session.urls) == 3  # index plus two pages; no docs needed for API metadata
+    assert models["gpt-audio"]["capabilities"] == ["text", "audio"]
+    assert models["gpt-audio"]["provider_capabilities"]["audio_input"]["support"] == "supported"
+    assert len(session.urls) == 4  # index plus three pages; no docs needed for API metadata
 
     # Match the admin UI payload, including metadata carried under raw.
     service.sync_provider("openai", [
@@ -768,8 +777,8 @@ async def test_gemini_vision_refresh_roundtrip_preserves_evidence_on_docs_failur
     monkeypatch.setattr(model_sync.aiohttp, "ClientSession", lambda: session)
     remote = await service.fetch_remote_models("google")
     models = {m["id"]: m for m in remote["models"]}
-    assert models["gemini-3.6-flash"]["capabilities"] == ["text", "reasoning", "thinking", "vision"]
-    assert models["gemini-3.5-transcribe"]["capabilities"] == ["text"]
+    assert models["gemini-3.6-flash"]["capabilities"] == ["text", "reasoning", "thinking", "vision", "audio"]
+    assert models["gemini-3.5-transcribe"]["capabilities"] == ["text", "audio"]
     assert models["gemini-legacy-vision"]["capabilities"] == ["text", "vision"]
     assert models["gemini-undocumented"]["capabilities"] == ["text"]
     assert "vision_input" not in models["gemini-undocumented"]["provider_capabilities"]
@@ -1287,6 +1296,27 @@ LUNA_CATALOG_PRICING = {
 }
 PLAIN_REMOTE_PRICING = {"prompt": "0.00000008", "completion": "0.0000003"}
 PLAIN_CATALOG_PRICING = {"input_per_million": 0.08, "output_per_million": 0.3}
+
+
+def test_catalog_normalization_preserves_curated_audio_rates():
+    pricing = {"audio_input_per_million": 10, "input_per_million": 2,
+               "long_context": {"threshold_tokens": 32000, "audio_input_per_million": 15}}
+    assert model_sync._normalize_pricing_block(pricing) == pricing
+
+
+def test_full_sync_preserves_audio_formats_and_unlisted_audio_rate(service):
+    current = {"pricing": {"input_per_million": 2, "audio_input_per_million": 10},
+               "provider_capabilities": {"audio_input": {"support": "supported", "formats": ["wav", "mp3"]}}}
+    remote = {"id": "audio-model", "pricing": {"input_per_million": 3},
+              "provider_capabilities": {"audio_input": {"support": "supported", "source": "provider_metadata"}}}
+    updated = service._build_provider_spec("openrouter", remote, current)
+    assert updated["pricing"] == {"input_per_million": 3, "audio_input_per_million": 10}
+    assert updated["provider_capabilities"]["audio_input"]["formats"] == ["wav", "mp3"]
+    remote["provider_capabilities"]["audio_input"]["formats"] = ["flac"]
+    remote["pricing"]["audio_input_per_million"] = 12
+    updated = service._build_provider_spec("openrouter", remote, current)
+    assert updated["pricing"]["audio_input_per_million"] == 12
+    assert updated["provider_capabilities"]["audio_input"]["formats"] == ["flac"]
 
 
 def test_openrouter_pricing_maps_cache_rates_and_long_context_override():

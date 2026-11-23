@@ -262,7 +262,11 @@
       "source": null,
       "verified_at": "2026-07-12",
       "provenance": "manual_curated",
-      "note": "Per-request input limit (embeddings model; no output budget). Curated-only; provider resolves tiktoken cl100k counting."
+      "note": "Per-request input limit (embeddings model; no output budget). Curated-only; provider resolves tiktoken cl100k counting.",
+      "capabilities": [
+        "embeddings"
+      ],
+      "enabled": true
     },
     "text-embedding-3-small": {
       "max_input_tokens": 8192,
@@ -274,7 +278,11 @@
       "source": null,
       "verified_at": "2026-07-12",
       "provenance": "manual_curated",
-      "note": "Per-request input limit (embeddings model; no output budget). Curated-only; provider resolves tiktoken cl100k counting."
+      "note": "Per-request input limit (embeddings model; no output budget). Curated-only; provider resolves tiktoken cl100k counting.",
+      "capabilities": [
+        "embeddings"
+      ],
+      "enabled": true
     },
     "models/text-embedding-004": {
       "max_input_tokens": 2048,
@@ -286,7 +294,11 @@
       "source": "https://ai.google.dev/gemini-api/docs/tokens",
       "verified_at": "2026-07-12",
       "provenance": "manual_curated",
-      "note": "SHUT DOWN 2026-01-14 (embeddings model; no output budget)."
+      "note": "SHUT DOWN 2026-01-14 (embeddings model; no output budget).",
+      "capabilities": [
+        "embeddings"
+      ],
+      "enabled": false
     },
     "jev-latest": {
       "max_input_tokens": 32000,

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import re
 import time
 import traceback
@@ -41,6 +42,7 @@ from deterministic_validation import (
     SEGMENT_BUDGET_CHECK_NAME,
     DraftValidationResult,
     build_segment_budget_gate_evaluations,
+    build_segment_budget_instructions,
     evaluate_segment_budget_gate,
     has_active_generation_validators,
     prepare_validation_context,
@@ -54,6 +56,7 @@ from json_field_utils import prepare_content_for_qa, reconstruct_json, try_extra
 from llm_accent_prompts import ACCENT_SYSTEM_PROMPT_SNIPPET
 from llm_routing import endpoint_id_call_kwargs, resolve_call, resolve_temperature
 from local_execution_policy import LocalExecutionPolicyError
+from logging_policy import get_logging_policy
 from logging_utils import Phase, create_phase_logger
 from long_text_adapter import (
     IterationCandidateResult,
@@ -77,7 +80,7 @@ from models import (
 )
 from preflight_validator import resolve_preflight_model
 from provider_budget import ProviderBudgetError
-from provider_errors import ProviderErrorKind, ProviderFailure
+from provider_errors import ProviderErrorKind, ProviderFailure, classify_provider_exception
 from provider_health import provider_health_for_failure_payload
 from qa_engine import QAModelUnavailableError, QAProcessCancelled
 from qa_result_utils import (
@@ -109,7 +112,7 @@ from smart_edit import (
     locate_by_word_indices,
     normalize_source_text,
 )
-from tool_loop_models import JsonContractError, OutputContract, ToolLoopSchemaViolationError
+from tool_loop_models import JsonContractError, OutputContract, ToolLoopExhausted, ToolLoopSchemaViolationError
 from tools.ai_json_cleanroom import (
     ValidationResult,
     make_loose_json_validate_options,
@@ -422,12 +425,56 @@ def _purge_content_filter_session_state(session: Dict[str, Any]) -> None:
     session["json_guard_history"] = []
 
 
+class GranSabioCallLimitExceeded(RuntimeError):
+    """The request's explicit review budget has been consumed."""
+
+
+def _claim_gran_sabio_call(session: Dict[str, Any], request: ContentRequest) -> bool:
+    """Atomically consume one logical review across inline and final paths."""
+    iteration = getattr(request, "_current_iteration", None) or session.get("current_iteration", 0)
+    counts = session.setdefault("gran_sabio_calls_per_iteration", {})
+    iteration_count = counts.get(iteration, 0)
+    session_count = session.get("gran_sabio_escalation_count", 0)
+    iteration_limit = request.gran_sabio_call_limit_per_iteration
+    session_limit = request.gran_sabio_call_limit_per_session
+    if ((iteration_limit != -1 and iteration_count >= iteration_limit)
+            or (session_limit != -1 and session_count >= session_limit)):
+        return False
+    counts[iteration] = iteration_count + 1
+    session["gran_sabio_escalation_count"] = session_count + 1
+    return True
+
+
 def _build_generation_error_result(
     session: Dict[str, Any],
     request: ContentRequest,
     exc: Exception,
 ) -> Dict[str, Any]:
     """Build the terminal FAILED payload for unexpected generation errors."""
+    from ai_runtime.audio import AudioInputError
+
+    if isinstance(exc, AudioInputError):
+        session["error_type"] = "audio_input"
+        session["error_code"] = exc.code
+        return {
+            "content": _get_error_result_content(session, default=""),
+            "final_iteration": session.get("current_iteration", 0),
+            "final_score": 0.0, "approved": False, "status": GenerationStatus.FAILED.value,
+            "failure_reason": str(exc), "error_type": "audio_input", "error_code": exc.code,
+            "audio_error": exc.details, "retryable": False, "generated_at": datetime.now().isoformat(),
+        }
+
+    if isinstance(exc, GranSabioCallLimitExceeded):
+        session["error_type"] = "generation_error"
+        session["error_code"] = "gran_sabio_call_limit"
+        return {
+            "content": _get_error_result_content(session, default=""),
+            "final_iteration": session.get("current_iteration", 0),
+            "final_score": 0.0, "approved": False, "status": GenerationStatus.FAILED.value,
+            "failure_reason": "Gran Sabio call limit reached.",
+            "error_type": "generation_error", "error_code": "gran_sabio_call_limit",
+            "evidence_grounding": None, "generated_at": datetime.now().isoformat(),
+        }
 
     if isinstance(exc, ContextAdmissionError):
         context_public = _context_admission_public_payload(exc)
@@ -832,24 +879,19 @@ def _log_generation_error_result(
         )
         logger.error("Failure reason: %s", final_result.get("failure_reason"))
         content_to_log = final_result.get("content") or ""
-        if content_to_log:
-            logger.error("Partial Content (%d characters):", len(content_to_log))
-            logger.error("--- START PARTIAL CONTENT ---")
-            logger.error(content_to_log)
-            logger.error("--- END PARTIAL CONTENT ---")
+        if content_to_log and not get_logging_policy().quiet:
+            logger.error("Partial content length: %d characters", len(content_to_log))
         return
 
-    content_to_log = final_result.get("content") or "No content generated"
+    content_to_log = final_result.get("content") or ""
     logger.error(
         "CONTENT REJECTED DUE TO ERROR - Session %s (%s)",
         session_id,
         _internal_exception_type(exc),
         exc_info=(type(exc), exc, exc.__traceback__),
     )
-    logger.error(f"Rejected Content ({len(content_to_log)} characters):")
-    logger.error(f"--- START REJECTED CONTENT ---")
-    logger.error(content_to_log)
-    logger.error(f"--- END REJECTED CONTENT ---")
+    if not get_logging_policy().quiet:
+        logger.error("Rejected content length: %d characters", len(content_to_log))
 
 
 class _ServiceProxy:
@@ -1254,9 +1296,9 @@ async def resolve_images_for_generation(
                 resolved,
             )
         except Exception as exc:
+            logger.exception("Image processing failed for upload %s", img_ref.upload_id)
             raise AttachmentError(
-                f"Failed to process image {img_ref.upload_id} "
-                f"({resolved.record.original_filename}): {exc}"
+                f"Failed to process image {img_ref.upload_id}."
             ) from exc
 
         # 4. Get dimensions AFTER resize for accurate token estimation
@@ -1842,20 +1884,22 @@ async def _commit_live_session_field(
     await mutate_session(session_id, _replace)
 
 
-async def _publish_gran_sabio_json_rejected(
+async def _publish_gran_sabio_candidate_rejected(
     session: Dict[str, Any],
     session_id: str,
     *,
     content: str,
     reason: str,
+    subphase: str,
 ) -> None:
-    """Label a Gran Sabio candidate the caller's JSON guard threw away (C5-bis).
+    """Label a Gran Sabio JSON candidate the caller's contract threw away (C5-bis).
 
     Gran Sabio commits its regeneration as ``accepted`` once its own contract
-    passes, but the caller's guard (schema plus json_expectations) runs after
-    that and can still reject it. Re-publishing the same body labelled
-    ``rejected`` is the correction: the consumer is told the text it is holding
-    is dead and why, instead of watching the live field go blank.
+    passes, but the caller's guards (schema plus json_expectations, then the
+    segment budgets gate) run after that and can still reject it.
+    Re-publishing the same body labelled ``rejected`` is the correction: the
+    consumer is told the text it is holding is dead and why, instead of
+    watching the live field go blank.
     """
 
     await publish_content_event(
@@ -1863,7 +1907,7 @@ async def _publish_gran_sabio_json_rejected(
             phase=ContentPhase.GRAN_SABIO,
             content=content,
             content_status=ContentStatus.REJECTED,
-            subphase=_GRAN_SABIO_REJECTED_JSON_SUBPHASE,
+            subphase=subphase,
             session_id=session_id,
             project_id=session.get("project_id"),
             project_epoch=session.get("project_epoch"),
@@ -2603,39 +2647,12 @@ def _is_retryable_streaming_error(exc: Exception) -> bool:
     if isinstance(exc, StructuredOutputSchemaError):
         return False
 
-    # AIRequestError already went through retry logic in ai_service
-    # but we want to retry at this level too for partial content scenarios
+    # AIService has already spent its retry budget. Never multiply that budget.
     if isinstance(exc, AIRequestError):
-        failure = getattr(exc, "provider_failure", None)
-        if failure is not None:
-            if failure.provider == "chatgpt":
-                # AIService owns the subscription's complete overload budget
-                # and partial-stream guard; an outer retry would bypass both.
-                return False
-            return bool(failure.retryable)
-        return True
-
-    # Check for transient HTTP errors
-    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
-    if status in {408, 425, 429, 500, 502, 503, 504}:
-        return True
-
-    message = str(exc).lower()
-
-    # Schema validation errors from structured outputs are retriable.
-    # These occur when the model generates syntactically valid JSON but with
-    # values that don't match the schema (e.g., "atmospheric" instead of "atmosphere").
-    # Since LLMs are stochastic, the model may produce correct values on retry.
-    if "validation error" in message:
-        return True
-
-    transient_markers = [
-        "timeout", "temporarily unavailable", "internal server error",
-        "gateway", "rate limit", "overloaded", "unavailable",
-        "service unavailable", "connection reset", "connection refused",
-        "api_error"
-    ]
-    return any(marker in message for marker in transient_markers)
+        return False
+    return classify_provider_exception(
+        exc, provider="unknown", model_id="unknown", operation="streaming",
+    ).retryable
 
 
 def _extract_error_reason(exc: Exception) -> str:
@@ -2906,6 +2923,7 @@ async def _generate_full_content(
     images: Optional[List[ImageData]] = None,
     prompt_safety_parts: Optional[List[PromptPart]] = None,
     cancellation_token: Optional[CancellationToken] = None,
+    audios: Optional[List[Any]] = None,
 ) -> str:
     """
     Generate complete content from scratch using AI service.
@@ -3129,6 +3147,7 @@ async def _generate_full_content(
                 ) if usage_tracker else None,
                 phase_logger=phase_logger,
                 images=images,
+                audios=audios,
                 max_tool_rounds=tool_rounds,
                 accent_guard=accent_guard_for_call,
                 accent_audit_timeout=accent_audit_timeout,
@@ -3262,35 +3281,6 @@ async def _generate_full_content(
         except StructuredOutputSchemaError:
             # Deterministic request-contract failure: never retry or silently downgrade.
             raise
-        except ValueError as exc:
-            # Check accent fail_closed contract before allowing ungated fallback to standard generation.
-            guard = request.llm_accent_guard
-            accent_mode_local = guard.mode
-            on_error_local = guard.on_error
-            if accent_mode_local in {"inline", "inline_post"} and on_error_local == "fail_closed":
-                # Tool-loop unavailable but accent fail_closed requires gating. Upgrade to AccentGuardError.
-                session["failure_reason"] = "accent_failed"
-                session["accent_guard_reason"] = "error"
-                session["accent_guard_details"] = {
-                    "original_exception": type(exc).__name__,
-                    "path": "value_error_fallback",
-                }
-                raise AccentGuardError(
-                    f"Tool-loop unavailable for fail_closed inline accent mode: {exc}",
-                    reason="error",
-                    details={"original_exception": type(exc).__name__, "path": "value_error_fallback"},
-                ) from exc
-            if accent_mode_local in {"inline", "inline_post"} and on_error_local == "fail_open":
-                _record_accent_fail_open(session, path="value_error_fallback", reason="error")
-            logger.info(
-                "Session %s: Generation tools unavailable for %s (%s). Falling back to standard generation.",
-                session_id,
-                request.generator_model,
-                exc,
-            )
-            await add_verbose_log(session_id, f"[Tools] Fallback to standard generation: {exc}")
-        except Exception:
-            raise
         else:
             # Proposal §3.7: ``call_ai_with_validation_tools`` may return an
             # envelope with ``tools_skipped_reason`` set when it consciously
@@ -3401,7 +3391,7 @@ async def _generate_full_content(
     max_stream_attempts = (
         1
         if getattr(request, "strict_single_generation_attempt", False)
-        else (config.MAX_RETRIES if config.RETRY_STREAMING_AFTER_PARTIAL else 1)
+        else (max(1, int(config.MAX_RETRIES)) if config.RETRY_STREAMING_AFTER_PARTIAL else 1)
     )
     max_provider_attempts = max_stream_attempts + 1
     transient_failures = 0
@@ -3486,6 +3476,7 @@ async def _generate_full_content(
                 ) if usage_tracker else None,
                 phase_logger=phase_logger,
                 images=images,
+                audios=audios,
                 model_alias_registry=getattr(request, "_model_alias_registry", None),
                 prompt_safety_parts=prompt_safety_parts,
                 llm_routing=getattr(request, "_llm_routing", None),
@@ -3822,7 +3813,8 @@ async def _generate_full_content(
                 # purged in ``_purge_content_filter_session_state``.
                 _clear_unaccepted_generation_snapshot(session)
 
-    # After the retry loop, content_chunks contains the successful result
+    else:
+        raise RuntimeError("Generation ended without a complete candidate")
     if await _generation_cancelled():
         raise asyncio.CancelledError()
     content = "".join(content_chunks)
@@ -3868,6 +3860,7 @@ async def generate_iteration_candidate(
     images: Optional[List[ImageData]],
     prompt_safety_parts: Optional[List[PromptPart]] = None,
     cancellation_token: Optional[CancellationToken] = None,
+    audios: Optional[List[Any]] = None,
 ) -> IterationCandidateResult:
     """Generate the next outer-iteration candidate in standard or Long Text mode."""
 
@@ -3885,6 +3878,7 @@ async def generate_iteration_candidate(
             json_output_requested=json_output_requested,
             phase_logger=phase_logger,
             images=images,
+            audios=audios,
             prompt_safety_parts=prompt_safety_parts,
             cancellation_token=cancellation_token,
         )
@@ -4260,17 +4254,12 @@ def _apply_direct_operation(
     # Locate the exact fragment within the paragraph
     fragment_start = paragraph_text.find(exact_fragment)
     if fragment_start == -1:
-        # Try case-insensitive search as fallback
-        fragment_start_lower = paragraph_text.lower().find(exact_fragment.lower())
-        if fragment_start_lower != -1:
-            fragment_start = fragment_start_lower
-        else:
-            return EditResult(
-                success=False,
-                content_before=content,
-                content_after=content,
-                errors=[f"Exact fragment not found in paragraph: '{exact_fragment[:50]}...'"]
-            )
+        return EditResult(
+            success=False,
+            content_before=content,
+            content_after=content,
+            errors=[f"Exact fragment not found in paragraph: '{exact_fragment[:50]}...'"]
+        )
 
     # Calculate absolute position in full content
     abs_start = span_start + fragment_start
@@ -4541,6 +4530,7 @@ async def _process_single_layer_with_edits(
     iteration: int = 1,
     qa_tool_event_callback: Optional[Any] = None,
     cancellation_token: Optional[CancellationToken] = None,
+    audios_for_qa: Optional[List[Any]] = None,
 ) -> tuple:
     """
     Process a single QA layer with iterative smart-edit.
@@ -4581,9 +4571,8 @@ async def _process_single_layer_with_edits(
     """
     from arbiter import ArbiterContext, LayerEditHistory
 
-    min_score = layer.min_score or 7.0
+    min_score = layer.min_score
     layer_name = layer.name
-    gran_sabio_limit = getattr(request, "gran_sabio_call_limit_per_session", -1)
 
     # Initialize edit history for this layer (used by Arbiter to detect cycles)
     layer_history = LayerEditHistory(layer_name=layer_name)
@@ -4653,6 +4642,7 @@ async def _process_single_layer_with_edits(
             word_map_formatted=word_map_formatted,
             draft_map_formatted=draft_map_formatted,
             input_images=images_for_qa,
+            input_audios=audios_for_qa,
             content_for_bypass=(
                 current_content
                 if (json_context and not json_context.get("error"))
@@ -4719,7 +4709,7 @@ async def _process_single_layer_with_edits(
         if (is_tie or is_minority) and deal_breakers:
             can_escalate = (
                 gran_sabio
-                and (gran_sabio_limit == -1 or session.get("gran_sabio_escalation_count", 0) < gran_sabio_limit)
+                and _claim_gran_sabio_call(session, request)
             )
 
             if not can_escalate:
@@ -4744,8 +4734,6 @@ async def _process_single_layer_with_edits(
                 }
                 return content, layer_results, False, fail_info
 
-            # Increment session-level escalation counter
-            session["gran_sabio_escalation_count"] = session.get("gran_sabio_escalation_count", 0) + 1
             escalation_type = "50_50_tie" if is_tie else "minority_deal_breaker"
             tracker = get_tracker()
             first_deal_breaker = deal_breakers[0]
@@ -5019,6 +5007,11 @@ async def _process_single_layer_with_edits(
                     content = edited_text
                 else:
                     content = gs_modified_content
+                if round_num == max_rounds - 1:
+                    layer_results, deal_breaker_info = await _evaluate_current_content(content)
+                    passed = (not deal_breaker_info and _has_valid_layer_scores(layer_results)
+                              and _calculate_layer_avg_score(layer_results) >= min_score)
+                    return content, layer_results, passed, deal_breaker_info
                 # Restart evaluation loop for this layer with modified content
                 continue
 
@@ -5080,11 +5073,10 @@ async def _process_single_layer_with_edits(
         )
 
         if not proposed_edits:
-            # No edits suggested - continue to next round (maybe different evaluation)
-            logger.info(f"Layer '{layer_name}' failed but no edits suggested. Continuing to next round.")
+            logger.info(f"Layer '{layer_name}' failed with no applicable edits.")
             if progress_callback:
                 await progress_callback(f"Layer '{layer_name}' failed (score: {avg_score:.2f}), no edits available")
-            continue
+            return content, layer_results, False, None
 
         # Use Arbiter to resolve conflicts and verify alignment with original request
         if arbiter:
@@ -5144,10 +5136,10 @@ async def _process_single_layer_with_edits(
             edits_to_apply = arbiter_result.edits_to_apply
 
             if not edits_to_apply:
-                logger.info(f"Layer '{layer_name}': Arbiter rejected all edits. Continuing to next round.")
+                logger.info(f"Layer '{layer_name}': Arbiter rejected all edits.")
                 if progress_callback:
                     await progress_callback(f"Layer '{layer_name}': Arbiter rejected all proposed edits")
-                continue
+                return content, layer_results, False, None
         else:
             # No Arbiter - use all proposed edits directly (legacy behavior)
             edits_to_apply = [pe.edit for pe in proposed_edits]
@@ -5167,10 +5159,10 @@ async def _process_single_layer_with_edits(
                 logger.warning(f"Discarding edit with invalid markers: {paragraph_key[:80]}...")
 
         if not valid_edits:
-            logger.warning(f"Layer '{layer_name}': All edits had invalid markers. Continuing.")
+            logger.warning(f"Layer '{layer_name}': All edits had invalid markers.")
             if progress_callback:
                 await progress_callback(f"Layer '{layer_name}': Edits discarded (invalid markers)")
-            continue
+            return content, layer_results, False, None
 
         # Apply edits using existing smart edit infrastructure
         logger.info(f"Layer '{layer_name}': Applying {len(valid_edits)} edit(s)...")
@@ -5209,6 +5201,8 @@ async def _process_single_layer_with_edits(
                     phase_logger=phase_logger,
                     cancellation_token=cancellation_token,
                 )
+            if edited_content == content:
+                return content, layer_results, False, None
             content = edited_content
             logger.info(f"Layer '{layer_name}': Edits applied successfully. Re-evaluating...")
 
@@ -5278,8 +5272,7 @@ async def _process_single_layer_with_edits(
             logger.error(f"Layer '{layer_name}': Smart edit failed: {e}")
             if progress_callback:
                 await progress_callback(f"Layer '{layer_name}': Edit failed - {str(e)[:50]}")
-            # Continue to next round - maybe next evaluation will work
-            continue
+            return content, layer_results, False, None
 
         # Loop continues - will re-evaluate with edited content
 
@@ -5310,6 +5303,7 @@ async def _process_all_layers_with_edits(
     images_for_qa: Optional[List["ImageData"]] = None,
     iteration: int = 1,
     cancellation_token: Optional[CancellationToken] = None,
+    audios_for_qa: Optional[List[Any]] = None,
 ) -> tuple:
     """
     Process all QA layers sequentially with per-layer smart-edit.
@@ -5429,6 +5423,7 @@ async def _process_all_layers_with_edits(
             progress_callback=progress_callback,
             stream_callback=stream_callback,
             images_for_qa=images_for_qa,
+            audios_for_qa=audios_for_qa,
             iteration=iteration,
             qa_tool_event_callback=_qa_tool_event_callback,
             cancellation_token=cancellation_token,
@@ -5451,7 +5446,7 @@ async def _process_all_layers_with_edits(
         layers_summary[layer_name] = {
             "passed": layer_passed,
             "score": avg_score,
-            "min_score": layer.min_score or 7.0,
+            "min_score": layer.min_score,
             "deal_breaker": layer_has_deal_breaker,
             "order": getattr(layer, 'order', 0),
         }
@@ -5680,7 +5675,6 @@ async def _adjudicate_final_verification_deal_breakers(
 
     layer_lookup = _build_final_verification_layer_lookup(evaluated_layers)
     decisions: List[Dict[str, Any]] = []
-    session_limit = getattr(request, "gran_sabio_call_limit_per_session", -1)
     tracker = get_tracker()
 
     async def final_verification_gran_sabio_stream_callback(
@@ -5712,10 +5706,7 @@ async def _adjudicate_final_verification_deal_breakers(
         if not (is_tie or is_minority):
             continue
 
-        can_escalate = (
-            session_limit == -1
-            or session.get("gran_sabio_escalation_count", 0) < session_limit
-        )
+        can_escalate = _claim_gran_sabio_call(session, request)
         if not can_escalate:
             decisions.append(
                 {
@@ -5727,7 +5718,6 @@ async def _adjudicate_final_verification_deal_breakers(
             )
             continue
 
-        session["gran_sabio_escalation_count"] = session.get("gran_sabio_escalation_count", 0) + 1
         escalation_type = "final_verification_50_50_tie" if is_tie else "final_verification_minority_deal_breaker"
         first_deal_breaker = deal_breakers[0]
         escalation_id = tracker.record_escalation(
@@ -5909,6 +5899,7 @@ async def _maybe_run_final_verification(
     qa_input_images: Optional[List["ImageData"]],
     context_prompt: str,
     cancellation_token: Optional[CancellationToken] = None,
+    qa_input_audios: Optional[List[Any]] = None,
 ) -> Dict[str, Any]:
     """Run final QA verification when enabled and return status plus results."""
 
@@ -5957,6 +5948,7 @@ async def _maybe_run_final_verification(
         word_map_formatted=marker_config.get("word_map_formatted"),
         draft_map_formatted=marker_config.get("draft_map_formatted"),
         input_images=qa_input_images,
+        input_audios=qa_input_audios,
         evidence_grounding_config=grounding_config,
         context_for_grounding=_build_grounding_context(request, context_prompt),
         model_alias_registry=getattr(request, "_model_alias_registry", None),
@@ -6238,7 +6230,7 @@ async def _generate_smart_edits(
                 logger.info(f"  - Issue #{idx}: {edit.issue_severity} - {desc}")
             logger.info("")
             logger.info("[ORIGINAL PARAGRAPH - BEFORE AI EDIT]")
-            logger.info(f"{paragraph_text}")
+            logger.info("Original paragraph: %d characters", len(paragraph_text))
             logger.info("")
 
             # Build instruction from all edits for this paragraph
@@ -6321,7 +6313,7 @@ async def _generate_smart_edits(
                 new_span_end = span_start + len(result.content_after) - len(edited_content) + span_end - span_start
                 edited_paragraph = result.content_after[span_start:new_span_end]
                 logger.info("[AI GENERATED PARAGRAPH - RAW OUTPUT]")
-                logger.info(f"{edited_paragraph}")
+                logger.info("Edited paragraph: %d characters", len(edited_paragraph))
                 logger.info("")
                 logger.info("[FINAL PARAGRAPH - AFTER CLEANUP]")
                 logger.info("=" * 80)
@@ -6464,7 +6456,7 @@ async def _generate_smart_edits(
         logger.error(f"Smart edit failed (fail-fast): {e}")
         await add_verbose_log(
             session_id,
-            f"Smart edit failed: {str(e)}, falling back to regeneration"
+            f"Smart edit failed: {str(e)}, rejecting the edit"
         )
 
         await _debug_record_event(
@@ -6480,7 +6472,7 @@ async def _generate_smart_edits(
         # Discard the failed edit payload. Outer retries generate a new draft.
         session["smart_edit_data"] = None
 
-        return base_content
+        raise
 
     except asyncio.CancelledError:
         logger.info("Generation task cancelled for session %s", session_id)
@@ -6491,7 +6483,7 @@ async def _generate_smart_edits(
         logger.error(f"Error applying smart edits: {e}")
         await add_verbose_log(
             session_id,
-            f"Error applying edits: {str(e)}, falling back to regeneration"
+            f"Error applying edits: {str(e)}, rejecting the edit"
         )
 
         await _debug_record_event(
@@ -6505,11 +6497,10 @@ async def _generate_smart_edits(
             },
         )
 
-        # Same fallback as SmartEditError (GEN-09): discard the failed edit
-        # payload and retain the unchanged text for the current layer.
+        # Discard the failed edit payload and propagate the technical failure.
         session["smart_edit_data"] = None
 
-        return base_content
+        raise
 
 
 async def _record_terminal_generation_failure(
@@ -6565,6 +6556,7 @@ async def process_content_generation(
     resolved_attachments: Optional[List[ResolvedAttachment]] = None,
     attachment_manager: Optional[AttachmentManager] = None,
     resolved_images: Optional[List[ImageData]] = None,
+    resolved_audios: Optional[List[Any]] = None,
 ):
     """
     Main content generation process with multi-layer QA
@@ -6708,6 +6700,13 @@ async def process_content_generation(
                         ),
                     )
 
+        audios_for_generation = resolved_audios or []
+        if request.audios and resolved_audios is None:
+            from services.audio_inputs import resolve_audio_inputs
+
+            manager = manager or get_attachment_manager()
+            audios_for_generation = await resolve_audio_inputs(request, manager, config)
+
         # Resolve images for vision-enabled generation (fail-fast on any error)
         images_for_generation: List[ImageData] = []
         if resolved_images:
@@ -6776,6 +6775,9 @@ async def process_content_generation(
                 "attachments": [_serialize_for_debug(item) for item in resolved_context],
                 "initial_rules": session.get("initial_rules", []),
                 "images_count": len(images_for_generation),
+                "audios_info": [
+                    audio.model_dump(exclude={"base64_data"}) for audio in audios_for_generation
+                ],
                 "images_info": [
                     {
                         "filename": img.original_filename,
@@ -6829,7 +6831,12 @@ async def process_content_generation(
                                                   qa_edit_results: Optional[Dict[str, Any]] = None,
                                                   qa_edit_comprehensive: Optional[Dict[str, Any]] = None,
                                                   final_verification: Optional[Dict[str, Any]] = None) -> bool:
-            """Record a failed final-text gate and feed the bounded retry loop."""
+            """Record a failed final-text gate and feed the bounded retry loop.
+
+            When the gate rejects the last iteration, its reason becomes the
+            Gran Sabio fallback context, like every other exhausting failure.
+            """
+            nonlocal fallback_reason
             check = evaluate_segment_budget_gate(candidate, request)
             if check is None or check.passed:
                 return False
@@ -6871,10 +6878,11 @@ async def process_content_generation(
             }
             session["iterations"].append(iteration_data)
             _prune_session_iteration_content(session)
+            final_rejection = iteration_index + 1 >= request.max_iterations
             await _publish_iteration_rejected(
                 session, session_id, iteration=iteration_index + 1,
                 consensus_result=None,
-                approval_result={"approved": False, "reason": reason, "final_rejection": False},
+                approval_result={"approved": False, "reason": reason, "final_rejection": final_rejection},
                 deal_breaker_found=True,
             )
             await _debug_record_event(session_id, "segment_budget_gate_rejected", {
@@ -6903,6 +6911,10 @@ async def process_content_generation(
                         raise
                     logger.error("Failed to update feedback memory for session %s: %s", session_id, exc)
             session["smart_edit_data"] = None
+            if final_rejection and request.gran_sabio_fallback:
+                await add_verbose_log(session_id, f"Iterations exhausted: {reason}")
+                await add_verbose_log(session_id, "Gran Sabio fallback enabled - moving to fallback...")
+                fallback_reason = reason
             return True
 
         for iteration in range(request.max_iterations):
@@ -6951,6 +6963,7 @@ async def process_content_generation(
 
             # Build word count instructions
             word_instructions = build_word_count_instructions(request)
+            segment_budget_instructions = build_segment_budget_instructions(request)
 
             # Build context from previous iterations (feedback + rejected content)
             iteration_feedback_context = ""
@@ -7049,6 +7062,9 @@ ITERATION CONTEXT:
             if word_instructions:
                 stable_prompt_sections.append(word_instructions)
                 prompt_safety_parts.append(PromptPart(word_instructions, "system_generated", "generation.word_instructions"))
+            if segment_budget_instructions:
+                stable_prompt_sections.append(segment_budget_instructions)
+                prompt_safety_parts.append(PromptPart(segment_budget_instructions, "user_supplied", "generation.segment_budget_instructions"))
             if iteration_context_block:
                 prompt_sections.append(iteration_context_block)
                 prompt_safety_parts.append(PromptPart(iteration_context_block, "system_generated", "generation.iteration_context"))
@@ -7141,6 +7157,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     json_output_requested=json_output_requested,
                     phase_logger=phase_logger,
                     images=images_for_generation,
+                    audios=audios_for_generation,
                     prompt_safety_parts=prompt_safety_parts,
                     cancellation_token=cancellation_token,
                 )
@@ -7162,6 +7179,9 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     f"Long Text request deadline exhausted: {exc}",
                 )
                 raise
+            except ToolLoopExhausted:
+                await add_verbose_log(session_id, "Validation tools exhausted; rejecting this candidate")
+                content = ""
             except LongTextGenerationError as exc:
                 if exc.long_text_state is not None:
                     session["long_text_state"] = exc.long_text_state.model_dump(mode="python")
@@ -7420,7 +7440,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                             # when JSON retry is active - focus on JSON structure correction only
                             final_prompt_retry = _build_generation_prompt(
                                 context_prompt,
-                                [request.prompt, word_instructions],
+                                [request.prompt, word_instructions, segment_budget_instructions],
                                 [json_error_context],
                                 cache_retry_prefix=True,
                                 prompt_cache=request.prompt_cache,
@@ -7481,10 +7501,15 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                                     ) if usage_tracker else None,
                                     phase_logger=phase_logger,
                                     images=images_for_generation,
+                                    audios=audios_for_generation,
                                     model_alias_registry=getattr(request, "_model_alias_registry", None),
                                     prompt_safety_parts=[
-                                        PromptPart(word_instructions, "system_generated", "json_retry.word_instructions")
-                                    ] if word_instructions else None,
+                                        PromptPart(text, origin, label)
+                                        for text, origin, label in (
+                                            (word_instructions, "system_generated", "json_retry.word_instructions"),
+                                            (segment_budget_instructions, "user_supplied", "json_retry.segment_budget_instructions"),
+                                        ) if text
+                                    ] or None,
                                     llm_routing=getattr(request, "_llm_routing", None),
                                     provider_options=getattr(
                                         json_retry_route, "provider_options", {}
@@ -7837,7 +7862,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                 logger.info(f"CONTENT APPROVED (QA BYPASSED) - Session {session_id}")
                 logger.info(f"Generated Content ({len(content)} characters):")
                 logger.info(f"--- START CONTENT ---")
-                logger.info(content)
+                logger.info("Generated response: %d characters", len(content))
                 logger.info(f"--- END CONTENT ---")
 
                 # Log timing summary and exit phases
@@ -8112,6 +8137,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                 session['marker_config'] = marker_config
 
             # Determine if we should pass images to QA (vision-enabled QA)
+            qa_input_audios = audios_for_generation or None
             qa_input_images = None
             if getattr(request, 'qa_with_vision', False) and images_for_generation:
                 qa_input_images = images_for_generation
@@ -8181,6 +8207,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                         progress_callback=qa_progress_callback,
                         stream_callback=qa_stream_callback,
                         images_for_qa=qa_input_images,
+                        audios_for_qa=qa_input_audios,
                         iteration=iteration + 1,
                         cancellation_token=cancellation_token,
                     )
@@ -8325,6 +8352,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     stream_callback=qa_stream_callback,
                     cancel_callback=cancellation_requested,
                     qa_input_images=qa_input_images,
+                    qa_input_audios=qa_input_audios,
                     context_prompt=context_prompt,
                     cancellation_token=cancellation_token,
                 )
@@ -8340,7 +8368,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                         "Final QA verification results are now authoritative for approval.",
                     )
 
-            except QAProcessCancelled:
+            except (QAProcessCancelled, GranSabioProcessCancelled):
                 await add_verbose_log(session_id, "QA evaluation cancelled by user request")
                 phase_logger._exit_phase(Phase.QA)
                 await _finalize_generation_interruption_shielded(
@@ -8849,7 +8877,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                 logger.info(f"Final Score: {consensus_result.average_score:.1f}")
                 logger.info(f"Generated Content ({len(content)} characters):")
                 logger.info(f"--- START CONTENT ---")
-                logger.info(content)
+                logger.info("Generated response: %d characters", len(content))
                 logger.info(f"--- END CONTENT ---")
 
                 # Log timing summary and exit COMPLETION phase
@@ -8876,7 +8904,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     fallback_reason = approval_result["reason"]
                     break  # Exit the iteration loop to trigger fallback
                 else:
-                    await add_verbose_log(session_id, f"Final rejection: {approval_result['reason']}")
+                    await add_verbose_log(session_id, f"Final rejection: {approval_result['reason']}", level=logging.WARNING)
                     rejection_reason = approval_result["reason"]
                     final_result = {
                         "content": session.get("last_generated_content", "No content generated"),
@@ -8926,16 +8954,19 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     content_to_log = session.get("last_generated_content", "No content generated")
                     logger.warning(f"CONTENT REJECTED - Session {session_id}")
                     logger.warning(f"FULL REJECTION REASON: {approval_result['reason']}")
-                    logger.warning(f"Rejected Content ({len(content_to_log)} characters):")
-                    logger.warning("--- START REJECTED CONTENT ---")
-                    logger.warning(content_to_log)
-                    logger.warning("--- END REJECTED CONTENT ---")
+                    if not get_logging_policy().quiet:
+                        logger.warning(f"Rejected Content ({len(content_to_log)} characters):")
+                        logger.warning("--- START REJECTED CONTENT ---")
+                        logger.warning("Rejected response: %d characters", len(content_to_log))
+                        logger.warning("--- END REJECTED CONTENT ---")
                     return
 
         # Maximum iterations reached - check if Gran Sabio fallback is enabled
         fallback_notes: List[str] = []
 
         if request.gran_sabio_fallback:
+            if not _claim_gran_sabio_call(session, request):
+                raise GranSabioCallLimitExceeded()
             separator = "=" * 80
             logger.info(separator)
             logger.info("ESCALATING TO GRAN SABIO - CONTENT REGENERATION FALLBACK")
@@ -8977,6 +9008,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     original_request=request,
                     previous_attempts=previous_attempts,
                     images=images_for_generation,
+                    audios=audios_for_generation,
                     stream_callback=gran_sabio_stream_callback,
                     cancel_callback=cancellation_requested,
                     usage_tracker=usage_tracker,
@@ -9039,6 +9071,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     )
 
                 proceed_with_qa = True
+                skip_qa_reason = "invalid JSON"
                 gran_sabio_json_guard_dict: Optional[Dict[str, Any]] = None
                 if json_output_requested:
                     gran_sabio_json_guard: ValidationResult = _run_json_post_guard(
@@ -9075,11 +9108,12 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                         # labelled ``rejected`` with its reason (C5-bis), so it
                         # stays visible on the stream and in the debugger trace
                         # instead of disappearing without explanation.
-                        await _publish_gran_sabio_json_rejected(
+                        await _publish_gran_sabio_candidate_rejected(
                             session,
                             session_id,
                             content=gran_sabio_content,
                             reason=error_messages,
+                            subphase=_GRAN_SABIO_REJECTED_JSON_SUBPHASE,
                         )
                         _open_live_session_field_attempt(session, "gransabio_content")
                         logger.warning(
@@ -9103,72 +9137,86 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                             )
                         else:
                             await add_verbose_log(session_id, "JSON guard (Gran Sabio) validation passed.")
-                        # Store the Gran Sabio parsed JSON payload for later use
-                        if gran_sabio_json_guard.data is not None:
-                            session["gran_sabio_json_parsed_content"] = gran_sabio_json_guard.data
-                            normalized_json_content = _json_guard_data_to_content(gran_sabio_json_guard)
-                            if normalized_json_content is not None:
-                                gran_sabio_content = normalized_json_content
-                        _set_generation_content_metrics(
-                            session,
-                            gran_sabio_content,
-                        )
-                        _set_last_generated_content_metrics(
-                            session,
-                            gran_sabio_content,
-                        )
-                        await _debug_record_event(
-                            session_id,
-                            "gran_sabio_regeneration_completed",
-                            {
-                                "content": gran_sabio_content,
-                                "word_count": len(
-                                    gran_sabio_content.split()
-                                ),
-                                "reason": gran_sabio_generation.reason,
-                                "model": getattr(
-                                    gran_sabio_generation,
-                                    "model",
-                                    None,
-                                ),
-                                "json_guard_validated": True,
-                            },
-                        )
+                        # Continue with the normalized Gran Sabio JSON payload
+                        normalized_json_content = _json_guard_data_to_content(gran_sabio_json_guard)
+                        if normalized_json_content is not None:
+                            gran_sabio_content = normalized_json_content
+                        # Segment-budget gate (segment-budgets/v1) for the
+                        # regenerated candidate: same non-acceptance guarantee
+                        # as the main loop, applied before the candidate becomes
+                        # the canonical body and before the fallback QA round
+                        # can approve it. Mirrors the invalid-JSON path above:
+                        # relabel the published candidate as rejected, skip QA
+                        # and record the reason, leaving the canonical body
+                        # untouched. The QA round never edits this content, so
+                        # no later recheck is needed.
+                        gran_sabio_segment_gate = evaluate_segment_budget_gate(gran_sabio_content, request)
+                        if gran_sabio_segment_gate is not None and not gran_sabio_segment_gate.passed:
+                            gran_sabio_gate_reason = (
+                                "Segment budget gate rejected the Gran Sabio regeneration: "
+                                f"{gran_sabio_segment_gate.summary}"
+                            )
+                            await add_verbose_log(session_id, gran_sabio_gate_reason)
+                            logger.warning(
+                                "Session %s Gran Sabio regeneration rejected by segment budget gate: %s",
+                                session_id,
+                                gran_sabio_segment_gate.summary,
+                            )
+                            _clear_unaccepted_generation_snapshot(session)
+                            await _publish_gran_sabio_candidate_rejected(
+                                session,
+                                session_id,
+                                content=gran_sabio_content,
+                                reason=gran_sabio_gate_reason,
+                                subphase="rejected_candidate",
+                            )
+                            _open_live_session_field_attempt(session, "gransabio_content")
+                            fallback_notes.append(gran_sabio_gate_reason)
+                            await _debug_record_event(
+                                session_id,
+                                "gran_sabio_segment_budget_rejected",
+                                {
+                                    "summary": gran_sabio_segment_gate.summary,
+                                    "metadata": gran_sabio_segment_gate.metadata,
+                                },
+                            )
+                            skip_qa_reason = "a segment budget violation"
+                            proceed_with_qa = False
+                        else:
+                            _set_generation_content_metrics(
+                                session,
+                                gran_sabio_content,
+                            )
+                            _set_last_generated_content_metrics(
+                                session,
+                                gran_sabio_content,
+                            )
+                            await _debug_record_event(
+                                session_id,
+                                "gran_sabio_regeneration_completed",
+                                {
+                                    "content": gran_sabio_content,
+                                    "word_count": len(
+                                        gran_sabio_content.split()
+                                    ),
+                                    "reason": gran_sabio_generation.reason,
+                                    "model": getattr(
+                                        gran_sabio_generation,
+                                        "model",
+                                        None,
+                                    ),
+                                    "json_guard_validated": True,
+                                },
+                            )
 
                 # Initialize before conditional branches (same pattern as proceed_with_qa)
                 qa_evaluation_success_gs = False
 
-                # Segment-budget gate (segment-budgets/v1) for the regenerated
-                # candidate: same non-acceptance guarantee as the main loop,
-                # applied before the fallback QA round can approve it. Mirrors
-                # the invalid-JSON path: skip QA and record the reason.
-                if proceed_with_qa:
-                    gran_sabio_segment_gate = evaluate_segment_budget_gate(gran_sabio_content, request)
-                    if gran_sabio_segment_gate is not None and not gran_sabio_segment_gate.passed:
-                        gran_sabio_gate_reason = (
-                            "Segment budget gate rejected the Gran Sabio regeneration: "
-                            f"{gran_sabio_segment_gate.summary}"
-                        )
-                        await add_verbose_log(session_id, gran_sabio_gate_reason)
-                        logger.warning(
-                            "Session %s Gran Sabio regeneration rejected by segment budget gate: %s",
-                            session_id,
-                            gran_sabio_segment_gate.summary,
-                        )
-                        _clear_unaccepted_generation_snapshot(session)
-                        fallback_notes.append(gran_sabio_gate_reason)
-                        await _debug_record_event(
-                            session_id,
-                            "gran_sabio_segment_budget_rejected",
-                            {
-                                "summary": gran_sabio_segment_gate.summary,
-                                "metadata": gran_sabio_segment_gate.metadata,
-                            },
-                        )
-                        proceed_with_qa = False
-
                 if not proceed_with_qa:
-                    await add_verbose_log(session_id, "Skipping QA for Gran Sabio regeneration due to invalid JSON.")
+                    await add_verbose_log(
+                        session_id,
+                        f"Skipping QA for Gran Sabio regeneration due to {skip_qa_reason}.",
+                    )
                 else:
                     if await cancellation_requested():
                         await add_verbose_log(session_id, "Generation cancelled before Gran Sabio QA evaluation")
@@ -9295,6 +9343,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                     draft_map_formatted_gs = marker_config_gs.get('draft_map_formatted')
 
                     # Determine if we should pass images to QA (vision-enabled QA) - for Gran Sabio fallback
+                    qa_input_audios = audios_for_generation or None
                     qa_input_images = None
                     if getattr(request, 'qa_with_vision', False) and images_for_generation:
                         qa_input_images = images_for_generation
@@ -9359,6 +9408,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                                     word_map_formatted=word_map_formatted_gs,
                                     draft_map_formatted=draft_map_formatted_gs,
                                     input_images=qa_input_images,
+                                    input_audios=qa_input_audios,
                                     evidence_grounding_config=getattr(request, 'evidence_grounding', None),
                                     context_for_grounding=_build_grounding_context(request, context_prompt),
                                     model_alias_registry=getattr(request, "_model_alias_registry", None),
@@ -9391,6 +9441,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                                 stream_callback=qa_stream_callback_gran_sabio,
                                 cancel_callback=cancellation_requested,
                                 qa_input_images=qa_input_images,
+                                qa_input_audios=qa_input_audios,
                                 context_prompt=context_prompt,
                                 cancellation_token=cancellation_token,
                             )
@@ -9469,19 +9520,6 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                                 ),
                                 qa_comprehensive_result,
                             )
-                            final_gate = evaluate_segment_budget_gate(gran_sabio_content, request)
-                            if final_gate is not None and not final_gate.passed:
-                                reason = f"Segment budget gate rejected the Gran Sabio QA result: {final_gate.summary}"
-                                qa_results[SEGMENT_BUDGET_CHECK_NAME] = build_segment_budget_gate_evaluations(
-                                    final_gate, request.qa_models,
-                                )
-                                gran_sabio_iteration["qa_results"] = qa_results
-                                gran_sabio_iteration["deal_breaker_found"] = True
-                                gran_sabio_iteration["segment_budget_gate"] = final_gate.metadata
-                                approval_result = {"approved": False, "reason": reason, "final_rejection": True}
-                                await _debug_record_event(session_id, "gran_sabio_segment_budget_rejected", {
-                                    "summary": final_gate.summary, "metadata": final_gate.metadata,
-                                })
                             if gran_sabio_final_verification and gran_sabio_final_verification.get("triggered"):
                                 gran_sabio_final_verification["passed"] = approval_result["approved"]
                                 gran_sabio_final_verification["approval_reason"] = approval_result.get("reason")
@@ -9617,7 +9655,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                             break  # Exit retry loop
 
                 # After retry loop: check if QA evaluation succeeded for Gran Sabio
-                # Only log failure if QA was actually attempted (not skipped due to invalid JSON)
+                # Only log failure if QA was actually attempted (not skipped by the JSON guard or the segment budget gate)
                 if proceed_with_qa and not qa_evaluation_success_gs:
                     await add_verbose_log(session_id, "Gran Sabio QA evaluation failed after retries")
 
@@ -9628,6 +9666,8 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
             await add_verbose_log(session_id, "Gran Sabio review cancelled before escalation")
             return
         # Standard Gran Sabio review (when fallback is disabled or after fallback fails)
+        if not _claim_gran_sabio_call(session, request):
+            raise GranSabioCallLimitExceeded()
         update_session_status(session, session_id, GenerationStatus.GRAN_SABIO_REVIEW, SessionPhase.GRAN_SABIO_REVIEW)
         # New Gran Sabio operation: open a fresh live attempt.
         _open_live_session_field_attempt(session, "gransabio_content")
@@ -9811,18 +9851,100 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
             )
             return
 
+        if gran_sabio_result.approved and json_output_requested:
+            gran_sabio_review_guard: ValidationResult = _run_json_post_guard(
+                gran_sabio_result.final_content or "",
+                schema=getattr(request, "json_schema", None),
+                expectations=getattr(request, "json_expectations", None),
+            )
+            gran_sabio_review_guard_dict = gran_sabio_review_guard.to_dict()
+            session["json_guard_history"].append({
+                "iteration": "gran_sabio_review",
+                "result": gran_sabio_review_guard_dict
+            })
+            if not gran_sabio_review_guard.json_valid:
+                session["json_guard_failures"] = session.get("json_guard_failures", 0) + 1
+                error_messages = "; ".join(
+                    getattr(issue, "message", "") for issue in gran_sabio_review_guard.errors if getattr(issue, "message", "")
+                )
+                if not error_messages:
+                    error_messages = "JSON output failed validation"
+                await add_verbose_log(
+                    session_id,
+                    f"Gran Sabio review produced invalid JSON: {error_messages}"
+                )
+                logger.warning(
+                    "Session %s Gran Sabio review JSON validation failed: %s",
+                    session_id,
+                    error_messages
+                )
+                failure_reason = "Gran Sabio review produced invalid JSON"
+                final_payload = {
+                    "content": "",
+                    "final_iteration": "Gran Sabio",
+                    "final_score": 0.0,
+                    "approved": False,
+                    "failure_reason": failure_reason,
+                    "gran_sabio_reason": gran_sabio_result.reason,
+                    "evidence_grounding": None,
+                    "generated_at": datetime.now().isoformat()
+                }
+                if fallback_notes:
+                    final_payload["gran_sabio_fallback_notes"] = fallback_notes.copy()
+                _attach_json_guard_metadata(session, final_payload, request)
+                _store_final_result(
+                    session,
+                    final_payload,
+                    session_id,
+                    final_status=GenerationStatus.FAILED.value,
+                )
+                session["error"] = failure_reason
+                update_session_status(session, session_id, GenerationStatus.FAILED)
+                await _debug_record_event(
+                    session_id,
+                    "gran_sabio_review_json_error",
+                    {
+                        "final_result": final_payload,
+                        "reason": failure_reason,
+                    },
+                )
+                await _debug_update_status(
+                    session_id,
+                    status=GenerationStatus.FAILED.value,
+                    final_payload=final_payload,
+                )
+                return
+            warning_messages = [
+                getattr(issue, "message", "") for issue in gran_sabio_review_guard.warnings if getattr(issue, "message", "")
+            ]
+            if warning_messages:
+                await add_verbose_log(
+                    session_id,
+                    "Gran Sabio review JSON guard warnings: " + "; ".join(warning_messages)
+                )
+            else:
+                await add_verbose_log(session_id, "Gran Sabio review JSON guard validation passed.")
+            normalized_json_content = _json_guard_data_to_content(gran_sabio_review_guard)
+            if normalized_json_content is not None:
+                gran_sabio_result.final_content = normalized_json_content
+
+        # Segment-budget gate (segment-budgets/v1) on the final decision. It
+        # runs after the JSON guard, on the normalized content: invalid JSON
+        # keeps its technical failure above and a repaired syntax slip is not
+        # mistaken for a budget violation. Gran Sabio's own decision, reason
+        # and score stay untouched; the gate's reason rejects the result.
+        final_gate_reason: Optional[str] = None
         if gran_sabio_result.approved:
             final_gate = evaluate_segment_budget_gate(gran_sabio_result.final_content or "", request)
             if final_gate is not None and not final_gate.passed:
-                gran_sabio_result.approved = False
-                gran_sabio_result.reason = (
+                final_gate_reason = (
                     f"Segment budget gate rejected the Gran Sabio final decision: {final_gate.summary}"
                 )
                 await _debug_record_event(session_id, "gran_sabio_segment_budget_rejected", {
                     "summary": final_gate.summary, "metadata": final_gate.metadata,
                 })
 
-        if gran_sabio_result.approved:
+        if gran_sabio_result.approved and final_gate_reason is None:
             separator = "=" * 80
             logger.info(separator)
             logger.info("GRAN SABIO APPROVED CONTENT")
@@ -9832,86 +9954,6 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
             logger.info(f"Reason: {gran_sabio_result.reason[:200]}...")
             logger.info(separator)
             await add_verbose_log(session_id, f"GRAN SABIO APPROVED: {gran_sabio_result.reason}")
-
-            gran_sabio_review_guard_dict: Optional[Dict[str, Any]] = None
-            if json_output_requested:
-                gran_sabio_review_guard: ValidationResult = _run_json_post_guard(
-                    gran_sabio_result.final_content or "",
-                    schema=getattr(request, "json_schema", None),
-                    expectations=getattr(request, "json_expectations", None),
-                )
-                gran_sabio_review_guard_dict = gran_sabio_review_guard.to_dict()
-                session["json_guard_history"].append({
-                    "iteration": "gran_sabio_review",
-                    "result": gran_sabio_review_guard_dict
-                })
-                if not gran_sabio_review_guard.json_valid:
-                    session["json_guard_failures"] = session.get("json_guard_failures", 0) + 1
-                    error_messages = "; ".join(
-                        getattr(issue, "message", "") for issue in gran_sabio_review_guard.errors if getattr(issue, "message", "")
-                    )
-                    if not error_messages:
-                        error_messages = "JSON output failed validation"
-                    await add_verbose_log(
-                        session_id,
-                        f"Gran Sabio review produced invalid JSON: {error_messages}"
-                    )
-                    logger.warning(
-                        "Session %s Gran Sabio review JSON validation failed: %s",
-                        session_id,
-                        error_messages
-                    )
-                    failure_reason = "Gran Sabio review produced invalid JSON"
-                    final_payload = {
-                        "content": "",
-                        "final_iteration": "Gran Sabio",
-                        "final_score": 0.0,
-                        "approved": False,
-                        "failure_reason": failure_reason,
-                        "gran_sabio_reason": gran_sabio_result.reason,
-                        "evidence_grounding": None,
-                        "generated_at": datetime.now().isoformat()
-                    }
-                    if fallback_notes:
-                        final_payload["gran_sabio_fallback_notes"] = fallback_notes.copy()
-                    _attach_json_guard_metadata(session, final_payload, request)
-                    _store_final_result(
-                        session,
-                        final_payload,
-                        session_id,
-                        final_status=GenerationStatus.FAILED.value,
-                    )
-                    session["error"] = failure_reason
-                    update_session_status(session, session_id, GenerationStatus.FAILED)
-                    await _debug_record_event(
-                        session_id,
-                        "gran_sabio_review_json_error",
-                        {
-                            "final_result": final_payload,
-                            "reason": failure_reason,
-                        },
-                    )
-                    await _debug_update_status(
-                        session_id,
-                        status=GenerationStatus.FAILED.value,
-                        final_payload=final_payload,
-                    )
-                    return
-                warning_messages = [
-                    getattr(issue, "message", "") for issue in gran_sabio_review_guard.warnings if getattr(issue, "message", "")
-                ]
-                if warning_messages:
-                    await add_verbose_log(
-                        session_id,
-                        "Gran Sabio review JSON guard warnings: " + "; ".join(warning_messages)
-                    )
-                else:
-                    await add_verbose_log(session_id, "Gran Sabio review JSON guard validation passed.")
-                if gran_sabio_review_guard.data is not None:
-                    session["gran_sabio_json_parsed_content"] = gran_sabio_review_guard.data
-                    normalized_json_content = _json_guard_data_to_content(gran_sabio_review_guard)
-                    if normalized_json_content is not None:
-                        gran_sabio_result.final_content = normalized_json_content
 
             # Enter COMPLETION phase for Gran Sabio final decision
             phase_logger._enter_phase(Phase.COMPLETION)
@@ -9962,22 +10004,34 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
             phase_logger._exit_phase(Phase.COMPLETION)
 
         else:
+            # A deterministic gate rejection is reported like the other
+            # deterministic rejections: its own reason and a 0.0 score, never
+            # the approving score of the decision it overruled.
+            rejected_by_gate = final_gate_reason is not None
+            rejection_reason = final_gate_reason if rejected_by_gate else gran_sabio_result.reason
+            rejection_score = 0.0 if rejected_by_gate else gran_sabio_result.final_score
             separator = "=" * 80
             logger.info(separator)
-            logger.info("GRAN SABIO REJECTED CONTENT")
+            logger.info(
+                "SEGMENT BUDGET GATE REJECTED THE GRAN SABIO FINAL DECISION"
+                if rejected_by_gate
+                else "GRAN SABIO REJECTED CONTENT"
+            )
             logger.info(f"Session: {session_id}")
-            logger.info(f"Final Score: {gran_sabio_result.final_score:.2f}/10")
-            logger.info(f"Reason: {gran_sabio_result.reason[:200]}...")
+            logger.info(f"Final Score: {rejection_score:.2f}/10")
+            logger.info(f"Reason: {rejection_reason[:200]}...")
             logger.info(separator)
-            await add_verbose_log(session_id, f"GRAN SABIO REJECTED: {gran_sabio_result.reason}")
-            rejection_reason = gran_sabio_result.reason
+            await add_verbose_log(
+                session_id,
+                rejection_reason if rejected_by_gate else f"GRAN SABIO REJECTED: {rejection_reason}",
+            )
             final_payload = {
                 "content": session.get("last_generated_content", "No content generated"),
                 "final_iteration": "Gran Sabio - REJECTED",
-                "final_score": gran_sabio_result.final_score,
+                "final_score": rejection_score,
                 "approved": False,
                 "failure_reason": rejection_reason,
-                "gran_sabio_reason": rejection_reason,
+                "gran_sabio_reason": gran_sabio_result.reason,
                 "evidence_grounding": None,  # Not available in Gran Sabio review flow
                 "generated_at": datetime.now().isoformat()
             }
@@ -10005,7 +10059,7 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
                 "gran_sabio_review_rejected",
                 {
                     "final_result": final_payload,
-                    "reason": gran_sabio_result.reason,
+                    "reason": rejection_reason,
                 },
             )
             await _debug_update_status(
@@ -10016,12 +10070,17 @@ If JSON is requested, reduce verbosity inside string fields and keep the JSON co
 
             # Console logging for Gran Sabio rejected content
             content_to_log = session.get("last_generated_content", "No content generated")
-            logger.warning(f"CONTENT REJECTED BY GRAN SABIO (FINAL) - Session {session_id}")
+            logger.warning(
+                f"CONTENT REJECTED BY {'THE SEGMENT BUDGET GATE' if rejected_by_gate else 'GRAN SABIO'} "
+                f"(FINAL) - Session {session_id}"
+            )
+            logger.warning(f"Rejection Reason: {rejection_reason}")
             logger.warning(f"Gran Sabio Reason: {gran_sabio_result.reason}")
-            logger.warning(f"Rejected Content ({len(content_to_log)} characters):")
-            logger.warning(f"--- START REJECTED CONTENT ---")
-            logger.warning(content_to_log)
-            logger.warning(f"--- END REJECTED CONTENT ---")
+            if not get_logging_policy().quiet:
+                logger.warning(f"Rejected Content ({len(content_to_log)} characters):")
+                logger.warning(f"--- START REJECTED CONTENT ---")
+                logger.warning("Rejected response: %d characters", len(content_to_log))
+                logger.warning(f"--- END REJECTED CONTENT ---")
 
     except asyncio.CancelledError:
         logger.info("Generation processor interrupted for session %s", session_id)
@@ -10087,7 +10146,7 @@ def _strip_console_unsafe_symbols(message: str) -> str:
     return " ".join(cleaned.split())
 
 
-async def add_verbose_log(session_id: str, message: str) -> None:
+async def add_verbose_log(session_id: str, message: str, *, level: int = logging.INFO) -> None:
     '''Add a verbose log entry with timestamp and enforce log limits.
 
     The list stays a ring buffer capped at VERBOSE_MAX_ENTRIES; the engine's
@@ -10117,12 +10176,7 @@ async def add_verbose_log(session_id: str, message: str) -> None:
     if not appended:
         return
 
-    logger.info(f"Session {session_id}: {message}")
-
-    if "rejection" in message.lower() or "rechaza" in message.lower():
-        logger.warning(f"DETAILED REJECTION LOG - Session {session_id}")
-        logger.warning(f"COMPLETE MESSAGE: {message}")
-        logger.warning(f"MESSAGE LENGTH: {len(message)} characters")
+    logger.log(level, "Session %s: %s", session_id, message)
 
 async def add_to_session_field(session_id: str, field_name: str, content: str) -> None:
     '''Append content to a specific session field for real-time streaming.

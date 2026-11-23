@@ -773,14 +773,14 @@ class TestDirectOperationSafety:
         assert mock_qa_engine._evaluate_single_semantic_layer.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_layer_fails_no_edits_continues_to_max_rounds(
+    async def test_layer_fails_no_edits_stops_without_repeating_qa(
         self, sample_qa_layer, mock_qa_engine, mock_ai_service,
         sample_content, sample_content_request, mock_session, failing_evaluation_no_edits
     ):
         """
         Given: Layer that fails but has no edits suggested
         When: _process_single_layer_with_edits() is called
-        Then: Continues re-evaluating until max_rounds reached
+        Then: Rejects the layer without paying for QA on identical text
         """
         from core.generation_processor import _process_single_layer_with_edits
 
@@ -807,8 +807,7 @@ class TestDirectOperationSafety:
 
         assert passed is False
         assert deal_breaker_info is None
-        # Should have tried max_rounds times
-        assert mock_qa_engine._evaluate_single_semantic_layer.call_count == max_rounds
+        assert mock_qa_engine._evaluate_single_semantic_layer.call_count == 1
 
     @pytest.mark.asyncio
     async def test_layer_passes_after_applying_edits(
@@ -1084,15 +1083,13 @@ class TestProcessAllLayersWithEdits:
             QALayer(name="Layer2", description="L2", criteria="C2", min_score=7.0, order=2),
         ]
 
-        # First layer fails (with no edits, so max rounds quickly), second passes
+        # Each unchanged layer is evaluated once; the second layer can still pass.
         call_count = 0
-        max_rounds = sample_content_request.max_edit_rounds_per_layer
 
         async def mock_evaluate(*args, **kwargs):
             nonlocal call_count
             call_count += 1
-            # First max_rounds calls are for Layer1 (all fail)
-            if call_count <= max_rounds:
+            if call_count == 1:
                 return ({"gpt-4o": failing_evaluation_no_edits}, None)
             # Then Layer2 passes
             return ({"gpt-4o": passing_evaluation}, None)

@@ -76,6 +76,7 @@ class ProjectRuntime:
     cancelled: bool = False
     cancel_mode: Optional[str] = None
     idle_since: Optional[datetime] = None
+    pending_admissions: int = 0
 
 
 @dataclass(frozen=True)
@@ -138,7 +139,8 @@ class CancellationRegistry:
         if project is None:
             return
         if (
-            project.hard_stop_in_progress
+            project.pending_admissions
+            or project.hard_stop_in_progress
             or project.hard_stop_ids
             or project.hard_stop_active_count
         ):
@@ -167,6 +169,7 @@ class CancellationRegistry:
                 and project.idle_since <= cutoff
                 and not project.hard_stop_in_progress
                 and not project.hard_stop_ids
+                and not project.pending_admissions
                 and project_id not in active_project_ids
             ]
             for project_id in expired_project_ids:
@@ -200,8 +203,19 @@ class CancellationRegistry:
         async with self._lock:
             project = self._project(project_id)
             if project.cancelled or project.hard_stop_in_progress:
+                self._cleanup_project_if_unused_locked(project_id)
                 raise asyncio.CancelledError(f"Project {project_id} is stopped")
+            project.pending_admissions += 1
             return project.epoch
+
+    async def end_project_admission(self, project_id: str) -> None:
+        """Release an admission even when validation rejects it before a session exists."""
+        async with self._lock:
+            project = self._projects[project_id]
+            if project.pending_admissions <= 0:
+                raise RuntimeError("Project admission was already released")
+            project.pending_admissions -= 1
+            self._cleanup_project_if_unused_locked(project_id)
 
     async def validate_project_admission(self, project_id: str, admission_epoch: int) -> None:
         async with self._lock:
